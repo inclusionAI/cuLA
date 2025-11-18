@@ -94,8 +94,8 @@ ext_modules.append(
         include_dirs=[
             Path(this_dir) / "csrc",
             Path(this_dir) / "csrc" / "cutlass" / "include",
-            Path(this_dir) / "csrc" / "cutlass" / "include" / "cccl",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
+            "/usr/local/cuda/include/cccl",
         ],
     )
 )
