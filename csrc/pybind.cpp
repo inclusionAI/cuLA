@@ -5,7 +5,6 @@
 
 #include <cutlass/fast_math.h>
 
-#include "params.h"
 #include "lightning/sm100/prefill_fwd.h"
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
