@@ -2,7 +2,7 @@ from typing import Optional, Tuple
 
 import torch
 
-import flashla.cuda as flashla_cuda
+import flashla.cudac as flashla_cuda
 
 
 def lightning_prefill_fwd(

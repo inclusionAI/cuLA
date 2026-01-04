@@ -64,7 +64,7 @@ else:
 ext_modules = []
 ext_modules.append(
     CUDAExtension(
-        name="flashla.cuda",
+        name="flashla.cudac",
         sources=[
             "csrc/pybind.cpp",
             "csrc/lightning/sm100/prefill_fwd.cu",
