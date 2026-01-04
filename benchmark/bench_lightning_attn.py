@@ -240,37 +240,240 @@ def benchmark_lightning_attn(
         else:
             print(f"✗ Triton is {1/speedup:.2f}x faster than CuteDSL")
         print("="*60 + "\n")
+        
+        # Return results for plotting
+        return {
+            'max_diff': max_diff,
+            'mean_diff': mean_diff,
+            'rel_error': rel_error,
+            'triton_time': triton_elapsed * 1000 / iterations,
+            'cutedsl_time': cutedsl_elapsed * 1000 / iterations,
+            'speedup': speedup,
+        }
+
+
+def run_benchmark_suite():
+    """
+    Run comprehensive benchmarks with multiple configurations.
+    Tests different batch sizes and head counts, then plots results.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    # Test configurations
+    batch_sizes = [2, 8, 16, 64]
+    num_heads_list = [64, 128]
+    seq_len = 4096
+    head_dim = 128
+    layer_idx = 12
+    num_layers = 24
+    iterations = 10
+    
+    results = []
+    configs = []
+    
+    print("\n" + "="*80)
+    print("Running Comprehensive Benchmark Suite")
+    print("="*80)
+    print(f"Configurations to test: {len(batch_sizes) * len(num_heads_list)}")
+    print(f"Batch sizes: {batch_sizes}")
+    print(f"Num heads: {num_heads_list}")
+    print(f"Seq len: {seq_len}, Head dim: {head_dim}")
+    print(f"Layer: {layer_idx}/{num_layers}, Iterations: {iterations}")
+    print("="*80 + "\n")
+    
+    for B in batch_sizes:
+        for H in num_heads_list:
+            config_name = f"B={B}, H={H}"
+            configs.append(config_name)
+            
+            print(f"\n{'='*60}")
+            print(f"Testing configuration: {config_name}")
+            print(f"{'='*60}")
+            
+            try:
+                result = benchmark_lightning_attn(
+                    B=B,
+                    T=seq_len,
+                    H=H,
+                    D=head_dim,
+                    scale=1.0,
+                    dtype=torch.bfloat16,
+                    layer_idx=layer_idx,
+                    num_layers=num_layers,
+                    iterations=iterations,
+                )
+                results.append(result)
+            except Exception as e:
+                print(f"\n✗ Configuration {config_name} failed with error: {e}")
+                print("Skipping this configuration and continuing...\n")
+                # Add placeholder result
+                results.append({
+                    'max_diff': float('nan'),
+                    'mean_diff': float('nan'),
+                    'rel_error': float('nan'),
+                    'triton_time': float('nan'),
+                    'cutedsl_time': float('nan'),
+                    'speedup': float('nan'),
+                })
+                continue
+    
+    # Plot results
+    plot_benchmark_results(configs, results, batch_sizes, num_heads_list)
+    
+    return results
+
+
+def plot_benchmark_results(configs, results, batch_sizes, num_heads_list):
+    """
+    Create visualization of benchmark results.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    # Extract data
+    max_diffs = [r['max_diff'] for r in results]
+    mean_diffs = [r['mean_diff'] for r in results]
+    rel_errors = [r['rel_error'] for r in results]
+    triton_times = [r['triton_time'] for r in results]
+    cutedsl_times = [r['cutedsl_time'] for r in results]
+    speedups = [r['speedup'] for r in results]
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle('Lightning Attention Benchmark: CuteDSL vs Triton (FLA)', fontsize=16, fontweight='bold')
+    
+    x = np.arange(len(configs))
+    width = 0.35
+    
+    # Plot 1: Max Difference
+    ax1 = axes[0, 0]
+    bars1 = ax1.bar(x, max_diffs, color='coral')
+    ax1.set_ylabel('Max Absolute Difference', fontsize=10)
+    ax1.set_title('Maximum Difference', fontsize=12, fontweight='bold')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(configs, rotation=45, ha='right', fontsize=8)
+    ax1.grid(axis='y', alpha=0.3)
+    for i, (bar, val) in enumerate(zip(bars1, max_diffs)):
+        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{val:.1f}',
+                ha='center', va='bottom', fontsize=8)
+    
+    # Plot 2: Mean Difference
+    ax2 = axes[0, 1]
+    bars2 = ax2.bar(x, mean_diffs, color='lightblue')
+    ax2.set_ylabel('Mean Absolute Difference', fontsize=10)
+    ax2.set_title('Mean Difference', fontsize=12, fontweight='bold')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(configs, rotation=45, ha='right', fontsize=8)
+    ax2.grid(axis='y', alpha=0.3)
+    for i, (bar, val) in enumerate(zip(bars2, mean_diffs)):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{val:.3f}',
+                ha='center', va='bottom', fontsize=8)
+    
+    # Plot 3: Relative Error
+    ax3 = axes[0, 2]
+    bars3 = ax3.bar(x, [r*100 for r in rel_errors], color='lightgreen')
+    ax3.set_ylabel('Relative Error (%)', fontsize=10)
+    ax3.set_title('Relative Error', fontsize=12, fontweight='bold')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(configs, rotation=45, ha='right', fontsize=8)
+    ax3.grid(axis='y', alpha=0.3)
+    ax3.axhline(y=3.0, color='r', linestyle='--', linewidth=1, alpha=0.5, label='Tolerance (3%)')
+    ax3.legend(fontsize=8)
+    for i, (bar, val) in enumerate(zip(bars3, rel_errors)):
+        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{val*100:.2f}%',
+                ha='center', va='bottom', fontsize=8)
+    
+    # Plot 4: Execution Time Comparison
+    ax4 = axes[1, 0]
+    bars4a = ax4.bar(x - width/2, triton_times, width, label='Triton (FLA)', color='steelblue')
+    bars4b = ax4.bar(x + width/2, cutedsl_times, width, label='CuteDSL', color='orange')
+    ax4.set_ylabel('Time (ms/iter)', fontsize=10)
+    ax4.set_title('Execution Time Comparison', fontsize=12, fontweight='bold')
+    ax4.set_xticks(x)
+    ax4.set_xticklabels(configs, rotation=45, ha='right', fontsize=8)
+    ax4.legend(fontsize=9)
+    ax4.grid(axis='y', alpha=0.3)
+    
+    # Plot 5: Speedup
+    ax5 = axes[1, 1]
+    bars5 = ax5.bar(x, speedups, color='gold')
+    ax5.set_ylabel('Speedup (Triton/CuteDSL)', fontsize=10)
+    ax5.set_title('Performance Speedup', fontsize=12, fontweight='bold')
+    ax5.set_xticks(x)
+    ax5.set_xticklabels(configs, rotation=45, ha='right', fontsize=8)
+    ax5.axhline(y=1.0, color='r', linestyle='--', linewidth=1, alpha=0.5, label='Baseline')
+    ax5.legend(fontsize=8)
+    ax5.grid(axis='y', alpha=0.3)
+    for i, (bar, val) in enumerate(zip(bars5, speedups)):
+        ax5.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{val:.2f}x',
+                ha='center', va='bottom', fontsize=8)
+    
+    # Plot 6: Grouped comparison by batch size and heads
+    ax6 = axes[1, 2]
+    
+    # Reshape data by batch size and num heads
+    n_batch = len(batch_sizes)
+    n_heads = len(num_heads_list)
+    speedup_matrix = np.array(speedups).reshape(n_batch, n_heads)
+    
+    x_pos = np.arange(n_batch)
+    width = 0.35
+    
+    for i, H in enumerate(num_heads_list):
+        offset = (i - n_heads/2 + 0.5) * width
+        ax6.bar(x_pos + offset, speedup_matrix[:, i], width, label=f'H={H}')
+    
+    ax6.set_ylabel('Speedup (Triton/CuteDSL)', fontsize=10)
+    ax6.set_title('Speedup by Batch Size and Heads', fontsize=12, fontweight='bold')
+    ax6.set_xlabel('Batch Size', fontsize=10)
+    ax6.set_xticks(x_pos)
+    ax6.set_xticklabels([f'B={b}' for b in batch_sizes], fontsize=9)
+    ax6.legend(fontsize=9)
+    ax6.axhline(y=1.0, color='r', linestyle='--', linewidth=1, alpha=0.5)
+    ax6.grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save figure
+    output_path = 'benchmark_results.png'
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"\n{'='*60}")
+    print(f"Benchmark results saved to: {output_path}")
+    print(f"{'='*60}\n")
+    
+    # Print summary table
+    print("\n" + "="*100)
+    print("BENCHMARK SUMMARY TABLE")
+    print("="*100)
+    print(f"{'Config':<15} {'Max Diff':>12} {'Mean Diff':>12} {'Rel Err %':>10} "
+          f"{'Triton(ms)':>12} {'CuteDSL(ms)':>12} {'Speedup':>10}")
+    print("-"*100)
+    for cfg, res in zip(configs, results):
+        if np.isnan(res['speedup']):
+            print(f"{cfg:<15} {'FAILED':>12} {'FAILED':>12} {'FAILED':>10} "
+                  f"{'FAILED':>12} {'FAILED':>12} {'FAILED':>10}")
+        else:
+            print(f"{cfg:<15} {res['max_diff']:>12.2f} {res['mean_diff']:>12.4f} {res['rel_error']*100:>9.2f}% "
+                  f"{res['triton_time']:>12.3f} {res['cutedsl_time']:>12.3f} {res['speedup']:>9.2f}x")
+    print("="*100 + "\n")
+    
+    # Calculate and print averages (excluding failed tests)
+    valid_speedups = [s for s in speedups if not np.isnan(s)]
+    valid_rel_errors = [r for r in rel_errors if not np.isnan(r)]
+    if valid_speedups:
+        avg_speedup = np.mean(valid_speedups)
+        avg_rel_error = np.mean(valid_rel_errors) * 100
+        print(f"Average Speedup: {avg_speedup:.2f}x (from {len(valid_speedups)} successful tests)")
+        print(f"Average Relative Error: {avg_rel_error:.2f}%")
+    else:
+        print("No successful tests to calculate averages.")
+    print()
 
 
 if __name__ == '__main__':
-    # Default configuration
-    B, T, H, D = 64, 4096, 64, 128
-    
-    # Alternative configurations (uncomment to test):
-    # B, T, H, D = 1, 256, 4, 128        # Small test
-    # B, T, H, D = 2, 2048, 16, 128      # Medium test
-    # B, T, H, D = 32, 8192, 32, 128     # Large test
-    
-    # Benchmark with layer_idx=12 (middle layer, moderate decay)
-    benchmark_lightning_attn(
-        B, T, H, D, 
-        scale=1., 
-        dtype=torch.bfloat16, 
-        layer_idx=12,
-        num_layers=24,
-        iterations=10
-    )
-    
-    # Test with different layers to see decay effects
-    # for layer_idx in [0, 6, 12, 18, 23]:
-    #     benchmark_lightning_attn(
-    #         B, T, H, D, 
-    #         scale=1., 
-    #         dtype=torch.bfloat16, 
-    #         layer_idx=layer_idx,
-    #         num_layers=24,
-    #         iterations=10
-    #     )
+    # Run comprehensive benchmark suite
+    run_benchmark_suite()
     
     # Optional: Test different decay values
     # for decay_val in [0.05, 0.1, 0.2, 0.5]:

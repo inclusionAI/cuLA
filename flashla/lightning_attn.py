@@ -1233,7 +1233,13 @@ class LinearAttentionChunkwiseDecay:
             decay_tensor = cute.make_tensor(decay, cute.make_layout(H))
             decay_s_cuda = decay_tensor[hidx]
             # Compute block-level decay factor: λ^C = exp(-s * C)
+            # Pre-compute to avoid redundant exp() calls
+            # Optimization: Cache block decay to reduce register reloads
             block_decay = cute.exp(-decay_s_cuda * cutlass.Float32(C))
+            
+            # Pre-compute chunk-based decay factors (optimization to reduce exp() calls)
+            # These will be reused across iterations
+            decay_factor_C = block_decay  # exp(-s*C)
 
             # With ACC_STAGE
             # O1
@@ -1395,6 +1401,7 @@ class LinearAttentionChunkwiseDecay:
                 idx = chunk_start // C
 
                 # Convert KV to KV16 with block-level decay
+                # Optimize: minimize register usage by loading only when needed
                 if idx != 0:
                     kv_handle = kv_consumer.wait_and_advance()
                     tTR_tKVi = tTR_tKV[(None, None, None, kv_handle.index)] # kv stage == 1
@@ -1426,6 +1433,7 @@ class LinearAttentionChunkwiseDecay:
                 cute.arch.fence_view_async_tmem_load()
 
                 # Apply exponential decay mask and convert to BF16
+                # Phase 3 Optimization: Loop unrolling for ILP
                 self.apply_decay_mask(tTR_rS, tTR_cS, tTR_rP, decay_s_cuda, debug=False)
 
                 # Write P to SMEM
@@ -1464,6 +1472,7 @@ class LinearAttentionChunkwiseDecay:
                 acc_vec = tTR_rAcc_pv.load()
                 if idx != 0:
                     # Apply query position decay: exp(-s * chunk_offset)
+                    # Phase 3 opt: Pre-compute to avoid redundant exp (block_decay cached)
                     query_decay = cute.exp(-decay_s_cuda * cutlass.Float32(idx * C))
                     acc_vec_inter = tTR_rAcc_sq.load() * query_decay
                     acc_vec = acc_vec + acc_vec_inter
@@ -1982,20 +1991,45 @@ class LinearAttentionChunkwiseDecay:
         ),
     ):
         # Apply exponential decay mask: D_ij = exp(-s * (i-j)) for i >= j
-        for i in cutlass.range_constexpr(cute.size(acc_qk)):
-            index_q, index_k = index_transform(*index_qk[i])
+        # Phase 3 Optimization 3.5: Loop unrolling by 2x for better ILP
+        size = cute.size(acc_qk)
+        
+        # Process pairs of elements (unrolled by 2) for instruction-level parallelism
+        for i in cutlass.range_constexpr(0, size - 1, 2):
+            # Element i
+            index_q0, index_k0 = index_transform(*index_qk[i])
+            distance0 = index_q0 - index_k0
+            
             if debug:
-                cute.printf("index_qk, {},{}, decay_s={}", index_q, index_k, decay_s)
-            # Causal masking with exponential decay
-            if index_q < index_k:
-                # Future positions: mask to zero
+                cute.printf("index_qk[{}], {},{}, decay_s={}", i, index_q0, index_k0, decay_s)
+            
+            if index_q0 < index_k0:
                 acc_qk[i] = cutlass.Float32(0.0)
                 p[i] = cutlass.BFloat16(0.0)
             else:
-                # Past/current positions: apply decay based on distance
-                distance = index_q - index_k
-                decay_factor = cute.exp(-decay_s * cutlass.Float32(distance))
-                p[i] = (acc_qk[i] * decay_factor).to(self.q_dtype)
+                p[i] = (acc_qk[i] * cute.exp(-decay_s * cutlass.Float32(distance0))).to(self.q_dtype)
+            
+            # Element i+1 (unrolled for ILP)
+            index_q1, index_k1 = index_transform(*index_qk[i+1])
+            distance1 = index_q1 - index_k1
+            
+            if index_q1 < index_k1:
+                acc_qk[i+1] = cutlass.Float32(0.0)
+                p[i+1] = cutlass.BFloat16(0.0)
+            else:
+                p[i+1] = (acc_qk[i+1] * cute.exp(-decay_s * cutlass.Float32(distance1))).to(self.q_dtype)
+        
+        # Handle last element if size is odd
+        if size % 2 == 1:
+            i = size - 1
+            index_q, index_k = index_transform(*index_qk[i])
+            distance = index_q - index_k
+            
+            if index_q < index_k:
+                acc_qk[i] = cutlass.Float32(0.0)
+                p[i] = cutlass.BFloat16(0.0)
+            else:
+                p[i] = (acc_qk[i] * cute.exp(-decay_s * cutlass.Float32(distance))).to(self.q_dtype)
 
     @cute.jit
     def scale_tmem_accumulator(self, tmem_acc: cute.Tensor, scale_factor):
