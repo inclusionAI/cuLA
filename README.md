@@ -63,12 +63,16 @@ WIP
 
 ## Mathematical background (brief)
 
-Linear attention rewrites the attention kernel using a feature map phi:
+Linear attention rewrites the attention kernel using a feature map $\phi$:
 
-$$A_{ij} = \\phi(q_i)^T\\phi(k_j)$$
+$$A_{ij} = \phi(q_i)^T \phi(k_j)$$
 
 so the output can be expressed as
 
-$$out_i = \\sum_j \\mathrm{softmax\\_approx}(q_i^T k_j) v_j \\approx \\phi(q_i)^T \\left(\\sum_j \\phi(k_j) v_j^T\\right)$$
+$$o_i = \sum_j \frac{\phi(q_i)^T \phi(k_j)}{\sum_{j'} \phi(q_i)^T \phi(k_{j'})} v_j = \frac{\phi(q_i)^T \sum_j \phi(k_j) v_j^T}{\phi(q_i)^T \sum_j \phi(k_j)}$$
 
-This transforms the O(N^2) pairwise computation into two O(N) accumulation operations.
+For causal (autoregressive) linear attention:
+
+$$o_i = \frac{\phi(q_i)^T S_i}{\phi(q_i)^T z_i}, \quad S_i = \sum_{j \le i} \phi(k_j) v_j^T, \quad z_i = \sum_{j \le i} \phi(k_j)$$
+
+The recurrence $S_i = S_{i-1} + \phi(k_i) v_i^T$ enables $O(N)$ sequential computation, avoiding $O(N^2)$ pairwise interactions.
