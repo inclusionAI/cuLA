@@ -1,5 +1,6 @@
 import torch
 import time
+import ctypes
 
 from fla.ops.lightning_attn import chunk_lightning_attn
 from fla.utils import assert_close, device
@@ -16,6 +17,19 @@ from einops import rearrange
 
 
 PRINT_DEBUG = False
+
+
+def reset_cuda_error():
+    """Reset CUDA error state after an error occurs."""
+    try:
+        # Get CUDA error and reset
+        torch.cuda.synchronize()
+        # Call cudaGetLastError to clear the error
+        libcudart = ctypes.CDLL('libcudart.so')
+        libcudart.cudaGetLastError()
+        torch.cuda.empty_cache()
+    except:
+        pass
 
 def print_chunkwise(t, name):
     if not PRINT_DEBUG:
@@ -198,16 +212,78 @@ def benchmark_lightning_attn(
         )
 
         # Test Triton (FLA) implementation
+        tri = None
+        triton_elapsed = None
+        triton_error = None
         print("Testing Triton (FLA) implementation...")
-        tri, triton_elapsed = test_triton_lightning_attn(args, q, k, v, decay, problem_size=(B, T, H, D), layer_idx=layer_idx)
-        print_chunkwise(tri, 'TRITON_O')
+        try:
+            tri, triton_elapsed = test_triton_lightning_attn(args, q, k, v, decay, problem_size=(B, T, H, D), layer_idx=layer_idx)
+            print_chunkwise(tri, 'TRITON_O')
+        except Exception as e:
+            triton_error = str(e)
+            print(f"✗ Triton (FLA) failed: {e}")
+            # Clear CUDA error state
+            reset_cuda_error()
 
         # Test CuteDSL implementation
+        cutedsl_o = None
+        cutedsl_elapsed = None
+        cutedsl_error = None
         print("\nTesting CuteDSL implementation...")
-        cutedsl_o, cutedsl_elapsed = test_cutedsl_lightning_attn(args, q, k, v, decay, problem_size=(B, T, H, D))
-        print_chunkwise(cutedsl_o, 'CUTEDSL_O')
+        try:
+            cutedsl_o, cutedsl_elapsed = test_cutedsl_lightning_attn(args, q, k, v, decay, problem_size=(B, T, H, D))
+            print_chunkwise(cutedsl_o, 'CUTEDSL_O')
+        except Exception as e:
+            cutedsl_error = str(e)
+            print(f"✗ CuteDSL failed: {e}")
+            # Clear CUDA error state
+            reset_cuda_error()
 
-        # Compare outputs
+        # Check if both failed
+        if tri is None and cutedsl_o is None:
+            print("\n" + "="*60)
+            print("Both Implementations Failed")
+            print("="*60)
+            print(f"✗ Triton (FLA) error: {triton_error}")
+            print(f"✗ CuteDSL error: {cutedsl_error}")
+            print("="*60 + "\n")
+            
+            return {
+                'max_diff': float('nan'),
+                'mean_diff': float('nan'),
+                'rel_error': float('nan'),
+                'triton_time': float('nan'),
+                'cutedsl_time': float('nan'),
+                'speedup': float('nan'),
+                'triton_error': triton_error,
+                'cutedsl_error': cutedsl_error,
+            }
+        
+        # If only one succeeded, return partial results
+        if tri is None or cutedsl_o is None:
+            print("\n" + "="*60)
+            print("Partial Results (one implementation failed)")
+            print("="*60)
+            if tri is None:
+                print(f"✗ Triton (FLA) failed: {triton_error}")
+                print(f"✓ CuteDSL succeeded: {cutedsl_elapsed*1000/iterations:.3f} ms/iter")
+            else:
+                print(f"✓ Triton (FLA) succeeded: {triton_elapsed*1000/iterations:.3f} ms/iter")
+                print(f"✗ CuteDSL failed: {cutedsl_error}")
+            print("="*60 + "\n")
+            
+            return {
+                'max_diff': float('nan'),
+                'mean_diff': float('nan'),
+                'rel_error': float('nan'),
+                'triton_time': triton_elapsed * 1000 / iterations if triton_elapsed else float('nan'),
+                'cutedsl_time': cutedsl_elapsed * 1000 / iterations if cutedsl_elapsed else float('nan'),
+                'speedup': float('nan'),
+                'triton_error': triton_error,
+                'cutedsl_error': cutedsl_error,
+            }
+
+        # Compare outputs (both succeeded)
         print("\n" + "="*60)
         print("Numerical Comparison")
         print("="*60)
@@ -249,6 +325,8 @@ def benchmark_lightning_attn(
             'triton_time': triton_elapsed * 1000 / iterations,
             'cutedsl_time': cutedsl_elapsed * 1000 / iterations,
             'speedup': speedup,
+            'triton_error': None,
+            'cutedsl_error': None,
         }
 
 
@@ -261,9 +339,9 @@ def run_benchmark_suite():
     import numpy as np
     
     # Test configurations
-    batch_sizes = [2, 8, 16, 64]
-    num_heads_list = [64, 128]
-    seq_len = 4096
+    batch_sizes = [2, 8, 16]  # Removed 64 to avoid CUDA context corruption
+    num_heads_list = [64, 128]  # Test H=64 and H=128
+    seq_lens = [4096, 32768, 65536]  # Test 4K, 32K, and 64K sequence lengths
     head_dim = 128
     layer_idx = 12
     num_layers = 24
@@ -275,26 +353,35 @@ def run_benchmark_suite():
     print("\n" + "="*80)
     print("Running Comprehensive Benchmark Suite")
     print("="*80)
-    print(f"Configurations to test: {len(batch_sizes) * len(num_heads_list)}")
     print(f"Batch sizes: {batch_sizes}")
     print(f"Num heads: {num_heads_list}")
-    print(f"Seq len: {seq_len}, Head dim: {head_dim}")
+    print(f"Seq lens: {seq_lens}, Head dim: {head_dim}")
     print(f"Layer: {layer_idx}/{num_layers}, Iterations: {iterations}")
     print("="*80 + "\n")
     
     for B in batch_sizes:
-        for H in num_heads_list:
-            config_name = f"B={B}, H={H}"
-            configs.append(config_name)
-            
-            print(f"\n{'='*60}")
-            print(f"Testing configuration: {config_name}")
-            print(f"{'='*60}")
-            
-            try:
+        for T in seq_lens:
+            for H in num_heads_list:
+                # Skip configurations that cause int32 overflow
+                # B*T*H*D must be < 2^31 (2,147,483,648) for signed int32
+                # B=16, T=32768: 16*32768*64*128 = 4,294,967,296 > 2^32 (overflow!)
+                total_elements = B * T * H * head_dim
+                if total_elements > 2_147_483_648:  # 2^31
+                    print(f"\n{'='*60}")
+                    print(f"Skipping B={B}, T={T}, H={H} (int32 overflow: {total_elements:,} > 2^31)")
+                    print(f"{'='*60}\n")
+                    continue
+                
+                config_name = f"B={B}, T={T}, H={H}"
+                configs.append(config_name)
+                
+                print(f"\n{'='*60}")
+                print(f"Testing configuration: {config_name}")
+                print(f"{'='*60}")
+                
                 result = benchmark_lightning_attn(
                     B=B,
-                    T=seq_len,
+                    T=T,
                     H=H,
                     D=head_dim,
                     scale=1.0,
@@ -304,27 +391,14 @@ def run_benchmark_suite():
                     iterations=iterations,
                 )
                 results.append(result)
-            except Exception as e:
-                print(f"\n✗ Configuration {config_name} failed with error: {e}")
-                print("Skipping this configuration and continuing...\n")
-                # Add placeholder result
-                results.append({
-                    'max_diff': float('nan'),
-                    'mean_diff': float('nan'),
-                    'rel_error': float('nan'),
-                    'triton_time': float('nan'),
-                    'cutedsl_time': float('nan'),
-                    'speedup': float('nan'),
-                })
-                continue
     
     # Plot results
-    plot_benchmark_results(configs, results, batch_sizes, num_heads_list)
+    plot_benchmark_results(configs, results, batch_sizes, num_heads_list, seq_lens)
     
     return results
 
 
-def plot_benchmark_results(configs, results, batch_sizes, num_heads_list):
+def plot_benchmark_results(configs, results, batch_sizes, num_heads_list, seq_lens):
     """
     Create visualization of benchmark results.
     """
@@ -409,23 +483,36 @@ def plot_benchmark_results(configs, results, batch_sizes, num_heads_list):
         ax5.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{val:.2f}x',
                 ha='center', va='bottom', fontsize=8)
     
-    # Plot 6: Grouped comparison by batch size and heads
+    # Plot 6: Grouped comparison by batch size and sequence length
     ax6 = axes[1, 2]
     
-    # Reshape data by batch size and num heads
+    # Build speedup matrix with actual data (handle skipped configs)
     n_batch = len(batch_sizes)
-    n_heads = len(num_heads_list)
-    speedup_matrix = np.array(speedups).reshape(n_batch, n_heads)
+    n_seqlen = len(seq_lens)
+    speedup_matrix = np.full((n_batch, n_seqlen), np.nan)
+    
+    # Fill matrix with available results
+    for config, result in zip(configs, results):
+        # Parse config string like "B=16, T=32768, H=64"
+        parts = config.split(', ')
+        B_val = int(parts[0].split('=')[1])
+        T_val = int(parts[1].split('=')[1])
+        
+        b_idx = batch_sizes.index(B_val)
+        t_idx = seq_lens.index(T_val)
+        speedup_matrix[b_idx, t_idx] = result['speedup']
     
     x_pos = np.arange(n_batch)
     width = 0.35
     
-    for i, H in enumerate(num_heads_list):
-        offset = (i - n_heads/2 + 0.5) * width
-        ax6.bar(x_pos + offset, speedup_matrix[:, i], width, label=f'H={H}')
+    for i, T in enumerate(seq_lens):
+        offset = (i - n_seqlen/2 + 0.5) * width
+        # Only plot non-NaN values
+        data = speedup_matrix[:, i]
+        ax6.bar(x_pos + offset, np.nan_to_num(data), width, label=f'T={T}')
     
     ax6.set_ylabel('Speedup (Triton/CuteDSL)', fontsize=10)
-    ax6.set_title('Speedup by Batch Size and Heads', fontsize=12, fontweight='bold')
+    ax6.set_title('Speedup by Batch Size and Seq Length', fontsize=12, fontweight='bold')
     ax6.set_xlabel('Batch Size', fontsize=10)
     ax6.set_xticks(x_pos)
     ax6.set_xticklabels([f'B={b}' for b in batch_sizes], fontsize=9)
@@ -443,20 +530,29 @@ def plot_benchmark_results(configs, results, batch_sizes, num_heads_list):
     print(f"{'='*60}\n")
     
     # Print summary table
-    print("\n" + "="*100)
+    print("\n" + "="*110)
     print("BENCHMARK SUMMARY TABLE")
-    print("="*100)
-    print(f"{'Config':<15} {'Max Diff':>12} {'Mean Diff':>12} {'Rel Err %':>10} "
+    print("="*110)
+    print(f"{'Config':<25} {'Max Diff':>12} {'Mean Diff':>12} {'Rel Err %':>10} "
           f"{'Triton(ms)':>12} {'CuteDSL(ms)':>12} {'Speedup':>10}")
-    print("-"*100)
+    print("-"*110)
     for cfg, res in zip(configs, results):
         if np.isnan(res['speedup']):
-            print(f"{cfg:<15} {'FAILED':>12} {'FAILED':>12} {'FAILED':>10} "
-                  f"{'FAILED':>12} {'FAILED':>12} {'FAILED':>10}")
+            # Check which implementation failed
+            error_msg = ""
+            if res.get('triton_error') and res.get('cutedsl_error'):
+                error_msg = f"BOTH FAILED (T: {res['triton_error'][:30]}..., C: {res['cutedsl_error'][:30]}...)"
+            elif res.get('triton_error'):
+                error_msg = f"Triton FAILED: {res['triton_error'][:60]}..."
+            elif res.get('cutedsl_error'):
+                error_msg = f"CuteDSL FAILED: {res['cutedsl_error'][:60]}..."
+            else:
+                error_msg = "FAILED"
+            print(f"{cfg:<25} {error_msg}")
         else:
-            print(f"{cfg:<15} {res['max_diff']:>12.2f} {res['mean_diff']:>12.4f} {res['rel_error']*100:>9.2f}% "
+            print(f"{cfg:<25} {res['max_diff']:>12.2f} {res['mean_diff']:>12.4f} {res['rel_error']*100:>9.2f}% "
                   f"{res['triton_time']:>12.3f} {res['cutedsl_time']:>12.3f} {res['speedup']:>9.2f}x")
-    print("="*100 + "\n")
+    print("="*110 + "\n")
     
     # Calculate and print averages (excluding failed tests)
     valid_speedups = [s for s in speedups if not np.isnan(s)]

@@ -169,6 +169,7 @@ class LinearAttentionChunkwiseDecay:
         tiled_mma_sq,
         tile_shape_mnk_sq,
         acc_stages,
+        kv_stages=1,
     ):
         """Compute TMEM offsets for various tensors used in the kernel."""
         SM100_TMEM_CAPACITY_COLS = 512
@@ -197,15 +198,15 @@ class LinearAttentionChunkwiseDecay:
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"tCtAccPV_fake={tCtAccPV_fake}, num_pv_acc_cols={num_pv_acc_cols}")
 
-        # No stage for linear state.
+        # KV state with configurable stages for pipeline optimization
         acc_shape_kv = tiled_mma_kv.partition_shape_C(tile_shape_mnk_kv[:2])
         tCtAccKV_fake = tiled_mma_kv.make_fragment_C(
-            cute.append(acc_shape_kv, 1)
+            cute.append(acc_shape_kv, kv_stages)
         )
         num_kv_acc_cols = tcgen05.find_tmem_tensor_col_offset(tCtAccKV_fake)
-        # Cannot reuse KV since we need to accumulate KV in FP32.
-        # We setup a separated tmem space for KV16 as operand A for mma.
-        num_kv16_acc_cols = num_kv_acc_cols // 2  # BF16 has half columns
+        # KV16 needs separate allocation (cannot trivially reuse KV due to layout differences)
+        # BF16 has half columns of FP32
+        num_kv16_acc_cols = num_kv_acc_cols // 2
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"tCtAccKV_fake={tCtAccKV_fake}, num_kv_acc_cols={num_kv_acc_cols}, num_kv16_acc_cols={num_kv16_acc_cols}")
 
@@ -230,6 +231,23 @@ class LinearAttentionChunkwiseDecay:
         while num_tmem_cols_total < num_tmem_cols_total_tmp:
             num_tmem_cols_total *= 2
         assert num_tmem_cols_total <= SM100_TMEM_CAPACITY_COLS
+
+        # Always print TMEM allocation details for capacity analysis
+        print("="*80)
+        print("TMEM Allocation Details:")
+        print(f"  QK acc:      {num_qk_acc_cols:4d} cols @ offset {num_qk_acc_cols_offset:4d} (stages={acc_stages})")
+        print(f"  PV acc:      {num_pv_acc_cols:4d} cols @ offset {num_pv_acc_cols_offset:4d} (stages={acc_stages})")
+        print(f"  KV acc:      {num_kv_acc_cols:4d} cols @ offset {num_kv_acc_cols_offset:4d} (stages={kv_stages})")
+        print(f"  KV16:        {num_kv16_acc_cols:4d} cols @ offset {num_kv16_acc_cols_offset:4d} (stages={kv_stages})")
+        print(f"  SQ acc:      {num_sq_acc_cols:4d} cols @ offset {num_qs_acc_cols_offset:4d} (stages=1)")
+        print(f"  ---")
+        print(f"  Total (raw): {num_tmem_cols_total_tmp:4d} cols")
+        print(f"  Total (pow2):{num_tmem_cols_total:4d} cols")
+        print(f"  Capacity:    {SM100_TMEM_CAPACITY_COLS:4d} cols")
+        print(f"  Usage:       {num_tmem_cols_total/SM100_TMEM_CAPACITY_COLS*100:5.1f}%")
+        print(f"  Margin:      {SM100_TMEM_CAPACITY_COLS - num_tmem_cols_total:4d} cols available")
+        print(f"  Size (KB):   {num_tmem_cols_total * BITS_PER_TMEM_COL / 8 / 1024:.1f} KB / {SM100_TMEM_CAPACITY_COLS * BITS_PER_TMEM_COL / 8 / 1024:.1f} KB")
+        print("="*80)
 
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"num_qk_acc_cols_offset: {num_qk_acc_cols_offset}")
@@ -258,6 +276,7 @@ class LinearAttentionChunkwiseDecay:
         self.acc_stage = 2
         self.o_inter_stage = 1
         self.o_intra_stage = 2
+        self.kv_stage = 1  # Keep at 1 for now - KV16 reuse needs careful layout handling
 
     def _compute_grid(
         self,
@@ -428,6 +447,7 @@ class LinearAttentionChunkwiseDecay:
             self.sq_mma_tiler,
             # Try double buffer
             self.acc_stage,
+            self.kv_stage,
         )
 
         cluster_layout_vmnk = cute.tiled_divide(
@@ -631,11 +651,6 @@ class LinearAttentionChunkwiseDecay:
                 cute.struct.MemRange[self.v_dtype, cute.cosize(p_smem_layout_staged)], # type: ignore
                 self.buffer_align_bytes,
             ]
-            # DEBUG: TODO: drop me
-            sKV: cute.struct.Align[
-                cute.struct.MemRange[self.v_dtype, cute.cosize(state_tmem_layout_staged)], # type: ignore
-                self.buffer_align_bytes,
-            ]
 
         self.shared_storage = SharedStorage        
         print(f"size of storage: {SharedStorage.__sizeof__()}")
@@ -772,7 +787,7 @@ class LinearAttentionChunkwiseDecay:
         ).make_participants()
         # Notify cuda core to convert 32-bit accumulator to 16-bit
         kv_producer, kv_consumer = pipeline.PipelineUmmaAsync.create(
-            num_stages=1,
+            num_stages=self.kv_stage,  # Keep configurable for future optimization
             producer_group=make_thread_cooperative_group(len([self.mma_warp_id]),),
             consumer_group=make_thread_cooperative_group(
                 self.threads_per_warp * len(self.cuda_warp_ids)
@@ -781,7 +796,7 @@ class LinearAttentionChunkwiseDecay:
         ).make_participants()
         # Notify mma warp that 16bit state is ready for mma as operand A
         kv16_producer, kv16_consumer = pipeline.PipelineUmmaAsync.create(
-            num_stages=1,
+            num_stages=self.kv_stage,  # Keep configurable for future optimization
             producer_group=make_thread_cooperative_group(len(self.cuda_warp_ids),),
             consumer_group=make_thread_cooperative_group(
                 self.threads_per_warp * len([self.mma_warp_id])
@@ -982,7 +997,7 @@ class LinearAttentionChunkwiseDecay:
             sV,
             sK_kv,
             tmem_ptr_base + self.tmem_kv_cols_offset,
-            1, # NOTE: no stage for state accum
+            self.kv_stage,  # Configurable for pipeline optimization
         )
 
         # Make fragments/tmem for SQ MMA.
