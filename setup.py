@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-from datetime import datetime
 import subprocess
 
 from setuptools import setup, find_packages
@@ -100,18 +99,12 @@ ext_modules.append(
     )
 )
 
-try:
-    cmd = ["git", "rev-parse", "--short", "HEAD"]
-    rev = "+" + subprocess.check_output(cmd).decode("ascii").rstrip()
-except Exception as _:
-    now = datetime.now()
-    date_time_str = now.strftime("%Y-%m-%d-%H-%M-%S")
-    rev = "+" + date_time_str
-
-
 setup(
     name="flashla",
-    version="0.1.0" + rev,
+    use_scm_version={
+        "write_to": "flashla/_version.py",
+        "local_scheme": "node-and-date",
+    },
     packages=find_packages(include=["flashla"]),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

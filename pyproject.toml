@@ -1,0 +1,26 @@
+
+[build-system]
+requires = ["setuptools>=61", "wheel", "setuptools_scm>=6.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashla"
+dynamic = ["version"]
+description = "FlashLA CUDA extension"
+readme = "README.md"
+authors = [ { name = "flashla contributors" } ]
+requires-python = ">=3.8"
+dependencies = []
+license = { text = "MIT" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flashla"]
+
+[tool.setuptools_scm]
+# write generated version into package for runtime access
+write_to = "flashla/_version.py"
+# add a date-based local suffix when needed
+local_scheme = "node-and-date"
+# fallback for non-git sources
+fallback_version = "0.1.0"
