@@ -10,3 +10,5 @@ compile_commands.json
 .cache
 /dev
 debug.log
+deprecated
+
