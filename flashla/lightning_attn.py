@@ -232,30 +232,24 @@ class LinearAttentionChunkwiseDecay:
             num_tmem_cols_total *= 2
         assert num_tmem_cols_total <= SM100_TMEM_CAPACITY_COLS
 
-        # Always print TMEM allocation details for capacity analysis
-        print("="*80)
-        print("TMEM Allocation Details:")
-        print(f"  QK acc:      {num_qk_acc_cols:4d} cols @ offset {num_qk_acc_cols_offset:4d} (stages={acc_stages})")
-        print(f"  PV acc:      {num_pv_acc_cols:4d} cols @ offset {num_pv_acc_cols_offset:4d} (stages={acc_stages})")
-        print(f"  KV acc:      {num_kv_acc_cols:4d} cols @ offset {num_kv_acc_cols_offset:4d} (stages={kv_stages})")
-        print(f"  KV16:        {num_kv16_acc_cols:4d} cols @ offset {num_kv16_acc_cols_offset:4d} (stages={kv_stages})")
-        print(f"  SQ acc:      {num_sq_acc_cols:4d} cols @ offset {num_qs_acc_cols_offset:4d} (stages=1)")
-        print(f"  ---")
-        print(f"  Total (raw): {num_tmem_cols_total_tmp:4d} cols")
-        print(f"  Total (pow2):{num_tmem_cols_total:4d} cols")
-        print(f"  Capacity:    {SM100_TMEM_CAPACITY_COLS:4d} cols")
-        print(f"  Usage:       {num_tmem_cols_total/SM100_TMEM_CAPACITY_COLS*100:5.1f}%")
-        print(f"  Margin:      {SM100_TMEM_CAPACITY_COLS - num_tmem_cols_total:4d} cols available")
-        print(f"  Size (KB):   {num_tmem_cols_total * BITS_PER_TMEM_COL / 8 / 1024:.1f} KB / {SM100_TMEM_CAPACITY_COLS * BITS_PER_TMEM_COL / 8 / 1024:.1f} KB")
-        print("="*80)
 
         if cutlass.const_expr(PRINT_DEBUG):
-            print(f"num_qk_acc_cols_offset: {num_qk_acc_cols_offset}")
-            print(f"num_pv_acc_cols_offset: {num_pv_acc_cols_offset}")
-            print(f"num_kv_acc_cols_offset: {num_kv_acc_cols_offset}")
-            print(f"num_kv16_acc_cols_offset: {num_kv16_acc_cols_offset}")
-            print(f"num_qs_acc_cols_offset: {num_qs_acc_cols_offset}")
-            print(f"num_tmem_cols_total: {num_tmem_cols_total}")
+            # Always print TMEM allocation details for capacity analysis
+            print("="*80)
+            print("TMEM Allocation Details:")
+            print(f"  QK acc:      {num_qk_acc_cols:4d} cols @ offset {num_qk_acc_cols_offset:4d} (stages={acc_stages})")
+            print(f"  PV acc:      {num_pv_acc_cols:4d} cols @ offset {num_pv_acc_cols_offset:4d} (stages={acc_stages})")
+            print(f"  KV acc:      {num_kv_acc_cols:4d} cols @ offset {num_kv_acc_cols_offset:4d} (stages={kv_stages})")
+            print(f"  KV16:        {num_kv16_acc_cols:4d} cols @ offset {num_kv16_acc_cols_offset:4d} (stages={kv_stages})")
+            print(f"  SQ acc:      {num_sq_acc_cols:4d} cols @ offset {num_qs_acc_cols_offset:4d} (stages=1)")
+            print(f"  ---")
+            print(f"  Total (raw): {num_tmem_cols_total_tmp:4d} cols")
+            print(f"  Total (pow2):{num_tmem_cols_total:4d} cols")
+            print(f"  Capacity:    {SM100_TMEM_CAPACITY_COLS:4d} cols")
+            print(f"  Usage:       {num_tmem_cols_total/SM100_TMEM_CAPACITY_COLS*100:5.1f}%")
+            print(f"  Margin:      {SM100_TMEM_CAPACITY_COLS - num_tmem_cols_total:4d} cols available")
+            print(f"  Size (KB):   {num_tmem_cols_total * BITS_PER_TMEM_COL / 8 / 1024:.1f} KB / {SM100_TMEM_CAPACITY_COLS * BITS_PER_TMEM_COL / 8 / 1024:.1f} KB")
+            print("="*80)
 
         return (
             num_qk_acc_cols_offset,
@@ -653,14 +647,14 @@ class LinearAttentionChunkwiseDecay:
             ]
 
         self.shared_storage = SharedStorage        
-        print(f"size of storage: {SharedStorage.__sizeof__()}")
+        # print(f"size of storage: {SharedStorage.__sizeof__()}")
 
         self.grid = self._compute_grid(
             # (D, S, (H, B))
             o_shape=cute.shape(o),
             chunk_size=self.chunk_size,
         )
-        print(f"grid: {self.grid}")
+        # print(f"grid: {self.grid}")
 
         self.kernel(
             qk_tiled_mma,
@@ -1190,11 +1184,36 @@ class LinearAttentionChunkwiseDecay:
                 s0_handle.commit()
                 # End of GEMM (Qi, Ki) -> S0i
 
-                # Wait for PV, produce ointra
+                ####################################################
+                # OPTIMIZATION A+B: Move KV GEMM before VP to parallelize with decay mask
+                # Also apply block decay directly in MMA warp to avoid extra TMEM round-trip
+                ####################################################
+                
+                # Wait for V, then execute KV GEMM (moved earlier)
                 v_handle = load_v_consumer.wait_and_advance()
+                kv_handle = kv_producer.acquire_and_advance()
+                
+                # Execute KV GEMM: State = K^T @ V
+                # NOTE: Always ACC to avoid adding in cuda core.
+                kv_tiled_mma = self.exec_mma(
+                    tiled_mma=kv_tiled_mma,
+                    tCtAcc=tCtAccKV,
+                    tCrA=tCrV,
+                    tCrB=tCrK_kv,
+                    a_stage_idx=v_handle.index,
+                    b_stage_idx=k_handle.index,
+                    acc_stage_idx=0,
+                    always_acc=True if idx != 0 else False,
+                )
+                kv_handle.commit()
+                k_handle.release()
+                
+                # Now wait for P and execute VP GEMM
+                # By this time, KV GEMM has completed in parallel with decay mask computation
                 p_handle = p_consumer.wait_and_advance()
                 o_intra_handle = o_intra_producer.acquire_and_advance()
-                # both v and p are in smem
+                
+                # VP GEMM: O_intra = P @ V
                 vp_tiled_mma = self.exec_mma(
                     tiled_mma=vp_tiled_mma,
                     tCtAcc=tCtAccPV,
@@ -1206,28 +1225,9 @@ class LinearAttentionChunkwiseDecay:
                 )
                 p_handle.release()
                 o_intra_handle.commit()
-
-                ####################################################
-                # Note: Block-level decay to KV state will be applied in CUDA warps
-                # after loading from TMEM to registers (see cuda_kv_process)
                 
-                kv_handle = kv_producer.acquire_and_advance()
-                # NOTE: Always ACC to avoid adding in cuda core.
-                kv_tiled_mma = self.exec_mma(
-                    tiled_mma=kv_tiled_mma,
-                    tCtAcc=tCtAccKV,
-                    tCrA=tCrV,
-                    # tCrB=tCrK,
-                    tCrB=tCrK_kv,
-                    a_stage_idx=v_handle.index,
-                    b_stage_idx=k_handle.index,
-                    acc_stage_idx=0,
-                    always_acc=True if idx != 0 else False, # always accumulate states
-                )
                 # Release K V here
-                k_handle.release()
                 v_handle.release()
-                kv_handle.commit()
 
         # ///////////////////////////////////////////////////////////////////////////////
         # CUDA CORE WARPS
@@ -1415,27 +1415,31 @@ class LinearAttentionChunkwiseDecay:
             for chunk_start in cutlass.range(0, S, C, unroll=0):
                 idx = chunk_start // C
 
-                # Convert KV to KV16 with block-level decay
-                # Optimize: minimize register usage by loading only when needed
+                ####################################################
+                # OPTIMIZATION B: Apply block decay with type conversion
+                # Load KV from TMEM, apply decay, convert to BF16, store to kv16
+                ####################################################
+                
+                # Wait for KV state and apply block-level decay
                 if idx != 0:
                     kv_handle = kv_consumer.wait_and_advance()
-                    tTR_tKVi = tTR_tKV[(None, None, None, kv_handle.index)] # kv stage == 1
+                    tTR_tKVi = tTR_tKV[(None, None, None, kv_handle.index)]
+                    
                     # Load KV state from TMEM to RMEM
                     cute.copy(tiled_copy_t2r_kv, tTR_tKVi, tTR_rKV)
                     cute.arch.fence_view_async_tmem_load()
                     kv_handle.release()
-
-                    # Apply block-level decay in registers: State *= λ^C
+                    # Apply block-level decay: State *= λ^C
                     kv_state_vec = tTR_rKV.load()
                     kv_state_vec = kv_state_vec * block_decay
-                    tTR_rKV.store(kv_state_vec)
-
-                    # Convert decayed state to BF16 and store back to TMEM
+                    
+                    # Convert to BF16 and store to kv16 region
                     kv16_handle = kv16_producer.acquire_and_advance()
                     tmem_store_rAccKVAsBF16.store(kv_state_vec.to(self.io_dtype))
                     tmem_store_tAccKVi = tmem_store_tAccKV[None, None, None, None, kv16_handle.index]
                     cute.copy(tmem_store_kv, tmem_store_rAccKV, tmem_store_tAccKVi)
                     cute.arch.fence_view_async_tmem_store()
+                    
                     kv16_handle.commit()
 
                 # Wait for S = QK^T

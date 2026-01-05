@@ -395,6 +395,9 @@ def run_benchmark_suite():
     # Plot results
     plot_benchmark_results(configs, results, batch_sizes, num_heads_list, seq_lens)
     
+    # Generate markdown report
+    generate_markdown_report(configs, results, batch_sizes, num_heads_list, seq_lens, layer_idx, num_layers, iterations)
+    
     return results
 
 
@@ -567,17 +570,168 @@ def plot_benchmark_results(configs, results, batch_sizes, num_heads_list, seq_le
     print()
 
 
+def generate_markdown_report(configs, results, batch_sizes, num_heads_list, seq_lens, layer_idx, num_layers, iterations):
+    """
+    Generate a markdown report of benchmark results.
+    """
+    from datetime import datetime
+    import numpy as np
+    
+    # Generate report filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = f'benchmark_report_{timestamp}.md'
+    
+    with open(report_path, 'w') as f:
+        # Header
+        f.write("# Lightning Attention Benchmark Report\n\n")
+        f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        # Configuration
+        f.write("## Test Configuration\n\n")
+        f.write(f"- **Batch Sizes:** {batch_sizes}\n")
+        f.write(f"- **Number of Heads:** {num_heads_list}\n")
+        f.write(f"- **Sequence Lengths:** {seq_lens}\n")
+        f.write(f"- **Head Dimension:** 128\n")
+        f.write(f"- **Layer:** {layer_idx}/{num_layers}\n")
+        f.write(f"- **Iterations:** {iterations}\n")
+        f.write(f"- **Data Type:** BFloat16 (I/O), Float32 (Accumulation)\n\n")
+        
+        # Summary statistics
+        valid_speedups = [r['speedup'] for r in results if not np.isnan(r['speedup'])]
+        valid_rel_errors = [r['rel_error'] for r in results if not np.isnan(r['rel_error'])]
+        
+        f.write("## Summary\n\n")
+        if valid_speedups:
+            avg_speedup = np.mean(valid_speedups)
+            min_speedup = np.min(valid_speedups)
+            max_speedup = np.max(valid_speedups)
+            avg_rel_error = np.mean(valid_rel_errors) * 100
+            
+            f.write(f"- **Average Speedup:** {avg_speedup:.2f}x\n")
+            f.write(f"- **Speedup Range:** {min_speedup:.2f}x - {max_speedup:.2f}x\n")
+            f.write(f"- **Average Relative Error:** {avg_rel_error:.2f}%\n")
+            f.write(f"- **Successful Tests:** {len(valid_speedups)}/{len(results)}\n")
+            f.write(f"- **Failed Tests:** {len(results) - len(valid_speedups)}\n\n")
+        else:
+            f.write("⚠️ **No successful tests to report.**\n\n")
+        
+        # Detailed results table
+        f.write("## Detailed Results\n\n")
+        f.write("| Configuration | Max Diff | Mean Diff | Rel Error (%) | Triton (ms) | CuteDSL (ms) | Speedup | Status |\n")
+        f.write("|--------------|----------|-----------|---------------|-------------|--------------|---------|--------|\n")
+        
+        for cfg, res in zip(configs, results):
+            if np.isnan(res['speedup']):
+                # Failed test
+                status = "❌"
+                if res.get('triton_error') and res.get('cutedsl_error'):
+                    status += " Both Failed"
+                elif res.get('triton_error'):
+                    status += " Triton Failed"
+                elif res.get('cutedsl_error'):
+                    status += " CuteDSL Failed"
+                else:
+                    status += " Failed"
+                f.write(f"| {cfg} | - | - | - | - | - | - | {status} |\n")
+            else:
+                # Successful test
+                status = "✅"
+                if res['rel_error'] > 0.03:  # > 3% tolerance
+                    status += " ⚠️ High Error"
+                f.write(f"| {cfg} | {res['max_diff']:.2f} | {res['mean_diff']:.4f} | {res['rel_error']*100:.2f}% | "
+                       f"{res['triton_time']:.3f} | {res['cutedsl_time']:.3f} | {res['speedup']:.2f}x | {status} |\n")
+        
+        f.write("\n")
+        
+        # Performance analysis by configuration
+        f.write("## Performance Analysis\n\n")
+        
+        # Group by batch size
+        f.write("### Performance by Batch Size\n\n")
+        f.write("| Batch Size | Avg Speedup | Avg Triton (ms) | Avg CuteDSL (ms) |\n")
+        f.write("|------------|-------------|-----------------|------------------|\n")
+        
+        for B in batch_sizes:
+            batch_results = [r for cfg, r in zip(configs, results) if f"B={B}" in cfg and not np.isnan(r['speedup'])]
+            if batch_results:
+                avg_speedup = np.mean([r['speedup'] for r in batch_results])
+                avg_triton = np.mean([r['triton_time'] for r in batch_results])
+                avg_cutedsl = np.mean([r['cutedsl_time'] for r in batch_results])
+                f.write(f"| {B} | {avg_speedup:.2f}x | {avg_triton:.3f} | {avg_cutedsl:.3f} |\n")
+            else:
+                f.write(f"| {B} | - | - | - |\n")
+        
+        f.write("\n")
+        
+        # Group by sequence length
+        f.write("### Performance by Sequence Length\n\n")
+        f.write("| Sequence Length | Avg Speedup | Avg Triton (ms) | Avg CuteDSL (ms) |\n")
+        f.write("|-----------------|-------------|-----------------|------------------|\n")
+        
+        for T in seq_lens:
+            seq_results = [r for cfg, r in zip(configs, results) if f"T={T}" in cfg and not np.isnan(r['speedup'])]
+            if seq_results:
+                avg_speedup = np.mean([r['speedup'] for r in seq_results])
+                avg_triton = np.mean([r['triton_time'] for r in seq_results])
+                avg_cutedsl = np.mean([r['cutedsl_time'] for r in seq_results])
+                f.write(f"| {T} | {avg_speedup:.2f}x | {avg_triton:.3f} | {avg_cutedsl:.3f} |\n")
+            else:
+                f.write(f"| {T} | - | - | - |\n")
+        
+        f.write("\n")
+        
+        # Group by number of heads
+        f.write("### Performance by Number of Heads\n\n")
+        f.write("| Num Heads | Avg Speedup | Avg Triton (ms) | Avg CuteDSL (ms) |\n")
+        f.write("|-----------|-------------|-----------------|------------------|\n")
+        
+        for H in num_heads_list:
+            head_results = [r for cfg, r in zip(configs, results) if f"H={H}" in cfg and not np.isnan(r['speedup'])]
+            if head_results:
+                avg_speedup = np.mean([r['speedup'] for r in head_results])
+                avg_triton = np.mean([r['triton_time'] for r in head_results])
+                avg_cutedsl = np.mean([r['cutedsl_time'] for r in head_results])
+                f.write(f"| {H} | {avg_speedup:.2f}x | {avg_triton:.3f} | {avg_cutedsl:.3f} |\n")
+            else:
+                f.write(f"| {H} | - | - | - |\n")
+        
+        f.write("\n")
+        
+        # Accuracy analysis
+        f.write("## Accuracy Analysis\n\n")
+        f.write("### Error Distribution\n\n")
+        
+        if valid_rel_errors:
+            f.write(f"- **Mean Relative Error:** {np.mean(valid_rel_errors)*100:.2f}%\n")
+            f.write(f"- **Median Relative Error:** {np.median(valid_rel_errors)*100:.2f}%\n")
+            f.write(f"- **Min Relative Error:** {np.min(valid_rel_errors)*100:.2f}%\n")
+            f.write(f"- **Max Relative Error:** {np.max(valid_rel_errors)*100:.2f}%\n")
+            f.write(f"- **Tests within 3% tolerance:** {sum(1 for e in valid_rel_errors if e <= 0.03)}/{len(valid_rel_errors)}\n\n")
+        
+        # Failure analysis
+        failed_tests = [cfg for cfg, r in zip(configs, results) if np.isnan(r['speedup'])]
+        if failed_tests:
+            f.write("## Failed Tests\n\n")
+            for cfg in failed_tests:
+                idx = configs.index(cfg)
+                res = results[idx]
+                f.write(f"### {cfg}\n\n")
+                if res.get('triton_error'):
+                    f.write(f"**Triton Error:** `{res['triton_error']}`\n\n")
+                if res.get('cutedsl_error'):
+                    f.write(f"**CuteDSL Error:** `{res['cutedsl_error']}`\n\n")
+        
+        # Footer
+        f.write("---\n\n")
+        f.write("*Report generated by bench_lightning_attn.py*\n")
+    
+    print(f"\n{'='*60}")
+    print(f"Markdown report saved to: {report_path}")
+    print(f"{'='*60}\n")
+    
+    return report_path
+
+
 if __name__ == '__main__':
     # Run comprehensive benchmark suite
     run_benchmark_suite()
-    
-    # Optional: Test different decay values
-    # for decay_val in [0.05, 0.1, 0.2, 0.5]:
-    #     benchmark_lightning_attn(
-    #         B, T, H, D, 
-    #         scale=1., 
-    #         dtype=torch.bfloat16, 
-    #         decay_value=decay_val,
-    #         num_layers=24,
-    #         iterations=10
-    #     )
