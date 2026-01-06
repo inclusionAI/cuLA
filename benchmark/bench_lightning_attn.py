@@ -340,8 +340,8 @@ def run_benchmark_suite():
     
     # Test configurations
     batch_sizes = [2, 8, 16]  # Removed 64 to avoid CUDA context corruption
-    num_heads_list = [64, 128]  # Test H=64 and H=128
-    seq_lens = [4096, 32768, 65536]  # Test 4K, 32K, and 64K sequence lengths
+    num_heads_list = [16, 64]  # Test H=16 and H=64
+    seq_lens = [128, 512, 1024, 2048, 4096, 8192]  # Test short to long sequence lengths
     head_dim = 128
     layer_idx = 12
     num_layers = 24
@@ -577,9 +577,8 @@ def generate_markdown_report(configs, results, batch_sizes, num_heads_list, seq_
     from datetime import datetime
     import numpy as np
     
-    # Generate report filename with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = f'benchmark_report_{timestamp}.md'
+    # Fixed report filename
+    report_path = 'benchmark_report.md'
     
     with open(report_path, 'w') as f:
         # Header
