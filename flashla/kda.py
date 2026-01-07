@@ -74,7 +74,7 @@ import cutlass.cute.testing as testing
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64, Float32
 
-PRINT_DEBUG=True
+PRINT_DEBUG=False
 
 class Constant:
     """Common constants used in KDA implementation."""
@@ -154,6 +154,9 @@ class KDAChunkwise:
         # self.empty_warp_id = 7
 
         self.threads_per_warp = 32
+        self.cuda_core_threads = self.threads_per_warp * (
+            len(self.cuda_warp_ids)
+        )
         self.threads_per_cta = self.threads_per_warp * len(
             (
                 *self.cuda_warp_ids,
@@ -166,6 +169,11 @@ class KDAChunkwise:
         self.tmem_dealloc_sync_barrier = pipeline.NamedBarrier(
             barrier_id=2,
             num_threads=self.threads_per_cta,
+        )
+
+        self.cuda_wg_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=3,
+            num_threads=self.cuda_core_threads,
         )
 
         self.buffer_align_bytes = 1024
@@ -271,7 +279,7 @@ class KDAChunkwise:
         self.k_stage = 2
         self.v_stage = 2
         self.o_stage = 2
-        self.g_stage = 1  # Single stage for g (CUDA warp processes immediately)
+        self.g_stage = 2  # Single stage for g (CUDA warp processes immediately)
 
         self.epi_stage = 2
         self.acc_stage = 2
@@ -655,7 +663,10 @@ class KDAChunkwise:
             # Pipeline barriers
             # Inputs
             load_q_mbar_ptr: cute.struct.MemRange[Int64, self.q_stage * 2] # type: ignore
+            load_q2_mbar_ptr: cute.struct.MemRange[Int64, self.q_stage * 2] # type: ignore
             load_k_mbar_ptr: cute.struct.MemRange[Int64, self.k_stage * 2] # type: ignore
+            load_k2_mbar_ptr: cute.struct.MemRange[Int64, self.k_stage * 2] # type: ignore
+            load_kt2_mbar_ptr: cute.struct.MemRange[Int64, self.k_stage * 2] # type: ignore
             load_v_mbar_ptr: cute.struct.MemRange[Int64, self.v_stage * 2] # type: ignore
             load_g_mbar_ptr: cute.struct.MemRange[Int64, self.g_stage * 2] # type: ignore  # NEW for KDA
             # KDA gating sync: CUDA warp notifies MMA warp that Q'/K' are ready
@@ -702,11 +713,6 @@ class KDAChunkwise:
             # Store QK
             sP: cute.struct.Align[
                 cute.struct.MemRange[self.v_dtype, cute.cosize(p_smem_layout_staged)], # type: ignore
-                self.buffer_align_bytes,
-            ]
-            # DEBUG: TODO: drop me
-            sKV: cute.struct.Align[
-                cute.struct.MemRange[self.v_dtype, cute.cosize(state_tmem_layout_staged)], # type: ignore
                 self.buffer_align_bytes,
             ]
 
@@ -811,12 +817,18 @@ class KDAChunkwise:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        load_q_producer, load_q_consumer = pipeline.PipelineTmaUmma.create(
+        load_q_producer, load_q_consumer = pipeline.PipelineTmaAsync.create(
             num_stages=self.q_stage,
             producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
+            consumer_group=make_thread_cooperative_group(len(self.cuda_warp_ids)),  # CUDA cores will consume
             tx_count=self.tma_copy_q_bytes,
             barrier_storage=storage.load_q_mbar_ptr.data_ptr(),
+        ).make_participants()
+        load_q2_producer, load_q2_consumer = pipeline.PipelineAsync.create(
+            num_stages=self.q_stage,
+            producer_group=make_thread_cooperative_group(32*len(self.cuda_warp_ids)),
+            consumer_group=make_thread_cooperative_group(32*len([self.mma_warp_id])),
+            barrier_storage=storage.load_q2_mbar_ptr.data_ptr(),
         ).make_participants()
         load_k_producer, load_k_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.k_stage,
@@ -824,6 +836,12 @@ class KDAChunkwise:
             consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             tx_count=self.tma_copy_k_bytes,
             barrier_storage=storage.load_k_mbar_ptr.data_ptr(),
+        ).make_participants()
+        load_k2_producer, load_k2_consumer = pipeline.PipelineAsync.create(
+            num_stages=self.k_stage,
+            producer_group=make_thread_cooperative_group(32*len(self.cuda_warp_ids)),
+            consumer_group=make_thread_cooperative_group(32*len([self.mma_warp_id])),
+            barrier_storage=storage.load_k2_mbar_ptr.data_ptr(),
         ).make_participants()
         load_v_producer, load_v_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.v_stage,
@@ -1017,9 +1035,14 @@ class KDAChunkwise:
 
         # ((64,16),1,(4,2),2):
         # ((64,1),0,(16,4096),8192)>
-        sK_flat_layout = cute.make_layout((64, 64, 2, 2), stride=(64,1,4096,8192))
+        sK_flat_layout = cute.make_layout((64, (64, 2), 2), stride=(64,(1,4096),8192))
         sK_flat = storage.sK.get_tensor(
             sK_flat_layout, swizzle=k_smem_layout_staged.inner,
+        )
+
+        sG_flat_layout_print = cute.make_layout((64, (64, 2), 2), stride=(64,(1,4096),8192))
+        sG_flat_print = storage.sG.get_tensor(
+            sG_flat_layout_print, swizzle=g_smem_layout_staged.inner,
         )
 
         # Q and K flat layout for s2r - similar to g_smem_layout_epi
@@ -1228,6 +1251,15 @@ class KDAChunkwise:
                 idx = chunk_start // C
                 should_debug = PRINT_DEBUG and tidx == warp_idx * 32 and hidx == 0 and bidx == 0
 
+                # Gi (gate/g_cumsum) - NEW for KDA
+                g_handle = load_g_producer.acquire_and_advance()
+                cute.copy(
+                    atom=tma_atom_g,
+                    src=tGgG[None, idx, 0],
+                    dst=tGsG[None, g_handle.index],
+                    tma_bar_ptr=g_handle.barrier,
+                )
+
                 # Qi
                 # SRC: ((ATOM_V, REST_V), TILES_M, TILES_K)
                 # DST: ((ATOM_V, REST_V), INPUT_STAGE)
@@ -1260,16 +1292,6 @@ class KDAChunkwise:
                     dst=tVsV[None, v_handle.index],
                     tma_bar_ptr=v_handle.barrier,
                 )
-
-                # Gi (gate/g_cumsum) - NEW for KDA
-                g_handle = load_g_producer.acquire_and_advance()
-                cute.copy(
-                    atom=tma_atom_g,
-                    src=tGgG[None, idx, 0],
-                    dst=tGsG[None, g_handle.index],
-                    tma_bar_ptr=g_handle.barrier,
-                )
-
                 if should_debug:
                     # cute.printf("tKgK={}", tKgK)
                     # cute.printf("tKgKT={}", tKgKT)
@@ -1296,11 +1318,8 @@ class KDAChunkwise:
                 idx = chunk_start // C
 
                 # Wait for Qi (TMA load complete).
-                q_handle = load_q_consumer.wait_and_advance()
+                q_handle = load_q2_consumer.wait_and_advance()
 
-                # Wait for Ki (TMA load complete).
-                k_handle = load_k_consumer.wait_and_advance()
-                
                 # ============================================================
                 # KDA: Wait for CUDA warp to complete Q'/K' gating
                 # After this, Q and K in SMEM are gated versions (Q' and K')
@@ -1326,6 +1345,9 @@ class KDAChunkwise:
                     o_inter_handle.commit()
                     kv16_handle.release()
 
+                # Wait for Ki (TMA load complete).
+                k_handle = load_k2_consumer.wait_and_advance()
+                
                 # Acquire empty S0 buffer
                 s0_handle = mma_s0_producer.acquire_and_advance()
                 # GEMM
@@ -1598,6 +1620,17 @@ class KDAChunkwise:
 
             should_debug = PRINT_DEBUG and tidx == self.cuda_warp_ids[0]*32 and hidx == 0 and bidx == 0
 
+            # -------------- DEBUG -------------
+            # if tidx == 0:
+            #     cute.printf("-------------------- sG_flat raw:")
+            #     cute.print_tensor(sG_flat)
+            #     cute.printf("-------------------- sQ_flat raw:")
+            #     cute.print_tensor(sQ_flat)
+            #     cute.printf("-------------------- sK_flat raw:")
+            #     cute.print_tensor(sK_flat)
+            # # Note: add barrier here to make sure print make sense since we'll overwrite sG
+            # self.cuda_wg_sync_barrier.arrive_and_wait()
+
             for chunk_start in cutlass.range(0, S, C, unroll=0):
                 idx = chunk_start // C
 
@@ -1617,13 +1650,13 @@ class KDAChunkwise:
                 )
 
                 # Load Q from SMEM to RMEM for KDA elementwise processing
-                # NOTE: Q and K are loaded by load warp using the same stage index pattern
-                # We use (idx % q_stage) to match the stage used by load warp
-                q_stage_idx = idx % self.q_stage
+                q_handle = load_q_consumer.wait_and_advance()
+                q_stage_idx = q_handle.index
                 cute.copy(tiled_s2r_q, tRS_sQ[(None, None, None, q_stage_idx)], tRS_rQ)
                 
                 # Load K from SMEM to RMEM for KDA elementwise processing
-                k_stage_idx = idx % self.k_stage
+                k_handle = load_k_consumer.wait_and_advance()
+                k_stage_idx = k_handle.index
                 cute.copy(tiled_s2r_k, tRS_sK[(None, None, None, k_stage_idx)], tRS_rK)
                 
                 # Fence for shared memory reads
@@ -1631,6 +1664,10 @@ class KDAChunkwise:
                     cute.arch.ProxyKind.async_shared,
                     space=cute.arch.SharedSpace.shared_cta,
                 )
+
+                g_handle.release()
+                q_handle.release()
+                k_handle.release()
                 
                 # ============================================================
                 # KDA Step 2: Compute exp(g) and apply to Q, K
@@ -1644,6 +1681,7 @@ class KDAChunkwise:
                 # Total 64 elements per thread (8 * 8 = 64)
                 
                 # Load g, Q, K values and compute gated values
+                # TODO: reorder to reduce register peak
                 g_val = tRS_rG.load()  # BF16 tensor
                 q_val = tRS_rQ.load()  # BF16 tensor
                 k_val = tRS_rK.load()  # BF16 tensor
@@ -1659,7 +1697,9 @@ class KDAChunkwise:
                 
                 # Apply gates:
                 # Q' = Q * exp(g)
-                q_gated = q_f32 * exp_g
+                # TODO: FIXME
+                # q_gated = q_f32 * exp_g
+                q_gated = exp_g
                 # K_inter = K * exp(g) - for inter-chunk KV state update
                 k_inter = k_f32 * exp_g
                 # K_intra = K * exp(-g) - for intra-chunk QK^T
@@ -1682,9 +1722,12 @@ class KDAChunkwise:
                 # - K_intra = K * exp(-g) -> SMEM[G] (overwrite g)
                 # ============================================================
                 
+                # TODO: check q2 & k2 stage equivalence
+                q2_handle = load_q2_producer.acquire_and_advance()
                 # Write Q' from RMEM to SMEM (same location as original Q)
                 cute.copy(tiled_s2r_q, tRS_rQ, tRS_sQ[(None, None, None, q_stage_idx)])
                 
+                k2_handle = load_k2_producer.acquire_and_advance()
                 # Write K_inter = K * exp(g) to SMEM[K]
                 cute.copy(tiled_s2r_k, tRS_rK_inter, tRS_sK[(None, None, None, k_stage_idx)])
                 
@@ -1697,222 +1740,26 @@ class KDAChunkwise:
                     cute.arch.ProxyKind.async_shared,
                     space=cute.arch.SharedSpace.shared_cta,
                 )
-                
-                # ============================================================
-                # KDA Step 3.5: Extract exp(-g) for last row and broadcast via shuffle
-                # 
-                # Thread layout analysis for G(C=64, D=64):
-                # - tiled_s2r_g has Tiler MN = (8, 128), meaning:
-                #   * M (rows): tiled in chunks of 8 rows
-                #   * N (cols): 128 cols per tile (but G only has D=64)
-                # - TV Layout tiled: ((16,8),8):((64,1),8)
-                #   * 128 threads arranged in (16,8) grid
-                #   * Thread (tr, tc) handles columns [tc*8 : tc*8+8]
-                #   * Thread (tr, tc) handles rows [tr, tr+16, tr+32, tr+48] for C=64
-                #
-                # G row 63 (last row):
-                # - Row 63 = thread_row 15 + 3*16 (i.e., tile_row 3 for threads in row 15)
-                # - Threads 120-127 (thread_row=15) hold row 63
-                # - In tRS_rG shape ((8,1),8,1): M-index for row 63 varies by thread
-                #
-                # For this implementation:
-                # - Each thread checks if it holds row 63 data (thread_row == 15)
-                # - Row 63 corresponds to M-tile index: 63 // 8 = 7, offset 63 % 8 = 7
-                # - We use shuffle to broadcast the last-row values within each warp
-                # ============================================================
-                
-                # Get thread's position in the thread layout
-                # local_tidx is thread index within cuda warp group [0, 128)
-                thread_row = local_tidx // 8    # 0-15
-                thread_col = local_tidx % 8     # 0-7
-                lane_id = local_tidx % 32       # lane within warp
-                warp_id_local = local_tidx // 32  # 0-3 within cuda warp group
-                
-                # ============================================================
-                # Analysis of tRS_rG layout:
-                # - Shape ((8,1), 8, 1) = (V, M, N) where V=8, M=8, N=1
-                # - Total 64 elements per thread
-                # - Stride ((1,0), 8, 0) means: V-stride=1, M-stride=8
-                # - So element at (v, m, 0) has linear index = v + 8*m
-                #
-                # For G(64, 64):
-                # - M=8 tiles, each tile has 8 rows: tile_i covers rows [8i, 8i+8)
-                # - Row 63 is in M-tile 7 (63//8=7), offset v=7 (63%8=7)
-                # - Linear index for row 63 = 7 + 8*7 = 63
-                #
-                # exp_neg_g has the same layout (it's computed from tRS_rG data)
-                # We need to extract all 64 elements of row 63 (D=64 columns)
-                # ============================================================
-                
-                # Extract exp(-g) for row 63 from this thread's registers
-                # Each thread holds 8 columns worth of data for row 63
-                # Thread with thread_col=c holds columns [8c, 8c+8) for all rows
-                #
-                # exp_neg_g is a tensor with shape matching tRS_rG
-                # To extract row 63, we need elements at (v=7, m=7, n=0) through (v=0, m=7, n=0)
-                # Actually, row 63 = M-tile 7, and all V positions [0-7] at M=7 give row 63's columns
-                # Wait no - V is the "value" dimension (vectorized load), M is row-tiles
-                # 
-                # Let me re-read: tRS_rG shape ((8,1), 8, 1)
-                # This is ((V_atom, V_rest), M, N) = ((8,1), 8, 1)
-                # V_atom = 8 means each atomic copy loads 8 consecutive elements
-                # M = 8 means 8 "M-tiles" or repetitions along M dimension
-                # 
-                # For row-major G(C=64, D=64) with Tiler (8, 128):
-                # - Each M-tile is one row (8 elements along N/D dimension)
-                # - So tRS_rG M=8 means 8 rows, each with 8 elements = 64 total
-                # - BUT this is for each thread's slice of the data!
-                
-                # The key insight: with 128 threads and G(64,64)=4096 elements:
-                # - Each thread holds 4096/128 = 32 elements on average
-                # - But tRS_rG shows 64 elements per thread
-                # - This suggests partial overlap or the layout is different
-                
-                # For now, let's just try to read row 63 data from M-tile 7
-                # and see what happens
-                
-                # exp_neg_g has the same shape, we can index it
-                
-                # ============================================================
-                # KDA Step 3.5: Extract exp(-g) for last row (row 63) to RMEM
-                # 
-                # Goal: Thread i holds exp(-g)[row63, col_i] as a scalar
-                #
-                # Current data: Each thread holds 8 values at M=7 (row 63)
-                # Thread with thread_col=tc holds columns [tc*8, tc*8+8)
-                # thread_col = local_tidx % 8 for D=64
-                #
-                # Shuffle approach:
-                # Thread i needs column i, which is at src_thread_col = i // 8, offset = i % 8
-                # We use a two-step process:
-                # 1. Each thread reads its rG_last_row_8[(local_tidx % 8)] - this gives element (local_tidx % 8)
-                # 2. Shuffle to get value from lane that has the correct thread_col
-                #
-                # Key: Lane L has thread_col = L % 8 and sends element (L % 8)
-                # Thread i needs element (i % 8) from thread_col (i // 8)
-                # So: src_lane = (i % 8) * 8 + (i // 8) ... but this might exceed 32
-                #
-                # Simpler: Thread i reads its own element (i % 8), then shuffles from
-                # lane (i // 8) to get that thread_col's data. But lane (i // 8) sends
-                # element ((i // 8) % 8), not element (i % 8).
-                #
-                # Correct solution: src_lane = (i % 8) + (row in thread_layout)
-                # where row selects which thread_col we want
-                # 
-                # For 128 threads in (16, 8) layout:
-                # - thread_col = local_tidx % 8
-                # - thread_row = local_tidx // 8 (0-15)
-                # - Lane in warp = local_tidx % 32
-                #
-                # Thread i needs column i:
-                # - src_thread_col = i // 8
-                # - src_val_offset = i % 8
-                # - src_lane = src_val_offset * 8 + src_thread_col (within warp)
-                #   This gives lane with thread_col=src_thread_col that holds element src_val_offset
-                # ============================================================
-                
-                # Extract 8-element slice at M=7 (row 63)
-                rG_last_row_8 = exp_g[(None, None), 7, 0]  # Shape: (8, 1) = 8 elements
-                
-                my_col = local_tidx  # Thread i handles column i (mod D for D<128)
-                src_thread_col = my_col // 8   # 0-7 for D=64
-                src_val_offset = my_col % 8    # 0-7
-                
-                # Read element at my position (this is what I send)
-                my_val_at_my_offset = rG_last_row_8[(src_val_offset, 0)]
-                
-                # Compute source lane: we need a lane with thread_col = src_thread_col
-                # that will send element src_val_offset
-                # Lane L has thread_col = L % 8
-                # Lane L reads and sends element (L % 8) = its thread_col
-                # So: I need lane where L % 8 == src_thread_col
-                #     AND that lane reads src_val_offset
-                # Since lane L reads element (L % 8), we need L % 8 == src_val_offset
-                # But we also need L % 8 == src_thread_col (to have the right data)
-                # This only works if src_thread_col == src_val_offset
-                #
-                # Alternative: Each lane reads element src_val_offset (passed by thread)
-                # Then shuffle from lane with thread_col = src_thread_col
-                #
-                # Actually simplest: 
-                # 1. All threads read the SAME offset position first via shuffle
-                # 2. Then each thread picks its value
-                #
-                # Final working solution: 8-way shuffle
-                # For offset j in 0..7:
-                #   - Each thread reads rG_last_row_8[j]
-                #   - Shuffle from lane (thread_col we need) to get the right thread_col's value
-                #   - Store if j == src_val_offset
-                
-                # Simpler: just read the element directly based on computed src
-                # Each thread has thread_col = local_tidx % 8
-                # Thread i needs data from thread_col (i // 8)
-                # src_lane = src_thread_col (picks lane 0-7 which have thread_col 0-7)
-                src_lane = src_thread_col
-                
-                # Shuffle: get value from src_lane
-                # src_lane sends rG_last_row_8[src_lane % 8] = rG_last_row_8[src_thread_col]
-                # But thread i needs rG_last_row_8[src_val_offset] from that thread_col!
-                #
-                # We need src_lane to send the right element. Let's redefine:
-                # src_lane = src_val_offset (lane 0-7)
-                # Then src_lane has thread_col = src_val_offset % 8 = src_val_offset
-                # And src_lane sends element src_val_offset
-                #
-                # But thread i needs element src_val_offset from thread_col src_thread_col,
-                # not from thread_col src_val_offset!
-                #
-                # OK final correct approach:
-                # src_lane = src_val_offset * 8 + src_thread_col (lane index formula)
-                # But lanes are 0-31 in a warp, so this needs adjustment
-                # 
-                # Actually for D=64 with 8 thread_cols:
-                # lanes 0-7 have thread_col 0-7 and are in thread_row 0
-                # lanes 8-15 have thread_col 0-7 and are in thread_row 1
-                # ...
-                # Lane L: thread_col = L % 8, thread_row = L // 8
-                #
-                # For thread i to get column i:
-                # - Need thread_col = i // 8
-                # - Need element = i % 8
-                # - Lane with thread_col = src_thread_col is: src_thread_col, src_thread_col+8, src_thread_col+16, src_thread_col+24
-                # - Each of these lanes sends element (lane % 8) = src_thread_col
-                # - We need element src_val_offset = i % 8
-                # - So we need a lane L where L % 8 == src_thread_col AND L sends element src_val_offset
-                # - Lane L sends element (L % 8), so L % 8 must equal src_val_offset
-                # - But also L % 8 == src_thread_col
-                # - Only works if src_thread_col == src_val_offset
-                #
-                # Multi-round solution:
-                # Round 0: All threads read their element 0, shuffle from lane with their src_thread_col
-                #          Thread with src_val_offset==0 keeps this value
-                # Round j: All threads read element j, shuffle, threads with src_val_offset==j keep
-                #
-                # This requires 8 rounds. Let's implement it:
-                
-                # Initialize result
-                rG_last_row_scalar = cutlass.Float32(0.0)
-                
-                for j in cutlass.range_constexpr(8):  # 8 rounds for 8 elements
-                    # Read element j from my data
-                    val_j = rG_last_row_8[(j, 0)]
-                    # Shuffle from lane with my src_thread_col
-                    val_from_src = cute.arch.shuffle_sync(val_j, src_thread_col, 0xFFFFFFFF, 31)
-                    # Keep if j == src_val_offset
-                    if j == src_val_offset:
-                        rG_last_row_scalar = val_from_src
-                
-                # Debug: verify shuffle results
-                if idx == 0 and hidx == 0 and bidx == 0:
-                    if local_tidx == 0:
-                        cute.printf("[CUDA] Thread 0: col=0, exp_neg_g_scalar=%f", rG_last_row_scalar)
-                    if local_tidx == 7:
-                        cute.printf("[CUDA] Thread 7: col=7, exp_neg_g_scalar=%f", rG_last_row_scalar)
-                    if local_tidx == 8:
-                        cute.printf("[CUDA] Thread 8: col=8, exp_neg_g_scalar=%f", rG_last_row_scalar)
-                    if local_tidx == 63:
-                        cute.printf("[CUDA] Thread 63: col=63, exp_neg_g_scalar=%f", rG_last_row_scalar)
-                
+
+                q2_handle.commit()
+                k2_handle.commit()
+                # TODO: produce k^t * exp(-g) for mma
+
+                if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
+                    cute.printf("-------------------- sQ_flat: q * exp(g)")
+                    cute.print_tensor(sQ_flat)
+                    # cute.printf("-------------------- sK_flat: k * exp(g)")
+                    # cute.print_tensor(sK_flat)
+                    # cute.printf("-------------------- sG_flat stored with K^T*exp(-g):")
+                    # cute.print_tensor(sG_flat)
+
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+
+                # ------------------------------------------------------------
+                # Save exp(g) of last row to rG_last for state update in next chunk
+                rG_last = cutlass.Float32(0.0)
+                rG_last = exp_g[Constant.C - 1]
+
                 # ============================================================
                 # KDA Step 4: Notify MMA warp that Q'/K' are ready
                 # ============================================================
@@ -1922,8 +1769,6 @@ class KDAChunkwise:
                 if should_debug and idx == 0:
                     cute.printf("[CUDA] chunk idx={}, KDA gating done", idx)
                 
-                g_handle.release()
-
                 # Convert KV to KV16
                 if idx != 0:
                     kv_handle = kv_consumer.wait_and_advance()
@@ -2674,9 +2519,10 @@ class KDAChunkwise:
         copy_atom_s2r_x = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             dtype,
-            num_bits_per_copy=128,
+            # NOTE: make wanna make sure every thread loads a column of 16bits, i.e. one element
+            num_bits_per_copy=16,
         )
-        num_elements_per_thread = 128 // dtype.width
+        num_elements_per_thread = 16 // dtype.width
         num_threads_per_row = shape_x[1] // num_elements_per_thread
         # NOTE: Assume 128 cuda core threads 
         num_threads_per_col = 128 // num_threads_per_row
@@ -2703,70 +2549,6 @@ class KDAChunkwise:
         )
         return tiled_s2r_x, thr_s2r_x, tXsX_s2r, tXrX_s2r
 
-    @cute.jit
-    def make_s2r_partitions_single_row(
-        self,
-        local_tidx: cutlass.Int32,
-        smem_row: cute.Tensor,  # SMEM tensor for a single row, shape (D,) or (D, 1)
-        D: int,  # Number of columns (head dimension)
-    ):
-        """
-        Create s2r partition for a single row where each thread holds ONE element.
-        
-        This is used for G's last row extraction, enabling simple 1:1 mapping
-        between threads and columns for subsequent state decay computation.
-        
-        For D=64:  threads 0-63 each hold one element, threads 64-127 hold duplicates
-        For D=128: threads 0-127 each hold one element (1:1 mapping)
-        
-        Args:
-            local_tidx: Thread index within cuda warp group [0, 128)
-            smem_row: SMEM tensor for the row, shape (D,) with appropriate layout
-            D: Head dimension (64 or 128)
-        
-        Returns:
-            tiled_copy, smem_partition, rmem_scalar
-        """
-        dtype = smem_row.element_type
-        
-        # Use 16-bit copy (one bf16 element per thread)
-        copy_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            dtype,
-            num_bits_per_copy=dtype.width,  # 16 bits for bf16
-        )
-        
-        # Thread layout: 128 threads in a row, each handles 1 element
-        # For D=64:  only first 64 threads are active
-        # For D=128: all 128 threads are active
-        thread_layout = cute.make_layout(
-            (1, 128),  # 1 row, 128 columns of threads
-            stride=(128, 1),
-        )
-        
-        # Value layout: each thread handles 1 element
-        val_layout = cute.make_layout((1, 1))
-        
-        tiled_copy = cute.make_tiled_copy_tv(
-            copy_atom,
-            thread_layout,
-            val_layout,
-        )
-        thr_copy = tiled_copy.get_slice(local_tidx)
-        
-        # Partition SMEM row
-        # smem_row shape should be (D,) or (D, 1)
-        tXsX = thr_copy.partition_S(smem_row)
-        
-        # Create RMEM tensor - each thread holds 1 element
-        tXrX = cute.make_rmem_tensor(
-            cute.slice_(tXsX.shape, (None, 0)),  # Remove stage dimension if any
-            dtype,
-        )
-        
-        return tiled_copy, tXsX, tXrX
-
-
 def make_thread_cooperative_group(size: int):
     """Helper to create thread cooperative groups for pipeline synchronization."""
     return pipeline.CooperativeGroup(pipeline.Agent.Thread, size)
@@ -2778,9 +2560,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Chunkwise Linear Attention with Headwise Decay"
     )
-    parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
-    parser.add_argument("--seq_len", type=int, default=4096, help="Sequence length")
-    parser.add_argument("--num_heads", type=int, default=64, help="Number of heads")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+    parser.add_argument("--seq_len", type=int, default=128, help="Sequence length")
+    parser.add_argument("--num_heads", type=int, default=1, help="Number of heads")
     parser.add_argument("--head_dim", type=int, default=128, help="Head dimension")
     parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size")
     parser.add_argument("--decay", type=float, default=0.95, help="Decay factor")
