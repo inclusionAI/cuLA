@@ -74,7 +74,7 @@ import cutlass.cute.testing as testing
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64, Float32
 
-PRINT_DEBUG=False
+PRINT_DEBUG=True
 
 class Constant:
     """Common constants used in KDA implementation."""
@@ -1543,6 +1543,18 @@ class KDAChunkwise:
             # tRS_sG: tensor<ptr<bf16, smem, align<16>, S<3,4,3>> o ((8,1),8,1,2):((1,0),512,0,8192)>
             # tRS_rG: tensor<ptr<bf16, rmem, align<32>> o ((8,1),8,1):((1,0),8,0)>
             print(f"tRS_sG: {tRS_sG}")
+            
+            #-------------------------------------------------------
+            # G last row s2r partition - for exp(-g) decay factor
+            # Each thread holds ONE element of the last row (thread i holds column i)
+            # This enables simple 1:1 multiplication with state later
+            #
+            # sG_flat has shape (C, D, stages) after coalescing
+            # We extract the last row: sG_flat[C-1, :, stage]
+            #-------------------------------------------------------
+            # Get last row (row C-1 = 63) from sG_flat for each stage
+            # sG_flat shape: (C, (D, stages)) with some swizzle
+            # We'll extract last row after G is loaded, in the loop below
             print(f"tRS_rG: {tRS_rG}")
             #-------------------------------------------------------
 
@@ -1687,13 +1699,228 @@ class KDAChunkwise:
                 )
                 
                 # ============================================================
+                # KDA Step 3.5: Extract exp(-g) for last row and broadcast via shuffle
+                # 
+                # Thread layout analysis for G(C=64, D=64):
+                # - tiled_s2r_g has Tiler MN = (8, 128), meaning:
+                #   * M (rows): tiled in chunks of 8 rows
+                #   * N (cols): 128 cols per tile (but G only has D=64)
+                # - TV Layout tiled: ((16,8),8):((64,1),8)
+                #   * 128 threads arranged in (16,8) grid
+                #   * Thread (tr, tc) handles columns [tc*8 : tc*8+8]
+                #   * Thread (tr, tc) handles rows [tr, tr+16, tr+32, tr+48] for C=64
+                #
+                # G row 63 (last row):
+                # - Row 63 = thread_row 15 + 3*16 (i.e., tile_row 3 for threads in row 15)
+                # - Threads 120-127 (thread_row=15) hold row 63
+                # - In tRS_rG shape ((8,1),8,1): M-index for row 63 varies by thread
+                #
+                # For this implementation:
+                # - Each thread checks if it holds row 63 data (thread_row == 15)
+                # - Row 63 corresponds to M-tile index: 63 // 8 = 7, offset 63 % 8 = 7
+                # - We use shuffle to broadcast the last-row values within each warp
+                # ============================================================
+                
+                # Get thread's position in the thread layout
+                # local_tidx is thread index within cuda warp group [0, 128)
+                thread_row = local_tidx // 8    # 0-15
+                thread_col = local_tidx % 8     # 0-7
+                lane_id = local_tidx % 32       # lane within warp
+                warp_id_local = local_tidx // 32  # 0-3 within cuda warp group
+                
+                # ============================================================
+                # Analysis of tRS_rG layout:
+                # - Shape ((8,1), 8, 1) = (V, M, N) where V=8, M=8, N=1
+                # - Total 64 elements per thread
+                # - Stride ((1,0), 8, 0) means: V-stride=1, M-stride=8
+                # - So element at (v, m, 0) has linear index = v + 8*m
+                #
+                # For G(64, 64):
+                # - M=8 tiles, each tile has 8 rows: tile_i covers rows [8i, 8i+8)
+                # - Row 63 is in M-tile 7 (63//8=7), offset v=7 (63%8=7)
+                # - Linear index for row 63 = 7 + 8*7 = 63
+                #
+                # exp_neg_g has the same layout (it's computed from tRS_rG data)
+                # We need to extract all 64 elements of row 63 (D=64 columns)
+                # ============================================================
+                
+                # Extract exp(-g) for row 63 from this thread's registers
+                # Each thread holds 8 columns worth of data for row 63
+                # Thread with thread_col=c holds columns [8c, 8c+8) for all rows
+                #
+                # exp_neg_g is a tensor with shape matching tRS_rG
+                # To extract row 63, we need elements at (v=7, m=7, n=0) through (v=0, m=7, n=0)
+                # Actually, row 63 = M-tile 7, and all V positions [0-7] at M=7 give row 63's columns
+                # Wait no - V is the "value" dimension (vectorized load), M is row-tiles
+                # 
+                # Let me re-read: tRS_rG shape ((8,1), 8, 1)
+                # This is ((V_atom, V_rest), M, N) = ((8,1), 8, 1)
+                # V_atom = 8 means each atomic copy loads 8 consecutive elements
+                # M = 8 means 8 "M-tiles" or repetitions along M dimension
+                # 
+                # For row-major G(C=64, D=64) with Tiler (8, 128):
+                # - Each M-tile is one row (8 elements along N/D dimension)
+                # - So tRS_rG M=8 means 8 rows, each with 8 elements = 64 total
+                # - BUT this is for each thread's slice of the data!
+                
+                # The key insight: with 128 threads and G(64,64)=4096 elements:
+                # - Each thread holds 4096/128 = 32 elements on average
+                # - But tRS_rG shows 64 elements per thread
+                # - This suggests partial overlap or the layout is different
+                
+                # For now, let's just try to read row 63 data from M-tile 7
+                # and see what happens
+                
+                # exp_neg_g has the same shape, we can index it
+                
+                # ============================================================
+                # KDA Step 3.5: Extract exp(-g) for last row (row 63) to RMEM
+                # 
+                # Goal: Thread i holds exp(-g)[row63, col_i] as a scalar
+                #
+                # Current data: Each thread holds 8 values at M=7 (row 63)
+                # Thread with thread_col=tc holds columns [tc*8, tc*8+8)
+                # thread_col = local_tidx % 8 for D=64
+                #
+                # Shuffle approach:
+                # Thread i needs column i, which is at src_thread_col = i // 8, offset = i % 8
+                # We use a two-step process:
+                # 1. Each thread reads its rG_last_row_8[(local_tidx % 8)] - this gives element (local_tidx % 8)
+                # 2. Shuffle to get value from lane that has the correct thread_col
+                #
+                # Key: Lane L has thread_col = L % 8 and sends element (L % 8)
+                # Thread i needs element (i % 8) from thread_col (i // 8)
+                # So: src_lane = (i % 8) * 8 + (i // 8) ... but this might exceed 32
+                #
+                # Simpler: Thread i reads its own element (i % 8), then shuffles from
+                # lane (i // 8) to get that thread_col's data. But lane (i // 8) sends
+                # element ((i // 8) % 8), not element (i % 8).
+                #
+                # Correct solution: src_lane = (i % 8) + (row in thread_layout)
+                # where row selects which thread_col we want
+                # 
+                # For 128 threads in (16, 8) layout:
+                # - thread_col = local_tidx % 8
+                # - thread_row = local_tidx // 8 (0-15)
+                # - Lane in warp = local_tidx % 32
+                #
+                # Thread i needs column i:
+                # - src_thread_col = i // 8
+                # - src_val_offset = i % 8
+                # - src_lane = src_val_offset * 8 + src_thread_col (within warp)
+                #   This gives lane with thread_col=src_thread_col that holds element src_val_offset
+                # ============================================================
+                
+                # Extract 8-element slice at M=7 (row 63)
+                rG_last_row_8 = exp_g[(None, None), 7, 0]  # Shape: (8, 1) = 8 elements
+                
+                my_col = local_tidx  # Thread i handles column i (mod D for D<128)
+                src_thread_col = my_col // 8   # 0-7 for D=64
+                src_val_offset = my_col % 8    # 0-7
+                
+                # Read element at my position (this is what I send)
+                my_val_at_my_offset = rG_last_row_8[(src_val_offset, 0)]
+                
+                # Compute source lane: we need a lane with thread_col = src_thread_col
+                # that will send element src_val_offset
+                # Lane L has thread_col = L % 8
+                # Lane L reads and sends element (L % 8) = its thread_col
+                # So: I need lane where L % 8 == src_thread_col
+                #     AND that lane reads src_val_offset
+                # Since lane L reads element (L % 8), we need L % 8 == src_val_offset
+                # But we also need L % 8 == src_thread_col (to have the right data)
+                # This only works if src_thread_col == src_val_offset
+                #
+                # Alternative: Each lane reads element src_val_offset (passed by thread)
+                # Then shuffle from lane with thread_col = src_thread_col
+                #
+                # Actually simplest: 
+                # 1. All threads read the SAME offset position first via shuffle
+                # 2. Then each thread picks its value
+                #
+                # Final working solution: 8-way shuffle
+                # For offset j in 0..7:
+                #   - Each thread reads rG_last_row_8[j]
+                #   - Shuffle from lane (thread_col we need) to get the right thread_col's value
+                #   - Store if j == src_val_offset
+                
+                # Simpler: just read the element directly based on computed src
+                # Each thread has thread_col = local_tidx % 8
+                # Thread i needs data from thread_col (i // 8)
+                # src_lane = src_thread_col (picks lane 0-7 which have thread_col 0-7)
+                src_lane = src_thread_col
+                
+                # Shuffle: get value from src_lane
+                # src_lane sends rG_last_row_8[src_lane % 8] = rG_last_row_8[src_thread_col]
+                # But thread i needs rG_last_row_8[src_val_offset] from that thread_col!
+                #
+                # We need src_lane to send the right element. Let's redefine:
+                # src_lane = src_val_offset (lane 0-7)
+                # Then src_lane has thread_col = src_val_offset % 8 = src_val_offset
+                # And src_lane sends element src_val_offset
+                #
+                # But thread i needs element src_val_offset from thread_col src_thread_col,
+                # not from thread_col src_val_offset!
+                #
+                # OK final correct approach:
+                # src_lane = src_val_offset * 8 + src_thread_col (lane index formula)
+                # But lanes are 0-31 in a warp, so this needs adjustment
+                # 
+                # Actually for D=64 with 8 thread_cols:
+                # lanes 0-7 have thread_col 0-7 and are in thread_row 0
+                # lanes 8-15 have thread_col 0-7 and are in thread_row 1
+                # ...
+                # Lane L: thread_col = L % 8, thread_row = L // 8
+                #
+                # For thread i to get column i:
+                # - Need thread_col = i // 8
+                # - Need element = i % 8
+                # - Lane with thread_col = src_thread_col is: src_thread_col, src_thread_col+8, src_thread_col+16, src_thread_col+24
+                # - Each of these lanes sends element (lane % 8) = src_thread_col
+                # - We need element src_val_offset = i % 8
+                # - So we need a lane L where L % 8 == src_thread_col AND L sends element src_val_offset
+                # - Lane L sends element (L % 8), so L % 8 must equal src_val_offset
+                # - But also L % 8 == src_thread_col
+                # - Only works if src_thread_col == src_val_offset
+                #
+                # Multi-round solution:
+                # Round 0: All threads read their element 0, shuffle from lane with their src_thread_col
+                #          Thread with src_val_offset==0 keeps this value
+                # Round j: All threads read element j, shuffle, threads with src_val_offset==j keep
+                #
+                # This requires 8 rounds. Let's implement it:
+                
+                # Initialize result
+                rG_last_row_scalar = cutlass.Float32(0.0)
+                
+                for j in cutlass.range_constexpr(8):  # 8 rounds for 8 elements
+                    # Read element j from my data
+                    val_j = rG_last_row_8[(j, 0)]
+                    # Shuffle from lane with my src_thread_col
+                    val_from_src = cute.arch.shuffle_sync(val_j, src_thread_col, 0xFFFFFFFF, 31)
+                    # Keep if j == src_val_offset
+                    if j == src_val_offset:
+                        rG_last_row_scalar = val_from_src
+                
+                # Debug: verify shuffle results
+                if idx == 0 and hidx == 0 and bidx == 0:
+                    if local_tidx == 0:
+                        cute.printf("[CUDA] Thread 0: col=0, exp_neg_g_scalar=%f", rG_last_row_scalar)
+                    if local_tidx == 7:
+                        cute.printf("[CUDA] Thread 7: col=7, exp_neg_g_scalar=%f", rG_last_row_scalar)
+                    if local_tidx == 8:
+                        cute.printf("[CUDA] Thread 8: col=8, exp_neg_g_scalar=%f", rG_last_row_scalar)
+                    if local_tidx == 63:
+                        cute.printf("[CUDA] Thread 63: col=63, exp_neg_g_scalar=%f", rG_last_row_scalar)
+                
+                # ============================================================
                 # KDA Step 4: Notify MMA warp that Q'/K' are ready
                 # ============================================================
                 kda_gate_handle = kda_gate_producer.acquire_and_advance()
                 kda_gate_handle.commit()
                 
                 if should_debug and idx == 0:
-                    cute.printf("[CUDA] chunk idx={}, KDA gating: Q'=Q*exp(g), K_inter=K*exp(g)->sK, K_intra=K*exp(-g)->sG", idx)
+                    cute.printf("[CUDA] chunk idx={}, KDA gating done", idx)
                 
                 g_handle.release()
 
@@ -2475,6 +2702,69 @@ class KDAChunkwise:
             dtype,
         )
         return tiled_s2r_x, thr_s2r_x, tXsX_s2r, tXrX_s2r
+
+    @cute.jit
+    def make_s2r_partitions_single_row(
+        self,
+        local_tidx: cutlass.Int32,
+        smem_row: cute.Tensor,  # SMEM tensor for a single row, shape (D,) or (D, 1)
+        D: int,  # Number of columns (head dimension)
+    ):
+        """
+        Create s2r partition for a single row where each thread holds ONE element.
+        
+        This is used for G's last row extraction, enabling simple 1:1 mapping
+        between threads and columns for subsequent state decay computation.
+        
+        For D=64:  threads 0-63 each hold one element, threads 64-127 hold duplicates
+        For D=128: threads 0-127 each hold one element (1:1 mapping)
+        
+        Args:
+            local_tidx: Thread index within cuda warp group [0, 128)
+            smem_row: SMEM tensor for the row, shape (D,) with appropriate layout
+            D: Head dimension (64 or 128)
+        
+        Returns:
+            tiled_copy, smem_partition, rmem_scalar
+        """
+        dtype = smem_row.element_type
+        
+        # Use 16-bit copy (one bf16 element per thread)
+        copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            dtype,
+            num_bits_per_copy=dtype.width,  # 16 bits for bf16
+        )
+        
+        # Thread layout: 128 threads in a row, each handles 1 element
+        # For D=64:  only first 64 threads are active
+        # For D=128: all 128 threads are active
+        thread_layout = cute.make_layout(
+            (1, 128),  # 1 row, 128 columns of threads
+            stride=(128, 1),
+        )
+        
+        # Value layout: each thread handles 1 element
+        val_layout = cute.make_layout((1, 1))
+        
+        tiled_copy = cute.make_tiled_copy_tv(
+            copy_atom,
+            thread_layout,
+            val_layout,
+        )
+        thr_copy = tiled_copy.get_slice(local_tidx)
+        
+        # Partition SMEM row
+        # smem_row shape should be (D,) or (D, 1)
+        tXsX = thr_copy.partition_S(smem_row)
+        
+        # Create RMEM tensor - each thread holds 1 element
+        tXrX = cute.make_rmem_tensor(
+            cute.slice_(tXsX.shape, (None, 0)),  # Remove stage dimension if any
+            dtype,
+        )
+        
+        return tiled_copy, tXsX, tXrX
 
 
 def make_thread_cooperative_group(size: int):
