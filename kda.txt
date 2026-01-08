@@ -1,0 +1,71 @@
+Running Chunkwise Linear Attention with CuTe DSL:
+  Batch size: 1
+  Sequence length: 128
+  Number of heads: 1
+  Head dimension: 128
+  Chunk size: 64
+  IO dtype: BFloat16
+  Accumulation dtype: Float32
+  Warmup iterations: 0
+  Benchmark iterations: 1
+size of storage: 181248
+grid: (1, Int32(?), Int32(?))
+g_smem_layout_epi: S<3,4,3> o 0 o ((8,8),(64,2),(1,2)):((64,512),(1,4096),(0,8192))
+g_smem_layout_coalesce: S<3,4,3> o 0 o (64,(64,2),2):(64,(1,4096),8192)
+tiled_t2r_S: Tiled Copy
+  Tiler MN:        ((4,16):(16,1),64:1)
+  TV Layout tiled: ((32,4),(64,16)):((0,1),(64,4))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,1024):(0,1)
+  TV Layout Dst:   ((4,8),(2,2,8)):((2,64),(1,512,8))
+  Value type:      f32
+tTR_tS: tensor<ptr<f32, tmem, align<16>> o (((64,16),1),1,1,2):(((1,65536),0),0,0,1048576)>
+tTR_rS: tensor<ptr<f32, rmem, align<32>> o (((2,2,8),1),1,1):(((1,2,4),0),0,0)>
+tiled_t2r_KK: Tiled Copy
+  Tiler MN:        ((4,16):(16,1),64:1)
+  TV Layout tiled: ((32,4),(64,16)):((0,1),(64,4))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,1024):(0,1)
+  TV Layout Dst:   ((4,8),(2,2,8)):((2,64),(1,512,8))
+  Value type:      f32
+tTR_tKK: tensor<ptr<f32, tmem, align<16>> o (((64,16),1),1,1,2):(((1,65536),0),0,0,1048576)>
+tTR_rKK: tensor<ptr<f32, rmem, align<32>> o (((2,2,8),1),1,1):(((1,2,4),0),0,0)>
+tiled_s2r_g: Tiled Copy
+  Tiler MN:        (1:0,128:1)
+  TV Layout tiled: (128,1):(1,0)
+Copy Atom
+  ThrID:           1:0
+  TV Layout Src:   (1,1):(0,1)
+  TV Layout Dst:   (1,1):(0,1)
+  Value type:      bf16
+tRS_sG: tensor<ptr<bf16, smem, S<3,4,3>> o ((1,1),64,1,2):((0,0),64,0,8192)>
+tRS_rG: tensor<ptr<bf16, rmem, align<32>> o ((1,1),64,1):((0,0),1,0)>
+tiled_s2r_q: Tiled Copy
+  Tiler MN:        (1:0,128:1)
+  TV Layout tiled: (128,1):(1,0)
+Copy Atom
+  ThrID:           1:0
+  TV Layout Src:   (1,1):(0,1)
+  TV Layout Dst:   (1,1):(0,1)
+  Value type:      bf16
+tRS_sQ: tensor<ptr<bf16, smem, S<3,4,3>> o ((1,1),64,1,2):((0,0),64,0,8192)>
+tRS_rQ: tensor<ptr<bf16, rmem, align<32>> o ((1,1),64,1):((0,0),1,0)>
+tiled_s2r_k: Tiled Copy
+  Tiler MN:        (1:0,128:1)
+  TV Layout tiled: (128,1):(1,0)
+Copy Atom
+  ThrID:           1:0
+  TV Layout Src:   (1,1):(0,1)
+  TV Layout Dst:   (1,1):(0,1)
+  Value type:      bf16
+tRS_sK: tensor<ptr<bf16, smem, S<3,4,3>> o ((1,1),64,1,2):((0,0),64,0,8192)>
+tRS_rK: tensor<ptr<bf16, rmem, align<32>> o ((1,1),64,1):((0,0),1,0)>
+Compilation time: 2.4322 seconds
+B, S, H, D: (1, 128, 1, 128)
+
+Execution time: 5.85 ms (average over 1 iterations)
+Throughput: 0.00 GB/s
+
+PASS
