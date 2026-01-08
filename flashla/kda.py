@@ -182,6 +182,23 @@ class KDAChunkwise:
         # Using same C, D as defined above
         self.g_tile_shape = (C * D,)  # Flatten to 1D for simple linear TMA load
 
+    def get_config(self) -> dict:
+        """
+        Get current KDA configuration.
+        
+        Returns:
+            dict: Configuration dictionary with kernel parameters
+        """
+        return {
+            "chunk_size": self.chunk_size,
+            "qk_acc_dtype": str(self.qk_acc_dtype),
+            "kv_acc_dtype": str(self.kv_acc_dtype),
+            "acc_dtype": str(self.acc_dtype),
+            "io_dtype": str(self.io_dtype),
+            "num_cuda_core_threads": self.cuda_core_threads,
+            "threads_per_cta": self.threads_per_cta,
+        }
+    
     @staticmethod
     def _plan_tmem_offsets(
         tiled_mma_qk,
@@ -313,7 +330,7 @@ class KDAChunkwise:
         v_iter: cute.Pointer,
         g_iter: cute.Pointer,  # NEW: gate values
         o_iter: cute.Pointer,
-        decay: cute.Pointer,
+        beta_iter: cute.Pointer,  # NEW: beta tensor [B, S, H]
         problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B, S, H, D)
         stream: cuda.CUstream,
     ):
@@ -328,7 +345,7 @@ class KDAChunkwise:
             v_iter: Value tensor [B, S, H, D]
             g_iter: Gate tensor [B, S, H, D] - NEW for KDA
             o_iter: Output tensor [B, S, H, D]
-            decay: Per-head decay coefficients pointer [H] (legacy from linear_attn)
+            beta_iter: Beta tensor [B, S, H] - NEW for KDA, scaling factor for K and V
             problem_size: (B, S, H, D) problem dimensions
             stream: CUDA stream
         """
@@ -375,6 +392,14 @@ class KDAChunkwise:
             stride=(D*H, 1, (D, D*H*S)),
         )
         g = cute.make_tensor(g_iter, g_layout)
+
+        # beta - NEW for KDA, shape (B, S, H)
+        # Layout: (S, (H,B)) with stride (H, (1, H*S))
+        beta_layout = cute.make_layout(
+            (S, (H,B)),
+            stride=(H, (1, H*S)),
+        )
+        beta = cute.make_tensor(beta_iter, beta_layout)
 
         o_layout = cute.make_layout(
             (D, S, (H,B)),
@@ -743,7 +768,7 @@ class KDAChunkwise:
             tma_tensor_g,  # NEW for KDA
             tma_atom_o,
             tma_tensor_o,
-            decay,
+            beta,  # NEW for KDA
             q_smem_layout_staged,
             k_smem_layout_staged,
             kv_k_smem_layout_staged,
@@ -780,7 +805,7 @@ class KDAChunkwise:
         tma_tensor_g: cute.Tensor,  # NEW for KDA
         tma_atom_o: cute.CopyAtom,
         tma_tensor_o: cute.Tensor,
-        decay: cute.Pointer,
+        beta: cute.Tensor,  # NEW for KDA - shape (S, (H, B))
         q_smem_layout_staged: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
         kv_k_smem_layout_staged: cute.ComposedLayout,
@@ -1695,12 +1720,22 @@ class KDAChunkwise:
                 exp_g = cute.exp(g_f32)      # exp(g) for Q' and K_inter
                 exp_neg_g = cute.exp(-g_f32)  # exp(-g) for K_intra
                 
-                # Apply gates:
+                # Apply gates with KDA beta scaling:
                 # Q' = Q * exp(g)
                 q_gated = q_f32 * exp_g
-                # K_inter = K * exp(g) - for inter-chunk KV state update
-                k_inter = k_f32 * exp_g
-                # K_intra = K * exp(-g) - for intra-chunk QK^T
+                # K_inter = K * beta * exp(g) - for inter-chunk KV state update (W matrix)
+                # beta scales the importance of the state update
+                # beta has shape (B,S,H), needs to be broadcast to (B,S,H,D)
+                # We use the first sequence position in this chunk as representative
+                b_idx = bidx
+                h_idx = hidx
+                # Use the first position in the chunk as representative
+                s_idx = idx * Constant.C
+                beta_val = beta[(s_idx, (h_idx, b_idx))]
+                beta_f32 = beta_val.to(cutlass.Float32)
+                
+                k_inter = k_f32 * beta_f32 * exp_g
+                # K_intra = K * exp(-g) - for intra-chunk QK^T computation
                 k_intra = k_f32 * exp_neg_g
                 
                 # Convert back to BF16
@@ -2563,7 +2598,6 @@ def main():
     parser.add_argument("--num_heads", type=int, default=1, help="Number of heads")
     parser.add_argument("--head_dim", type=int, default=128, help="Head dimension")
     parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size")
-    parser.add_argument("--decay", type=float, default=0.95, help="Decay factor")
     parser.add_argument(
         "--io_dtype", type=cutlass.dtype, default=cutlass.BFloat16,
         help="Input/output data type"
@@ -2587,7 +2621,6 @@ def main():
     print(f"  Number of heads: {args.num_heads}")
     print(f"  Head dimension: {args.head_dim}")
     print(f"  Chunk size: {args.chunk_size}")
-    print(f"  Decay factor: {args.decay}")
     print(f"  IO dtype: {args.io_dtype}")
     print(f"  Accumulation dtype: {args.acc_dtype}")
     print(f"  Warmup iterations: {args.warmup_iterations}")
@@ -2606,15 +2639,16 @@ def main():
     V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     G = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)  # Gate tensor for KDA
     
-    # Per-head decay coefficients [H]
-    decay = torch.full((H,), args.decay, device="cuda", dtype=torch.float32)
+    # Beta tensor for KDA: shape (B, S, H)
+    # Each position in the sequence can have its own beta value per batch and head
+    beta_tensor = torch.ones((B, S, H), device="cuda", dtype=torch.bfloat16)
     
     # Convert to dlpack for CuTe
     q_cute = from_dlpack(Q)
     k_cute = from_dlpack(K)
     v_cute = from_dlpack(V)
     g_cute = from_dlpack(G)
-    decay_cute = from_dlpack(decay)
+    beta_cute = from_dlpack(beta_tensor)
     
     o_cute = from_dlpack(torch.zeros_like(Q))
     
@@ -2637,7 +2671,7 @@ def main():
         v_cute.iterator,
         g_cute.iterator,
         o_cute.iterator,
-        decay_cute.iterator,
+        beta_cute.iterator,
         (B, S, H, D),
         stream,
     )
@@ -2654,7 +2688,7 @@ def main():
             v_cute.iterator,
             g_cute.iterator,
             o_cute.iterator,
-            decay_cute.iterator,
+            beta_cute.iterator,
             (B, S, H, D),
             stream,
         )
@@ -2670,7 +2704,7 @@ def main():
             v_cute.iterator,
             g_cute.iterator,
             o_cute.iterator,
-            decay_cute.iterator,
+            beta_cute.iterator,
             (B, S, H, D),
             stream,
         )
