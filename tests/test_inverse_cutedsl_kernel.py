@@ -67,6 +67,9 @@ def compute_matrix_inverse_kernel(
     
     # Stage 2: Compute below-diagonal 8x8 blocks using Schur complement
     # For blocks where i > j, compute: X[i,j] = -inv(L[i,i]) @ L[i,j] @ inv(L[j,j])
+    # Following flat_collective_inverse.hpp algorithm:
+    #   Stage 2a: T = inv(L[i,i]) @ L[i,j]
+    #   Stage 2b: X = -T @ inv(L[j,j])
     for block_i in cutlass.range(1, 8):
         for block_j in cutlass.range(block_i):
             i_idx = block_i * 8
@@ -75,17 +78,42 @@ def compute_matrix_inverse_kernel(
             if lane_id < 8:
                 row = lane_id
                 
+                # Stage 2a: Compute T = inv(L[i,i]) @ L[i,j]
+                # T[row, col] = sum_k inv(L[i,i])[row, k] * L[i,j][k, col]
                 for col in cutlass.range(8):
-                    # Get elements
-                    inv_li_diag = s_mat_inv[i_idx + row, i_idx + row].to(cutlass.Float32)
-                    l_elem = s_mat[i_idx + row, j_idx + col].to(cutlass.Float32)
-                    inv_lj_diag = s_mat_inv[j_idx + col, j_idx + col].to(cutlass.Float32)
+                    t_val = cutlass.Float32(0.0)
                     
-                    # Compute: -inv(L[i,i])[row,row] * L[i,j][row,col] * inv(L[j,j])[col,col]
-                    result = -inv_li_diag * l_elem * inv_lj_diag
+                    # Full matrix multiplication: sum over all k
+                    for k in cutlass.range(8):
+                        inv_li_elem = s_mat_inv[i_idx + row, i_idx + k].to(cutlass.Float32)
+                        l_elem = s_mat[i_idx + k, j_idx + col].to(cutlass.Float32)
+                        t_val = t_val + inv_li_elem * l_elem
                     
-                    # Store result in BF16
-                    s_mat_inv[i_idx + row, j_idx + col] = result.to(cutlass.BFloat16)
+                    # Store intermediate T in output location
+                    s_mat_inv[i_idx + row, j_idx + col] = t_val.to(cutlass.BFloat16)
+            
+            # Synchronize to ensure all T values computed before stage 2b
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            
+            if lane_id < 8:
+                row = lane_id
+                
+                # Stage 2b: Compute X = -T @ inv(L[j,j])
+                # X[row, col] = -sum_k T[row, k] * inv(L[j,j])[k, col]
+                for col in cutlass.range(8):
+                    x_val = cutlass.Float32(0.0)
+                    
+                    # Full matrix multiplication: sum over all k
+                    for k in cutlass.range(8):
+                        t_elem = s_mat_inv[i_idx + row, j_idx + k].to(cutlass.Float32)
+                        inv_lj_elem = s_mat_inv[j_idx + k, j_idx + col].to(cutlass.Float32)
+                        x_val = x_val - t_elem * inv_lj_elem  # Negative sign for Schur complement
+                    
+                    # Store final result
+                    s_mat_inv[i_idx + row, j_idx + col] = x_val.to(cutlass.BFloat16)
 
 
 def create_inverse_kernel():

@@ -91,17 +91,39 @@ def create_bf16_inverse_kernel() -> callable:
                 if lane_id < 8:
                     row = lane_id
                     
+                    # Stage 2a: Compute T = inv(L[i,i]) @ L[i,j]
+                    # T[row, col] = sum_k inv(L[i,i])[row, k] * L[i,j][k, col]
                     for col in cutlass.range(8):
-                        # X[i,j] = -inv(L[i,i])[row,row] * L[i,j][row,col] * inv(L[j,j])[col,col]
+                        t_val = cutlass.Float32(0.0)
                         
-                        inv_li_diag = o[i_idx + row, i_idx + row].to(cutlass.Float32)
-                        l_elem = q[i_idx + row, j_idx + col].to(cutlass.Float32)
-                        inv_lj_diag = o[j_idx + col, j_idx + col].to(cutlass.Float32)
+                        # Full matrix multiplication: sum over all k
+                        for k in cutlass.range(8):
+                            inv_li_elem = o[i_idx + row, i_idx + k].to(cutlass.Float32)
+                            l_elem = q[i_idx + k, j_idx + col].to(cutlass.Float32)
+                            t_val = t_val + inv_li_elem * l_elem
                         
-                        result = -inv_li_diag * l_elem * inv_lj_diag
+                        # Store intermediate T in output location
+                        o[i_idx + row, j_idx + col] = t_val.to(cutlass.BFloat16)
+                    
+                    # Synchronize to ensure all T values computed before stage 2b
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
+                    
+                    # Stage 2b: Compute X = -T @ inv(L[j,j])
+                    # X[row, col] = -sum_k T[row, k] * inv(L[j,j])[k, col]
+                    for col in cutlass.range(8):
+                        x_val = cutlass.Float32(0.0)
                         
-                        # Store result (BF16 conversion implicit)
-                        o[i_idx + row, j_idx + col] = result.to(cutlass.BFloat16)
+                        # Full matrix multiplication: sum over all k
+                        for k in cutlass.range(8):
+                            t_elem = o[i_idx + row, j_idx + k].to(cutlass.Float32)
+                            inv_lj_elem = o[j_idx + k, j_idx + col].to(cutlass.Float32)
+                            x_val = x_val - t_elem * inv_lj_elem  # Negative sign for Schur complement
+                        
+                        # Store final result
+                        o[i_idx + row, j_idx + col] = x_val.to(cutlass.BFloat16)
     
     return bf16_matrix_inverse_kernel
 

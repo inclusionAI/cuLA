@@ -2565,28 +2565,50 @@ class KDAChunkwise:
         """
         Compute Schur complement block: X[i,j] = -inv(L[i,i]) @ L[i,j] @ inv(L[j,j])
         
-        Simplified version that computes element-by-element.
-        Full implementation would use warp-level matrix multiplication.
+        Follows the algorithm from flat_collective_inverse.hpp:
+        - Stage 1: Compute T = inv(L[i,i]) @ L[i,j]
+        - Stage 2: Compute X = -T @ inv(L[j,j])
+        
+        This implements full matrix multiplication instead of simplified scalar products.
+        Each lane (0-7) processes one row of the computation.
         """
-        # For now, a simple version that multiplies using scalar operations
-        # Full CUTLASS version would use WMMA or tensor operations
         
         if lane_id < 8:
             row = lane_id
             
+            # Stage 1: Compute T = inv(L[i,i]) @ L[i,j]
+            # T[row, col] = sum_k inv(L[i,i])[row, k] * L[i,j][k, col]
             for col in cutlass.range(8):
-                # Compute X[row, col] = sum_k (inv(L[i,i])[row,k] * L[i,j][k,col] * inv(L[j,j])[0,col])
-                # Simplified: X[row, col] = -inv(L[i,i])[row,row] * L[i,j][row,col] * inv(L[j,j])[col,col]
+                t_val = cutlass.Float32(0.0)
                 
-                # Get elements
-                inv_li_diag = s_dst[inv_i + row, inv_i_j + row].to(cutlass.Float32)
-                l_elem = s_src[out_i + row, out_j + col].to(cutlass.Float32)
-                inv_lj_diag = s_dst[inv_j + col, inv_j_j + col].to(cutlass.Float32)
+                # Full matrix multiplication: sum over all k
+                for k in cutlass.range(8):
+                    inv_li_elem = s_dst[inv_i + row, inv_i_j + k].to(cutlass.Float32)
+                    l_elem = s_src[out_i + k, out_j + col].to(cutlass.Float32)
+                    t_val = t_val + inv_li_elem * l_elem
                 
-                # Compute: -inv(L[i,i])[row,row] * L[i,j][row,col] * inv(L[j,j])[col,col]
-                result = -inv_li_diag * l_elem * inv_lj_diag
+                # Store intermediate T in output location
+                s_dst[out_i + row, out_j + col] = t_val.to(cutlass.BFloat16)
+            
+            # Synchronize to ensure all T values computed before stage 2
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            
+            # Stage 2: Compute X = -T @ inv(L[j,j])
+            # X[row, col] = -sum_k T[row, k] * inv(L[j,j])[k, col]
+            for col in cutlass.range(8):
+                x_val = cutlass.Float32(0.0)
                 
-                s_dst[out_i + row, out_j + col] = result
+                # Full matrix multiplication: sum over all k
+                for k in cutlass.range(8):
+                    t_elem = s_dst[out_i + row, out_j + k].to(cutlass.Float32)
+                    inv_lj_elem = s_dst[inv_j + k, inv_j_j + col].to(cutlass.Float32)
+                    x_val = x_val - t_elem * inv_lj_elem  # Negative sign for Schur complement
+                
+                # Store final result
+                s_dst[out_i + row, out_j + col] = x_val.to(cutlass.BFloat16)
 
     @cute.jit
     def apply_mask(
