@@ -1697,9 +1697,7 @@ class KDAChunkwise:
                 
                 # Apply gates:
                 # Q' = Q * exp(g)
-                # TODO: FIXME
-                # q_gated = q_f32 * exp_g
-                q_gated = exp_g
+                q_gated = q_f32 * exp_g
                 # K_inter = K * exp(g) - for inter-chunk KV state update
                 k_inter = k_f32 * exp_g
                 # K_intra = K * exp(-g) - for intra-chunk QK^T
@@ -1756,7 +1754,7 @@ class KDAChunkwise:
                 self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 # ------------------------------------------------------------
-                # Save exp(g) of last row to rG_last for state update in next chunk
+                # NOTE: Save exp(g) of last row to rG_last for state update in next chunk
                 rG_last = cutlass.Float32(0.0)
                 rG_last = exp_g[Constant.C - 1]
 
