@@ -868,6 +868,13 @@ class KDAChunkwise:
             consumer_group=make_thread_cooperative_group(32*len([self.mma_warp_id])),
             barrier_storage=storage.load_k2_mbar_ptr.data_ptr(),
         ).make_participants()
+        load_kt2_producer, load_kt2_consumer = pipeline.PipelineAsync.create(
+            # TODO: add assert that g and k have the same stage count
+            num_stages=self.g_stage,
+            producer_group=make_thread_cooperative_group(32*len(self.cuda_warp_ids)),
+            consumer_group=make_thread_cooperative_group(32*len([self.mma_warp_id])),
+            barrier_storage=storage.load_kt2_mbar_ptr.data_ptr(),
+        ).make_participants()
         load_v_producer, load_v_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.v_stage,
             producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
@@ -1000,16 +1007,20 @@ class KDAChunkwise:
         sK = storage.sK.get_tensor(
             k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
         )
-        # TODO: Avoid duplicated loading of k even through L2 cache might make it fine.
-        swizzle_mode_k_for_kv = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            # cute.nvgpu.warpgroup.SmemLayoutAtomKind.MN_SW128,
-            cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128,
-            self.io_dtype,
-        )
         sK_kv = storage.sK.get_tensor(
             # kv_k_smem_layout_staged.outer, swizzle=kv_k_smem_layout_staged.inner
             # NOTE: same swizzle atom (k-major) as k_smem_layout_staged
             kv_k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
+        )
+        # NOTE: reuse same smem as sK
+        sK_g = storage.sK.get_tensor(
+            k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
+        )
+        # NOTE: reuse same smem as sG
+        sK_neg_g = storage.sG.get_tensor(
+            # kv_k_smem_layout_staged.outer, swizzle=kv_k_smem_layout_staged.inner
+            # NOTE: same swizzle atom (k-major) as k_smem_layout_staged
+            k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
         )
         # (((64,2),16),1,4,2):(((1,4096),64),0,1024,8192)>
         sV = storage.sV.get_tensor(
@@ -1119,11 +1130,6 @@ class KDAChunkwise:
         B, S, H, D = problem_size
         C = self.chunk_size
 
-        qk_thr_mma = qk_tiled_mma.get_slice(0)
-        vp_thr_mma = vp_tiled_mma.get_slice(0)
-        kv_thr_mma = kv_tiled_mma.get_slice(0)
-        sq_thr_mma = sq_tiled_mma.get_slice(0)
-
         #-------------------------------------------------------------
         # Make fragments for MMAs.
 
@@ -1135,7 +1141,7 @@ class KDAChunkwise:
             qk_tiled_mma,
             self.qk_mma_tiler,
             sQ,
-            sK,
+            sK_neg_g,
             tmem_ptr_base + self.tmem_qk_cols_offset,
             self.acc_stage,
         )
@@ -1317,18 +1323,6 @@ class KDAChunkwise:
                     dst=tVsV[None, v_handle.index],
                     tma_bar_ptr=v_handle.barrier,
                 )
-                if should_debug:
-                    # cute.printf("tKgK={}", tKgK)
-                    # cute.printf("tKgKT={}", tKgKT)
-                    # cute.printf("tVgV={}", tVgV)
-                    # cute.printf("tVsV={}", tVsV)
-                    # cute.printf("tma produce v, index={}", v_handle.index)
-                    # # cute.print_tensor(tVsV[None, v_handle.index])
-                    # cute.printf("Full SV")
-                    # cute.print_tensor(sV_flat)
-                    # cute.printf("Full SK")
-                    # cute.print_tensor(sK_flat)
-                    pass
 
         # ///////////////////////////////////////////////////////////////////////////////
         # COMPUTE WARPS
@@ -1344,13 +1338,6 @@ class KDAChunkwise:
 
                 # Wait for Qi (TMA load complete).
                 q_handle = load_q2_consumer.wait_and_advance()
-
-                # ============================================================
-                # KDA: Wait for CUDA warp to complete Q'/K' gating
-                # After this, Q and K in SMEM are gated versions (Q' and K')
-                # ============================================================
-                kda_gate_handle = kda_gate_consumer.wait_and_advance()
-                kda_gate_handle.release()
 
                 if idx != 0:
                     kv16_handle = kv16_consumer.wait_and_advance()
@@ -1503,11 +1490,7 @@ class KDAChunkwise:
                 tCtAccQK[((None,None), 0, 0, None)]
             )
             # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
-            # tCcM = qk_thr_mma.partition_C(cM)
             tTR_cS = thr_t2r_S.partition_D(cM)
-            # print(f"thr_t2r_S: {thr_t2r_S}")
-            # print(f"tCcM: {tCcM}")
-            # print(f"tTR_cS: {tTR_cS}")
 
             tTR_rP = cute.make_rmem_tensor_like(
                 src=tTR_rS,
@@ -1662,11 +1645,25 @@ class KDAChunkwise:
                 # ============================================================
                 # KDA Prologue: Load g, Q, K from SMEM to RMEM for elementwise
                 # ============================================================
+                s_idx = idx * C
+                beta_chunk = beta[(None, (hidx, bidx))]
+                beta_chunk_layout = cute.make_layout((C, 1), stride=(H, 0))
+                beta_chunk = cute.make_tensor(beta_chunk.iterator + s_idx*H, layout=beta_chunk_layout)
+                beta_val = beta_chunk[None].load()
+                beta_f32 = beta_val.to(cutlass.Float32)
+
+                print(f"beta_val bf16: {beta_val}, beta_f32: {beta_f32}")
+                print(f"beta_chunk: {beta_chunk}")
+
+                if tidx == 0:
+                    # cute.printf("beta_f32: {}", beta_f32)
+                    cute.printf("------------- beta_f32")
+                    cute.print_tensor(beta_f32)
                 
                 # Load g (g_cumsum) - NEW for KDA Step 1
                 g_handle = load_g_consumer.wait_and_advance()
-                
-                cute.copy(tiled_s2r_g, tRS_sG[(None, None, None, g_handle.index)], tRS_rG)
+                g_stage_idx = g_handle.index
+                cute.copy(tiled_s2r_g, tRS_sG[(None, None, None, g_stage_idx)], tRS_rG)
 
                 # Fence for shared memory
                 cute.arch.fence_proxy(
@@ -1716,25 +1713,14 @@ class KDAChunkwise:
                 q_f32 = q_val.to(cutlass.Float32)
                 k_f32 = k_val.to(cutlass.Float32)
                 
-                # Compute exp(g) and exp(-g)
                 exp_g = cute.exp(g_f32)      # exp(g) for Q' and K_inter
                 exp_neg_g = cute.exp(-g_f32)  # exp(-g) for K_intra
                 
                 # Apply gates with KDA beta scaling:
                 # Q' = Q * exp(g)
                 q_gated = q_f32 * exp_g
-                # K_inter = K * beta * exp(g) - for inter-chunk KV state update (W matrix)
-                # beta scales the importance of the state update
-                # beta has shape (B,S,H), needs to be broadcast to (B,S,H,D)
-                # We use the first sequence position in this chunk as representative
-                b_idx = bidx
-                h_idx = hidx
-                # Use the first position in the chunk as representative
-                s_idx = idx * Constant.C
-                beta_val = beta[(s_idx, (h_idx, b_idx))]
-                beta_f32 = beta_val.to(cutlass.Float32)
-                
-                k_inter = k_f32 * beta_f32 * exp_g
+                # K_inter = K * exp(g) - for inter-chunk KV state update (W matrix)
+                k_inter = k_f32 * exp_g
                 # K_intra = K * exp(-g) - for intra-chunk QK^T computation
                 k_intra = k_f32 * exp_neg_g
                 
@@ -1765,7 +1751,7 @@ class KDAChunkwise:
                 cute.copy(tiled_s2r_k, tRS_rK_inter, tRS_sK[(None, None, None, k_stage_idx)])
                 
                 # Write K_intra = K * exp(-g) to SMEM[G] (overwrite g)
-                g_stage_idx = g_handle.index
+                kt2_handle = load_kt2_producer.acquire_and_advance()
                 cute.copy(tiled_s2r_g, tRS_rK, tRS_sG[(None, None, None, g_stage_idx)])
                 
                 # Fence for shared memory writes
@@ -1774,34 +1760,27 @@ class KDAChunkwise:
                     space=cute.arch.SharedSpace.shared_cta,
                 )
 
+                # produce q * exp(g) for mma
                 q2_handle.commit()
+                # produce k * exp(g) for mma
                 k2_handle.commit()
-                # TODO: produce k^t * exp(-g) for mma
+                # produce k^t * exp(-g) for mma
+                kt2_handle.commit()
 
-                if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
-                    cute.printf("-------------------- sQ_flat: q * exp(g)")
-                    cute.print_tensor(sQ_flat)
-                    # cute.printf("-------------------- sK_flat: k * exp(g)")
-                    # cute.print_tensor(sK_flat)
-                    # cute.printf("-------------------- sG_flat stored with K^T*exp(-g):")
-                    # cute.print_tensor(sG_flat)
-
-                self.cuda_wg_sync_barrier.arrive_and_wait()
+                # if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
+                #     cute.printf("-------------------- sQ_flat: q * exp(g)")
+                #     cute.print_tensor(sQ_flat)
+                #     # cute.printf("-------------------- sK_flat: k * exp(g)")
+                #     # cute.print_tensor(sK_flat)
+                #     # cute.printf("-------------------- sG_flat stored with K^T*exp(-g):")
+                #     # cute.print_tensor(sG_flat)
+                # self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 # ------------------------------------------------------------
                 # NOTE: Save exp(g) of last row to rG_last for state update in next chunk
                 rG_last = cutlass.Float32(0.0)
                 rG_last = exp_g[Constant.C - 1]
 
-                # ============================================================
-                # KDA Step 4: Notify MMA warp that Q'/K' are ready
-                # ============================================================
-                kda_gate_handle = kda_gate_producer.acquire_and_advance()
-                kda_gate_handle.commit()
-                
-                if should_debug and idx == 0:
-                    cute.printf("[CUDA] chunk idx={}, KDA gating done", idx)
-                
                 # Convert KV to KV16
                 if idx != 0:
                     kv_handle = kv_consumer.wait_and_advance()
@@ -1819,7 +1798,7 @@ class KDAChunkwise:
                     #####################################################################3
                     kv16_handle.commit()
 
-                # Wait for S = QK^T
+                # Wait for S = MMA(exp(g)*Q, (K*exp(-g))^T)
                 s0_handle = mma_s0_consumer.wait_and_advance()
 
                 # (MMA, MMA_M, MMA_N, ACC_STAGE)
@@ -1828,8 +1807,7 @@ class KDAChunkwise:
                 cute.copy(tiled_t2r_S, tTR_tSi, tTR_rS)
                 cute.arch.fence_view_async_tmem_load()
 
-                # Apply mask and convert to BF16
-                # TODO: check causal correctness
+                # TODO: Apply strict causal mask and comput inverse of M
                 self.apply_mask(tTR_rS, tTR_cS, tTR_rP, debug=False)
 
                 # Write P to SMEM
