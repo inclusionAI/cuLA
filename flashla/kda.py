@@ -567,6 +567,14 @@ class KDAChunkwise:
             self.epi_tile,
             self.acc_stage,
         )
+        # For M, same shape as KK^T
+        m_smem_layout_staged = sm100_utils.make_smem_layout_epi(
+            self.o_dtype,
+            # SMEM M = KK^T should be row-major
+            utils.LayoutEnum.ROW_MAJOR,
+            self.kk_mma_tiler[:2],
+            self.acc_stage,
+        )
 
         # TMA operations
         # TODO: multicast check, (1,1,1) cluster indicates no multicast
@@ -705,7 +713,10 @@ class KDAChunkwise:
             kda_gate_mbar_ptr: cute.struct.MemRange[Int64, self.q_stage * 2] # type: ignore  # NEW for KDA
             # Masking
             s_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
+            # MMA
             kk_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
+            # Write to SMEM
+            smem_kk_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
             # KV
             kv_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
             kv16_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
@@ -742,9 +753,15 @@ class KDAChunkwise:
                 cute.struct.MemRange[self.v_dtype, cute.cosize(p_smem_layout_staged)], # type: ignore
                 self.buffer_align_bytes,
             ]
+            # Store KK
+            sM: cute.struct.Align[
+                cute.struct.MemRange[self.k_dtype, cute.cosize(m_smem_layout_staged)], # type: ignore
+                self.buffer_align_bytes,
+            ]
 
         self.shared_storage = SharedStorage        
         print(f"size of storage: {SharedStorage.__sizeof__()}")
+        print(f"m_smem_layout_staged: {m_smem_layout_staged}")
 
         self.grid = self._compute_grid(
             # (D, S, (H, B))
@@ -779,6 +796,7 @@ class KDAChunkwise:
             g_smem_layout_staged,  # NEW for KDA
             o_smem_layout_staged,
             p_smem_layout_staged,
+            m_smem_layout_staged,
             state_tmem_layout_staged,
             problem_size,
         ).launch(
@@ -817,6 +835,7 @@ class KDAChunkwise:
         g_smem_layout_staged: cute.ComposedLayout,  # NEW for KDA
         o_smem_layout_staged: cute.ComposedLayout,
         p_smem_layout_staged: cute.ComposedLayout,
+        m_smem_layout_staged: cute.ComposedLayout,
         state_tmem_layout_staged: cute.ComposedLayout,
         problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B, S, H, D)
     ):
@@ -960,6 +979,16 @@ class KDAChunkwise:
             ),
             barrier_storage=storage.p_mbar_ptr.data_ptr(),
         ).make_participants()
+        smem_kk_producer, smem_kk_consumer = pipeline.PipelineAsync.create(
+            num_stages=self.acc_stage,
+            producer_group=make_thread_cooperative_group(
+                self.threads_per_warp * len(self.cuda_warp_ids)
+            ),
+            consumer_group=make_thread_cooperative_group(
+                self.threads_per_warp * len([self.mma_warp_id])
+            ),
+            barrier_storage=storage.smem_kk_mbar_ptr.data_ptr(),
+        ).make_participants()
         o_intra_producer, o_intra_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=self.acc_stage,
             producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
@@ -1058,6 +1087,20 @@ class KDAChunkwise:
         sO = storage.sO.get_tensor(
             o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner
         )
+        # (MMA, MMA_M, MMA_K, STAGE_O)
+        sM_swizzle = cute.nvgpu.warpgroup.make_smem_layout_atom(
+            cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_INTER,
+            element_type=self.io_dtype,
+        )
+        # sM = storage.sM.get_tensor(
+        #     m_smem_layout_staged.outer, swizzle=sM_swizzle
+        # )
+        sM = storage.sM.get_tensor(
+            m_smem_layout_staged.outer, swizzle=m_smem_layout_staged.inner
+        )
+        sM_f16 = cute.make_tensor(cute.recast_ptr(sM.iterator, dtype=cutlass.Float16), layout=sM.layout)
+
+        # (MMA, MMA_M, MMA_K, STAGE_O)
 
         # NOTE: row major has the same majorness as mma operand B
         qk_smem_layout_staged = sm100_utils.make_smem_layout_epi(
@@ -1553,6 +1596,22 @@ class KDAChunkwise:
                 tCtAccKK[((None,None), 0, 0, None)]
             )
 
+            # TODO: check reuse of rKK and rP
+            inverse_type = cutlass.Float16
+            tTR_rKK_f16 = cute.make_rmem_tensor_like(
+                src=tTR_rKK,
+                dtype=inverse_type,
+            )
+            (
+                tiled_r2s_KK,
+                thr_r2s_KK,
+                tRS_rKK,
+                tRS_sKK,
+            ) = self.smem_store_acc_as_ab_and_partition_x(
+                local_tidx, sM_f16, tiled_t2r_KK, tTR_rKK_f16,
+                show_debug_info=True, debug_name="KK"
+            )
+
             if True or cutlass.const_expr(PRINT_DEBUG):
                 print(f"tiled_t2r_S: {tiled_t2r_S}")
                 print(f"tTR_tS: {tTR_tS}")
@@ -1818,13 +1877,32 @@ class KDAChunkwise:
                 beta_chunk = cute.make_tensor(beta_chunk.iterator + s_idx*H, layout=beta_chunk_layout)
 
                 mma_kk_handle = mma_kk_consumer.wait_and_advance()
-                # GEMM KK done, can release
                 cute.copy(tiled_t2r_KK, tTR_tKK[None, None, None, mma_kk_handle.index], tTR_rKK)
+                cute.arch.fence_view_async_tmem_load()
+                # GEMM KK done, can release
+                mma_kk_handle.release()
+
                 # Inplace modify tTR_rKK to M matrix
                 # step1: M = I + StrictTril(beta*KK^T), save M in smem
-                self.apply_M_transform(tTR_rKK, beta_chunk, tTR_cMask)
+                # TODO: drop assignment for tTR_rKK
+                self.apply_M_transform(tTR_rKK, beta_chunk, tTR_cMask, tTR_rKK_f16)
+
+                # STORE M as F16
+                # TODO: shall we store M as F32
+                smem_kk_handle = smem_kk_producer.acquire_and_advance()
+                tRS_sKKi = tRS_sKK[(None, None, None, smem_kk_handle.index)]
+                cute.copy(tiled_r2s_KK, tRS_rKK, tRS_sKKi)
+                # Fence
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
+                smem_kk_handle.commit()
+
                 # TODO: step2: M_inverse = M^{-1} in smem
-                mma_kk_handle.release()
+                print(f"sM: {sM}")
+                print(f"sM_f16: {sM_f16}")
+                self.compute_matrix_inverse_64x64(sM_f16[None, None, smem_kk_handle.index])
 
                 # if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
                 #     cute.printf("-------------------- sQ_flat: q * exp(g)")
@@ -2271,7 +2349,7 @@ class KDAChunkwise:
 
     @cute.jit
     def smem_store_acc_as_ab_and_partition_x(
-        self, local_tidx, smem_x, tiled_t2r_x, tXrX_t2r,
+        self, local_tidx, smem_x, tiled_t2r_x, tXrX_t2r, show_debug_info=False, debug_name="X",
     ):
         copy_atom_r2s_x = sm100_utils.get_smem_store_op(
             utils.LayoutEnum.from_tensor(smem_x),
@@ -2288,7 +2366,8 @@ class KDAChunkwise:
         # ((V, R), M, N)
         tXrX_r2s = thr_r2s_x.retile(tXrX_t2r)
 
-        if cutlass.const_expr(PRINT_DEBUG):
+        if show_debug_info:
+            print(f"-------------------- SMEM STORE: {debug_name}")
             print(f"copy_atom_r2s_x: {copy_atom_r2s_x}")
             print(f"tiled_t2r_x: {tiled_t2r_x}")
             print(f"thr_t2r_x: {thr_r2s_x}")
@@ -2420,6 +2499,7 @@ class KDAChunkwise:
         kk_mat: cute.Tensor,  # (C, C) matrix from K*K^T, stored in registers - INPLACE MODIFIED
         beta_vec: cute.Tensor,  # (C, 1) vector of beta values
         index_kk: cute.Tensor,  # Index tensor with row/col information for strict triangular structure
+        kk_f16_mat: cute.Tensor,
     ):
         """
         Compute M = I + StrictTril(beta * KK^T) INPLACE
@@ -2444,21 +2524,23 @@ class KDAChunkwise:
             if row == col:
                 # Diagonal: M[i,i] = 1.0 (identity)
                 kk_mat[i] = cutlass.Float32(1.0)
+                kk_f16_mat[i] = cutlass.Float16(1.0)
             elif row > col:
                 # Strict lower triangular: M[i,j] = beta[row] * KK[i,j]
                 # TODO: cache beta to register since row does not change here.
                 beta_val = beta_vec[row].to(cutlass.Float32)
                 kk_val = kk_mat[i].to(cutlass.Float32)
                 kk_mat[i] = beta_val * kk_val
+                kk_f16_mat[i] = kk_mat[i].to(cutlass.Float16)
             else:
                 # Upper triangular: M[i,j] = 0.0
                 kk_mat[i] = cutlass.Float32(0.0)
+                kk_f16_mat[i] = cutlass.Float16(0.0)
 
     @cute.jit
     def compute_matrix_inverse_64x64(
         self,
         s_mat: cute.Tensor,  # Input M matrix in smem, shape (64, 64)
-        s_mat_inv: cute.Tensor,  # Output M^{-1} in smem, shape (64, 64)
     ):
         """
         Compute M^{-1} for 64x64 lower triangular matrix using block-wise Schur complement.
@@ -2475,140 +2557,315 @@ class KDAChunkwise:
         
         Args:
             s_mat: Input M matrix (lower triangular) in smem, shape (64, 64)
-            s_mat_inv: Output M^{-1} in smem
         """
-        thread_idx = cute.arch.thread_idx().x
-        lane_id = thread_idx % 32  # Within warp
-        warp_id = thread_idx // 32
-        
+        tidx, _, _ = cute.arch.thread_idx()
+        tidx = tidx % 128
+        lane_id = tidx % 32  # Within warp
+        warp_id = tidx // 32
+
+        # Stage 1: Invert all 8 diagonal 8x8 blocks
+        t8x8mat = cute.flat_divide(s_mat, (8, 8))
+        if tidx == 0:
+            cute.printf("---------- Raw first 8x8 block:")
+            cute.print_tensor(t8x8mat[None, None, 0, 0], verbose=True)
+
         # Block size progression: 8x8 -> 16x16 -> 32x32 -> 64x64
         # Process in stages
         
         # Stage 1: Invert all 8 diagonal 8x8 blocks
-        # Blocks are at positions: (0,0), (1,1), (2,2), ..., (7,7) when divided by 8
-        for block_diag in cutlass.range(8):
-            start_idx = block_diag * 8
-            self._invert_8x8_lower_triangular_block(
-                s_mat, s_mat_inv, start_idx, start_idx, lane_id, warp_id
+        t8x8mat = cute.flat_divide(s_mat, (8, 8))
+        if tidx < 64:
+            print(f"t8x8mat: {t8x8mat}")
+            self.compute_diagonal_inverse_8x8(
+                t8x8mat[None, None, tidx//8, tidx//8],
+                tidx % 8
             )
-        
-        # Synchronize after stage 1
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
+        self.cuda_wg_sync_barrier.arrive_and_wait()
+
+        if tidx == 0:
+            cute.printf("---------- After Stage1, first 8x8 block:")
+            cute.print_tensor(t8x8mat[None, None, 0, 0], verbose=True)
+
+        # Stage 2: Invert all 4 diagonal 16x16 blocks
+        t16x16mat = cute.flat_divide(s_mat, (16, 16))
+        print(f"t16x16mat: {t16x16mat}")
+        self.compute_diagonal_inverse_8x8_to_16x16(
+            t16x16mat[None, None, tidx//32, tidx//32],
         )
+        # Synchronize after stage 2
+        self.cuda_wg_sync_barrier.arrive_and_wait()
 
-        # Stage 2: Compute below-diagonal 8x8 blocks using Schur complement
-        # For blocks where i > j, compute: X[i,j] = -inv(L[i,i]) @ L[i,j] @ inv(L[j,j])
-        for block_i in cutlass.range(1, 8):
-            for block_j in cutlass.range(block_i):
-                i_idx = block_i * 8
-                j_idx = block_j * 8
-                
-                self._compute_schur_8x8_block(
-                    s_mat_inv, s_mat,
-                    i_idx, j_idx,  # Output block location
-                    i_idx, i_idx,  # inv(L[i,i])
-                    j_idx, j_idx,  # inv(L[j,j])
-                    lane_id, warp_id
-                )
+        if tidx == 0:
+            print(f"-------------- After stage 2 inverse 16x16, first 16x16 block")
+            cute.print_tensor(t16x16mat[None, None, 0, 0], verbose=True)
 
-    @cute.jit
-    def _invert_8x8_lower_triangular_block(
-        self,
-        s_src: cute.Tensor,  # Input matrix in smem
-        s_dst: cute.Tensor,  # Output matrix in smem
-        row_offset: int,
-        col_offset: int,
-        lane_id: int,
-        warp_id: int,
-    ):
-        """
-        Invert a lower triangular 8x8 block using forward elimination with thread parallelization.
-        Each lane handles a column of the output matrix.
-        """
-        # Use lanes 0-7 for the 8 columns
-        if lane_id < 8:
-            col = lane_id
-            
-            # Forward substitution: solve L * X = I for column col
-            # X[row, col] is computed based on previous values in the same column
-            for row in cutlass.range(col, 8):
-                if row == col:
-                    # Diagonal: X[row, col] = 1.0 / L[row, row]
-                    l_diag = s_src[row_offset + row, col_offset + col].to(cutlass.Float32)
-                    x_val = cutlass.Float32(1.0) / l_diag
-                else:
-                    # Below diagonal: X[row, col] = -sum(L[row, k] * X[k, col]) / L[row, row]
-                    sum_val = cutlass.Float32(0.0)
-                    for k in cutlass.range(col, row):
-                        l_val = s_src[row_offset + row, col_offset + k].to(cutlass.Float32)
-                        x_val_k = s_dst[row_offset + k, col_offset + col].to(cutlass.Float32)
-                        sum_val = sum_val + l_val * x_val_k
-                    
-                    l_diag = s_src[row_offset + row, col_offset + row].to(cutlass.Float32)
-                    x_val = -sum_val / l_diag
-                
-                s_dst[row_offset + row, col_offset + col] = x_val
-
-    @cute.jit
-    def _compute_schur_8x8_block(
-        self,
-        s_dst: cute.Tensor,  # Output X in smem  
-        s_src: cute.Tensor,  # Input L in smem
-        out_i: int, out_j: int,  # Output block X[i,j] starting row/col
-        inv_i: int, inv_i_j: int,  # Location of computed inv(L[i,i])
-        inv_j: int, inv_j_j: int,  # Location of computed inv(L[j,j])
-        lane_id: int,
-        warp_id: int,
-    ):
-        """
-        Compute Schur complement block: X[i,j] = -inv(L[i,i]) @ L[i,j] @ inv(L[j,j])
-        
-        Follows the algorithm from flat_collective_inverse.hpp:
-        - Stage 1: Compute T = inv(L[i,i]) @ L[i,j]
-        - Stage 2: Compute X = -T @ inv(L[j,j])
-        
-        This implements full matrix multiplication instead of simplified scalar products.
-        Each lane (0-7) processes one row of the computation.
-        """
-        
-        if lane_id < 8:
-            row = lane_id
-            
-            # Stage 1: Compute T = inv(L[i,i]) @ L[i,j]
-            # T[row, col] = sum_k inv(L[i,i])[row, k] * L[i,j][k, col]
-            for col in cutlass.range(8):
-                t_val = cutlass.Float32(0.0)
-                
-                # Full matrix multiplication: sum over all k
-                for k in cutlass.range(8):
-                    inv_li_elem = s_dst[inv_i + row, inv_i_j + k].to(cutlass.Float32)
-                    l_elem = s_src[out_i + k, out_j + col].to(cutlass.Float32)
-                    t_val = t_val + inv_li_elem * l_elem
-                
-                # Store intermediate T in output location
-                s_dst[out_i + row, out_j + col] = t_val.to(cutlass.BFloat16)
-            
-            # Synchronize to ensure all T values computed before stage 2
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
+        # Stage 3: Invert all 2 diagonal 32x32 blocks
+        if tidx < 64:
+            t32x32mat = cute.flat_divide(s_mat, (32, 32))
+            self.compute_diagonal_inverse_16x16_to_32x32(
+                t32x32mat[None, None, tidx//32, tidx//32],
             )
-            
-            # Stage 2: Compute X = -T @ inv(L[j,j])
-            # X[row, col] = -sum_k T[row, k] * inv(L[j,j])[k, col]
-            for col in cutlass.range(8):
-                x_val = cutlass.Float32(0.0)
-                
-                # Full matrix multiplication: sum over all k
-                for k in cutlass.range(8):
-                    t_elem = s_dst[out_i + row, out_j + k].to(cutlass.Float32)
-                    inv_lj_elem = s_dst[inv_j + k, inv_j_j + col].to(cutlass.Float32)
-                    x_val = x_val - t_elem * inv_lj_elem  # Negative sign for Schur complement
-                
-                # Store final result
-                s_dst[out_i + row, out_j + col] = x_val.to(cutlass.BFloat16)
+        self.cuda_wg_sync_barrier.arrive_and_wait()
+
+        # Stage 4: Invert the full 64x64 matrix
+        self.compute_diagonal_inverse_32x32_to_64x64(s_mat)
+
+    @cute.jit
+    def compute_diagonal_inverse_8x8(
+        self,
+        s_block: cute.Tensor,  # Input 8x8 block in smem
+        lane_id: int,
+    ):
+        """
+        Compute inverse of a diagonal 8x8 lower triangular block.
+        
+        Each warp processes one 8x8 block. Each lane (0-7) computes one column.
+        """
+        # Every thread fix a row
+        row = self.load_row_mat8x8(s_block, lane_id)
+        for src_row in cutlass.range_constexpr(8-1):
+            row_scale = row[src_row] * cutlass.Float32(-1)
+            # for i in cutlass.range(src_row, unroll_full=True):
+            for i in cutlass.range(src_row):
+                src_row_value = cute.arch.shuffle_sync_op(
+                    value=row[i], offset=src_row, mask=0xFFFFFFFF, mask_and_clamp=8-1
+                )
+                if lane_id > src_row:
+                    row[i] += row_scale * src_row_value
+            if lane_id > src_row:
+                row[src_row] = row_scale
+        # Store row
+        self.store_row_mat8x8(s_block, row, lane_id)
+
+    @cute.jit
+    def load_row_mat8x8(
+        self,
+        mat: cute.Tensor,
+        idx: int,
+    ) -> cute.Tensor:
+        copy_atom_s2r_x = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            mat.element_type,
+            num_bits_per_copy=mat.element_type.width * 8,
+        )
+        row_tensor = cute.make_rmem_tensor(cute.make_layout(8), mat.element_type)
+        cute.copy(copy_atom_s2r_x, mat[idx, None], row_tensor[None])
+        row_f32_tensor = cute.make_rmem_tensor_like(row_tensor, cutlass.Float32)
+        row_f32_tensor.store(row_tensor.load().to(cutlass.Float32))
+        return row_f32_tensor
+
+    @cute.jit
+    def store_row_mat8x8(
+        self,
+        mat: cute.Tensor,
+        row: cute.Tensor,
+        idx: int,
+    ) -> cute.Tensor:
+        print(f"store_row_mat8x8: idx={idx}, row={row}, mat={mat}")
+        row_bf16 = cute.make_rmem_tensor_like(row, mat.element_type)
+        row_bf16.store(row.load().to(mat.element_type))
+        copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            mat.element_type,
+            num_bits_per_copy=mat.element_type.width * 8,
+        )
+        cute.copy(copy_atom, row_bf16[None], mat[idx, None])
+
+    @cute.jit
+    def make_op_a_from_acc_rmem_16x8x8(
+        self,
+        acc_dtype: cute.Numeric,
+        ab_dtype: cute.Numeric,
+        acc_tensor: cute.Tensor,
+    ):
+        # For 16x8x8, ACC result 16x8 can directly serve as operand A
+        a_tensor = cute.make_rmem_tensor_like(
+            acc_tensor,
+            dtype=ab_dtype,
+        )
+        a_tensor.store(acc_tensor.load().to(ab_dtype))
+        return a_tensor
+
+    def compute_diagonal_inverse_8x8_to_16x16(
+        self,
+        mat: cute.Tensor,  # Input 16x16 block in smem
+    ):
+        """
+        Compute inverse of a diagonal 16x16 lower triangular block using
+        two 8x8 blocks and Schur complement.
+        """
+        dtype = mat.element_type
+        mat8x8_2x2 = cute.flat_divide(mat, (8, 8))
+
+        mma_atom_shape = (16, 8, 8)
+        mma_atom = cute.nvgpu.warp.MmaF16BF16Op(
+            ab_dtype=dtype,
+            acc_dtype=self.acc_dtype,
+            shape_mnk=mma_atom_shape,
+        )
+        tiled_mma = cute.make_tiled_mma(
+            mma_atom,
+            atom_layout_mnk=(1,1,1),
+        )
+        # TODO: check transpose for column major mat
+        copy_op_s2r = cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=1)
+        copy_op_s2r_t = cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=1)
+        copy_op_r2s = cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=1)
+        copy_op_r2s_t = cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=True, num_matrices=1)
+        copy_atom_s2r = cute.make_copy_atom(copy_op_s2r, mat.element_type)
+        copy_atom_s2r_t = cute.make_copy_atom(copy_op_s2r_t, mat.element_type)
+        copy_atom_r2s = cute.make_copy_atom(copy_op_r2s, mat.element_type)
+        copy_atom_r2s_t = cute.make_copy_atom(copy_op_r2s_t, mat.element_type)
+
+        tidx,_,_ = cute.arch.thread_idx()
+        lane_id = tidx % 32
+
+        thr_mma = tiled_mma.get_slice(lane_id)
+        print(f"thr_mma: {thr_mma}")
+        print(f"tiled_mma: {tiled_mma}")
+
+        D_tiled_copy = cute.make_tiled_copy_A(copy_atom_s2r, tiled_mma)
+        # C_tiled_copy = cute.make_tiled_copy_B(copy_atom_s2r, tiled_mma)
+        # A_tiled_copy = cute.make_tiled_copy_B(copy_atom_s2r, tiled_mma)
+        C_tiled_copy = cute.make_tiled_copy_B(copy_atom_s2r_t, tiled_mma)
+        A_tiled_copy = cute.make_tiled_copy_B(copy_atom_s2r_t, tiled_mma)
+        O_tiled_copy = cute.make_tiled_copy_C(copy_atom_r2s, tiled_mma)
+
+        D_thr_copy = D_tiled_copy.get_slice(lane_id)
+        C_thr_copy = C_tiled_copy.get_slice(lane_id)
+        A_thr_copy = A_tiled_copy.get_slice(lane_id)
+        O_thr_copy = O_tiled_copy.get_slice(lane_id)
+
+        sDInv = mat8x8_2x2[None, None, 1, 1]
+        sC = mat8x8_2x2[None, None, 1, 0]
+        sAInv = mat8x8_2x2[None, None, 0, 0]
+        sO = mat8x8_2x2[None, None, 1, 0]
+
+        print(f"sDInv: {sDInv}")
+        print(f"sO: {sO}")
+
+        print(f"Before sC: {sC}")
+        print(f"Before sAInv: {sAInv}")
+        sC = cute.make_tensor(sC.iterator, layout=cute.select(sC.layout, mode=[1,0]))
+        sAInv = cute.make_tensor(sAInv.iterator, layout=cute.select(sAInv.layout, mode=[1,0]))
+        print(f"After sC: {sC}")
+        print(f"After sAInv: {sAInv}")
+
+        # Padding by broadcast, need to figure out why cutlass version choose a operand of (2,0) 
+        # TODO: check broadcast results
+        # sDInv_bcast = cute.make_tensor(sDInv.iterator, cute.logical_product(sDInv.layout, cute.make_layout((2,1))))
+        # sO_bcast = cute.make_tensor(sO.iterator, cute.logical_product(sO.layout, cute.make_layout((2, 1))))
+        sDInv_bcast = cute.make_tensor(sDInv.iterator, cute.blocked_product(sDInv.layout, cute.make_layout((2,1), stride=(0,0))))
+        sO_bcast = cute.make_tensor(sO.iterator, cute.blocked_product(sO.layout, cute.make_layout((2,1), stride=(0,0))))
+        # sDInv_bcast = cute.make_tensor(sDInv.iterator, cute.logical_product(sDInv.layout, cute.make_layout(2, stride=0)))
+        # sO_bcast = cute.make_tensor(sO.iterator, cute.logical_product(sO.layout, cute.make_layout(2, stride=0)))
+        print(f"sDInv_bcast: {sDInv_bcast}")
+        print(f"sO_bcast: {sO_bcast}")
+
+        a_shape = cute.dice(mma_atom_shape, (1,None,1))
+        b_shape = cute.dice(mma_atom_shape, (None,1,1))
+        c_shape = cute.dice(mma_atom_shape, (1,1,None))
+        print(f"a_shape: {a_shape}, b_shape: {b_shape}, c_shape: {c_shape}")
+        tOrDInv = thr_mma.make_fragment_A(tiled_mma.partition_shape_A(a_shape))
+        print(f"tOrDInv: {tOrDInv}")
+        tOrC    = thr_mma.make_fragment_B(thr_mma.partition_B(sC))
+        print(f"tOrC: {tOrC}")
+        tOrAInv = thr_mma.make_fragment_B(thr_mma.partition_B(sAInv))
+        print(f"tOrAInv: {tOrAInv}")
+
+        print(f"C_thr_copy: {C_thr_copy}")
+        print(f"C_tiled_copy: {C_tiled_copy}")
+        print(f"A_thr_copy: {A_thr_copy}")
+        print(f"D_thr_copy: {D_thr_copy}")
+        print(f"O_thr_copy: {O_thr_copy}")
+
+        tDCrDC = thr_mma.make_fragment_C(tiled_mma.partition_shape_C(c_shape))
+        tOrO   = thr_mma.make_fragment_C(tiled_mma.partition_shape_C(c_shape))
+
+        # ((vecsize, numvec), M, N)
+        tOsDInv    = D_thr_copy.partition_S(sDInv_bcast)
+        tOrDInv_cv = D_thr_copy.retile(tOrDInv)
+        tOsC       = C_thr_copy.partition_S(sC)
+        tOrC_cv    = C_thr_copy.retile(tOrC)
+        tOsAInv    = A_thr_copy.partition_S(sAInv)
+        tOrAInv_cv = A_thr_copy.retile(tOrAInv)
+        tOsO       = O_thr_copy.partition_D(sO_bcast)
+        tOrO_cv    = O_thr_copy.retile(tOrO)
+
+        print(f"tOsDInv: {tOsDInv}")
+        print(f"tOrDInv: {tOrDInv}")
+        print(f"tOrDInv_cv: {tOrDInv_cv}")
+        print(f"tOsC: {tOsC}")
+        print(f"tOrC: {tOrC}")
+        print(f"tOrC_cv: {tOrC_cv}")
+        print(f"tOsAInv: {tOsAInv}")
+        print(f"tOrAInv: {tOrAInv}")
+        print(f"tOrAInv_cv: {tOrAInv_cv}")
+        print(f"tOsO: {tOsO}")
+        print(f"tOrO: {tOrO}")
+        print(f"tOrO_cv: {tOrO_cv}")
+
+        cute.copy(C_tiled_copy, tOsC, tOrC_cv)
+
+        tDInv_src = tOsDInv
+        tDInv_dst = tOrDInv_cv
+        # tDInv_src = tOsDInv[(None, 0), None, None]
+        # tDInv_dst = tOrDInv_cv[(None, 0), None, None]
+        # TODO: how
+        print(f"tDInv_src: {tDInv_src}")
+        print(f"tDInv_dst: {tDInv_dst}")
+        cute.copy(D_tiled_copy, tDInv_src, tDInv_dst)
+
+        tDCrDC.fill(0.0) # Clear C for D = A*B + C
+        cute.gemm(tiled_mma, tDCrDC, tOrDInv, tOrC, tDCrDC)
+        tDCrDC.store(tDCrDC.load() * cutlass.Float32(-1))
+
+        tOrDC = self.make_op_a_from_acc_rmem_16x8x8(
+            self.acc_dtype,
+            mat.element_type,
+            tDCrDC,
+        )
+        cute.copy(A_tiled_copy, tOsAInv, tOrAInv_cv)
+        tOrO_cv.fill(0.0) # Clear O for O = A*B + O
+        cute.gemm(tiled_mma, tOrO_cv, tOrDC, tOrAInv, tOrO_cv)
+
+        tOrO_cv_half = tOrO_cv[(None, 0), None, None]
+        print(f"tOrO_cv_half: {tOrO_cv_half}")
+        tOrO_f16 = cute.make_rmem_tensor_like(tOrO_cv_half, mat.element_type)
+        tOrO_f16.store(tOrO_cv[(None, 0), None, None].load().to(mat.element_type))
+
+        # NOTE: group here to make cutedsl happy
+        src_shape = tOrO_f16.shape
+        src_stride = tOrO_f16.layout.stride
+        dst_shape = tOsO[(None, 0), None, None].shape
+        dst_stride = tOsO[(None, 0), None, None].layout.stride
+        tOrO_src = cute.make_tensor(tOrO_f16.iterator, layout=cute.make_layout(((src_shape[0], 1), src_shape[1], src_shape[2]), stride=((src_stride[0], 0), src_stride[1], src_stride[2])))
+        tOsO_dst = cute.make_tensor(tOsO.iterator, layout=cute.make_layout(((dst_shape[0], 1), dst_shape[1], dst_shape[2]), stride=((dst_stride[0], 0), dst_stride[1], dst_stride[2])))
+        # tOrO_src = tOrO_f16
+        # tOsO_dst = tOsO[(None, 0), None, None]
+        print(f"tOrO_src: {tOrO_src}")
+        print(f"tOsO_dst: {tOsO_dst}")
+        cute.copy(O_tiled_copy, tOrO_src, tOsO_dst)
+
+    def compute_diagonal_inverse_16x16_to_32x32(
+        self,
+        s_block: cute.Tensor,  # Input 16x16 block in smem
+    ):
+        """
+        Compute inverse of a diagonal 16x16 lower triangular block using
+        two 8x8 blocks and Schur complement.
+        """
+        pass
+
+    def compute_diagonal_inverse_32x32_to_64x64(
+        self,
+        s_block: cute.Tensor,  # Input 16x16 block in smem
+    ):
+        """
+        Compute inverse of a diagonal 16x16 lower triangular block using
+        two 8x8 blocks and Schur complement.
+        """
+        pass
 
     @cute.jit
     def apply_mask(
@@ -2901,7 +3158,7 @@ def main():
     Q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    G = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)  # Gate tensor for KDA
+    G = torch.nn.functional.logsigmoid(torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16))  # Gate tensor for KDA (logsigmoid initialized)
     
     # Beta tensor for KDA: shape (B, S, H)
     # Each position in the sequence can have its own beta value per batch and head
