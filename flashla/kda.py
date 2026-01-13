@@ -1812,8 +1812,8 @@ class KDAChunkwise:
                 q_f32 = q_val.to(cutlass.Float32)
                 k_f32 = k_val.to(cutlass.Float32)
                 
-                exp_g = cute.exp(g_f32)      # exp(g) for Q' and K_inter
-                exp_neg_g = cute.exp(-g_f32)  # exp(-g) for K_intra
+                exp_g = cute.exp2(g_f32)      # exp(g) for Q' and K_inter
+                exp_neg_g = cute.exp2(-g_f32)  # exp(-g) for K_intra
                 
                 # Apply gates with KDA beta scaling:
                 # Q' = Q * exp(g)
@@ -3151,18 +3151,27 @@ def main():
         print("CUDA is not available!")
         return
     
+    # Set random seed for reproducibility
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    
     # Create inputs
     B, S, H, D = args.batch_size, args.seq_len, args.num_heads, args.head_dim
-    
+
     # Input tensors in format [B, S, H, D]
     Q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     G = torch.nn.functional.logsigmoid(torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16))  # Gate tensor for KDA (logsigmoid initialized)
     
+    # Apply cumsum within each chunk (chunk_size=64) and multiply by 1/ln2 for G before passing to kernel
+    chunk_size = 64
+    num_chunks = S // chunk_size
+    G = G.view(B, num_chunks, chunk_size, H, D).cumsum(dim=2).view(B, S, H, D) * 1.4426950216
+    
     # Beta tensor for KDA: shape (B, S, H)
     # Each position in the sequence can have its own beta value per batch and head
-    beta_tensor = torch.ones((B, S, H), device="cuda", dtype=torch.bfloat16)
+    beta_tensor = torch.randn(B, S, H, device="cuda", dtype=torch.bfloat16).sigmoid()
     
     # Convert to dlpack for CuTe
     q_cute = from_dlpack(Q)
