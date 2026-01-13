@@ -2611,7 +2611,7 @@ class KDAChunkwise:
         self.cuda_wg_sync_barrier.arrive_and_wait()
 
         if tidx == 0:
-            print(f"-------------- After stage 2 inverse 16x16, first 16x16 block")
+            cute.printf("-------------- After stage 2 inverse 16x16, first 16x16 block")
             cute.print_tensor(t16x16mat[None, None, 0, 0])
 
         # Stage 3: Invert all 2 diagonal 32x32 blocks
@@ -2622,11 +2622,14 @@ class KDAChunkwise:
             )
         self.cuda_wg_sync_barrier.arrive_and_wait()
         if tidx == 0:
-            print(f"-------------- After stage 3 inverse 32x32, first 32x32 block")
+            cute.printf("-------------- After stage 3 inverse 32x32, first 32x32 block")
             cute.print_tensor(t32x32mat[None, None, 0, 0])
 
         # Stage 4: Invert the full 64x64 matrix
         self.compute_diagonal_inverse_32x32_to_64x64(s_mat)
+        if tidx == 0:
+            cute.printf("-------------- Final inverse 64x64 block")
+            cute.print_tensor(s_mat)
 
     @cute.jit
     def compute_diagonal_inverse_8x8(
@@ -3437,6 +3440,9 @@ def main():
     Q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    # Beta tensor for KDA: shape (B, S, H)
+    # Each position in the sequence can have its own beta value per batch and head
+    beta_tensor = torch.randn(B, S, H, device="cuda", dtype=torch.float32).sigmoid()
     G = torch.nn.functional.logsigmoid(torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16))  # Gate tensor for KDA (logsigmoid initialized)
     
     # Apply cumsum within each chunk (chunk_size=64) and multiply by 1/ln2 for G before passing to kernel
@@ -3444,10 +3450,6 @@ def main():
     num_chunks = S // chunk_size
     G = G.view(B, num_chunks, chunk_size, H, D).cumsum(dim=2).view(B, S, H, D) * 1.4426950216
     
-    # Beta tensor for KDA: shape (B, S, H)
-    # Each position in the sequence can have its own beta value per batch and head
-    beta_tensor = torch.randn(B, S, H, device="cuda", dtype=torch.bfloat16).sigmoid()
-
     # QK, L2 Norm
     Q, Q_rstd = l2norm_fwd(Q)
     K, K_rstd = l2norm_fwd(K)
