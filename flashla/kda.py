@@ -1749,15 +1749,15 @@ class KDAChunkwise:
             should_debug = PRINT_DEBUG and tidx == self.cuda_warp_ids[0]*32 and hidx == 0 and bidx == 0
 
             # -------------- DEBUG -------------
-            if tidx == 0:
-                cute.printf("-------------------- sG_flat raw:")
-                cute.print_tensor(sG_flat)
-            #     cute.printf("-------------------- sQ_flat raw:")
-            #     cute.print_tensor(sQ_flat)
-                cute.printf("-------------------- sK_flat raw:")
-                cute.print_tensor(sK_flat)
-            # # Note: add barrier here to make sure print make sense since we'll overwrite sG
-            self.cuda_wg_sync_barrier.arrive_and_wait()
+            # if tidx == 0:
+            #     cute.printf("-------------------- sG_flat raw:")
+            #     cute.print_tensor(sG_flat)
+            # #     cute.printf("-------------------- sQ_flat raw:")
+            # #     cute.print_tensor(sQ_flat)
+            #     cute.printf("-------------------- sK_flat raw:")
+            #     cute.print_tensor(sK_flat)
+            # # # Note: add barrier here to make sure print make sense since we'll overwrite sG
+            # self.cuda_wg_sync_barrier.arrive_and_wait()
 
             for chunk_start in cutlass.range(0, S, C, unroll=0):
                 idx = chunk_start // C
@@ -1888,9 +1888,9 @@ class KDAChunkwise:
                 # TODO: only Allow next TMA Load for G after k^exp(-g) has been consumed by QK & KK
                 g_handle.release()
 
-                if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
-                    cute.printf("-------------------- First row of KK MMA results: ")
-                    cute.print_tensor(tTR_rKK)
+                # if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
+                #     cute.printf("-------------------- First row of KK MMA results: ")
+                #     cute.print_tensor(tTR_rKK)
                 self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 # Inplace modify tTR_rKK to M matrix
@@ -1910,14 +1910,14 @@ class KDAChunkwise:
                 )
                 smem_kk_handle.commit()
 
-                if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
-                    # cute.printf("-------------------- sQ_flat: q * exp(g)")
-                    # cute.print_tensor(sQ_flat)
-                    cute.printf("-------------------- sK_flat: k * exp(g)")
-                    cute.print_tensor(sK_flat)
-                    cute.printf("-------------------- sG_flat stored with K^T*exp(-g):")
-                    cute.print_tensor(sG_flat)
-                self.cuda_wg_sync_barrier.arrive_and_wait()
+                # if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
+                #     # cute.printf("-------------------- sQ_flat: q * exp(g)")
+                #     # cute.print_tensor(sQ_flat)
+                #     cute.printf("-------------------- sK_flat: k * exp(g)")
+                #     cute.print_tensor(sK_flat)
+                #     cute.printf("-------------------- sG_flat stored with K^T*exp(-g):")
+                #     cute.print_tensor(sG_flat)
+                # self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 # TODO: step2: M_inverse = M^{-1} in smem
                 print(f"sM: {sM}")
@@ -2599,7 +2599,7 @@ class KDAChunkwise:
 
         if tidx == 0:
             cute.printf("---------- After Stage1, first 8x8 block:")
-            cute.print_tensor(t8x8mat[None, None, 0, 0], verbose=True)
+            cute.print_tensor(t8x8mat[None, None, 0, 0])
 
         # Stage 2: Invert all 4 diagonal 16x16 blocks
         t16x16mat = cute.flat_divide(s_mat, (16, 16))
@@ -2612,15 +2612,18 @@ class KDAChunkwise:
 
         if tidx == 0:
             print(f"-------------- After stage 2 inverse 16x16, first 16x16 block")
-            cute.print_tensor(t16x16mat[None, None, 0, 0], verbose=True)
+            cute.print_tensor(t16x16mat[None, None, 0, 0])
 
         # Stage 3: Invert all 2 diagonal 32x32 blocks
+        t32x32mat = cute.flat_divide(s_mat, (32, 32))
         if tidx < 64:
-            t32x32mat = cute.flat_divide(s_mat, (32, 32))
             self.compute_diagonal_inverse_16x16_to_32x32(
                 t32x32mat[None, None, tidx//32, tidx//32],
             )
         self.cuda_wg_sync_barrier.arrive_and_wait()
+        if tidx == 0:
+            print(f"-------------- After stage 3 inverse 32x32, first 32x32 block")
+            cute.print_tensor(t32x32mat[None, None, 0, 0])
 
         # Stage 4: Invert the full 64x64 matrix
         self.compute_diagonal_inverse_32x32_to_64x64(s_mat)
@@ -2862,25 +2865,282 @@ class KDAChunkwise:
         print(f"tOsO_dst: {tOsO_dst}")
         cute.copy(O_tiled_copy, tOrO_src, tOsO_dst)
 
+    def canonical_lane_id(self):
+        tidx, _, _ = cute.arch.thread_idx()
+        lane_id = tidx % 32
+        return lane_id
+
     def compute_diagonal_inverse_16x16_to_32x32(
         self,
-        s_block: cute.Tensor,  # Input 16x16 block in smem
+        mat: cute.Tensor,  # Input 16x16 block in smem
     ):
         """
         Compute inverse of a diagonal 16x16 lower triangular block using
         two 8x8 blocks and Schur complement.
         """
-        pass
+        dtype = mat.element_type
+        lane_id = self.canonical_lane_id()
+        mat16x16_2x2 = cute.flat_divide(mat, (16, 16))
+        mma_atom_shape = (16, 8, 16)
+        mma_tiler = (16, 16, 16)
+        mma_atom = cute.nvgpu.warp.MmaF16BF16Op(
+            ab_dtype=dtype,
+            acc_dtype=self.acc_dtype,
+            shape_mnk=mma_atom_shape,
+        )
+        tiled_mma = cute.make_tiled_mma(
+            mma_atom,
+            atom_layout_mnk=(1,1,1),
+            permutation_mnk=mma_tiler,
+        )
+        thr_mma = tiled_mma.get_slice(lane_id)
+        copy_atom_s2r = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=2),
+            mat.element_type,
+        )
+        copy_atom_s2r_t = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=2),
+            mat.element_type,
+        )
+        copy_atom_r2s = cute.make_copy_atom(
+            cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=2),
+            mat.element_type,
+        )
+        copy_atom_r2s_t = cute.make_copy_atom(
+            cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=True, num_matrices=2),
+            mat.element_type,
+        )
+        D_tiled_copy = cute.make_tiled_copy_A(copy_atom_s2r, tiled_mma)
+        C_tiled_copy = cute.make_tiled_copy_B(copy_atom_s2r_t, tiled_mma)
+        A_tiled_copy = cute.make_tiled_copy_B(copy_atom_s2r_t, tiled_mma)
+        O_tiled_copy = cute.make_tiled_copy_C(copy_atom_r2s, tiled_mma)
+        D_thr_copy = D_tiled_copy.get_slice(lane_id)
+        C_thr_copy = C_tiled_copy.get_slice(lane_id)
+        A_thr_copy = A_tiled_copy.get_slice(lane_id)
+        O_thr_copy = O_tiled_copy.get_slice(lane_id)
+        
+        sDInv = mat16x16_2x2[None, None, 1, 1]
+        sC = mat16x16_2x2[None, None, 1, 0]
+        sAInv = mat16x16_2x2[None, None, 0, 0]
+        sO = mat16x16_2x2[None, None, 1, 0]
 
+        sC = cute.make_tensor(sC.iterator, layout=cute.select(sC.layout, mode=[1,0]))
+        sAInv = cute.make_tensor(sAInv.iterator, layout=cute.select(sAInv.layout, mode=[1,0]))
+
+        a_shape = cute.dice(mma_tiler, (1,None,1))
+        b_shape = cute.dice(mma_tiler, (None,1,1))
+        c_shape = cute.dice(mma_tiler, (1,1,None))
+
+        tOrDInv = thr_mma.make_fragment_A(thr_mma.partition_A(sDInv))
+        tOrC    = thr_mma.make_fragment_B(thr_mma.partition_B(sC))
+        tOrAInv = thr_mma.make_fragment_B(thr_mma.partition_B(sAInv))
+
+        tDCrDC  = thr_mma.make_fragment_C(tiled_mma.partition_shape_C(c_shape))
+        tOrO    = thr_mma.make_fragment_C(tiled_mma.partition_shape_C(c_shape))
+
+        tOsDInv    = D_thr_copy.partition_S(sDInv)
+        tOrDInv_cv = D_thr_copy.retile(tOrDInv)
+        tOsC       = C_thr_copy.partition_S(sC)
+        tOrC_cv    = C_thr_copy.retile(tOrC)
+        tOsAInv    = A_thr_copy.partition_S(sAInv)
+        tOrAInv_cv = A_thr_copy.retile(tOrAInv)
+        tOsO       = O_thr_copy.partition_D(sO)
+        tOrO_cv    = O_thr_copy.retile(tOrO)
+
+        print(f"tDCrDC: {tDCrDC}")
+        print(f"tOsDInv: {tOsDInv}")
+        print(f"tOrDInv: {tOrDInv}")
+        print(f"tOrDInv_cv: {tOrDInv_cv}")
+        print(f"tOsC: {tOsC}")
+        print(f"tOrC: {tOrC}")
+        print(f"tOrC_cv: {tOrC_cv}")
+        print(f"tOsAInv: {tOsAInv}")
+        print(f"tOrAInv: {tOrAInv}")
+        print(f"tOrAInv_cv: {tOrAInv_cv}")
+        print(f"tOsO: {tOsO}")
+        print(f"tOrO: {tOrO}")
+        print(f"tOrO_cv: {tOrO_cv}")
+        
+        cute.copy(D_tiled_copy, tOsDInv, tOrDInv_cv)
+        cute.copy(C_tiled_copy, tOsC, tOrC_cv)
+
+        tDCrDC.fill(0.0) # Clear C for D = A*B + C
+        cute.gemm(tiled_mma, tDCrDC, tOrDInv, tOrC, tDCrDC)
+        tDCrDC.store(tDCrDC.load() * cutlass.Float32(-1))
+
+        tOrDC = self.make_acc_as_a(
+            tDCrDC,
+            tiled_mma,
+            mat.element_type,
+        )
+        cute.copy(A_tiled_copy, tOsAInv, tOrAInv_cv)
+        tOrO.fill(0.0) # Clear O for O = A*B + O
+        cute.gemm(tiled_mma, tOrO, tOrDC, tOrAInv, tOrO)
+        
+        tOrO_f16 = cute.make_rmem_tensor_like(tOrO_cv, mat.element_type)
+        tOrO_f16.store(tOrO_cv.load().to(mat.element_type))
+        cute.copy(O_tiled_copy, tOrO_f16, tOsO)
+
+    def convert_layout_c_to_a(
+        self,
+        c_layout: cute.Layout,
+        tiled_mma: cute.TiledMma,
+    ):
+        # TODO: VERIFY THIS
+        cfrag_atom_size = cute.size(c_layout.shape[0])
+        afrag_atom_size = cute.size(tiled_mma.tv_layout_A.shape[1])
+        ratio = afrag_atom_size // cfrag_atom_size
+        print(f"cfrag_atom_size: {cfrag_atom_size}, afrag_atom_size: {afrag_atom_size}")
+
+        if ratio == 1:
+            return c_layout
+
+        divided = cute.logical_divide(c_layout, (None, None, ratio))
+        a_layout = cute.make_layout((
+            # cute.flatten(cute.make_layout((divided.shape[0], divided.shape[2][0]))),
+            cute.flatten((divided.shape[0], divided.shape[2][0])),
+            divided.shape[1],
+            divided.shape[2][1]
+        ))
+        print(f"c_layout: {c_layout}")
+        print(f"a_layout: {a_layout}")
+        return a_layout
+
+    def make_acc_as_a(self, acc: cute.Tensor, tiled_mma: cute.TiledMma, dtype: cute.Numeric):
+        a_layout = self.convert_layout_c_to_a(acc.layout, tiled_mma)
+        a_tensor = cute.make_rmem_tensor(a_layout, dtype=dtype)
+        op_as_acc = cute.make_tensor(a_tensor.iterator, layout=acc.layout)
+        op_as_acc.store(acc.load().to(dtype))
+        return a_tensor
+
+    @cute.jit
     def compute_diagonal_inverse_32x32_to_64x64(
         self,
-        s_block: cute.Tensor,  # Input 16x16 block in smem
+        mat: cute.Tensor,  # Input 16x16 block in smem
     ):
         """
         Compute inverse of a diagonal 16x16 lower triangular block using
         two 8x8 blocks and Schur complement.
         """
-        pass
+        # TODO: try tcgen05 tensor core here since M is 32
+        mat32x32_2x2 = cute.flat_divide(mat, (32, 32))
+        mat_16x2_2x2 = cute.logical_divide(mat32x32_2x2, (16, 16))
+
+        warp_id_wg = cute.arch.warp_idx() % 4
+        x = warp_id_wg // 2
+        y = warp_id_wg % 2
+
+        lane_id = self.canonical_lane_id()
+        mma_atom_shape = (16, 8, 16)
+        mma_atom = cute.nvgpu.warp.MmaF16BF16Op(
+            ab_dtype=mat.element_type,
+            acc_dtype=self.acc_dtype,
+            shape_mnk=mma_atom_shape,
+        )
+        mma_tiler1 = (16, 16, 32)
+        mma_tiler2 = (16, 32, 16)
+        tiled_mma1 = cute.make_tiled_mma(
+            mma_atom,
+            atom_layout_mnk=(1,1,1),
+            permutation_mnk=mma_tiler1,
+        )
+        tiled_mma2 = cute.make_tiled_mma(
+            mma_atom,
+            atom_layout_mnk=(1,1,1),
+            permutation_mnk=mma_tiler2,
+        )
+        thr_mma1 = tiled_mma1.get_slice(lane_id)
+        thr_mma2 = tiled_mma2.get_slice(lane_id)
+        copy_atom_s2r = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+            mat.element_type,
+        )
+        copy_atom_s2r_t = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
+            mat.element_type,
+        )
+        copy_atom_r2s = cute.make_copy_atom(
+            cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4),
+            mat.element_type,
+        )
+        copy_atom_r2s_t = cute.make_copy_atom(
+            cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=True, num_matrices=4),
+            mat.element_type,
+        )
+
+        D_tiled_copy = cute.make_tiled_copy_A(copy_atom_s2r, tiled_mma1)
+        C_tiled_copy = cute.make_tiled_copy_B(copy_atom_s2r_t, tiled_mma1)
+        A_tiled_copy = cute.make_tiled_copy_B(copy_atom_s2r_t, tiled_mma2)
+        O_tiled_s2r = cute.make_tiled_copy_C(copy_atom_s2r, tiled_mma2)
+        O_tiled_r2s = cute.make_tiled_copy_C(copy_atom_r2s, tiled_mma2)
+
+        D_thr_copy = D_tiled_copy.get_slice(lane_id)
+        C_thr_copy = C_tiled_copy.get_slice(lane_id)
+        A_thr_copy = A_tiled_copy.get_slice(lane_id)
+        O_thr_s2r = O_tiled_s2r.get_slice(lane_id)
+        O_thr_r2s = O_tiled_r2s.get_slice(lane_id)
+
+        sDInv = mat_16x2_2x2[(None, y), None, 1, 1]
+        sC    = mat_16x2_2x2[None, (None, x), 1, 0]
+        sAInv = mat_16x2_2x2[(None, x), None, 0, 0]
+        sO    = mat_16x2_2x2[(None, y), None, 1, 0]
+
+        # Make oprand B Col-Major
+        sC = cute.make_tensor(sC.iterator, layout=cute.select(sC.layout, mode=[1,0]))
+        sAInv = cute.make_tensor(sAInv.iterator, layout=cute.select(sAInv.layout, mode=[1,0]))
+
+        tOrDInv = thr_mma1.make_fragment_A(thr_mma1.partition_A(sDInv))
+        tOrC    = thr_mma1.make_fragment_B(thr_mma1.partition_B(sC))
+        tOrAInv = thr_mma2.make_fragment_B(thr_mma2.partition_B(sAInv))
+        
+        tDCrDC = thr_mma1.make_fragment_C(tiled_mma1.partition_shape_C((16,16)))
+        tOrO   = thr_mma2.make_fragment_C(tiled_mma2.partition_shape_C((16,32)))
+
+        tOsDInv    = D_thr_copy.partition_S(sDInv)
+        tOrDInv_cv = D_thr_copy.retile(tOrDInv)
+        tOsC       = C_thr_copy.partition_S(sC)
+        tOrC_cv    = C_thr_copy.retile(tOrC)
+        tOsAInv    = A_thr_copy.partition_S(sAInv)
+        tOrAInv_cv = A_thr_copy.retile(tOrAInv)
+
+        cute.copy(D_tiled_copy, tOsDInv, tOrDInv_cv)
+        cute.copy(C_tiled_copy, tOsC, tOrC_cv)
+
+        tDCrDC.fill(0.0) # Clear C for D = A*B + C
+        cute.gemm(tiled_mma1, tDCrDC, tOrDInv, tOrC, tDCrDC)
+        tDCrDC.store(tDCrDC.load() * cutlass.Float32(-1))
+
+        tOrDC = self.make_acc_as_a(
+            tDCrDC,
+            tiled_mma2,
+            mat.element_type,
+        )
+
+        cute.copy(A_tiled_copy, tOsAInv, tOrAInv_cv)
+        tOrO.fill(0.0) # Clear O for O = A*B
+        cute.gemm(tiled_mma2, tOrO, tOrDC, tOrAInv, tOrO)
+
+        tOrO_f16 = cute.make_rmem_tensor_like(tOrO, mat.element_type)
+        tOrO_f16.store(tOrO.load().to(mat.element_type))
+
+        # Make sure tOsC are consumed since we've 4 warps here.
+        self.cuda_wg_sync_barrier.arrive_and_wait()
+
+        tOsO = O_thr_r2s.partition_D(sO)
+        tOrO_cvt_cv = O_thr_r2s.retile(tOrO_f16)
+        if x == 0:
+            cute.copy(O_tiled_r2s, tOrO_cvt_cv, tOsO)
+
+        self.cuda_wg_sync_barrier.arrive_and_wait()
+
+        if x == 1:
+            # reduce to get correct results
+            tOrO_red = cute.make_rmem_tensor_like(tOrO_f16)
+            tOsO_s = O_thr_s2r.partition_S(sO)
+            tOrO_red_cv = O_thr_s2r.retile(tOrO_red)
+            cute.copy(O_tiled_s2r, tOsO_s, tOrO_red_cv)
+            tOrO_f16.store(tOrO_f16.load() + tOrO_red.load())
+            cute.copy(O_tiled_r2s, tOrO_cvt_cv, tOsO)
 
     @cute.jit
     def apply_mask(
