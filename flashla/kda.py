@@ -74,6 +74,8 @@ import cutlass.cute.testing as testing
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64, Float32
 
+from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
+
 PRINT_DEBUG=False
 
 class Constant:
@@ -82,6 +84,7 @@ class Constant:
     MAX_TMEM_COLS_SM100 = 512
     C = 64   # chunk size
     D = 128  # head dim
+    SCALE = float(D) ** -0.5
 
 class MaskEnum:
     """Enumeration for different mask types."""
@@ -1746,15 +1749,15 @@ class KDAChunkwise:
             should_debug = PRINT_DEBUG and tidx == self.cuda_warp_ids[0]*32 and hidx == 0 and bidx == 0
 
             # -------------- DEBUG -------------
-            # if tidx == 0:
-            #     cute.printf("-------------------- sG_flat raw:")
-            #     cute.print_tensor(sG_flat)
+            if tidx == 0:
+                cute.printf("-------------------- sG_flat raw:")
+                cute.print_tensor(sG_flat)
             #     cute.printf("-------------------- sQ_flat raw:")
             #     cute.print_tensor(sQ_flat)
-            #     cute.printf("-------------------- sK_flat raw:")
-            #     cute.print_tensor(sK_flat)
+                cute.printf("-------------------- sK_flat raw:")
+                cute.print_tensor(sK_flat)
             # # Note: add barrier here to make sure print make sense since we'll overwrite sG
-            # self.cuda_wg_sync_barrier.arrive_and_wait()
+            self.cuda_wg_sync_barrier.arrive_and_wait()
 
             for chunk_start in cutlass.range(0, S, C, unroll=0):
                 idx = chunk_start // C
@@ -1790,7 +1793,6 @@ class KDAChunkwise:
                     space=cute.arch.SharedSpace.shared_cta,
                 )
 
-                g_handle.release()
                 q_handle.release()
                 k_handle.release()
                 
@@ -1817,7 +1819,8 @@ class KDAChunkwise:
                 
                 # Apply gates with KDA beta scaling:
                 # Q' = Q * exp(g)
-                q_gated = q_f32 * exp_g
+                # TODO: support input of scale
+                q_gated = q_f32 * exp_g * Constant.SCALE
                 # K_inter = K * exp(g) - for inter-chunk KV state update (W matrix)
                 k_inter = k_f32 * exp_g
                 # K_intra = K * exp(-g) - for intra-chunk QK^T computation
@@ -1882,6 +1885,14 @@ class KDAChunkwise:
                 # GEMM KK done, can release
                 mma_kk_handle.release()
 
+                # TODO: only Allow next TMA Load for G after k^exp(-g) has been consumed by QK & KK
+                g_handle.release()
+
+                if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
+                    cute.printf("-------------------- First row of KK MMA results: ")
+                    cute.print_tensor(tTR_rKK)
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+
                 # Inplace modify tTR_rKK to M matrix
                 # step1: M = I + StrictTril(beta*KK^T), save M in smem
                 # TODO: drop assignment for tTR_rKK
@@ -1899,19 +1910,19 @@ class KDAChunkwise:
                 )
                 smem_kk_handle.commit()
 
+                if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
+                    # cute.printf("-------------------- sQ_flat: q * exp(g)")
+                    # cute.print_tensor(sQ_flat)
+                    cute.printf("-------------------- sK_flat: k * exp(g)")
+                    cute.print_tensor(sK_flat)
+                    cute.printf("-------------------- sG_flat stored with K^T*exp(-g):")
+                    cute.print_tensor(sG_flat)
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+
                 # TODO: step2: M_inverse = M^{-1} in smem
                 print(f"sM: {sM}")
                 print(f"sM_f16: {sM_f16}")
                 self.compute_matrix_inverse_64x64(sM_f16[None, None, smem_kk_handle.index])
-
-                # if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
-                #     cute.printf("-------------------- sQ_flat: q * exp(g)")
-                #     cute.print_tensor(sQ_flat)
-                #     # cute.printf("-------------------- sK_flat: k * exp(g)")
-                #     # cute.print_tensor(sK_flat)
-                #     # cute.printf("-------------------- sG_flat stored with K^T*exp(-g):")
-                #     # cute.print_tensor(sG_flat)
-                # self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 # ------------------------------------------------------------
                 # NOTE: Save exp(g) of last row to rG_last for state update in next chunk
@@ -2567,7 +2578,11 @@ class KDAChunkwise:
         t8x8mat = cute.flat_divide(s_mat, (8, 8))
         if tidx == 0:
             cute.printf("---------- Raw first 8x8 block:")
-            cute.print_tensor(t8x8mat[None, None, 0, 0], verbose=True)
+            t4x4mat = cute.flat_divide(t8x8mat[None, None, 0, 0], (4, 4))
+            cute.print_tensor(t4x4mat[None, None, 0, 0])
+            cute.print_tensor(t4x4mat[None, None, 0, 1])
+            cute.print_tensor(t4x4mat[None, None, 1, 0])
+            cute.print_tensor(t4x4mat[None, None, 1, 1])
 
         # Block size progression: 8x8 -> 16x16 -> 32x32 -> 64x64
         # Process in stages
@@ -2625,8 +2640,8 @@ class KDAChunkwise:
         row = self.load_row_mat8x8(s_block, lane_id)
         for src_row in cutlass.range_constexpr(8-1):
             row_scale = row[src_row] * cutlass.Float32(-1)
-            # for i in cutlass.range(src_row, unroll_full=True):
-            for i in cutlass.range(src_row):
+            for i in cutlass.range(src_row, unroll_full=True):
+            # for i in cutlass.range(src_row):
                 src_row_value = cute.arch.shuffle_sync_op(
                     value=row[i], offset=src_row, mask=0xFFFFFFFF, mask_and_clamp=8-1
                 )
@@ -3172,6 +3187,10 @@ def main():
     # Beta tensor for KDA: shape (B, S, H)
     # Each position in the sequence can have its own beta value per batch and head
     beta_tensor = torch.randn(B, S, H, device="cuda", dtype=torch.bfloat16).sigmoid()
+
+    # QK, L2 Norm
+    Q, Q_rstd = l2norm_fwd(Q)
+    K, K_rstd = l2norm_fwd(K)
     
     # Convert to dlpack for CuTe
     q_cute = from_dlpack(Q)
