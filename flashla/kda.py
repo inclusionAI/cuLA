@@ -3393,7 +3393,7 @@ def main():
         description="Chunkwise Linear Attention with Headwise Decay"
     )
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
-    parser.add_argument("--seq_len", type=int, default=128, help="Sequence length")
+    parser.add_argument("--seq_len", type=int, default=64, help="Sequence length")
     parser.add_argument("--num_heads", type=int, default=1, help="Number of heads")
     parser.add_argument("--head_dim", type=int, default=128, help="Head dimension")
     parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size")
@@ -3440,10 +3440,10 @@ def main():
     Q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    G = torch.nn.functional.logsigmoid(torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16))  # Gate tensor for KDA (logsigmoid initialized)
     # Beta tensor for KDA: shape (B, S, H)
     # Each position in the sequence can have its own beta value per batch and head
     beta_tensor = torch.randn(B, S, H, device="cuda", dtype=torch.float32).sigmoid()
-    G = torch.nn.functional.logsigmoid(torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16))  # Gate tensor for KDA (logsigmoid initialized)
     
     # Apply cumsum within each chunk (chunk_size=64) and multiply by 1/ln2 for G before passing to kernel
     chunk_size = 64
