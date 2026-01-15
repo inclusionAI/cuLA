@@ -294,7 +294,7 @@ class KDAChunkwise:
 
         self.q_stage = 2
         self.k_stage = 2
-        self.v_stage = 2
+        self.v_stage = 1
         self.o_stage = 2
         self.g_stage = 2  # Single stage for g (CUDA warp processes immediately)
 
@@ -635,6 +635,8 @@ class KDAChunkwise:
             qk_tiled_mma,
             cluster_layout_vmnk.shape,
         )
+        print(f"tma_atom_g: {cute.pretty_str(tma_atom_g)}")
+        print(f"g_smem_layout: {cute.pretty_str(g_smem_layout)}")
         
         # NOTE: G's last row will be extracted from sG in CUDA warp after TMA load
         # No separate TMA needed for G last row - we extract it from the full G tile
@@ -656,7 +658,6 @@ class KDAChunkwise:
         # self.tma_copy_v_bytes = v_copy_size        
         self.tma_copy_v_bytes = k_copy_size
         self.tma_copy_g_bytes = g_copy_size  # NEW for KDA        
-
 
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"q_layout: {cute.pretty_str(q_layout)}")
@@ -1069,11 +1070,17 @@ class KDAChunkwise:
             k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
         )
         # NOTE: reuse same smem as sG
-        sK_neg_g = storage.sG.get_tensor(
+        sK_neg_g_f32 = storage.sG.get_tensor(
             # kv_k_smem_layout_staged.outer, swizzle=kv_k_smem_layout_staged.inner
             # NOTE: same swizzle atom (k-major) as k_smem_layout_staged
             k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
         )
+        # NOTE: recast as bf16 since operand B is BF16
+        # TODO: VERIFY ME, here we keep the same layout, this requires consistent r2s
+        sK_neg_g = cute.make_tensor(
+            cute.recast_ptr(sK_neg_g_f32.iterator, dtype=self.io_dtype),
+            layout=sK_neg_g_f32.layout)
+        print(f"sK_neg_g: {cute.pretty_str(sK_neg_g)}")
         # (((64,2),16),1,4,2):(((1,4096),64),0,1024,8192)>
         sV = storage.sV.get_tensor(
             v_smem_layout_staged.outer, swizzle=v_smem_layout_staged.inner
@@ -1298,6 +1305,12 @@ class KDAChunkwise:
         sG_flat = storage.sG.get_tensor(
             g_smem_layout_coalesce.outer, swizzle=g_smem_layout_coalesce.inner
         )
+        # HALF SPACE
+        sG_flat_as_bf16 = cute.make_tensor(
+            cute.recast_ptr(sG_flat.iterator, dtype=self.io_dtype),
+            layout=sG_flat.layout)
+        print(f"sG_flat: {cute.pretty_str(sG_flat)}")
+        print(f"sG_flat_as_bf16: {cute.pretty_str(sG_flat_as_bf16)}")
         print(f"g_smem_layout_epi: {g_smem_layout_epi}")
         print(f"g_smem_layout_coalesce: {g_smem_layout_coalesce}")
 
@@ -1700,7 +1713,8 @@ class KDAChunkwise:
                 tRS_rG,
             ) = self.make_s2r_partitions_prologue(
                 local_tidx,
-                sG_flat,
+                # sG_flat,
+                sG_flat_as_bf16,
                 shape_g,
             )
             print(f"tiled_s2r_g: {tiled_s2r_g}")
@@ -1810,7 +1824,7 @@ class KDAChunkwise:
                 k_val = tRS_rK.load()  # BF16 tensor
                 
                 # Convert to F32 for exp computation
-                g_f32 = g_val.to(cutlass.Float32)
+                g_f32 = g_val # assert dtype here
                 q_f32 = q_val.to(cutlass.Float32)
                 k_f32 = k_val.to(cutlass.Float32)
                 
@@ -3351,10 +3365,11 @@ class KDAChunkwise:
         copy_atom_s2r_x = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             dtype,
-            # NOTE: make wanna make sure every thread loads a column of 16bits, i.e. one element
-            num_bits_per_copy=16,
+            # NOTE: make wanna make sure every thread loads one element
+            num_bits_per_copy=dtype.width,
         )
-        num_elements_per_thread = 16 // dtype.width
+        # num_elements_per_thread = 16 // dtype.width
+        num_elements_per_thread = 1
         num_threads_per_row = shape_x[1] // num_elements_per_thread
         # NOTE: Assume 128 cuda core threads 
         num_threads_per_col = 128 // num_threads_per_row
@@ -3448,7 +3463,7 @@ def main():
     # Apply cumsum within each chunk (chunk_size=64) and multiply by 1/ln2 for G before passing to kernel
     chunk_size = 64
     num_chunks = S // chunk_size
-    G = G.view(B, num_chunks, chunk_size, H, D).cumsum(dim=2).view(B, S, H, D) * 1.4426950216
+    G = G.float().view(B, num_chunks, chunk_size, H, D).cumsum(dim=2).view(B, S, H, D) * 1.4426950216
     
     # QK, L2 Norm
     Q, Q_rstd = l2norm_fwd(Q)

@@ -1,60 +1,3 @@
----------- Raw first 8x8 block:
-tensor(raw_ptr(0x000000000002c800: f16, smem, align<1024>) o (4,4):(64,1), data=
-       [[ 1.000000,  0.000000,  0.000000,  0.000000, ],
-        [ 0.013077,  1.000000,  0.000000,  0.000000, ],
-        [-0.007172, -0.010437,  1.000000,  0.000000, ],
-        [-0.007828,  0.030624, -0.043732,  1.000000, ]])
-tensor(raw_ptr(0x000000000002c808: f16, smem, align<8>) o (4,4):(64,1), data=
-       [[ 0.000000,  0.000000,  0.000000,  0.000000, ],
-        [ 0.000000,  0.000000,  0.000000,  0.000000, ],
-        [ 0.000000,  0.000000,  0.000000,  0.000000, ],
-        [ 0.000000,  0.000000,  0.000000,  0.000000, ]])
-tensor(raw_ptr(0x000000000002ca00: f16, smem, align<512>) o (4,4):(64,1), data=
-       [[-0.007492, -0.006737, -0.007015,  0.008537, ],
-        [-0.001477, -0.001678,  0.012421, -0.033325, ],
-        [ 0.001599,  0.002464, -0.004009, -0.003025, ],
-        [-0.001817,  0.000148,  0.001115,  0.002176, ]])
-tensor(raw_ptr(0x000000000002ca08: f16, smem, align<8>) o (4,4):(64,1), data=
-       [[ 1.000000,  0.000000,  0.000000,  0.000000, ],
-        [-0.051300,  1.000000,  0.000000,  0.000000, ],
-        [-0.012901,  0.039734,  1.000000,  0.000000, ],
-        [ 0.005592, -0.019318, -0.024277,  1.000000, ]])
----------- After Stage1, first 8x8 block:
-tensor(raw_ptr(0x000000000002c800: f16, smem, align<1024>) o (8,8):(64,1), data=
-       [[ 1.000000,  0.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
-        [-0.013077,  1.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
-        [ 0.007034,  0.010437,  1.000000, ...,  0.000000,  0.000000,  0.000000, ],
-        ...
-        [ 0.002031,  0.000906, -0.010620, ...,  1.000000,  0.000000,  0.000000, ],
-        [-0.001498, -0.002459,  0.004650, ..., -0.039734,  1.000000,  0.000000, ],
-        [ 0.001754, -0.000176, -0.001340, ...,  0.018356,  0.024277,  1.000000, ]])
--------------- After stage 2 inverse 16x16, first 16x16 block
-tensor(raw_ptr(0x000000000002c800: f16, smem, align<1024>) o (16,16):(64,1), data=
-       [[ 1.000000,  0.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
-        [-0.013077,  1.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
-        [ 0.007034,  0.010437,  1.000000, ...,  0.000000,  0.000000,  0.000000, ],
-        ...
-        [ 0.000019,  0.000001, -0.000037, ...,  1.000000,  0.000000,  0.000000, ],
-        [ 0.000009,  0.000002,  0.000018, ..., -0.023529,  1.000000,  0.000000, ],
-        [ 0.000001, -0.000002,  0.000004, ...,  0.000949, -0.012169,  1.000000, ]])
--------------- After stage 3 inverse 32x32, first 32x32 block
-tensor(raw_ptr(0x000000000002c800: f16, smem, align<1024>) o (32,32):(64,1), data=
-       [[ 1.000000,  0.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
-        [-0.013077,  1.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
-        [ 0.007034,  0.010437,  1.000000, ...,  0.000000,  0.000000,  0.000000, ],
-        ...
-        [ -0.000000,  0.000000,  -0.000000, ...,  1.000000,  0.000000,  0.000000, ],
-        [ 0.000000,  -0.000000,  0.000000, ...,  0.039612,  1.000000,  0.000000, ],
-        [ 0.000000,  -0.000000,  0.000000, ..., -0.000548,  0.005543,  1.000000, ]])
--------------- Final inverse 64x64 block
-tensor(raw_ptr(0x000000000002c800: f16, smem, align<1024>) o ((8,8),(64,1)):((64,512),(1,0)), data=
-       [[ 1.000000,  0.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
-        [-0.013077,  1.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
-        [ 0.007034,  0.010437,  1.000000, ...,  0.000000,  0.000000,  0.000000, ],
-        ...
-        [ 0.000000,  0.000000,  0.000000, ...,  1.000000,  0.000000,  0.000000, ],
-        [ 0.000000,  0.000000,  0.000000, ..., -0.016205,  1.000000,  0.000000, ],
-        [ 0.000000,  0.000000,  0.000000, ..., -0.001307, -0.056305,  1.000000, ]])
 Running Chunkwise Linear Attention with CuTe DSL:
   Batch size: 1
   Sequence length: 64
@@ -65,11 +8,20 @@ Running Chunkwise Linear Attention with CuTe DSL:
   Accumulation dtype: Float32
   Warmup iterations: 0
   Benchmark iterations: 1
-size of storage: 197632
+tma_atom_g: Copy Atom
+  ThrID:         1:0
+  TV Layout Src: (1,2048):(0,1)
+  TV Layout Dst: (1,2048):(0,1)
+  Value type:    f32
+g_smem_layout: S<3,4,3> o 0 o ((64,16),1,(2,4)):((32,1),0,(16,2048))
+size of storage: 214016
 m_smem_layout_staged: S<3,4,3> o 0 o ((8,8),(64,1),(1,2)):((64,512),(1,0),(0,4096))
 grid: (1, Int32(?), Int32(?))
-g_smem_layout_epi: S<3,4,3> o 0 o ((8,8),(64,2),(1,2)):((64,512),(1,4096),(0,8192))
-g_smem_layout_coalesce: S<3,4,3> o 0 o (64,(64,2),2):(64,(1,4096),8192)
+sK_neg_g: tensor<ptr<bf16, smem, align<1024>> o ((64,16),1,(4,2),2):((64,1),0,(16,4096),8192)>
+sG_flat: tensor<ptr<f32, smem, align<1024>, S<3,4,3>> o (64,(32,4),2):(32,(1,2048),8192)>
+sG_flat_as_bf16: tensor<ptr<bf16, smem, align<1024>> o (64,(32,4),2):(32,(1,2048),8192)>
+g_smem_layout_epi: S<3,4,3> o 0 o ((8,8),(32,4),(1,2)):((32,256),(1,2048),(0,8192))
+g_smem_layout_coalesce: S<3,4,3> o 0 o (64,(32,4),2):(32,(1,2048),8192)
 -------------------- SMEM STORE: KK
 copy_atom_r2s_x: Copy Atom
   ThrID:         32:1
@@ -124,7 +76,7 @@ Copy Atom
   TV Layout Src:   (1,1):(0,1)
   TV Layout Dst:   (1,1):(0,1)
   Value type:      bf16
-tRS_sG: tensor<ptr<bf16, smem, S<3,4,3>> o ((1,1),64,1,2):((0,0),64,0,8192)>
+tRS_sG: tensor<ptr<bf16, smem> o ((1,1),64,1,2):((0,0),32,0,8192)>
 tRS_rG: tensor<ptr<bf16, rmem, align<32>> o ((1,1),64,1):((0,0),1,0)>
 tiled_s2r_q: Tiled Copy
   Tiler MN:        (1:0,128:1)
@@ -257,10 +209,31 @@ a_layout: ((2,2,2),1,1):((1,2,4),0,0)
 cfrag_atom_size: 4, afrag_atom_size: 8
 c_layout: ((2,2),1,2):((1,2),0,4)
 a_layout: ((2,2,2),1,1):((1,2,4),0,0)
-Compilation time: 3.8356 seconds
-B, S, H, D: (1, 64, 1, 128)
+Traceback (most recent call last):
+  File "/ossfs/workspace/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/base_dsl/dsl.py", line 1005, in compile_and_jit
+    kernel = self.compiler_provider.compile_and_jit(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/ossfs/workspace/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/base_dsl/compiler.py", line 186, in compile_and_jit
+    self.compile(
+  File "/ossfs/workspace/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/base_dsl/compiler.py", line 161, in compile
+    raise e
+  File "/ossfs/workspace/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/base_dsl/compiler.py", line 148, in compile
+    pm.run(module.operation)
+cutlass._mlir._mlir_libs._site_initialize.<locals>.MLIRError: Failure while executing pass pipeline:
+error: "tCrB = tiled_mma.make_fragment_B(smem_b)"("/ossfs/workspace/flashla/flashla/kda.py":3208:11): failed to legalize operation 'cute_nvgpu.make_umma_smem_desc' that was explicitly marked illegal
+ note: "tCrB = tiled_mma.make_fragment_B(smem_b)"("/ossfs/workspace/flashla/flashla/kda.py":3208:11): see current operation: %1186 = "cute_nvgpu.make_umma_smem_desc"(%1164) <{layout = #cute.layout<"((64,16),1,(4,2),2):((64,1),0,(16,4096),8192)">, major = #cute_nvgpu.major<k>}> : (!cute.ptr<bf16, smem, align<1024>>) -> !cute_nvgpu.smem_desc
 
-Execution time: 16.13 ms (average over 1 iterations)
-Throughput: 0.00 GB/s
+During handling of the above exception, another exception occurred:
 
-PASS
+Traceback (most recent call last):
+  File "/ossfs/workspace/flashla/flashla/kda.py", line 3547, in <module>
+    main()
+  File "/ossfs/workspace/flashla/flashla/kda.py", line 3493, in main
+    compiled = cute.compile(
+               ^^^^^^^^^^^^^
+  File "/ossfs/workspace/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/base_dsl/dsl.py", line 1025, in compile_and_jit
+    raise DSLRuntimeError("🧊🧊🧊 ICE 🧊🧊🧊", cause=e)
+cutlass.base_dsl.common.DSLRuntimeError: DSLRuntimeError: 🧊🧊🧊 ICE 🧊🧊🧊
+  Caused exception: Failure while executing pass pipeline:
+error: "tCrB = tiled_mma.make_fragment_B(smem_b)"("/ossfs/workspace/flashla/flashla/kda.py":3208:11): failed to legalize operation 'cute_nvgpu.make_umma_smem_desc' that was explicitly marked illegal
+ note: "tCrB = tiled_mma.make_fragment_B(smem_b)"("/ossfs/workspace/flashla/flashla/kda.py":3208:11): see current operation: %1186 = "cute_nvgpu.make_umma_smem_desc"(%1164) <{layout = #cute.layout<"((64,16),1,(4,2),2):((64,1),0,(16,4096),8192)">, major = #cute_nvgpu.major<k>}> : (!cute.ptr<bf16, smem, align<1024>>) -> !cute_nvgpu.smem_desc
