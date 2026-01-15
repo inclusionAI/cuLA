@@ -124,6 +124,7 @@ class KDAChunkwise:
         self.pv_acc_dtype = kv_acc_dtype
         self.acc_dtype = acc_dtype
         self.io_dtype = io_dtype
+        self.inverse_dtype = cutlass.Float16  # For inverse
 
         # Warp specialization
         self.num_load_warps = 1
@@ -1963,10 +1964,37 @@ class KDAChunkwise:
                 #     cute.print_tensor(sG_flat)
                 # self.cuda_wg_sync_barrier.arrive_and_wait()
 
-                # TODO: step2: M_inverse = M^{-1} in smem
                 print(f"sM: {sM}")
                 print(f"sM_f16: {sM_f16}")
-                self.compute_matrix_inverse_64x64(sM_f16[None, None, smem_kk_handle.index])
+
+                curr_sM = sM[None, None, smem_kk_handle.index]
+                curr_sM_f16 = sM_f16[None, None, smem_kk_handle.index]
+                self.compute_matrix_inverse_64x64(curr_sM_f16)
+
+                # Plans:
+                #
+                # TODO: Final M = M^{-1} * beta
+                # S2R, scale with beta, convert to BF16, store back to smem `sM`
+                self.scale_M_inverse_with_beta(local_tidx, beta_chunk, curr_sM_f16, curr_sM)
+                
+                # Let Kg = K * exp(g_cumsum)
+                # Let Kn = K * exp(-g_cumsum)
+                # Let Qg = Q * exp(g_cumsum)
+                # 
+                # TODO: Produce pseudo-V = M * (V - Kg * States)
+                # {Pseudo-V} ^ T = (V^T - State^T * Kg^T) * M^T
+                # State stored as inputs:
+                
+
+                # TODO:
+                #
+                # Maintain of S:
+                # S_{t+1} = Diag(G)*S_{t} + Kg^T* PseudoV
+                # 
+                # O_Inter = Qg * S
+                # O_Intra = Tril(Qg * Kn^T) * PseudoV
+                # O = O_Inter + O_Intra
+
 
                 # ------------------------------------------------------------
                 # NOTE: Save exp(g) of last row to rG_last for state update in next chunk
@@ -2674,6 +2702,116 @@ class KDAChunkwise:
         if tidx == 0:
             cute.printf("-------------- Final inverse 64x64 block\n")
             cute.print_tensor(s_mat, verbose=False)
+
+    @cute.jit
+    def scale_M_inverse_with_beta(
+        self,
+        local_tidx,
+        beta_vec: cute.Tensor,  # (C, 1) vector of beta values from gmem
+        sM_f16: cute.Tensor,    # Input M^{-1} in smem, Float16, shape (64, 64, STAGE)
+        sM: cute.Tensor,        # Output M^{-1}*beta in smem, BFloat16, shape (64, 64, STAGE)
+    ):
+        """
+        Scale M^{-1} by beta and convert from Float16 to BFloat16.
+        
+        For each row i: M_scaled[i, :] = beta[i] * M_inverse[i, :]
+        
+        Uses 128 threads (4 warps × 32 threads) to process 64×64 matrix.
+        Each thread processes one row (64 elements), with 2 rows per thread
+        across all 128 threads covering 64 rows in 2 passes, or each thread
+        handles half a row.
+        
+        Strategy: 128 threads, 64 rows, each pair of threads handles one row.
+        Thread 2*i and 2*i+1 handle row i, with 32 elements each.
+        
+        Args:
+            beta_vec: KDA beta scaling factor, shape (C, 1)
+            sM_f16: Input M^{-1} matrix in smem (Float16), shape (64, 64, STAGE)
+            sM: Output scaled matrix in smem (BFloat16), shape (64, 64, STAGE)
+        """
+        tidx, _, _ = cute.arch.thread_idx()
+        tidx = tidx % 128
+        
+        C = 64  # Chunk size
+        
+        # Each thread handles half a row (32 elements)
+        # Thread layout: thread i handles row (i//2), columns [(i%2)*32 : (i%2+1)*32]
+        row_idx = tidx // 2      # 0-63
+        col_offset = (tidx % 2) * 32  # 0 or 32
+        
+        # Load beta value for this row
+        beta_val = beta_vec[row_idx].to(cutlass.Float32)
+        
+        # Create copy atom for smem <-> rmem transfers (32 elements at once)
+        copy_atom_s2r_x = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            sM_f16.element_type,
+            # (64,64) ; copy half row
+            num_bits_per_copy=32 * 16,
+        )
+        copy_atom_r2s_x = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            sM.element_type,
+            # (64,64) ; copy half row
+            num_bits_per_copy=32 * 16,
+        )
+
+        shape_x = cute.coalesce(sM_f16.layout, target_profile=(1,1)).shape
+
+        print(f"shape_x: {shape_x}")
+
+        num_elements_per_thread = 32
+        num_threads_per_row = shape_x[1] // num_elements_per_thread
+        # NOTE: Assume 128 cuda core threads 
+        num_threads_per_col = 128 // num_threads_per_row
+        # (64,2):(2,1)
+        thread_layout = cute.make_layout(
+            (num_threads_per_col, num_threads_per_row),
+            stride=(num_threads_per_row, 1),
+        )
+        val_layout = cute.make_layout((1, num_elements_per_thread))
+        tiled_s2r_x = cute.make_tiled_copy_tv(
+            copy_atom_s2r_x,
+            thread_layout,
+            val_layout,
+        )
+        thr_s2r_x = tiled_s2r_x.get_slice(local_tidx)
+        # Partition shared tensor for smem load Bt
+        # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
+        tXsX_s2r = thr_s2r_x.partition_S(sM_f16)
+
+        # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
+        tXrX_s2r = cute.make_rmem_tensor(
+            tXsX_s2r.shape,
+            sM_f16.element_type,
+        )
+
+        cute.copy(copy_atom_s2r_x, tXsX_s2r, tXrX_s2r)
+
+        tXrX_s2r.store((tXrX_s2r.load().to(cutlass.Float32) * beta_val).to(sM.element_type))
+
+        tiled_r2s_x = cute.make_tiled_copy_tv(
+            copy_atom_r2s_x,
+            thread_layout,
+            val_layout,
+        )
+        thr_r2s_x = tiled_r2s_x.get_slice(local_tidx)
+
+        # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
+        tXsX_r2s = thr_r2s_x.partition_S(sM)
+
+        print(f"tXsX_r2s: {tXsX_r2s}")
+        print(f"tXsX_s2r: {tXsX_s2r}")
+        print(f"tXrX_s2r: {tXrX_s2r}")
+
+        cute.copy(copy_atom_r2s_x, tXrX_s2r, tXsX_r2s)
+
+        # TODO: check fence
+        cute.arch.fence_proxy(
+            cute.arch.ProxyKind.async_shared,
+            space=cute.arch.SharedSpace.shared_cta,
+        )
+        
 
     @cute.jit
     def compute_diagonal_inverse_8x8(
