@@ -76,6 +76,8 @@ from cutlass.cute.typing import Int32, Int64, Float32
 
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 
+import flashla.utils
+
 PRINT_DEBUG=False
 
 class Constant:
@@ -1078,9 +1080,13 @@ class KDAChunkwise:
         # NOTE: recast as bf16 since operand B is BF16
         # TODO: VERIFY ME, here we keep the same layout, this requires consistent r2s
         sK_neg_g = cute.make_tensor(
-            cute.recast_ptr(sK_neg_g_f32.iterator, dtype=self.io_dtype),
+            cute.recast_ptr(
+                sK_neg_g_f32.iterator,
+                swizzle_=k_smem_layout_staged.inner,
+                dtype=self.io_dtype),
             layout=sK_neg_g_f32.layout)
         print(f"sK_neg_g: {cute.pretty_str(sK_neg_g)}")
+        print(f"sK_g: {cute.pretty_str(sK_g)}")
         # (((64,2),16),1,4,2):(((1,4096),64),0,1024,8192)>
         sV = storage.sV.get_tensor(
             v_smem_layout_staged.outer, swizzle=v_smem_layout_staged.inner
@@ -1184,6 +1190,16 @@ class KDAChunkwise:
         sK_flat_s2r = storage.sK.get_tensor(
             k_smem_layout_coalesce.outer, swizzle=k_smem_layout_coalesce.inner
         )
+
+        sG_flat_s2r_f32_fake = storage.sG.get_tensor(
+            k_smem_layout_coalesce.outer, swizzle=k_smem_layout_coalesce.inner
+        )
+        sG_flat_bf16 = cute.make_tensor(
+            cute.recast_ptr(
+                sG_flat_s2r_f32_fake.iterator,
+                swizzle_=k_smem_layout_coalesce.inner,
+                dtype=self.io_dtype),
+            layout=k_smem_layout_coalesce.outer)
 
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"sQ: {cute.pretty_str(sQ)}")
@@ -1705,21 +1721,34 @@ class KDAChunkwise:
             # G (gate/g_cumsum) - NEW for KDA Step 1
 
             shape_g = (Constant.C, Constant.D)
+            # LOAD AS F32
             (
                 tiled_s2r_g,
                 thr_s2r_g,
-                # ()
                 tRS_sG,
                 tRS_rG,
             ) = self.make_s2r_partitions_prologue(
                 local_tidx,
-                # sG_flat,
-                sG_flat_as_bf16,
+                sG_flat,
+                shape_g,
+            )
+            # STORE k * exp(-g) AS BF16
+            (
+                tiled_s2r_g_bf16,
+                thr_s2r_g_bf16,
+                tRS_sG_bf16,
+                tRS_rG_bf16,
+            ) = self.make_s2r_partitions_prologue(
+                local_tidx,
+                sG_flat_bf16,
                 shape_g,
             )
             print(f"tiled_s2r_g: {tiled_s2r_g}")
             print(f"tRS_sG: {tRS_sG}")
             print(f"tRS_rG: {tRS_rG}")
+            print(f"tiled_s2r_g_bf16: {tiled_s2r_g_bf16}")
+            print(f"tRS_sG_bf16: {tRS_sG_bf16}")
+            print(f"tRS_rG_bf16: {tRS_rG_bf16}")
             #-------------------------------------------------------
 
             #-------------------------------------------------------
@@ -1754,10 +1783,11 @@ class KDAChunkwise:
                 shape_k,
             )
             # Create additional RMEM tensor for K_inter = K * exp(g)
-            tRS_rK_inter = cute.make_rmem_tensor_like(tRS_rK, dtype=self.io_dtype)
+            # tRS_rK_inter = cute.make_rmem_tensor_like(tRS_rK, dtype=self.io_dtype)
             print(f"tiled_s2r_k: {tiled_s2r_k}")
             print(f"tRS_sK: {tRS_sK}")
             print(f"tRS_rK: {tRS_rK}")
+            # print(f"tRS_rK_inter: {tRS_rK_inter}")
             #-------------------------------------------------------
 
             should_debug = PRINT_DEBUG and tidx == self.cuda_warp_ids[0]*32 and hidx == 0 and bidx == 0
@@ -1847,8 +1877,8 @@ class KDAChunkwise:
                 
                 # Store gated values to RMEM tensors
                 tRS_rQ.store(q_gated_bf16)
-                tRS_rK_inter.store(k_inter_bf16)  # K * exp(g) for inter-chunk
-                tRS_rK.store(k_intra_bf16)        # K * exp(-g) for intra-chunk
+                tRS_rG_bf16.store(k_intra_bf16)  # K * exp(-g) for inter-chunk
+                tRS_rK.store(k_inter_bf16)        # K * exp(g) for intra-chunk
                 
                 # ============================================================
                 # KDA Step 3: Write gated Q', K_inter, K_intra back to SMEM
@@ -1864,11 +1894,11 @@ class KDAChunkwise:
                 
                 k2_handle = load_k2_producer.acquire_and_advance()
                 # Write K_inter = K * exp(g) to SMEM[K]
-                cute.copy(tiled_s2r_k, tRS_rK_inter, tRS_sK[(None, None, None, k_stage_idx)])
+                cute.copy(tiled_s2r_k, tRS_rK, tRS_sK[(None, None, None, k_stage_idx)])
                 
                 # Write K_intra = K * exp(-g) to SMEM[G] (overwrite g)
                 kt2_handle = load_kt2_producer.acquire_and_advance()
-                cute.copy(tiled_s2r_g, tRS_rK, tRS_sG[(None, None, None, g_stage_idx)])
+                cute.copy(tiled_s2r_g_bf16, tRS_rG_bf16, tRS_sG_bf16[(None, None, None, g_stage_idx)])
                 
                 # Fence for shared memory writes
                 cute.arch.fence_proxy(
@@ -2642,8 +2672,8 @@ class KDAChunkwise:
         # Stage 4: Invert the full 64x64 matrix
         self.compute_diagonal_inverse_32x32_to_64x64(s_mat)
         if tidx == 0:
-            cute.printf("-------------- Final inverse 64x64 block")
-            cute.print_tensor(s_mat)
+            cute.printf("-------------- Final inverse 64x64 block\n")
+            cute.print_tensor(s_mat, verbose=False)
 
     @cute.jit
     def compute_diagonal_inverse_8x8(
