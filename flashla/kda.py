@@ -2290,7 +2290,7 @@ class KDAChunkwise:
                     cute.arch.fence_view_async_tmem_load()
 
                     scaled = self.scale_state(tTR_rKV, sG_last[None, g_stage_idx])
-                    # TODO: shall we use a new register here? Is the compiler smart enough?
+                    # TODO: shall we use a new rmem tensor here? Is the compiler smart enough?
                     tTR_rKV.store(scaled.to(cutlass.Float32))
 
                     # NOTE: TMEM STORE DECAY KV STATE to enable accumulation over chunks
