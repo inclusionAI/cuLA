@@ -2262,7 +2262,8 @@ class KDAChunkwise:
 
                     kv16_handle = kv16_producer.acquire_and_advance()
                     #####################################################################3
-                    tmem_store_rAccKVAsBF16.store(tTR_rKV.load().to(self.io_dtype))
+                    scaled = tTR_rKV.load() * rG_last
+                    tmem_store_rAccKVAsBF16.store(scaled.to(self.io_dtype))
                     tmem_store_tAccKVi = tmem_store_tAccKV[None, None, None, None, kv16_handle.index]
                     cute.copy(tmem_store_kv, tmem_store_rAccKV, tmem_store_tAccKVi)
                     cute.arch.fence_view_async_tmem_store()
