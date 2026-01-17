@@ -1370,6 +1370,17 @@ class KDAChunkwise:
             acc_stages=1,
         )
 
+        # REUSE PV TMEM FOR KS MMA
+        tCrState_KS, tCrK_KS, tCtAccKS = self.mma_partition_ts(
+            tiled_mma=ks_tiled_mma,
+            tile_shape_mnk=self.ks_mma_tiler,
+            a_tmem_layout=state_tmem_layout_staged,
+            smem_b=sK_g,
+            tmem_a_ptr=tmem_ptr_base + self.tmem_kv16_cols_offset,
+            tmem_acc_ptr=tmem_ptr_base + self.tmem_pv_cols_offset,
+            acc_stages=1,
+        )
+
         ############################################
         kv_mma_tiler2 = (self.kv_mma_tiler[0], self.kv_mma_tiler[1] // 2, self.kv_mma_tiler[2])
         fake_kv_tiled_mma_acc32 = sm100_utils.make_trivial_tiled_mma(
@@ -1586,10 +1597,11 @@ class KDAChunkwise:
                     ks_handle = ks_producer.acquire_and_advance()
                     ks_tiled_mma = self.exec_mma(
                         tiled_mma=ks_tiled_mma,
-                        tCtAcc=tCtStateAsF32,
-                        tCrA=tCrState,
+                        # REUSE TMEM of PV
+                        tCtAcc=tCtAccKS,
+                        tCrA=tCrState_KS,
                         # NOTE: S^T * K^T,  this is still k-major, its ok to reuse here
-                        tCrB=tCrKG,
+                        tCrB=tCrK_KS,
                         a_stage_idx=k_handle.index,
                         b_stage_idx=k_handle.index,
                         acc_stage_idx=ks_handle.index,
@@ -1819,7 +1831,6 @@ class KDAChunkwise:
                 smem_p=sQK,
                 tiled_t2r_qk=tiled_t2r_S,
                 tPrP_t2r=tTR_rP,
-                # tiled_mma=vp_tiled_mma,
                 tiled_mma=qk_tiled_mma,
             )
 
@@ -2191,15 +2202,15 @@ class KDAChunkwise:
                 )
                 v_handle.release()
 
-                # TODO: copy KS from TMEM to RMEM, NOTE KS reuse TMEM of QS
-                # TODO: check the layout equivalence, should be both row-major
-                tTR_rAcc_ks = cute.make_tensor(tTR_rAcc_sq.iterator, layout=tRS_rV.layout)
+                # TODO: copy KS from TMEM to RMEM, NOTE KS reuse TMEM of PV, since they have the same shapes
+                # TODO: check the layout equivalence, should be row-major
+                tTR_rAcc_ks = cute.make_tensor(tTR_rAcc_pv.iterator, layout=tRS_rV.layout)
                 if idx != 0:
                     # Wait for KS
                     ks_handle = ks_consumer.wait_and_advance()
-                    tTR_tAcc_ks_i = tTR_tAcc_base_sq[(None, None, None, 0, 0, ks_handle.index)] # KS HANDLE INDEX == 0
+                    tTR_tAcc_ks_i = tTR_tAcc_base_pv[(None, None, None, 0, 0, ks_handle.index)] # KS HANDLE INDEX == 0
                     # Load KS from TMEM to RMEM, (128,64)
-                    cute.copy(tiled_copy_t2r_sq, tTR_tAcc_ks_i, tTR_rAcc_sq)
+                    cute.copy(tiled_copy_t2r_sq, tTR_tAcc_ks_i, tTR_rAcc_pv)
                     cute.arch.fence_view_async_tmem_load()
                     ks_handle.release()
 
@@ -2271,10 +2282,15 @@ class KDAChunkwise:
                     cute.arch.fence_view_async_tmem_load()
                     kv_handle.release()
 
+                    scaled = self.scale_state(tTR_rKV, sG_last[None, g_stage_idx])
+                    tTR_rKV.store(scaled.to(cutlass.Float32))
+
+                    cute.copy(, tmem_store_rAccKV, tmem_store_tAccKVi)
+                    cute.arch.fence_view_async_tmem_store()
+
                     kv16_handle = kv16_producer.acquire_and_advance()
                     #####################################################################3
                     # V^T*K -> (Dv, Dk)
-                    scaled = self.scale_state(tTR_rKV, sG_last[None, g_stage_idx])
                     tmem_store_rAccKVAsBF16.store(scaled.to(self.io_dtype))
                     tmem_store_tAccKVi = tmem_store_tAccKV[None, None, None, None, kv16_handle.index]
                     cute.copy(tmem_store_kv, tmem_store_rAccKV, tmem_store_tAccKVi)
