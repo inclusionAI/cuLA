@@ -78,7 +78,7 @@ from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 
 import flashla.utils
 
-PRINT_DEBUG=False
+PRINT_DEBUG=True
 
 class Constant:
     """Common constants used in KDA implementation."""
@@ -124,6 +124,7 @@ class KDAChunkwise:
         self.pv_acc_dtype = kv_acc_dtype
         self.acc_dtype = acc_dtype
         self.io_dtype = io_dtype
+        self.mv_acc_stage = 1
         self.inverse_dtype = cutlass.Float16  # For inverse
 
         # Warp specialization
@@ -144,12 +145,14 @@ class KDAChunkwise:
         self.kk_mma_tiler = (C, C, D)  # (M, N, K)
         # (D, C, C)
         self.vp_mma_tiler = (D, C, C)  # (M, N, K)
+        self.mv_mma_tiler = (D, C, C)  # (M, N, K)
         # (D, D, C)
         self.kv_mma_tiler = (D, D, C)  # (M, N, K)
         # (D, C, D)
         # State as operand A since it's in TMEM
         # Q now as operand B
         self.sq_mma_tiler = (D, C, D)  # (M, N, K)
+        self.ks_mma_tiler = (D, C, D)  # (M, N, K)
 
         # one-cta cluster shape
         self.cluster_shape_mnk = (1, 1, 1)
@@ -303,6 +306,7 @@ class KDAChunkwise:
 
         self.epi_stage = 2
         self.acc_stage = 2
+        self.ks_stage = 1
         self.o_inter_stage = 1
         self.o_intra_stage = 2
 
@@ -476,6 +480,28 @@ class KDAChunkwise:
             self.sq_mma_tiler[:2],
             a_source=tcgen05.OperandSource.TMEM,
         )
+        ks_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.io_dtype,
+            # State is in TMEM, always K major, TODO
+            tcgen05.OperandMajorMode.K,
+            # State is in TMEM, always K major, TODO
+            self.k_major_mode,
+            self.acc_dtype,
+            self.cta_group,
+            self.ks_mma_tiler[:2],
+            a_source=tcgen05.OperandSource.TMEM,
+        )
+
+        m_major_mode = tcgen05.OperandMajorMode.K
+        mv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.v_dtype,
+            self.v_major_mode,
+            m_major_mode,
+            self.acc_dtype,
+            self.cta_group,
+            self.mv_mma_tiler[:2],
+        )
+
         p_major_mode = tcgen05.OperandMajorMode.K
         vp_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.v_dtype,
@@ -715,6 +741,9 @@ class KDAChunkwise:
             load_k2_mbar_ptr: cute.struct.MemRange[Int64, self.k_stage * 2] # type: ignore
             load_kt2_mbar_ptr: cute.struct.MemRange[Int64, self.k_stage * 2] # type: ignore
             load_v_mbar_ptr: cute.struct.MemRange[Int64, self.v_stage * 2] # type: ignore
+            load_v2_mbar_ptr: cute.struct.MemRange[Int64, self.v_stage * 2] # type: ignore
+            load_v3_mbar_ptr: cute.struct.MemRange[Int64, self.v_stage * 2] # type: ignore
+            pseudo_v_mbar_ptr: cute.struct.MemRange[Int64, self.v_stage * 2] # type: ignore
             load_g_mbar_ptr: cute.struct.MemRange[Int64, self.g_stage * 2] # type: ignore  # NEW for KDA
             # KDA gating sync: CUDA warp notifies MMA warp that Q'/K' are ready
             kda_gate_mbar_ptr: cute.struct.MemRange[Int64, self.q_stage * 2] # type: ignore  # NEW for KDA
@@ -729,6 +758,7 @@ class KDAChunkwise:
             kv16_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
             p_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
             o_intra_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
+            ks_mbar_ptr: cute.struct.MemRange[Int64, self.ks_stage * 2] # type: ignore
             o_inter_mbar_ptr: cute.struct.MemRange[Int64, 1 * 2] # type: ignore
             smem_o_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
             # Tmem holding buffer
@@ -783,6 +813,8 @@ class KDAChunkwise:
             kv_tiled_mma,
             vp_tiled_mma,
             sq_tiled_mma,
+            ks_tiled_mma,
+            mv_tiled_mma,
             tma_atom_q,
             tma_tensor_q,
             tma_atom_k,
@@ -822,6 +854,8 @@ class KDAChunkwise:
         kv_tiled_mma: cute.TiledMma,
         vp_tiled_mma: cute.TiledMma,
         sq_tiled_mma: cute.TiledMma,
+        ks_tiled_mma: cute.TiledMma,
+        mv_tiled_mma: cute.TiledMma,
         tma_atom_q: cute.CopyAtom,
         tma_tensor_q: cute.Tensor,
         tma_atom_k: cute.CopyAtom,
@@ -911,6 +945,26 @@ class KDAChunkwise:
             consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             tx_count=self.tma_copy_v_bytes,
             barrier_storage=storage.load_v_mbar_ptr.data_ptr(),
+        ).make_participants()
+        load_v2_producer, load_v2_consumer = pipeline.PipelineAsync.create(
+            num_stages=self.v_stage,
+            producer_group=make_thread_cooperative_group(32*len(self.cuda_warp_ids)),
+            consumer_group=make_thread_cooperative_group(32*len([self.mma_warp_id])),
+            barrier_storage=storage.load_v2_mbar_ptr.data_ptr(),
+        ).make_participants()
+        pseudo_v_producer, pseudo_v_consumer = pipeline.PipelineUmmaAsync.create(
+            num_stages=self.v_stage,
+            producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
+            consumer_group=make_thread_cooperative_group(
+                self.threads_per_warp * len(self.cuda_warp_ids)
+            ),
+            barrier_storage=storage.pseudo_v_mbar_ptr.data_ptr(),
+        ).make_participants()
+        load_v3_producer, load_v3_consumer = pipeline.PipelineAsync.create(
+            num_stages=self.v_stage,
+            producer_group=make_thread_cooperative_group(32*len(self.cuda_warp_ids)),
+            consumer_group=make_thread_cooperative_group(32*len([self.mma_warp_id])),
+            barrier_storage=storage.load_v3_mbar_ptr.data_ptr(),
         ).make_participants()
         # G (gate/g_cumsum) - NEW for KDA
         load_g_producer, load_g_consumer = pipeline.PipelineTmaAsync.create(
@@ -1003,6 +1057,15 @@ class KDAChunkwise:
                 self.threads_per_warp * len(self.cuda_warp_ids)
             ),
             barrier_storage=storage.o_intra_mbar_ptr.data_ptr(),
+        ).make_participants()
+        ks_producer, ks_consumer = pipeline.PipelineUmmaAsync.create(
+            # NO STAGE for Kg * STATE
+            num_stages=1,
+            producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
+            consumer_group=make_thread_cooperative_group(
+                self.threads_per_warp * len(self.cuda_warp_ids)
+            ),
+            barrier_storage=storage.ks_mbar_ptr.data_ptr(),
         ).make_participants()
         o_inter_producer, o_inter_consumer = pipeline.PipelineUmmaAsync.create(
             # NO STAGE for Q*STATE
@@ -1115,7 +1178,15 @@ class KDAChunkwise:
         sM = storage.sM.get_tensor(
             m_smem_layout_staged.outer, swizzle=m_smem_layout_staged.inner
         )
-        sM_f16 = cute.make_tensor(cute.recast_ptr(sM.iterator, dtype=cutlass.Float16), layout=sM.layout)
+        sM_opB = storage.sM.get_tensor(
+            p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner
+        )
+        sM_f16 = cute.make_tensor(
+            cute.recast_ptr(
+                sM.iterator,
+                swizzle_=m_smem_layout_staged.inner,
+                dtype=cutlass.Float16),
+            layout=sM.layout)
 
         # (MMA, MMA_M, MMA_K, STAGE_O)
 
@@ -1147,6 +1218,19 @@ class KDAChunkwise:
         # sV_flat_layout = cute.make_layout((128, 64, 2), stride=(128,1,64))
         sV_flat = storage.sV.get_tensor(
             sV_flat_layout, swizzle=v_smem_layout_staged.inner,
+        )
+        v_smem_layout_epi = sm100_utils.make_smem_layout_epi(
+            self.v_dtype,
+            utils.LayoutEnum.ROW_MAJOR,
+            (Constant.C, Constant.D),
+            self.v_stage,
+        )
+        v_smem_layout_coalesce = cute.coalesce(
+            v_smem_layout_epi,
+            target_profile=(1, 1, 1),
+        )
+        sV_flat_s2r = storage.sV.get_tensor(
+            v_smem_layout_coalesce.outer, swizzle=v_smem_layout_coalesce.inner
         )
 
         # ((64,16),1,(4,2),2):
@@ -1302,6 +1386,21 @@ class KDAChunkwise:
             sP,
             tmem_ptr_base + self.tmem_pv_cols_offset,
             self.acc_stage,
+        )
+
+        # Make fragments/tmem for MV MMA.
+        # (MMA, MMA_M, MMA_K, INPUT_STAGE)
+        # (MMA, MMA_N, MMA_K, INPUT_STAGE)
+        # (MMA, MMA_M, MMA_N, ACC_STAGE)
+        print(f"sP: {cute.pretty_str(sP)}")
+        print(f"sM: {cute.pretty_str(sM)}")
+        tCrV_corr, tCrM, tCtAccMV = self.mma_partition_ss(
+            mv_tiled_mma,
+            self.mv_mma_tiler,
+            sV,
+            sM_opB,
+            tmem_ptr_base + self.tmem_pv_cols_offset,
+            self.mv_acc_stage,
         )
 
         # -------------------------------------------------------
@@ -1467,10 +1566,30 @@ class KDAChunkwise:
                 q_handle = load_q2_consumer.wait_and_advance()
 
                 if idx != 0:
+                    # TODO: support initial state, should be trivial
+
+                    #############################################
+                    # HANDLE KS
                     kv16_handle = kv16_consumer.wait_and_advance()
+                    # Calculate MMA(State, Kg)
+                    # Produce KS, need to create a operand B style
+                    ks_handle = ks_producer.acquire_and_advance()
+                    ks_tiled_mma = self.exec_mma(
+                        tiled_mma=ks_tiled_mma,
+                        tCtAcc=tCtStateAsF32,
+                        tCrA=tCrState,
+                        # NOTE: S^T * K^T,  this is still k-major, its ok to reuse here
+                        tCrB=tCrKG,
+                        a_stage_idx=k_handle.index,
+                        b_stage_idx=k_handle.index,
+                        acc_stage_idx=ks_handle.index,
+                    )
+                    ks_handle.commit()
+
+                    #############################################
+                    # HANDLE QS
                     o_inter_handle = o_inter_producer.acquire_and_advance()
 
-                    # TODO: support initial state
                     # Compute SQ once Qi is ready.
                     sq_tiled_mma = self.exec_mma(
                         tiled_mma=sq_tiled_mma,
@@ -1502,8 +1621,28 @@ class KDAChunkwise:
                 s0_handle.commit()
                 # End of GEMM (Qi, Ki) -> S0i
 
+                #-------------------------------------------------------------
+                # PRODUCE PSEUDO_V HERE
+                kk_handle = smem_kk_consumer.wait_and_advance()
+                v2_handle = load_v2_consumer.wait_and_advance()
+                pseudo_v_handle = pseudo_v_producer.acquire_and_advance()
+                # Produce Pseudo V
+                mv_tiled_mma = self.exec_mma(
+                    tiled_mma=mv_tiled_mma,
+                    # Reuse TMEM and shape of PV
+                    tCtAcc=tCtAccMV,
+                    tCrA=tCrV_corr,
+                    tCrB=tCrM,
+                    a_stage_idx=v2_handle.index,
+                    b_stage_idx=kk_handle.index,
+                    acc_stage_idx=pseudo_v_handle.index,
+                )
+                v2_handle.release()
+                kk_handle.release()
+                pseudo_v_handle.commit()
+
                 # Wait for PV, produce ointra
-                v_handle = load_v_consumer.wait_and_advance()
+                v3_handle = load_v3_consumer.wait_and_advance()
                 p_handle = p_consumer.wait_and_advance()
                 o_intra_handle = o_intra_producer.acquire_and_advance()
                 # both v and p are in smem
@@ -1512,7 +1651,7 @@ class KDAChunkwise:
                     tCtAcc=tCtAccPV,
                     tCrA=tCrV,
                     tCrB=tCrP,
-                    a_stage_idx=v_handle.index,
+                    a_stage_idx=v3_handle.index,
                     b_stage_idx=p_handle.index,
                     acc_stage_idx=o_intra_handle.index,
                 )
@@ -1528,14 +1667,14 @@ class KDAChunkwise:
                     tCrA=tCrV,
                     # tCrB=tCrK,
                     tCrB=tCrK_kv,
-                    a_stage_idx=v_handle.index,
+                    a_stage_idx=v3_handle.index,
                     b_stage_idx=k_handle.index,
                     acc_stage_idx=0,
                     always_acc=True if idx != 0 else False, # always accumulate states
                 )
                 # Release K V here
                 k_handle.release()
-                v_handle.release()
+                v3_handle.release()
                 kv_handle.commit()
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1674,13 +1813,33 @@ class KDAChunkwise:
                 tiled_mma=qk_tiled_mma,
             )
 
+            # To Store Pseudo-V
+            tTR_rPseudoV = cute.make_rmem_tensor_like(
+                src=tTR_rAcc_pv,
+                dtype=self.v_dtype,
+            )
+            (
+                tiled_r2s_pseudo_v,
+                thr_r2s_pseudo_v,
+                tRS_rPseudoV,
+                tRS_sPseudoV,
+            ) = self.smem_store_and_partition_x(
+                local_tidx=local_tidx,
+                smem_x=sV_flat_s2r,
+                tiled_t2r_x=tiled_copy_t2r_pv,
+                tXrX_t2r=tTR_rPseudoV,
+            )
+
             if cutlass.const_expr(PRINT_DEBUG):
                 print(f"tTR_tS: {tTR_tS}")
                 print(f"tTR_cMask: {tTR_cMask}")
                 print(f"tTR_rS: {tTR_rS}")
                 print(f"tTR_rP: {tTR_rP}")
-                print(f"tRS_rP: {tRS_rP}")
-                print(f"tRS_sP: {tRS_sP}")
+                print(f"tRS_rPseudoV: {tRS_rPseudoV}")
+                print(f"tRS_sPseudoV: {tRS_sPseudoV}")
+                print(f"tiled_r2s_pseudo_v: {tiled_r2s_pseudo_v}")
+                print(f"thr_r2s_pseudo_v: {thr_r2s_pseudo_v}")
+                print(f"tTR_rPseudoV: {tTR_rPseudoV}")
             #-------------------------------------------------------
 
             # With ACC_STAGE
@@ -1789,6 +1948,24 @@ class KDAChunkwise:
             print(f"tRS_sK: {tRS_sK}")
             print(f"tRS_rK: {tRS_rK}")
             # print(f"tRS_rK_inter: {tRS_rK_inter}")
+            #-------------------------------------------------------
+
+            #-------------------------------------------------------
+            # V s2r partitions - NEW for KDA elementwise processing
+            shape_v = (Constant.C, Constant.D)
+            (
+                tiled_s2r_v,
+                thr_s2r_v,
+                tRS_sV,  # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N, INPUT_STAGE)
+                tRS_rV,  # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
+            ) = self.make_s2r_partitions_prologue(
+                local_tidx,
+                sV_flat_s2r,
+                shape_v,
+            )
+            print(f"tiled_s2r_v: {tiled_s2r_v}")
+            print(f"tRS_sV: {tRS_sV}")
+            print(f"tRS_rV: {tRS_rV}")
             #-------------------------------------------------------
 
             should_debug = PRINT_DEBUG and tidx == self.cuda_warp_ids[0]*32 and hidx == 0 and bidx == 0
@@ -1953,7 +2130,6 @@ class KDAChunkwise:
                     cute.arch.ProxyKind.async_shared,
                     space=cute.arch.SharedSpace.shared_cta,
                 )
-                smem_kk_handle.commit()
 
                 # if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
                 #     # cute.printf("-------------------- sQ_flat: q * exp(g)")
@@ -1971,21 +2147,97 @@ class KDAChunkwise:
                 curr_sM_f16 = sM_f16[None, None, smem_kk_handle.index]
                 self.compute_matrix_inverse_64x64(curr_sM_f16)
 
-                # Plans:
-                #
-                # TODO: Final M = M^{-1} * beta
+                # Make sure the inverse is done.
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+
                 # S2R, scale with beta, convert to BF16, store back to smem `sM`
+                # TODO: make a repro for the cutedsl team
                 self.scale_M_inverse_with_beta(local_tidx, beta_chunk, curr_sM_f16, curr_sM)
+
+                # FIXME: drop me
+                # self.cuda_wg_sync_barrier.arrive_and_wait()
+                # if tidx == 0:
+                #     # cute.printf("--------------- beta_chunk:")
+                #     # cute.print_tensor(beta_chunk)
+                #     cute.printf("--------------- now sM:")
+                #     cute.print_tensor(curr_sM)
                 
+                # Notify end of smem_kk
+                smem_kk_handle.commit()
+
+                # TODO: LOAD V via S2R, need to have the same tv-layout as TMEM, since we need to perform a elementwise reduce here.
+                # Need to make it (128,64) and row-major
+                v_handle = load_v_consumer.wait_and_advance()
+                cute.copy(tiled_s2r_v, tRS_sV[(None, None, None, v_handle.index)], tRS_rV)
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
+                v_handle.release()
+
+                # TODO: copy KS from TMEM to RMEM, NOTE KS reuse TMEM of QS
+                # TODO: check the layout equivalence, should be both row-major
+                tTR_rAcc_ks = cute.make_tensor(tTR_rAcc_sq.iterator, layout=tRS_rV.layout)
+                if idx != 0:
+                    # Wait for KS
+                    ks_handle = ks_consumer.wait_and_advance()
+                    tTR_tAcc_ks_i = tTR_tAcc_base_sq[(None, None, None, 0, 0, ks_handle.index)] # KS HANDLE INDEX == 0
+                    # Load KS from TMEM to RMEM, (128,64)
+                    cute.copy(tiled_copy_t2r_sq, tTR_tAcc_ks_i, tTR_rAcc_sq)
+                    cute.arch.fence_view_async_tmem_load()
+                    ks_handle.release()
+
+                # Perform addition and store to tmem for Vcorr^T * M^T
+                # TODO: now we just store V back to SMEM, in the future we could save them to TMEM to enable double stage of V
+                v2_handle = load_v2_producer.acquire_and_advance()
+
+                if idx != 0:
+                    # First V could be kept no changes
+                    v_corrected = tRS_rV.load().to(cutlass.Float32)
+                    print(f"tTR_rAcc_ks: {tTR_rAcc_ks}")
+                    print(f"v_corrected: {v_corrected}")
+                    ks = tTR_rAcc_ks.load()
+                    v_corrected -= ks
+                    # Convert to BF16 and store v_corrected to SMEM
+                    tRS_rV.store(v_corrected.to(self.v_dtype))
+                    # Store Vcorr back to SMEM
+                    cute.copy(tiled_s2r_v, tRS_rV, tRS_sV[(None, None, None, v_handle.index)])
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
+                # Commit Vcorr = V - KS to trigger M*Vcorr
+                v2_handle.commit()
+
+                if tidx == 0:
+                    cute.printf("------------ V corrected:")
+                    cute.print_tensor(sV_flat_s2r)
+
                 # Let Kg = K * exp(g_cumsum)
                 # Let Kn = K * exp(-g_cumsum)
                 # Let Qg = Q * exp(g_cumsum)
                 # 
                 # TODO: Produce pseudo-V = M * (V - Kg * States)
                 # {Pseudo-V} ^ T = (V^T - State^T * Kg^T) * M^T
-                # State stored as inputs:
-                
+                # Store Pseudo-V back to V-SMEM
+                pseudo_v_handle = pseudo_v_consumer.wait_and_advance()
+                pseudo_v_stage_idx = pseudo_v_handle.index
+                # REUSE TMEM of PV
+                tTR_tAcc_pv_i = tTR_tAcc_base_pv[(None, None, None, 0, 0, pseudo_v_stage_idx)]
+                cute.copy(tiled_copy_t2r_pv, tTR_tAcc_pv_i, tTR_rAcc_pv)
+                cute.arch.fence_view_async_tmem_load()
+                pseudo_v_handle.release()
 
+                # Convert to V dtype, store to SMEM
+                tTR_rPseudoV.store(tTR_rAcc_pv.load().to(self.v_dtype))
+                v3_handle = load_v3_producer.acquire_and_advance()
+                cute.copy(tiled_r2s_pseudo_v, tTR_rPseudoV, tRS_sPseudoV[(None, None, None, pseudo_v_stage_idx)])
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
+                v3_handle.commit()
+                
                 # TODO:
                 #
                 # Maintain of S:
@@ -1994,7 +2246,6 @@ class KDAChunkwise:
                 # O_Inter = Qg * S
                 # O_Intra = Tril(Qg * Kn^T) * PseudoV
                 # O = O_Inter + O_Intra
-
 
                 # ------------------------------------------------------------
                 # NOTE: Save exp(g) of last row to rG_last for state update in next chunk
@@ -2400,6 +2651,41 @@ class KDAChunkwise:
         return tiled_t2r, thr_t2r, tTR_t, tTR_r
 
     @cute.jit
+    def smem_store_and_partition_x(
+        self,
+        local_tidx: cutlass.Int32,
+        smem_x: cute.Tensor,
+        tiled_t2r_x: cute.TiledCopy,
+        tXrX_t2r: cute.Tensor,
+    ):
+        copy_atom_r2s_x = sm100_utils.get_smem_store_op(
+            utils.LayoutEnum.from_tensor(smem_x),
+            self.io_dtype,
+            self.acc_dtype,
+            tiled_t2r_x
+        )
+        # num_dp, num_bits, num_rep, pack = sm100_utils.get_tmem_copy_properties(tiled_t2r_x)
+        tiled_r2s_x = cute.make_tiled_copy_D(copy_atom_r2s_x, tiled_t2r_x)
+        thr_r2s_x = tiled_r2s_x.get_slice(local_tidx)
+
+        # ((V, R), M, N, N_STAGE)
+        tXsX_r2s = thr_r2s_x.partition_D(smem_x)
+
+        # ((V, R), M, N)
+        tXrX_r2s = thr_r2s_x.retile(tXrX_t2r)
+
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"copy_atom_r2s_x: {copy_atom_r2s_x}")
+            print(f"tiled_t2r_x: {tiled_t2r_x}")
+            print(f"thr_t2r_x: {thr_r2s_x}")
+            print(f"before partition_D: {smem_x}")
+            print(f"after partition_D, tXsX_r2s: {tXsX_r2s}")
+            print(f"before retile tXrX_t2r: {tXrX_t2r}")
+            print(f"after retile tXrX_r2s: {tXrX_r2s}")
+
+        return tiled_r2s_x, thr_r2s_x, tXrX_r2s, tXsX_r2s
+
+    @cute.jit
     def smem_store_and_partition_qk(
         self, local_tidx, smem_p, tiled_t2r_qk, tPrP_t2r, tiled_mma = None,
     ):
@@ -2729,31 +3015,30 @@ class KDAChunkwise:
             sM_f16: Input M^{-1} matrix in smem (Float16), shape (64, 64, STAGE)
             sM: Output scaled matrix in smem (BFloat16), shape (64, 64, STAGE)
         """
-        tidx, _, _ = cute.arch.thread_idx()
-        tidx = tidx % 128
-        
         C = 64  # Chunk size
         
         # Each thread handles half a row (32 elements)
         # Thread layout: thread i handles row (i//2), columns [(i%2)*32 : (i%2+1)*32]
-        row_idx = tidx // 2      # 0-63
-        col_offset = (tidx % 2) * 32  # 0 or 32
+        row_idx = local_tidx // 2      # 0-63
         
         # Load beta value for this row
-        beta_val = beta_vec[row_idx].to(cutlass.Float32)
+        beta_val = beta_vec[row_idx]
+        # beta_val = beta_vec[row_idx].to(cutlass.Float32)
         
         # Create copy atom for smem <-> rmem transfers (32 elements at once)
+        # FIXME: figure out why num__bits_per_copy == 512 does not work here
+        num_bits_per_copy = 128
         copy_atom_s2r_x = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             sM_f16.element_type,
             # (64,64) ; copy half row
-            num_bits_per_copy=32 * 16,
+            num_bits_per_copy=num_bits_per_copy,
         )
         copy_atom_r2s_x = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             sM.element_type,
             # (64,64) ; copy half row
-            num_bits_per_copy=32 * 16,
+            num_bits_per_copy=num_bits_per_copy,
         )
 
         shape_x = cute.coalesce(sM_f16.layout, target_profile=(1,1)).shape
@@ -2776,6 +3061,9 @@ class KDAChunkwise:
             val_layout,
         )
         thr_s2r_x = tiled_s2r_x.get_slice(local_tidx)
+
+        print(f"thr_s2r_x: {thr_s2r_x}")
+
         # Partition shared tensor for smem load Bt
         # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
         tXsX_s2r = thr_s2r_x.partition_S(sM_f16)
@@ -2785,10 +3073,38 @@ class KDAChunkwise:
             tXsX_s2r.shape,
             sM_f16.element_type,
         )
+        tXrX_bf16 = cute.make_rmem_tensor_like(
+            tXsX_s2r,
+            sM.element_type,
+        )
 
-        cute.copy(copy_atom_s2r_x, tXsX_s2r, tXrX_s2r)
+        cute.copy(tiled_s2r_x, tXsX_s2r, tXrX_s2r)
+        # TODO: check fence
+        cute.arch.fence_proxy(
+            cute.arch.ProxyKind.async_shared,
+            space=cute.arch.SharedSpace.shared_cta,
+        )
 
-        tXrX_s2r.store((tXrX_s2r.load().to(cutlass.Float32) * beta_val).to(sM.element_type))
+        # TODO: FIXME, drop me
+        # Ensure read of smem completed since we'll override SMEM inplace
+        # self.cuda_wg_sync_barrier.arrive_and_wait()
+
+        # if local_tidx == 127:
+        #     cute.printf("----------- tXrX_s2r before scaling -----------, beta_val: {}\n", beta_val)
+        #     cute.print_tensor(tXrX_s2r, verbose=True)
+
+        scaled = tXrX_s2r.load().to(cutlass.Float32) * cutlass.Float32(beta_val)
+        tXrX_bf16.store(scaled.to(sM.element_type))
+
+        # TODO: FIXME, drop me
+        # self.cuda_wg_sync_barrier.arrive_and_wait()
+
+        # if local_tidx == 127:
+        #     # cute.printf("----------- TensorSSA after scaling -----------\n")
+        #     # cute.print_tensor(scaled, verbose=True)
+        #     cute.printf("----------- tXrX_bf16 after scaling -----------\n")
+        #     cute.print_tensor(tXrX_bf16, verbose=True)
+        #     # cute.print_tensor(tXrX_s2r.load().to(cutlass.Float32) * beta_val, verbose=True)
 
         tiled_r2s_x = cute.make_tiled_copy_tv(
             copy_atom_r2s_x,
@@ -2798,13 +3114,13 @@ class KDAChunkwise:
         thr_r2s_x = tiled_r2s_x.get_slice(local_tidx)
 
         # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
-        tXsX_r2s = thr_r2s_x.partition_S(sM)
+        tXsX_r2s = thr_r2s_x.partition_D(sM)
 
         print(f"tXsX_r2s: {tXsX_r2s}")
         print(f"tXsX_s2r: {tXsX_s2r}")
-        print(f"tXrX_s2r: {tXrX_s2r}")
+        print(f"tXrX_bf16: {tXrX_bf16}")
 
-        cute.copy(copy_atom_r2s_x, tXrX_s2r, tXsX_r2s)
+        cute.copy(tiled_r2s_x, tXrX_bf16, tXsX_r2s)
 
         # TODO: check fence
         cute.arch.fence_proxy(
