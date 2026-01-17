@@ -188,9 +188,6 @@ class KDAChunkwise:
 
         self.buffer_align_bytes = 1024
         
-        # G (gate) tile shape for KDA - linear layout (C * D elements)
-        # Using same C, D as defined above
-        self.g_tile_shape = (C * D,)  # Flatten to 1D for simple linear TMA load
 
     def get_config(self) -> dict:
         """
@@ -795,6 +792,12 @@ class KDAChunkwise:
                 cute.struct.MemRange[self.k_dtype, cute.cosize(m_smem_layout_staged)], # type: ignore
                 self.buffer_align_bytes,
             ]
+            # Store last row of exp(g) for KDA
+            # 4B * 128 = 512B
+            sG_last: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, D], # type: ignore
+                self.buffer_align_bytes,
+            ]
 
         self.shared_storage = SharedStorage        
         print(f"size of storage: {SharedStorage.__sizeof__()}")
@@ -1159,6 +1162,13 @@ class KDAChunkwise:
         sG = storage.sG.get_tensor(
             g_smem_layout_staged.outer, swizzle=g_smem_layout_staged.inner
         )
+        # No swizzling for last row of exp(G)
+        sG_last = storage.sG_last.get_tensor(
+            cute.make_layout((Constant.D, self.g_stage), stride=(1, Constant.D)),
+            swizzle=None,
+        )
+        print(f"sG_last: {cute.pretty_str(sG_last)}")
+
         # (MMA, MMA_N, MMA_K, STAGE)
         sP = storage.sP.get_tensor(
             p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner
@@ -2101,6 +2111,12 @@ class KDAChunkwise:
                 beta_chunk_layout = cute.make_layout((C, 1), stride=(H, 0))
                 beta_chunk = cute.make_tensor(beta_chunk.iterator + s_idx*H, layout=beta_chunk_layout)
 
+                # ------------------------------------------------------------
+                # NOTE: Save exp(g) of last row to rG_last for state update in next chunk
+                rG_last = cutlass.Float32(0.0)
+                rG_last = exp_g[Constant.C - 1]
+                sG_last[local_tidx, g_stage_idx] = rG_last
+
                 mma_kk_handle = mma_kk_consumer.wait_and_advance()
                 cute.copy(tiled_t2r_KK, tTR_tKK[None, None, None, mma_kk_handle.index], tTR_rKK)
                 cute.arch.fence_view_async_tmem_load()
@@ -2247,11 +2263,6 @@ class KDAChunkwise:
                 # O_Intra = Tril(Qg * Kn^T) * PseudoV
                 # O = O_Inter + O_Intra
 
-                # ------------------------------------------------------------
-                # NOTE: Save exp(g) of last row to rG_last for state update in next chunk
-                rG_last = cutlass.Float32(0.0)
-                rG_last = exp_g[Constant.C - 1]
-
                 # Convert KV to KV16
                 if idx != 0:
                     kv_handle = kv_consumer.wait_and_advance()
@@ -2262,7 +2273,8 @@ class KDAChunkwise:
 
                     kv16_handle = kv16_producer.acquire_and_advance()
                     #####################################################################3
-                    scaled = tTR_rKV.load() * rG_last
+                    # V^T*K -> (Dv, Dk)
+                    scaled = self.scale_state(tTR_rKV, sG_last[None, g_stage_idx])
                     tmem_store_rAccKVAsBF16.store(scaled.to(self.io_dtype))
                     tmem_store_tAccKVi = tmem_store_tAccKV[None, None, None, None, kv16_handle.index]
                     cute.copy(tmem_store_kv, tmem_store_rAccKV, tmem_store_tAccKVi)
@@ -2377,6 +2389,14 @@ class KDAChunkwise:
         tmem.free(tmem_ptr_base)
 
         return
+
+    @cute.jit
+    def scale_state(self, tTR_rKV: cute.Tensor, sG_last: cute.Tensor) -> cute.TensorSSA:
+        # tTR_rKV: (Dk, Dv)
+        kv_f32 = tTR_rKV.load()
+        for i in cutlass.range_constexpr(kv_f32.size()):
+            kv_f32[i] = kv_f32[i] * sG_last[i]
+        return kv_f32
 
     def tmem_load_kv16(self, local_tidx, tState):
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
