@@ -1600,7 +1600,7 @@ class KDAChunkwise:
                         # REUSE TMEM of PV
                         tCtAcc=tCtAccKS,
                         tCrA=tCrState_KS,
-                        # NOTE: S^T * K^T,  this is still k-major, its ok to reuse here
+                        # NOTE: S^T * K^T,  this is still k-major, its ok to reuse A-style K here
                         tCrB=tCrK_KS,
                         a_stage_idx=k_handle.index,
                         b_stage_idx=k_handle.index,
@@ -1879,6 +1879,14 @@ class KDAChunkwise:
             )
 
             ############################################################
+            (
+                tmem_store_kv_f32,
+                tmem_store_tAccKV_f32,
+                tmem_store_rAccKV_f32,
+            ) = self.tmem_store_and_partition_acc(
+                local_tidx,
+                tCtAcc=tCtAccKV,
+            )
             (
                 tmem_store_kv,
                 tmem_store_tAccKV,
@@ -2280,13 +2288,18 @@ class KDAChunkwise:
                     tTR_tKVi = tTR_tKV[(None, None, None, kv_handle.index)] # kv stage == 1
                     cute.copy(tiled_copy_t2r_kv, tTR_tKVi, tTR_rKV)
                     cute.arch.fence_view_async_tmem_load()
-                    kv_handle.release()
 
                     scaled = self.scale_state(tTR_rKV, sG_last[None, g_stage_idx])
+                    # TODO: shall we use a new register here? Is the compiler smart enough?
                     tTR_rKV.store(scaled.to(cutlass.Float32))
 
-                    cute.copy(, tmem_store_rAccKV, tmem_store_tAccKVi)
+                    # NOTE: TMEM STORE DECAY KV STATE to enable accumulation over chunks
+                    cute.copy(
+                        tmem_store_kv_f32,
+                        tTR_rKV,
+                        tmem_store_tAccKV_f32[None, None, None, None, kv_handle.index])
                     cute.arch.fence_view_async_tmem_store()
+                    kv_handle.release()
 
                     kv16_handle = kv16_producer.acquire_and_advance()
                     #####################################################################3
