@@ -2860,9 +2860,7 @@ class KDAChunkwise:
         assert epitile[0] == 128
         # TODO: 32dp ease DEBUGGING
         copy_atom_t2r = cute.make_copy_atom(
-            # FIXME
-            tcgen05.Ld32x32bOp(tcgen05.Repetition(8), tcgen05.Pack.NONE),
-            # tcgen05.Ld32x32bOp(tcgen05.Repetition(32), tcgen05.Pack.NONE),
+            tcgen05.Ld32x32bOp(tcgen05.Repetition(32), tcgen05.Pack.NONE),
             self.acc_dtype,
         ) 
         # copy_atom_t2r = sm100_utils.get_tmem_load_op(
