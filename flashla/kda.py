@@ -138,8 +138,7 @@ class KDAChunkwise:
         # Q: (64, 128)
         # K: (64, 128)
         # V: (64, 128)
-        # TODO: READ from input
-        C, D = (64, 128)
+        C, D = (Constant.C, Constant.D)
         # (C, C, D)
         self.qk_mma_tiler = (C, C, D)  # (M, N, K)
         self.kk_mma_tiler = (C, C, D)  # (M, N, K)
@@ -728,9 +727,7 @@ class KDAChunkwise:
             print(f"k_copy_size: {k_copy_size}")
             print(f"v_copy_size: {v_copy_size}")
 
-        # g_last_layout = cute.make_layout((D, self.g_stage), stride=(1, D))
-        # g_last_layout = cute.make_layout((D, 1), stride=(1, D))
-        g_last_layout = cute.make_layout((128, 1), stride=(1, 128))
+        g_last_layout = cute.make_layout((Constant.D, self.g_stage), stride=(1, Constant.D))
 
         @cute.struct
         class SharedStorage:
@@ -800,8 +797,7 @@ class KDAChunkwise:
             # 4B * 128 = 512B
             sG_last: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, cute.cosize(g_last_layout)], # type: ignore
-                # cute.struct.MemRange[self.k_dtype, cute.cosize(m_smem_layout_staged)], # type: ignore
-                128,
+                self.buffer_align_bytes,
             ]
 
         self.shared_storage = SharedStorage        
@@ -1174,11 +1170,8 @@ class KDAChunkwise:
             cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_INTER,
             element_type=self.g_dtype,
         )
-        # sG_last = storage.sG_last.get_tensor(
-        #     cute.make_layout((128, 1), stride=(1, 128)),
-        # )
-        # print(f"sG_last: {cute.pretty_str(sG_last)}")
         sG_last = self.get_smem_tensor_sG_last(storage, g_last_layout)
+        print(f"sG_last: {sG_last}")
 
         # (MMA, MMA_N, MMA_K, STAGE)
         sP = storage.sP.get_tensor(
@@ -1229,21 +1222,21 @@ class KDAChunkwise:
             1,
         )
         # ROW MAJOR
-        sQK_flat_layout = cute.make_layout((64, 64, 2), stride=(64,1,4096))
+        sQK_flat_layout = cute.make_layout((64, 64, self.q_stage), stride=(64,1,4096))
         sQK_flat = storage.sP.get_tensor(
             sQK_flat_layout, swizzle=qk_smem_layout_staged.inner,
         )
         # ROW MAJOR
-        sV_flat_layout = cute.make_layout((64, 64, 2, 2), stride=(1,64,4096,8192))
-        # sV_flat_layout = cute.make_layout((128, 64, 2), stride=(64,1,8192))
-        # sV_flat_layout = cute.make_layout((128, 64, 2), stride=(128,1,64))
+        # TODO:
+        sV_flat_layout = cute.make_layout((64, 64, 2, self.v_stage), stride=(1,64,4096,8192))
         sV_flat = storage.sV.get_tensor(
             sV_flat_layout, swizzle=v_smem_layout_staged.inner,
         )
         v_smem_layout_epi = sm100_utils.make_smem_layout_epi(
             self.v_dtype,
-            utils.LayoutEnum.ROW_MAJOR,
-            (Constant.C, Constant.D),
+            # utils.LayoutEnum.ROW_MAJOR,
+            utils.LayoutEnum.COL_MAJOR,
+            (Constant.D, Constant.C),
             self.v_stage,
         )
         v_smem_layout_coalesce = cute.coalesce(
@@ -1253,15 +1246,18 @@ class KDAChunkwise:
         sV_flat_s2r = storage.sV.get_tensor(
             v_smem_layout_coalesce.outer, swizzle=v_smem_layout_coalesce.inner
         )
+        sV_epi = storage.sV.get_tensor(
+            v_smem_layout_epi.outer, swizzle=v_smem_layout_epi.inner
+        )
 
         # ((64,16),1,(4,2),2):
         # ((64,1),0,(16,4096),8192)>
-        sK_flat_layout = cute.make_layout((64, (64, 2), 2), stride=(64,(1,4096),8192))
+        sK_flat_layout = cute.make_layout((64, (64, 2), self.k_stage), stride=(64,(1,4096),8192))
         sK_flat = storage.sK.get_tensor(
             sK_flat_layout, swizzle=k_smem_layout_staged.inner,
         )
 
-        sG_flat_layout_print = cute.make_layout((64, (64, 2), 2), stride=(64,(1,4096),8192))
+        sG_flat_layout_print = cute.make_layout((64, (64, 2), self.g_stage), stride=(64,(1,4096),8192))
         sG_flat_print = storage.sG.get_tensor(
             sG_flat_layout_print, swizzle=g_smem_layout_staged.inner,
         )
@@ -1857,7 +1853,7 @@ class KDAChunkwise:
                 tRS_sPseudoV,
             ) = self.smem_store_and_partition_x(
                 local_tidx=local_tidx,
-                smem_x=sV_flat_s2r,
+                smem_x=sV_epi,
                 tiled_t2r_x=tiled_copy_t2r_pv,
                 tXrX_t2r=tTR_rPseudoV,
             )
@@ -1869,9 +1865,12 @@ class KDAChunkwise:
                 print(f"tTR_rP: {tTR_rP}")
                 print(f"tRS_rPseudoV: {tRS_rPseudoV}")
                 print(f"tRS_sPseudoV: {tRS_sPseudoV}")
+                print(f"tTR_rPseudoV: {tTR_rPseudoV}")
+                print(f"sV_epi: {sV_epi}")
+                print(f"sV_flat_s2r: {sV_flat_s2r}")
+                print(f"sV_flat: {sV_flat}")
                 print(f"tiled_r2s_pseudo_v: {tiled_r2s_pseudo_v}")
                 print(f"thr_r2s_pseudo_v: {thr_r2s_pseudo_v}")
-                print(f"tTR_rPseudoV: {tTR_rPseudoV}")
             #-------------------------------------------------------
 
             # With ACC_STAGE
@@ -1898,6 +1897,9 @@ class KDAChunkwise:
                 local_tidx,
                 tCtAcc=tCtAccKV,
             )
+            tmem_store_rKV = cute.make_tensor(tTR_rKV.iterator,
+                                              layout=tmem_store_rAccKV_f32.layout)
+
             (
                 tmem_store_kv,
                 tmem_store_tAccKV,
@@ -1916,6 +1918,11 @@ class KDAChunkwise:
                 print(f"tiled_copy_t2r_kv: {tiled_copy_t2r_kv}")
                 print(f"LOAD tTR_tKV: {tTR_tKV}")
                 print(f"LOAD tTR_rKV: {tTR_rKV}")
+                print(f"tmem_store_rKV: {tmem_store_rKV}")
+                print(f"tmem_store_tAccKV_f32: {tmem_store_tAccKV_f32}")
+                print(f"tmem_store_rAccKV_f32: {tmem_store_rAccKV_f32}")
+                print(f"tmem_store_tAccKV: {tmem_store_tAccKV}")
+                print(f"tmem_store_rAccKV: {tmem_store_rAccKV}")
 
             #-------------------------------------------------------
             # G (gate/g_cumsum) - NEW for KDA Step 1
@@ -2277,7 +2284,7 @@ class KDAChunkwise:
                 # Convert to V dtype, store to SMEM
                 tTR_rPseudoV.store(tTR_rAcc_pv.load().to(self.v_dtype))
                 v3_handle = load_v3_producer.acquire_and_advance()
-                cute.copy(tiled_r2s_pseudo_v, tTR_rPseudoV, tRS_sPseudoV[(None, None, None, pseudo_v_stage_idx)])
+                cute.copy(tiled_r2s_pseudo_v, tRS_rPseudoV, tRS_sPseudoV[(None, None, None, pseudo_v_stage_idx)])
                 cute.arch.fence_proxy(
                     cute.arch.ProxyKind.async_shared,
                     space=cute.arch.SharedSpace.shared_cta,
@@ -2300,22 +2307,23 @@ class KDAChunkwise:
                     cute.copy(tiled_copy_t2r_kv, tTR_tKVi, tTR_rKV)
                     cute.arch.fence_view_async_tmem_load()
 
-                    scaled = self.scale_state(tTR_rKV, sG_last[None, g_stage_idx])
+                    flat = cute.make_tensor(
+                        tTR_rKV.iterator, layout=cute.make_layout(Constant.D))
+                    print(f"flat: {flat}")
+                    scaled = self.scale_state(flat, sG_last[None, g_stage_idx])
                     # TODO: shall we use a new rmem tensor here? Is the compiler smart enough?
-                    tTR_rKV.store(scaled.to(cutlass.Float32))
+                    # flat.store(scaled.load())
 
                     # NOTE: TMEM STORE DECAY KV STATE to enable accumulation over chunks
-                    cute.copy(
-                        tmem_store_kv_f32,
-                        tTR_rKV,
-                        tmem_store_tAccKV_f32[None, None, None, None, kv_handle.index])
+                    tmem_store_tKVi = tmem_store_tAccKV_f32[None, None, None, None, kv_handle.index]
+                    cute.copy(tmem_store_kv_f32, tmem_store_rKV, tmem_store_tKVi)
                     cute.arch.fence_view_async_tmem_store()
                     kv_handle.release()
 
                     kv16_handle = kv16_producer.acquire_and_advance()
                     #####################################################################3
                     # V^T*K -> (Dv, Dk)
-                    tmem_store_rAccKVAsBF16.store(scaled.to(self.io_dtype))
+                    tmem_store_rAccKVAsBF16.store(scaled.load().to(self.io_dtype))
                     tmem_store_tAccKVi = tmem_store_tAccKV[None, None, None, None, kv16_handle.index]
                     cute.copy(tmem_store_kv, tmem_store_rAccKV, tmem_store_tAccKVi)
                     cute.arch.fence_view_async_tmem_store()
@@ -2431,10 +2439,12 @@ class KDAChunkwise:
         return
 
     @cute.jit
-    def scale_state(self, tTR_rKV: cute.Tensor, sG_last: cute.Tensor) -> cute.TensorSSA:
+    def scale_state(self, flat: cute.Tensor, sG_last: cute.Tensor) -> cute.Tensor:
         # tTR_rKV: (Dk, Dv)
-        kv_f32 = tTR_rKV.load()
-        for i in cutlass.range_constexpr(kv_f32.size()):
+        # kv_f32 = flat.load()
+        kv_f32 = flat
+        print(f"kv_f32: {kv_f32}")
+        for i in cutlass.range_constexpr(Constant.D):
             kv_f32[i] = kv_f32[i] * sG_last[i]
         return kv_f32
 
@@ -2570,7 +2580,6 @@ class KDAChunkwise:
         return self.make_tmem_load_and_partition(
             copy_atom_t2r, tState, (None, None, 0), local_tidx, fake_sState
         )
-
     
     def make_tmem_load_and_partition(
         self, copy_atom_t2r, tmem_tensor, tmem_tile_coord, local_tidx, smem_tensor
@@ -2591,32 +2600,6 @@ class KDAChunkwise:
             dtype,
         )
         return tiled_t2r, thr_t2r, tTR_t, tTR_r
-
-    def tmem_store_and_partition_kv(self, local_tidx, tCtState):
-        dtype = tCtState.element_type
-        # Make tiledCopy for tensor memory store
-        # (D, D), 128,128, 16b
-        copy_atom_r2t = cute.make_copy_atom(
-            # TODO: check unpack
-            # tcgen05.St32x32bOp(tcgen05.Repetition(8), tcgen05.Unpack.NONE),
-            tcgen05.St32x32bOp(tcgen05.Repetition(8), tcgen05.Unpack.UNPACK_32b_IN_16b),
-            dtype,
-        )
-
-        tiled_r2t_kv = tcgen05.make_tmem_copy(copy_atom_r2t, tCtState)
-        thr_r2t_kv = tiled_r2t_kv.get_slice(local_tidx)
-
-        # Partition tmem/register tensor for tensor memory store INTRA2_Q
-        # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, ...)
-        tCtState_partitioned = thr_r2t_kv.partition_S(tCtState)
-        tRT_rKV16 = cute.make_rmem_tensor(
-            cute.slice_(tCtState_partitioned.shape, (None, None, None, 0)),
-            dtype,
-        )
-        # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, ..., INTERNAL_STAGE)
-        tRT_tKV16 = thr_r2t_kv.partition_D(tCtState)
-
-        return tiled_r2t_kv, tRT_tKV16, tRT_rKV16
 
     def tmem_store_and_partition_acc(self, local_tidx, tCtAcc):
         dtype = tCtAcc.element_type
@@ -2719,13 +2702,20 @@ class KDAChunkwise:
         tiled_t2r_x: cute.TiledCopy,
         tXrX_t2r: cute.Tensor,
     ):
+        # TODO: figure out why the selected smem store atom is not correct
         copy_atom_r2s_x = sm100_utils.get_smem_store_op(
             utils.LayoutEnum.from_tensor(smem_x),
             self.io_dtype,
             self.acc_dtype,
             tiled_t2r_x
         )
-        # num_dp, num_bits, num_rep, pack = sm100_utils.get_tmem_copy_properties(tiled_t2r_x)
+        if cutlass.const_expr(PRINT_DEBUG):
+            num_dp, num_bits, num_rep, pack = sm100_utils.get_tmem_copy_properties(tiled_t2r_x)
+            print(f"num_dp={num_dp}, num_bits={num_bits}, num_rep={num_rep}, pack={pack}")
+            print(f"copy_atom_r2s_x: {copy_atom_r2s_x}")
+            print(f"tiled_t2r_x.layout_dst_tv_tiled: {tiled_t2r_x.layout_dst_tv_tiled}")
+            print(f"tiled_t2r_x.tiler_mn: {tiled_t2r_x.tiler_mn}")
+
         tiled_r2s_x = cute.make_tiled_copy_D(copy_atom_r2s_x, tiled_t2r_x)
         thr_r2s_x = tiled_r2s_x.get_slice(local_tidx)
 
@@ -2738,7 +2728,8 @@ class KDAChunkwise:
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"copy_atom_r2s_x: {copy_atom_r2s_x}")
             print(f"tiled_t2r_x: {tiled_t2r_x}")
-            print(f"thr_t2r_x: {thr_r2s_x}")
+            print(f"tiled_r2s_x: {tiled_r2s_x}")
+            print(f"thr_r2s_x: {thr_r2s_x}")
             print(f"before partition_D: {smem_x}")
             print(f"after partition_D, tXsX_r2s: {tXsX_r2s}")
             print(f"before retile tXrX_t2r: {tXrX_t2r}")
@@ -2869,7 +2860,9 @@ class KDAChunkwise:
         assert epitile[0] == 128
         # TODO: 32dp ease DEBUGGING
         copy_atom_t2r = cute.make_copy_atom(
-            tcgen05.Ld32x32bOp(tcgen05.Repetition(32), tcgen05.Pack.NONE),
+            # FIXME
+            tcgen05.Ld32x32bOp(tcgen05.Repetition(8), tcgen05.Pack.NONE),
+            # tcgen05.Ld32x32bOp(tcgen05.Repetition(32), tcgen05.Pack.NONE),
             self.acc_dtype,
         ) 
         # copy_atom_t2r = sm100_utils.get_tmem_load_op(
