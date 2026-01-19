@@ -728,6 +728,10 @@ class KDAChunkwise:
             print(f"k_copy_size: {k_copy_size}")
             print(f"v_copy_size: {v_copy_size}")
 
+        # g_last_layout = cute.make_layout((D, self.g_stage), stride=(1, D))
+        # g_last_layout = cute.make_layout((D, 1), stride=(1, D))
+        g_last_layout = cute.make_layout((128, 1), stride=(1, 128))
+
         @cute.struct
         class SharedStorage:
             # Pipeline barriers
@@ -795,8 +799,9 @@ class KDAChunkwise:
             # Store last row of exp(g) for KDA
             # 4B * 128 = 512B
             sG_last: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, D], # type: ignore
-                self.buffer_align_bytes,
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(g_last_layout)], # type: ignore
+                # cute.struct.MemRange[self.k_dtype, cute.cosize(m_smem_layout_staged)], # type: ignore
+                128,
             ]
 
         self.shared_storage = SharedStorage        
@@ -839,6 +844,7 @@ class KDAChunkwise:
             o_smem_layout_staged,
             p_smem_layout_staged,
             m_smem_layout_staged,
+            g_last_layout,
             state_tmem_layout_staged,
             problem_size,
         ).launch(
@@ -880,6 +886,7 @@ class KDAChunkwise:
         o_smem_layout_staged: cute.ComposedLayout,
         p_smem_layout_staged: cute.ComposedLayout,
         m_smem_layout_staged: cute.ComposedLayout,
+        g_last_layout: cute.Layout,
         state_tmem_layout_staged: cute.ComposedLayout,
         problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B, S, H, D)
     ):
@@ -1163,11 +1170,15 @@ class KDAChunkwise:
             g_smem_layout_staged.outer, swizzle=g_smem_layout_staged.inner
         )
         # No swizzling for last row of exp(G)
-        sG_last = storage.sG_last.get_tensor(
-            cute.make_layout((Constant.D, self.g_stage), stride=(1, Constant.D)),
-            swizzle=None,
+        K_INTER_SWIZZLE = cute.nvgpu.warpgroup.make_smem_layout_atom(
+            cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_INTER,
+            element_type=self.g_dtype,
         )
-        print(f"sG_last: {cute.pretty_str(sG_last)}")
+        # sG_last = storage.sG_last.get_tensor(
+        #     cute.make_layout((128, 1), stride=(1, 128)),
+        # )
+        # print(f"sG_last: {cute.pretty_str(sG_last)}")
+        sG_last = self.get_smem_tensor_sG_last(storage, g_last_layout)
 
         # (MMA, MMA_N, MMA_K, STAGE)
         sP = storage.sP.get_tensor(
@@ -3856,6 +3867,17 @@ class KDAChunkwise:
         else:
             raise RuntimeError("unknown operand mode")
         return tCgX
+
+    @cute.jit
+    def get_smem_tensor_sG_last(
+        self,
+        storage,
+        layout: cute.Layout,
+        swizzle = None,
+    ):
+        sG_last = storage.sG_last.get_tensor(layout, swizzle=None)
+        return sG_last
+
 
     @cute.jit
     def tma_partition_for_mma_operand(
