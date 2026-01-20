@@ -2092,8 +2092,9 @@ class KDAChunkwise:
                 
                 # Apply gates with KDA beta scaling:
                 # Q' = Q * exp(g)
-                # TODO: support input of scale
-                q_gated = q_f32 * exp_g * Constant.SCALE
+                # TODO: compare perf of two different impl
+                q_gated = q_f32 * exp_g * self.scale
+                # q_gated = q_f32 * exp_g
                 # K_inter = K * exp(g) - for inter-chunk KV state update (W matrix)
                 k_inter = k_f32 * exp_g
                 # K_intra = K * exp(-g) - for intra-chunk QK^T computation
@@ -2346,7 +2347,7 @@ class KDAChunkwise:
                 cute.arch.fence_view_async_tmem_load()
 
                 # TODO: Apply strict causal mask and comput inverse of M
-                self.apply_mask(tTR_rS, tTR_cMask, tTR_rP, self.scale, debug=False)
+                self.apply_mask(tTR_rS, tTR_cMask, tTR_rP, debug=False)
 
                 # Write P to SMEM
                 p_handle = p_producer.acquire_and_advance()
@@ -2383,7 +2384,7 @@ class KDAChunkwise:
                 # Perform addition and store to gmem
                 acc_vec = tTR_rAcc_pv.load()
                 if idx != 0:
-                    acc_vec_inter = tTR_rAcc_sq.load() * self.scale
+                    acc_vec_inter = tTR_rAcc_sq.load()
                     acc_vec = acc_vec + acc_vec_inter
                 tTR_rO.store(acc_vec.to(self.io_dtype))
 
@@ -3706,7 +3707,6 @@ class KDAChunkwise:
         acc_qk: cute.Tensor,
         index_qk: cute.Tensor,
         p: cute.Tensor,
-        scale: cutlass.Float32,
         debug: bool = False,
         index_transform: cutlass.Constexpr = lambda index_q, index_k: (
             index_q,
@@ -3723,7 +3723,7 @@ class KDAChunkwise:
                 acc_qk[i] = cutlass.Float32(0.0)
                 p[i] = cutlass.BFloat16(0.0)
             else:
-                p[i] = (acc_qk[i] * scale).to(self.q_dtype)
+                p[i] = (acc_qk[i]).to(self.q_dtype)
 
     @cute.jit
     def make_tmem_store_and_partition(
