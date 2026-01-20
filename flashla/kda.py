@@ -2208,12 +2208,13 @@ class KDAChunkwise:
                 self.scale_M_inverse_with_beta(local_tidx, beta_chunk, curr_sM_f16, curr_sM)
 
                 # FIXME: drop me
-                # self.cuda_wg_sync_barrier.arrive_and_wait()
-                # if tidx == 0:
-                #     # cute.printf("--------------- beta_chunk:")
-                #     # cute.print_tensor(beta_chunk)
-                #     cute.printf("--------------- now sM:")
-                #     cute.print_tensor(curr_sM)
+                if cutlass.const_expr(PRINT_DEBUG):
+                    self.cuda_wg_sync_barrier.arrive_and_wait()
+                    if tidx == 0:
+                        cute.printf("--------------- beta_chunk:")
+                        cute.print_tensor(beta_chunk)
+                        cute.printf("--------------- now sM:")
+                        cute.print_tensor(curr_sM)
                 
                 # Notify end of smem_kk
                 smem_kk_handle.commit()
@@ -2264,7 +2265,7 @@ class KDAChunkwise:
 
                 if tidx == 0:
                     cute.printf("------------ V corrected:")
-                    cute.print_tensor(sV_flat_s2r)
+                    cute.print_tensor(sV_flat)
 
                 # Let Kg = K * exp(g_cumsum)
                 # Let Kn = K * exp(-g_cumsum)
