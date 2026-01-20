@@ -117,7 +117,11 @@ class KDAChunkwise:
         kv_acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
+        scale: cutlass.Float32 = 1.0,
     ):
+        # make scale a constant
+        self.scale = scale
+
         self.chunk_size = chunk_size
         self.qk_acc_dtype = qk_acc_dtype
         self.kv_acc_dtype = kv_acc_dtype
@@ -2341,7 +2345,7 @@ class KDAChunkwise:
                 cute.arch.fence_view_async_tmem_load()
 
                 # TODO: Apply strict causal mask and comput inverse of M
-                self.apply_mask(tTR_rS, tTR_cMask, tTR_rP, debug=False)
+                self.apply_mask(tTR_rS, tTR_cMask, tTR_rP, self.scale, debug=False)
 
                 # Write P to SMEM
                 p_handle = p_producer.acquire_and_advance()
@@ -2378,7 +2382,7 @@ class KDAChunkwise:
                 # Perform addition and store to gmem
                 acc_vec = tTR_rAcc_pv.load()
                 if idx != 0:
-                    acc_vec_inter = tTR_rAcc_sq.load()
+                    acc_vec_inter = tTR_rAcc_sq.load() * self.scale
                     acc_vec = acc_vec + acc_vec_inter
                 tTR_rO.store(acc_vec.to(self.io_dtype))
 
@@ -3702,6 +3706,7 @@ class KDAChunkwise:
         acc_qk: cute.Tensor,
         index_qk: cute.Tensor,
         p: cute.Tensor,
+        scale: cutlass.Float32,
         debug: bool = False,
         index_transform: cutlass.Constexpr = lambda index_q, index_k: (
             index_q,
@@ -3718,7 +3723,7 @@ class KDAChunkwise:
                 acc_qk[i] = cutlass.Float32(0.0)
                 p[i] = cutlass.BFloat16(0.0)
             else:
-                p[i] = acc_qk[i].to(self.q_dtype)
+                p[i] = (acc_qk[i] * scale).to(self.q_dtype)
 
     @cute.jit
     def make_tmem_store_and_partition(
@@ -3960,6 +3965,7 @@ def main():
     parser.add_argument("--num_heads", type=int, default=1, help="Number of heads")
     parser.add_argument("--head_dim", type=int, default=128, help="Head dimension")
     parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size")
+    parser.add_argument("--scale", type=float, default=1.0, help="Scale factor for Q")
     parser.add_argument(
         "--io_dtype", type=cutlass.dtype, default=cutlass.BFloat16,
         help="Input/output data type"
@@ -4032,6 +4038,7 @@ def main():
         qk_acc_dtype=args.acc_dtype,
         kv_acc_dtype=args.acc_dtype,
         io_dtype=args.io_dtype,
+        scale=args.scale,
     )
 
     # Get default stream
