@@ -2267,9 +2267,10 @@ class KDAChunkwise:
                 # Commit Vcorr = V - KS to trigger M*Vcorr
                 v2_handle.commit()
 
-                if tidx == 0:
-                    cute.printf("------------ V corrected:")
-                    cute.print_tensor(sV_flat)
+                if cutlass.const_expr(PRINT_DEBUG):
+                    if tidx == 0:
+                        cute.printf("------------ V corrected:")
+                        cute.print_tensor(sV_flat)
 
                 # Let Kg = K * exp(g_cumsum)
                 # Let Kn = K * exp(-g_cumsum)
@@ -2991,13 +2992,14 @@ class KDAChunkwise:
 
         # Stage 1: Invert all 8 diagonal 8x8 blocks
         t8x8mat = cute.flat_divide(s_mat, (8, 8))
-        if tidx == 0:
-            cute.printf("---------- Raw first 8x8 block:")
-            t4x4mat = cute.flat_divide(t8x8mat[None, None, 0, 0], (4, 4))
-            cute.print_tensor(t4x4mat[None, None, 0, 0])
-            cute.print_tensor(t4x4mat[None, None, 0, 1])
-            cute.print_tensor(t4x4mat[None, None, 1, 0])
-            cute.print_tensor(t4x4mat[None, None, 1, 1])
+        if cutlass.const_expr(PRINT_DEBUG):
+            if tidx == 0:
+                cute.printf("---------- Raw first 8x8 block:")
+                t4x4mat = cute.flat_divide(t8x8mat[None, None, 0, 0], (4, 4))
+                cute.print_tensor(t4x4mat[None, None, 0, 0])
+                cute.print_tensor(t4x4mat[None, None, 0, 1])
+                cute.print_tensor(t4x4mat[None, None, 1, 0])
+                cute.print_tensor(t4x4mat[None, None, 1, 1])
 
         # Block size progression: 8x8 -> 16x16 -> 32x32 -> 64x64
         # Process in stages
@@ -3005,27 +3007,25 @@ class KDAChunkwise:
         # Stage 1: Invert all 8 diagonal 8x8 blocks
         t8x8mat = cute.flat_divide(s_mat, (8, 8))
         if tidx < 64:
-            print(f"t8x8mat: {t8x8mat}")
             self.compute_diagonal_inverse_8x8(
                 t8x8mat[None, None, tidx//8, tidx//8],
                 tidx % 8
             )
         self.cuda_wg_sync_barrier.arrive_and_wait()
 
-        if tidx == 0:
+        if cutlass.const_expr(PRINT_DEBUG) and tidx == 0:
             cute.printf("---------- After Stage1, first 8x8 block:")
             cute.print_tensor(t8x8mat[None, None, 0, 0])
 
         # Stage 2: Invert all 4 diagonal 16x16 blocks
         t16x16mat = cute.flat_divide(s_mat, (16, 16))
-        print(f"t16x16mat: {t16x16mat}")
         self.compute_diagonal_inverse_8x8_to_16x16(
             t16x16mat[None, None, tidx//32, tidx//32],
         )
         # Synchronize after stage 2
         self.cuda_wg_sync_barrier.arrive_and_wait()
 
-        if tidx == 0:
+        if cutlass.const_expr(PRINT_DEBUG) and tidx == 0:
             cute.printf("-------------- After stage 2 inverse 16x16, first 16x16 block")
             cute.print_tensor(t16x16mat[None, None, 0, 0])
 
@@ -3036,13 +3036,13 @@ class KDAChunkwise:
                 t32x32mat[None, None, tidx//32, tidx//32],
             )
         self.cuda_wg_sync_barrier.arrive_and_wait()
-        if tidx == 0:
+        if cutlass.const_expr(PRINT_DEBUG) and tidx == 0:
             cute.printf("-------------- After stage 3 inverse 32x32, first 32x32 block")
             cute.print_tensor(t32x32mat[None, None, 0, 0])
 
         # Stage 4: Invert the full 64x64 matrix
         self.compute_diagonal_inverse_32x32_to_64x64(s_mat)
-        if tidx == 0:
+        if cutlass.const_expr(PRINT_DEBUG) and tidx == 0:
             cute.printf("-------------- Final inverse 64x64 block\n")
             cute.print_tensor(s_mat, verbose=False)
 
@@ -4018,10 +4018,16 @@ def main():
     chunk_size = 64
     num_chunks = S // chunk_size
     G = G.float().view(B, num_chunks, chunk_size, H, D).cumsum(dim=2).view(B, S, H, D) * 1.4426950216
-    
+
     # QK, L2 Norm
     Q, Q_rstd = l2norm_fwd(Q)
     K, K_rstd = l2norm_fwd(K)
+
+    print(f"G: {G}")
+    print(f"Q: {Q}")
+    print(f"K: {K}")
+    print(f"V: {V}")
+    print(f"beta {beta_tensor}")
     
     # Convert to dlpack for CuTe
     q_cute = from_dlpack(Q)
