@@ -1721,26 +1721,28 @@ class KDAChunkwise:
                 p_handle.release()
                 o_intra_handle.commit()
 
-                ####################################################
-                kv_handle = kv_producer.acquire_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got kv producer={}", idx, kv_handle.index)
-                # NOTE: Always ACC to avoid adding in cuda core.
-                kv_tiled_mma = self.exec_mma(
-                    tiled_mma=kv_tiled_mma,
-                    tCtAcc=tCtAccKV,
-                    tCrA=tCrV,
-                    # tCrB=tCrK,
-                    tCrB=tCrK_kv,
-                    a_stage_idx=v3_handle.index,
-                    b_stage_idx=k_handle.index,
-                    acc_stage_idx=0,
-                    always_acc=True if idx != 0 else False, # always accumulate states
-                )
-                # Release K V here
+                ##########################################################
+                # NOTE: Generate next state if you are not the last chunk
+                if idx != (S // C) - 1:
+                    kv_handle = kv_producer.acquire_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got kv producer={}", idx, kv_handle.index)
+                    # NOTE: Always ACC to avoid adding in cuda core.
+                    kv_tiled_mma = self.exec_mma(
+                        tiled_mma=kv_tiled_mma,
+                        tCtAcc=tCtAccKV,
+                        tCrA=tCrV,
+                        # tCrB=tCrK,
+                        tCrB=tCrK_kv,
+                        a_stage_idx=v3_handle.index,
+                        b_stage_idx=k_handle.index,
+                        acc_stage_idx=0,
+                        always_acc=True if idx != 0 else False, # always accumulate states
+                    )
+                    # Release K V here
+                    kv_handle.commit()
                 k_handle.release()
                 v3_handle.release()
-                kv_handle.commit()
 
         # ///////////////////////////////////////////////////////////////////////////////
         # CUDA CORE WARPS
@@ -2379,41 +2381,6 @@ class KDAChunkwise:
                 # O_Intra = Tril(Qg * Kn^T) * PseudoV
                 # O = O_Inter + O_Intra
 
-                # Convert KV to KV16
-                if idx != 0:
-                    kv_handle = kv_consumer.wait_and_advance()
-                    if should_debug:
-                        cute.printf("chunk idx={}, got kv consumer={}", idx, kv_handle.index)
-
-                    tTR_tKVi = tTR_tKV[(None, None, None, kv_handle.index)] # kv stage == 1
-                    cute.copy(tiled_copy_t2r_kv, tTR_tKVi, tTR_rKV)
-                    cute.arch.fence_view_async_tmem_load()
-
-                    flat = cute.make_tensor(
-                        tTR_rKV.iterator, layout=cute.make_layout(Constant.D))
-                    print(f"flat: {flat}")
-                    scaled = self.scale_state(flat, sG_last[None, g_stage_idx])
-                    # TODO: shall we use a new rmem tensor here? Is the compiler smart enough?
-                    # flat.store(scaled.load())
-
-                    # NOTE: TMEM STORE DECAY KV STATE to enable accumulation over chunks
-                    tmem_store_tKVi = tmem_store_tAccKV_f32[None, None, None, None, kv_handle.index]
-                    cute.copy(tmem_store_kv_f32, tmem_store_rKV, tmem_store_tKVi)
-                    cute.arch.fence_view_async_tmem_store()
-                    kv_handle.release()
-
-                    kv16_handle = kv16_producer.acquire_and_advance()
-                    if should_debug:
-                        cute.printf("chunk idx={}, got kv16 producer={}", idx, kv16_handle.index)
-                    #####################################################################3
-                    # V^T*K -> (Dv, Dk)
-                    tmem_store_rAccKVAsBF16.store(scaled.load().to(self.io_dtype))
-                    tmem_store_tAccKVi = tmem_store_tAccKV[None, None, None, None, kv16_handle.index]
-                    cute.copy(tmem_store_kv, tmem_store_rAccKV, tmem_store_tAccKVi)
-                    cute.arch.fence_view_async_tmem_store()
-                    #####################################################################3
-                    kv16_handle.commit()
-
                 # Wait for S = MMA(exp(g)*Q, (K*exp(-g))^T)
                 s0_handle = mma_s0_consumer.wait_and_advance()
                 if should_debug:
@@ -2483,6 +2450,44 @@ class KDAChunkwise:
                     space=cute.arch.SharedSpace.shared_cta,
                 )
                 smem_o_handle.commit()
+
+                # Prepare next state if this is not the last chunk
+                # 1. Decay the state
+                # 2. Convert to BF16
+                if idx != (S // C - 1):
+                    kv_handle = kv_consumer.wait_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got kv consumer={}", idx, kv_handle.index)
+
+                    tTR_tKVi = tTR_tKV[(None, None, None, kv_handle.index)] # kv stage == 1
+                    cute.copy(tiled_copy_t2r_kv, tTR_tKVi, tTR_rKV)
+                    cute.arch.fence_view_async_tmem_load()
+
+                    flat = cute.make_tensor(
+                        tTR_rKV.iterator, layout=cute.make_layout(Constant.D))
+                    print(f"flat: {flat}")
+                    scaled = self.scale_state(flat, sG_last[None, g_stage_idx])
+                    # TODO: shall we use a new rmem tensor here? Is the compiler smart enough?
+                    # flat.store(scaled.load())
+
+                    # NOTE: TMEM STORE DECAY KV STATE to enable accumulation over chunks
+                    tmem_store_tKVi = tmem_store_tAccKV_f32[None, None, None, None, kv_handle.index]
+                    cute.copy(tmem_store_kv_f32, tmem_store_rKV, tmem_store_tKVi)
+                    cute.arch.fence_view_async_tmem_store()
+                    kv_handle.release()
+
+                    kv16_handle = kv16_producer.acquire_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got kv16 producer={}", idx, kv16_handle.index)
+                    #####################################################################
+                    # V^T*K -> (Dv, Dk)
+                    tmem_store_rAccKVAsBF16.store(scaled.load().to(self.io_dtype))
+                    tmem_store_tAccKVi = tmem_store_tAccKV[None, None, None, None, kv16_handle.index]
+                    cute.copy(tmem_store_kv, tmem_store_rAccKV, tmem_store_tAccKVi)
+                    cute.arch.fence_view_async_tmem_store()
+                    #####################################################################
+                    kv16_handle.commit()
+
 
         elif warp_idx == self.epilogue_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_epilogue_warps)
