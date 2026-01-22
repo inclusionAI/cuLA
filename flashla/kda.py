@@ -987,17 +987,6 @@ class KDAChunkwise:
             tx_count=self.tma_copy_g_bytes,
             barrier_storage=storage.load_g_mbar_ptr.data_ptr(),
         ).make_participants()
-        # KDA gating sync: CUDA warp (producer) notifies MMA warp (consumer) that Q'/K' are ready
-        kda_gate_producer, kda_gate_consumer = pipeline.PipelineAsyncUmma.create(
-            num_stages=self.q_stage,  # Match Q/K stages
-            producer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.cuda_warp_ids)
-            ),
-            consumer_group=make_thread_cooperative_group(
-                len([self.mma_warp_id])
-            ),
-            barrier_storage=storage.kda_gate_mbar_ptr.data_ptr(),
-        ).make_participants()
         mma_s0_producer, mma_s0_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=self.acc_stage,
             producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
@@ -1014,14 +1003,6 @@ class KDAChunkwise:
             ),
             barrier_storage=storage.kk_mbar_ptr.data_ptr(),
         ).make_participants()
-        mma_m_producer, mma_m_consumer = pipeline.PipelineUmmaAsync.create(
-            num_stages=self.acc_stage,
-            producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.cuda_warp_ids)
-            ),
-            barrier_storage=storage.s_mbar_ptr.data_ptr(),
-        ).make_participants()
         # Notify cuda core to convert 32-bit accumulator to 16-bit
         kv_producer, kv_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=1,
@@ -1032,12 +1013,10 @@ class KDAChunkwise:
             barrier_storage=storage.kv_mbar_ptr.data_ptr(),
         ).make_participants()
         # Notify mma warp that 16bit state is ready for mma as operand A
-        kv16_producer, kv16_consumer = pipeline.PipelineUmmaAsync.create(
+        kv16_producer, kv16_consumer = pipeline.PipelineAsyncUmma.create(
             num_stages=1,
-            producer_group=make_thread_cooperative_group(len(self.cuda_warp_ids),),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len([self.mma_warp_id])
-            ),
+            producer_group=make_thread_cooperative_group(32 * len(self.cuda_warp_ids),),
+            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             barrier_storage=storage.kv16_mbar_ptr.data_ptr(),
         ).make_participants()
         p_producer, p_consumer = pipeline.PipelineAsyncUmma.create(
@@ -2159,6 +2138,9 @@ class KDAChunkwise:
                 # Write K_inter = K * exp(g) to SMEM[K]
                 cute.copy(tiled_s2r_k, tRS_rK, tRS_sK[(None, None, None, k_stage_idx)])
                 
+                # Make sure the read of G is completed
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+
                 # Write K_intra = K * exp(-g) to SMEM[G] (overwrite g)
                 kt2_handle = load_kt2_producer.acquire_and_advance()
                 if should_debug:
@@ -2245,9 +2227,23 @@ class KDAChunkwise:
 
                 curr_sM = sM[None, None, smem_kk_handle.index]
                 curr_sM_f16 = sM_f16[None, None, smem_kk_handle.index]
+
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+                if tidx == 0:
+                    cute.printf("--------------- KK results before inverse")
+                    # cute.print_tensor(curr_sM_f16, verbose=True)
+                    cute.print_tensor(curr_sM_f16[63, None], verbose=True)
+                # FIXME
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+
                 self.compute_matrix_inverse_64x64(curr_sM_f16)
 
                 # Make sure the inverse is done.
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+                if tidx == 0:
+                    cute.printf("--------------- now sM before beta scale:")
+                    cute.print_tensor(curr_sM_f16)
+                # FIXME
                 self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 # S2R, scale with beta, convert to BF16, store back to smem `sM`
@@ -2255,7 +2251,7 @@ class KDAChunkwise:
                 self.scale_M_inverse_with_beta(local_tidx, beta_chunk, curr_sM_f16, curr_sM)
 
                 # FIXME: drop me
-                if True or cutlass.const_expr(PRINT_DEBUG):
+                if cutlass.const_expr(PRINT_DEBUG):
                     self.cuda_wg_sync_barrier.arrive_and_wait()
                     if tidx == 0:
                         cute.printf("--------------- now sM:")
@@ -2848,7 +2844,7 @@ class KDAChunkwise:
     ):
         copy_atom_r2s_x = sm100_utils.get_smem_store_op(
             utils.LayoutEnum.from_tensor(smem_x),
-            self.io_dtype,
+            smem_x.element_type,
             self.acc_dtype,
             tiled_t2r_x
         )
