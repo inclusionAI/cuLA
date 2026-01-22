@@ -78,7 +78,7 @@ from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 
 import flashla.utils
 
-PRINT_DEBUG=True
+PRINT_DEBUG=False
 
 class Constant:
     """Common constants used in KDA implementation."""
@@ -923,10 +923,10 @@ class KDAChunkwise:
             tx_count=self.tma_copy_q_bytes,
             barrier_storage=storage.load_q_mbar_ptr.data_ptr(),
         ).make_participants()
-        load_q2_producer, load_q2_consumer = pipeline.PipelineAsync.create(
+        load_q2_producer, load_q2_consumer = pipeline.PipelineAsyncUmma.create(
             num_stages=self.q_stage,
             producer_group=make_thread_cooperative_group(32*len(self.cuda_warp_ids)),
-            consumer_group=make_thread_cooperative_group(32*len([self.mma_warp_id])),
+            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             barrier_storage=storage.load_q2_mbar_ptr.data_ptr(),
         ).make_participants()
         load_k_producer, load_k_consumer = pipeline.PipelineTmaAsync.create(
@@ -936,17 +936,17 @@ class KDAChunkwise:
             tx_count=self.tma_copy_k_bytes,
             barrier_storage=storage.load_k_mbar_ptr.data_ptr(),
         ).make_participants()
-        load_k2_producer, load_k2_consumer = pipeline.PipelineAsync.create(
+        load_k2_producer, load_k2_consumer = pipeline.PipelineAsyncUmma.create(
             num_stages=self.k_stage,
             producer_group=make_thread_cooperative_group(32*len(self.cuda_warp_ids)),
-            consumer_group=make_thread_cooperative_group(32*len([self.mma_warp_id])),
+            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             barrier_storage=storage.load_k2_mbar_ptr.data_ptr(),
         ).make_participants()
-        load_kt2_producer, load_kt2_consumer = pipeline.PipelineAsync.create(
+        load_kt2_producer, load_kt2_consumer = pipeline.PipelineAsyncUmma.create(
             # TODO: add assert that g and k have the same stage count
             num_stages=self.g_stage,
             producer_group=make_thread_cooperative_group(32*len(self.cuda_warp_ids)),
-            consumer_group=make_thread_cooperative_group(32*len([self.mma_warp_id])),
+            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             barrier_storage=storage.load_kt2_mbar_ptr.data_ptr(),
         ).make_participants()
         load_v_producer, load_v_consumer = pipeline.PipelineTmaAsync.create(
@@ -956,10 +956,10 @@ class KDAChunkwise:
             tx_count=self.tma_copy_v_bytes,
             barrier_storage=storage.load_v_mbar_ptr.data_ptr(),
         ).make_participants()
-        load_v2_producer, load_v2_consumer = pipeline.PipelineAsync.create(
+        load_v2_producer, load_v2_consumer = pipeline.PipelineAsyncUmma.create(
             num_stages=self.v_stage,
             producer_group=make_thread_cooperative_group(32*len(self.cuda_warp_ids)),
-            consumer_group=make_thread_cooperative_group(32*len([self.mma_warp_id])),
+            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             barrier_storage=storage.load_v2_mbar_ptr.data_ptr(),
         ).make_participants()
         pseudo_v_producer, pseudo_v_consumer = pipeline.PipelineUmmaAsync.create(
@@ -970,10 +970,10 @@ class KDAChunkwise:
             ),
             barrier_storage=storage.pseudo_v_mbar_ptr.data_ptr(),
         ).make_participants()
-        load_v3_producer, load_v3_consumer = pipeline.PipelineAsync.create(
+        load_v3_producer, load_v3_consumer = pipeline.PipelineAsyncUmma.create(
             num_stages=self.v_stage,
             producer_group=make_thread_cooperative_group(32*len(self.cuda_warp_ids)),
-            consumer_group=make_thread_cooperative_group(32*len([self.mma_warp_id])),
+            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             barrier_storage=storage.load_v3_mbar_ptr.data_ptr(),
         ).make_participants()
         # G (gate/g_cumsum) - NEW for KDA
@@ -988,13 +988,13 @@ class KDAChunkwise:
             barrier_storage=storage.load_g_mbar_ptr.data_ptr(),
         ).make_participants()
         # KDA gating sync: CUDA warp (producer) notifies MMA warp (consumer) that Q'/K' are ready
-        kda_gate_producer, kda_gate_consumer = pipeline.PipelineAsync.create(
+        kda_gate_producer, kda_gate_consumer = pipeline.PipelineAsyncUmma.create(
             num_stages=self.q_stage,  # Match Q/K stages
             producer_group=make_thread_cooperative_group(
                 self.threads_per_warp * len(self.cuda_warp_ids)
             ),
             consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len([self.mma_warp_id])
+                len([self.mma_warp_id])
             ),
             barrier_storage=storage.kda_gate_mbar_ptr.data_ptr(),
         ).make_participants()
@@ -1040,23 +1040,23 @@ class KDAChunkwise:
             ),
             barrier_storage=storage.kv16_mbar_ptr.data_ptr(),
         ).make_participants()
-        p_producer, p_consumer = pipeline.PipelineAsync.create(
+        p_producer, p_consumer = pipeline.PipelineAsyncUmma.create(
             num_stages=self.acc_stage, # TODO: check p stages
             producer_group=make_thread_cooperative_group(
                 self.threads_per_warp * len(self.cuda_warp_ids)
             ),
             consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len([self.mma_warp_id])
+                len([self.mma_warp_id])
             ),
             barrier_storage=storage.p_mbar_ptr.data_ptr(),
         ).make_participants()
-        smem_kk_producer, smem_kk_consumer = pipeline.PipelineAsync.create(
+        smem_kk_producer, smem_kk_consumer = pipeline.PipelineAsyncUmma.create(
             num_stages=self.acc_stage,
             producer_group=make_thread_cooperative_group(
                 self.threads_per_warp * len(self.cuda_warp_ids)
             ),
             consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len([self.mma_warp_id])
+                len([self.mma_warp_id])
             ),
             barrier_storage=storage.smem_kk_mbar_ptr.data_ptr(),
         ).make_participants()
@@ -1573,24 +1573,14 @@ class KDAChunkwise:
         elif warp_idx == self.mma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_mma)
 
-            should_debug = tidx == warp_idx * 32
+            should_debug = PRINT_DEBUG and tidx == warp_idx * 32 and hidx == 0 and bidx == 0
 
             for chunk_start in cutlass.range(0, S, C, unroll=0):
                 idx = chunk_start // C
 
-                if should_debug:
-                    cute.printf("-------------DEBUG ----------- NO ARGS")
-
                 k_handle = load_k2_consumer.wait_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got kg consumer={}", idx, k_handle.index)
                 kt_handle = load_kt2_consumer.wait_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got kng consumer={}", idx, kt_handle.index)
-
                 mma_kk_handle = mma_kk_producer.acquire_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got mma_kk producer={}", idx, mma_kk_handle.index)
                 # GEMM KK
                 kk_tiled_mma = self.exec_mma(
                     tiled_mma=kk_tiled_mma,
@@ -2241,14 +2231,14 @@ class KDAChunkwise:
                     space=cute.arch.SharedSpace.shared_cta,
                 )
 
-                if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
-                    # cute.printf("-------------------- sQ_flat: q * exp(g)")
-                    # cute.print_tensor(sQ_flat)
-                    cute.printf("-------------------- sK_flat: k * exp(g)")
-                    cute.print_tensor(sK_flat)
-                    cute.printf("-------------------- sG_flat stored with K^T*exp(-g):")
-                    cute.print_tensor(sG_flat_bf16)
-                self.cuda_wg_sync_barrier.arrive_and_wait()
+                # if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
+                #     # cute.printf("-------------------- sQ_flat: q * exp(g)")
+                #     # cute.print_tensor(sQ_flat)
+                #     cute.printf("-------------------- sK_flat: k * exp(g)")
+                #     cute.print_tensor(sK_flat)
+                #     cute.printf("-------------------- sG_flat stored with K^T*exp(-g):")
+                #     cute.print_tensor(sG_flat_bf16)
+                # self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 print(f"sM: {sM}")
                 print(f"sM_f16: {sM_f16}")
@@ -2265,19 +2255,14 @@ class KDAChunkwise:
                 self.scale_M_inverse_with_beta(local_tidx, beta_chunk, curr_sM_f16, curr_sM)
 
                 # FIXME: drop me
-                if cutlass.const_expr(PRINT_DEBUG):
+                if True or cutlass.const_expr(PRINT_DEBUG):
                     self.cuda_wg_sync_barrier.arrive_and_wait()
                     if tidx == 0:
-                        cute.printf("--------------- beta_chunk:")
-                        cute.print_tensor(beta_chunk)
                         cute.printf("--------------- now sM:")
                         cute.print_tensor(curr_sM)
                 
                 # Notify end of smem_kk
                 smem_kk_handle.commit()
-
-                if should_debug:
-                    cute.printf("------------DEBUG before v consumer wait--------------", )
 
                 # TODO: LOAD V via S2R, need to have the same tv-layout as TMEM, since we need to perform a elementwise reduce here.
                 # Need to make it (128,64) and row-major
