@@ -929,10 +929,10 @@ class KDAChunkwise:
             consumer_group=make_thread_cooperative_group(32*len([self.mma_warp_id])),
             barrier_storage=storage.load_q2_mbar_ptr.data_ptr(),
         ).make_participants()
-        load_k_producer, load_k_consumer = pipeline.PipelineTmaUmma.create(
+        load_k_producer, load_k_consumer = pipeline.PipelineTmaAsync.create(
             num_stages=self.k_stage,
             producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
+            consumer_group=make_thread_cooperative_group(len(self.cuda_warp_ids)),  # CUDA cores will consume
             tx_count=self.tma_copy_k_bytes,
             barrier_storage=storage.load_k_mbar_ptr.data_ptr(),
         ).make_participants()
