@@ -2174,9 +2174,6 @@ class KDAChunkwise:
                 if should_debug:
                     cute.printf("chunk idx={}, got kt2 producer={}", idx, kt2_handle.index)
 
-                if should_debug:
-                    cute.printf("-------------DEBUG , after acquire kng producer, idx={}", idx)
-
                 cute.copy(tiled_s2r_g_bf16, tRS_rG_bf16, tRS_sG_bf16[(None, None, None, g_stage_idx)])
                 
                 # Fence for shared memory writes
@@ -2208,15 +2205,9 @@ class KDAChunkwise:
                 rG_last = exp_g[Constant.C - 1]
                 sG_last[local_tidx, g_stage_idx] = rG_last
 
-                if should_debug:
-                    cute.printf("-------------DEBUG , before wait mma kk, idx={}", idx)
-
                 mma_kk_handle = mma_kk_consumer.wait_and_advance()
                 if should_debug:
                     cute.printf("chunk idx={}, got mma_kk consumer={}", idx, mma_kk_handle.index)
-
-                if should_debug:
-                    cute.printf("-------------DEBUG , after wait mma kk, idx={}", idx)
 
                 cute.copy(tiled_t2r_KK, tTR_tKK[None, None, None, mma_kk_handle.index], tTR_rKK)
                 cute.arch.fence_view_async_tmem_load()
@@ -2229,6 +2220,7 @@ class KDAChunkwise:
                 # if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
                 #     cute.printf("-------------------- First row of KK MMA results: ")
                 #     cute.print_tensor(tTR_rKK)
+                # FIXME:
                 self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 # Inplace modify tTR_rKK to M matrix
@@ -2249,14 +2241,14 @@ class KDAChunkwise:
                     space=cute.arch.SharedSpace.shared_cta,
                 )
 
-                # if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
-                #     # cute.printf("-------------------- sQ_flat: q * exp(g)")
-                #     # cute.print_tensor(sQ_flat)
-                #     cute.printf("-------------------- sK_flat: k * exp(g)")
-                #     cute.print_tensor(sK_flat)
-                #     cute.printf("-------------------- sG_flat stored with K^T*exp(-g):")
-                #     cute.print_tensor(sG_flat)
-                # self.cuda_wg_sync_barrier.arrive_and_wait()
+                if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
+                    # cute.printf("-------------------- sQ_flat: q * exp(g)")
+                    # cute.print_tensor(sQ_flat)
+                    cute.printf("-------------------- sK_flat: k * exp(g)")
+                    cute.print_tensor(sK_flat)
+                    cute.printf("-------------------- sG_flat stored with K^T*exp(-g):")
+                    cute.print_tensor(sG_flat_bf16)
+                self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 print(f"sM: {sM}")
                 print(f"sM_f16: {sM_f16}")
