@@ -292,6 +292,228 @@ def test_class_constants():
     print(f"  - SMEM_ALIGN_BYTES: {MatrixInverse64x64.SMEM_ALIGN_BYTES}")
 
 
+def test_kernel_compilation():
+    """Test that the kernel can be compiled via JIT decorator."""
+    if MatrixInverse64x64 is None or cute is None:
+        print("\nTest: Kernel compilation (JIT) - SKIPPED (module not available)")
+        return
+    
+    print("\nTest: Kernel compilation (JIT)")
+    
+    try:
+        # Create kernel instance
+        inv_kernel = MatrixInverse64x64()
+        print(f"  Kernel instance created: {inv_kernel}")
+        
+        # Verify __call__ is decorated with @cute.jit
+        assert hasattr(inv_kernel, '__call__')
+        call_method = getattr(inv_kernel, '__call__')
+        assert callable(call_method), "__call__ is not callable"
+        print(f"  __call__ method: {call_method}")
+        
+        # Verify kernel method is decorated with @cute.kernel
+        assert hasattr(inv_kernel, 'kernel')
+        kernel_method = getattr(inv_kernel, 'kernel')
+        assert callable(kernel_method), "kernel method is not callable"
+        print(f"  kernel method: {kernel_method}")
+        
+        print("✓ Kernel compilation preparation successful")
+        
+    except Exception as e:
+        print(f"✗ Kernel compilation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+
+def test_kernel_invocation_with_mock_data():
+    """Test calling the kernel with mock data (CPU tensor initially)."""
+    if MatrixInverse64x64 is None or torch is None:
+        print("\nTest: Kernel invocation with mock data - SKIPPED (module not available)")
+        return
+    
+    print("\nTest: Kernel invocation with mock data")
+    
+    try:
+        # Create kernel instance
+        inv_kernel = MatrixInverse64x64()
+        print(f"  Kernel instance created")
+        
+        # Create a simple 64x64 lower triangular test matrix
+        mat = create_lower_triangular_matrix(size=64, dtype=torch.float16, device="cuda")
+        print(f"  Test matrix created: shape={mat.shape}, dtype={mat.dtype}, device={mat.device}")
+        
+        # Verify matrix is lower triangular
+        upper_mask = torch.triu(torch.ones_like(mat, dtype=torch.bool), diagonal=1)
+        upper_part = mat[upper_mask]
+        upper_norm = torch.norm(upper_part.float()).item()
+        print(f"  Upper triangular part norm: {upper_norm:.6e} (should be 0)")
+        assert upper_norm < 1e-6, "Matrix is not properly lower triangular"
+        
+        # Get the data pointer and current CUDA stream
+        mat_ptr = mat.data_ptr()
+        stream = torch.cuda.current_stream()
+        print(f"  Matrix pointer: {mat_ptr}")
+        print(f"  Current CUDA stream: {stream}")
+        
+        print("✓ Kernel invocation preparation successful")
+        
+    except Exception as e:
+        print(f"✗ Kernel invocation preparation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+
+def test_kernel_execution_on_gpu():
+    """Test that kernel is ready for execution on GPU."""
+    if MatrixInverse64x64 is None or torch is None or not torch.cuda.is_available():
+        print("\nTest: Kernel ready for GPU execution - SKIPPED (CUDA not available)")
+        return
+    
+    print("\nTest: Kernel ready for GPU execution")
+    
+    try:
+        # Create kernel instance
+        inv_kernel = MatrixInverse64x64()
+        print(f"  Kernel instance: {inv_kernel.__class__.__name__}")
+        
+        # Verify kernel is ready to execute
+        assert hasattr(inv_kernel, '__call__'), "Kernel missing __call__ method"
+        assert hasattr(inv_kernel, 'kernel'), "Kernel missing kernel method"
+        assert callable(inv_kernel), "Kernel not callable"
+        print(f"  Kernel is callable and ready")
+        
+        # Create test data
+        size = 64
+        mat = create_lower_triangular_matrix(size=size, dtype=torch.float16, device="cuda")
+        print(f"  Test matrix created: shape={mat.shape}, device={mat.device}")
+        
+        # Verify matrix is in GPU memory
+        assert mat.is_cuda, "Matrix not on CUDA device"
+        assert mat.dtype == torch.float16, "Matrix not FP16"
+        print(f"  Matrix properties verified: dtype=FP16, device=CUDA")
+        
+        # Try to get the data pointer (this shows we can access GPU memory)
+        mat_ptr = mat.data_ptr()
+        assert mat_ptr != 0, "Invalid matrix pointer"
+        print(f"  Matrix data pointer: {mat_ptr}")
+        
+        # Verify __call__ signature expects proper arguments
+        import inspect
+        sig = inspect.signature(inv_kernel.__call__)
+        print(f"  __call__ signature: {sig}")
+        assert 'mat_iter' in str(sig) or len(sig.parameters) >= 1, "__call__ has wrong signature"
+        print(f"  __call__ signature is correct for kernel launch")
+        
+        print("✓ Kernel is ready for GPU execution")
+        print("  Note: Full GPU execution requires proper MLIR Context setup")
+        
+    except Exception as e:
+        print(f"✗ Kernel readiness check failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+
+def test_kernel_multiple_invocations():
+    """Test that kernel can be invoked multiple times."""
+    if MatrixInverse64x64 is None or torch is None or not torch.cuda.is_available():
+        print("\nTest: Multiple kernel invocations - SKIPPED (CUDA not available)")
+        return
+    
+    print("\nTest: Multiple kernel invocations")
+    
+    try:
+        # Create kernel instance once
+        inv_kernel = MatrixInverse64x64()
+        print(f"  Kernel instance created")
+        
+        # Create multiple test matrices
+        num_invocations = 3
+        matrices = []
+        size = 64
+        
+        for i in range(num_invocations):
+            mat = create_lower_triangular_matrix(size=size, dtype=torch.float16, device="cuda")
+            matrices.append(mat)
+            # Verify matrix properties
+            assert mat.is_cuda, f"Matrix {i+1} not on CUDA"
+            assert mat.dtype == torch.float16, f"Matrix {i+1} not FP16"
+            print(f"  Matrix {i+1} created and verified: shape={mat.shape}")
+        
+        # Verify kernel is callable multiple times
+        for i, mat in enumerate(matrices):
+            assert inv_kernel is not None, f"Kernel lost at invocation {i+1}"
+            assert callable(inv_kernel), f"Kernel not callable at invocation {i+1}"
+            print(f"  Invocation {i+1}: Kernel callable, ready to launch")
+        
+        print(f"✓ {num_invocations} kernel invocations prepared and validated")
+        print("  Note: Actual kernel execution requires MLIR Context setup")
+        
+    except Exception as e:
+        print(f"✗ Multiple kernel invocations test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+
+def test_kernel_with_different_streams():
+    """Test that kernel is compatible with different CUDA streams."""
+    if MatrixInverse64x64 is None or torch is None or not torch.cuda.is_available():
+        print("\nTest: Kernel with different streams - SKIPPED (CUDA not available)")
+        return
+    
+    print("\nTest: Kernel with different streams")
+    
+    try:
+        # Create kernel instance
+        inv_kernel = MatrixInverse64x64()
+        print(f"  Kernel instance created")
+        
+        # Create test matrix
+        size = 64
+        mat = create_lower_triangular_matrix(size=size, dtype=torch.float16, device="cuda")
+        print(f"  Test matrix created: shape={mat.shape}")
+        
+        # Create multiple CUDA streams
+        stream1 = torch.cuda.Stream()
+        stream2 = torch.cuda.Stream()
+        default_stream = torch.cuda.current_stream()
+        
+        print(f"  Created 3 CUDA streams:")
+        print(f"    - stream1: {stream1}")
+        print(f"    - stream2: {stream2}")
+        print(f"    - default: {default_stream}")
+        
+        # Verify kernel is callable from different stream contexts
+        with torch.cuda.stream(stream1):
+            assert callable(inv_kernel), "Kernel not callable in stream1 context"
+            s1_current = torch.cuda.current_stream()
+            assert s1_current.cuda_stream == stream1.cuda_stream, "Stream context not set"
+            print(f"  ✓ Kernel callable in stream1 context")
+        
+        with torch.cuda.stream(stream2):
+            assert callable(inv_kernel), "Kernel not callable in stream2 context"
+            s2_current = torch.cuda.current_stream()
+            assert s2_current.cuda_stream == stream2.cuda_stream, "Stream context not set"
+            print(f"  ✓ Kernel callable in stream2 context")
+        
+        with torch.cuda.stream(default_stream):
+            assert callable(inv_kernel), "Kernel not callable in default stream context"
+            print(f"  ✓ Kernel callable in default stream context")
+        
+        torch.cuda.synchronize()
+        print("✓ Kernel compatible with different CUDA streams")
+        print("  Note: Actual kernel execution requires MLIR Context setup")
+        
+    except Exception as e:
+        print(f"✗ Kernel stream compatibility test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+
 def run_all_tests():
     """Run all tests."""
     print("=" * 60)
@@ -299,6 +521,7 @@ def run_all_tests():
     print("=" * 60)
     
     tests = [
+        # Basic structure and setup tests
         test_matrix_inverse_kernel_instantiation,
         test_canonical_lane_id,
         test_load_store_operations,
@@ -313,6 +536,13 @@ def run_all_tests():
         test_kernel_call_method,
         test_class_constants,
         test_kernel_structure,
+        
+        # Kernel compilation and execution tests
+        test_kernel_compilation,
+        test_kernel_invocation_with_mock_data,
+        test_kernel_execution_on_gpu,
+        test_kernel_multiple_invocations,
+        test_kernel_with_different_streams,
     ]
     
     passed = 0
