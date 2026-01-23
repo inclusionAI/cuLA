@@ -6,8 +6,12 @@ from flashla.flashla_interface import lightning_prefill_fwd
 from flashla.linear_attn import LinearAttentionChunkwise
 from flashla.lightning_attn import LinearAttentionChunkwiseDecay
 
+# Matrix inversion kernel
+from flashla.inv import MatrixInverse64x64
+
 __all__ = [
     "lightning_prefill_fwd",
     "LinearAttentionChunkwise",
     "LinearAttentionChunkwiseDecay",
+    "MatrixInverse64x64",
 ]
