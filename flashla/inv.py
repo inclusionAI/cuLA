@@ -14,6 +14,7 @@ import cutlass
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cuda.bindings.driver as cuda
+from cutlass.cute.typing import Int64
 
 
 class MatrixInverse64x64:
@@ -32,6 +33,7 @@ class MatrixInverse64x64:
     
     # Kernel configuration constants
     MATRIX_SIZE = 64
+    MATRIX_DTYPE = cutlass.Float16  # Input/output data type
     THREADS_PER_CTA = 128  # 4 warps of 32 threads
     GRID_SIZE = 1  # Single CTA for entire matrix
     SMEM_ALIGN_BYTES = 1024
@@ -635,9 +637,14 @@ class MatrixInverse64x64:
             stream: CUDA stream for execution
         
         The kernel performs:
-        1. Load 64x64 matrix from GMEM to SMEM (shared memory)
+        1. Load 64x64 matrix from GMEM (with SMEM intermediate processing)
         2. Compute matrix inverse using 4 progressive stages in a warp group (128 threads)
         3. Store result back to GMEM
+        
+        The SharedStorage structure defines the shared memory layout:
+        - load_mbar_ptr: Pipeline barrier for load coordination
+        - sync_mbar_ptr: Barrier for all-thread synchronization
+        - smat: Shared memory buffer for 64x64 FP16 matrix (8 KB)
         
         Stages:
         - Stage 1: Invert 8 diagonal 8x8 blocks
@@ -645,6 +652,31 @@ class MatrixInverse64x64:
         - Stage 3: Build 32x32 blocks from 16x16 blocks using Schur complement
         - Stage 4: Build full 64x64 inverse from 32x32 blocks using Schur complement
         """
+        # Define shared memory layout for 64x64 FP16 matrix storage
+        # Layout: Row-major, shape (64, 64), stride (64, 1)
+        smat_layout = cute.make_layout(
+            (self.MATRIX_SIZE, self.MATRIX_SIZE),
+            stride=(self.MATRIX_SIZE, 1),
+        )
+        
+        # Define SharedStorage structure for shared memory management
+        # This follows the same pattern as kda.py for shared memory organization
+        @cute.struct
+        class SharedStorage:
+            # Pipeline barriers for synchronization
+            load_mbar_ptr: cute.struct.MemRange[Int64, 1 * 2]  # type: ignore
+            sync_mbar_ptr: cute.struct.MemRange[Int64, 1 * 2]  # type: ignore
+            # Shared memory buffer for 64x64 matrix (FP16)
+            # Aligned to SMEM_ALIGN_BYTES for optimal access patterns
+            # Size: 64 * 64 * sizeof(FP16) = 8192 bytes
+            smat: cute.struct.Align[
+                cute.struct.MemRange[self.MATRIX_DTYPE, cute.cosize(smat_layout)],  # type: ignore
+                self.SMEM_ALIGN_BYTES,
+            ]
+        
+        # Store SharedStorage class reference for kernel use
+        self.shared_storage = SharedStorage
+        
         # Launch the kernel with proper grid and block configuration
         self.kernel(mat).launch(
             grid=(self.GRID_SIZE, 1, 1),
@@ -660,16 +692,16 @@ class MatrixInverse64x64:
         Core kernel that performs the 64x64 matrix inversion.
         
         This kernel is decorated with @cute.kernel and handles:
-        - Loading matrix from global memory (GMEM)
+        - Loading matrix from global memory (GMEM) 
         - Computing the 4-stage block-wise inverse using 128 threads in a warp group
         - Storing result back to global memory
         
-        In this implementation, we perform the following operations:
-        - Stage 0: Load 64x64 matrix from GMEM and validate
-        - Stage 1-4: Compute 4-stage matrix inversion
-        - Stage Final: Store result back to GMEM
+        The kernel uses a SharedStorage structure in shared memory to:
+        - Store the 64x64 matrix for fast, coordinated access
+        - Manage synchronization barriers for thread cooperation
+        - Enable efficient computation of the 4-stage Schur complement algorithm
         
-        The computation is organized as:
+        Algorithm stages (to be implemented):
         - Stage 1: Invert 8 diagonal 8x8 blocks cooperatively
         - Stage 2: Build 16x16 blocks from 8x8 blocks using Schur complement
         - Stage 3: Build 32x32 blocks from 16x16 blocks using Schur complement
@@ -687,6 +719,7 @@ class MatrixInverse64x64:
         
         # Stage 0: Load and process matrix from global memory (GMEM)
         # All 128 threads cooperatively process the 64x64 matrix
+        # TODO: In the full implementation, this stage will load from GMEM to SMEM
         for i in range(elements_per_thread):
             # Calculate linear index for this thread
             linear_idx = tidx + i * self.threads_per_cta
@@ -694,13 +727,11 @@ class MatrixInverse64x64:
             n_idx = linear_idx % self.MATRIX_SIZE
             
             # Bounds check and process each element
-            # For now, just read the value to validate kernel execution
             if m_idx < self.MATRIX_SIZE and n_idx < self.MATRIX_SIZE:
                 # Load from global memory
                 val = mat[m_idx, n_idx]
-                # TODO: Apply inverse computation here
-                # For now, write back the same value
-                mat[m_idx, n_idx] = val
+                # TODO: Store to shared memory (part of SharedStorage.smat)
+                # mat[m_idx, n_idx] = val  # Placeholder
         
         # Synchronize all threads after all operations
         self.cuda_wg_sync_barrier.arrive_and_wait()
