@@ -2268,15 +2268,6 @@ class KDAChunkwise:
                 curr_sM = sM[None, None, smem_kk_handle.index]
                 curr_sM_f16 = sM_f16[None, None, smem_kk_handle.index]
 
-                self.cuda_wg_sync_barrier.arrive_and_wait()
-                if tidx == 0:
-                    cute.printf("--------------- KK results before inverse")
-                    cute.print_tensor(curr_sM_f16)
-                    cute.print_tensor(curr_sM_f16[63, None], verbose=True)
-                    pass
-                # FIXME
-                self.cuda_wg_sync_barrier.arrive_and_wait()
-
                 self.compute_matrix_inverse_64x64(curr_sM_f16)
 
                 # Make sure the inverse is done.
@@ -2284,6 +2275,8 @@ class KDAChunkwise:
                 if tidx == 0:
                     cute.printf("--------------- now sM before beta scale:")
                     cute.print_tensor(curr_sM_f16)
+                    cute.print_tensor(curr_sM_f16[63, None], verbose=True)
+                    cute.print_tensor(curr_sM_f16[62, None], verbose=True)
                 # FIXME
                 self.cuda_wg_sync_barrier.arrive_and_wait()
 
@@ -2297,6 +2290,8 @@ class KDAChunkwise:
                     if tidx == 0:
                         cute.printf("--------------- now sM:")
                         cute.print_tensor(curr_sM)
+                        cute.print_tensor(curr_sM[63, None], verbose=True)
+                        cute.print_tensor(curr_sM[62, None], verbose=True)
                 
                 # Notify end of smem_kk
                 smem_kk_handle.commit()
@@ -3116,7 +3111,8 @@ class KDAChunkwise:
         if tidx < 64:
             self.compute_diagonal_inverse_8x8(
                 t8x8mat[None, None, tidx//8, tidx//8],
-                tidx % 8
+                tidx % 8,
+                tidx // 8  # Pass block_id for correct shuffle masking
             )
         self.cuda_wg_sync_barrier.arrive_and_wait()
 
@@ -3298,6 +3294,7 @@ class KDAChunkwise:
         self,
         s_block: cute.Tensor,  # Input 8x8 block in smem
         lane_id: int,
+        block_id: int = -1,  # Block ID for correct shuffle mask calculation
     ):
         """
         Compute inverse of a diagonal 8x8 lower triangular block.
@@ -3306,13 +3303,27 @@ class KDAChunkwise:
         """
         # Every thread fix a row
         row = self.load_row_mat8x8(s_block, lane_id)
+        
+        # Calculate the actual physical starting position of this block in the warp
+        # Blocks 0-3 are in Warp 0 (tidx 0-31), Blocks 4-7 are in Warp 1 (tidx 32-63)
+        # Each block starts at: warp_base + block_index_in_warp * 8
+        # where block_index_in_warp = block_id % 4
+        actual_block_base = (block_id % 4) * 8  # 0, 8, 16, or 24 within the warp
+        
         for src_row in cutlass.range_constexpr(8-1):
             row_scale = row[src_row] * cutlass.Float32(-1)
             for i in cutlass.range(src_row, unroll_full=True):
-            # for i in cutlass.range(src_row):
+                # Correct target lane: within the block, we need threads at positions
+                # actual_block_base + 0, actual_block_base + 1, ..., actual_block_base + 7
+                # The src_row thread (0-7 within the block) maps to actual_block_base + src_row
+                # in the warp
+                target_lane = actual_block_base + src_row
+                
                 src_row_value = cute.arch.shuffle_sync_op(
-                    # 0x11000 | 0x00111 = 768 + 7
-                    value=row[i], offset=src_row, mask=0xFFFFFFFF, mask_and_clamp=775
+                    value=row[i], 
+                    offset=target_lane,  # Use actual position, not just src_row
+                    mask=0xFFFFFFFF, 
+                    mask_and_clamp=31
                 )
                 if lane_id > src_row:
                     row[i] += row_scale * src_row_value
@@ -4128,10 +4139,6 @@ def main():
     # QK, L2 Norm
     Q, Q_rstd = l2norm_fwd(Q)
     K, K_rstd = l2norm_fwd(K)
-
-    print(f"Q:\n {Q}")
-    print(f"K:\n {K}")
-    print(f"G:\n {G}")
 
     # Convert to dlpack for CuTe
     q_cute = from_dlpack(Q)
