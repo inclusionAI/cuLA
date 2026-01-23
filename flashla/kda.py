@@ -3311,7 +3311,8 @@ class KDAChunkwise:
             for i in cutlass.range(src_row, unroll_full=True):
             # for i in cutlass.range(src_row):
                 src_row_value = cute.arch.shuffle_sync_op(
-                    value=row[i], offset=src_row, mask=0xFFFFFFFF, mask_and_clamp=8-1
+                    # 0x11000 | 0x00111
+                    value=row[i], offset=src_row, mask=0xFFFFFFFF, mask_and_clamp=775
                 )
                 if lane_id > src_row:
                     row[i] += row_scale * src_row_value

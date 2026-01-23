@@ -1,7 +1,7 @@
 -------------------- k * exp(g)
 chunk idx=0, got k2 consumer=0
-chunk idx=0, got kt2 consumer=0
 tensor(raw_ptr(0x0000000000010800: bf16, smem, align<1024>) o (64,(64,2)):(64,(1,4096)), data=
+chunk idx=0, got kt2 consumer=0
 chunk idx=0, got mma_kk producer=0
        [[ 0.004517, -0.001404, -0.020630, ..., -0.009888,  0.069336, -0.043945, ],
         [-0.005646,  0.005127,  0.001801, ..., -0.014893, -0.026001, -0.032227, ],
@@ -102,7 +102,7 @@ tensor(raw_ptr(0x0000000000030800: f16, smem, align<1024>) o ((8,8),(64,1)):((64
         ...
         [ 0.000000,  0.000000,  0.000000, ...,  1.000000,  0.000000,  0.000000, ],
         [ 0.000000,  0.000000,  0.000000, ..., -0.016083,  1.000000,  0.000000, ],
-        [ 0.000000,  0.000000,  0.000000, ..., -0.000763, -0.045959,  1.000000, ]])
+        [ 0.000000,  0.000000,  0.000000, ...,  0.001647, -0.045959,  1.000000, ]])
 Running Chunkwise Linear Attention with CuTe DSL:
   Batch size: 1
   Sequence length: 64
@@ -395,10 +395,10 @@ tXsX_s2r: tensor<ptr<f16, smem, align<64>, S<3,4,3>> o ((8,4),1,1):((1,8),0,0)>
 tXrX_bf16: tensor<ptr<bf16, rmem, align<32>> o ((8,4),1,1):((1,8),0,0)>
 flat: tensor<ptr<f32, rmem, align<32>> o 128:1>
 kv_f32: tensor<ptr<f32, rmem, align<32>> o 128:1>
-Compilation time: 4.4877 seconds
+Compilation time: 4.5104 seconds
 B, S, H, D: (1, 64, 1, 128)
 
-Execution time: 24.95 ms (average over 1 iterations)
+Execution time: 24.92 ms (average over 1 iterations)
 Throughput: 0.00 GB/s
 
 PASS
