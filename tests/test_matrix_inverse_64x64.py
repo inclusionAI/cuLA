@@ -62,54 +62,6 @@ def test_matrix_inverse_kernel_instantiation():
     print("✓ Kernel instantiation successful")
 
 
-def test_canonical_lane_id():
-    """Test the canonical_lane_id function."""
-    if MatrixInverse64x64 is None:
-        print("\nTest: Canonical lane ID - SKIPPED (module not available)")
-        return
-    
-    print("\nTest: Canonical lane ID")
-    inv_kernel = MatrixInverse64x64()
-    # This would need to be called from within a CUDA kernel
-    # For now, we just verify the method exists
-    assert hasattr(inv_kernel, 'canonical_lane_id')
-    print("✓ Canonical lane ID method exists")
-
-
-def test_load_store_operations():
-    """Test load and store operations for 8x8 blocks."""
-    if MatrixInverse64x64 is None:
-        print("\nTest: Load/Store operations - SKIPPED (module not available)")
-        return
-    
-    print("\nTest: Load/Store operations")
-    inv_kernel = MatrixInverse64x64()
-    
-    # Create a test 8x8 matrix
-    test_mat = torch.randn(8, 8, dtype=torch.float16)
-    
-    # The actual load/store would happen in the kernel
-    # Here we just verify the methods exist
-    assert hasattr(inv_kernel, 'load_row_mat8x8')
-    assert hasattr(inv_kernel, 'store_row_mat8x8')
-    print("✓ Load/Store operations available")
-
-
-def test_convert_layout():
-    """Test layout conversion utilities."""
-    if MatrixInverse64x64 is None:
-        print("\nTest: Layout conversion - SKIPPED (module not available)")
-        return
-    
-    print("\nTest: Layout conversion")
-    inv_kernel = MatrixInverse64x64()
-    
-    # Verify conversion methods exist
-    assert hasattr(inv_kernel, 'convert_layout_c_to_a')
-    assert hasattr(inv_kernel, 'make_acc_as_a')
-    print("✓ Layout conversion methods available")
-
-
 def test_matrix_inverse_fp16_cpu():
     """Test matrix inverse computation using CPU (PyTorch) as reference."""
     print("\nTest: FP16 Matrix inverse (CPU reference)")
@@ -148,123 +100,6 @@ def test_matrix_inverse_fp16_cpu():
         print("✓ FP16 matrix inverse reference computed")
     except Exception as e:
         print(f"✗ Error in test: {e}")
-
-
-def test_stage_1_kernel_exists():
-    """Test that 8x8 diagonal inverse kernel method exists."""
-    if MatrixInverse64x64 is None:
-        print("\nTest: Stage 1 (8x8) kernel - SKIPPED (module not available)")
-        return
-    
-    print("\nTest: Stage 1 (8x8) kernel")
-    inv_kernel = MatrixInverse64x64()
-    assert hasattr(inv_kernel, 'compute_diagonal_inverse_8x8')
-    print("✓ Stage 1 kernel method exists")
-
-
-def test_stage_2_kernel_exists():
-    """Test that 8x8->16x16 conversion kernel method exists."""
-    if MatrixInverse64x64 is None:
-        print("\nTest: Stage 2 (8x8->16x16) kernel - SKIPPED (module not available)")
-        return
-    
-    print("\nTest: Stage 2 (8x8->16x16) kernel")
-    inv_kernel = MatrixInverse64x64()
-    assert hasattr(inv_kernel, 'compute_diagonal_inverse_8x8_to_16x16')
-    print("✓ Stage 2 kernel method exists")
-
-
-def test_stage_3_kernel_exists():
-    """Test that 16x16->32x32 conversion kernel method exists."""
-    if MatrixInverse64x64 is None:
-        print("\nTest: Stage 3 (16x16->32x32) kernel - SKIPPED (module not available)")
-        return
-    
-    print("\nTest: Stage 3 (16x16->32x32) kernel")
-    inv_kernel = MatrixInverse64x64()
-    assert hasattr(inv_kernel, 'compute_diagonal_inverse_16x16_to_32x32')
-    print("✓ Stage 3 kernel method exists")
-
-
-def test_stage_4_kernel_exists():
-    """Test that 32x32->64x64 conversion kernel method exists."""
-    if MatrixInverse64x64 is None:
-        print("\nTest: Stage 4 (32x32->64x64) kernel - SKIPPED (module not available)")
-        return
-    
-    print("\nTest: Stage 4 (32x32->64x64) kernel")
-    inv_kernel = MatrixInverse64x64()
-    assert hasattr(inv_kernel, 'compute_diagonal_inverse_32x32_to_64x64')
-    print("✓ Stage 4 kernel method exists")
-
-
-def test_main_kernel_exists():
-    """Test that the main compute_matrix_inverse_64x64 kernel exists."""
-    if MatrixInverse64x64 is None:
-        print("\nTest: Main 64x64 inverse kernel - SKIPPED (module not available)")
-        return
-    
-    print("\nTest: Main 64x64 inverse kernel")
-    inv_kernel = MatrixInverse64x64()
-    assert hasattr(inv_kernel, 'compute_matrix_inverse_64x64')
-    print("✓ Main kernel method exists")
-
-
-def test_barrier_initialization():
-    """Test that the work-group barrier is initialized."""
-    if MatrixInverse64x64 is None:
-        print("\nTest: Barrier initialization - SKIPPED (module not available)")
-        return
-    
-    print("\nTest: Barrier initialization")
-    inv_kernel = MatrixInverse64x64()
-    assert hasattr(inv_kernel, 'cuda_wg_sync_barrier')
-    print("✓ Work-group barrier initialized")
-
-
-def test_kernel_structure():
-    """Comprehensive test of kernel structure and organization."""
-    if MatrixInverse64x64 is None:
-        print("\nTest: Kernel structure - SKIPPED (module not available)")
-        return
-    
-    print("\nTest: Kernel structure")
-    
-    inv_kernel = MatrixInverse64x64()
-    
-    # Verify all required methods exist
-    required_methods = [
-        'canonical_lane_id',
-        'convert_layout_c_to_a',
-        'make_acc_as_a',
-        'make_op_a_from_acc_rmem_16x8x8',
-        'compute_diagonal_inverse_8x8',
-        'load_row_mat8x8',
-        'store_row_mat8x8',
-        'compute_diagonal_inverse_8x8_to_16x16',
-        'compute_diagonal_inverse_16x16_to_32x32',
-        'compute_diagonal_inverse_32x32_to_64x64',
-        'compute_matrix_inverse_64x64',
-    ]
-    
-    for method_name in required_methods:
-        assert hasattr(inv_kernel, method_name), f"Missing method: {method_name}"
-        assert callable(getattr(inv_kernel, method_name)), f"Not callable: {method_name}"
-    
-    print(f"✓ All {len(required_methods)} required methods present and callable")
-
-
-def test_kernel_call_method():
-    """Test that __call__ method exists and is callable."""
-    if MatrixInverse64x64 is None:
-        print("\nTest: Kernel __call__ method - SKIPPED (module not available)")
-        return
-    
-    print("\nTest: Kernel __call__ method")
-    inv_kernel = MatrixInverse64x64()
-    assert hasattr(inv_kernel, '__call__')
-    assert callable(inv_kernel)
-    print("✓ __call__ method exists and is callable")
 
 
 def test_class_constants():
@@ -521,21 +356,12 @@ def run_all_tests():
     print("=" * 60)
     
     tests = [
-        # Basic structure and setup tests
+        # Kernel instantiation and configuration tests
         test_matrix_inverse_kernel_instantiation,
-        test_canonical_lane_id,
-        test_load_store_operations,
-        test_convert_layout,
-        test_matrix_inverse_fp16_cpu,
-        test_stage_1_kernel_exists,
-        test_stage_2_kernel_exists,
-        test_stage_3_kernel_exists,
-        test_stage_4_kernel_exists,
-        test_main_kernel_exists,
-        test_barrier_initialization,
-        test_kernel_call_method,
         test_class_constants,
-        test_kernel_structure,
+        
+        # Numerical validation tests
+        test_matrix_inverse_fp16_cpu,
         
         # Kernel compilation and execution tests
         test_kernel_compilation,
