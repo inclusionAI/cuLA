@@ -3814,11 +3814,14 @@ class KDAChunkwise:
 
         tOsO = O_thr_r2s.partition_D(sO)
         tOrO_cvt_cv = O_thr_r2s.retile(tOrO_f16)
+        
+        # Warp with x=0 writes the result
         if x == 0:
             cute.copy(O_tiled_r2s, tOrO_cvt_cv, tOsO)
 
         self.cuda_wg_sync_barrier.arrive_and_wait()
 
+        # Warp with x=1 reads and accumulates (reduce operation)
         if x == 1:
             # reduce to get correct results
             tOrO_red = cute.make_rmem_tensor_like(tOrO_f16)
@@ -3827,6 +3830,8 @@ class KDAChunkwise:
             cute.copy(O_tiled_s2r, tOsO_s, tOrO_red_cv)
             tOrO_f16.store(tOrO_f16.load() + tOrO_red.load())
             cute.copy(O_tiled_r2s, tOrO_cvt_cv, tOsO)
+
+        self.cuda_wg_sync_barrier.arrive_and_wait()
 
     @cute.jit
     def apply_mask(
