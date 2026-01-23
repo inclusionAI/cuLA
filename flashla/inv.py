@@ -12,6 +12,7 @@ for 64x64 lower triangular matrices using 4 progressive stages:
 import cutlass.cute as cute
 import cutlass
 import cutlass.pipeline as pipeline
+import cuda.bindings.driver as cuda
 
 
 class MatrixInverse64x64:
@@ -21,7 +22,18 @@ class MatrixInverse64x64:
     This kernel inverts a 64x64 lower triangular matrix using the 
     block-wise Schur complement method. The matrix is divided into 
     8x8 blocks and progressively inverted in 4 stages.
+    
+    Grid Configuration:
+        - Grid size: 1 (single block per matrix)
+        - Block size: 128 threads (4 warps × 32 lanes)
+        - Shared memory: ~64 KB (64x64 FP16 matrix + synchronization overhead)
     """
+    
+    # Kernel configuration constants
+    MATRIX_SIZE = 64
+    THREADS_PER_CTA = 128  # 4 warps of 32 threads
+    GRID_SIZE = 1  # Single CTA for entire matrix
+    SMEM_ALIGN_BYTES = 1024
     
     def __init__(self, acc_dtype=cutlass.Float32, cuda_core_threads=128):
         """
@@ -33,6 +45,7 @@ class MatrixInverse64x64:
         """
         self.acc_dtype = acc_dtype
         self.cuda_core_threads = cuda_core_threads
+        self.threads_per_cta = cuda_core_threads
         # Create a named barrier for synchronization across all threads
         self.cuda_wg_sync_barrier = pipeline.NamedBarrier(
             barrier_id=3,
@@ -580,3 +593,123 @@ class MatrixInverse64x64:
         
         # Stage 4: Build full 64x64 inverse
         self.compute_diagonal_inverse_32x32_to_64x64(s_mat)
+    
+    @cute.jit
+    def __call__(
+        self,
+        mat_iter: cute.Pointer,
+        stream: cuda.CUstream = None,
+    ):
+        """
+        Launch the matrix inverse kernel on a 64x64 FP16 matrix.
+        
+        Grid Configuration:
+            - Grid dimensions: (1, 1, 1)
+            - Block dimensions: (128, 1, 1) = 128 threads
+            - Shared memory: ~64 KB for 64x64 FP16 matrix
+            - Cluster shape: (1, 1, 1) for single CTA
+        
+        Args:
+            mat_iter: Pointer to 64x64 FP16 matrix in global memory
+            stream: Optional CUDA stream for async execution
+        
+        Example:
+            >>> import torch
+            >>> from flashla.inv import MatrixInverse64x64
+            >>> 
+            >>> # Create a 64x64 lower triangular matrix
+            >>> mat = torch.tril(torch.randn(64, 64, dtype=torch.float16, device='cuda'))
+            >>> mat.diagonal().add_(1.0)  # Ensure well-conditioned
+            >>> 
+            >>> # Invert the matrix
+            >>> inv_kernel = MatrixInverse64x64()
+            >>> inv_kernel(mat.data_ptr(), stream=torch.cuda.current_stream())
+            >>> # mat now contains the inverse
+        """
+        # Create tensor layout for 64x64 FP16 matrix
+        # Layout: (M, N) with stride (N, 1) for row-major
+        mat_layout = cute.make_layout(
+            (self.MATRIX_SIZE, self.MATRIX_SIZE),
+            stride=(self.MATRIX_SIZE, 1),
+        )
+        mat_tensor = cute.make_tensor(mat_iter, mat_layout)
+        
+        # Define shared memory storage for the matrix
+        class SharedStorage:
+            """Shared memory layout for matrix inverse kernel."""
+            # 64x64 FP16 matrix in shared memory
+            # Alignment: 1024 bytes for optimal performance
+            s_mat: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float16, self.MATRIX_SIZE * self.MATRIX_SIZE],
+                self.SMEM_ALIGN_BYTES,
+            ]
+        
+        self.shared_storage = SharedStorage
+        
+        # Grid and block configuration
+        grid = (self.GRID_SIZE, 1, 1)  # Single CTA
+        block = (self.threads_per_cta, 1, 1)  # 128 threads per block
+        cluster = (1, 1, 1)  # Single cluster
+        
+        # Launch the kernel
+        self.kernel(mat_tensor).launch(
+            grid=grid,
+            block=block,
+            cluster=cluster,
+            stream=stream,
+            min_blocks_per_mp=1,
+        )
+    
+    @cute.kernel
+    def kernel(self, mat: cute.Tensor):
+        """
+        Core kernel that performs the 64x64 matrix inversion.
+        
+        This kernel is decorated with @cute.kernel and handles:
+        - SMEM allocation and initialization
+        - Loading matrix from global to shared memory
+        - Computing the 4-stage block-wise inverse
+        - Storing result back to global memory
+        
+        Args:
+            mat: 64x64 FP16 matrix tensor (from global memory)
+        """
+        # Get thread indices
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        
+        # Allocate shared memory for the matrix
+        s_mat = cute.make_smem_tensor(
+            cute.make_layout(
+                (self.MATRIX_SIZE, self.MATRIX_SIZE),
+                stride=(self.MATRIX_SIZE, 1),
+            ),
+            element_type=cutlass.Float16,
+        )
+        
+        # Stage 0: Load matrix from global memory to shared memory
+        # Each thread loads MATRIX_SIZE * MATRIX_SIZE / THREADS_PER_CTA elements
+        elements_per_thread = (self.MATRIX_SIZE * self.MATRIX_SIZE) // self.threads_per_cta
+        for i in range(elements_per_thread):
+            linear_idx = tidx + i * self.threads_per_cta
+            m_idx = linear_idx // self.MATRIX_SIZE
+            n_idx = linear_idx % self.MATRIX_SIZE
+            if m_idx < self.MATRIX_SIZE and n_idx < self.MATRIX_SIZE:
+                s_mat[m_idx, n_idx] = mat[m_idx, n_idx]
+        
+        # Synchronize all threads after loading
+        self.cuda_wg_sync_barrier.arrive_and_wait()
+        
+        # Compute the matrix inverse using 4 progressive stages
+        self.compute_matrix_inverse_64x64(s_mat)
+        
+        # Synchronize before storing
+        self.cuda_wg_sync_barrier.arrive_and_wait()
+        
+        # Stage Final: Store result back to global memory
+        for i in range(elements_per_thread):
+            linear_idx = tidx + i * self.threads_per_cta
+            m_idx = linear_idx // self.MATRIX_SIZE
+            n_idx = linear_idx % self.MATRIX_SIZE
+            if m_idx < self.MATRIX_SIZE and n_idx < self.MATRIX_SIZE:
+                mat[m_idx, n_idx] = s_mat[m_idx, n_idx]

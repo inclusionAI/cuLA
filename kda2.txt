@@ -1,0 +1,715 @@
+-------------DEBUG ----------- NO ARGS
+TMA v producer idx=0, v_handle=0
+chunk idx=0, got g consumer=0
+chunk idx=0, got q consumer=0
+chunk idx=0, got k consumer=0
+chunk idx=0, got q2 producer=0
+chunk idx=0, got k2 producer=0
+chunk idx=0, got kt2 producer=0
+chunk idx=0, got kg consumer=0
+chunk idx=0, got kng consumer=0
+chunk idx=0, got mma_kk producer=0
+chunk idx=0, got mma_kk consumer=0
+chunk idx=0, got q2 consumer=0
+chunk idx=0, got s0 producer=0
+chunk idx=0, got smem_kk producer=0
+-------------------- sK_flat: k * exp(g)
+tensor(raw_ptr(0x0000000000010800: bf16, smem, align<1024>) o (64,(64,2),2):(64,(1,4096),8192), data=
+       [[[ 0.004517, -0.001404, -0.020630, ..., -0.009888,  0.069336, -0.043945, ],
+         [-0.005646,  0.005127,  0.001801, ..., -0.014893, -0.026001, -0.032227, ],
+         [-0.007935,  0.001320, -0.005280, ...,  0.024902,  0.009338,  0.002884, ],
+         ...
+         [-0.000000, -0.000000,  0.000000, ..., -0.000000,  0.000000, -0.000000, ],
+         [-0.000000,  0.000000,  0.000000, ..., -0.000000,  0.000000, -0.000000, ],
+         [-0.000000,  0.000000, -0.000000, ...,  0.000000,  0.000000,  0.000000, ]],
+
+        [[ 0.000000,  0.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
+         [ 0.000000,  0.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
+         [ 0.000000,  0.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
+         ...
+         [ 0.000000,  0.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
+         [ 0.000000,  0.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
+         [ 0.000000,  0.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ]]])
+-------------------- sG_flat stored with K^T*exp(-g):
+tensor(raw_ptr(0x000000000001c800: bf16, smem, align<1024>) o (64,(64,2),2):(64,(1,4096),8192), data=
+       [[[ 0.040771, -0.079102, -0.239258, ..., -0.016479,  0.197266, -0.098633, ],
+         [-0.421875,  1.695312,  0.102051, ..., -0.052979, -0.345703, -0.118652, ],
+         [-1.312500,  3.156250, -1.765625, ...,  0.339844,  0.316406,  0.090332, ],
+         ...
+         [-4719772409484279808.000000, -9583660007044415488.000000,  13871951543429582815232.000000, ..., -184467440737095516160.000000,  116288274640665013387264.000000, -1046852726183017054208.000000, ],
+         [-5548434740920451072.000000,  332041393326771929088.000000,  12986507827891524337664.000000, ..., -110680464442257309696.000000,  218409449832721091133440.000000, -2545650682171918123008.000000, ],
+         [-5116089176692883456.000000,  1079134528312008769536.000000, -57553841509973801041920.000000, ...,  880832029519631089664.000000,  197158800659807687671808.000000,  1604866734412730990592.000000, ]],
+
+        [[-853221023154176.000000, -0.675781, -276.000000, ..., -0.753906,  89120571392.000000, -0.582031, ],
+         [ 854748333399405783678976.000000, -1.515625,  0.000000, ..., -1.859375, -11837801625666448878722875392.000000, -0.937500, ],
+         [-21206401024.000000, -3.625000, -2078764171264.000000, ..., -2.531250,  0.000000, -2.484375, ],
+         ...
+         [-914828034048.000000, -73.500000,  612368384.000000, ..., -80.500000, -0.000000, -73.500000, ],
+         [-162.000000, -76.000000,  0.000000, ..., -81.000000, -0.000000, -74.000000, ],
+         [-168040688926433455284158464.000000, -77.500000, -1032192.000000, ..., -82.500000,  1635778560.000000, -74.500000, ]]])
+---------- Raw first 8x8 block:
+tensor(raw_ptr(0x0000000000030800: f16, smem, align<1024>) o (4,4):(64,1), data=
+       [[ 1.000000,  0.000000,  0.000000,  0.000000, ],
+        [ 0.013443,  1.000000,  0.000000,  0.000000, ],
+        [ 0.037292, -0.061493,  1.000000,  0.000000, ],
+        [-0.158447,  0.475098, -0.091858,  1.000000, ]])
+tensor(raw_ptr(0x0000000000030808: f16, smem, align<8>) o (4,4):(64,1), data=
+       [[ 0.000000,  0.000000,  0.000000,  0.000000, ],
+        [ 0.000000,  0.000000,  0.000000,  0.000000, ],
+        [ 0.000000,  0.000000,  0.000000,  0.000000, ],
+        [ 0.000000,  0.000000,  0.000000,  0.000000, ]])
+tensor(raw_ptr(0x0000000000030a00: f16, smem, align<512>) o (4,4):(64,1), data=
+       [[ inf, -inf,  inf, -inf, ],
+        [-inf, -inf, -inf, -inf, ],
+        [-inf, -inf, -inf, -inf, ],
+        [nan,  inf, nan, nan, ]])
+tensor(raw_ptr(0x0000000000030a08: f16, smem, align<8>) o (4,4):(64,1), data=
+       [[ 1.000000,  0.000000,  0.000000,  0.000000, ],
+        [-inf,  1.000000,  0.000000,  0.000000, ],
+        [-inf,  inf,  1.000000,  0.000000, ],
+        [ inf, nan, nan,  1.000000, ]])
+---------- After Stage1, first 8x8 block:
+tensor(raw_ptr(0x0000000000030800: f16, smem, align<1024>) o (8,8):(64,1), data=
+       [[ 1.000000,  0.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
+        [-0.013443,  1.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
+        [-0.038116,  0.061493,  1.000000, ...,  0.000000,  0.000000,  0.000000, ],
+        ...
+        [nan, nan, nan, ...,  1.000000,  0.000000,  0.000000, ],
+        [nan, nan, nan, ..., -inf,  1.000000,  0.000000, ],
+        [nan, nan, nan, ..., nan, nan,  1.000000, ]])
+-------------- After stage 2 inverse 16x16, first 16x16 block
+tensor(raw_ptr(0x0000000000030800: f16, smem, align<1024>) o (16,16):(64,1), data=
+       [[ 1.000000,  0.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
+        [-0.013443,  1.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
+        [-0.038116,  0.061493,  1.000000, ...,  0.000000,  0.000000,  0.000000, ],
+        ...
+        [nan, nan, nan, ...,  1.000000,  0.000000,  0.000000, ],
+        [nan, nan, nan, ..., nan,  1.000000,  0.000000, ],
+        [nan, nan, nan, ..., nan, nan,  1.000000, ]])
+-------------- After stage 3 inverse 32x32, first 32x32 block
+tensor(raw_ptr(0x0000000000030800: f16, smem, align<1024>) o (32,32):(64,1), data=
+       [[ 1.000000,  0.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
+        [-0.013443,  1.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
+        [-0.038116,  0.061493,  1.000000, ...,  0.000000,  0.000000,  0.000000, ],
+        ...
+        [nan, nan, nan, ...,  1.000000,  0.000000,  0.000000, ],
+        [nan, nan, nan, ..., nan,  1.000000,  0.000000, ],
+        [nan, nan, nan, ..., nan, nan,  1.000000, ]])
+-------------- Final inverse 64x64 block
+
+tensor(raw_ptr(0x0000000000030800: f16, smem, align<1024>) o ((8,8),(64,1)):((64,512),(1,0)), data=
+       [[ 1.000000,  0.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
+        [-0.013443,  1.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
+        [-0.038116,  0.061493,  1.000000, ...,  0.000000,  0.000000,  0.000000, ],
+        ...
+        [nan, nan, nan, ...,  1.000000,  0.000000,  0.000000, ],
+        [nan, nan, nan, ..., nan,  1.000000,  0.000000, ],
+        [nan, nan, nan, ..., nan, nan,  1.000000, ]])
+--------------- beta_chunk:
+tensor(raw_ptr(0x0000fff99dc0c200: f32, gmem, align<4>) o (64,1):(1,0), data=
+       [[ 0.219562, ],
+        [ 0.490427, ],
+        [ 0.474287, ],
+        ...
+        [ 0.782673, ],
+        [ 0.246144, ],
+        [ 0.674811, ]])
+--------------- now sM:
+tensor(raw_ptr(0x0000000000030800: bf16, smem, align<1024>) o ((8,8),(64,1)):((64,512),(1,0)), data=
+       [[ 0.219727,  0.000000,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
+        [-0.006592,  0.490234,  0.000000, ...,  0.000000,  0.000000,  0.000000, ],
+        [-0.018066,  0.029175,  0.474609, ...,  0.000000,  0.000000,  0.000000, ],
+        ...
+        [nan, nan, nan, ...,  0.781250,  0.000000,  0.000000, ],
+        [nan, nan, nan, ..., nan,  0.246094,  0.000000, ],
+        [nan, nan, nan, ..., nan, nan,  0.675781, ]])
+chunk idx=0, got kk consumer=0
+------------DEBUG before v consumer wait--------------
+chunk idx=0, got v consumer=0
+chunk idx=0, got v2 producer=0
+------------ V corrected:
+chunk idx=0, got v2 consumer=0
+chunk idx=0, got pseudo_v producer=0
+tensor(raw_ptr(0x0000000000018800: bf16, smem, align<1024>) o (64,64,2,1):(1,64,4096,8192), data=
+       [[[-0.519531,  0.515625, -1.359375, ...,  0.217773,  2.375000, -0.441406, ],
+         [ 1.226562,  0.675781,  2.078125, ...,  0.953125, -0.304688,  0.863281, ],
+         [ 0.625000, -1.312500, -1.851562, ...,  0.206055, -0.151367, -0.796875, ],
+         ...
+         [ 0.120117, -0.414062, -0.129883, ..., nan, nan, nan, ],
+         [-0.097168,  0.597656,  0.022217, ..., nan, nan, nan, ],
+         [ 0.005432, -0.054932, -0.180664, ..., nan, nan, nan, ]],
+
+        [[ 0.316406, -0.562500, -0.168945, ..., nan, nan, nan, ],
+         [-0.314453,  0.136719,  1.015625, ..., nan, nan, nan, ],
+         [ 0.188477,  0.109375,  0.014709, ..., nan, nan, nan, ],
+         ...
+         [-0.005219, -0.390625,  0.281250, ..., nan, nan, nan, ],
+         [-0.140625, -0.045898,  0.165039, ..., nan, nan, nan, ],
+         [-0.333984, -0.033203,  0.124512, ..., nan, nan, nan, ]]])
+chunk idx=0, got pseudo_v consumer=0
+chunk idx=0, got v3 producer=0
+chunk idx=0, got s0 consumer=0
+chunk idx=0, got p producer=0
+chunk idx=0, got o_intra producer=0
+chunk idx=0, got o_intra consumer=0
+chunk idx=0, got smem_o producer=0
+Running Chunkwise Linear Attention with CuTe DSL:
+  Batch size: 1
+  Sequence length: 64
+  Number of heads: 1
+  Head dimension: 128
+  Chunk size: 64
+  IO dtype: BFloat16
+  Accumulation dtype: Float32
+  Warmup iterations: 0
+  Benchmark iterations: 1
+tCtAccPV_fake=tensor<ptr<f32, tmem, align<1>> o ((128,64),1,1,2):((65536,1),0,0,64)>, num_pv_acc_cols=128
+tCtAccKV_fake=tensor<ptr<f32, tmem, align<1>> o ((128,128),1,1,1):((65536,1),0,0,0)>, num_kv_acc_cols=128, num_kv16_acc_cols=64
+tCtAccSQ_fake=tensor<ptr<f32, tmem, align<1>> o ((128,64),1,1,1):((65536,1),0,0,0)>, num_qs_acc_cols=64
+num_qk_acc_cols_offset: 0
+num_pv_acc_cols_offset: 64
+num_kv_acc_cols_offset: 192
+num_kv16_acc_cols_offset: 320
+num_qs_acc_cols_offset: 384
+num_tmem_cols_total: 512
+tma_atom_g: Copy Atom
+  ThrID:         1:0
+  TV Layout Src: (1,2048):(0,1)
+  TV Layout Dst: (1,2048):(0,1)
+  Value type:    f32
+g_smem_layout: S<3,4,3> o 0 o ((64,16),1,(2,4)):((32,1),0,(16,2048))
+q_layout: (?,?,(?,?)):(?,1,(?,?))
+q: tensor<ptr<bf16, gmem> o (?,?,(?,?)):(?,1,(?,?))>
+k_layout: (?,?,(?,?)):(?,1,(?,?))
+k: tensor<ptr<bf16, gmem> o (?,?,(?,?)):(?,1,(?,?))>
+v_layout: (?,?,(?,?)):(1,?,(?,?))
+v: tensor<ptr<bf16, gmem> o (?,?,(?,?)):(1,?,(?,?))>
+o_layout: (?,?,(?,?)):(1,?,(?,?))
+o: tensor<ptr<bf16, gmem> o (?,?,(?,?)):(1,?,(?,?))>
+qk_tiled_mma: Tiled MMA
+  Thr Layout VMNK: (1,1,1,1):(0,0,0,0)
+  Permutation MNK: (_,_,_)
+MMA Atom
+  ThrID:           1:0
+  Shape MNK:       (64,64,16)
+  TV Layout A:     (1,(64,16)):(64,(1,64))
+  TV Layout B:     (1,(64,16)):(64,(1,64))
+  TV Layout C:     (1,(64,64)):(64,(1,64))
+kv_tiled_mma: Tiled MMA
+  Thr Layout VMNK: (1,1,1,1):(0,0,0,0)
+  Permutation MNK: (_,_,_)
+MMA Atom
+  ThrID:           1:0
+  Shape MNK:       (128,128,16)
+  TV Layout A:     (1,(128,16)):(128,(1,128))
+  TV Layout B:     (1,(128,16)):(128,(1,128))
+  TV Layout C:     (1,(128,128)):(128,(1,128))
+vp_tiled_mma: Tiled MMA
+  Thr Layout VMNK: (1,1,1,1):(0,0,0,0)
+  Permutation MNK: (_,_,_)
+MMA Atom
+  ThrID:           1:0
+  Shape MNK:       (128,64,16)
+  TV Layout A:     (1,(128,16)):(128,(1,128))
+  TV Layout B:     (1,(64,16)):(64,(1,64))
+  TV Layout C:     (1,(128,64)):(128,(1,128))
+sq_tiled_mma: Tiled MMA
+  Thr Layout VMNK: (1,1,1,1):(0,0,0,0)
+  Permutation MNK: (_,_,_)
+MMA Atom
+  ThrID:           1:0
+  Shape MNK:       (128,64,16)
+  TV Layout A:     (1,(128,16)):(128,(1,128))
+  TV Layout B:     (1,(64,16)):(64,(1,64))
+  TV Layout C:     (1,(128,64)):(128,(1,128))
+cluster_layout_vmnk: ((1),1,1,1):((0),0,0,0)
+epi_tile: (128,64)
+q_smem_layout: S<3,4,3> o 0 o ((64,16),1,(4,2)):((64,1),0,(16,4096))
+k_smem_layout: S<3,4,3> o 0 o ((64,16),1,(4,2)):((64,1),0,(16,4096))
+v_smem_layout: S<3,4,3> o 0 o (((64,2),16),1,4):(((1,4096),64),0,1024)
+q_smem_layout_staged: S<3,4,3> o 0 o ((64,16),1,(4,2),2):((64,1),0,(16,4096),8192)
+k_smem_layout_staged: S<3,4,3> o 0 o ((64,16),1,(4,2),2):((64,1),0,(16,4096),8192)
+k_smem_layout_staged.swzzle: S<3,4,3>
+k_smem_layout_staged.outer: ((64,16),1,(4,2),2):((64,1),0,(16,4096),8192)
+kv_k_smem_layout_staged: S<3,4,3> o 0 o (((64,2),16),1,4,2):(((1,4096),64),0,1024,8192)
+kv_k_smem_layout_staged.swzzle: S<3,4,3>
+kv_k_smem_layout_staged.outer: (((64,2),16),1,4,2):(((1,4096),64),0,1024,8192)
+v_smem_layout_staged: S<3,4,3> o 0 o (((64,2),16),1,4,1):(((1,4096),64),0,1024,0)
+o_smem_layout_staged: S<3,4,3> o 0 o ((64,2),(8,8),(1,2)):((1,4096),(64,512),(0,8192))
+p_smem_layout_staged: S<3,4,3> o 0 o ((64,16),1,4,2):((64,1),0,16,4096)
+tma_atom_q: Copy Atom
+  ThrID:         1:0
+  TV Layout Src: (1,4096):(0,1)
+  TV Layout Dst: (1,4096):(0,1)
+  Value type:    bf16
+tma_atom_k: Copy Atom
+  ThrID:         1:0
+  TV Layout Src: (1,4096):(0,1)
+  TV Layout Dst: (1,4096):(0,1)
+  Value type:    bf16
+tma_atom_v: Copy Atom
+  ThrID:         1:0
+  TV Layout Src: (1,4096):(0,1)
+  TV Layout Dst: (1,4096):(0,1)
+  Value type:    bf16
+tma_tensor_q: tensor<(0,0,0,0) o (?,?,(?,?)):(1@1,1@0,(1@2,1@3))>
+tma_tensor_k: tensor<(0,0,0,0) o (?,?,(?,?)):(1@1,1@0,(1@2,1@3))>
+tma_tensor_v: tensor<(0,0,0,0) o (?,?,(?,?)):(1@0,1@1,(1@2,1@3))>
+tma_atom_o: Copy Atom
+  ThrID:         1:0
+  TV Layout Src: (1,4096):(0,1)
+  TV Layout Dst: (1,4096):(0,1)
+  Value type:    bf16
+o_smem_layout: S<3,4,3> o 0 o ((64,2),(8,8)):((1,4096),(64,512))
+tma_tensor_o: tensor<(0,0,0,0) o (?,?,(?,?)):(1@0,1@1,(1@2,1@3))>
+q_copy_size: 16384
+k_copy_size: 16384
+v_copy_size: 16384
+size of storage: 215040
+m_smem_layout_staged: S<3,4,3> o 0 o ((8,8),(64,1),(1,2)):((64,512),(1,0),(0,4096))
+grid: (1, Int32(?), Int32(?))
+sK_neg_g: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((64,16),1,(4,2),2):((64,1),0,(16,4096),8192)>
+sK_g: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((64,16),1,(4,2),2):((64,1),0,(16,4096),8192)>
+sG_last: tensor<ptr<f32, smem, align<1024>> o (128,2):(1,128)>
+sQ: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((64,16),1,(4,2),2):((64,1),0,(16,4096),8192)>
+sK: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((64,16),1,(4,2),2):((64,1),0,(16,4096),8192)>
+sK_kv: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o (((64,2),16),1,4,2):(((1,4096),64),0,1024,8192)>
+sV: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o (((64,2),16),1,4,1):(((1,4096),64),0,1024,0)>
+sO: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((64,2),(8,8),(1,2)):((1,4096),(64,512),(0,8192))>
+sP: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((64,16),1,4,2):((64,1),0,16,4096)>
+sQK: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((8,8),(64,1),(1,2)):((64,512),(1,0),(0,4096))>
+sP: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((64,16),1,4,2):((64,1),0,16,4096)>
+sM: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((8,8),(64,1),(1,2)):((64,512),(1,0),(0,4096))>
+sG_flat: tensor<ptr<f32, smem, align<1024>, S<3,4,3>> o (64,(32,4),2):(32,(1,2048),8192)>
+sG_flat_as_bf16: tensor<ptr<bf16, smem, align<1024>> o (64,(32,4),2):(32,(1,2048),8192)>
+g_smem_layout_epi: S<3,4,3> o 0 o ((8,8),(32,4),(1,2)):((32,256),(1,2048),(0,8192))
+g_smem_layout_coalesce: S<3,4,3> o 0 o (64,(32,4),2):(32,(1,2048),8192)
+tKsK=tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((4096,2),2):((1,4096),8192)>
+tKgK=tensor<(0,0,?,?) o (((64,64),2),?,?):(((1@0,1@1),64@0),64@1,128@0)>
+tVsV=tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((4096,2),1):((1,4096),0)>
+tVgV=tensor<(0,0,?,?) o (((64,64),2),?,?):(((1@0,1@1),64@0),128@0,64@1)>
+------------ EPILOG TMEM COPY AND PARTITION BEGIN --------------
+tAcc: tensor<ptr<f32, tmem, align<16>> o ((128,64),1,1,2):((65536,1),0,0,64)>
+tAcc_epi: tensor<ptr<f32, tmem, align<16>> o (128,64,1,1,2):(65536,1,0,0,64)>
+copy_atom_t2r: Copy Atom
+  ThrID:         32:1
+  TV Layout Src: (32,1024):(0,1)
+  TV Layout Dst: (32,32):(32,1)
+  Value type:    f32
+tiled_copy_t2r: Tiled Copy
+  Tiler MN:        ((4,32):(32,1),32:1)
+  TV Layout tiled: ((32,4),(32,32)):((0,1),(128,4))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,1024):(0,1)
+  TV Layout Dst:   (32,32):(32,1)
+  Value type:      f32
+thr_copy_t2r: Tiled Copy
+  Tiler MN:        ((4,32):(32,1),32:1)
+  TV Layout tiled: ((32,4),(32,32)):((0,1),(128,4))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,1024):(0,1)
+  TV Layout Dst:   (32,32):(32,1)
+  Value type:      f32
+tTR_tAcc: tensor<ptr<f32, tmem, align<16>> o (((32,32),1),1,2,1,1,2):(((1,65536),0),0,32,0,0,64)>
+tTR_rAcc: tensor<ptr<f32, rmem, align<32>> o ((32,1),1,2):((1,0),0,32)>
+------------ EPILOG TMEM COPY AND PARTITION END --------------
+thr_copy_r2s_o: Tiled Copy
+  Tiler MN:        ((4,32):(32,1),32:1)
+  TV Layout tiled: ((32,4),(32,1)):((4,1),(128,0))
+Copy Atom
+  ThrID:           1:0
+  TV Layout Src:   (1,1):(0,0)
+  TV Layout Dst:   (1,1):(0,0)
+  Value type:      bf16
+sO: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((64,2),(8,8),(1,2)):((1,4096),(64,512),(0,8192))>
+tTR_rO: tensor<ptr<bf16, rmem, align<32>> o ((32,1),1,2):((1,0),0,32)>
+tRS_rO: tensor<ptr<bf16, rmem, align<32>> o ((1,32),1,2):((0,1),0,32)>
+tRS_sO: tensor<ptr<bf16, smem, S<3,4,3>> o ((1,32),1,2,(1,2)):((0,64),0,2048,(0,8192))>
+------------ EPILOG TMEM COPY AND PARTITION BEGIN --------------
+tAcc: tensor<ptr<f32, tmem, align<16>> o ((128,64),1,1,1):((65536,1),0,0,0)>
+tAcc_epi: tensor<ptr<f32, tmem, align<16>> o (128,64,1,1,1):(65536,1,0,0,0)>
+copy_atom_t2r: Copy Atom
+  ThrID:         32:1
+  TV Layout Src: (32,1024):(0,1)
+  TV Layout Dst: (32,32):(32,1)
+  Value type:    f32
+tiled_copy_t2r: Tiled Copy
+  Tiler MN:        ((4,32):(32,1),32:1)
+  TV Layout tiled: ((32,4),(32,32)):((0,1),(128,4))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,1024):(0,1)
+  TV Layout Dst:   (32,32):(32,1)
+  Value type:      f32
+thr_copy_t2r: Tiled Copy
+  Tiler MN:        ((4,32):(32,1),32:1)
+  TV Layout tiled: ((32,4),(32,32)):((0,1),(128,4))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,1024):(0,1)
+  TV Layout Dst:   (32,32):(32,1)
+  Value type:      f32
+tTR_tAcc: tensor<ptr<f32, tmem, align<16>> o (((32,32),1),1,2,1,1,1):(((1,65536),0),0,32,0,0,0)>
+tTR_rAcc: tensor<ptr<f32, rmem, align<32>> o ((32,1),1,2):((1,0),0,32)>
+------------ EPILOG TMEM COPY AND PARTITION END --------------
+tiled_copy_t2r_pv: Tiled Copy
+  Tiler MN:        ((4,32):(32,1),32:1)
+  TV Layout tiled: ((32,4),(32,32)):((0,1),(128,4))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,1024):(0,1)
+  TV Layout Dst:   (32,32):(32,1)
+  Value type:      f32
+tTR_tAcc_base_pv: tensor<ptr<f32, tmem, align<16>> o (((32,32),1),1,2,1,1,2):(((1,65536),0),0,32,0,0,64)>
+tTR_rAcc_pv: tensor<ptr<f32, rmem, align<32>> o ((32,1),1,2):((1,0),0,32)>
+tiled_copy_t2r_sq: Tiled Copy
+  Tiler MN:        ((4,32):(32,1),32:1)
+  TV Layout tiled: ((32,4),(32,32)):((0,1),(128,4))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,1024):(0,1)
+  TV Layout Dst:   (32,32):(32,1)
+  Value type:      f32
+tTR_tAcc_base_sq: tensor<ptr<f32, tmem, align<16>> o (((32,32),1),1,2,1,1,1):(((1,65536),0),0,32,0,0,0)>
+tTR_rAcc_sq: tensor<ptr<f32, rmem, align<32>> o ((32,1),1,2):((1,0),0,32)>
+tCtAccQK: tensor<ptr<f32, tmem, align<16>> o (((16,4),64),1,1,2):(((65536,2097152),1),0,0,1048576)>
+tCtAccSQ: tensor<ptr<f32, tmem, align<16>> o ((128,64),1,1,1):((65536,1),0,0,0)>
+tCtAccPV: tensor<ptr<f32, tmem, align<16>> o ((128,64),1,1,2):((65536,1),0,0,64)>
+-------------------- SMEM STORE: KK
+copy_atom_r2s_x: Copy Atom
+  ThrID:         32:1
+  TV Layout Src: (32,(2,4)):(2,(1,64))
+  TV Layout Dst: (32,8):(8,1)
+  Value type:    bf16
+tiled_t2r_x: Tiled Copy
+  Tiler MN:        ((4,16):(16,1),64:1)
+  TV Layout tiled: ((32,4),(64,16)):((0,1),(64,4))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,1024):(0,1)
+  TV Layout Dst:   ((4,8),(2,2,8)):((2,64),(1,512,8))
+  Value type:      f32
+thr_t2r_x: Tiled Copy
+  Tiler MN:        ((4,16):(16,1),64:1)
+  TV Layout tiled: ((4,8,4),((2,2,8),1)):((128,4,1),((64,32,512),0))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,(2,4)):(2,(1,64))
+  TV Layout Dst:   (32,8):(8,1)
+  Value type:      bf16
+before partition_D: tensor<ptr<f16, smem, align<1024>, S<3,4,3>> o ((8,8),(64,1),(1,2)):((64,512),(1,0),(0,4096))>
+after partition_D, tXsX_r2s: tensor<ptr<f16, smem, align<16>, S<3,4,3>> o ((8,4),1,1,(1,2)):((1,16),0,0,(0,4096))>
+before retile tXrX_t2r: tensor<ptr<f16, rmem, align<32>> o (((2,2,8),1),1,1):(((1,2,4),0),0,0)>
+after retile tXrX_r2s: tensor<ptr<f16, rmem, align<32>> o ((8,4),1,1):((1,8),0,0)>
+tiled_t2r_S: Tiled Copy
+  Tiler MN:        ((4,16):(16,1),64:1)
+  TV Layout tiled: ((32,4),(64,16)):((0,1),(64,4))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,1024):(0,1)
+  TV Layout Dst:   ((4,8),(2,2,8)):((2,64),(1,512,8))
+  Value type:      f32
+tTR_tS: tensor<ptr<f32, tmem, align<16>> o (((64,16),1),1,1,2):(((1,65536),0),0,0,1048576)>
+tTR_rS: tensor<ptr<f32, rmem, align<32>> o (((2,2,8),1),1,1):(((1,2,4),0),0,0)>
+tiled_t2r_KK: Tiled Copy
+  Tiler MN:        ((4,16):(16,1),64:1)
+  TV Layout tiled: ((32,4),(64,16)):((0,1),(64,4))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,1024):(0,1)
+  TV Layout Dst:   ((4,8),(2,2,8)):((2,64),(1,512,8))
+  Value type:      f32
+tTR_tKK: tensor<ptr<f32, tmem, align<16>> o (((64,16),1),1,1,2):(((1,65536),0),0,0,1048576)>
+tTR_rKK: tensor<ptr<f32, rmem, align<32>> o (((2,2,8),1),1,1):(((1,2,4),0),0,0)>
+copy_atom_r2s_qk: Copy Atom
+  ThrID:         32:1
+  TV Layout Src: (32,(2,4)):(2,(1,64))
+  TV Layout Dst: (32,8):(8,1)
+  Value type:    bf16
+tiled_t2r_qk: Tiled Copy
+  Tiler MN:        ((4,16):(16,1),64:1)
+  TV Layout tiled: ((32,4),(64,16)):((0,1),(64,4))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,1024):(0,1)
+  TV Layout Dst:   ((4,8),(2,2,8)):((2,64),(1,512,8))
+  Value type:      f32
+thr_t2r_qk: Tiled Copy
+  Tiler MN:        ((4,16):(16,1),64:1)
+  TV Layout tiled: ((4,8,4),((2,2,8),1)):((128,4,1),((64,32,512),0))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,(2,4)):(2,(1,64))
+  TV Layout Dst:   (32,8):(8,1)
+  Value type:      bf16
+before partition_D: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((8,8),(64,1),(1,2)):((64,512),(1,0),(0,4096))>
+after partition_D, tPsP_r2s: tensor<ptr<bf16, smem, align<16>, S<3,4,3>> o ((8,4),1,1,(1,2)):((1,16),0,0,(0,4096))>
+before retile tPrP_t2r: tensor<ptr<bf16, rmem, align<32>> o (((2,2,8),1),1,1):(((1,2,4),0),0,0)>
+after retile tPrP_r2s: tensor<ptr<bf16, rmem, align<32>> o ((8,4),1,1):((1,8),0,0)>
+num_dp=32, num_bits=32, num_rep=32, pack=Pack.NONE
+copy_atom_r2s_x: Copy Atom
+  ThrID:         1:0
+  TV Layout Src: (1,1):(0,0)
+  TV Layout Dst: (1,1):(0,0)
+  Value type:    bf16
+tiled_t2r_x.layout_dst_tv_tiled: ((32,4),(32,1)):((4,1),(128,0))
+tiled_t2r_x.tiler_mn: (<cutlass.cute.core._Layout object at 0xfff9a52ed790>, <cutlass.cute.core._Layout object at 0xfff9a52eda90>)
+copy_atom_r2s_x: Copy Atom
+  ThrID:         1:0
+  TV Layout Src: (1,1):(0,0)
+  TV Layout Dst: (1,1):(0,0)
+  Value type:    bf16
+tiled_t2r_x: Tiled Copy
+  Tiler MN:        ((4,32):(32,1),32:1)
+  TV Layout tiled: ((32,4),(32,32)):((0,1),(128,4))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,1024):(0,1)
+  TV Layout Dst:   (32,32):(32,1)
+  Value type:      f32
+tiled_r2s_x: Tiled Copy
+  Tiler MN:        ((4,32):(32,1),32:1)
+  TV Layout tiled: ((32,4),(32,1)):((4,1),(128,0))
+Copy Atom
+  ThrID:           1:0
+  TV Layout Src:   (1,1):(0,0)
+  TV Layout Dst:   (1,1):(0,0)
+  Value type:      bf16
+thr_r2s_x: Tiled Copy
+  Tiler MN:        ((4,32):(32,1),32:1)
+  TV Layout tiled: ((32,4),(32,1)):((4,1),(128,0))
+Copy Atom
+  ThrID:           1:0
+  TV Layout Src:   (1,1):(0,0)
+  TV Layout Dst:   (1,1):(0,0)
+  Value type:      bf16
+before partition_D: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((64,2),(8,8),(1,1)):((1,4096),(64,512),(0,0))>
+after partition_D, tXsX_r2s: tensor<ptr<bf16, smem, S<3,4,3>> o ((1,32),1,2,(1,1)):((0,64),0,2048,(0,0))>
+before retile tXrX_t2r: tensor<ptr<bf16, rmem, align<32>> o ((32,1),1,2):((1,0),0,32)>
+after retile tXrX_r2s: tensor<ptr<bf16, rmem, align<32>> o ((1,32),1,2):((0,1),0,32)>
+tTR_tS: tensor<ptr<f32, tmem, align<16>> o (((64,16),1),1,1,2):(((1,65536),0),0,0,1048576)>
+tTR_cMask: tensor<(?,?{div=2}) o (((2,2,8),1),1,1):(((1@1,8@0,8@1),0),0,0)>
+tTR_rS: tensor<ptr<f32, rmem, align<32>> o (((2,2,8),1),1,1):(((1,2,4),0),0,0)>
+tTR_rP: tensor<ptr<bf16, rmem, align<32>> o (((2,2,8),1),1,1):(((1,2,4),0),0,0)>
+tRS_rPseudoV: tensor<ptr<bf16, rmem, align<32>> o ((1,32),1,2):((0,1),0,32)>
+tRS_sPseudoV: tensor<ptr<bf16, smem, S<3,4,3>> o ((1,32),1,2,(1,1)):((0,64),0,2048,(0,0))>
+tTR_rPseudoV: tensor<ptr<bf16, rmem, align<32>> o ((32,1),1,2):((1,0),0,32)>
+sV_epi: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((64,2),(8,8),(1,1)):((1,4096),(64,512),(0,0))>
+sV_flat_s2r: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((64,2),64,1):((1,4096),64,0)>
+sV_flat: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o (64,64,2,1):(1,64,4096,8192)>
+tiled_r2s_pseudo_v: Tiled Copy
+  Tiler MN:        ((4,32):(32,1),32:1)
+  TV Layout tiled: ((32,4),(32,1)):((4,1),(128,0))
+Copy Atom
+  ThrID:           1:0
+  TV Layout Src:   (1,1):(0,0)
+  TV Layout Dst:   (1,1):(0,0)
+  Value type:      bf16
+thr_r2s_pseudo_v: Tiled Copy
+  Tiler MN:        ((4,32):(32,1),32:1)
+  TV Layout tiled: ((32,4),(32,1)):((4,1),(128,0))
+Copy Atom
+  ThrID:           1:0
+  TV Layout Src:   (1,1):(0,0)
+  TV Layout Dst:   (1,1):(0,0)
+  Value type:      bf16
+tiled_copy_t2r_kv: Tiled Copy
+  Tiler MN:        ((4,32):(32,1),128:1)
+  TV Layout tiled: ((32,4),(128,32)):((0,1),(128,4))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,4096):(0,1)
+  TV Layout Dst:   (32,128):(128,1)
+  Value type:      f32
+LOAD tTR_tKV: tensor<ptr<f32, tmem, align<16>> o (((128,32),1),1,1,1):(((1,65536),0),0,0,0)>
+LOAD tTR_rKV: tensor<ptr<f32, rmem, align<32>> o ((128,1),1,1):((1,0),0,0)>
+tmem_store_rKV: tensor<ptr<f32, rmem, align<32>> o ((32,1),4,1,1):((1,0),32,0,0)>
+tmem_store_tAccKV_f32: tensor<ptr<f32, tmem, align<16>> o (((32,32),1),4,1,1,1):(((1,65536),0),32,0,0,0)>
+tmem_store_rAccKV_f32: tensor<ptr<f32, rmem, align<32>> o ((32,1),4,1,1):((1,0),32,0,0)>
+tmem_store_tAccKV: tensor<ptr<f32, tmem, align<16>> o (((32,32),1),2,1,1,1):(((1,65536),0),32,0,0,0)>
+tmem_store_rAccKV: tensor<ptr<f32, rmem, align<32>> o ((32,1),2,1,1):((1,0),32,0,0)>
+tiled_s2r_g: Tiled Copy
+  Tiler MN:        (1:0,128:1)
+  TV Layout tiled: (128,1):(1,0)
+Copy Atom
+  ThrID:           1:0
+  TV Layout Src:   (1,1):(0,1)
+  TV Layout Dst:   (1,1):(0,1)
+  Value type:      f32
+tRS_sG: tensor<ptr<f32, smem, S<3,4,3>> o ((1,1),64,1,2):((0,0),32,0,8192)>
+tRS_rG: tensor<ptr<f32, rmem, align<32>> o ((1,1),64,1):((0,0),1,0)>
+tiled_s2r_g_bf16: Tiled Copy
+  Tiler MN:        (1:0,128:1)
+  TV Layout tiled: (128,1):(1,0)
+Copy Atom
+  ThrID:           1:0
+  TV Layout Src:   (1,1):(0,1)
+  TV Layout Dst:   (1,1):(0,1)
+  Value type:      bf16
+tRS_sG_bf16: tensor<ptr<bf16, smem, S<3,4,3>> o ((1,1),64,1,2):((0,0),64,0,8192)>
+tRS_rG_bf16: tensor<ptr<bf16, rmem, align<32>> o ((1,1),64,1):((0,0),1,0)>
+tiled_s2r_q: Tiled Copy
+  Tiler MN:        (1:0,128:1)
+  TV Layout tiled: (128,1):(1,0)
+Copy Atom
+  ThrID:           1:0
+  TV Layout Src:   (1,1):(0,1)
+  TV Layout Dst:   (1,1):(0,1)
+  Value type:      bf16
+tRS_sQ: tensor<ptr<bf16, smem, S<3,4,3>> o ((1,1),64,1,2):((0,0),64,0,8192)>
+tRS_rQ: tensor<ptr<bf16, rmem, align<32>> o ((1,1),64,1):((0,0),1,0)>
+tiled_s2r_k: Tiled Copy
+  Tiler MN:        (1:0,128:1)
+  TV Layout tiled: (128,1):(1,0)
+Copy Atom
+  ThrID:           1:0
+  TV Layout Src:   (1,1):(0,1)
+  TV Layout Dst:   (1,1):(0,1)
+  Value type:      bf16
+tRS_sK: tensor<ptr<bf16, smem, S<3,4,3>> o ((1,1),64,1,2):((0,0),64,0,8192)>
+tRS_rK: tensor<ptr<bf16, rmem, align<32>> o ((1,1),64,1):((0,0),1,0)>
+tiled_s2r_v: Tiled Copy
+  Tiler MN:        (1:0,128:1)
+  TV Layout tiled: (128,1):(1,0)
+Copy Atom
+  ThrID:           1:0
+  TV Layout Src:   (1,1):(0,1)
+  TV Layout Dst:   (1,1):(0,1)
+  Value type:      bf16
+tRS_sV: tensor<ptr<bf16, smem, align<128>, S<3,4,3>> o ((1,1),(64,2),1,1):((0,0),(1,4096),0,0)>
+tRS_rV: tensor<ptr<bf16, rmem, align<32>> o ((1,1),(64,2),1):((0,0),(1,64),0)>
+sM: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((8,8),(64,1),(1,2)):((64,512),(1,0),(0,4096))>
+sM_f16: tensor<ptr<f16, smem, align<1024>, S<3,4,3>> o ((8,8),(64,1),(1,2)):((64,512),(1,0),(0,4096))>
+store_row_mat8x8: idx=?, row=tensor<ptr<f32, rmem, align<32>> o 8:1>, mat=tensor<ptr<f16, smem, align<16>, S<3,4,3>> o (8,8):(64,1)>
+thr_mma: Tiled MMA
+  Thr Layout VMNK: (32,1,1,1):(1,0,0,0)
+  Permutation MNK: (_,_,_)
+MMA Atom
+  ThrID:           32:1
+  Shape MNK:       (16,8,8)
+  TV Layout A:     ((4,8),(2,2)):((32,1),(16,8))
+  TV Layout B:     ((4,8),2):((16,1),8)
+  TV Layout C:     ((4,8),(2,2)):((32,1),(16,8))
+tiled_mma: Tiled MMA
+  Thr Layout VMNK: (32,1,1,1):(1,0,0,0)
+  Permutation MNK: (_,_,_)
+MMA Atom
+  ThrID:           32:1
+  Shape MNK:       (16,8,8)
+  TV Layout A:     ((4,8),(2,2)):((32,1),(16,8))
+  TV Layout B:     ((4,8),2):((16,1),8)
+  TV Layout C:     ((4,8),(2,2)):((32,1),(16,8))
+sDInv: tensor<ptr<f16, smem, align<16>, S<3,4,3>> o (8,8):(64,1)>
+sO: tensor<ptr<f16, smem, align<32>, S<3,4,3>> o (8,8):(64,1)>
+Before sC: tensor<ptr<f16, smem, align<32>, S<3,4,3>> o (8,8):(64,1)>
+Before sAInv: tensor<ptr<f16, smem, align<32>, S<3,4,3>> o (8,8):(64,1)>
+After sC: tensor<ptr<f16, smem, align<32>, S<3,4,3>> o (8,8):(1,64)>
+After sAInv: tensor<ptr<f16, smem, align<32>, S<3,4,3>> o (8,8):(1,64)>
+sDInv_bcast: tensor<ptr<f16, smem, align<16>, S<3,4,3>> o ((8,2),(8,1)):((64,0),(1,0))>
+sO_bcast: tensor<ptr<f16, smem, align<32>, S<3,4,3>> o ((8,2),(8,1)):((64,0),(1,0))>
+a_shape: (16, 8), b_shape: (8, 8), c_shape: (16, 8)
+tOrDInv: tensor<ptr<f16, rmem, align<8>> o ((2,2),1,1):((1,2),0,0)>
+tOrC: tensor<ptr<f16, rmem, align<4>> o (2,1,1):(1,0,0)>
+tOrAInv: tensor<ptr<f16, rmem, align<4>> o (2,1,1):(1,0,0)>
+C_thr_copy: Tiled Copy
+  Tiler MN:        (8:1,8:1)
+  TV Layout tiled: ((4,8),(2,(1,1))):((16,1),(8,(0,0)))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   ((8,4),8):((8,0),1)
+  TV Layout Dst:   ((4,8),(1,2)):((16,1),(1,8))
+  Value type:      f16
+C_tiled_copy: Tiled Copy
+  Tiler MN:        (8:1,8:1)
+  TV Layout tiled: ((4,8),(2,(1,1))):((16,1),(8,(0,0)))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   ((8,4),8):((8,0),1)
+  TV Layout Dst:   ((4,8),(1,2)):((16,1),(1,8))
+  Value type:      f16
+A_thr_copy: Tiled Copy
+  Tiler MN:        (8:1,8:1)
+  TV Layout tiled: ((4,8),(2,(1,1))):((16,1),(8,(0,0)))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   ((8,4),8):((8,0),1)
+  TV Layout Dst:   ((4,8),(1,2)):((16,1),(1,8))
+  Value type:      f16
+D_thr_copy: Tiled Copy
+  Tiler MN:        (16:1,8:1)
+  TV Layout tiled: ((4,8),((2,2),(1,1))):((32,1),((16,8),(0,0)))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   ((8,4),8):((8,0),1)
+  TV Layout Dst:   (32,2):(2,1)
+  Value type:      f16
+O_thr_copy: Tiled Copy
+  Tiler MN:        (16:1,8:1)
+  TV Layout tiled: ((4,8),((2,2),(1,1))):((32,1),((16,8),(0,0)))
+Copy Atom
+  ThrID:           32:1
+  TV Layout Src:   (32,2):(2,1)
+  TV Layout Dst:   ((8,4),8):((8,0),1)
+  Value type:      f16
+tOsDInv: tensor<ptr<f16, smem, align<16>, S<3,4,3>> o ((8,2),1,1):((1,0),0,0)>
+tOrDInv: tensor<ptr<f16, rmem, align<8>> o ((2,2),1,1):((1,2),0,0)>
+tOrDInv_cv: tensor<ptr<f16, rmem, align<8>> o ((2,2),1,1):((1,2),0,0)>
+tOsC: tensor<ptr<f16, smem, align<32>, S<3,4,3>> o ((8,1),1,1):((1,0),0,0)>
+tOrC: tensor<ptr<f16, rmem, align<4>> o (2,1,1):(1,0,0)>
+tOrC_cv: tensor<ptr<f16, rmem, align<4>> o ((2,1),1,1):((1,0),0,0)>
+tOsAInv: tensor<ptr<f16, smem, align<32>, S<3,4,3>> o ((8,1),1,1):((1,0),0,0)>
+tOrAInv: tensor<ptr<f16, rmem, align<4>> o (2,1,1):(1,0,0)>
+tOrAInv_cv: tensor<ptr<f16, rmem, align<4>> o ((2,1),1,1):((1,0),0,0)>
+tOsO: tensor<ptr<f16, smem, align<32>, S<3,4,3>> o ((8,2),1,1):((1,0),0,0)>
+tOrO: tensor<ptr<f32, rmem, align<16>> o ((2,2),1,1):((1,2),0,0)>
+tOrO_cv: tensor<ptr<f32, rmem, align<16>> o ((2,2),1,1):((1,2),0,0)>
+tDInv_src: tensor<ptr<f16, smem, align<16>, S<3,4,3>> o ((8,2),1,1):((1,0),0,0)>
+tDInv_dst: tensor<ptr<f16, rmem, align<8>> o ((2,2),1,1):((1,2),0,0)>
+tOrO_cv_half: tensor<ptr<f32, rmem, align<16>> o (2,1,1):(1,0,0)>
+tOrO_src: tensor<ptr<f16, rmem, align<32>> o ((2,1),1,1):((1,0),0,0)>
+tOsO_dst: tensor<ptr<f16, smem, align<32>, S<3,4,3>> o ((8,1),1,1):((1,0),0,0)>
+tDCrDC: tensor<ptr<f32, rmem, align<16>> o ((2,2),1,2):((1,2),0,4)>
+tOsDInv: tensor<ptr<f16, smem, align<32>, S<3,4,3>> o ((8,2),1,1):((1,8),0,0)>
+tOrDInv: tensor<ptr<f16, rmem, align<16>> o ((2,2,2),1,1):((1,2,4),0,0)>
+tOrDInv_cv: tensor<ptr<f16, rmem, align<16>> o ((4,2),1,1):((1,4),0,0)>
+tOsC: tensor<ptr<f16, smem, align<64>, S<3,4,3>> o ((8,2),1,1):((1,8),0,0)>
+tOrC: tensor<ptr<f16, rmem, align<8>> o ((2,2),2,1):((1,2),4,0)>
+tOrC_cv: tensor<ptr<f16, rmem, align<8>> o ((4,2),1,1):((1,4),0,0)>
+tOsAInv: tensor<ptr<f16, smem, align<64>, S<3,4,3>> o ((8,2),1,1):((1,8),0,0)>
+tOrAInv: tensor<ptr<f16, rmem, align<8>> o ((2,2),2,1):((1,2),4,0)>
+tOrAInv_cv: tensor<ptr<f16, rmem, align<8>> o ((4,2),1,1):((1,4),0,0)>
+tOsO: tensor<ptr<f16, smem, align<64>, S<3,4,3>> o ((8,2),1,1):((1,8),0,0)>
+tOrO: tensor<ptr<f32, rmem, align<16>> o ((2,2),1,2):((1,2),0,4)>
+tOrO_cv: tensor<ptr<f32, rmem, align<16>> o ((4,2),1,1):((1,4),0,0)>
+cfrag_atom_size: 4, afrag_atom_size: 8
+c_layout: ((2,2),1,2):((1,2),0,4)
+a_layout: ((2,2,2),1,1):((1,2,4),0,0)
+cfrag_atom_size: 4, afrag_atom_size: 8
+c_layout: ((2,2),1,2):((1,2),0,4)
+a_layout: ((2,2,2),1,1):((1,2,4),0,0)
+shape_x: (64, 64)
+thr_s2r_x: Tiled Copy
+  Tiler MN:        (64:1,64:1)
+  TV Layout tiled: ((2,64),32):((2048,1),64)
+Copy Atom
+  ThrID:           1:0
+  TV Layout Src:   (1,8):(0,1)
+  TV Layout Dst:   (1,8):(0,1)
+  Value type:      f16
+tXsX_r2s: tensor<ptr<bf16, smem, align<64>, S<3,4,3>> o ((8,4),1,1):((1,8),0,0)>
+tXsX_s2r: tensor<ptr<f16, smem, align<64>, S<3,4,3>> o ((8,4),1,1):((1,8),0,0)>
+tXrX_bf16: tensor<ptr<bf16, rmem, align<32>> o ((8,4),1,1):((1,8),0,0)>
+flat: tensor<ptr<f32, rmem, align<32>> o 128:1>
+kv_f32: tensor<ptr<f32, rmem, align<32>> o 128:1>
+tma_tensor_o: tensor<(0,0,0,0) o (?,?,(?,?)):(1@0,1@1,(1@2,1@3))>
+bSG_sO: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o ((4096,2),(1,2)):((1,4096),(0,8192))>
+bSG_gO_partitioned: tensor<(0,0,?,?) o (((64,64),2),1,1,?,?):(((1@0,1@1),64@0),0,0,128@0,64@1)>
+Compilation time: 5.8877 seconds
+B, S, H, D: (1, 64, 1, 128)
+
+Execution time: 144.45 ms (average over 1 iterations)
+Throughput: 0.00 GB/s
+
+PASS

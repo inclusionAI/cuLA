@@ -254,6 +254,44 @@ def test_kernel_structure():
     print(f"✓ All {len(required_methods)} required methods present and callable")
 
 
+def test_kernel_call_method():
+    """Test that __call__ method exists and is callable."""
+    if MatrixInverse64x64 is None:
+        print("\nTest: Kernel __call__ method - SKIPPED (module not available)")
+        return
+    
+    print("\nTest: Kernel __call__ method")
+    inv_kernel = MatrixInverse64x64()
+    assert hasattr(inv_kernel, '__call__')
+    assert callable(inv_kernel)
+    print("✓ __call__ method exists and is callable")
+
+
+def test_class_constants():
+    """Test that kernel class has proper configuration constants."""
+    if MatrixInverse64x64 is None:
+        print("\nTest: Class constants - SKIPPED (module not available)")
+        return
+    
+    print("\nTest: Class constants")
+    
+    # Check class constants
+    assert hasattr(MatrixInverse64x64, 'MATRIX_SIZE')
+    assert MatrixInverse64x64.MATRIX_SIZE == 64
+    assert hasattr(MatrixInverse64x64, 'THREADS_PER_CTA')
+    assert MatrixInverse64x64.THREADS_PER_CTA == 128
+    assert hasattr(MatrixInverse64x64, 'GRID_SIZE')
+    assert MatrixInverse64x64.GRID_SIZE == 1
+    assert hasattr(MatrixInverse64x64, 'SMEM_ALIGN_BYTES')
+    assert MatrixInverse64x64.SMEM_ALIGN_BYTES == 1024
+    
+    print("✓ All class constants are properly defined")
+    print(f"  - MATRIX_SIZE: {MatrixInverse64x64.MATRIX_SIZE}")
+    print(f"  - THREADS_PER_CTA: {MatrixInverse64x64.THREADS_PER_CTA}")
+    print(f"  - GRID_SIZE: {MatrixInverse64x64.GRID_SIZE}")
+    print(f"  - SMEM_ALIGN_BYTES: {MatrixInverse64x64.SMEM_ALIGN_BYTES}")
+
+
 def run_all_tests():
     """Run all tests."""
     print("=" * 60)
@@ -272,6 +310,8 @@ def run_all_tests():
         test_stage_4_kernel_exists,
         test_main_kernel_exists,
         test_barrier_initialization,
+        test_kernel_call_method,
+        test_class_constants,
         test_kernel_structure,
     ]
     
@@ -284,6 +324,8 @@ def run_all_tests():
             passed += 1
         except Exception as e:
             print(f"✗ Test failed with error: {e}")
+            import traceback
+            traceback.print_exc()
             failed += 1
     
     print("\n" + "=" * 60)
