@@ -55,12 +55,14 @@ class MatrixInverse64x64:
             num_threads=cuda_core_threads,
         )
     
+    @cute.jit
     def canonical_lane_id(self):
         """Get the canonical lane ID within the warp."""
         tidx, _, _ = cute.arch.thread_idx()
         lane_id = tidx % 32
         return lane_id
     
+    @cute.jit
     def convert_layout_c_to_a(
         self,
         c_layout: cute.Layout,
@@ -71,7 +73,7 @@ class MatrixInverse64x64:
         afrag_atom_size = cute.size(tiled_mma.tv_layout_A.shape[1])
         ratio = afrag_atom_size // cfrag_atom_size
         
-        if ratio == 1:
+        if cutlass.const_expr(ratio == 1):
             return c_layout
         
         divided = cute.logical_divide(c_layout, (None, None, ratio))
@@ -82,6 +84,7 @@ class MatrixInverse64x64:
         ))
         return a_layout
     
+    @cute.jit
     def make_acc_as_a(self, acc: cute.Tensor, tiled_mma: cute.TiledMma, dtype: cute.Numeric):
         """Convert MMA accumulator to operand A format."""
         a_layout = self.convert_layout_c_to_a(acc.layout, tiled_mma)
@@ -90,220 +93,215 @@ class MatrixInverse64x64:
         op_as_acc.store(acc.load().to(dtype))
         return a_tensor
     
+    @cute.jit
     def make_op_a_from_acc_rmem_16x8x8(
         self,
         acc_dtype: cute.Numeric,
-        dst_dtype: cute.Numeric,
-        acc: cute.Tensor,
+        ab_dtype: cute.Numeric,
+        acc_tensor: cute.Tensor,
     ):
-        """Convert MMA accumulator to operand A format for 16x8x8 MMA."""
-        # For 16x8x8 MMA, we need to reshape the accumulator
-        a_layout = cute.make_layout((16, 8))
-        a_tensor = cute.make_rmem_tensor(a_layout, dtype=dst_dtype)
-        
-        # Store accumulator values into the A operand tensor
-        # This handles the conversion from accumulator format to A operand format
-        for i in range(cute.size(a_layout)):
-            idx_tuple = cute.unflatten(i, a_layout.shape)
-            a_val = acc[idx_tuple]
-            a_tensor[idx_tuple] = a_val.to(dst_dtype)
-        
+        # For 16x8x8, ACC result 16x8 can directly serve as operand A
+        a_tensor = cute.make_rmem_tensor_like(
+            acc_tensor,
+            dtype=ab_dtype,
+        )
+        a_tensor.store(acc_tensor.load().to(ab_dtype))
         return a_tensor
     
+    @cute.jit
     def compute_diagonal_inverse_8x8(
         self,
-        s_block: cute.Tensor,
+        s_block: cute.Tensor,  # Input 8x8 block in smem
         lane_id: int,
+        block_id: int = -1,  # Block ID for correct shuffle mask calculation
     ):
         """
-        Compute inverse of an 8x8 block in SMEM using warp-level operations.
+        Compute inverse of a diagonal 8x8 lower triangular block.
         
-        This function inverts an 8x8 diagonal block using in-warp Gaussian 
-        elimination and warp shuffle operations.
+        Each warp processes one 8x8 block. Each lane (0-7) computes one column.
         
         Args:
-            s_block: 8x8 tensor in SMEM
-            lane_id: Lane ID within the warp (0-31)
+            s_block: 8x8 block in shared memory
+            lane_id: local lane ID within the block (0-7)
+            block_id: global block ID (0-7) for correct shuffle masking
         """
-        # Load 8x8 block into registers with FP16->FP32 conversion
-        s_row = s_block[lane_id // 8] if lane_id < 64 else None
+        # Every thread loads its row
+        row = self.load_row_mat8x8(s_block, lane_id)
         
-        # In-warp Gaussian elimination for 8x8 matrix
-        # This would involve warp shuffle operations for row operations
-        # For now, this is a placeholder for the warp-level inversion logic
+        # Calculate the actual physical starting position of this block in the warp
+        # Blocks 0-3 are in Warp 0 (tidx 0-31), Blocks 4-7 are in Warp 1 (tidx 32-63)
+        # Each block starts at: warp_base + block_index_in_warp * 8
+        # where block_index_in_warp = block_id % 4
+        actual_block_base = (block_id % 4) * 8  # 0, 8, 16, or 24 within the warp
+        
+        for src_row in cutlass.range_constexpr(8-1):
+            row_scale = row[src_row] * cutlass.Float32(-1)
+            for i in cutlass.range(src_row, unroll_full=True):
+                # Correct target lane: within the block, we need threads at positions
+                # actual_block_base + 0, actual_block_base + 1, ..., actual_block_base + 7
+                # The src_row thread (0-7 within the block) maps to actual_block_base + src_row
+                # in the warp
+                target_lane = actual_block_base + src_row
+                
+                src_row_value = cute.arch.shuffle_sync_op(
+                    value=row[i], 
+                    offset=target_lane,  # Use actual position, not just src_row
+                    mask=0xFFFFFFFF, 
+                    mask_and_clamp=31
+                )
+                if lane_id > src_row:
+                    row[i] += row_scale * src_row_value
+            if lane_id > src_row:
+                row[src_row] = row_scale
+        # Store row
+        self.store_row_mat8x8(s_block, row, lane_id)
     
+    @cute.jit
     def load_row_mat8x8(
         self,
         mat: cute.Tensor,
         idx: int,
     ) -> cute.Tensor:
-        """
-        Load a row from 8x8 matrix with FP16->FP32 conversion.
-        
-        Args:
-            mat: 8x8 matrix tensor
-            idx: Row index (0-7)
-            
-        Returns:
-            Row tensor with FP32 dtype
-        """
-        row = mat[idx]
-        return row.to(cutlass.Float32)
-    
+        copy_atom_s2r_x = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            mat.element_type,
+            num_bits_per_copy=mat.element_type.width * 8,
+        )
+        row_tensor = cute.make_rmem_tensor(cute.make_layout(8), mat.element_type)
+        cute.copy(copy_atom_s2r_x, mat[idx, None], row_tensor[None])
+        row_f32_tensor = cute.make_rmem_tensor_like(row_tensor, cutlass.Float32)
+        row_f32_tensor.store(row_tensor.load().to(cutlass.Float32))
+        return row_f32_tensor
+
+    @cute.jit
     def store_row_mat8x8(
         self,
         mat: cute.Tensor,
         row: cute.Tensor,
         idx: int,
     ):
-        """
-        Store a row to 8x8 matrix with FP32->FP16 conversion.
-        
-        Args:
-            mat: 8x8 matrix tensor
-            row: Row tensor with FP32 dtype
-            idx: Row index (0-7)
-        """
-        mat[idx] = row.to(mat.element_type)
+        row_bf16 = cute.make_rmem_tensor_like(row, mat.element_type)
+        row_bf16.store(row.load().to(mat.element_type))
+        copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            mat.element_type,
+            num_bits_per_copy=mat.element_type.width * 8,
+        )
+        cute.copy(copy_atom, row_bf16[None], mat[idx, None])
     
+    
+    @cute.jit
     def compute_diagonal_inverse_8x8_to_16x16(
         self,
-        mat: cute.Tensor,  # Input 8x8 block in smem
+        mat: cute.Tensor,  # Input 16x16 block in smem
     ):
         """
-        Build 16x16 diagonal block inverse from two 8x8 blocks using Schur complement.
-        
-        Computes: inv([A 0; C D]) = [inv(A) 0; -inv(D)C*inv(A) inv(D)]
-        
-        Args:
-            mat: 16x16 tensor in SMEM (divided into 4 8x8 blocks)
+        Compute inverse of a diagonal 16x16 lower triangular block using
+        two 8x8 blocks and Schur complement.
         """
         dtype = mat.element_type
-        lane_id = self.canonical_lane_id()
-        
-        # Divide 16x16 into 4 8x8 blocks
         mat8x8_2x2 = cute.flat_divide(mat, (8, 8))
-        
-        # MMA configuration for 16x8x8 operations
+
         mma_atom_shape = (16, 8, 8)
-        mma_tiler = (16, 16, 8)
-        
         mma_atom = cute.nvgpu.warp.MmaF16BF16Op(
             ab_dtype=dtype,
             acc_dtype=self.acc_dtype,
             shape_mnk=mma_atom_shape,
         )
-        
         tiled_mma = cute.make_tiled_mma(
             mma_atom,
             atom_layout_mnk=(1,1,1),
-            permutation_mnk=mma_tiler,
         )
-        
+        # TODO: check transpose for column major mat
+        copy_op_s2r = cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=1)
+        copy_op_s2r_t = cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=1)
+        copy_op_r2s = cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=1)
+        copy_op_r2s_t = cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=True, num_matrices=1)
+        copy_atom_s2r = cute.make_copy_atom(copy_op_s2r, mat.element_type)
+        copy_atom_s2r_t = cute.make_copy_atom(copy_op_s2r_t, mat.element_type)
+        copy_atom_r2s = cute.make_copy_atom(copy_op_r2s, mat.element_type)
+        copy_atom_r2s_t = cute.make_copy_atom(copy_op_r2s_t, mat.element_type)
+
+        tidx,_,_ = cute.arch.thread_idx()
+        lane_id = tidx % 32
+
         thr_mma = tiled_mma.get_slice(lane_id)
-        
-        # Copy atoms for SMEM<->RMEM transfers
-        copy_atom_s2r = cute.make_copy_atom(
-            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=2),
-            dtype,
-        )
-        copy_atom_s2r_t = cute.make_copy_atom(
-            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=2),
-            dtype,
-        )
-        copy_atom_r2s = cute.make_copy_atom(
-            cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=2),
-            dtype,
-        )
-        
-        # Tiled copy operations
+
         D_tiled_copy = cute.make_tiled_copy_A(copy_atom_s2r, tiled_mma)
         C_tiled_copy = cute.make_tiled_copy_B(copy_atom_s2r_t, tiled_mma)
         A_tiled_copy = cute.make_tiled_copy_B(copy_atom_s2r_t, tiled_mma)
         O_tiled_copy = cute.make_tiled_copy_C(copy_atom_r2s, tiled_mma)
-        
+
         D_thr_copy = D_tiled_copy.get_slice(lane_id)
         C_thr_copy = C_tiled_copy.get_slice(lane_id)
         A_thr_copy = A_tiled_copy.get_slice(lane_id)
         O_thr_copy = O_tiled_copy.get_slice(lane_id)
-        
-        # Extract blocks: D=inv(D), C=C, A=inv(A), O=output
+
         sDInv = mat8x8_2x2[None, None, 1, 1]
         sC = mat8x8_2x2[None, None, 1, 0]
         sAInv = mat8x8_2x2[None, None, 0, 0]
         sO = mat8x8_2x2[None, None, 1, 0]
-        
-        # Make operand B column-major
+
         sC = cute.make_tensor(sC.iterator, layout=cute.select(sC.layout, mode=[1,0]))
         sAInv = cute.make_tensor(sAInv.iterator, layout=cute.select(sAInv.layout, mode=[1,0]))
-        
-        # Create MMA fragments
-        a_shape = cute.dice(mma_tiler, (1,None,1))
-        b_shape = cute.dice(mma_tiler, (None,1,1))
-        c_shape = cute.dice(mma_tiler, (1,1,None))
-        
+
+        sDInv_bcast = cute.make_tensor(sDInv.iterator, cute.blocked_product(sDInv.layout, cute.make_layout((2,1), stride=(0,0))))
+        sO_bcast = cute.make_tensor(sO.iterator, cute.blocked_product(sO.layout, cute.make_layout((2,1), stride=(0,0))))
+
+        a_shape = cute.dice(mma_atom_shape, (1,None,1))
+        b_shape = cute.dice(mma_atom_shape, (None,1,1))
+        c_shape = cute.dice(mma_atom_shape, (1,1,None))
         tOrDInv = thr_mma.make_fragment_A(tiled_mma.partition_shape_A(a_shape))
-        tOrC = thr_mma.make_fragment_B(thr_mma.partition_B(sC))
+        tOrC    = thr_mma.make_fragment_B(thr_mma.partition_B(sC))
         tOrAInv = thr_mma.make_fragment_B(thr_mma.partition_B(sAInv))
+
         tDCrDC = thr_mma.make_fragment_C(tiled_mma.partition_shape_C(c_shape))
-        tOrO = thr_mma.make_fragment_C(tiled_mma.partition_shape_C(c_shape))
-        
-        # Partition shared memory
-        tOsDInv = D_thr_copy.partition_S(sDInv)
+        tOrO   = thr_mma.make_fragment_C(tiled_mma.partition_shape_C(c_shape))
+
+        # ((vecsize, numvec), M, N)
+        tOsDInv    = D_thr_copy.partition_S(sDInv_bcast)
         tOrDInv_cv = D_thr_copy.retile(tOrDInv)
-        tOsC = C_thr_copy.partition_S(sC)
-        tOrC_cv = C_thr_copy.retile(tOrC)
-        tOsAInv = A_thr_copy.partition_S(sAInv)
+        tOsC       = C_thr_copy.partition_S(sC)
+        tOrC_cv    = C_thr_copy.retile(tOrC)
+        tOsAInv    = A_thr_copy.partition_S(sAInv)
         tOrAInv_cv = A_thr_copy.retile(tOrAInv)
-        tOsO = O_thr_copy.partition_D(sO)
-        tOrO_cv = O_thr_copy.retile(tOrO)
-        
-        # Copy D inverse and C from SMEM
-        cute.copy(D_tiled_copy, tOsDInv, tOrDInv_cv)
+        tOsO       = O_thr_copy.partition_D(sO_bcast)
+        tOrO_cv    = O_thr_copy.retile(tOrO)
+
         cute.copy(C_tiled_copy, tOsC, tOrC_cv)
-        
-        # Compute DC = -D*C
-        tDCrDC.fill(0.0)
+
+        tDInv_src = tOsDInv
+        tDInv_dst = tOrDInv_cv
+        cute.copy(D_tiled_copy, tDInv_src, tDInv_dst)
+
+        tDCrDC.fill(0.0) # Clear C for D = A*B + C
         cute.gemm(tiled_mma, tDCrDC, tOrDInv, tOrC, tDCrDC)
         tDCrDC.store(tDCrDC.load() * cutlass.Float32(-1))
-        
-        # Convert accumulator to A operand format
+
         tOrDC = self.make_op_a_from_acc_rmem_16x8x8(
             self.acc_dtype,
-            dtype,
+            mat.element_type,
             tDCrDC,
         )
-        
-        # Copy A inverse and compute O = -DC * A_inv
         cute.copy(A_tiled_copy, tOsAInv, tOrAInv_cv)
-        tOrO_cv.fill(0.0)
+        tOrO_cv.fill(0.0) # Clear O for O = A*B + O
         cute.gemm(tiled_mma, tOrO_cv, tOrDC, tOrAInv, tOrO_cv)
-        
-        # Convert output back to FP16
-        tOrO_f16 = cute.make_rmem_tensor_like(tOrO_cv[(None, 0), None, None], dtype)
-        tOrO_f16.store(tOrO_cv[(None, 0), None, None].load().to(dtype))
-        
-        # Store result back to SMEM
+
+        tOrO_cv_half = tOrO_cv[(None, 0), None, None]
+        tOrO_f16 = cute.make_rmem_tensor_like(tOrO_cv_half, mat.element_type)
+        tOrO_f16.store(tOrO_cv[(None, 0), None, None].load().to(mat.element_type))
+
+        # NOTE: group here to make cutedsl happy
         src_shape = tOrO_f16.shape
         src_stride = tOrO_f16.layout.stride
         dst_shape = tOsO[(None, 0), None, None].shape
         dst_stride = tOsO[(None, 0), None, None].layout.stride
-        tOrO_src = cute.make_tensor(
-            tOrO_f16.iterator,
-            layout=cute.make_layout(
-                ((src_shape[0], 1), src_shape[1], src_shape[2]),
-                stride=((src_stride[0], 0), src_stride[1], src_stride[2])
-            )
-        )
-        tOsO_dst = cute.make_tensor(
-            tOsO.iterator,
-            layout=cute.make_layout(
-                ((dst_shape[0], 1), dst_shape[1], dst_shape[2]),
-                stride=((dst_stride[0], 0), dst_stride[1], dst_stride[2])
-            )
-        )
+        tOrO_src = cute.make_tensor(tOrO_f16.iterator, layout=cute.make_layout(((src_shape[0], 1), src_shape[1], src_shape[2]), stride=((src_stride[0], 0), src_stride[1], src_stride[2])))
+        tOsO_dst = cute.make_tensor(tOsO.iterator, layout=cute.make_layout(((dst_shape[0], 1), dst_shape[1], dst_shape[2]), stride=((dst_stride[0], 0), dst_stride[1], dst_stride[2])))
         cute.copy(O_tiled_copy, tOrO_src, tOsO_dst)
+
     
+    @cute.jit
     def compute_diagonal_inverse_16x16_to_32x32(
         self,
         mat: cute.Tensor,  # Input 32x32 block in smem
@@ -550,135 +548,125 @@ class MatrixInverse64x64:
         self.cuda_wg_sync_barrier.arrive_and_wait()
     
     @cute.jit
-    def compute_matrix_inverse_64x64(self, s_mat: cute.Tensor):
-        """
-        Compute 64x64 lower triangular matrix inverse using 4 progressive stages.
-        
-        Stage 1: Invert 8 diagonal 8x8 blocks
-        Stage 2: Combine to form 16x16 diagonal blocks (2x2 of 8x8)
-        Stage 3: Combine to form 32x32 diagonal blocks (2x2 of 16x16)
-        Stage 4: Combine to form full 64x64 inverse (2x2 of 32x32)
-        
-        Args:
-            s_mat: 64x64 tensor in SMEM (lower triangular matrix in FP16)
-        """
-        tidx, _, _ = cute.arch.thread_idx()
-        
-        # Stage 1: Invert 8 diagonal 8x8 blocks
-        t8x8mat = cute.flat_divide(s_mat, (8, 8))
-        if tidx < 64:
-            # Each thread processes one 8x8 diagonal block
-            block_idx = tidx // 8
-            lane_id = tidx % 8
-            if block_idx < 8:
-                # This would call the 8x8 inversion for diagonal blocks
-                self.compute_diagonal_inverse_8x8(t8x8mat[block_idx, block_idx], tidx % 32)
-        
-        self.cuda_wg_sync_barrier.arrive_and_wait()
-        
-        # Stage 2: Build 16x16 blocks from 8x8 (using Schur complement)
-        t16x16mat = cute.flat_divide(s_mat, (16, 16))
-        if tidx < 128:
-            block_idx = (tidx // 32) % 4
-            if block_idx < 4:
-                self.compute_diagonal_inverse_8x8_to_16x16(t16x16mat[block_idx // 2, block_idx // 2])
-        
-        self.cuda_wg_sync_barrier.arrive_and_wait()
-        
-        # Stage 3: Build 32x32 blocks from 16x16
-        t32x32mat = cute.flat_divide(s_mat, (32, 32))
-        if tidx < 128:
-            block_idx = (tidx // 32) % 2
-            if block_idx < 2:
-                self.compute_diagonal_inverse_16x16_to_32x32(t32x32mat[block_idx, block_idx])
-        
-        self.cuda_wg_sync_barrier.arrive_and_wait()
-        
-        # Stage 4: Build full 64x64 inverse
-        self.compute_diagonal_inverse_32x32_to_64x64(s_mat)
-    
-    def create_cute_tensor_from_torch(self, torch_tensor):
-        """
-        Create a CuTe tensor wrapper from a PyTorch tensor.
-        
-        This must be done within @cute.jit context to avoid MLIR Context issues.
-        
-        Args:
-            torch_tensor: PyTorch tensor in GPU memory
-            
-        Returns:
-            CuTe tensor wrapper
-        """
-        mat_layout = cute.make_layout(
-            (self.MATRIX_SIZE, self.MATRIX_SIZE),
-            stride=(self.MATRIX_SIZE, 1),
-        )
-        mat_ptr = cute.Pointer(torch_tensor.data_ptr())
-        mat_tensor = cute.make_tensor(mat_ptr, mat_layout)
-        return mat_tensor
-    
-    @cute.jit
-    def __call__(
+    def compute_matrix_inverse_64x64(
         self,
-        mat: cute.Tensor,
-        stream: cuda.CUstream,
+        s_mat: cute.Tensor,  # Input M matrix in smem, shape (64, 64)
+        stage_limit: int = 99,  # Maximum stage to compute (1-4, default 99 for all)
     ):
         """
-        Launch the matrix inverse kernel on a 64x64 FP16 matrix.
+        Compute M^{-1} for 64x64 lower triangular matrix using block-wise Schur complement.
         
-        Grid Configuration:
-            - Grid dimensions: (1, 1, 1)
-            - Block dimensions: (128, 1, 1) = 128 threads
-            - Shared memory: ~8 KB for 64x64 FP16 matrix
-            - Cluster shape: (1, 1, 1) for single CTA
+        Based on flat_collective_inverse.hpp algorithm:
+        1. Divide into 8x8 blocks  
+        2. Compute 8x8 diagonal block inverses (lower triangular blocks)
+        3. Use Schur complement for below-diagonal blocks
+        4. Progressively combine: 8x8 -> 16x16 -> 32x32 -> 64x64
+        
+        For a lower triangular matrix L:
+            inv([A  0 ]) = [inv(A)  0                    ]
+               [C  D ]   [-inv(D)C*inv(A)  inv(D)        ]
         
         Args:
-            mat: 64x64 FP16 CuTe tensor in global memory
-            stream: CUDA stream for execution
-        
-        The kernel performs:
-        1. Load 64x64 matrix from GMEM (with SMEM intermediate processing)
-        2. Compute matrix inverse using 4 progressive stages in a warp group (128 threads)
-        3. Store result back to GMEM
-        
-        The SharedStorage structure defines the shared memory layout:
-        - load_mbar_ptr: Pipeline barrier for load coordination
-        - sync_mbar_ptr: Barrier for all-thread synchronization
-        - smat: Shared memory buffer for 64x64 FP16 matrix (8 KB)
-        
-        Stages:
-        - Stage 1: Invert 8 diagonal 8x8 blocks
-        - Stage 2: Build 16x16 blocks from 8x8 blocks using Schur complement
-        - Stage 3: Build 32x32 blocks from 16x16 blocks using Schur complement
-        - Stage 4: Build full 64x64 inverse from 32x32 blocks using Schur complement
+            s_mat: Input M matrix (lower triangular) in smem, shape (64, 64)
+            stage_limit: Maximum stage to execute (1-4, default 99 for all)
         """
-        # Define shared memory layout for 64x64 FP16 matrix storage
-        # Layout: Row-major, shape (64, 64), stride (64, 1)
+        tidx, _, _ = cute.arch.thread_idx()
+        tidx = tidx % 128
+        lane_id = tidx % 32  # Within warp
+        warp_id = tidx // 32
+
+        # Stage 1: Invert all 8 diagonal 8x8 blocks
+        t8x8mat = cute.flat_divide(s_mat, (8, 8))
+
+        # Block size progression: 8x8 -> 16x16 -> 32x32 -> 64x64
+        # Process in stages
+        
+        # Stage 1: Invert all 8 diagonal 8x8 blocks
+        t8x8mat = cute.flat_divide(s_mat, (8, 8))
+        if tidx < 64:
+            self.compute_diagonal_inverse_8x8(
+                t8x8mat[None, None, tidx//8, tidx//8],
+                tidx % 8,
+                tidx // 8  # Pass block_id for correct shuffle masking
+            )
+        self.cuda_wg_sync_barrier.arrive_and_wait()
+
+        # Stage 2: Invert all 4 diagonal 16x16 blocks
+        if stage_limit >= 2:
+            t16x16mat = cute.flat_divide(s_mat, (16, 16))
+            self.compute_diagonal_inverse_8x8_to_16x16(
+                t16x16mat[None, None, tidx//32, tidx//32],
+            )
+            # Synchronize after stage 2
+            self.cuda_wg_sync_barrier.arrive_and_wait()
+
+        # Stage 3: Invert all 2 diagonal 32x32 blocks
+        if stage_limit >= 3:
+            t32x32mat = cute.flat_divide(s_mat, (32, 32))
+            if tidx < 64:
+                self.compute_diagonal_inverse_16x16_to_32x32(
+                    t32x32mat[None, None, tidx//32, tidx//32],
+                )
+            self.cuda_wg_sync_barrier.arrive_and_wait()
+
+        # Stage 4: Invert the full 64x64 matrix
+        if stage_limit >= 4:
+            self.compute_diagonal_inverse_32x32_to_64x64(s_mat)
+    
+    @cute.jit
+    def __call__(self, torch_mat, stream):
+        """
+        Public interface that accepts PyTorch tensor and launches kernel.
+        
+        This method handles the conversion from PyTorch tensor to the JIT-compiled kernel.
+        
+        Args:
+            torch_mat: 64x64 FP16 PyTorch tensor in GPU memory
+            stream: CUDA stream for execution
+        """
+        # Call the JIT-compiled kernel with the PyTorch tensor
+        # CuTe will handle the conversion to cute.Pointer internally
+        self._jit_call(torch_mat, stream)
+    
+    @cute.jit
+    def _jit_call(self, mat_iter, stream):
+        """
+        JIT-compiled entry point that accepts matrix pointer and launches kernel.
+        
+        This is decorated with @cute.jit so CuTe can handle CUDA operations properly.
+        CuTe will automatically convert PyTorch tensors to cute.Pointer.
+        
+        Args:
+            mat_iter: Pointer to 64x64 FP16 matrix in GPU memory
+            stream: CUDA stream for execution
+        """
+        # Define SharedStorage structure for SMEM allocation
         smat_layout = cute.make_layout(
             (self.MATRIX_SIZE, self.MATRIX_SIZE),
             stride=(self.MATRIX_SIZE, 1),
         )
         
-        # Define SharedStorage structure for shared memory management
-        # This follows the same pattern as kda.py for shared memory organization
         @cute.struct
         class SharedStorage:
-            # Pipeline barriers for synchronization
-            load_mbar_ptr: cute.struct.MemRange[Int64, 1 * 2]  # type: ignore
-            sync_mbar_ptr: cute.struct.MemRange[Int64, 1 * 2]  # type: ignore
-            # Shared memory buffer for 64x64 matrix (FP16)
-            # Aligned to SMEM_ALIGN_BYTES for optimal access patterns
-            # Size: 64 * 64 * sizeof(FP16) = 8192 bytes
             smat: cute.struct.Align[
                 cute.struct.MemRange[self.MATRIX_DTYPE, cute.cosize(smat_layout)],  # type: ignore
                 self.SMEM_ALIGN_BYTES,
             ]
         
-        # Store SharedStorage class reference for kernel use
         self.shared_storage = SharedStorage
         
-        # Launch the kernel with proper grid and block configuration
-        self.kernel(mat).launch(
+        # Create layout for the input matrix
+        mat_layout = cute.make_layout(
+            (self.MATRIX_SIZE, self.MATRIX_SIZE),
+            stride=(self.MATRIX_SIZE, 1),
+        )
+        
+        # mat_iter is already a Tensor object from the PyTorch conversion
+        # Use it directly without creating a new tensor
+        mat = mat_iter
+        
+        # Launch kernel
+        self.kernel(mat, smat_layout).launch(
             grid=(self.GRID_SIZE, 1, 1),
             block=(self.threads_per_cta, 1, 1),
             cluster=(1, 1, 1),
@@ -687,7 +675,7 @@ class MatrixInverse64x64:
         )
     
     @cute.kernel
-    def kernel(self, mat: cute.Tensor):
+    def kernel(self, mat: cute.Tensor, smat_layout: cute.Layout):
         """
         Core kernel that performs the 64x64 matrix inversion.
         
@@ -714,27 +702,31 @@ class MatrixInverse64x64:
         
         Args:
             mat: 64x64 FP16 matrix tensor (from global memory, GMEM)
+            smat_layout: Layout for the shared memory tensor
         """
         # Get thread indices for cooperative work distribution
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         
-        # Create a temporary buffer to simulate SMEM storage
-        # In a real implementation, this would directly use SharedStorage.smat
-        # For now, we use a register buffer to hold the loaded data
-        temp_buffer = cute.make_rmem_tensor(
-            (self.MATRIX_SIZE, self.MATRIX_SIZE),
-            self.MATRIX_DTYPE,
+        # Allocate shared memory using SmemAllocator
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(self.shared_storage)
+        
+        # Get the SMEM tensor from SharedStorage
+        # Use recast_ptr to ensure proper FP16 type handling
+        smat = cute.make_tensor(
+            cute.recast_ptr(storage.smat.data_ptr(), dtype=self.MATRIX_DTYPE),
+            layout=smat_layout
         )
         
         # Each thread will handle (64*64)/128 = 32 elements
         elements_per_thread = (self.MATRIX_SIZE * self.MATRIX_SIZE) // self.threads_per_cta
         
         # ========================================================================
-        # Stage 0: Load 64x64 matrix from GMEM to temporary buffer (simulating SMEM)
+        # Stage 0: Load 64x64 matrix from GMEM to SMEM
         # ========================================================================
         # All 128 threads cooperatively load the entire 64x64 matrix from global memory
-        # to the temporary buffer. Each thread loads its assigned elements.
+        # to the shared memory buffer. Each thread loads its assigned elements.
         for i in range(elements_per_thread):
             # Calculate linear index for this thread's element
             linear_idx = tidx + i * self.threads_per_cta
@@ -743,13 +735,14 @@ class MatrixInverse64x64:
             m_idx = linear_idx // self.MATRIX_SIZE  # Row index (0-63)
             n_idx = linear_idx % self.MATRIX_SIZE   # Column index (0-63)
             
-            # Bounds check and load from GMEM to buffer
+            # Bounds check and load from GMEM to SMEM
             if m_idx < self.MATRIX_SIZE and n_idx < self.MATRIX_SIZE:
-                # Load element from global memory (FP16)
+                # Load element from global memory using 2D indexing
+                # mat is a properly typed FP16 CuTe tensor
                 val = mat[m_idx, n_idx]
                 
-                # Store element to temporary buffer (simulating SMEM write)
-                temp_buffer[m_idx, n_idx] = val
+                # Store element to shared memory (SMEM write)
+                smat[m_idx, n_idx] = val
         
         # Synchronize all 128 threads after GMEM load
         # Ensures all threads have completed their loads before computation begins
@@ -758,17 +751,17 @@ class MatrixInverse64x64:
         # ========================================================================
         # Stage 1-4: Compute 4-stage block-wise Schur complement inversion
         # ========================================================================
-        # Call the main inversion function which operates on the buffer
-        # This function assumes input is a 64x64 lower triangular matrix
+        # Call the jit-compiled inversion function which operates on the SMEM buffer
+        # This function assumes input is a 64x64 lower triangular matrix in SMEM
         # and performs 4 progressive stages:
         #   - Stage 1: Invert 8 diagonal 8×8 blocks
         #   - Stage 2: Build 16×16 blocks using Schur complement
         #   - Stage 3: Build 32×32 blocks using Schur complement
         #   - Stage 4: Build full 64×64 inverse using Schur complement
-        # self.compute_matrix_inverse_64x64(temp_buffer)
-        # 
-        # TODO: Implement full 4-stage inversion in SMEM
-        # For now, this placeholder preserves the buffer content for validation
+        # Get stage limit from environment variable (default: 99 for all stages)
+        import os
+        stage_limit = int(os.environ.get('FLASHLA_STAGE_LIMIT', '99'))
+        self.compute_matrix_inverse_64x64(smat, stage_limit)
         
         # Synchronize all threads after computation
         # Ensures all threads have completed inversion before store
@@ -778,7 +771,7 @@ class MatrixInverse64x64:
         # Stage Final: Store result back to GMEM
         # ========================================================================
         # All 128 threads cooperatively store the computed inverse matrix from
-        # the temporary buffer back to global memory using the same distribution pattern as load.
+        # the shared memory buffer back to global memory using the same distribution pattern as load.
         for i in range(elements_per_thread):
             # Calculate linear index for this thread's element
             linear_idx = tidx + i * self.threads_per_cta
@@ -787,12 +780,12 @@ class MatrixInverse64x64:
             m_idx = linear_idx // self.MATRIX_SIZE  # Row index (0-63)
             n_idx = linear_idx % self.MATRIX_SIZE   # Column index (0-63)
             
-            # Bounds check and store from buffer to GMEM
+            # Bounds check and store from SMEM to GMEM
             if m_idx < self.MATRIX_SIZE and n_idx < self.MATRIX_SIZE:
-                # Load element from temporary buffer
-                val = temp_buffer[m_idx, n_idx]
+                # Load element from shared memory
+                val = smat[m_idx, n_idx]
                 
-                # Store element to global memory
+                # Store element to global memory using 2D indexing
                 mat[m_idx, n_idx] = val
         
         # Final synchronization of all threads
