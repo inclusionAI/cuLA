@@ -189,6 +189,11 @@ class KDAChunkwise:
             num_threads=self.cuda_core_threads,
         )
 
+        self.mma_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=4,
+            num_threads=32 * len([self.mma_warp_id]),
+        )
+
         self.buffer_align_bytes = 1024
         
 
@@ -1137,7 +1142,13 @@ class KDAChunkwise:
                 sK_neg_g_f32.iterator,
                 swizzle_=k_smem_layout_staged.inner,
                 dtype=self.io_dtype),
-            layout=sK_neg_g_f32.layout)
+            layout=sK_g.layout)
+        # sK_neg_g = cute.make_tensor(
+        #     cute.recast_ptr(
+        #         sK_neg_g_f32.iterator,
+        #         swizzle_=k_smem_layout_staged.inner,
+        #         dtype=self.io_dtype),
+        #     layout=sK_neg_g_f32.layout)
         print(f"sK_neg_g: {cute.pretty_str(sK_neg_g)}")
         print(f"sK_g: {cute.pretty_str(sK_g)}")
         # (((64,2),16),1,4,2):(((1,4096),64),0,1024,8192)>
@@ -1553,6 +1564,7 @@ class KDAChunkwise:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_mma)
 
             should_debug = PRINT_DEBUG and tidx == warp_idx * 32 and hidx == 0 and bidx == 0
+            should_debug_f = tidx == warp_idx * 32 and hidx == 0 and bidx == 0
 
             for chunk_start in cutlass.range(0, S, C, unroll=0):
                 idx = chunk_start // C
@@ -1560,6 +1572,14 @@ class KDAChunkwise:
                 k_handle = load_k2_consumer.wait_and_advance()
                 kt_handle = load_kt2_consumer.wait_and_advance()
                 mma_kk_handle = mma_kk_producer.acquire_and_advance()
+
+                if should_debug_f:
+                    cute.printf("chunk idx={}, got k2 consumer={}", idx, k_handle.index)
+                    cute.printf("chunk idx={}, got kt2 consumer={}", idx, kt_handle.index)
+                    cute.printf("chunk idx={}, got mma_kk producer={}", idx, mma_kk_handle.index)
+
+                self.mma_sync_barrier.arrive_and_wait()
+
                 # GEMM KK
                 kk_tiled_mma = self.exec_mma(
                     tiled_mma=kk_tiled_mma,
@@ -1570,9 +1590,11 @@ class KDAChunkwise:
                     b_stage_idx=kt_handle.index,
                     acc_stage_idx=mma_kk_handle.index,
                 )
+
+                self.mma_sync_barrier.arrive_and_wait()
+
                 # Commit KK
                 mma_kk_handle.commit()
-                kt_handle.release()
                 # Wait for Qi (TMA load complete).
                 q_handle = load_q2_consumer.wait_and_advance()
                 if should_debug:
@@ -1641,6 +1663,8 @@ class KDAChunkwise:
                 )
                 # Release Q. 
                 q_handle.release()
+                # Release Kng = K*exp(-g) After QK and KK
+                kt_handle.release()
                 # Commit S = QK.
                 s0_handle.commit()
                 # End of GEMM (Qi, Ki) -> S0i
@@ -2047,8 +2071,7 @@ class KDAChunkwise:
 
                 g_stage_idx = g_handle.index
                 cute.copy(tiled_s2r_g, tRS_sG[(None, None, None, g_stage_idx)], tRS_rG)
-
-                # Fence for shared memory
+                # Fence for shared memory reads
                 cute.arch.fence_proxy(
                     cute.arch.ProxyKind.async_shared,
                     space=cute.arch.SharedSpace.shared_cta,
@@ -2060,6 +2083,11 @@ class KDAChunkwise:
                     cute.printf("chunk idx={}, got q consumer={}", idx, q_handle.index)
                 q_stage_idx = q_handle.index
                 cute.copy(tiled_s2r_q, tRS_sQ[(None, None, None, q_stage_idx)], tRS_rQ)
+                # Fence for shared memory reads
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
                 
                 # Load K from SMEM to RMEM for KDA elementwise processing
                 k_handle = load_k_consumer.wait_and_advance()
@@ -2091,7 +2119,7 @@ class KDAChunkwise:
                 k_val = tRS_rK.load()  # BF16 tensor
                 
                 # Convert to F32 for exp computation
-                g_f32 = g_val # assert dtype here
+                g_f32 = g_val.to(cutlass.Float32) # assert dtype here
                 q_f32 = q_val.to(cutlass.Float32)
                 k_f32 = k_val.to(cutlass.Float32)
                 
@@ -2125,41 +2153,59 @@ class KDAChunkwise:
                 # - K_intra = K * exp(-g) -> SMEM[G] (overwrite g)
                 # ============================================================
                 
-                # TODO: check q2 & k2 stage equivalence
-                q2_handle = load_q2_producer.acquire_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got q2 producer={}", idx, q2_handle.index)
-                # Write Q' from RMEM to SMEM (same location as original Q)
-                cute.copy(tiled_s2r_q, tRS_rQ, tRS_sQ[(None, None, None, q_stage_idx)])
+                # Make sure the read from sK and sG are completed.
+                self.cuda_wg_sync_barrier.arrive_and_wait()
                 
+                # TODO: check q2 & k2 stage equivalence
                 k2_handle = load_k2_producer.acquire_and_advance()
                 if should_debug:
                     cute.printf("chunk idx={}, got k2 producer={}", idx, k2_handle.index)
                 # Write K_inter = K * exp(g) to SMEM[K]
                 cute.copy(tiled_s2r_k, tRS_rK, tRS_sK[(None, None, None, k_stage_idx)])
+                # produce k * exp(g) for mma
+                k2_handle.commit()
                 
-                # Make sure the read of G is completed
+                # FIXME
                 self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 # Write K_intra = K * exp(-g) to SMEM[G] (overwrite g)
                 kt2_handle = load_kt2_producer.acquire_and_advance()
                 if should_debug:
                     cute.printf("chunk idx={}, got kt2 producer={}", idx, kt2_handle.index)
-
                 cute.copy(tiled_s2r_g_bf16, tRS_rG_bf16, tRS_sG_bf16[(None, None, None, g_stage_idx)])
+                # produce k^t * exp(-g) for mma
+                kt2_handle.commit()
                 
+                # FIXME
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+
+                q2_handle = load_q2_producer.acquire_and_advance()
+                if should_debug:
+                    cute.printf("chunk idx={}, got q2 producer={}", idx, q2_handle.index)
+                # Write Q' from RMEM to SMEM (same location as original Q)
+                cute.copy(tiled_s2r_q, tRS_rQ, tRS_sQ[(None, None, None, q_stage_idx)])
+                # produce q * exp(g) for mma
+                q2_handle.commit()
+                
+                # FIXME
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+
                 # Fence for shared memory writes
                 cute.arch.fence_proxy(
                     cute.arch.ProxyKind.async_shared,
                     space=cute.arch.SharedSpace.shared_cta,
                 )
 
-                # produce q * exp(g) for mma
-                q2_handle.commit()
-                # produce k * exp(g) for mma
-                k2_handle.commit()
-                # produce k^t * exp(-g) for mma
-                kt2_handle.commit()
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+                if tidx == self.cuda_warp_ids[0] * 32 and hidx == 0 and bidx == 0:
+                    # cute.printf("-------------------- sQ_flat: q * exp(g)")
+                    # cute.print_tensor(sQ_flat)
+                    cute.printf("-------------------- k * exp(g)")
+                    # cute.print_tensor(sK_flat[63, None, k_stage_idx], verbose=True)
+                    cute.print_tensor(sK_flat[None, None, k_stage_idx])
+                    cute.printf("-------------------- k * exp(-g):")
+                    cute.print_tensor(sG_flat_bf16[None, None, g_stage_idx])
+                self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 # ============================================================
                 # KDA End of Prologue
@@ -2177,6 +2223,9 @@ class KDAChunkwise:
                 rG_last = exp_g[Constant.C - 1]
                 sG_last[local_tidx, g_stage_idx] = rG_last
 
+                # FIXME
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+
                 mma_kk_handle = mma_kk_consumer.wait_and_advance()
                 if should_debug:
                     cute.printf("chunk idx={}, got mma_kk consumer={}", idx, mma_kk_handle.index)
@@ -2186,14 +2235,14 @@ class KDAChunkwise:
                 # GEMM KK done, can release
                 mma_kk_handle.release()
 
-                # TODO: only Allow next TMA Load for G after k^exp(-g) has been consumed by QK & KK
-                g_handle.release()
-
                 # if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
                 #     cute.printf("-------------------- First row of KK MMA results: ")
                 #     cute.print_tensor(tTR_rKK)
                 # FIXME:
                 self.cuda_wg_sync_barrier.arrive_and_wait()
+
+                # TODO: only Allow next TMA Load for G after k^exp(-g) has been consumed by QK & KK
+                g_handle.release()
 
                 # Inplace modify tTR_rKK to M matrix
                 # step1: M = I + StrictTril(beta*KK^T), save M in smem
@@ -2213,15 +2262,6 @@ class KDAChunkwise:
                     space=cute.arch.SharedSpace.shared_cta,
                 )
 
-                # if local_tidx == 0 and hidx == 0 and bidx == 0 and idx == 0:
-                #     # cute.printf("-------------------- sQ_flat: q * exp(g)")
-                #     # cute.print_tensor(sQ_flat)
-                #     cute.printf("-------------------- sK_flat: k * exp(g)")
-                #     cute.print_tensor(sK_flat)
-                #     cute.printf("-------------------- sG_flat stored with K^T*exp(-g):")
-                #     cute.print_tensor(sG_flat_bf16)
-                # self.cuda_wg_sync_barrier.arrive_and_wait()
-
                 print(f"sM: {sM}")
                 print(f"sM_f16: {sM_f16}")
 
@@ -2231,8 +2271,9 @@ class KDAChunkwise:
                 self.cuda_wg_sync_barrier.arrive_and_wait()
                 if tidx == 0:
                     cute.printf("--------------- KK results before inverse")
-                    # cute.print_tensor(curr_sM_f16, verbose=True)
+                    cute.print_tensor(curr_sM_f16)
                     cute.print_tensor(curr_sM_f16[63, None], verbose=True)
+                    pass
                 # FIXME
                 self.cuda_wg_sync_barrier.arrive_and_wait()
 
@@ -2270,7 +2311,6 @@ class KDAChunkwise:
                     cute.arch.ProxyKind.async_shared,
                     space=cute.arch.SharedSpace.shared_cta,
                 )
-                v_handle.release()
 
                 # TODO: copy KS from TMEM to RMEM, NOTE KS reuse TMEM of PV, since they have the same shapes
                 # TODO: check the layout equivalence, should be row-major
@@ -2460,6 +2500,9 @@ class KDAChunkwise:
                     cute.arch.fence_view_async_tmem_store()
                     #####################################################################
                     kv16_handle.commit()
+
+                # NOTE: only release v after PV and State=KV has been consumed
+                v_handle.release()
 
 
         elif warp_idx == self.epilogue_warp_id:
@@ -3014,18 +3057,18 @@ class KDAChunkwise:
             
             if row == col:
                 # Diagonal: M[i,i] = 1.0 (identity)
-                kk_mat[i] = cutlass.Float32(1.0)
+                # kk_mat[i] = cutlass.Float32(1.0)
                 kk_f16_mat[i] = cutlass.Float16(1.0)
             elif row > col:
                 # Strict lower triangular: M[i,j] = beta[row] * KK[i,j]
                 # TODO: cache beta to register since row does not change here.
                 beta_val = beta_vec[row].to(cutlass.Float32)
                 kk_val = kk_mat[i].to(cutlass.Float32)
-                kk_mat[i] = beta_val * kk_val
-                kk_f16_mat[i] = kk_mat[i].to(cutlass.Float16)
+                # kk_mat[i] = beta_val * kk_val
+                kk_f16_mat[i] = (beta_val * kk_val).to(cutlass.Float16)
             else:
                 # Upper triangular: M[i,j] = 0.0
-                kk_mat[i] = cutlass.Float32(0.0)
+                # kk_mat[i] = cutlass.Float32(0.0)
                 kk_f16_mat[i] = cutlass.Float16(0.0)
 
     @cute.jit
@@ -4084,6 +4127,10 @@ def main():
     # QK, L2 Norm
     Q, Q_rstd = l2norm_fwd(Q)
     K, K_rstd = l2norm_fwd(K)
+
+    print(f"Q:\n {Q}")
+    print(f"K:\n {K}")
+    print(f"G:\n {G}")
 
     # Convert to dlpack for CuTe
     q_cute = from_dlpack(Q)
