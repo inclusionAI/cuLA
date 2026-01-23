@@ -39,6 +39,8 @@ ITERATIONS = 1
 
 SEED = 42
 
+torch.set_printoptions(edgeitems=8)
+
 compiled_kernel = None
 
 def cutedsl_kda_prefill(
@@ -323,7 +325,13 @@ def test_accuracy():
     print(f"Absolute error between flash_kda_prefill and naive_recurrent_kda outputs: {abs_err}")
     print(f"Relative error between flash_kda_prefill and naive_recurrent_kda outputs: {err_ratio}")
 
-    # torch.testing.assert_close(o_naive, o), "TORCH & CUTELDS outputs do not match!"
+    abs_err = get_abs_err(o, o_fla)
+    err_ratio = get_err_ratio(o, o_fla)
+    print(f"Absolute error between flash_kda_prefill and fla outputs: {abs_err}")
+    print(f"Relative error between flash_kda_prefill and fla outputs: {err_ratio}")
+
+    # torch.testing.assert_close(o_naive, o_fla), "TORCH & FLA outputs do not match!"
+    torch.testing.assert_close(o_naive, o), "TORCH & CUTELDS outputs do not match!"
     # torch.testing.assert_close(o_naive, o_fla), "TORCH & FLA outputs do not match!"
     # assert_close("O accuracy: naive vs. flashkda", o_naive, o, 1e-3)
     # assert_close("O accuracy: naive vs. fla", o_naive, o_fla, 1e-3)

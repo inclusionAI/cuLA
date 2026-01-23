@@ -1573,7 +1573,7 @@ class KDAChunkwise:
                 kt_handle = load_kt2_consumer.wait_and_advance()
                 mma_kk_handle = mma_kk_producer.acquire_and_advance()
 
-                if should_debug_f:
+                if should_debug:
                     cute.printf("chunk idx={}, got k2 consumer={}", idx, k_handle.index)
                     cute.printf("chunk idx={}, got kt2 consumer={}", idx, kt_handle.index)
                     cute.printf("chunk idx={}, got mma_kk producer={}", idx, mma_kk_handle.index)
@@ -1746,7 +1746,9 @@ class KDAChunkwise:
             #----------------------------------------------------------
             local_tidx = tidx % (self.threads_per_warp * len(self.cuda_warp_ids))
 
-            should_debug = True if cutlass.const_expr(PRINT_DEBUG) and tidx == warp_idx * 32 and hidx == 0 and bidx == 0 and warp_idx == self.cuda_warp_ids[0] else False
+            should_debug = cutlass.const_expr(PRINT_DEBUG) and hidx == 0 and bidx == 0 and local_tidx == 0
+
+            should_debug_f = hidx == 0 and bidx == 0 and tidx == 32*self.cuda_warp_ids[0]
 
             # constant mask tensor
             cM = cute.make_identity_tensor(self.qk_mma_tiler[:2])
@@ -1844,7 +1846,7 @@ class KDAChunkwise:
                 show_debug_info=True, debug_name="KK"
             )
 
-            if True or cutlass.const_expr(PRINT_DEBUG):
+            if cutlass.const_expr(PRINT_DEBUG):
                 print(f"tiled_t2r_S: {tiled_t2r_S}")
                 print(f"tTR_tS: {tTR_tS}")
                 print(f"tTR_rS: {tTR_rS}")
@@ -2196,16 +2198,16 @@ class KDAChunkwise:
                     space=cute.arch.SharedSpace.shared_cta,
                 )
 
-                self.cuda_wg_sync_barrier.arrive_and_wait()
-                if tidx == self.cuda_warp_ids[0] * 32 and hidx == 0 and bidx == 0:
-                    # cute.printf("-------------------- sQ_flat: q * exp(g)")
-                    # cute.print_tensor(sQ_flat)
-                    cute.printf("-------------------- k * exp(g)")
-                    # cute.print_tensor(sK_flat[63, None, k_stage_idx], verbose=True)
-                    cute.print_tensor(sK_flat[None, None, k_stage_idx])
-                    cute.printf("-------------------- k * exp(-g):")
-                    cute.print_tensor(sG_flat_bf16[None, None, g_stage_idx])
-                self.cuda_wg_sync_barrier.arrive_and_wait()
+                if cutlass.const_expr(PRINT_DEBUG):
+                    self.cuda_wg_sync_barrier.arrive_and_wait()
+                    if tidx == self.cuda_warp_ids[0] * 32 and hidx == 0 and bidx == 0:
+                        # cute.printf("-------------------- sQ_flat: q * exp(g)")
+                        # cute.print_tensor(sQ_flat)
+                        cute.printf("-------------------- k * exp(g)")
+                        # cute.print_tensor(sK_flat[63, None, k_stage_idx], verbose=True)
+                        cute.print_tensor(sK_flat[None, None, k_stage_idx])
+                        cute.printf("-------------------- k * exp(-g):")
+                        cute.print_tensor(sG_flat_bf16[None, None, g_stage_idx])
 
                 # ============================================================
                 # KDA End of Prologue
@@ -2250,7 +2252,6 @@ class KDAChunkwise:
                 self.apply_M_transform(tTR_rKK, beta_chunk, tTR_cMask, tTR_rKK_f16)
 
                 # STORE M as F16
-                # TODO: shall we store M as F32
                 smem_kk_handle = smem_kk_producer.acquire_and_advance()
                 if should_debug:
                     cute.printf("chunk idx={}, got smem_kk producer={}", idx, smem_kk_handle.index)
@@ -2271,20 +2272,20 @@ class KDAChunkwise:
                 self.compute_matrix_inverse_64x64(curr_sM_f16)
 
                 # Make sure the inverse is done.
-                self.cuda_wg_sync_barrier.arrive_and_wait()
-                if tidx == 0:
-                    cute.printf("--------------- now sM before beta scale:")
-                    cute.print_tensor(curr_sM_f16)
-                    cute.print_tensor(curr_sM_f16[63, None], verbose=True)
-                    cute.print_tensor(curr_sM_f16[62, None], verbose=True)
-                # FIXME
-                self.cuda_wg_sync_barrier.arrive_and_wait()
+                if cutlass.const_expr(PRINT_DEBUG):
+                    self.cuda_wg_sync_barrier.arrive_and_wait()
+                    if tidx == 0:
+                        cute.printf("--------------- now sM before beta scale:")
+                        cute.print_tensor(curr_sM_f16)
+                        cute.print_tensor(curr_sM_f16[63, None], verbose=True)
+                        cute.print_tensor(curr_sM_f16[62, None], verbose=True)
+                    # FIXME
+                    self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 # S2R, scale with beta, convert to BF16, store back to smem `sM`
                 # TODO: make a repro for the cutedsl team
                 self.scale_M_inverse_with_beta(local_tidx, beta_chunk, curr_sM_f16, curr_sM)
 
-                # FIXME: drop me
                 if cutlass.const_expr(PRINT_DEBUG):
                     self.cuda_wg_sync_barrier.arrive_and_wait()
                     if tidx == 0:
@@ -2352,7 +2353,7 @@ class KDAChunkwise:
                 # Let Kn = K * exp(-g_cumsum)
                 # Let Qg = Q * exp(g_cumsum)
                 # 
-                # TODO: Produce pseudo-V = M * (V - Kg * States)
+                # Produce pseudo-V = M * (V - Kg * States)
                 # {Pseudo-V} ^ T = (V^T - State^T * Kg^T) * M^T
                 # Store Pseudo-V back to V-SMEM
                 pseudo_v_handle = pseudo_v_consumer.wait_and_advance()
@@ -2418,6 +2419,14 @@ class KDAChunkwise:
                 )
                 s0_handle.release()
                 p_handle.commit()
+
+                if cutlass.const_expr(PRINT_DEBUG):
+                    self.cuda_wg_sync_barrier.arrive_and_wait()
+                    if should_debug_f:
+                        cute.printf("------- smem QK:")
+                        cute.print_tensor(sQK_flat)
+                        cute.printf("------- smem QK, last row:")
+                        cute.print_tensor(sQK_flat[63, None, None], verbose=True)
 
                 # Wait for O_INTRA
                 o_intra_handle = o_intra_consumer.wait_and_advance()
