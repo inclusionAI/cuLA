@@ -118,7 +118,6 @@ class KDAChunkwise:
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         scale: cutlass.Float32 = 1.0,
-        max_inverse_stage: int = 4,  # NEW: Max inverse stage to execute (1-4)
     ):
         # make scale a constant
         self.scale = scale
@@ -131,7 +130,6 @@ class KDAChunkwise:
         self.io_dtype = io_dtype
         self.mv_acc_stage = 1
         self.inverse_dtype = cutlass.Float16  # For inverse
-        self.max_inverse_stage = max_inverse_stage  # NEW: Control inverse computation depth
 
         # Warp specialization
         self.num_load_warps = 1
@@ -345,9 +343,8 @@ class KDAChunkwise:
         g_iter: cute.Pointer,  # NEW: gate values
         o_iter: cute.Pointer,
         beta_iter: cute.Pointer,  # NEW: beta tensor [B, S, H]
-        inverse_iter: cute.Pointer,  # NEW: inverse matrix output [B, num_chunks, H, 64, 64]
-        problem_size: Tuple[Int32, Int32, Int32, Int32] = None,  # (B, S, H, D)
-        stream: cuda.CUstream = None,
+        problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B, S, H, D)
+        stream: cuda.CUstream,
     ):
         """
         Execute the Chunkwise KDA operation on the provided tensors.
@@ -361,7 +358,6 @@ class KDAChunkwise:
             g_iter: Gate tensor [B, S, H, D] - NEW for KDA
             o_iter: Output tensor [B, S, H, D]
             beta_iter: Beta tensor [B, S, H] - NEW for KDA, scaling factor for K and V
-            inverse_iter: (Optional) Inverse matrix output [B, num_chunks, H, 64, 64] - NEW for debugging/analysis
             problem_size: (B, S, H, D) problem dimensions
             stream: CUDA stream
         """
@@ -372,14 +368,6 @@ class KDAChunkwise:
 
         # TODO: try two-cta
         self.cta_group = tcgen05.CtaGroup.ONE
-
-        # Initialize inverse tensor for analysis output
-        num_chunks = (S + self.chunk_size - 1) // self.chunk_size  # ceil(S / chunk_size)
-        inverse_layout = cute.make_layout(
-            (num_chunks, 64*64, (H,B)),
-            stride=(64*64*H, 1, (64*64, 64*64*H*num_chunks)),
-        )
-        inverse = cute.make_tensor(inverse_iter, inverse_layout)
 
         # It's ok since torch tensor is row major, hence we've layout=(B,S,H,D):(DHS, DH, D, 1).
         # Below are just permutation tricks to ease the later processing.
@@ -853,8 +841,6 @@ class KDAChunkwise:
             tma_atom_o,
             tma_tensor_o,
             beta,  # NEW for KDA
-            inverse,  # NEW: inverse matrix output for analysis
-            num_chunks,  # NEW: number of chunks for inverse indexing
             q_smem_layout_staged,
             k_smem_layout_staged,
             kv_k_smem_layout_staged,
@@ -897,8 +883,6 @@ class KDAChunkwise:
         tma_atom_o: cute.CopyAtom,
         tma_tensor_o: cute.Tensor,
         beta: cute.Tensor,  # NEW for KDA - shape (S, (H, B))
-        inverse: cute.Tensor,  # NEW: inverse matrix output [num_chunks, 64*64, (H, B)] or None
-        num_chunks: Int32,  # NEW: number of chunks for inverse indexing
         q_smem_layout_staged: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
         kv_k_smem_layout_staged: cute.ComposedLayout,
@@ -1200,8 +1184,7 @@ class KDAChunkwise:
         #     m_smem_layout_staged.outer, swizzle=sM_swizzle
         # )
         sM = storage.sM.get_tensor(
-            # m_smem_layout_staged.outer, swizzle=m_smem_layout_staged.inner
-            m_smem_layout_staged.outer, swizzle=None,
+            m_smem_layout_staged.outer, swizzle=m_smem_layout_staged.inner
         )
         sM_opB = storage.sM.get_tensor(
             p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner
@@ -1209,7 +1192,7 @@ class KDAChunkwise:
         sM_f16 = cute.make_tensor(
             cute.recast_ptr(
                 sM.iterator,
-                swizzle_=None,
+                swizzle_=m_smem_layout_staged.inner,
                 dtype=cutlass.Float16),
             layout=sM.layout)
 
@@ -2288,22 +2271,6 @@ class KDAChunkwise:
 
                 self.compute_matrix_inverse_64x64(curr_sM_f16)
 
-                # NEW: Write inverse result to global memory for analysis
-                # Create a non-swizzled version of sM_f16 to avoid swizzled memory access errors
-                self.cuda_wg_sync_barrier.arrive_and_wait()
-                
-                if tidx < 64:
-                    # Each of first 64 threads (one warp) writes one row of the 64x64 matrix
-                    row = tidx
-                    for col in range(64):
-                        # Read one element from non-swizzled shared memory (column-major layout)
-                        value = curr_sM_f16[row, col]
-                        # Write to global memory with column-major indexing to match layout
-                        # inverse layout: (num_chunks, 64*64, (H,B))
-                        inverse[idx, col * 64 + row, (hidx, bidx)] = value
-                
-                self.cuda_wg_sync_barrier.arrive_and_wait()
-
                 # Make sure the inverse is done.
                 if cutlass.const_expr(PRINT_DEBUG):
                     self.cuda_wg_sync_barrier.arrive_and_wait()
@@ -3163,36 +3130,33 @@ class KDAChunkwise:
             cute.print_tensor(t8x8mat[None, None, 0, 0])
 
         # Stage 2: Invert all 4 diagonal 16x16 blocks
-        if cutlass.const_expr(self.max_inverse_stage >= 2):
-            t16x16mat = cute.flat_divide(s_mat, (16, 16))
-            self.compute_diagonal_inverse_8x8_to_16x16(
-                t16x16mat[None, None, tidx//32, tidx//32],
-            )
-            # Synchronize after stage 2
-            self.cuda_wg_sync_barrier.arrive_and_wait()
+        t16x16mat = cute.flat_divide(s_mat, (16, 16))
+        self.compute_diagonal_inverse_8x8_to_16x16(
+            t16x16mat[None, None, tidx//32, tidx//32],
+        )
+        # Synchronize after stage 2
+        self.cuda_wg_sync_barrier.arrive_and_wait()
 
-            if cutlass.const_expr(PRINT_DEBUG) and tidx == 0:
-                cute.printf("-------------- After stage 2 inverse 16x16, first 16x16 block")
-                cute.print_tensor(t16x16mat[None, None, 0, 0])
+        if cutlass.const_expr(PRINT_DEBUG) and tidx == 0:
+            cute.printf("-------------- After stage 2 inverse 16x16, first 16x16 block")
+            cute.print_tensor(t16x16mat[None, None, 0, 0])
 
         # Stage 3: Invert all 2 diagonal 32x32 blocks
-        if cutlass.const_expr(self.max_inverse_stage >= 3):
-            t32x32mat = cute.flat_divide(s_mat, (32, 32))
-            if tidx < 64:
-                self.compute_diagonal_inverse_16x16_to_32x32(
-                    t32x32mat[None, None, tidx//32, tidx//32],
-                )
-            self.cuda_wg_sync_barrier.arrive_and_wait()
-            if cutlass.const_expr(PRINT_DEBUG) and tidx == 0:
-                cute.printf("-------------- After stage 3 inverse 32x32, first 32x32 block")
-                cute.print_tensor(t32x32mat[None, None, 0, 0])
+        t32x32mat = cute.flat_divide(s_mat, (32, 32))
+        if tidx < 64:
+            self.compute_diagonal_inverse_16x16_to_32x32(
+                t32x32mat[None, None, tidx//32, tidx//32],
+            )
+        self.cuda_wg_sync_barrier.arrive_and_wait()
+        if cutlass.const_expr(PRINT_DEBUG) and tidx == 0:
+            cute.printf("-------------- After stage 3 inverse 32x32, first 32x32 block")
+            cute.print_tensor(t32x32mat[None, None, 0, 0])
 
         # Stage 4: Invert the full 64x64 matrix
-        if cutlass.const_expr(self.max_inverse_stage >= 4):
-            self.compute_diagonal_inverse_32x32_to_64x64(s_mat)
-            if cutlass.const_expr(PRINT_DEBUG) and tidx == 0:
-                cute.printf("-------------- Final inverse 64x64 block\n")
-                cute.print_tensor(s_mat, verbose=False)
+        self.compute_diagonal_inverse_32x32_to_64x64(s_mat)
+        if cutlass.const_expr(PRINT_DEBUG) and tidx == 0:
+            cute.printf("-------------- Final inverse 64x64 block\n")
+            cute.print_tensor(s_mat, verbose=False)
 
     @cute.jit
     def scale_M_inverse_with_beta(
