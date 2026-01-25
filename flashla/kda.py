@@ -595,6 +595,7 @@ class KDAChunkwise:
             self.g_dtype,
             self.g_stage,
         )
+        print(f"g_smem_layout_staged: {g_smem_layout_staged}")
         # V^T*P
         p_smem_layout_staged = sm100_utils.make_smem_layout_b(
             vp_tiled_mma,
@@ -697,6 +698,7 @@ class KDAChunkwise:
         k_copy_size = cute.size_in_bytes(self.k_dtype, k_smem_layout)
         v_copy_size = cute.size_in_bytes(self.v_dtype, v_smem_layout)
         g_copy_size = cute.size_in_bytes(self.g_dtype, g_smem_layout)  # NEW for KDA
+        print(f"q_copy_size: {q_copy_size}, k_copy_size: {k_copy_size}, v_copy_size: {v_copy_size}, g_copy_size: {g_copy_size}")
         self.tma_copy_q_bytes = q_copy_size
         self.tma_copy_k_bytes = k_copy_size        
         # self.tma_copy_v_bytes = v_copy_size        
@@ -1157,19 +1159,40 @@ class KDAChunkwise:
             k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
         )
         # NOTE: recast as bf16 since operand B is BF16
-        # TODO: VERIFY ME, here we keep the same layout, this requires consistent r2s
+        # CRITICAL FIX: sK_neg_g's stage stride must match sG's byte stride
+        # sG (F32) has stage stride = 8192 elements = 32768 bytes
+        # sK_neg_g (BF16) must have stage stride = 32768 bytes = 16384 BF16 elements
+        # Original bug: using sK_g.layout which has stage stride = 8192 BF16 elements = 16384 bytes
+        # This caused sK_neg_g stage 1 to overlap with sG stage 0's second half!
+        
+        # Get the base layout from sK_g but double the stage stride
+        sK_g_outer = sK_g.layout
+        # Create new layout with corrected stage stride (16384 BF16 elements instead of 8192)
+        # sK_g layout is: ((64,16),1,(4,2),2):((64,1),0,(16,4096),8192)
+        # We need: ((64,16),1,(4,2),2):((64,1),0,(16,4096),16384)
+        sK_neg_g_layout = cute.make_layout(
+            sK_g_outer.shape,
+            stride=(*sK_g_outer.stride[:-1], sK_g_outer.stride[-1] * 2)  # Double the stage stride
+        )
         sK_neg_g = cute.make_tensor(
             cute.recast_ptr(
                 sK_neg_g_f32.iterator,
                 swizzle_=k_smem_layout_staged.inner,
                 dtype=self.io_dtype),
-            layout=sK_g.layout)
+            layout=sK_neg_g_layout)
+        
+        # Same fix for sK_neg_g_b
+        sK_neg_g_b_outer = kv_k_smem_layout_staged.outer
+        sK_neg_g_b_layout = cute.make_layout(
+            sK_neg_g_b_outer.shape,
+            stride=(*sK_neg_g_b_outer.stride[:-1], sK_neg_g_b_outer.stride[-1] * 2)  # Double the stage stride
+        )
         sK_neg_g_b = cute.make_tensor(
             cute.recast_ptr(
                 sK_neg_g_f32.iterator,
                 swizzle_=kv_k_smem_layout_staged.inner,
                 dtype=self.io_dtype),
-            layout=kv_k_smem_layout_staged.outer)
+            layout=sK_neg_g_b_layout)
         # sK_neg_g = cute.make_tensor(
         #     cute.recast_ptr(
         #         sK_neg_g_f32.iterator,
@@ -1177,6 +1200,7 @@ class KDAChunkwise:
         #         dtype=self.io_dtype),
         #     layout=sK_neg_g_f32.layout)
         print(f"sK_neg_g: {cute.pretty_str(sK_neg_g)}")
+        print(f"sK_neg_g_b: {cute.pretty_str(sK_neg_g_b)}")
         print(f"sK_g: {cute.pretty_str(sK_g)}")
         # (((64,2),16),1,4,2):(((1,4096),64),0,1024,8192)>
         sV = storage.sV.get_tensor(
@@ -1323,12 +1347,21 @@ class KDAChunkwise:
         sG_flat_s2r_f32_fake = storage.sG.get_tensor(
             k_smem_layout_coalesce.outer, swizzle=k_smem_layout_coalesce.inner
         )
+        # CRITICAL FIX: When recasting F32 to BF16, we must double the stage stride
+        # so that the byte offset remains the same.
+        # F32 stage stride = 8192 elements = 32768 bytes
+        # BF16 stage stride should = 16384 elements = 32768 bytes
+        k_smem_layout_bf16_outer = k_smem_layout_coalesce.outer
+        k_smem_layout_bf16_fixed = cute.make_layout(
+            k_smem_layout_bf16_outer.shape,
+            stride=(*k_smem_layout_bf16_outer.stride[:-1], k_smem_layout_bf16_outer.stride[-1] * 2)
+        )
         sG_flat_bf16 = cute.make_tensor(
             cute.recast_ptr(
                 sG_flat_s2r_f32_fake.iterator,
                 swizzle_=k_smem_layout_coalesce.inner,
                 dtype=self.io_dtype),
-            layout=k_smem_layout_coalesce.outer)
+            layout=k_smem_layout_bf16_fixed)
 
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"sQ: {cute.pretty_str(sQ)}")
@@ -1476,10 +1509,15 @@ class KDAChunkwise:
         sG_flat = storage.sG.get_tensor(
             g_smem_layout_coalesce.outer, swizzle=g_smem_layout_coalesce.inner
         )
-        # HALF SPACE
+        # HALF SPACE - CRITICAL FIX: Double the stage stride for BF16
+        sG_flat_layout = sG_flat.layout
+        sG_flat_bf16_layout = cute.make_layout(
+            sG_flat_layout.shape,
+            stride=(*sG_flat_layout.stride[:-1], sG_flat_layout.stride[-1] * 2)
+        )
         sG_flat_as_bf16 = cute.make_tensor(
             cute.recast_ptr(sG_flat.iterator, dtype=self.io_dtype),
-            layout=sG_flat.layout)
+            layout=sG_flat_bf16_layout)
         print(f"sG_flat: {cute.pretty_str(sG_flat)}")
         print(f"sG_flat_as_bf16: {cute.pretty_str(sG_flat_as_bf16)}")
         print(f"g_smem_layout_epi: {g_smem_layout_epi}")
@@ -2143,6 +2181,12 @@ class KDAChunkwise:
                     space=cute.arch.SharedSpace.shared_cta,
                 )
 
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+                if should_debug_f:
+                    cute.printf("sG, idx={}", idx)
+                    cute.print_tensor(sG_flat[None, None, g_stage_idx])
+                self.cuda_wg_sync_barrier.arrive_and_wait()
+
                 # Load Q from SMEM to RMEM for KDA elementwise processing
                 q_handle = load_q_consumer.wait_and_advance()
                 if should_debug:
@@ -2232,9 +2276,10 @@ class KDAChunkwise:
                 
                 # Write K_intra = K * exp(-g) to SMEM[G] (overwrite g)
                 kt2_handle = load_kt2_producer.acquire_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got kt2 producer={}", idx, kt2_handle.index)
-                cute.copy(tiled_s2r_g_bf16, tRS_rG_bf16, tRS_sG_bf16[(None, None, None, g_stage_idx)])
+                if should_debug_f:
+                    cute.printf("chunk idx={}, got kt2 producer={}, g_stage_idx={}", idx, kt2_handle.index, g_stage_idx)
+                # BUG FIX: use kt2_handle.index instead of g_stage_idx to ensure producer/consumer index match
+                cute.copy(tiled_s2r_g_bf16, tRS_rG_bf16, tRS_sG_bf16[(None, None, None, kt2_handle.index)])
                 # produce k^t * exp(-g) for mma
                 kt2_handle.commit()
                 

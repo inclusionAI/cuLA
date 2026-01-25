@@ -30,7 +30,7 @@ from flashla.kda import KDAChunkwise
 # Constant params
 B, H, D = 1, 1, 128
 
-S = T = 128
+S = T = 192
 
 CHUNK_SIZE = 64
 
@@ -463,6 +463,7 @@ def test_accuracy():
     )
 
     # print("o flashkda:", o)
+    print("o flashkda:", o)
     print("o naive:", o_naive)
     # print("o fla:", o_fla)
 
