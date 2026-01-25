@@ -78,10 +78,12 @@ from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 
 import flashla.utils
 
-PRINT_DEBUG=False
-
-ENABLE_CUDA_WG_PRINT = True
-ENABLE_MMA_WARP_PRINT = False
+# Global debug switch - set to False to disable ALL print statements
+# When False, cutlass.const_expr(PRINT_DEBUG) will eliminate code at compile time
+PRINT_DEBUG = False
+# Fine-grained debug switches for specific warp groups
+ENABLE_MMA_WARP_PRINT = False  # MMA warp debug prints
+ENABLE_CUDA_WG_PRINT = False   # CUDA warpgroup debug prints
 
 class Constant:
     """Common constants used in KDA implementation."""
@@ -595,7 +597,8 @@ class KDAChunkwise:
             self.g_dtype,
             self.g_stage,
         )
-        print(f"g_smem_layout_staged: {g_smem_layout_staged}")
+        if PRINT_DEBUG:
+            print(f"g_smem_layout_staged: {g_smem_layout_staged}")
         # V^T*P
         p_smem_layout_staged = sm100_utils.make_smem_layout_b(
             vp_tiled_mma,
@@ -680,8 +683,9 @@ class KDAChunkwise:
             qk_tiled_mma,
             cluster_layout_vmnk.shape,
         )
-        print(f"tma_atom_g: {cute.pretty_str(tma_atom_g)}")
-        print(f"g_smem_layout: {cute.pretty_str(g_smem_layout)}")
+        if PRINT_DEBUG:
+            print(f"tma_atom_g: {cute.pretty_str(tma_atom_g)}")
+            print(f"g_smem_layout: {cute.pretty_str(g_smem_layout)}")
         
         # NOTE: G's last row will be extracted from sG in CUDA warp after TMA load
         # No separate TMA needed for G last row - we extract it from the full G tile
@@ -698,7 +702,8 @@ class KDAChunkwise:
         k_copy_size = cute.size_in_bytes(self.k_dtype, k_smem_layout)
         v_copy_size = cute.size_in_bytes(self.v_dtype, v_smem_layout)
         g_copy_size = cute.size_in_bytes(self.g_dtype, g_smem_layout)  # NEW for KDA
-        print(f"q_copy_size: {q_copy_size}, k_copy_size: {k_copy_size}, v_copy_size: {v_copy_size}, g_copy_size: {g_copy_size}")
+        if PRINT_DEBUG:
+            print(f"q_copy_size: {q_copy_size}, k_copy_size: {k_copy_size}, v_copy_size: {v_copy_size}, g_copy_size: {g_copy_size}")
         self.tma_copy_q_bytes = q_copy_size
         self.tma_copy_k_bytes = k_copy_size        
         # self.tma_copy_v_bytes = v_copy_size        
@@ -830,15 +835,17 @@ class KDAChunkwise:
             ]
 
         self.shared_storage = SharedStorage        
-        print(f"size of storage: {SharedStorage.__sizeof__()}")
-        print(f"m_smem_layout_staged: {m_smem_layout_staged}")
+        if PRINT_DEBUG:
+            print(f"size of storage: {SharedStorage.__sizeof__()}")
+            print(f"m_smem_layout_staged: {m_smem_layout_staged}")
 
         self.grid = self._compute_grid(
             # (D, S, (H, B))
             o_shape=cute.shape(o),
             chunk_size=self.chunk_size,
         )
-        print(f"grid: {self.grid}")
+        if PRINT_DEBUG:
+            print(f"grid: {self.grid}")
 
         self.kernel(
             qk_tiled_mma,
@@ -1199,9 +1206,10 @@ class KDAChunkwise:
         #         swizzle_=k_smem_layout_staged.inner,
         #         dtype=self.io_dtype),
         #     layout=sK_neg_g_f32.layout)
-        print(f"sK_neg_g: {cute.pretty_str(sK_neg_g)}")
-        print(f"sK_neg_g_b: {cute.pretty_str(sK_neg_g_b)}")
-        print(f"sK_g: {cute.pretty_str(sK_g)}")
+        if PRINT_DEBUG:
+            print(f"sK_neg_g: {cute.pretty_str(sK_neg_g)}")
+            print(f"sK_neg_g_b: {cute.pretty_str(sK_neg_g_b)}")
+            print(f"sK_g: {cute.pretty_str(sK_g)}")
         # (((64,2),16),1,4,2):(((1,4096),64),0,1024,8192)>
         sV = storage.sV.get_tensor(
             v_smem_layout_staged.outer, swizzle=v_smem_layout_staged.inner
@@ -1220,13 +1228,15 @@ class KDAChunkwise:
             element_type=self.beta_dtype,
         )
         sG_last = self.get_smem_tensor_sG_last(storage, g_last_layout)
-        print(f"sG_last: {sG_last}")
+        if PRINT_DEBUG:
+            print(f"sG_last: {sG_last}")
 
         # NOTE: optimize swizzle
         sBeta = storage.sBeta.get_tensor(
             beta_layout, swizzle=None
         )
-        print(f"sBeta: {sBeta}")
+        if PRINT_DEBUG:
+            print(f"sBeta: {sBeta}")
 
         # (MMA, MMA_N, MMA_K, STAGE)
         sP = storage.sP.get_tensor(
@@ -1480,8 +1490,9 @@ class KDAChunkwise:
         # (MMA, MMA_M, MMA_K, INPUT_STAGE)
         # (MMA, MMA_N, MMA_K, INPUT_STAGE)
         # (MMA, MMA_M, MMA_N, ACC_STAGE)
-        print(f"sP: {cute.pretty_str(sP)}")
-        print(f"sM: {cute.pretty_str(sM)}")
+        if PRINT_DEBUG:
+            print(f"sP: {cute.pretty_str(sP)}")
+            print(f"sM: {cute.pretty_str(sM)}")
         tCrV_corr, tCrM, tCtAccMV = self.mma_partition_ss(
             mv_tiled_mma,
             self.mv_mma_tiler,
@@ -1518,10 +1529,11 @@ class KDAChunkwise:
         sG_flat_as_bf16 = cute.make_tensor(
             cute.recast_ptr(sG_flat.iterator, dtype=self.io_dtype),
             layout=sG_flat_bf16_layout)
-        print(f"sG_flat: {cute.pretty_str(sG_flat)}")
-        print(f"sG_flat_as_bf16: {cute.pretty_str(sG_flat_as_bf16)}")
-        print(f"g_smem_layout_epi: {g_smem_layout_epi}")
-        print(f"g_smem_layout_coalesce: {g_smem_layout_coalesce}")
+        if PRINT_DEBUG:
+            print(f"sG_flat: {cute.pretty_str(sG_flat)}")
+            print(f"sG_flat_as_bf16: {cute.pretty_str(sG_flat_as_bf16)}")
+            print(f"g_smem_layout_epi: {g_smem_layout_epi}")
+            print(f"g_smem_layout_coalesce: {g_smem_layout_coalesce}")
 
         # ///////////////////////////////////////////////////////////////////////////////
         # LOAD WARP
@@ -1933,7 +1945,7 @@ class KDAChunkwise:
                 tRS_sKK,
             ) = self.smem_store_acc_as_ab_and_partition_x(
                 local_tidx, sM_f16, tiled_t2r_KK, tTR_rKK_f16,
-                show_debug_info=True, debug_name="KK"
+                show_debug_info=PRINT_DEBUG, debug_name="KK"
             )
 
             if cutlass.const_expr(PRINT_DEBUG):
@@ -2072,12 +2084,13 @@ class KDAChunkwise:
                 sG_flat_bf16,
                 shape_g,
             )
-            print(f"tiled_s2r_g: {tiled_s2r_g}")
-            print(f"tRS_sG: {tRS_sG}")
-            print(f"tRS_rG: {tRS_rG}")
-            print(f"tiled_s2r_g_bf16: {tiled_s2r_g_bf16}")
-            print(f"tRS_sG_bf16: {tRS_sG_bf16}")
-            print(f"tRS_rG_bf16: {tRS_rG_bf16}")
+            if cutlass.const_expr(PRINT_DEBUG):
+                print(f"tiled_s2r_g: {tiled_s2r_g}")
+                print(f"tRS_sG: {tRS_sG}")
+                print(f"tRS_rG: {tRS_rG}")
+                print(f"tiled_s2r_g_bf16: {tiled_s2r_g_bf16}")
+                print(f"tRS_sG_bf16: {tRS_sG_bf16}")
+                print(f"tRS_rG_bf16: {tRS_rG_bf16}")
             #-------------------------------------------------------
 
             #-------------------------------------------------------
@@ -2093,9 +2106,10 @@ class KDAChunkwise:
                 sQ_flat,
                 shape_q,
             )
-            print(f"tiled_s2r_q: {tiled_s2r_q}")
-            print(f"tRS_sQ: {tRS_sQ}")
-            print(f"tRS_rQ: {tRS_rQ}")
+            if cutlass.const_expr(PRINT_DEBUG):
+                print(f"tiled_s2r_q: {tiled_s2r_q}")
+                print(f"tRS_sQ: {tRS_sQ}")
+                print(f"tRS_rQ: {tRS_rQ}")
             #-------------------------------------------------------
 
             #-------------------------------------------------------
@@ -2113,9 +2127,10 @@ class KDAChunkwise:
             )
             # Create additional RMEM tensor for K_inter = K * exp(g)
             # tRS_rK_inter = cute.make_rmem_tensor_like(tRS_rK, dtype=self.io_dtype)
-            print(f"tiled_s2r_k: {tiled_s2r_k}")
-            print(f"tRS_sK: {tRS_sK}")
-            print(f"tRS_rK: {tRS_rK}")
+            if cutlass.const_expr(PRINT_DEBUG):
+                print(f"tiled_s2r_k: {tiled_s2r_k}")
+                print(f"tRS_sK: {tRS_sK}")
+                print(f"tRS_rK: {tRS_rK}")
             # print(f"tRS_rK_inter: {tRS_rK_inter}")
             #-------------------------------------------------------
 
@@ -2133,9 +2148,10 @@ class KDAChunkwise:
                 sV_flat_s2r,
                 shape_v,
             )
-            print(f"tiled_s2r_v: {tiled_s2r_v}")
-            print(f"tRS_sV: {tRS_sV}")
-            print(f"tRS_rV: {tRS_rV}")
+            if cutlass.const_expr(PRINT_DEBUG):
+                print(f"tiled_s2r_v: {tiled_s2r_v}")
+                print(f"tRS_sV: {tRS_sV}")
+                print(f"tRS_rV: {tRS_rV}")
             #-------------------------------------------------------
 
             # -------------- DEBUG -------------
@@ -2162,8 +2178,9 @@ class KDAChunkwise:
                 beta_chunk_layout = cute.make_layout((C, 1), stride=(H, 0))
                 beta_chunk = cute.make_tensor(beta_chunk.iterator + s_idx*H, layout=beta_chunk_layout)
 
-                print(f"sBeta: {sBeta}")
-                print(f"beta_chunk: {beta_chunk}")
+                if cutlass.const_expr(PRINT_DEBUG):
+                    print(f"sBeta: {sBeta}")
+                    print(f"beta_chunk: {beta_chunk}")
                 if local_tidx < Constant.C:
                     sBeta[local_tidx, 0] = beta_chunk[local_tidx, 0]
                 self.cuda_wg_sync_barrier.arrive_and_wait()
@@ -2345,8 +2362,9 @@ class KDAChunkwise:
                     space=cute.arch.SharedSpace.shared_cta,
                 )
 
-                print(f"sM: {sM}")
-                print(f"sM_f16: {sM_f16}")
+                if cutlass.const_expr(PRINT_DEBUG):
+                    print(f"sM: {sM}")
+                    print(f"sM_f16: {sM_f16}")
 
                 curr_sM = sM[None, None, smem_kk_handle.index]
                 curr_sM_f16 = sM_f16[None, None, smem_kk_handle.index]
@@ -2388,8 +2406,9 @@ class KDAChunkwise:
                 # TODO: copy KS from TMEM to RMEM, NOTE KS reuse TMEM of PV, since they have the same shapes
                 # TODO: check the layout equivalence, should be row-major
                 tTR_rAcc_ks = cute.make_tensor(tTR_rAcc_pv.iterator, layout=tRS_rV.layout)
-                print(f"FIXME tTR_rAcc_pv: {tTR_rAcc_pv}")
-                print(f"FIXME tTR_rAcc_ks: {tTR_rAcc_ks}")
+                if cutlass.const_expr(PRINT_DEBUG):
+                    print(f"FIXME tTR_rAcc_pv: {tTR_rAcc_pv}")
+                    print(f"FIXME tTR_rAcc_ks: {tTR_rAcc_ks}")
                 if idx != 0:
                     # Wait for KS
                     ks_handle = ks_consumer.wait_and_advance()
@@ -2695,7 +2714,8 @@ class KDAChunkwise:
         # tTR_rKV: (Dk, Dv)
         # kv_f32 = flat.load()
         kv_f32 = flat
-        print(f"kv_f32: {kv_f32}")
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"kv_f32: {kv_f32}")
         for i in cutlass.range_constexpr(Constant.D):
             kv_f32[i] = kv_f32[i] * sG_last[i]
         return kv_f32
@@ -3351,7 +3371,8 @@ class KDAChunkwise:
 
         shape_x = cute.coalesce(sM_f16.layout, target_profile=(1,1)).shape
 
-        print(f"shape_x: {shape_x}")
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"shape_x: {shape_x}")
 
         num_elements_per_thread = 32
         num_threads_per_row = shape_x[1] // num_elements_per_thread
@@ -3370,7 +3391,8 @@ class KDAChunkwise:
         )
         thr_s2r_x = tiled_s2r_x.get_slice(local_tidx)
 
-        print(f"thr_s2r_x: {thr_s2r_x}")
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"thr_s2r_x: {thr_s2r_x}")
 
         # Partition shared tensor for smem load Bt
         # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
@@ -3393,7 +3415,8 @@ class KDAChunkwise:
             space=cute.arch.SharedSpace.shared_cta,
         )
 
-        print(f"------ DOT tXrX_s2r: {tXrX_s2r}")
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"------ DOT tXrX_s2r: {tXrX_s2r}")
         # M^{-1} * diag(beta): Load values and prepare beta scaling vector
         m = cute.make_rmem_tensor_like(tXrX_s2r, cutlass.Float32)
         m.store(tXrX_s2r.load().to(cutlass.Float32))
@@ -3490,7 +3513,8 @@ class KDAChunkwise:
         row: cute.Tensor,
         idx: int,
     ) -> cute.Tensor:
-        print(f"store_row_mat8x8: idx={idx}, row={row}, mat={mat}")
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"store_row_mat8x8: idx={idx}, row={row}, mat={mat}")
         row_bf16 = cute.make_rmem_tensor_like(row, mat.element_type)
         row_bf16.store(row.load().to(mat.element_type))
         copy_atom = cute.make_copy_atom(
@@ -3550,8 +3574,9 @@ class KDAChunkwise:
         lane_id = tidx % 32
 
         thr_mma = tiled_mma.get_slice(lane_id)
-        print(f"thr_mma: {thr_mma}")
-        print(f"tiled_mma: {tiled_mma}")
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"thr_mma: {thr_mma}")
+            print(f"tiled_mma: {tiled_mma}")
 
         D_tiled_copy = cute.make_tiled_copy_A(copy_atom_s2r, tiled_mma)
         C_tiled_copy = cute.make_tiled_copy_B(copy_atom_s2r_t, tiled_mma)
@@ -3617,7 +3642,8 @@ class KDAChunkwise:
         cute.gemm(tiled_mma, tOrO_cv, tOrDC, tOrAInv, tOrO_cv)
 
         tOrO_cv_half = tOrO_cv[(None, 0), None, None]
-        print(f"tOrO_cv_half: {tOrO_cv_half}")
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"tOrO_cv_half: {tOrO_cv_half}")
         tOrO_f16 = cute.make_rmem_tensor_like(tOrO_cv_half, mat.element_type)
         tOrO_f16.store(tOrO_cv[(None, 0), None, None].load().to(mat.element_type))
 
@@ -3630,8 +3656,9 @@ class KDAChunkwise:
         tOsO_dst = cute.make_tensor(tOsO.iterator, layout=cute.make_layout(((dst_shape[0], 1), dst_shape[1], dst_shape[2]), stride=((dst_stride[0], 0), dst_stride[1], dst_stride[2])))
         # tOrO_src = tOrO_f16
         # tOsO_dst = tOsO[(None, 0), None, None]
-        print(f"tOrO_src: {tOrO_src}")
-        print(f"tOsO_dst: {tOsO_dst}")
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"tOrO_src: {tOrO_src}")
+            print(f"tOsO_dst: {tOsO_dst}")
         cute.copy(O_tiled_copy, tOrO_src, tOsO_dst)
 
     def canonical_lane_id(self):
@@ -3745,7 +3772,8 @@ class KDAChunkwise:
         cfrag_atom_size = cute.size(c_layout.shape[0])
         afrag_atom_size = cute.size(tiled_mma.tv_layout_A.shape[1])
         ratio = afrag_atom_size // cfrag_atom_size
-        print(f"cfrag_atom_size: {cfrag_atom_size}, afrag_atom_size: {afrag_atom_size}")
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"cfrag_atom_size: {cfrag_atom_size}, afrag_atom_size: {afrag_atom_size}")
 
         if ratio == 1:
             return c_layout
@@ -3756,8 +3784,9 @@ class KDAChunkwise:
             divided.shape[1],
             divided.shape[2][1]
         ))
-        print(f"c_layout: {c_layout}")
-        print(f"a_layout: {a_layout}")
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"c_layout: {c_layout}")
+            print(f"a_layout: {a_layout}")
         return a_layout
 
     def make_acc_as_a(self, acc: cute.Tensor, tiled_mma: cute.TiledMma, dtype: cute.Numeric):
@@ -4147,7 +4176,8 @@ class KDAChunkwise:
             cute.slice_(tXsX_s2r.shape, (None, None, None, 0)),
             dtype,
         )
-        print(f"v s2r tiled: {tiled_s2r_x}")
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"v s2r tiled: {tiled_s2r_x}")
         return tiled_s2r_x, thr_s2r_x, tXsX_s2r, tXrX_s2r
 
     @cute.jit

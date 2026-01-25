@@ -30,7 +30,7 @@ from flashla.kda import KDAChunkwise
 # Constant params
 B, H, D = 1, 1, 128
 
-S = T = 192
+S = T = 64*5
 
 CHUNK_SIZE = 64
 
