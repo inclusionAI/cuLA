@@ -128,6 +128,9 @@ class KDAChunkwise:
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         scale: cutlass.Float32 = 1.0,
+        num_regs_mma: int = 96,  # Optimized: best config from sweep
+        num_regs_cuda: int = 224,
+        num_regs_epilogue_warps: int = 24,
     ):
         # make scale a constant
         self.scale = scale
@@ -141,6 +144,11 @@ class KDAChunkwise:
         self.mv_acc_stage = 1
         self.inverse_dtype = cutlass.Float16  # For inverse
         self.beta_dtype = cutlass.Float32
+
+        # Register allocation configuration
+        self.num_regs_mma = num_regs_mma
+        self.num_regs_cuda = num_regs_cuda
+        self.num_regs_epilogue_warps = num_regs_epilogue_warps
 
         # Warp specialization
         self.num_load_warps = 1
