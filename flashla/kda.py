@@ -128,8 +128,8 @@ class KDAChunkwise:
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         scale: cutlass.Float32 = 1.0,
-        num_regs_mma: int = 96,  # Optimized: best config from sweep
-        num_regs_cuda: int = 224,
+        num_regs_mma: int = 64,  # Optimized: best config from comprehensive sweep
+        num_regs_cuda: int = 248,  # Critical: 248 provides 39% speedup over 160
         num_regs_epilogue_warps: int = 24,
     ):
         # make scale a constant
@@ -1388,12 +1388,6 @@ class KDAChunkwise:
             print(f"sO: {cute.pretty_str(sO)}")
             print(f"sP: {cute.pretty_str(sP)}")
             print(f"sQK: {cute.pretty_str(sQK)}")
-
-        self.num_regs_other = 24
-        self.num_regs_epilogue_warps = 24
-        # TODO: CUTE PRINTF REQUIRES AT LEAST 32, OTHERWISE ILL INS OCCURRED
-        self.num_regs_mma = 32 
-        self.num_regs_cuda = 160
 
         (_, hidx, bidx) = cute.arch.block_idx()
         B, S, H, D = problem_size
