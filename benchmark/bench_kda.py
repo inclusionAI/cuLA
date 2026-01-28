@@ -85,7 +85,6 @@ def benchmark_safe_gate(T, provider):
        init_state = None
 
     if provider == 'flashla_cutedsl':
-        # TODO: integrate KdaChunkWise
         results = triton.testing.do_bench(
           lambda: flash_kda_prefill(
               q=q,

@@ -8,14 +8,10 @@ from fla.ops.kda import chunk_kda
 from fla.ops.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from fla.ops.kda.gate import fused_kda_gate, naive_kda_gate
 from fla.modules.l2norm import l2norm_fwd
-from fla.ops.utils import chunk_local_cumsum
-from fla.ops.utils.constant import RCP_LN2
 from fla.utils import assert_close
-from benchmark.utils import set_seed, exclusive_cumsum
-
-import time
-
+from benchmark.utils import set_seed
 from torch.profiler import profile, record_function, ProfilerActivity
+
 from flashla.kda_wrapper import flash_kda_prefill
 
 # Constant params
@@ -231,97 +227,42 @@ def test_accuracy():
         lower_bound = None
         naive_kda_gate_fn = naive_kda_gate
 
-    o, final_states = None, None
-    for _ in range(WARMUP_ITERATIONS):
-        o, final_states = flash_kda_prefill(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A_log=(A_log.clone() if use_gate_in_kernel else None),
-            dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-            scale=scale,
-            initial_state=init_state,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens,
-            use_gate_in_kernel=use_gate_in_kernel,
-            safe_gate=safe_gate,
-            lower_bound=lower_bound,
-        )
-    torch.cuda.synchronize()
-
-    start_time = time.perf_counter()
-    for _ in range(ITERATIONS):
-        o, final_states = flash_kda_prefill(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A_log=(A_log.clone() if use_gate_in_kernel else None),
-            dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-            scale=scale,
-            initial_state=init_state,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens,
-            use_gate_in_kernel=use_gate_in_kernel,
-            safe_gate=safe_gate,
-            lower_bound=lower_bound,
-        )
-    torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start_time
-    print(f"\nFlashKDA Execution time: {elapsed*1000/ITERATIONS:.2f} ms (average over {ITERATIONS} iterations)")
+    o, final_states = flash_kda_prefill(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=(A_log.clone() if use_gate_in_kernel else None),
+        dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
+        scale=scale,
+        initial_state=init_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+    )
 
     set_seed(SEED)
 
-    o_fla = None
-    final_states_fla = None
-
-    for _ in range(WARMUP_ITERATIONS):
-        o_fla, final_states_fla = chunk_kda(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A_log=(A_log.clone() if use_gate_in_kernel else None),
-            dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-            scale=scale,
-            initial_state=init_state,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=use_gate_in_kernel,
-            safe_gate=safe_gate,
-            lower_bound=lower_bound,
-        )
-
-    torch.cuda.synchronize()
-
-    start_time = time.perf_counter()
-    for _ in range(ITERATIONS):
-        o_fla, final_states_fla = chunk_kda(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A_log=(A_log.clone() if use_gate_in_kernel else None),
-            dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-            scale=scale,
-            initial_state=init_state,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=use_gate_in_kernel,
-            safe_gate=safe_gate,
-            lower_bound=lower_bound,
-        )
-
-    torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start_time
-    print(f"\nFLA Execution time: {elapsed*1000/ITERATIONS:.2f} ms (average over {ITERATIONS} iterations)")
+    o_fla, final_states_fla = chunk_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=(A_log.clone() if use_gate_in_kernel else None),
+        dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
+        scale=scale,
+        initial_state=init_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+    )
 
     set_seed(42)
     q, q_rstd = l2norm_fwd(q)
