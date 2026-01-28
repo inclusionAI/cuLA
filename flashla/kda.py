@@ -4305,7 +4305,7 @@ def main():
     g_cute = from_dlpack(G)
     beta_cute = from_dlpack(beta_tensor)
     
-    o_cute = from_dlpack(torch.zeros_like(Q))
+    o_cute = from_dlpack(torch.empty_like(Q))
     
     # Create kernel instance
     attn_kernel = KDAChunkwise(

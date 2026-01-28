@@ -67,7 +67,7 @@ def flashkda_impl(q, k, v, g, beta, scale, B, S, H, D):
     g_cute = from_dlpack(g)
     beta_cute = from_dlpack(beta)
     
-    o = torch.zeros_like(q)
+    o = torch.empty_like(q)
     o_cute = from_dlpack(o)
 
     stream = cutlass_torch.default_stream()
