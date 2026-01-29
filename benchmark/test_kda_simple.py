@@ -185,6 +185,66 @@ def analyze_8x8_blocks(o_pred, o_ref, name=""):
     print(f"  Max elem rel error across blocks: {max_elem_rel_errors.max():.2f}%")
     print(f"{'='*80}\n")
 
+def test_performance():
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+    set_seed(SEED)
+
+    seq_lens = [T] * B
+    num_seqs = len(seq_lens) # TODO: support varlen
+    assert num_seqs == B
+
+    # FIXME: support safe_gate=True
+    use_gate_in_kernel = False
+    safe_gate = False
+    output_final_state = False
+
+    scale = D ** (-0.5)
+    q = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
+    k = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
+    v = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
+    g = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
+    beta = torch.randn(B, T, H, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
+    # cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64, device=device)
+    # init_state = torch.randn(B, H, D, D, dtype=torch.float, device=device)
+    init_state = None
+    cu_seqlens = None
+
+    if use_gate_in_kernel:
+      A_log = torch.randn(H, dtype=torch.float)
+      dt_bias = torch.randn(H * D, dtype=torch.float)
+      A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(False), (A_log, dt_bias))
+    else:
+      g = F.logsigmoid(g)
+
+    if safe_gate:
+        from fla.ops.kda.gate import naive_kda_lowerbound_gate
+        lower_bound = -5.0
+        if not use_gate_in_kernel:
+            g = g.clamp(-5, 0)
+        naive_kda_gate_fn = naive_kda_lowerbound_gate
+    else:
+        lower_bound = None
+        naive_kda_gate_fn = naive_kda_gate
+
+    o, final_states = flash_kda_prefill(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=(A_log.clone() if use_gate_in_kernel else None),
+        dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
+        scale=scale,
+        initial_state=init_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+    )
+
 def test_accuracy():
     dtype = torch.bfloat16
     device = torch.device("cuda")

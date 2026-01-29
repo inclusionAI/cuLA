@@ -365,6 +365,7 @@ class KDAChunkwise:
         beta_iter: cute.Pointer,  # NEW: beta tensor [B, S, H]
         problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B, S, H, D)
         stream: cuda.CUstream,
+        options=None, # compile options
     ):
         """
         Execute the Chunkwise KDA operation on the provided tensors.

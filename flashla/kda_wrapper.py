@@ -27,6 +27,7 @@ from flashla.kda import KDAChunkwise
 
 # Global kernel cache
 compiled_kernel = None
+COMPILE_OPTIONS = "--generate-line-info --ptxas-options '--verbose'"
 
 def chunk_kda_fwd(
     q: torch.Tensor,
@@ -293,6 +294,7 @@ class ChunkKDAFunction(torch.autograd.Function):
                 beta_cute.iterator,
                 (B, S, H, D),
                 stream,
+                options=COMPILE_OPTIONS,
             )
 
         compiled_kernel(
@@ -304,6 +306,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             beta_cute.iterator,
             (B, S, H, D),
             stream,
+            options=COMPILE_OPTIONS,
         )
 
         if use_gate_in_kernel:
