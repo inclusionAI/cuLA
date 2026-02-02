@@ -26,7 +26,7 @@ from cutlass.cute.runtime import from_dlpack
 from flashla.kda import KDAChunkwise
 
 # Global kernel cache
-compiled_kernel = None
+compiled_kernel_cache = {}
 COMPILE_OPTIONS = "--generate-line-info --ptxas-options '--verbose'"
 
 def chunk_kda_fwd(
@@ -222,7 +222,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         chunk_size = 64
         assert q.shape[-2] == v.shape[-2] == k.shape[-2], "Number of heads must be the same for q, k, v."
 
-        global compiled_kernel
+        global compiled_kernel_cache
     
         B, S, H, D = q.shape
         g_org = None
@@ -264,19 +264,24 @@ class ChunkKDAFunction(torch.autograd.Function):
             q, q_rstd = l2norm_fwd(q)
             k, k_rstd = l2norm_fwd(k)
 
-        q_cute = from_dlpack(q)
-        k_cute = from_dlpack(k)
-        v_cute = from_dlpack(v)
-        g_cute = from_dlpack(g)
-        beta_cute = from_dlpack(beta)
+        q_cute = from_dlpack(q.detach())
+        k_cute = from_dlpack(k.detach())
+        v_cute = from_dlpack(v.detach())
+        g_cute = from_dlpack(g.detach())
+        beta_cute = from_dlpack(beta.detach())
 
         # FIXME: support return final_states
         o = torch.empty_like(q)
-        o_cute = from_dlpack(o)
+        o_cute = from_dlpack(o.detach())
 
         stream = cutlass_torch.default_stream()
 
-        if compiled_kernel is None:
+        has_initial_state = initial_state is not None
+        cache_key = (has_initial_state, safe_gate, scale, chunk_size, D)
+
+        if cache_key in compiled_kernel_cache:
+            compiled_kernel = compiled_kernel_cache[cache_key]
+        else:
             attn_kernel = KDAChunkwise(
                 chunk_size=chunk_size,
                 qk_acc_dtype=cutlass.Float32,
@@ -296,6 +301,7 @@ class ChunkKDAFunction(torch.autograd.Function):
                 stream,
                 options=COMPILE_OPTIONS,
             )
+            compiled_kernel_cache[cache_key] = compiled_kernel
 
         compiled_kernel(
             q_cute.iterator,
@@ -480,6 +486,7 @@ def flash_kda_prefill(
     assert q.shape == k.shape == g.shape, "q, k, g must have the same shape."
     assert beta.shape == q.shape[:3], "beta must be of shape (batch size, seq len, num of head)."
     assert v.shape == (*q.shape[:3], v.shape[-1]), "v must be of shape (batch size, seq len, num of head, head dim)."
+    assert q.dtype == k.dtype == v.dtype == torch.bfloat16, "q, k, v must be in bfloat16."
     if scale is None:
         scale = k.shape[-1] ** -0.5
     o, final_state = ChunkKDAFunction.apply(

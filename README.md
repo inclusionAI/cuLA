@@ -61,6 +61,20 @@ WIP
 
 ## Performance and benchmarks
 
+Benchmarks for KDA (Kimi Delta Attention)
+
+```bash
+python benchmark/bench_kda.py
+```
+
+## Tests
+
+[WIP] Tests for KDA (Kimi Delta Attention)
+
+```bash
+pytest tests/test_kda.py::test_safe_gate_chunk
+```
+
 ## Mathematical background (brief)
 
 Linear attention rewrites the attention kernel using a feature map $\phi$:

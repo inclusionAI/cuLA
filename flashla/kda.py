@@ -2777,7 +2777,7 @@ class KDAChunkwise:
         kv_f32 = flat
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"kv_f32: {kv_f32}")
-        for i in cutlass.range_constexpr(Constant.D):
+        for i in cutlass.range(0, Constant.D, unroll_full=True):
             kv_f32[i] = kv_f32[i] * sG_last[i]
         return kv_f32
 
