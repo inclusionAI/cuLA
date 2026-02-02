@@ -183,7 +183,7 @@ class KDAChunkwise:
         self.epilogue_warp_id = 10
         # NOTE: setmaxnreg is a warpgroup-wide instruction, so we force thread number to be multiply of warpgroup
         # https://docs.nvidia.com/cuda/parallel-thread-execution/#miscellaneous-instructions-setmaxnreg
-        self.empty_warp_id = 11
+        self.load_beta_warp_id = 11
 
         self.threads_per_warp = 32
         self.cuda_core_threads = self.threads_per_warp * (
@@ -199,7 +199,7 @@ class KDAChunkwise:
                 self.mma_warp_id,
                 self.load_warp_id,
                 self.epilogue_warp_id,
-                self.empty_warp_id,
+                self.load_beta_warp_id,
             )
         )
 
@@ -786,6 +786,7 @@ class KDAChunkwise:
             pseudo_v_mbar_ptr: cute.struct.MemRange[Int64, self.v_stage * 2] # type: ignore
             end_v_mbar_ptr: cute.struct.MemRange[Int64, self.v_stage * 2] # type: ignore
             load_g_mbar_ptr: cute.struct.MemRange[Int64, self.g_stage * 2] # type: ignore  # NEW for KDA
+            load_beta_mbar_ptr: cute.struct.MemRange[Int64, self.beta_stage * 2] # type: ignore
             # KDA gating sync: CUDA warp notifies MMA warp that Q'/K' are ready
             kda_gate_mbar_ptr: cute.struct.MemRange[Int64, self.q_stage * 2] # type: ignore  # NEW for KDA
             # Masking
@@ -1041,6 +1042,14 @@ class KDAChunkwise:
             ),
             tx_count=self.tma_copy_g_bytes,
             barrier_storage=storage.load_g_mbar_ptr.data_ptr(),
+        ).make_participants()
+        load_beta_producer, load_beta_consumer = pipeline.PipelineAsync.create(
+            num_stages=self.beta_stage,
+            producer_group=make_thread_cooperative_group(self.threads_per_warp * len([self.load_beta_warp_id])),
+            consumer_group=make_thread_cooperative_group(
+                self.threads_per_warp * (len(self.cuda_warp_ids) + len(self.cuda_subchunk_warp_ids))
+            ),
+            barrier_storage=storage.load_beta_mbar_ptr.data_ptr(),
         ).make_participants()
         mma_s0_producer, mma_s0_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=self.acc_stage,
@@ -2181,17 +2190,6 @@ class KDAChunkwise:
                 # KDA Prologue: Load g, Q, K from SMEM to RMEM for elementwise
                 # ============================================================
 
-                # Load beta into smem
-                s_idx = idx * C
-                beta_chunk = beta[(None, (hidx, bidx))]
-                beta_chunk_layout = cute.make_layout((C, 1), stride=(H, 0))
-                beta_chunk = cute.make_tensor(beta_chunk.iterator + s_idx*H, layout=beta_chunk_layout)
-
-                if cutlass.const_expr(PRINT_DEBUG):
-                    print(f"sBeta: {sBeta}")
-                    print(f"beta_chunk: {beta_chunk}")
-                if local_tidx < Constant.C:
-                    sBeta[local_tidx, 0] = beta_chunk[local_tidx, 0]
                 self.cuda_wg_sync_barrier.arrive_and_wait()
 
                 # Load g (g_cumsum) - NEW for KDA Step 1
@@ -2361,6 +2359,7 @@ class KDAChunkwise:
                 mma_kk_handle.release()
 
                 # Inplace modify tTR_rKK to M matrix
+                beta_handle = load_beta_consumer.wait_and_advance()
                 # step1: M = I + StrictTril(beta*KK^T), save M in smem
                 # TODO: drop assignment for tTR_rKK
                 self.apply_M_transform(tTR_rKK, sBeta, tTR_cMask, tTR_rKK_f16)
@@ -2401,6 +2400,8 @@ class KDAChunkwise:
 
                 # Notify end of smem_kk
                 smem_kk_handle.commit()
+                # release Beta
+                beta_handle.release()
 
                 # TODO: LOAD V via S2R, need to have the same tv-layout as TMEM, since we need to perform a elementwise reduce here.
                 # Need to make it (128,64) and row-major
@@ -2686,6 +2687,7 @@ class KDAChunkwise:
                 g_handle = load_g_consumer.wait_and_advance()
                 q_handle = load_q_consumer.wait_and_advance()
                 k_handle = load_k_consumer.wait_and_advance()
+                beta_handle = load_beta_consumer.wait_and_advance()
                 # subchunk computation
 
                 # QK/KK epilogue mask
@@ -2697,6 +2699,7 @@ class KDAChunkwise:
                 # inverse KK
 
                 # release Beta
+                beta_handle.release()
                 # self.cuda_subchunk_wg_sync_barrier.arrive_and_wait()
 
         elif warp_idx == self.epilogue_warp_id:
@@ -2736,8 +2739,27 @@ class KDAChunkwise:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
                 smem_o_handle.release()
         
-        elif warp_idx == self.empty_warp_id:
+        elif warp_idx == self.load_beta_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
+            local_tidx = tidx % (self.threads_per_warp * len([self.load_beta_warp_id]))
+            for chunk_start in cutlass.range(0, S, C, unroll=0):
+                idx = chunk_start // C
+                # Load beta into smem
+                beta_handle = load_beta_producer.acquire_and_advance()
+
+                s_idx = idx * C
+                beta_chunk = beta[(None, (hidx, bidx))]
+                beta_chunk_layout = cute.make_layout((C, 1), stride=(H, 0))
+                beta_chunk = cute.make_tensor(beta_chunk.iterator + s_idx*H, layout=beta_chunk_layout)
+
+                if cutlass.const_expr(PRINT_DEBUG):
+                    print(f"sBeta: {sBeta}")
+                    print(f"beta_chunk: {beta_chunk}")
+                # FIXME: update with the valid length for the last block
+                for data_idx in cutlass.range(local_tidx, Constant.C, self.threads_per_warp):
+                    sBeta[data_idx, 0] = beta_chunk[data_idx, 0]
+
+                beta_handle.commit()
 
         # Release tensor memory allocation lock
         tmem.relinquish_alloc_permit()
