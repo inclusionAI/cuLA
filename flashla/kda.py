@@ -128,9 +128,9 @@ class KDAChunkwise:
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         scale: cutlass.Float32 = 1.0,
-        num_regs_mma: int = 64,  # Optimized: best config from comprehensive sweep
         num_regs_cuda: int = 248,  # Critical: 248 provides 39% speedup over 160
-        num_regs_epilogue_warps: int = 24,
+        num_regs_subchunk: int = 192,
+        num_regs_others: int = 64,  # Optimized: best config from comprehensive sweep
     ):
         # make scale a constant
         self.scale = scale
@@ -146,14 +146,11 @@ class KDAChunkwise:
         self.beta_dtype = cutlass.Float32
 
         # Register allocation configuration
-        self.num_regs_mma = num_regs_mma
         self.num_regs_cuda = num_regs_cuda
-        self.num_regs_epilogue_warps = num_regs_epilogue_warps
+        self.num_regs_subchunk = num_regs_subchunk
+        # Reg count for load, MMA, epilogue and empty warp, maybe tuned
+        self.num_regs_others = num_regs_others
 
-        # Warp specialization
-        self.num_load_warps = 1
-        self.num_compute_warps = 4
-        self.num_correction_warps = 4
         self.threads_per_warp = 32
 
         # MMA tile shapes
@@ -180,21 +177,29 @@ class KDAChunkwise:
         self.cluster_shape_mnk = (1, 1, 1)
         # For masking & decay.
         self.cuda_warp_ids = (0, 1, 2, 3)
-        self.mma_warp_id = 4
-        self.load_warp_id = 5
-        self.epilogue_warp_id = 6
-        # self.empty_warp_id = 7
+        self.cuda_subchunk_warp_ids = (4, 5, 6, 7)
+        self.mma_warp_id = 8
+        self.load_warp_id = 9
+        self.epilogue_warp_id = 10
+        # NOTE: setmaxnreg is a warpgroup-wide instruction, so we force thread number to be multiply of warpgroup
+        # https://docs.nvidia.com/cuda/parallel-thread-execution/#miscellaneous-instructions-setmaxnreg
+        self.empty_warp_id = 11
 
         self.threads_per_warp = 32
         self.cuda_core_threads = self.threads_per_warp * (
             len(self.cuda_warp_ids)
         )
+        self.cuda_core_subchunk_threads = self.threads_per_warp * (
+            len(self.cuda_subchunk_warp_ids)
+        )
         self.threads_per_cta = self.threads_per_warp * len(
             (
                 *self.cuda_warp_ids,
+                *self.cuda_subchunk_warp_ids,
                 self.mma_warp_id,
                 self.load_warp_id,
                 self.epilogue_warp_id,
+                self.empty_warp_id,
             )
         )
 
@@ -381,6 +386,7 @@ class KDAChunkwise:
             beta_iter: Beta tensor [B, S, H] - NEW for KDA, scaling factor for K and V
             problem_size: (B, S, H, D) problem dimensions
             stream: CUDA stream
+            options: compile options for the kernel
         """
         B,S,H,D = problem_size
 
@@ -1542,7 +1548,7 @@ class KDAChunkwise:
         # LOAD WARP
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.load_warp_id:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_cuda)
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
             # ((ATOM_V, REST_V), INPUT_STAGE)
             # ((ATOM_V, REST_V), TILES_N, TILES_K)
@@ -1646,7 +1652,7 @@ class KDAChunkwise:
         # COMPUTE WARPS
         # ///////////////////////////////////////////////////////////////////////////////
         elif warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_mma)
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
             should_debug = PRINT_DEBUG and tidx == warp_idx * 32 and hidx == 0 and bidx == 0
             should_debug_f = ENABLE_MMA_WARP_PRINT and tidx == warp_idx * 32 and hidx == 0 and bidx == 0
@@ -2242,6 +2248,12 @@ class KDAChunkwise:
                 # K_intra = K * exp(-g)  (for intra-chunk: Q' K''^T computation)
                 # ============================================================
                 
+                # TODO: subchunk pipeline v1
+                # 1. g'=exp(g), store in reg
+                # 2. g'*Q, write to sQ_K_scaled
+                # 3. wait for QS finish, g'*K, write to sQ_K_scaled
+                # 3. wait for KS finish, exp(g_last-g)*K, write to sQ_K_scaled
+
                 # Load g, Q, K values and compute gated values
                 # TODO: reorder to reduce register peak
                 g_val = tRS_rG.load()  # BF16 tensor
@@ -2665,9 +2677,30 @@ class KDAChunkwise:
                 # Finally let us release v.
                 v_handle.release()
 
+        # CUDA core warps for subchunk computation
+        elif warp_idx in self.cuda_subchunk_warp_ids:
+            cute.arch.warpgroup_reg_alloc(self.num_regs_subchunk)
+            for chunk_start in cutlass.range(0, S, C, unroll=0):
+                idx = chunk_start // C
+                # wait for Q, K, G, Beta load
+                g_handle = load_g_consumer.wait_and_advance()
+                q_handle = load_q_consumer.wait_and_advance()
+                k_handle = load_k_consumer.wait_and_advance()
+                # subchunk computation
+
+                # QK/KK epilogue mask
+
+                # QK is ready to consume
+
+                # release Q, K, G
+
+                # inverse KK
+
+                # release Beta
+                # self.cuda_subchunk_wg_sync_barrier.arrive_and_wait()
 
         elif warp_idx == self.epilogue_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_epilogue_warps)
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
             should_debug = PRINT_DEBUG and tidx == warp_idx*32 and hidx == 0 and bidx == 0
             # TMA STORE
@@ -2691,7 +2724,7 @@ class KDAChunkwise:
                 print(f"bSG_sO: {bSG_sO}")
                 print(f"bSG_gO_partitioned: {bSG_gO}")
 
-            # TMA LOAD
+            # TMA STORE
             for chunk_start in cutlass.range(0, S, C, unroll=0):
                 idx = chunk_start // C
 
@@ -2702,6 +2735,9 @@ class KDAChunkwise:
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
                 smem_o_handle.release()
+        
+        elif warp_idx == self.empty_warp_id:
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
         # Release tensor memory allocation lock
         tmem.relinquish_alloc_permit()

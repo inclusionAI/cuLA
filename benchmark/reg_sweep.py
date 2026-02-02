@@ -56,9 +56,8 @@ def test_config(mma_regs, cuda_regs, q, k, v, g, beta, scale):
             kv_acc_dtype=cutlass.Float32,
             io_dtype=cutlass.BFloat16,
             scale=scale,
-            num_regs_mma=mma_regs,
             num_regs_cuda=cuda_regs,
-            num_regs_epilogue_warps=24,
+            num_regs_others=mma_regs,
         )
         
         # Compile

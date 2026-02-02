@@ -13,3 +13,6 @@ compile_commands.json
 debug.log
 deprecated
 
+*.log
+*.ncu-rep
+
