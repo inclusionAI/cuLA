@@ -95,8 +95,10 @@ class Constant:
     WARP_SIZE = 32
     MAX_TMEM_COLS_SM100 = 512
     C = 64   # chunk size
+    SC = 16  # subchunk size
     D = 128  # head dim
     SCALE = float(D) ** -0.5
+    BK_SC = 32 # tile size in subchunk MMA
 
 class MaskEnum:
     """Enumeration for different mask types."""
@@ -128,14 +130,17 @@ class KDAChunkwise:
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         scale: cutlass.Float32 = 1.0,
+        safe_gate: bool = False,
         num_regs_cuda: int = 248,  # Critical: 248 provides 39% speedup over 160
         num_regs_subchunk: int = 192,
         num_regs_others: int = 64,  # Optimized: best config from comprehensive sweep
     ):
         # make scale a constant
         self.scale = scale
+        self.safe_gate = safe_gate
 
         self.chunk_size = chunk_size
+        self.subchunk_size = 16
         self.qk_acc_dtype = qk_acc_dtype
         self.kv_acc_dtype = kv_acc_dtype
         self.pv_acc_dtype = kv_acc_dtype
@@ -172,6 +177,12 @@ class KDAChunkwise:
         # Q now as operand B
         self.sq_mma_tiler = (D, C, D)  # (M, N, K)
         self.ks_mma_tiler = (D, C, D)  # (M, N, K)
+
+        # subchunk MMA
+        SC, BK_SC = (Constant.SC, Constant.BK_SC)
+        self.qk_kk_subchunk_mma_tiler = (SC, SC, BK_SC) # (M, N, K)
+        self.NK_SC = D // BK_SC # number of iterations for MMA K dimension
+        assert self.NK_SC == 4 # FIXME: try smaller NK due to enough registers?
 
         # one-cta cluster shape
         self.cluster_shape_mnk = (1, 1, 1)
@@ -216,6 +227,11 @@ class KDAChunkwise:
         self.mma_sync_barrier = pipeline.NamedBarrier(
             barrier_id=4,
             num_threads=32 * len([self.mma_warp_id]),
+        )
+
+        self.cuda_subchunk_wg_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=5,
+            num_threads=self.cuda_core_subchunk_threads,
         )
 
         self.buffer_align_bytes = 1024
@@ -333,6 +349,7 @@ class KDAChunkwise:
         self.o_stage = 2
         self.g_stage = 2  # Single stage for g (CUDA warp processes immediately)
         self.beta_stage = 1 # TODO: two stage ?
+        self.q_k_scaled_stage = 1 # only single stage here due to smem limitation
 
         self.epi_stage = 2
         self.acc_stage = 2
@@ -583,6 +600,12 @@ class KDAChunkwise:
             self.q_dtype,
             self.q_stage,
         )
+        q_k_scaled_smem_layout = sm100_utils.make_smem_layout_a(
+            qk_tiled_mma,
+            self.qk_mma_tiler,
+            self.q_dtype,
+            self.q_k_scaled_stage,
+        )
         k_smem_layout_staged = sm100_utils.make_smem_layout_b(
             qk_tiled_mma,
             self.qk_mma_tiler,
@@ -787,6 +810,7 @@ class KDAChunkwise:
             end_v_mbar_ptr: cute.struct.MemRange[Int64, self.v_stage * 2] # type: ignore
             load_g_mbar_ptr: cute.struct.MemRange[Int64, self.g_stage * 2] # type: ignore  # NEW for KDA
             load_beta_mbar_ptr: cute.struct.MemRange[Int64, self.beta_stage * 2] # type: ignore
+            load_q_k_scaled_mbar_ptr: cute.struct.MemRange[Int64, self.q_k_scaled_stage * 2] # type: ignore
             # KDA gating sync: CUDA warp notifies MMA warp that Q'/K' are ready
             kda_gate_mbar_ptr: cute.struct.MemRange[Int64, self.q_stage * 2] # type: ignore  # NEW for KDA
             # Masking
@@ -820,6 +844,11 @@ class KDAChunkwise:
             ]
             sV: cute.struct.Align[
                 cute.struct.MemRange[self.v_dtype, cute.cosize(v_smem_layout_staged)], # type: ignore
+                self.buffer_align_bytes,
+            ]
+            # Store the exp scaled Q/K for MMA
+            sQ_K_scaled: cute.struct.Align[
+                cute.struct.MemRange[self.q_dtype, cute.cosize(q_k_scaled_smem_layout)], # type: ignore
                 self.buffer_align_bytes,
             ]
             # G (gate) - NEW for KDA
@@ -969,7 +998,9 @@ class KDAChunkwise:
         load_q_producer, load_q_consumer = pipeline.PipelineTmaAsync.create(
             num_stages=self.q_stage,
             producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len(self.cuda_warp_ids)),  # CUDA cores will consume
+            consumer_group=make_thread_cooperative_group(len(
+                [*self.cuda_warp_ids, *self.cuda_subchunk_warp_ids])
+            ),  # CUDA cores will consume
             tx_count=self.tma_copy_q_bytes,
             barrier_storage=storage.load_q_mbar_ptr.data_ptr(),
         ).make_participants()
@@ -982,7 +1013,9 @@ class KDAChunkwise:
         load_k_producer, load_k_consumer = pipeline.PipelineTmaAsync.create(
             num_stages=self.k_stage,
             producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len(self.cuda_warp_ids)),  # CUDA cores will consume
+            consumer_group=make_thread_cooperative_group(len(
+                [*self.cuda_warp_ids, *self.cuda_subchunk_warp_ids])
+            ),  # CUDA cores will consume
             tx_count=self.tma_copy_k_bytes,
             barrier_storage=storage.load_k_mbar_ptr.data_ptr(),
         ).make_participants()
@@ -1037,9 +1070,9 @@ class KDAChunkwise:
             num_stages=self.g_stage,
             producer_group=make_thread_cooperative_group(
                 len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(
-                len(self.cuda_warp_ids)  # CUDA cores will consume
-            ),
+            consumer_group=make_thread_cooperative_group(len(
+                [*self.cuda_warp_ids, *self.cuda_subchunk_warp_ids])
+            ),  # CUDA cores will consume
             tx_count=self.tma_copy_g_bytes,
             barrier_storage=storage.load_g_mbar_ptr.data_ptr(),
         ).make_participants()
@@ -1051,6 +1084,18 @@ class KDAChunkwise:
             ),
             barrier_storage=storage.load_beta_mbar_ptr.data_ptr(),
         ).make_participants()
+        # for Q/K prologue and Q@S, K@S, K^T@NewV MMA
+        load_q_k_scaled_producer, load_q_k_scaled_consumer = pipeline.PipelineAsyncUmma.create(
+            num_stages=self.q_k_scaled_stage,
+            producer_group=make_thread_cooperative_group(
+                self.threads_per_warp * len(self.cuda_warp_ids)
+            ),
+            consumer_group=make_thread_cooperative_group(
+                len([self.mma_warp_id])
+            ),
+            barrier_storage=storage.load_q_k_scaled_mbar_ptr.data_ptr(),
+        ).make_participants()
+
         mma_s0_producer, mma_s0_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=self.acc_stage,
             producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
@@ -1281,6 +1326,11 @@ class KDAChunkwise:
         sM = storage.sM.get_tensor(
             m_smem_layout_staged.outer, swizzle=m_smem_layout_staged.inner
         )
+        # ROW MAJOR
+        sM_flat_layout = cute.make_layout((64, 64, self.k_stage), stride=(64,1,4096))
+        sM_flat = storage.sM.get_tensor(
+            sM_flat_layout, swizzle=m_smem_layout_staged.inner,
+        )
         sM_opB = storage.sM.get_tensor(
             p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner
         )
@@ -1362,6 +1412,20 @@ class KDAChunkwise:
         )
         sQ_flat = storage.sQ.get_tensor(
             q_smem_layout_coalesce.outer, swizzle=q_smem_layout_coalesce.inner
+        )
+
+        q_k_scaled_layout_epi = sm100_utils.make_smem_layout_epi(
+            self.q_dtype,
+            utils.LayoutEnum.ROW_MAJOR,
+            (Constant.C, Constant.D),
+            self.q_k_scaled_stage,
+        )
+        q_k_scaled_smem_layout_coalesce = cute.coalesce(
+            q_k_scaled_layout_epi,
+            target_profile=(1, 1, 1),
+        )
+        sQ_K_scaled_flat = storage.sQ_K_scaled.get_tensor(
+           q_k_scaled_smem_layout_coalesce.outer, swizzle=q_k_scaled_smem_layout_coalesce.inner
         )
         
         k_smem_layout_epi = sm100_utils.make_smem_layout_epi(
@@ -1665,197 +1729,234 @@ class KDAChunkwise:
 
             should_debug = PRINT_DEBUG and tidx == warp_idx * 32 and hidx == 0 and bidx == 0
             should_debug_f = ENABLE_MMA_WARP_PRINT and tidx == warp_idx * 32 and hidx == 0 and bidx == 0
+            
+            if False and cutlass.const_expr(self.safe_gate):
+                for chunk_start in cutlass.range(0, S, C, unroll=0):
+                    idx = chunk_start // C
 
-            for chunk_start in cutlass.range(0, S, C, unroll=0):
-                idx = chunk_start // C
+                    if idx != 0:
+                        # wait for sQ_K_scaled ready
+                        q_k_scaled_handle = load_q_k_scaled_consumer.wait_and_advance()
 
-                k_handle = load_k2_consumer.wait_and_advance()
-                kt_handle = load_kt2_consumer.wait_and_advance()
-                mma_kk_handle = mma_kk_producer.acquire_and_advance()
+                        # launch Q@S MMA
+                        o_inter_handle = o_inter_producer.acquire_and_advance()
 
-                if should_debug:
-                    cute.printf("chunk idx={}, got k2 consumer={}", idx, k_handle.index)
-                    cute.printf("chunk idx={}, got kt2 consumer={}", idx, kt_handle.index)
-                    cute.printf("chunk idx={}, got mma_kk producer={}", idx, mma_kk_handle.index)
+                        # Compute SQ once Qi is ready.
+                        sq_tiled_mma = self.exec_mma(
+                            tiled_mma=sq_tiled_mma,
+                            tCtAcc=tCtAccSQ,
+                            tCrA=tCrState,
+                            tCrB=tCrQ_sq,
+                            a_stage_idx=0,
+                            b_stage_idx=q_k_scaled_handle.index,
+                            acc_stage_idx=0,
+                        )
+                        o_inter_handle.commit()
+                        q_k_scaled_handle.release()
 
-                # GEMM KK
-                kk_tiled_mma = self.exec_mma(
-                    tiled_mma=kk_tiled_mma,
-                    tCtAcc=tCtAccKK,
-                    tCrA=tCrKG,
-                    tCrB=tCrKNegG,
-                    a_stage_idx=k_handle.index,
-                    b_stage_idx=kt_handle.index,
-                    acc_stage_idx=mma_kk_handle.index,
-                )
+                        # wait for sQ_K_scaled ready
 
-                # Commit KK
-                mma_kk_handle.commit()
-                # Wait for Qi (TMA load complete).
-                q_handle = load_q2_consumer.wait_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got q2 consumer={}", idx, q_handle.index)
+                        # launch K@S MMA
 
-                if idx != 0:
-                    # TODO: support initial state, should be trivial
-                    #############################################
-                    # HANDLE KS
-                    kv16_handle = kv16_consumer.wait_and_advance()
+                    # NewV=T@V'
+
+                    # O2=P@NewV
+
+                    # wait for sQ_K_scaled ready
+
+                    # launch S=K^T@NewV MMA
+
+            else:
+                for chunk_start in cutlass.range(0, S, C, unroll=0):
+                    idx = chunk_start // C
+
+                    k_handle = load_k2_consumer.wait_and_advance()
+                    kt_handle = load_kt2_consumer.wait_and_advance()
+                    mma_kk_handle = mma_kk_producer.acquire_and_advance()
+
                     if should_debug:
-                        cute.printf("chunk idx={}, got kv16 consumer={}", idx, kv16_handle.index)
-                    # Calculate MMA(State, Kg)
-                    # Produce KS, need to create a operand B style
-                    ks_handle = ks_producer.acquire_and_advance()
-                    if should_debug:
-                        cute.printf("chunk idx={}, got ks producer={}", idx, ks_handle.index)
-                    ks_tiled_mma = self.exec_mma(
-                        tiled_mma=ks_tiled_mma,
-                        # REUSE TMEM of PV
-                        tCtAcc=tCtAccKS,
-                        tCrA=tCrState_KS,
-                        # NOTE: S^T * K^T,  this is still k-major, its ok to reuse A-style K here
-                        tCrB=tCrK_KS,
-                        a_stage_idx=kv16_handle.index,
-                        b_stage_idx=k_handle.index,
-                        acc_stage_idx=ks_handle.index,
+                        cute.printf("chunk idx={}, got k2 consumer={}", idx, k_handle.index)
+                        cute.printf("chunk idx={}, got kt2 consumer={}", idx, kt_handle.index)
+                        cute.printf("chunk idx={}, got mma_kk producer={}", idx, mma_kk_handle.index)
+
+                    # GEMM KK
+                    kk_tiled_mma = self.exec_mma(
+                        tiled_mma=kk_tiled_mma,
+                        tCtAcc=tCtAccKK,
+                        tCrA=tCrKG,
+                        tCrB=tCrKNegG,
+                        a_stage_idx=k_handle.index,
+                        b_stage_idx=kt_handle.index,
+                        acc_stage_idx=mma_kk_handle.index,
                     )
-                    ks_handle.commit()
-                    if should_debug:
-                        cute.printf("chunk idx={}, committed ks={}", idx, ks_handle.index)
 
-                    #############################################
-                    # HANDLE QS
-                    o_inter_handle = o_inter_producer.acquire_and_advance()
+                    # Commit KK
+                    mma_kk_handle.commit()
+                    # Wait for Qi (TMA load complete).
+                    q_handle = load_q2_consumer.wait_and_advance()
                     if should_debug:
-                        cute.printf("chunk idx={}, got o_inter producer={}", idx, o_inter_handle.index)
+                        cute.printf("chunk idx={}, got q2 consumer={}", idx, q_handle.index)
 
-                    # Compute SQ once Qi is ready.
-                    sq_tiled_mma = self.exec_mma(
-                        tiled_mma=sq_tiled_mma,
-                        tCtAcc=tCtAccSQ,
-                        tCrA=tCrState,
-                        tCrB=tCrQ_sq,
-                        a_stage_idx=0,
-                        b_stage_idx=q_handle.index,
-                        acc_stage_idx=0,
-                    )
-                    o_inter_handle.commit()
-                    kv16_handle.release()
+                    if idx != 0:
+                        # TODO: support initial state, should be trivial
+                        #############################################
+                        # HANDLE KS
+                        kv16_handle = kv16_consumer.wait_and_advance()
+                        if should_debug:
+                            cute.printf("chunk idx={}, got kv16 consumer={}", idx, kv16_handle.index)
+                        # Calculate MMA(State, Kg)
+                        # Produce KS, need to create a operand B style
+                        ks_handle = ks_producer.acquire_and_advance()
+                        if should_debug:
+                            cute.printf("chunk idx={}, got ks producer={}", idx, ks_handle.index)
+                        ks_tiled_mma = self.exec_mma(
+                            tiled_mma=ks_tiled_mma,
+                            # REUSE TMEM of PV
+                            tCtAcc=tCtAccKS,
+                            tCrA=tCrState_KS,
+                            # NOTE: S^T * K^T,  this is still k-major, its ok to reuse A-style K here
+                            tCrB=tCrK_KS,
+                            a_stage_idx=kv16_handle.index,
+                            b_stage_idx=k_handle.index,
+                            acc_stage_idx=ks_handle.index,
+                        )
+                        ks_handle.commit()
+                        if should_debug:
+                            cute.printf("chunk idx={}, committed ks={}", idx, ks_handle.index)
+
+                        #############################################
+                        # HANDLE QS
+                        o_inter_handle = o_inter_producer.acquire_and_advance()
+                        if should_debug:
+                            cute.printf("chunk idx={}, got o_inter producer={}", idx, o_inter_handle.index)
+
+                        # Compute SQ once Qi is ready.
+                        sq_tiled_mma = self.exec_mma(
+                            tiled_mma=sq_tiled_mma,
+                            tCtAcc=tCtAccSQ,
+                            tCrA=tCrState,
+                            tCrB=tCrQ_sq,
+                            a_stage_idx=0,
+                            b_stage_idx=q_handle.index,
+                            acc_stage_idx=0,
+                        )
+                        o_inter_handle.commit()
+                        kv16_handle.release()
                 
-                # Acquire empty S0 buffer
-                s0_handle = mma_s0_producer.acquire_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got s0 producer={}", idx, s0_handle.index)
-                # GEMM
-                qk_tiled_mma = self.exec_mma(
-                    tiled_mma=qk_tiled_mma,
-                    tCtAcc=tCtAccQK,
-                    tCrA=tCrQ,
-                    tCrB=tCrK,
-                    a_stage_idx=q_handle.index,
-                    b_stage_idx=k_handle.index,
-                    acc_stage_idx=s0_handle.index,
-                )
-                # Release Q. 
-                q_handle.release()
-                # Release Kng = K*exp(-g) After QK and KK
-                kt_handle.release()
-                # Commit S = QK.
-                s0_handle.commit()
-                # End of GEMM (Qi, Ki) -> S0i
+                    # Acquire empty S0 buffer
+                    s0_handle = mma_s0_producer.acquire_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got s0 producer={}", idx, s0_handle.index)
+                    # GEMM
+                    qk_tiled_mma = self.exec_mma(
+                        tiled_mma=qk_tiled_mma,
+                        tCtAcc=tCtAccQK,
+                        tCrA=tCrQ,
+                        tCrB=tCrK,
+                        a_stage_idx=q_handle.index,
+                        b_stage_idx=k_handle.index,
+                        acc_stage_idx=s0_handle.index,
+                    )
+                    # Release Q. 
+                    q_handle.release()
+                    # Release Kng = K*exp(-g) After QK and KK
+                    kt_handle.release()
+                    # Commit S = QK.
+                    s0_handle.commit()
+                    # End of GEMM (Qi, Ki) -> S0i
 
-                #-------------------------------------------------------------
-                # PRODUCE PSEUDO_V HERE
-                kk_handle = smem_kk_consumer.wait_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got kk consumer={}", idx, kk_handle.index)
-                v2_handle = load_v2_consumer.wait_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got v2 consumer={}", idx, v2_handle.index)
-                pseudo_v_handle = pseudo_v_producer.acquire_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got pseudo_v producer={}", idx, pseudo_v_handle.index)
-                # Produce Pseudo V
-                mv_tiled_mma = self.exec_mma(
-                    tiled_mma=mv_tiled_mma,
-                    # Reuse TMEM and shape of PV
-                    tCtAcc=tCtAccMV,
-                    tCrA=tCrV_corr,
-                    tCrB=tCrM,
-                    a_stage_idx=v2_handle.index,
-                    b_stage_idx=kk_handle.index,
-                    acc_stage_idx=pseudo_v_handle.index,
-                )
+                    #-------------------------------------------------------------
+                    # PRODUCE PSEUDO_V HERE
+                    kk_handle = smem_kk_consumer.wait_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got kk consumer={}", idx, kk_handle.index)
+                    v2_handle = load_v2_consumer.wait_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got v2 consumer={}", idx, v2_handle.index)
+                    pseudo_v_handle = pseudo_v_producer.acquire_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got pseudo_v producer={}", idx, pseudo_v_handle.index)
+                    # Produce Pseudo V
+                    mv_tiled_mma = self.exec_mma(
+                        tiled_mma=mv_tiled_mma,
+                        # Reuse TMEM and shape of PV
+                        tCtAcc=tCtAccMV,
+                        tCrA=tCrV_corr,
+                        tCrB=tCrM,
+                        a_stage_idx=v2_handle.index,
+                        b_stage_idx=kk_handle.index,
+                        acc_stage_idx=pseudo_v_handle.index,
+                    )
 
-                v2_handle.release()
-                kk_handle.release()
-                pseudo_v_handle.commit()
+                    v2_handle.release()
+                    kk_handle.release()
+                    pseudo_v_handle.commit()
 
-                # Wait for PV, produce ointra
-                v3_handle = load_v3_consumer.wait_and_advance()
-                p_handle = p_consumer.wait_and_advance()
-                o_intra_handle = o_intra_producer.acquire_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got o_intra producer={}", idx, o_intra_handle.index)
-                # both v and p are in smem
+                    # Wait for PV, produce ointra
+                    v3_handle = load_v3_consumer.wait_and_advance()
+                    p_handle = p_consumer.wait_and_advance()
+                    o_intra_handle = o_intra_producer.acquire_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got o_intra producer={}", idx, o_intra_handle.index)
+                    # both v and p are in smem
 
-                # FIXME
-                self.mma_sync_barrier.arrive_and_wait()
-                if should_debug_f:
-                    cute.printf("sV_epi before PV mma:\n")
-                    cute.print_tensor(sV_epi[None, None, v3_handle.index])
-                self.mma_sync_barrier.arrive_and_wait()
-
-                vp_tiled_mma = self.exec_mma(
-                    tiled_mma=vp_tiled_mma,
-                    tCtAcc=tCtAccPV,
-                    tCrA=tCrV,
-                    tCrB=tCrP,
-                    a_stage_idx=v3_handle.index,
-                    b_stage_idx=p_handle.index,
-                    acc_stage_idx=o_intra_handle.index,
-                )
-                p_handle.release()
-                o_intra_handle.commit()
-
-                ##########################################################
-                # NOTE: Generate next state if you are not the last chunk
-                # TODO: need to support output final state, need to remove this predicate 
-                if idx != (S // C) - 1:
-                    kv_handle = kv_producer.acquire_and_advance()
-
+                    # FIXME
                     self.mma_sync_barrier.arrive_and_wait()
                     if should_debug_f:
-                        cute.printf("chunk idx={}, got kv producer={}", idx, kv_handle.index)
-                        cute.printf("sK_flat before state mma:\n")
-                        cute.print_tensor(sK_flat[None, None, k_handle.index])
-                        cute.printf("sV_epi before state mma:\n")
+                        cute.printf("sV_epi before PV mma:\n")
                         cute.print_tensor(sV_epi[None, None, v3_handle.index])
-                        cute.printf("Full sV_epi before state mma:\n")
-                        cute.print_tensor(sV_epi)
                     self.mma_sync_barrier.arrive_and_wait()
 
-                    # NOTE: Always ACC to avoid adding in cuda core.
-                    kv_tiled_mma = self.exec_mma(
-                        tiled_mma=kv_tiled_mma,
-                        tCtAcc=tCtAccKV,
+                    vp_tiled_mma = self.exec_mma(
+                        tiled_mma=vp_tiled_mma,
+                        tCtAcc=tCtAccPV,
                         tCrA=tCrV,
-                        # tCrB=tCrK,
-                        tCrB=tCrK_kv,
+                        tCrB=tCrP,
                         a_stage_idx=v3_handle.index,
-                        b_stage_idx=k_handle.index,
-                        acc_stage_idx=0,
-                        always_acc=True if idx != 0 else False, # always accumulate states
+                        b_stage_idx=p_handle.index,
+                        acc_stage_idx=o_intra_handle.index,
                     )
-                    # Release K V here
-                    kv_handle.commit()
+                    p_handle.release()
+                    o_intra_handle.commit()
 
-                # NOTE: Add a signal to notify the end of v consumption.
-                end_v_handle = end_v_producer.acquire_and_advance()
-                end_v_handle.commit()
+                    ##########################################################
+                    # NOTE: Generate next state if you are not the last chunk
+                    # TODO: need to support output final state, need to remove this predicate 
+                    if idx != (S // C) - 1:
+                        kv_handle = kv_producer.acquire_and_advance()
 
-                k_handle.release()
-                v3_handle.release()
+                        self.mma_sync_barrier.arrive_and_wait()
+                        if should_debug_f:
+                            cute.printf("chunk idx={}, got kv producer={}", idx, kv_handle.index)
+                            cute.printf("sK_flat before state mma:\n")
+                            cute.print_tensor(sK_flat[None, None, k_handle.index])
+                            cute.printf("sV_epi before state mma:\n")
+                            cute.print_tensor(sV_epi[None, None, v3_handle.index])
+                            cute.printf("Full sV_epi before state mma:\n")
+                            cute.print_tensor(sV_epi)
+                        self.mma_sync_barrier.arrive_and_wait()
+
+                        # NOTE: Always ACC to avoid adding in cuda core.
+                        kv_tiled_mma = self.exec_mma(
+                            tiled_mma=kv_tiled_mma,
+                            tCtAcc=tCtAccKV,
+                            tCrA=tCrV,
+                            # tCrB=tCrK,
+                            tCrB=tCrK_kv,
+                            a_stage_idx=v3_handle.index,
+                            b_stage_idx=k_handle.index,
+                            acc_stage_idx=0,
+                            always_acc=True if idx != 0 else False, # always accumulate states
+                        )
+                        # Release K V here
+                        kv_handle.commit()
+
+                    # NOTE: Add a signal to notify the end of v consumption.
+                    end_v_handle = end_v_producer.acquire_and_advance()
+                    end_v_handle.commit()
+
+                    k_handle.release()
+                    v3_handle.release()
 
         # ///////////////////////////////////////////////////////////////////////////////
         # CUDA CORE WARPS
@@ -2129,6 +2230,17 @@ class KDAChunkwise:
                 print(f"tRS_sQ: {tRS_sQ}")
                 print(f"tRS_rQ: {tRS_rQ}")
             #-------------------------------------------------------
+            # scaled Q/K partitions
+            (
+                tiled_s2r_q_k_scaled,
+                thr_s2r_q_k_scaled,
+                tRS_sQ_K_scaled, # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N, INPUT_STAGE)
+                tRS_rQ_K_scaled, # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
+            ) = self.make_s2r_partitions_prologue(
+                local_tidx,
+                sQ_K_scaled_flat,
+                shape_q,
+            )
 
             #-------------------------------------------------------
             # K s2r partitions - NEW for KDA elementwise processing
@@ -2182,525 +2294,791 @@ class KDAChunkwise:
             #     cute.print_tensor(sK_flat)
             # # # Note: add barrier here to make sure print make sense since we'll overwrite sG
             # self.cuda_wg_sync_barrier.arrive_and_wait()
+            if False and cutlass.const_expr(self.safe_gate):
+                # safe_gate version
+                for chunk_start in cutlass.range(0, S, C, unroll=0):
+                    idx = chunk_start // C
 
-            for chunk_start in cutlass.range(0, S, C, unroll=0):
-                idx = chunk_start // C
+                    # ============================================================
+                    # KDA cuda core logic
+                    # 1. prologue for Q/K with G: exp(g)*Q/K for Q@S, K@S, exp(g_last-g)*K for K^T@NewV
+                    # 2. element-wise operations: V'=V-KS, S=S*g_last, O=O1+O2
+                    # ============================================================
 
-                # ============================================================
-                # KDA Prologue: Load g, Q, K from SMEM to RMEM for elementwise
-                # ============================================================
+                    if idx != 0:
+                        # wait G
+                        g_handle = load_g_consumer.wait_and_advance()
+                        # load G in reg, g'=exp(g)
+                        g_stage_idx = g_handle.index
+                        cute.copy(tiled_s2r_g, tRS_sG[(None, None, None, g_stage_idx)], tRS_rG)
+                        # Fence for shared memory reads
+                        cute.arch.fence_proxy(
+                            cute.arch.ProxyKind.async_shared,
+                            space=cute.arch.SharedSpace.shared_cta,
+                        )
+                        g_val = tRS_rG.load()  # BF16 tensor
+                        g_f32 = g_val.to(cutlass.Float32)
+                        exp_g = cute.exp2(g_f32)
 
-                self.cuda_wg_sync_barrier.arrive_and_wait()
+                        # wait Q
+                        q_handle = load_q_consumer.wait_and_advance()
+                        # load Q, g'*Q
+                        q_stage_idx = q_handle.index
+                        cute.copy(tiled_s2r_q, tRS_sQ[(None, None, None, q_stage_idx)], tRS_rQ)
+                        # Fence for shared memory reads
+                        cute.arch.fence_proxy(
+                            cute.arch.ProxyKind.async_shared,
+                            space=cute.arch.SharedSpace.shared_cta,
+                        )
+                        q_val = tRS_rQ.load()  # BF16 tensor
+                        q_f32 = q_val.to(cutlass.Float32)
+                        q_gated = q_f32 * exp_g * self.scale
+                        q_gated_bf16 = q_gated.to(self.io_dtype)
+                        tRS_rQ.store(q_gated_bf16)
 
-                # Load g (g_cumsum) - NEW for KDA Step 1
-                g_handle = load_g_consumer.wait_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got g consumer={}", idx, g_handle.index)
+                        # write to sQ_K_scaled
+                        q_k_scaled_handle = load_q_k_scaled_producer.acquire_and_advance()
+                        cute.copy(tiled_s2r_q_k_scaled, tRS_rQ, tRS_sQ_K_scaled[(None, None, None, 0)])
+                        # notify Q@S MMA
+                        q_k_scaled_handle.commit()
+                        # release Q
+                        q_handle.release()
 
-                g_stage_idx = g_handle.index
-                cute.copy(tiled_s2r_g, tRS_sG[(None, None, None, g_stage_idx)], tRS_rG)
-                # Fence for shared memory reads
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
+                        # wait K
+                        k_handle = load_k_consumer.wait_and_advance()
+                        # load K, g'*K
+                        k_stage_idx = k_handle.index
+                        cute.copy(tiled_s2r_k, tRS_sK[(None, None, None, k_stage_idx)], tRS_rK)
+                        # Fence for shared memory reads
+                        cute.arch.fence_proxy(
+                            cute.arch.ProxyKind.async_shared,
+                            space=cute.arch.SharedSpace.shared_cta,
+                        )
 
-                self.cuda_wg_sync_barrier.arrive_and_wait()
-                if should_debug_f:
-                    cute.printf("sG, idx={}", idx)
-                    cute.print_tensor(sG_flat[None, None, g_stage_idx])
-                self.cuda_wg_sync_barrier.arrive_and_wait()
+                        # wait Q@S MMA
+                        o_inter_handle = o_inter_consumer.wait()
 
-                # Load Q from SMEM to RMEM for KDA elementwise processing
-                q_handle = load_q_consumer.wait_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got q consumer={}", idx, q_handle.index)
-                q_stage_idx = q_handle.index
-                cute.copy(tiled_s2r_q, tRS_sQ[(None, None, None, q_stage_idx)], tRS_rQ)
-                # Fence for shared memory reads
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
-                
-                # Load K from SMEM to RMEM for KDA elementwise processing
-                k_handle = load_k_consumer.wait_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got k consumer={}", idx, k_handle.index)
-                k_stage_idx = k_handle.index
-                cute.copy(tiled_s2r_k, tRS_sK[(None, None, None, k_stage_idx)], tRS_rK)
-                
-                # Fence for shared memory reads
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
+                        # write to sQ_K_scaled
 
-                q_handle.release()
-                k_handle.release()
-                
-                # ============================================================
-                # KDA Step 2: Compute exp(g) and apply to Q, K
-                # Q' = Q * exp(g)
-                # K_inter = K * exp(g)   (for inter-chunk: K'^T V -> state update)
-                # K_intra = K * exp(-g)  (for intra-chunk: Q' K''^T computation)
-                # ============================================================
-                
-                # TODO: subchunk pipeline v1
-                # 1. g'=exp(g), store in reg
-                # 2. g'*Q, write to sQ_K_scaled
-                # 3. wait for QS finish, g'*K, write to sQ_K_scaled
-                # 3. wait for KS finish, exp(g_last-g)*K, write to sQ_K_scaled
+                        # notify K@S MMA
 
-                # Load g, Q, K values and compute gated values
-                # TODO: reorder to reduce register peak
-                g_val = tRS_rG.load()  # BF16 tensor
-                q_val = tRS_rQ.load()  # BF16 tensor
-                k_val = tRS_rK.load()  # BF16 tensor
-                
-                # Convert to F32 for exp computation
-                g_f32 = g_val.to(cutlass.Float32) # assert dtype here
-                q_f32 = q_val.to(cutlass.Float32)
-                k_f32 = k_val.to(cutlass.Float32)
-                
-                exp_g = cute.exp2(g_f32)      # exp(g) for Q' and K_inter
-                exp_neg_g = cute.exp2(-g_f32)  # exp(-g) for K_intra
-                
-                # Apply gates with KDA beta scaling:
-                # Q' = Q * exp(g)
-                # TODO: compare perf of two different impl
-                q_gated = q_f32 * exp_g * self.scale
-                # K_inter = K * exp(g) - for inter-chunk KV state update (W matrix)
-                k_inter = k_f32 * exp_g
-                # K_intra = K * exp(-g) - for intra-chunk QK^T computation
-                k_intra = k_f32 * exp_neg_g
-                
-                # Convert back to BF16
-                q_gated_bf16 = q_gated.to(self.io_dtype)
-                k_inter_bf16 = k_inter.to(self.io_dtype)
-                k_intra_bf16 = k_intra.to(self.io_dtype)
-                
-                # Store gated values to RMEM tensors
-                tRS_rQ.store(q_gated_bf16)
-                tRS_rG_bf16.store(k_intra_bf16)  # K * exp(-g) for inter-chunk
-                tRS_rK.store(k_inter_bf16)        # K * exp(g) for intra-chunk
-                
-                # ============================================================
-                # KDA Step 3: Write gated Q', K_inter, K_intra back to SMEM
-                # - Q' = Q * exp(g) -> SMEM[Q]
-                # - K_inter = K * exp(g) -> SMEM[K]
-                # - K_intra = K * exp(-g) -> SMEM[G] (overwrite g)
-                # ============================================================
-                
-                # Make sure the read from sK and sG are completed.
-                self.cuda_wg_sync_barrier.arrive_and_wait()
-                
-                # TODO: check q2 & k2 stage equivalence
-                k2_handle = load_k2_producer.acquire_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got k2 producer={}", idx, k2_handle.index)
-                # Write K_inter = K * exp(g) to SMEM[K]
-                cute.copy(tiled_s2r_k, tRS_rK, tRS_sK[(None, None, None, k_stage_idx)])
-                # produce k * exp(g) for mma
-                k2_handle.commit()
-                
-                # Write K_intra = K * exp(-g) to SMEM[G] (overwrite g)
-                kt2_handle = load_kt2_producer.acquire_and_advance()
-                if should_debug_f:
-                    cute.printf("chunk idx={}, got kt2 producer={}, g_stage_idx={}", idx, kt2_handle.index, g_stage_idx)
-                # BUG FIX: use kt2_handle.index instead of g_stage_idx to ensure producer/consumer index match
-                cute.copy(tiled_s2r_g_bf16, tRS_rG_bf16, tRS_sG_bf16[(None, None, None, kt2_handle.index)])
-                # produce k^t * exp(-g) for mma
-                kt2_handle.commit()
-                
-                q2_handle = load_q2_producer.acquire_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got q2 producer={}", idx, q2_handle.index)
-                # Write Q' from RMEM to SMEM (same location as original Q)
-                cute.copy(tiled_s2r_q, tRS_rQ, tRS_sQ[(None, None, None, q_stage_idx)])
-                # produce q * exp(g) for mma
-                q2_handle.commit()
-                
-                # Fence for shared memory writes
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
+                    # write g_last to sG_last
 
-                if True or cutlass.const_expr(PRINT_DEBUG):
-                    self.cuda_wg_sync_barrier.arrive_and_wait()
-                    if should_debug_f:
-                        cute.printf("-------------------- sQ_flat: q * exp(g)")
-                        cute.print_tensor(sQ_flat[None, None, q_stage_idx])
-                        cute.printf("-------------------- k * exp(g)")
-                        # cute.print_tensor(sK_flat[63, None, k_stage_idx], verbose=True)
-                        cute.print_tensor(sK_flat[None, None, k_stage_idx])
-                        cute.printf("-------------------- k * exp(-g):")
-                        cute.print_tensor(sG_flat_bf16[None, None, g_stage_idx])
+                    # wait V
 
-                # ============================================================
-                # KDA End of Prologue
-                # ============================================================
+                    # load V to reg
+                    if idx != 0: 
+                        pass
+                        # wait K@S MMA
 
-                # ------------------------------------------------------------
-                # NOTE: Save exp(g) of last row to rG_last for state update in next chunk
-                rG_last = cutlass.Float32(0.0)
-                rG_last = exp_g[Constant.C - 1]
-                # NOTE: each thread save one element
-                sG_last[local_tidx, g_stage_idx] = rG_last
+                        # T2R K@S acc
 
-                mma_kk_handle = mma_kk_consumer.wait_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got mma_kk consumer={}", idx, mma_kk_handle.index)
+                        # V'=V-KS
 
-                cute.copy(tiled_t2r_KK, tTR_tKK[None, None, None, mma_kk_handle.index], tTR_rKK)
-                cute.arch.fence_view_async_tmem_load()
-                # GEMM KK done, can release
-                mma_kk_handle.release()
+                    # notify T@V' MMA
 
-                # Inplace modify tTR_rKK to M matrix
-                beta_handle = load_beta_consumer.wait_and_advance()
-                # step1: M = I + StrictTril(beta*KK^T), save M in smem
-                # TODO: drop assignment for tTR_rKK
-                self.apply_M_transform(tTR_rKK, sBeta, tTR_cMask, tTR_rKK_f16)
+                    # decay S, S=S*g_last
 
-                # STORE M as F16
-                smem_kk_handle = smem_kk_producer.acquire_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got smem_kk producer={}", idx, smem_kk_handle.index)
-                tRS_sKKi = tRS_sKK[(None, None, None, smem_kk_handle.index)]
-                cute.copy(tiled_r2s_KK, tRS_rKK, tRS_sKKi)
-                # Fence
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
+                    # load K, exp(g_last-g)*K
 
-                if cutlass.const_expr(PRINT_DEBUG):
-                    print(f"sM: {sM}")
-                    print(f"sM_f16: {sM_f16}")
+                    # write to sQ_K_scaled
 
-                curr_sM = sM[None, None, smem_kk_handle.index]
-                curr_sM_f16 = sM_f16[None, None, smem_kk_handle.index]
+                    # wait O2=P@NewV MMA, reuse TMEM of K@S
 
-                self.compute_matrix_inverse_64x64(curr_sM_f16)
+                    # notify K^T@NewV MMA
 
-                # S2R, scale with beta, convert to BF16, store back to smem `sM`
-                # TODO: make a repro for the cutedsl team
-                self.scale_M_inverse_with_beta(local_tidx, sBeta, curr_sM_f16, curr_sM)
+                    # release K
 
-                # Make sure the inverse is done.
-                if True or cutlass.const_expr(PRINT_DEBUG):
-                    self.cuda_wg_sync_barrier.arrive_and_wait()
-                    if should_debug_f:
-                        cute.printf("--------------- M after inverse and beta scale:")
-                        cute.print_tensor(curr_sM)
-                    # FIXME
+                    if idx != 0:
+                        o_inter_handle = o_inter_consumer.wait_and_advance()
+                        # T2R Q@S (O_inter)
+                        o_inter_handle.release()
+                        # O=O1+O2
+
+                        # notify epilogue O Store
+
+                    # wait K^T@NewV MMA
+
+            else:
+                for chunk_start in cutlass.range(0, S, C, unroll=0):
+                    idx = chunk_start // C
+
+                    # ============================================================
+                    # KDA Prologue: Load g, Q, K from SMEM to RMEM for elementwise
+                    # ============================================================
+
                     self.cuda_wg_sync_barrier.arrive_and_wait()
 
-                # Notify end of smem_kk
-                smem_kk_handle.commit()
-                # release Beta
-                beta_handle.release()
-
-                # TODO: LOAD V via S2R, need to have the same tv-layout as TMEM, since we need to perform a elementwise reduce here.
-                # Need to make it (128,64) and row-major
-                v_handle = load_v_consumer.wait_and_advance()
-
-                self.cuda_wg_sync_barrier.arrive_and_wait()
-                if should_debug_f:
-                    cute.printf("chunk idx={}, got v consumer={}, sV:", idx, v_handle.index)
-                    cute.print_tensor(sV_epi)
-                self.cuda_wg_sync_barrier.arrive_and_wait()
-
-                cute.copy(tiled_s2r_v, tRS_sV[(None, None, None, v_handle.index)], tRS_rV)
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
-
-                # TODO: copy KS from TMEM to RMEM, NOTE KS reuse TMEM of PV, since they have the same shapes
-                # TODO: check the layout equivalence, should be row-major
-                tTR_rAcc_ks = cute.make_tensor(tTR_rAcc_pv.iterator, layout=tRS_rV.layout)
-                if cutlass.const_expr(PRINT_DEBUG):
-                    print(f"FIXME tTR_rAcc_pv: {tTR_rAcc_pv}")
-                    print(f"FIXME tTR_rAcc_ks: {tTR_rAcc_ks}")
-                if idx != 0:
-                    # Wait for KS
-                    ks_handle = ks_consumer.wait_and_advance()
-
+                    # Load g (g_cumsum) - NEW for KDA Step 1
+                    g_handle = load_g_consumer.wait_and_advance()
                     if should_debug:
-                        cute.printf("chunk idx={}, got ks consumer={}", idx, ks_handle.index)
-                    # TODO: confirm pv capacity is enough
-                    # Load KS from TMEM to RMEM, (128,64)
-                    tTR_tAcc_ks_i = tTR_tAcc_base_pv[(None, None, None, 0, 0, ks_handle.index)] # KS HANDLE INDEX == 0
-                    cute.copy(tiled_copy_t2r_sq, tTR_tAcc_ks_i, tTR_rAcc_pv)
-                    cute.arch.fence_view_async_tmem_load()
+                        cute.printf("chunk idx={}, got g consumer={}", idx, g_handle.index)
 
-                    ks_handle.release()
-
-                    if should_debug_f:
-                        cute.printf("chunk idx={}, KS:", idx)
-                        cute.print_tensor(tTR_rAcc_pv)
-
-                # Perform addition and store to tmem for Vcorr^T * M^T
-                # TODO: now we just store V back to SMEM, in the future we could save them to TMEM to enable double stage of V
-                # Produce Vcorr = V - KS
-                v2_handle = load_v2_producer.acquire_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got v2 producer={}", idx, v2_handle.index)
-
-                if idx != 0:
-                    # First V could be kept no changes, since the initial state is None
-                    v_corrected = tRS_rV.load().to(cutlass.Float32)
-
-                    self.cuda_wg_sync_barrier.arrive_and_wait()
-                    if should_debug_f:
-                        cute.printf("chunk idx={}, V rmem chunk:", idx)
-                        cute.print_tensor(tRS_rV)
-                    self.cuda_wg_sync_barrier.arrive_and_wait()
-
-                    ks = tTR_rAcc_ks.load()
-                    v_corrected -= ks
-                    # Convert to BF16 and store v_corrected to SMEM
-                    tRS_rV.store(v_corrected.to(self.v_dtype))
-
-                    self.cuda_wg_sync_barrier.arrive_and_wait()
-                    if should_debug_f:
-                        cute.printf("chunk idx={}, V-KS rmem chunk:", idx)
-                        cute.print_tensor(tRS_rV)
-                    self.cuda_wg_sync_barrier.arrive_and_wait()
-
-                    # Store Vcorr back to SMEM
-                    cute.copy(tiled_s2r_v, tRS_rV, tRS_sV[(None, None, None, v_handle.index)])
+                    g_stage_idx = g_handle.index
+                    cute.copy(tiled_s2r_g, tRS_sG[(None, None, None, g_stage_idx)], tRS_rG)
+                    # Fence for shared memory reads
                     cute.arch.fence_proxy(
                         cute.arch.ProxyKind.async_shared,
                         space=cute.arch.SharedSpace.shared_cta,
                     )
-                # Commit Vcorr = V - KS to trigger M*Vcorr
-                v2_handle.commit()
 
-                # Let Kg = K * exp(g_cumsum)
-                # Let Kn = K * exp(-g_cumsum)
-                # Let Qg = Q * exp(g_cumsum)
-                # 
-                # Produce pseudo-V = M * (V - Kg * States)
-                # {Pseudo-V} ^ T = (V^T - State^T * Kg^T) * M^T
-                # Store Pseudo-V back to V-SMEM
-                pseudo_v_handle = pseudo_v_consumer.wait_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got pseudo_v consumer={}", idx, pseudo_v_handle.index)
+                    # Load Q from SMEM to RMEM for KDA elementwise processing
+                    q_handle = load_q_consumer.wait_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got q consumer={}", idx, q_handle.index)
+                    q_stage_idx = q_handle.index
+                    cute.copy(tiled_s2r_q, tRS_sQ[(None, None, None, q_stage_idx)], tRS_rQ)
+                    # Fence for shared memory reads
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
+                
+                    # Load K from SMEM to RMEM for KDA elementwise processing
+                    k_handle = load_k_consumer.wait_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got k consumer={}", idx, k_handle.index)
+                    k_stage_idx = k_handle.index
+                    cute.copy(tiled_s2r_k, tRS_sK[(None, None, None, k_stage_idx)], tRS_rK)
+                
+                    # Fence for shared memory reads
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
 
-                pseudo_v_stage_idx = pseudo_v_handle.index
-                # REUSE TMEM of PV, LOAD Pseudo-V from TMEM to RMEM
-                tTR_tAcc_pv_i = tTR_tAcc_base_pv[(None, None, None, 0, 0, pseudo_v_stage_idx)]
-                cute.copy(tiled_copy_t2r_pv, tTR_tAcc_pv_i, tTR_rAcc_pv)
-                cute.arch.fence_view_async_tmem_load()
-                pseudo_v_handle.release()
+                    q_handle.release()
+                    k_handle.release()
+                
+                    # ============================================================
+                    # KDA Step 2: Compute exp(g) and apply to Q, K
+                    # Q' = Q * exp(g)
+                    # K_inter = K * exp(g)   (for inter-chunk: K'^T V -> state update)
+                    # K_intra = K * exp(-g)  (for intra-chunk: Q' K''^T computation)
+                    # ============================================================
+                
+                    # TODO: subchunk pipeline v1
+                    # 1. g'=exp(g), store in reg
+                    # 2. g'*Q, write to sQ_K_scaled
+                    # 3. wait for QS finish, g'*K, write to sQ_K_scaled
+                    # 3. wait for KS finish, exp(g_last-g)*K, write to sQ_K_scaled
 
-                # Convert to V dtype
-                tTR_rPseudoV.store(tTR_rAcc_pv.load().to(self.v_dtype))
-
-                v3_handle = load_v3_producer.acquire_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got v3 producer={}", idx, v3_handle.index)
-
-                cute.copy(tiled_r2s_pseudo_v, tRS_rPseudoV, tRS_sPseudoV[(None, None, None, pseudo_v_stage_idx)])
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
-                v3_handle.commit()
-
-                if True or cutlass.const_expr(PRINT_DEBUG):
-                    self.cuda_wg_sync_barrier.arrive_and_wait()
-                    if should_debug_f:
-                        cute.printf("------------ begin pseudov dump, idx={}", idx)
-                        cute.print_tensor(sV_epi)
-                        cute.printf("------------ end pseudov dump")
+                    # Load g, Q, K values and compute gated values
+                    # TODO: reorder to reduce register peak
+                    g_val = tRS_rG.load()  # BF16 tensor
+                    q_val = tRS_rQ.load()  # BF16 tensor
+                    k_val = tRS_rK.load()  # BF16 tensor
+                
+                    # Convert to F32 for exp computation
+                    g_f32 = g_val.to(cutlass.Float32) # assert dtype here
+                    q_f32 = q_val.to(cutlass.Float32)
+                    k_f32 = k_val.to(cutlass.Float32)
+                
+                    exp_g = cute.exp2(g_f32)      # exp(g) for Q' and K_inter
+                    exp_neg_g = cute.exp2(-g_f32)  # exp(-g) for K_intra
+                
+                    # Apply gates with KDA beta scaling:
+                    # Q' = Q * exp(g)
+                    # TODO: compare perf of two different impl
+                    q_gated = q_f32 * exp_g * self.scale
+                    # K_inter = K * exp(g) - for inter-chunk KV state update (W matrix)
+                    k_inter = k_f32 * exp_g
+                    # K_intra = K * exp(-g) - for intra-chunk QK^T computation
+                    k_intra = k_f32 * exp_neg_g
+                
+                    # Convert back to BF16
+                    q_gated_bf16 = q_gated.to(self.io_dtype)
+                    k_inter_bf16 = k_inter.to(self.io_dtype)
+                    k_intra_bf16 = k_intra.to(self.io_dtype)
+                
+                    # Store gated values to RMEM tensors
+                    tRS_rQ.store(q_gated_bf16)
+                    tRS_rG_bf16.store(k_intra_bf16)  # K * exp(-g) for inter-chunk
+                    tRS_rK.store(k_inter_bf16)        # K * exp(g) for intra-chunk
+                
+                    # ============================================================
+                    # KDA Step 3: Write gated Q', K_inter, K_intra back to SMEM
+                    # - Q' = Q * exp(g) -> SMEM[Q]
+                    # - K_inter = K * exp(g) -> SMEM[K]
+                    # - K_intra = K * exp(-g) -> SMEM[G] (overwrite g)
+                    # ============================================================
+                
+                    # Make sure the read from sK and sG are completed.
                     self.cuda_wg_sync_barrier.arrive_and_wait()
                 
-                # Maintain of S:
-                # S_{t+1} = G_last*S_{t} + Kg^T* PseudoV
-                # 
-                # O_Inter = Qg * S
-                # O_Intra = Tril(Qg * Kn^T) * PseudoV
-                # O = O_Inter + O_Intra
+                    # TODO: check q2 & k2 stage equivalence
+                    # TODO: remove, only write to a seperate smem
+                    k2_handle = load_k2_producer.acquire_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got k2 producer={}", idx, k2_handle.index)
+                    # Write K_inter = K * exp(g) to SMEM[K]
+                    cute.copy(tiled_s2r_k, tRS_rK, tRS_sK[(None, None, None, k_stage_idx)])
+                    # produce k * exp(g) for mma
+                    k2_handle.commit()
+                
+                    # Write K_intra = K * exp(-g) to SMEM[G] (overwrite g)
+                    # TODO: remove
+                    kt2_handle = load_kt2_producer.acquire_and_advance()
+                    if should_debug_f:
+                        cute.printf("chunk idx={}, got kt2 producer={}, g_stage_idx={}", idx, kt2_handle.index, g_stage_idx)
+                    # BUG FIX: use kt2_handle.index instead of g_stage_idx to ensure producer/consumer index match
+                    cute.copy(tiled_s2r_g_bf16, tRS_rG_bf16, tRS_sG_bf16[(None, None, None, kt2_handle.index)])
+                    # produce k^t * exp(-g) for mma
+                    kt2_handle.commit()
+                
+                    q2_handle = load_q2_producer.acquire_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got q2 producer={}", idx, q2_handle.index)
+                    # Write Q' from RMEM to SMEM (same location as original Q)
+                    cute.copy(tiled_s2r_q, tRS_rQ, tRS_sQ[(None, None, None, q_stage_idx)])
+                    # produce q * exp(g) for mma
+                    q2_handle.commit()
+                
+                    # Fence for shared memory writes
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
 
-                # Wait for S = MMA(exp(g)*Q, (K*exp(-g))^T)
-                s0_handle = mma_s0_consumer.wait_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got s0 consumer={}", idx, s0_handle.index)
+                    if True or cutlass.const_expr(PRINT_DEBUG):
+                        self.cuda_wg_sync_barrier.arrive_and_wait()
+                        if should_debug_f:
+                            cute.printf("-------------------- sQ_flat: q * exp(g)")
+                            cute.print_tensor(sQ_flat[None, None, q_stage_idx])
+                            cute.printf("-------------------- k * exp(g)")
+                            # cute.print_tensor(sK_flat[63, None, k_stage_idx], verbose=True)
+                            cute.print_tensor(sK_flat[None, None, k_stage_idx])
+                            cute.printf("-------------------- k * exp(-g):")
+                            cute.print_tensor(sG_flat_bf16[None, None, g_stage_idx])
 
-                # NOTE: Only Allow next TMA Load for G after k^exp(-g) has been consumed by QK & KK
-                # TODO: This pipeline is too complex, we need to refactor it.
-                # TODO: We might need to introduce multiple cuda warpgroups to achieve better parallelism.
-                # TODO: G has been consumed in multiple places, need to track them carefully and use updated pipeline instances.
-                g_handle.release()
+                    # ============================================================
+                    # KDA End of Prologue
+                    # ============================================================
 
-                # (MMA, MMA_M, MMA_N, ACC_STAGE)
-                tTR_tSi = tTR_tS[None, None, None, s0_handle.index]
-                # Load S from TMEM to RMEM
-                cute.copy(tiled_t2r_S, tTR_tSi, tTR_rS)
-                cute.arch.fence_view_async_tmem_load()
+                    # ------------------------------------------------------------
+                    # NOTE: Save exp(g) of last row to rG_last for state update in next chunk
+                    rG_last = cutlass.Float32(0.0)
+                    rG_last = exp_g[Constant.C - 1]
+                    # NOTE: each thread save one element
+                    sG_last[local_tidx, g_stage_idx] = rG_last
 
-                # TODO: Apply strict causal mask and comput inverse of M
-                self.apply_mask(tTR_rS, tTR_cMask, tTR_rP, debug=False)
+                    mma_kk_handle = mma_kk_consumer.wait_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got mma_kk consumer={}", idx, mma_kk_handle.index)
 
-                # Write P to SMEM
-                p_handle = p_producer.acquire_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got p producer={}", idx, p_handle.index)
+                    cute.copy(tiled_t2r_KK, tTR_tKK[None, None, None, mma_kk_handle.index], tTR_rKK)
+                    cute.arch.fence_view_async_tmem_load()
+                    # GEMM KK done, can release
+                    mma_kk_handle.release()
 
-                # Store P from RMEM to SMEM
-                tRS_sPi = tRS_sP[(None, None, None, p_handle.index)]
-                cute.copy(tiled_r2s_P, tRS_rP, tRS_sPi)
-                # Fence
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
-                s0_handle.release()
-                p_handle.commit()
+                    # Inplace modify tTR_rKK to M matrix
+                    beta_handle = load_beta_consumer.wait_and_advance()
+                    # step1: M = I + StrictTril(beta*KK^T), save M in smem
+                    # TODO: drop assignment for tTR_rKK
+                    self.apply_M_transform(tTR_rKK, sBeta, tTR_cMask, tTR_rKK_f16)
 
-                if cutlass.const_expr(PRINT_DEBUG):
+                    # STORE M as F16
+                    smem_kk_handle = smem_kk_producer.acquire_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got smem_kk producer={}", idx, smem_kk_handle.index)
+                    tRS_sKKi = tRS_sKK[(None, None, None, smem_kk_handle.index)]
+                    cute.copy(tiled_r2s_KK, tRS_rKK, tRS_sKKi)
+                    # Fence
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
+
+                    if cutlass.const_expr(PRINT_DEBUG):
+                        print(f"sM: {sM}")
+                        print(f"sM_f16: {sM_f16}")
+
+                    curr_sM = sM[None, None, smem_kk_handle.index]
+                    curr_sM_f16 = sM_f16[None, None, smem_kk_handle.index]
+
+                    self.compute_matrix_inverse_64x64(curr_sM_f16)
+
+                    # S2R, scale with beta, convert to BF16, store back to smem `sM`
+                    # TODO: make a repro for the cutedsl team
+                    self.scale_M_inverse_with_beta(local_tidx, sBeta, curr_sM_f16, curr_sM)
+
+                    # Make sure the inverse is done.
+                    if True or cutlass.const_expr(PRINT_DEBUG):
+                        self.cuda_wg_sync_barrier.arrive_and_wait()
+                        if should_debug_f:
+                            cute.printf("--------------- M after inverse and beta scale:")
+                            cute.print_tensor(curr_sM)
+                        # FIXME
+                        self.cuda_wg_sync_barrier.arrive_and_wait()
+
+                    # Notify end of smem_kk
+                    smem_kk_handle.commit()
+                    # release Beta
+                    beta_handle.release()
+
+                    # TODO: LOAD V via S2R, need to have the same tv-layout as TMEM, since we need to perform a elementwise reduce here.
+                    # Need to make it (128,64) and row-major
+                    v_handle = load_v_consumer.wait_and_advance()
+
                     self.cuda_wg_sync_barrier.arrive_and_wait()
                     if should_debug_f:
-                        cute.printf("------- smem QK:")
-                        cute.print_tensor(sQK_flat)
-                        cute.printf("------- smem QK, last row:")
-                        cute.print_tensor(sQK_flat[63, None, None], verbose=True)
-
-                # Wait for O_INTRA
-                o_intra_handle = o_intra_consumer.wait_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got o_intra consumer={}", idx, o_intra_handle.index)
-                # Load O_INTRA from TMEM to RMEM
-                tTR_tAcc_pv_i = tTR_tAcc_base_pv[(None, None, None, 0, 0, o_intra_handle.index)]
-                cute.copy(tiled_copy_t2r_pv, tTR_tAcc_pv_i, tTR_rAcc_pv)
-                cute.arch.fence_view_async_tmem_load()
-                o_intra_handle.release()
-
-                # Wait for O_INTER
-                if idx != 0:
-                    o_inter_handle = o_inter_consumer.wait_and_advance()
-                    if should_debug:
-                        cute.printf("chunk idx={}, got o_inter consumer={}", idx, o_inter_handle.index)
-                    tTR_tAcc_sq_i = tTR_tAcc_base_sq[(None, None, None, 0, 0, o_inter_handle.index)]
-                    # Load O_INTER from TMEM to RMEM
-                    cute.copy(tiled_copy_t2r_sq, tTR_tAcc_sq_i, tTR_rAcc_sq)
-                    cute.arch.fence_view_async_tmem_load()
-                    o_inter_handle.release()
-
-                # Perform addition and store to gmem
-                acc_vec = tTR_rAcc_pv.load()
-                if idx != 0:
-                    acc_vec_inter = tTR_rAcc_sq.load()
-                    acc_vec = acc_vec + acc_vec_inter
-                tTR_rO.store(acc_vec.to(self.io_dtype))
-
-                # Store output to smem
-                smem_o_handle = smem_o_producer.acquire_and_advance()
-                if should_debug:
-                    cute.printf("chunk idx={}, got smem_o producer={}", idx, smem_o_handle.index)
-                cute.copy(tiled_copy_r2s_o, tRS_rO, tRS_sO[(None, None, None, smem_o_handle.index)])
-                # Fence and barrier to make sure shared memory store is visible to TMA store
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
-                smem_o_handle.commit()
-
-                # ------------------------------------------------------------
-                # 1. Decay the state
-                # 2. Convert to BF16
-                # 3. TODO: output final state if this is the last chunk
-                if idx != (S // C - 1):
-                    # Wait for kv mma from `idx-1` round of mma warp
-                    kv_handle = kv_consumer.wait_and_advance()
-                    if should_debug:
-                        cute.printf("chunk idx={}, got kv consumer={}", idx, kv_handle.index)
-
-                    tTR_tKVi = tTR_tKV[(None, None, None, kv_handle.index)] # kv stage == 1
-                    cute.copy(tiled_copy_t2r_kv, tTR_tKVi, tTR_rKV)
-                    cute.arch.fence_view_async_tmem_load()
-
-                    if True or cutlass.const_expr(PRINT_DEBUG):
-                        self.cuda_wg_sync_barrier.arrive_and_wait()
-                        if should_debug_f:
-                            cute.printf("--------------- before decay KV state chunk idx={}", idx)
-                            cute.print_tensor(tTR_rKV)
-                        self.cuda_wg_sync_barrier.arrive_and_wait()
-
-                    flat = cute.make_tensor(
-                        tTR_rKV.iterator, layout=cute.make_layout(Constant.D))
-
-                    # FIXME
+                        cute.printf("chunk idx={}, got v consumer={}, sV:", idx, v_handle.index)
+                        cute.print_tensor(sV_epi)
                     self.cuda_wg_sync_barrier.arrive_and_wait()
 
-                    # Then decay the FP32 version state
-                    self.scale_state(flat, sG_last[None, g_stage_idx])
+                    cute.copy(tiled_s2r_v, tRS_sV[(None, None, None, v_handle.index)], tRS_rV)
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
+
+                    # TODO: copy KS from TMEM to RMEM, NOTE KS reuse TMEM of PV, since they have the same shapes
+                    # TODO: check the layout equivalence, should be row-major
+                    tTR_rAcc_ks = cute.make_tensor(tTR_rAcc_pv.iterator, layout=tRS_rV.layout)
+                    if cutlass.const_expr(PRINT_DEBUG):
+                        print(f"FIXME tTR_rAcc_pv: {tTR_rAcc_pv}")
+                        print(f"FIXME tTR_rAcc_ks: {tTR_rAcc_ks}")
+                    if idx != 0:
+                        # Wait for KS
+                        ks_handle = ks_consumer.wait_and_advance()
+
+                        if should_debug:
+                            cute.printf("chunk idx={}, got ks consumer={}", idx, ks_handle.index)
+                        # TODO: confirm pv capacity is enough
+                        # Load KS from TMEM to RMEM, (128,64)
+                        tTR_tAcc_ks_i = tTR_tAcc_base_pv[(None, None, None, 0, 0, ks_handle.index)] # KS HANDLE INDEX == 0
+                        cute.copy(tiled_copy_t2r_sq, tTR_tAcc_ks_i, tTR_rAcc_pv)
+                        cute.arch.fence_view_async_tmem_load()
+
+                        ks_handle.release()
+
+                        if should_debug_f:
+                            cute.printf("chunk idx={}, KS:", idx)
+                            cute.print_tensor(tTR_rAcc_pv)
+
+                    # Perform addition and store to tmem for Vcorr^T * M^T
+                    # TODO: now we just store V back to SMEM, in the future we could save them to TMEM to enable double stage of V
+                    # Produce Vcorr = V - KS
+                    v2_handle = load_v2_producer.acquire_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got v2 producer={}", idx, v2_handle.index)
+
+                    if idx != 0:
+                        # First V could be kept no changes, since the initial state is None
+                        v_corrected = tRS_rV.load().to(cutlass.Float32)
+
+                        self.cuda_wg_sync_barrier.arrive_and_wait()
+                        if should_debug_f:
+                            cute.printf("chunk idx={}, V rmem chunk:", idx)
+                            cute.print_tensor(tRS_rV)
+                        self.cuda_wg_sync_barrier.arrive_and_wait()
+
+                        ks = tTR_rAcc_ks.load()
+                        v_corrected -= ks
+                        # TODO: why store back to SMEM?
+                        # Convert to BF16 and store v_corrected to SMEM
+                        tRS_rV.store(v_corrected.to(self.v_dtype))
+
+                        self.cuda_wg_sync_barrier.arrive_and_wait()
+                        if should_debug_f:
+                            cute.printf("chunk idx={}, V-KS rmem chunk:", idx)
+                            cute.print_tensor(tRS_rV)
+                        self.cuda_wg_sync_barrier.arrive_and_wait()
+
+                        # Store Vcorr back to SMEM
+                        cute.copy(tiled_s2r_v, tRS_rV, tRS_sV[(None, None, None, v_handle.index)])
+                        cute.arch.fence_proxy(
+                            cute.arch.ProxyKind.async_shared,
+                            space=cute.arch.SharedSpace.shared_cta,
+                        )
+                    # Commit Vcorr = V - KS to trigger M*Vcorr
+                    v2_handle.commit()
+
+                    # Let Kg = K * exp(g_cumsum)
+                    # Let Kn = K * exp(-g_cumsum)
+                    # Let Qg = Q * exp(g_cumsum)
+                    # 
+                    # Produce pseudo-V = M * (V - Kg * States)
+                    # {Pseudo-V} ^ T = (V^T - State^T * Kg^T) * M^T
+                    # Store Pseudo-V back to V-SMEM
+                    pseudo_v_handle = pseudo_v_consumer.wait_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got pseudo_v consumer={}", idx, pseudo_v_handle.index)
+
+                    pseudo_v_stage_idx = pseudo_v_handle.index
+                    # REUSE TMEM of PV, LOAD Pseudo-V from TMEM to RMEM
+                    tTR_tAcc_pv_i = tTR_tAcc_base_pv[(None, None, None, 0, 0, pseudo_v_stage_idx)]
+                    cute.copy(tiled_copy_t2r_pv, tTR_tAcc_pv_i, tTR_rAcc_pv)
+                    cute.arch.fence_view_async_tmem_load()
+                    pseudo_v_handle.release()
+
+                    # Convert to V dtype
+                    tTR_rPseudoV.store(tTR_rAcc_pv.load().to(self.v_dtype))
+
+                    v3_handle = load_v3_producer.acquire_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got v3 producer={}", idx, v3_handle.index)
+
+                    cute.copy(tiled_r2s_pseudo_v, tRS_rPseudoV, tRS_sPseudoV[(None, None, None, pseudo_v_stage_idx)])
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
+                    v3_handle.commit()
 
                     if True or cutlass.const_expr(PRINT_DEBUG):
                         self.cuda_wg_sync_barrier.arrive_and_wait()
                         if should_debug_f:
-                            cute.printf("--------------- after decay KV state chunk idx={}", idx)
-                            cute.print_tensor(tTR_rKV)
+                            cute.printf("------------ begin pseudov dump, idx={}", idx)
+                            cute.print_tensor(sV_epi)
+                            cute.printf("------------ end pseudov dump")
+                        self.cuda_wg_sync_barrier.arrive_and_wait()
+                
+                    # Maintain of S:
+                    # S_{t+1} = G_last*S_{t} + Kg^T* PseudoV
+                    # 
+                    # O_Inter = Qg * S
+                    # O_Intra = Tril(Qg * Kn^T) * PseudoV
+                    # O = O_Inter + O_Intra
+
+                    # Wait for S = MMA(exp(g)*Q, (K*exp(-g))^T)
+                    s0_handle = mma_s0_consumer.wait_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got s0 consumer={}", idx, s0_handle.index)
+
+                    # NOTE: Only Allow next TMA Load for G after k^exp(-g) has been consumed by QK & KK
+                    # TODO: This pipeline is too complex, we need to refactor it.
+                    # TODO: We might need to introduce multiple cuda warpgroups to achieve better parallelism.
+                    # TODO: G has been consumed in multiple places, need to track them carefully and use updated pipeline instances.
+                    g_handle.release()
+
+                    # (MMA, MMA_M, MMA_N, ACC_STAGE)
+                    tTR_tSi = tTR_tS[None, None, None, s0_handle.index]
+                    # Load S from TMEM to RMEM
+                    cute.copy(tiled_t2r_S, tTR_tSi, tTR_rS)
+                    cute.arch.fence_view_async_tmem_load()
+
+                    # TODO: Apply strict causal mask and comput inverse of M
+                    self.apply_mask(tTR_rS, tTR_cMask, tTR_rP, debug=False)
+
+                    # Write P to SMEM
+                    p_handle = p_producer.acquire_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got p producer={}", idx, p_handle.index)
+
+                    # Store P from RMEM to SMEM
+                    tRS_sPi = tRS_sP[(None, None, None, p_handle.index)]
+                    cute.copy(tiled_r2s_P, tRS_rP, tRS_sPi)
+                    # Fence
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
+                    s0_handle.release()
+                    p_handle.commit()
+
+                    if cutlass.const_expr(PRINT_DEBUG):
+                        self.cuda_wg_sync_barrier.arrive_and_wait()
+                        if should_debug_f:
+                            cute.printf("------- smem QK:")
+                            cute.print_tensor(sQK_flat)
+                            cute.printf("------- smem QK, last row:")
+                            cute.print_tensor(sQK_flat[63, None, None], verbose=True)
+
+                    # Wait for O_INTRA
+                    o_intra_handle = o_intra_consumer.wait_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got o_intra consumer={}", idx, o_intra_handle.index)
+                    # Load O_INTRA from TMEM to RMEM
+                    tTR_tAcc_pv_i = tTR_tAcc_base_pv[(None, None, None, 0, 0, o_intra_handle.index)]
+                    cute.copy(tiled_copy_t2r_pv, tTR_tAcc_pv_i, tTR_rAcc_pv)
+                    cute.arch.fence_view_async_tmem_load()
+                    o_intra_handle.release()
+
+                    # Wait for O_INTER
+                    if idx != 0:
+                        o_inter_handle = o_inter_consumer.wait_and_advance()
+                        if should_debug:
+                            cute.printf("chunk idx={}, got o_inter consumer={}", idx, o_inter_handle.index)
+                        tTR_tAcc_sq_i = tTR_tAcc_base_sq[(None, None, None, 0, 0, o_inter_handle.index)]
+                        # Load O_INTER from TMEM to RMEM
+                        cute.copy(tiled_copy_t2r_sq, tTR_tAcc_sq_i, tTR_rAcc_sq)
+                        cute.arch.fence_view_async_tmem_load()
+                        o_inter_handle.release()
+
+                    # Perform addition and store to gmem
+                    acc_vec = tTR_rAcc_pv.load()
+                    if idx != 0:
+                        acc_vec_inter = tTR_rAcc_sq.load()
+                        acc_vec = acc_vec + acc_vec_inter
+                    tTR_rO.store(acc_vec.to(self.io_dtype))
+
+                    # Store output to smem
+                    smem_o_handle = smem_o_producer.acquire_and_advance()
+                    if should_debug:
+                        cute.printf("chunk idx={}, got smem_o producer={}", idx, smem_o_handle.index)
+                    cute.copy(tiled_copy_r2s_o, tRS_rO, tRS_sO[(None, None, None, smem_o_handle.index)])
+                    # Fence and barrier to make sure shared memory store is visible to TMA store
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
+                    smem_o_handle.commit()
+
+                    # ------------------------------------------------------------
+                    # 1. Decay the state
+                    # 2. Convert to BF16
+                    # 3. TODO: output final state if this is the last chunk
+                    if idx != (S // C - 1):
+                        # Wait for kv mma from `idx-1` round of mma warp
+                        kv_handle = kv_consumer.wait_and_advance()
+                        if should_debug:
+                            cute.printf("chunk idx={}, got kv consumer={}", idx, kv_handle.index)
+
+                        tTR_tKVi = tTR_tKV[(None, None, None, kv_handle.index)] # kv stage == 1
+                        cute.copy(tiled_copy_t2r_kv, tTR_tKVi, tTR_rKV)
+                        cute.arch.fence_view_async_tmem_load()
+
+                        if True or cutlass.const_expr(PRINT_DEBUG):
+                            self.cuda_wg_sync_barrier.arrive_and_wait()
+                            if should_debug_f:
+                                cute.printf("--------------- before decay KV state chunk idx={}", idx)
+                                cute.print_tensor(tTR_rKV)
+                            self.cuda_wg_sync_barrier.arrive_and_wait()
+
+                        flat = cute.make_tensor(
+                            tTR_rKV.iterator, layout=cute.make_layout(Constant.D))
+
+                        # FIXME
                         self.cuda_wg_sync_barrier.arrive_and_wait()
 
-                    # Store as a separated BF16 state for QS and KS MMA before decay
-                    # tmem_store_rAccKVAsBF16 point to the same rmem as tmem_store_rKV
-                    tmem_store_rAccKVAsBF16.store(tTR_rKV.load().to(self.io_dtype))
+                        # Then decay the FP32 version state
+                        self.scale_state(flat, sG_last[None, g_stage_idx])
 
-                    # NOTE: TMEM STORE DECAY KV STATE to enable accumulation over chunks
-                    tmem_store_tKVi = tmem_store_tAccKV_f32[None, None, None, None, kv_handle.index]
-                    cute.copy(tmem_store_kv_f32, tmem_store_rKV, tmem_store_tKVi)
-                    cute.arch.fence_view_async_tmem_store()
-                    kv_handle.release()
+                        if True or cutlass.const_expr(PRINT_DEBUG):
+                            self.cuda_wg_sync_barrier.arrive_and_wait()
+                            if should_debug_f:
+                                cute.printf("--------------- after decay KV state chunk idx={}", idx)
+                                cute.print_tensor(tTR_rKV)
+                            self.cuda_wg_sync_barrier.arrive_and_wait()
 
-                    # Prepare bf16 state for tcgen05.mma
-                    kv16_handle = kv16_producer.acquire_and_advance()
-                    if should_debug:
-                        cute.printf("chunk idx={}, got kv16 producer={}", idx, kv16_handle.index)
-                    #####################################################################
-                    # V^T*K -> (Dv, Dk)
-                    tmem_store_tAccKVi = tmem_store_tAccKV[None, None, None, None, kv16_handle.index]
-                    # tmem_store_rAccKV is just an FP32 recast view of tmem_store_rAccKVAsBF16
-                    cute.copy(tmem_store_kv, tmem_store_rAccKV, tmem_store_tAccKVi)
-                    cute.arch.fence_view_async_tmem_store()
-                    #####################################################################
-                    kv16_handle.commit()
+                        # Store as a separated BF16 state for QS and KS MMA before decay
+                        # tmem_store_rAccKVAsBF16 point to the same rmem as tmem_store_rKV
+                        tmem_store_rAccKVAsBF16.store(tTR_rKV.load().to(self.io_dtype))
 
-                # NOTE: only release v after PV and State=KV has been consumed
-                end_v_handle = end_v_consumer.wait_and_advance()
-                end_v_handle.release()
+                        # NOTE: TMEM STORE DECAY KV STATE to enable accumulation over chunks
+                        tmem_store_tKVi = tmem_store_tAccKV_f32[None, None, None, None, kv_handle.index]
+                        cute.copy(tmem_store_kv_f32, tmem_store_rKV, tmem_store_tKVi)
+                        cute.arch.fence_view_async_tmem_store()
+                        kv_handle.release()
 
-                # Finally let us release v.
-                v_handle.release()
+                        # Prepare bf16 state for tcgen05.mma
+                        kv16_handle = kv16_producer.acquire_and_advance()
+                        if should_debug:
+                            cute.printf("chunk idx={}, got kv16 producer={}", idx, kv16_handle.index)
+                        #####################################################################
+                        # V^T*K -> (Dv, Dk)
+                        tmem_store_tAccKVi = tmem_store_tAccKV[None, None, None, None, kv16_handle.index]
+                        # tmem_store_rAccKV is just an FP32 recast view of tmem_store_rAccKVAsBF16
+                        cute.copy(tmem_store_kv, tmem_store_rAccKV, tmem_store_tAccKVi)
+                        cute.arch.fence_view_async_tmem_store()
+                        #####################################################################
+                        kv16_handle.commit()
+
+                    # NOTE: only release v after PV and State=KV has been consumed
+                    end_v_handle = end_v_consumer.wait_and_advance()
+                    end_v_handle.release()
+
+                    # Finally let us release v.
+                    v_handle.release()
 
         # CUDA core warps for subchunk computation
         elif warp_idx in self.cuda_subchunk_warp_ids:
             cute.arch.warpgroup_reg_alloc(self.num_regs_subchunk)
-            for chunk_start in cutlass.range(0, S, C, unroll=0):
-                idx = chunk_start // C
-                # wait for Q, K, G, Beta load
-                g_handle = load_g_consumer.wait_and_advance()
-                q_handle = load_q_consumer.wait_and_advance()
-                k_handle = load_k_consumer.wait_and_advance()
-                beta_handle = load_beta_consumer.wait_and_advance()
-                # subchunk computation
+            local_tidx = tidx % (self.threads_per_warp * len(self.cuda_subchunk_warp_ids))
+            should_debug = local_tidx == 0 and hidx == 0 and bidx == 0
+            subchunk_tidx = local_tidx
+            if local_tidx >= 64:
+                subchunk_tidx = local_tidx - 64
+            if cutlass.const_expr(self.safe_gate):
+                # define TiledMMA and TiledCopy
+                mma_op = cute.nvgpu.warp.MmaF16BF16Op(
+                    ab_dtype=self.q_dtype,
+                    acc_dtype=self.acc_dtype,
+                    shape_mnk=(16, 8, 16)
+                )
+                tiled_mma_subchunk = cute.make_tiled_mma(
+                    mma_op,
+                    atom_layout_mnk=(1, 2, 1), # 2 warps compute MMA
+                    permutation_mnk=self.qk_kk_subchunk_mma_tiler,
+                )
+                thr_mma_subchunk = tiled_mma_subchunk.get_slice(subchunk_tidx)
+                copy_op_A_s2r = cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4)
+                copy_op_B_s2r = cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4)
+                copy_op_r2s = cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=2)
+                copy_alpha_atom = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), self.g_dtype, num_bits_per_copy=128
+                )
+                alpha_Q_tiled_copy = cute.make_tiled_copy_A(copy_alpha_atom, tiled_mma_subchunk)
+                alpha_Kt_tiled_copy = cute.make_tiled_copy_B(copy_alpha_atom, tiled_mma_subchunk)
+                Q_tiled_copy = cute.make_tiled_copy_A(
+                    cute.make_copy_atom(copy_op_A_s2r, self.q_dtype),
+                    tiled_mma_subchunk
+                )
+                Kt_tiled_copy = cute.make_tiled_copy_B(
+                    cute.make_copy_atom(copy_op_B_s2r, self.k_dtype),
+                    tiled_mma_subchunk
+                )
+                O_tiled_copy = cute.make_tiled_copy_C(
+                    cute.make_copy_atom(copy_op_r2s, self.q_dtype),
+                    tiled_mma_subchunk
+                )
+                O_tiled_copy_kk = cute.make_tiled_copy_C(
+                    cute.make_copy_atom(copy_op_r2s, self.inverse_dtype),
+                    tiled_mma_subchunk
+                )
+                alpha_Q_thr_copy = alpha_Q_tiled_copy.get_slice(subchunk_tidx)
+                alpha_Kt_thr_copy = alpha_Kt_tiled_copy.get_slice(subchunk_tidx)
+                Q_thr_copy = Q_tiled_copy.get_slice(subchunk_tidx)
+                Kt_thr_copy = Kt_tiled_copy.get_slice(subchunk_tidx)
+                O_thr_copy = O_tiled_copy.get_slice(subchunk_tidx)
+                O_thr_copy_kk = O_tiled_copy_kk.get_slice(subchunk_tidx)
 
-                # QK/KK epilogue mask
+                # TODO: implement subchunk first, easier for debugging
+                for chunk_start in cutlass.range(0, S, C, unroll=0):
+                    idx = chunk_start // C
 
-                # QK is ready to consume
+                    # subchunk computation
+                    # divide input/output
+                    tiler_subchunk_alpha = (16, (32, 1))
+                    tiler_subchunk_qk = (16, (32, 1))
+                    tiler_subchunk_beta = (16, )
+                    sQqk_curr = sQ_flat[None, None, load_q_consumer._PipelineConsumer__state.index]
+                    sKqk_curr = sK_flat[None, None, load_k_consumer._PipelineConsumer__state.index]
+                    sGqkq_curr = sG_flat[None, None, load_g_consumer._PipelineConsumer__state.index]
+                    sBeta_curr = sBeta[None, load_beta_consumer._PipelineConsumer__state.index]
 
-                # release Q, K, G
+                    # (_16,(_32,_1),_4,(_2,_2)):(_64,(_1,_0),_1024,(_32,_4096))
+                    sQqk_slice = cute.flat_divide(sQqk_curr, tiler_subchunk_qk)
+                    sKqk_slice = cute.flat_divide(sKqk_curr, tiler_subchunk_qk)
+                    # (_16,(_32,_1),_4,(_1,_4)):(_32,(_1,_0),_512,(_0,_2048))
+                    sGqkq_slice = cute.flat_divide(sGqkq_curr, tiler_subchunk_alpha)
+                    sBeta_slice = cute.flat_divide(sBeta_curr, tiler_subchunk_beta)
 
-                # inverse KK
+                    # Acc results
+                    tiler_acc_qk_kk = (16, 16)
+                    sQK_curr = sQK_flat[None, None, p_consumer._PipelineConsumer__state.index]
+                    sQK_slice = cute.flat_divide(sQK_curr, tiler_acc_qk_kk)
+                    sKK_inv_curr = sM_flat[None, None, smem_kk_consumer._PipelineConsumer__state.index]
+                    sKK_inv_slice = cute.flat_divide(sKK_inv_curr, tiler_acc_qk_kk)
 
-                # release Beta
-                beta_handle.release()
-                # self.cuda_subchunk_wg_sync_barrier.arrive_and_wait()
+                    sGqkq_0_0 = sGqkq_slice[None, None, 0, (0, 0)]
+                    layout_g_first = cute.make_layout(
+                        sGqkq_0_0.shape, stride=(0, sGqkq_0_0.stride[1]) 
+                    )
+                    # if should_debug:
+                    #     cute.printf("sQqk_curr")
+                    #     cute.print_tensor(sQqk_curr)
+                    #     cute.printf("sQqk_slice")
+                    #     cute.print_tensor(sQqk_slice)
+                    #     cute.printf("sKqk_curr")
+                    #     cute.print_tensor(sKqk_curr)
+                    #     cute.printf("sGqkq_curr")
+                    #     cute.print_tensor(sGqkq_curr)
+                    #     cute.printf("sGqkq_slice")
+                    #     cute.print_tensor(sGqkq_slice)
+                    #     cute.printf("layout_g_first")
+                    #     cute.printf(layout_g_first)
+                    #     cute.printf("sG_first")
+                    #     cute.print_tensor(sG_first)
+                    #     cute.printf("sBeta_curr")
+                    #     cute.print_tensor(sBeta_curr)
+                    #     cute.printf("sBeta_slice")
+                    #     cute.print_tensor(sBeta_slice)
+
+                    # used for make_fragment_like in G
+                    sQqk_1_0 = sQqk_slice[None, None, 1, (0, 0)]
+                    sKqk_1_0 = sKqk_slice[None, None, 1, (0, 0)]
+                    tQKrQ_1_0 = thr_mma_subchunk.make_fragment_A(thr_mma_subchunk.partition_A(sQqk_1_0))
+                    tQKrKt_1_0 = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_1_0))
+                    tv_layout_mma_A = tQKrQ_1_0.layout
+                    tv_layout_mma_B = tQKrKt_1_0.layout
+
+                    # g_i_j/q_i_j/k_i_j: 第i个subchunk的第j个head dim slice
+                    if local_tidx < 64:
+                        # Q/K0@K0, Q/K3@K3, Q/K3@K0, Q/K3@K1, Q/K3@K2
+                        pass
+                        # TODO: Q/K0@K0, Q/K3@K3 in cuda core
+                        # NOTE: tensor core MMA for safe gate with lower_bound >= -5
+                        tQKrQK_0_0 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tKKrKK_0_0 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        # first subchunk, wait for data ready
+                        g_handle = load_g_consumer.wait_and_advance()
+                        q_handle = load_q_consumer.wait_and_advance()
+                        k_handle = load_k_consumer.wait_and_advance()
+
+                        for j in cutlass.range_constexpr(self.NK_SC):
+                            pass
+                            # S2R g_r_j, g_r_j_first
+                            j0 = j % 2
+                            j1 = j // 2
+                            sGqkq_0_j = sGqkq_slice[None, None, 0, (0, j)]
+                            sG_first_0_j = cute.make_tensor(sGqkq_0_j.iterator, layout=layout_g_first)
+                            tGsG_0_j = alpha_Q_thr_copy.partition_S(sGqkq_0_j)
+                            tGsGfirst_0_j = alpha_Q_thr_copy.partition_S(sG_first_0_j)
+                            tGrG_0_j = cute.make_fragment_like(tv_layout_mma_A)
+                            tGrGfirst_0_j = cute.make_fragment_like(tv_layout_mma_A)
+
+                        # first subchunk, wait for data ready
+                        beta_handle = load_beta_consumer.wait_and_advance()
+
+                        # Q/K3@K0, Q/K3@K1, Q/K3@K2, Q/K3@K3
+
+
+                        # release Q, K, G
+                        g_handle.release()
+                        q_handle.release()
+                        k_handle.release()
+                        # release Beta
+                        beta_handle.release()
+
+                    else:
+                        # Q/K1@K0, Q/K2@K0, Q/K2@K1, Q/K2@K2, Q/K1@K1
+                        # first subchunk, wait for data ready
+                        g_handle = load_g_consumer.wait_and_advance()
+                        q_handle = load_q_consumer.wait_and_advance()
+                        k_handle = load_k_consumer.wait_and_advance()
+                        # first subchunk, wait for data ready
+                        beta_handle = load_beta_consumer.wait_and_advance()
+                        # Q/K1@K0, Q/K1@K1 in tensor core
+
+                        # release Q, K, G
+                        g_handle.release()
+                        q_handle.release()
+                        k_handle.release()
+                        # release Beta
+                        beta_handle.release()
+                    # QK/KK epilogue mask
+
+                    # QK is ready to consume
+
+
+                    # inverse KK
+
+                    # self.cuda_subchunk_wg_sync_barrier.arrive_and_wait()
+            else:
+                for chunk_start in cutlass.range(0, S, C, unroll=0):
+                    idx = chunk_start // C
+                    # wait for Q, K, G, Beta load
+                    g_handle = load_g_consumer.wait_and_advance()
+                    q_handle = load_q_consumer.wait_and_advance()
+                    k_handle = load_k_consumer.wait_and_advance()
+                    beta_handle = load_beta_consumer.wait_and_advance()
+                    # release Beta
+                    g_handle.release()
+                    q_handle.release()
+                    k_handle.release()
+                    beta_handle.release()
 
         elif warp_idx == self.epilogue_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
@@ -4195,6 +4573,18 @@ class KDAChunkwise:
             cute.group_modes(tCgX, 0, 3),
         )
         return tXsX, tXgX
+
+    # ===========
+    # Utility functions for Ampere-style mma.sync, used for subchunk computation
+    @cute.jit
+    def mma_sync_partition_c(self, tiled_mma, tile_shape_mnk, zero_fill=True):
+        acc_shape = tiled_mma.partition_shape_C(tile_shape_mnk[:2])
+        tCrC = tiled_mma.make_fragment_C(acc_shape)
+        if zero_fill:
+            tCrC.fill(0.0)
+        return tCrC
+
+    # ===========
 
     @cute.jit
     def make_s2r_partitions_v(

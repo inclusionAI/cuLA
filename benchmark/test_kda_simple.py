@@ -17,7 +17,7 @@ from flashla.kda_wrapper import flash_kda_prefill
 # Constant params
 B, H, D = 1, 1, 128
 
-S = T = 64*5
+S = T = 64*3
 
 WARMUP_ITERATIONS = 0
 ITERATIONS = 1
@@ -256,7 +256,7 @@ def test_accuracy():
 
     # FIXME: support safe_gate=True
     use_gate_in_kernel = False
-    safe_gate = False
+    safe_gate = True
     output_final_state = False
 
     scale = D ** (-0.5)

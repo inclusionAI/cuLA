@@ -288,6 +288,7 @@ class ChunkKDAFunction(torch.autograd.Function):
                 kv_acc_dtype=cutlass.Float32,
                 io_dtype=cutlass.BFloat16,
                 scale=scale,
+                safe_gate=safe_gate,
             )
             compiled_kernel = cute.compile(
                 attn_kernel,
