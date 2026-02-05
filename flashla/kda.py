@@ -2981,6 +2981,43 @@ class KDAChunkwise:
                     index_k,
                 )
 
+                # epilogue
+                tiled_mma_epi_fake = cute.make_tiled_mma(
+                    mma_op,
+                    atom_layout_mnk=(4, 1, 1),
+                    permutation_mnk=self.qk_mma_tiler,
+                )
+                thr_mma_epi_fake = tiled_mma_epi_fake.get_slice(local_tidx)
+                tQKrQK_fake = tiled_mma_epi_fake.make_fragment_C(
+                    tiled_mma_epi_fake.partition_shape_C(self.qk_mma_tiler[:2])
+                )
+                copy_op_epi_s2r = cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4)
+                copy_op_epi_r2s = cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4)
+                tiled_load_qk = cute.make_tiled_copy_C(
+                    cute.make_copy_atom(copy_op_epi_s2r, self.io_dtype),
+                    tiled_mma_epi_fake
+                )
+                tiled_load_kk = cute.make_tiled_copy_C(
+                    cute.make_copy_atom(copy_op_epi_s2r, self.inverse_dtype),
+                    tiled_mma_epi_fake
+                )
+                tiled_store_qk = cute.make_tiled_copy_C(
+                    cute.make_copy_atom(copy_op_epi_r2s, self.io_dtype),
+                    tiled_mma_epi_fake
+                )
+                tiled_store_kk = cute.make_tiled_copy_C(
+                    cute.make_copy_atom(copy_op_epi_r2s, self.inverse_dtype),
+                    tiled_mma_epi_fake
+                )
+                thr_load_qk = tiled_load_qk.get_slice(local_tidx)
+                thr_load_kk = tiled_load_kk.get_slice(local_tidx)
+                thr_store_qk = tiled_store_qk.get_slice(local_tidx)
+                thr_store_kk = tiled_store_kk.get_slice(local_tidx)
+                tQKrQK_cv = thr_load_qk.retile(tQKrQK_fake)
+                # index tensor
+                cM = cute.make_identity_tensor(self.qk_mma_tiler[:2])
+                tQKcMqk = thr_mma_epi_fake.partition_C(cM)
+
                 # TODO: implement subchunk first, easier for debugging
                 for chunk_start in cutlass.range(0, S, C, unroll=0):
                     idx = chunk_start // C
@@ -3147,6 +3184,7 @@ class KDAChunkwise:
                         beta_handle.release()
 
                     else:
+                        # TODO: finish logic
                         # Q/K1@K0, Q/K2@K0, Q/K2@K1, Q/K2@K2, Q/K1@K1
                         # first subchunk, wait for data ready
                         g_handle = load_g_consumer.wait_and_advance()
@@ -3169,13 +3207,24 @@ class KDAChunkwise:
 
                     # wait for QK/KK ready
                     self.cuda_subchunk_wg_sync_barrier.arrive_and_wait()
+
+                    # QK/KK epilogue mask
+                    tQKrQK = cute.make_fragment_like(tQKrQK_cv, dtype=self.io_dtype)
+                    tKKrKK = cute.make_fragment_like(tQKrQK_cv, dtype=self.inverse_dtype)
+                    cute.copy(tiled_load_qk, thr_load_qk.partition_S(sQK_curr), tQKrQK)
+                    cute.copy(tiled_load_kk, thr_load_kk.partition_S(sKK_inv_curr), tKKrKK)
+                    # triangular mask and boundary mask
+                    # FIXME: add boundary mask
+                    self.apply_qk_kk_mask(tQKcMqk, tQKrQK, tKKrKK)
+                    # R2S QK/KK
+                    cute.copy(tiled_store_qk, thr_store_qk.retile(tQKrQK), thr_store_qk.partition_D(sQK_curr))
+                    cute.copy(tiled_store_kk, thr_store_kk.retile(tKKrKK), thr_store_kk.partition_D(sKK_inv_curr))
+
                     # if should_debug:
                     #     cute.printf("sKK_inv_slice")
                     #     cute.print_tensor(sKK_inv_slice[None, None, 0, 0])
                     #     cute.printf("sQK_slice")
                     #     cute.print_tensor(sQK_slice[None, None, 0, 0])
-
-                    # QK/KK epilogue mask
 
                     # QK is ready to consume
                     p_handle = p_producer.acquire_and_advance()
@@ -4721,8 +4770,15 @@ class KDAChunkwise:
         return tCrC
 
     @cute.jit
-    def r2s_subchunk_acc(self, r, c, src, dst, 
-        tiled_copy, thr_copy, out_dtype):
+    def r2s_subchunk_acc(self, 
+        r: cutlass.Constexpr[int], 
+        c: cutlass.Constexpr[int], 
+        src: cute.Tensor, 
+        dst: cute.Tensor, 
+        tiled_copy, 
+        thr_copy, 
+        out_dtype,
+    ):
         dst_r_c = dst[None, None, r, c]
         tSdst_r_c = thr_copy.partition_D(dst_r_c)
         tRsrc = thr_copy.retile(src)
@@ -4731,6 +4787,29 @@ class KDAChunkwise:
         src_val_out = src_val.to(out_dtype)
         tRsrc_cvt.store(src_val_out)
         cute.copy(tiled_copy, tRsrc_cvt, tSdst_r_c)
+
+    @cute.jit
+    def apply_qk_kk_mask(
+        self,
+        index_qk: cute.Tensor,
+        qk: cute.Tensor,
+        kk: cute.Tensor,
+        index_transform: cutlass.Constexpr = lambda index_q, index_k: (
+            index_q,
+            index_k,
+        ),
+        # FIXME: boundary mask for the final block
+        is_final_block: cutlass.Constexpr[bool] = False,
+    ):
+        for i in cutlass.range_constexpr(cute.size(index_qk)):
+            index_q, index_k = index_transform(*index_qk[i])
+            # triangular for qk & kk
+            if index_q < index_k:
+                qk[i] = cutlass.BFloat16(0.0)
+                kk[i] = cutlass.Float16(0.0)
+            # fill 1.0 for kk diagonal
+            if index_q == index_k:
+                kk[i] = cutlass.Float16(1.0)
 
     # ===========
 
