@@ -3151,7 +3151,7 @@ class KDAChunkwise:
                         qk_0_0_val = qk_0_0_val * self.scale
                         tQKrQK_0_0.store(qk_0_0_val)
                         # first subchunk, wait for data ready
-                        beta_handle = load_beta_consumer.wait_and_advance()
+                        beta_handle = load_beta_consumer.wait()
                         # Fence due to normal load
                         cute.arch.fence_proxy(
                             cute.arch.ProxyKind.async_shared,
@@ -3175,35 +3175,553 @@ class KDAChunkwise:
                             O_tiled_copy, O_thr_copy, self.io_dtype)
 
                         # Q/K3@K0, Q/K3@K1, Q/K3@K2, Q/K3@K3
+                        tQKrQK_3_0 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tKKrKK_3_0 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tQKrQK_3_1 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tKKrKK_3_1 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tQKrQK_3_2 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tKKrKK_3_2 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tQKrQK_3_3 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tKKrKK_3_3 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        
+                        for j in cutlass.range_constexpr(self.NK_SC):
+                            # S2R g_3_j, g_3_j_first
+                            j0 = j % 2
+                            j1 = j // 2
+                            sGqkq_3_j = sGqkq_slice[None, None, 3, (0, j)]
+                            sG_first_3_j = cute.make_tensor(sGqkq_3_j.iterator, layout=layout_g_first)
+                            tGsG_3_j = alpha_Q_thr_copy.partition_S(sGqkq_3_j)
+                            tGsGfirst_3_j = alpha_Q_thr_copy.partition_S(sG_first_3_j)
+                            tGrG_3_j = cute.make_fragment_like(tv_layout_mma_A, dtype=self.g_dtype)
+                            tGrGfirst_3_j = cute.make_fragment_like(tv_layout_mma_A, dtype=self.g_dtype)
+                            tGrG_3_j_cv = alpha_Q_thr_copy.retile(tGrG_3_j)
+                            tGrGfirst_3_j_cv = alpha_Q_thr_copy.retile(tGrGfirst_3_j)
+                            cute.copy(alpha_Q_tiled_copy, tGsG_3_j, tGrG_3_j_cv)
+                            cute.copy(alpha_Q_tiled_copy, tGsGfirst_3_j, tGrGfirst_3_j_cv)
+
+                            # gqn_3_j = exp2(g_3_j - g_3_j_first[None, :]), reuse g_3_j
+                            g_3_j_val = tGrG_3_j.load()
+                            gfirst_3_j_val = tGrGfirst_3_j.load()
+                            g_3_j_val = cute.exp2(g_3_j_val - gfirst_3_j_val)
+                            tGrG_3_j.store(g_3_j_val)
+
+                            # S2R q_3_j, k_3_j
+                            sQqk_3_j = sQqk_slice[None, None, 3, (j0, j1)]
+                            sKqk_3_j = sKqk_slice[None, None, 3, (j0, j1)]
+                            tQKrQ_3_j = thr_mma_subchunk.make_fragment_A(thr_mma_subchunk.partition_A(sQqk_3_j))
+                            tQKrK_3_j = thr_mma_subchunk.make_fragment_A(thr_mma_subchunk.partition_A(sKqk_3_j))
+                            tQKsQ_3_j = Q_thr_copy.partition_S(sQqk_3_j)
+                            tQKsK_3_j = Q_thr_copy.partition_S(sKqk_3_j)
+                            tQKrQ_3_j_cv = Q_thr_copy.retile(tQKrQ_3_j)
+                            tQKrK_3_j_cv = Q_thr_copy.retile(tQKrK_3_j)
+                            cute.copy(Q_tiled_copy, tQKsQ_3_j, tQKrQ_3_j_cv)
+                            cute.copy(Q_tiled_copy, tQKsK_3_j, tQKrK_3_j_cv)
+
+                            # compute q_3_j/k_3_j * gqn_3_j, reuse q_3_j/k_3_j
+                            q_3_j_val = tQKrQ_3_j.load().to(cutlass.Float32)
+                            q_3_j_val = q_3_j_val * g_3_j_val
+                            q_3_j_val = q_3_j_val.to(self.io_dtype)
+                            tQKrQ_3_j.store(q_3_j_val)
+                            k_3_j_val = tQKrK_3_j.load().to(cutlass.Float32)
+                            k_3_j_val = k_3_j_val * g_3_j_val
+                            k_3_j_val = k_3_j_val.to(self.io_dtype)
+                            tQKrK_3_j.store(k_3_j_val)
+
+                            # S2R g_0_j, g_3_j_first again (different layouts for operand B)
+                            sGqkq_0_j = sGqkq_slice[None, None, 0, (0, j)]
+                            tGsG_0_j = alpha_Kt_thr_copy.partition_S(sGqkq_0_j)
+                            tGsGfirst_3_j_kt = alpha_Kt_thr_copy.partition_S(sG_first_3_j)
+                            tGrG_0_j = cute.make_fragment_like(tv_layout_mma_B, dtype=self.g_dtype)
+                            tGrGfirst_3_j_kt = cute.make_fragment_like(tv_layout_mma_B, dtype=self.g_dtype)
+                            tGrG_0_j_cv = alpha_Kt_thr_copy.retile(tGrG_0_j)
+                            tGrGfirst_3_j_kt_cv = alpha_Kt_thr_copy.retile(tGrGfirst_3_j_kt)
+                            cute.copy(alpha_Kt_tiled_copy, tGsG_0_j, tGrG_0_j_cv)
+                            cute.copy(alpha_Kt_tiled_copy, tGsGfirst_3_j_kt, tGrGfirst_3_j_kt_cv)
+
+                            # compute gktn_0_j = exp2(g_3_j_first - g_0_j), reuse g_0_j
+                            g_0_j_val = tGrG_0_j.load()
+                            gfirst_3_j_val_kt = tGrGfirst_3_j_kt.load()
+                            g_0_j_val = cute.exp2(gfirst_3_j_val_kt - g_0_j_val)
+                            tGrG_0_j.store(g_0_j_val)
+
+                            # S2R k_0_j
+                            sKqk_0_j = sKqk_slice[None, None, 0, (j0, j1)]
+                            tQKrKt_0_j = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_0_j))
+                            tQKsKt_0_j = Kt_thr_copy.partition_S(sKqk_0_j)
+                            tQKrKt_0_j_cv = Kt_thr_copy.retile(tQKrKt_0_j)
+                            cute.copy(Kt_tiled_copy, tQKsKt_0_j, tQKrKt_0_j_cv)
+
+                            # compute k_0_j * gktn_0_j
+                            k_0_j_val_kt = tQKrKt_0_j.load().to(cutlass.Float32)
+                            k_0_j_val_kt = k_0_j_val_kt * g_0_j_val
+                            k_0_j_val_kt = k_0_j_val_kt.to(self.io_dtype)
+                            tQKrKt_0_j.store(k_0_j_val_kt)
+
+                            # q_3_j/k_3_j @ k_0_j, accumulate acc_3_0
+                            cute.gemm(tiled_mma_subchunk, tQKrQK_3_0, tQKrQ_3_j, tQKrKt_0_j, tQKrQK_3_0)
+                            cute.gemm(tiled_mma_subchunk, tKKrKK_3_0, tQKrK_3_j, tQKrKt_0_j, tKKrKK_3_0)
+
+                            # S2R g_1_j_kt
+                            sGqkq_1_j = sGqkq_slice[None, None, 1, (0, j)]
+                            tGsG_1_j = alpha_Kt_thr_copy.partition_S(sGqkq_1_j)
+                            tGrG_1_j = cute.make_fragment_like(tv_layout_mma_B, dtype=self.g_dtype)
+                            tGrG_1_j_cv = alpha_Kt_thr_copy.retile(tGrG_1_j)
+                            cute.copy(alpha_Kt_tiled_copy, tGsG_1_j, tGrG_1_j_cv)
+
+                            # compute gktn_1_j = exp2(g_3_j_first - g_1_j), reuse g_1_j
+                            g_1_j_val = tGrG_1_j.load()
+                            g_1_j_val = cute.exp2(gfirst_3_j_val_kt - g_1_j_val)
+                            tGrG_1_j.store(g_1_j_val)
+
+                            # S2R k_1_j
+                            sKqk_1_j = sKqk_slice[None, None, 1, (j0, j1)]
+                            tQKrKt_1_j = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_1_j))
+                            tQKsKt_1_j = Kt_thr_copy.partition_S(sKqk_1_j)
+                            tQKrKt_1_j_cv = Kt_thr_copy.retile(tQKrKt_1_j)
+                            cute.copy(Kt_tiled_copy, tQKsKt_1_j, tQKrKt_1_j_cv)
+
+                            # compute k_1_j * gktn_1_j
+                            k_1_j_val_kt = tQKrKt_1_j.load().to(cutlass.Float32)
+                            k_1_j_val_kt = k_1_j_val_kt * g_1_j_val
+                            k_1_j_val_kt = k_1_j_val_kt.to(self.io_dtype)
+                            tQKrKt_1_j.store(k_1_j_val_kt)
+
+                            # q_3_j/k_3_j @ k_1_j, accumulate acc_3_1
+                            cute.gemm(tiled_mma_subchunk, tQKrQK_3_1, tQKrQ_3_j, tQKrKt_1_j, tQKrQK_3_1)
+                            cute.gemm(tiled_mma_subchunk, tKKrKK_3_1, tQKrK_3_j, tQKrKt_1_j, tKKrKK_3_1)
+
+                            # S2R g_2_j
+                            sGqkq_2_j = sGqkq_slice[None, None, 2, (0, j)]
+                            tGsG_2_j_kt = alpha_Kt_thr_copy.partition_S(sGqkq_2_j)
+                            tGrG_2_j_kt = cute.make_fragment_like(tv_layout_mma_B, dtype=self.g_dtype)
+                            tGrG_2_j_kt_cv = alpha_Kt_thr_copy.retile(tGrG_2_j_kt)
+                            cute.copy(alpha_Kt_tiled_copy, tGsG_2_j_kt, tGrG_2_j_kt_cv)
+
+                            # compute gktn_2_j = exp2(g_3_j_first - g_2_j), reuse g_2_j
+                            g_2_j_val_kt = tGrG_2_j_kt.load()
+                            g_2_j_val_kt = cute.exp2(gfirst_3_j_val_kt - g_2_j_val_kt)
+                            tGrG_2_j_kt.store(g_2_j_val_kt)
+
+                            # S2R k_2_j
+                            sKqk_2_j = sKqk_slice[None, None, 2, (j0, j1)]
+                            tQKrKt_2_j = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_2_j))
+                            tQKsKt_2_j = Kt_thr_copy.partition_S(sKqk_2_j)
+                            tQKrKt_2_j_cv = Kt_thr_copy.retile(tQKrKt_2_j)
+                            cute.copy(Kt_tiled_copy, tQKsKt_2_j, tQKrKt_2_j_cv)
+
+                            # compute k_2_j * gktn_2_j
+                            k_2_j_val_kt = tQKrKt_2_j.load().to(cutlass.Float32)
+                            k_2_j_val_kt = k_2_j_val_kt * g_2_j_val_kt
+                            k_2_j_val_kt = k_2_j_val_kt.to(self.io_dtype)
+                            tQKrKt_2_j.store(k_2_j_val_kt)
+
+                            # q_3_j/k_3_j @ k_2_j, accumulate acc_3_2
+                            cute.gemm(tiled_mma_subchunk, tQKrQK_3_2, tQKrQ_3_j, tQKrKt_2_j, tQKrQK_3_2)
+                            cute.gemm(tiled_mma_subchunk, tKKrKK_3_2, tQKrK_3_j, tQKrKt_2_j, tKKrKK_3_2)
+
+                            # S2R g_3_j
+                            tGsG_3_j_kt = alpha_Kt_thr_copy.partition_S(sGqkq_3_j)
+                            tGrG_3_j_kt = cute.make_fragment_like(tv_layout_mma_B, dtype=self.g_dtype)
+                            tGrG_3_j_kt_cv = alpha_Kt_thr_copy.retile(tGrG_3_j_kt)
+                            cute.copy(alpha_Kt_tiled_copy, tGsG_3_j_kt, tGrG_3_j_kt_cv)
+
+                            # compute gktn_3_j = exp2(g_3_j_first - g_3_j), reuse g_3_j
+                            g_3_j_val_kt = tGrG_3_j_kt.load()
+                            g_3_j_val_kt = cute.exp2(gfirst_3_j_val_kt - g_3_j_val_kt)
+                            tGrG_3_j_kt.store(g_3_j_val_kt)
+
+                            # S2R k_3_j
+                            tQKrKt_3_j = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_3_j))
+                            tQKsKt_3_j = Kt_thr_copy.partition_S(sKqk_3_j)
+                            tQKrKt_3_j_cv = Kt_thr_copy.retile(tQKrKt_3_j)
+                            cute.copy(Kt_tiled_copy, tQKsKt_3_j, tQKrKt_3_j_cv)
+
+                            # compute k_3_j * gktn_3_j
+                            k_3_j_val_kt = tQKrKt_3_j.load().to(cutlass.Float32)
+                            k_3_j_val_kt = k_3_j_val_kt * g_3_j_val_kt
+                            k_3_j_val_kt = k_3_j_val_kt.to(self.io_dtype)
+                            tQKrKt_3_j.store(k_3_j_val_kt)
+
+                            # q_3_j/k_3_j @ k_3_j, accumulate acc_3_3
+                            cute.gemm(tiled_mma_subchunk, tQKrQK_3_3, tQKrQ_3_j, tQKrKt_3_j, tQKrQK_3_3)
+                            cute.gemm(tiled_mma_subchunk, tKKrKK_3_3, tQKrK_3_j, tQKrKt_3_j, tKKrKK_3_3)
+                            
+                        qk_3_0_val = tQKrQK_3_0.load()
+                        qk_3_0_val = qk_3_0_val * self.scale
+                        tQKrQK_3_0.store(qk_3_0_val)
+                        qk_3_1_val = tQKrQK_3_1.load()
+                        qk_3_1_val = qk_3_1_val * self.scale
+                        tQKrQK_3_1.store(qk_3_1_val)
+                        qk_3_2_val = tQKrQK_3_2.load()
+                        qk_3_2_val = qk_3_2_val * self.scale
+                        tQKrQK_3_2.store(qk_3_2_val)
+                        qk_3_3_val = tQKrQK_3_3.load()
+                        qk_3_3_val = qk_3_3_val * self.scale
+                        tQKrQK_3_3.store(qk_3_3_val)
+                        sBeta_3 = sBeta_slice[None, 3]
+                        for i in cutlass.range_constexpr(cute.size(tQKcMqk_subchunk)):
+                            s, t = index_transform(*tQKcMqk_subchunk[i])
+                            b = sBeta_3[s]
+                            tKKrKK_3_0[i] *= b
+                            tKKrKK_3_1[i] *= b
+                            tKKrKK_3_2[i] *= b
+                            tKKrKK_3_3[i] *= b
+
+                        # R2S qk_3_0, kk_3_0
+                        self.r2s_subchunk_acc(3, 0, tKKrKK_3_0, sKK_inv_slice, 
+                            O_tiled_copy_kk, O_thr_copy_kk, self.inverse_dtype)
+                        self.r2s_subchunk_acc(3, 0, tQKrQK_3_0, sQK_slice, 
+                            O_tiled_copy, O_thr_copy, self.io_dtype)
+                        # R2S qk_3_1, kk_3_1
+                        self.r2s_subchunk_acc(3, 1, tKKrKK_3_1, sKK_inv_slice, 
+                            O_tiled_copy_kk, O_thr_copy_kk, self.inverse_dtype)
+                        self.r2s_subchunk_acc(3, 1, tQKrQK_3_1, sQK_slice, 
+                            O_tiled_copy, O_thr_copy, self.io_dtype)
+                        # R2S qk_3_2, kk_3_2
+                        self.r2s_subchunk_acc(3, 2, tKKrKK_3_2, sKK_inv_slice, 
+                            O_tiled_copy_kk, O_thr_copy_kk, self.inverse_dtype)
+                        self.r2s_subchunk_acc(3, 2, tQKrQK_3_2, sQK_slice, 
+                            O_tiled_copy, O_thr_copy, self.io_dtype)
+                        # R2S qk_3_3, kk_3_3
+                        self.r2s_subchunk_acc(3, 3, tKKrKK_3_3, sKK_inv_slice, 
+                            O_tiled_copy_kk, O_thr_copy_kk, self.inverse_dtype)
+                        self.r2s_subchunk_acc(3, 3, tQKrQK_3_3, sQK_slice, 
+                            O_tiled_copy, O_thr_copy, self.io_dtype)
 
                         # release Q, K, G
                         g_handle.release()
                         q_handle.release()
                         k_handle.release()
-                        # release Beta
-                        beta_handle.release()
 
                     else:
-                        # TODO: finish logic
                         # Q/K1@K0, Q/K2@K0, Q/K2@K1, Q/K2@K2, Q/K1@K1
+
+                        # Q/K1@K0, Q/K1@K1
+                        tQKrQK_1_0 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tKKrKK_1_0 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tQKrQK_1_1 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tKKrKK_1_1 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
                         # first subchunk, wait for data ready
                         g_handle = load_g_consumer.wait_and_advance()
                         q_handle = load_q_consumer.wait_and_advance()
                         k_handle = load_k_consumer.wait_and_advance()
+
+                        for j in cutlass.range_constexpr(self.NK_SC):
+                            # S2R g_1_j, g_1_j_first
+                            j0 = j % 2
+                            j1 = j // 2
+                            sGqkq_1_j = sGqkq_slice[None, None, 1, (0, j)]
+                            sG_first_1_j = cute.make_tensor(sGqkq_1_j.iterator, layout=layout_g_first)
+                            tGsG_1_j = alpha_Q_thr_copy.partition_S(sGqkq_1_j)
+                            tGsGfirst_1_j = alpha_Q_thr_copy.partition_S(sG_first_1_j)
+                            tGrG_1_j = cute.make_fragment_like(tv_layout_mma_A, dtype=self.g_dtype)
+                            tGrGfirst_1_j = cute.make_fragment_like(tv_layout_mma_A, dtype=self.g_dtype)
+                            tGrG_1_j_cv = alpha_Q_thr_copy.retile(tGrG_1_j)
+                            tGrGfirst_1_j_cv = alpha_Q_thr_copy.retile(tGrGfirst_1_j)
+                            cute.copy(alpha_Q_tiled_copy, tGsG_1_j, tGrG_1_j_cv)
+                            cute.copy(alpha_Q_tiled_copy, tGsGfirst_1_j, tGrGfirst_1_j_cv)
+
+                            # gqn_1_j = exp2(g_1_j - g_1_j_first[None, :]), reuse g_0_j
+                            g_1_j_val = tGrG_1_j.load()
+                            gfirst_1_j_val = tGrGfirst_1_j.load()
+                            g_1_j_val = cute.exp2(g_1_j_val - gfirst_1_j_val)
+                            tGrG_1_j.store(g_1_j_val)
+
+                            # S2R q_1_j, k_1_j
+                            sQqk_1_j = sQqk_slice[None, None, 1, (j0, j1)]
+                            sKqk_1_j = sKqk_slice[None, None, 1, (j0, j1)]
+                            tQKrQ_1_j = thr_mma_subchunk.make_fragment_A(thr_mma_subchunk.partition_A(sQqk_1_j))
+                            tQKrK_1_j = thr_mma_subchunk.make_fragment_A(thr_mma_subchunk.partition_A(sKqk_1_j))
+                            tQKsQ_1_j = Q_thr_copy.partition_S(sQqk_1_j)
+                            tQKsK_1_j = Q_thr_copy.partition_S(sKqk_1_j)
+                            tQKrQ_1_j_cv = Q_thr_copy.retile(tQKrQ_1_j)
+                            tQKrK_1_j_cv = Q_thr_copy.retile(tQKrK_1_j)
+                            cute.copy(Q_tiled_copy, tQKsQ_1_j, tQKrQ_1_j_cv)
+                            cute.copy(Q_tiled_copy, tQKsK_1_j, tQKrK_1_j_cv)
+
+                            # compute q_1_j/k_1_j * gqn_1_j, reuse q_1_j/k_1_j
+                            q_1_j_val = tQKrQ_1_j.load().to(cutlass.Float32)
+                            q_1_j_val = q_1_j_val * g_1_j_val
+                            q_1_j_val = q_1_j_val.to(self.io_dtype)
+                            tQKrQ_1_j.store(q_1_j_val)
+                            k_1_j_val = tQKrK_1_j.load().to(cutlass.Float32)
+                            k_1_j_val = k_1_j_val * g_1_j_val
+                            k_1_j_val = k_1_j_val.to(self.io_dtype)
+                            tQKrK_1_j.store(k_1_j_val)
+
+                            # S2R g_0_j, g_1_j_first again (different layouts for operand B)
+                            sGqkq_0_j = sGqkq_slice[None, None, 0, (0, j)]
+                            tGsG_0_j = alpha_Kt_thr_copy.partition_S(sGqkq_0_j)
+                            tGsGfirst_1_j_kt = alpha_Kt_thr_copy.partition_S(sG_first_1_j)
+                            tGrG_0_j = cute.make_fragment_like(tv_layout_mma_B, dtype=self.g_dtype)
+                            tGrGfirst_1_j_kt = cute.make_fragment_like(tv_layout_mma_B, dtype=self.g_dtype)
+                            tGrG_0_j_cv = alpha_Kt_thr_copy.retile(tGrG_0_j)
+                            tGrGfirst_1_j_kt_cv = alpha_Kt_thr_copy.retile(tGrGfirst_1_j_kt)
+                            cute.copy(alpha_Kt_tiled_copy, tGsG_0_j, tGrG_0_j_cv)
+                            cute.copy(alpha_Kt_tiled_copy, tGsGfirst_1_j_kt, tGrGfirst_1_j_kt_cv)
+
+                            # compute gktn_0_j = exp2(g_1_j_first - g_0_j), reuse g_3_j
+                            g_0_j_val = tGrG_0_j.load()
+                            gfirst_1_j_val_kt = tGrGfirst_1_j_kt.load()
+                            g_0_j_val = cute.exp2(gfirst_1_j_val_kt - g_0_j_val)
+                            tGrG_0_j.store(g_0_j_val)
+
+                            # S2R k_0_j
+                            sKqk_0_j = sKqk_slice[None, None, 0, (j0, j1)]
+                            tQKrKt_0_j = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_0_j))
+                            tQKsKt_0_j = Kt_thr_copy.partition_S(sKqk_0_j)
+                            tQKrKt_0_j_cv = Kt_thr_copy.retile(tQKrKt_0_j)
+                            cute.copy(Kt_tiled_copy, tQKsKt_0_j, tQKrKt_0_j_cv)
+
+                            # compute k_0_j * gktn_0_j
+                            k_0_j_val_kt = tQKrKt_0_j.load().to(cutlass.Float32)
+                            k_0_j_val_kt = k_0_j_val_kt * g_0_j_val
+                            k_0_j_val_kt = k_0_j_val_kt.to(self.io_dtype)
+                            tQKrKt_0_j.store(k_0_j_val_kt)
+
+                            # q_1_j/k_1_j @ k_0_j, accumulate acc_1_0
+                            cute.gemm(tiled_mma_subchunk, tQKrQK_1_0, tQKrQ_1_j, tQKrKt_0_j, tQKrQK_1_0)
+                            cute.gemm(tiled_mma_subchunk, tKKrKK_1_0, tQKrK_1_j, tQKrKt_0_j, tKKrKK_1_0)
+
+                            # S2R g_1_j_kt
+                            tGsG_1_j_kt = alpha_Kt_thr_copy.partition_S(sGqkq_1_j)
+                            tGrG_1_j_kt = cute.make_fragment_like(tv_layout_mma_B, dtype=self.g_dtype)
+                            tGrG_1_j_kt_cv = alpha_Kt_thr_copy.retile(tGrG_1_j_kt)
+                            cute.copy(alpha_Kt_tiled_copy, tGsG_1_j_kt, tGrG_1_j_kt_cv)
+
+                            # compute gktn_1_j = exp2(g_1_j_first - g_1_j), reuse g_1_j
+                            g_1_j_val_kt = tGrG_1_j_kt.load()
+                            g_1_j_val_kt = cute.exp2(gfirst_1_j_val_kt - g_1_j_val_kt)
+                            tGrG_1_j_kt.store(g_1_j_val_kt)
+
+                            # S2R k_1_j
+                            tQKrKt_1_j = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_1_j))
+                            tQKsKt_1_j = Kt_thr_copy.partition_S(sKqk_1_j)
+                            tQKrKt_1_j_cv = Kt_thr_copy.retile(tQKrKt_1_j)
+                            cute.copy(Kt_tiled_copy, tQKsKt_1_j, tQKrKt_1_j_cv)
+
+                            # compute k_1_j * gktn_1_j
+                            k_1_j_val_kt = tQKrKt_1_j.load().to(cutlass.Float32)
+                            k_1_j_val_kt = k_1_j_val_kt * g_1_j_val_kt
+                            k_1_j_val_kt = k_1_j_val_kt.to(self.io_dtype)
+                            tQKrKt_1_j.store(k_1_j_val_kt)
+
+                            # q_1_j/k_1_j @ k_1_j, accumulate acc_1_1
+                            cute.gemm(tiled_mma_subchunk, tQKrQK_1_1, tQKrQ_1_j, tQKrKt_1_j, tQKrQK_1_1)
+                            cute.gemm(tiled_mma_subchunk, tKKrKK_1_1, tQKrK_1_j, tQKrKt_1_j, tKKrKK_1_1)
+
+                        qk_1_0_val = tQKrQK_1_0.load()
+                        qk_1_0_val = qk_1_0_val * self.scale
+                        tQKrQK_1_0.store(qk_1_0_val)
+                        qk_1_1_val = tQKrQK_1_1.load()
+                        qk_1_1_val = qk_1_1_val * self.scale
+                        tQKrQK_1_1.store(qk_1_1_val)
                         # first subchunk, wait for data ready
-                        beta_handle = load_beta_consumer.wait_and_advance()
+                        beta_handle = load_beta_consumer.wait()
+                        # Fence due to normal load
+                        cute.arch.fence_proxy(
+                            cute.arch.ProxyKind.async_shared,
+                            space=cute.arch.SharedSpace.shared_cta,
+                        )
+                        sBeta_1 = sBeta_slice[None, 1]
+                        for i in cutlass.range_constexpr(cute.size(tQKcMqk_subchunk)):
+                            s, t = index_transform(*tQKcMqk_subchunk[i])
+                            b = sBeta_1[s]
+                            tKKrKK_1_0[i] *= b
+                            tKKrKK_1_1[i] *= b
+
+                        # R2S qk_1_0, kk_1_0
                         # first subchunk, acquire data
                         smem_kk_producer.acquire()
-
+                        self.r2s_subchunk_acc(1, 0, tKKrKK_1_0, sKK_inv_slice, 
+                            O_tiled_copy_kk, O_thr_copy_kk, self.inverse_dtype)
                         p_producer.acquire()
-                        # Q/K1@K0, Q/K1@K1 in tensor core
+                        self.r2s_subchunk_acc(1, 0, tQKrQK_1_0, sQK_slice, 
+                            O_tiled_copy, O_thr_copy, self.io_dtype)
+                        # R2S qk_1_1, kk_1_1
+                        self.r2s_subchunk_acc(1, 1, tKKrKK_1_1, sKK_inv_slice, 
+                            O_tiled_copy_kk, O_thr_copy_kk, self.inverse_dtype)
+                        self.r2s_subchunk_acc(1, 1, tQKrQK_1_1, sQK_slice, 
+                            O_tiled_copy, O_thr_copy, self.io_dtype)
+
+                        # Q/K2@K0, Q/K2@K1, Q/K2@K2
+                        tQKrQK_2_0 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tKKrKK_2_0 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tQKrQK_2_1 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tKKrKK_2_1 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tQKrQK_2_2 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        tKKrKK_2_2 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
+                        
+                        for j in cutlass.range_constexpr(self.NK_SC):
+                            # S2R g_2_j, g_2_j_first
+                            j0 = j % 2
+                            j1 = j // 2
+                            sGqkq_2_j = sGqkq_slice[None, None, 2, (0, j)]
+                            sG_first_2_j = cute.make_tensor(sGqkq_2_j.iterator, layout=layout_g_first)
+                            tGsG_2_j = alpha_Q_thr_copy.partition_S(sGqkq_2_j)
+                            tGsGfirst_2_j = alpha_Q_thr_copy.partition_S(sG_first_2_j)
+                            tGrG_2_j = cute.make_fragment_like(tv_layout_mma_A, dtype=self.g_dtype)
+                            tGrGfirst_2_j = cute.make_fragment_like(tv_layout_mma_A, dtype=self.g_dtype)
+                            tGrG_2_j_cv = alpha_Q_thr_copy.retile(tGrG_2_j)
+                            tGrGfirst_2_j_cv = alpha_Q_thr_copy.retile(tGrGfirst_2_j)
+                            cute.copy(alpha_Q_tiled_copy, tGsG_2_j, tGrG_2_j_cv)
+                            cute.copy(alpha_Q_tiled_copy, tGsGfirst_2_j, tGrGfirst_2_j_cv)
+
+                            # gqn_2_j = exp2(g_2_j - g_2_j_first[None, :]), reuse g_2_j
+                            g_2_j_val = tGrG_2_j.load()
+                            gfirst_2_j_val = tGrGfirst_2_j.load()
+                            g_2_j_val = cute.exp2(g_2_j_val - gfirst_2_j_val)
+                            tGrG_2_j.store(g_2_j_val)
+
+                            # S2R q_2_j, k_2_j
+                            sQqk_2_j = sQqk_slice[None, None, 2, (j0, j1)]
+                            sKqk_2_j = sKqk_slice[None, None, 2, (j0, j1)]
+                            tQKrQ_2_j = thr_mma_subchunk.make_fragment_A(thr_mma_subchunk.partition_A(sQqk_2_j))
+                            tQKrK_2_j = thr_mma_subchunk.make_fragment_A(thr_mma_subchunk.partition_A(sKqk_2_j))
+                            tQKsQ_2_j = Q_thr_copy.partition_S(sQqk_2_j)
+                            tQKsK_2_j = Q_thr_copy.partition_S(sKqk_2_j)
+                            tQKrQ_2_j_cv = Q_thr_copy.retile(tQKrQ_2_j)
+                            tQKrK_2_j_cv = Q_thr_copy.retile(tQKrK_2_j)
+                            cute.copy(Q_tiled_copy, tQKsQ_2_j, tQKrQ_2_j_cv)
+                            cute.copy(Q_tiled_copy, tQKsK_2_j, tQKrK_2_j_cv)
+
+                            # compute q_2_j/k_2_j * gqn_2_j, reuse q_2_j/k_2_j
+                            q_2_j_val = tQKrQ_2_j.load().to(cutlass.Float32)
+                            q_2_j_val = q_2_j_val * g_2_j_val
+                            q_2_j_val = q_2_j_val.to(self.io_dtype)
+                            tQKrQ_2_j.store(q_2_j_val)
+                            k_2_j_val = tQKrK_2_j.load().to(cutlass.Float32)
+                            k_2_j_val = k_2_j_val * g_2_j_val
+                            k_2_j_val = k_2_j_val.to(self.io_dtype)
+                            tQKrK_2_j.store(k_2_j_val)
+
+                            # S2R g_0_j, g_2_j_first again (different layouts for operand B)
+                            sGqkq_0_j = sGqkq_slice[None, None, 0, (0, j)]
+                            tGsG_0_j = alpha_Kt_thr_copy.partition_S(sGqkq_0_j)
+                            tGsGfirst_2_j_kt = alpha_Kt_thr_copy.partition_S(sG_first_2_j)
+                            tGrG_0_j = cute.make_fragment_like(tv_layout_mma_B, dtype=self.g_dtype)
+                            tGrGfirst_2_j_kt = cute.make_fragment_like(tv_layout_mma_B, dtype=self.g_dtype)
+                            tGrG_0_j_cv = alpha_Kt_thr_copy.retile(tGrG_0_j)
+                            tGrGfirst_2_j_kt_cv = alpha_Kt_thr_copy.retile(tGrGfirst_2_j_kt)
+                            cute.copy(alpha_Kt_tiled_copy, tGsG_0_j, tGrG_0_j_cv)
+                            cute.copy(alpha_Kt_tiled_copy, tGsGfirst_2_j_kt, tGrGfirst_2_j_kt_cv)
+
+                            # compute gktn_0_j = exp2(g_2_j_first - g_0_j), reuse g_0_j
+                            g_0_j_val = tGrG_0_j.load()
+                            gfirst_2_j_val_kt = tGrGfirst_2_j_kt.load()
+                            g_0_j_val = cute.exp2(gfirst_2_j_val_kt - g_0_j_val)
+                            tGrG_0_j.store(g_0_j_val)
+
+                            # S2R k_0_j
+                            sKqk_0_j = sKqk_slice[None, None, 0, (j0, j1)]
+                            tQKrKt_0_j = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_0_j))
+                            tQKsKt_0_j = Kt_thr_copy.partition_S(sKqk_0_j)
+                            tQKrKt_0_j_cv = Kt_thr_copy.retile(tQKrKt_0_j)
+                            cute.copy(Kt_tiled_copy, tQKsKt_0_j, tQKrKt_0_j_cv)
+
+                            # compute k_0_j * gktn_0_j
+                            k_0_j_val_kt = tQKrKt_0_j.load().to(cutlass.Float32)
+                            k_0_j_val_kt = k_0_j_val_kt * g_0_j_val
+                            k_0_j_val_kt = k_0_j_val_kt.to(self.io_dtype)
+                            tQKrKt_0_j.store(k_0_j_val_kt)
+
+                            # q_2_j/k_2_j @ k_0_j, accumulate acc_2_0
+                            cute.gemm(tiled_mma_subchunk, tQKrQK_2_0, tQKrQ_2_j, tQKrKt_0_j, tQKrQK_2_0)
+                            cute.gemm(tiled_mma_subchunk, tKKrKK_2_0, tQKrK_2_j, tQKrKt_0_j, tKKrKK_2_0)
+
+                            # S2R g_1_j_kt
+                            sGqkq_1_j = sGqkq_slice[None, None, 1, (0, j)]
+                            tGsG_1_j = alpha_Kt_thr_copy.partition_S(sGqkq_1_j)
+                            tGrG_1_j = cute.make_fragment_like(tv_layout_mma_B, dtype=self.g_dtype)
+                            tGrG_1_j_cv = alpha_Kt_thr_copy.retile(tGrG_1_j)
+                            cute.copy(alpha_Kt_tiled_copy, tGsG_1_j, tGrG_1_j_cv)
+
+                            # compute gktn_1_j = exp2(g_2_j_first - g_1_j), reuse g_1_j
+                            g_1_j_val = tGrG_1_j.load()
+                            g_1_j_val = cute.exp2(gfirst_2_j_val_kt - g_1_j_val)
+                            tGrG_1_j.store(g_1_j_val)
+
+                            # S2R k_1_j
+                            sKqk_1_j = sKqk_slice[None, None, 1, (j0, j1)]
+                            tQKrKt_1_j = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_1_j))
+                            tQKsKt_1_j = Kt_thr_copy.partition_S(sKqk_1_j)
+                            tQKrKt_1_j_cv = Kt_thr_copy.retile(tQKrKt_1_j)
+                            cute.copy(Kt_tiled_copy, tQKsKt_1_j, tQKrKt_1_j_cv)
+
+                            # compute k_1_j * gktn_1_j
+                            k_1_j_val_kt = tQKrKt_1_j.load().to(cutlass.Float32)
+                            k_1_j_val_kt = k_1_j_val_kt * g_1_j_val
+                            k_1_j_val_kt = k_1_j_val_kt.to(self.io_dtype)
+                            tQKrKt_1_j.store(k_1_j_val_kt)
+
+                            # q_2_j/k_2_j @ k_1_j, accumulate acc_2_1
+                            cute.gemm(tiled_mma_subchunk, tQKrQK_2_1, tQKrQ_2_j, tQKrKt_1_j, tQKrQK_2_1)
+                            cute.gemm(tiled_mma_subchunk, tKKrKK_2_1, tQKrK_2_j, tQKrKt_1_j, tKKrKK_2_1)
+
+                            # S2R g_2_j
+                            tGsG_2_j_kt = alpha_Kt_thr_copy.partition_S(sGqkq_2_j)
+                            tGrG_2_j_kt = cute.make_fragment_like(tv_layout_mma_B, dtype=self.g_dtype)
+                            tGrG_2_j_kt_cv = alpha_Kt_thr_copy.retile(tGrG_2_j_kt)
+                            cute.copy(alpha_Kt_tiled_copy, tGsG_2_j_kt, tGrG_2_j_kt_cv)
+
+                            # compute gktn_2_j = exp2(g_2_j_first - g_2_j), reuse g_2_j
+                            g_2_j_val_kt = tGrG_2_j_kt.load()
+                            g_2_j_val_kt = cute.exp2(gfirst_2_j_val_kt - g_2_j_val_kt)
+                            tGrG_2_j_kt.store(g_2_j_val_kt)
+
+                            # S2R k_2_j
+                            tQKrKt_2_j = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_2_j))
+                            tQKsKt_2_j = Kt_thr_copy.partition_S(sKqk_2_j)
+                            tQKrKt_2_j_cv = Kt_thr_copy.retile(tQKrKt_2_j)
+                            cute.copy(Kt_tiled_copy, tQKsKt_2_j, tQKrKt_2_j_cv)
+
+                            # compute k_2_j * gktn_2_j
+                            k_2_j_val_kt = tQKrKt_2_j.load().to(cutlass.Float32)
+                            k_2_j_val_kt = k_2_j_val_kt * g_2_j_val_kt
+                            k_2_j_val_kt = k_2_j_val_kt.to(self.io_dtype)
+                            tQKrKt_2_j.store(k_2_j_val_kt)
+
+                            # q_2_j/k_2_j @ k_2_j, accumulate acc_2_2
+                            cute.gemm(tiled_mma_subchunk, tQKrQK_2_2, tQKrQ_2_j, tQKrKt_2_j, tQKrQK_2_2)
+                            cute.gemm(tiled_mma_subchunk, tKKrKK_2_2, tQKrK_2_j, tQKrKt_2_j, tKKrKK_2_2)
+                            
+                        qk_2_0_val = tQKrQK_2_0.load()
+                        qk_2_0_val = qk_2_0_val * self.scale
+                        tQKrQK_2_0.store(qk_2_0_val)
+                        qk_2_1_val = tQKrQK_2_1.load()
+                        qk_2_1_val = qk_2_1_val * self.scale
+                        tQKrQK_2_1.store(qk_2_1_val)
+                        qk_2_2_val = tQKrQK_2_2.load()
+                        qk_2_2_val = qk_2_2_val * self.scale
+                        tQKrQK_2_2.store(qk_2_2_val)
+                        sBeta_2 = sBeta_slice[None, 2]
+                        for i in cutlass.range_constexpr(cute.size(tQKcMqk_subchunk)):
+                            s, t = index_transform(*tQKcMqk_subchunk[i])
+                            b = sBeta_2[s]
+                            tKKrKK_2_0[i] *= b
+                            tKKrKK_2_1[i] *= b
+                            tKKrKK_2_2[i] *= b
+
+                        # R2S qk_2_0, kk_2_0
+                        self.r2s_subchunk_acc(2, 0, tKKrKK_2_0, sKK_inv_slice, 
+                            O_tiled_copy_kk, O_thr_copy_kk, self.inverse_dtype)
+                        self.r2s_subchunk_acc(2, 0, tQKrQK_2_0, sQK_slice, 
+                            O_tiled_copy, O_thr_copy, self.io_dtype)
+                        # R2S qk_2_1, kk_2_1
+                        self.r2s_subchunk_acc(2, 1, tKKrKK_2_1, sKK_inv_slice, 
+                            O_tiled_copy_kk, O_thr_copy_kk, self.inverse_dtype)
+                        self.r2s_subchunk_acc(2, 1, tQKrQK_2_1, sQK_slice, 
+                            O_tiled_copy, O_thr_copy, self.io_dtype)
+                        # R2S qk_2_2, kk_2_2
+                        self.r2s_subchunk_acc(2, 2, tKKrKK_2_2, sKK_inv_slice, 
+                            O_tiled_copy_kk, O_thr_copy_kk, self.inverse_dtype)
+                        self.r2s_subchunk_acc(2, 2, tQKrQK_2_2, sQK_slice, 
+                            O_tiled_copy, O_thr_copy, self.io_dtype)
 
                         # release Q, K, G
                         g_handle.release()
                         q_handle.release()
                         k_handle.release()
-                        # release Beta
-                        beta_handle.release()
 
                     # wait for QK/KK ready
                     self.cuda_subchunk_wg_sync_barrier.arrive_and_wait()
@@ -3230,10 +3748,14 @@ class KDAChunkwise:
                     p_handle = p_producer.acquire_and_advance()
                     p_handle.commit()
 
-                    # inverse KK
+                    # TODO: inverse KK
 
                     smem_kk_handle = smem_kk_producer.acquire_and_advance()
                     smem_kk_handle.commit()
+
+                    # after inverse KK, release Beta
+                    beta_handle = load_beta_consumer.wait_and_advance()
+                    beta_handle.release()
 
             else:
                 for chunk_start in cutlass.range(0, S, C, unroll=0):
