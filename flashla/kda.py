@@ -2612,15 +2612,15 @@ class KDAChunkwise:
                     #     sM_f16_slice = cute.flat_divide(sM_f16[None, None, smem_kk_handle.index], tiler_acc_qk_kk)
                     #     cute.printf("sM_f16_0_0")
                     #     cute.print_tensor(sM_f16_slice[None, None, 0, 0])
-
                     curr_sM = sM[None, None, smem_kk_handle.index]
                     curr_sM_f16 = sM_f16[None, None, smem_kk_handle.index]
+                    if not cutlass.const_expr(self.safe_gate):
 
-                    self.compute_matrix_inverse_64x64(curr_sM_f16)
+                        self.compute_matrix_inverse_64x64(curr_sM_f16)
 
-                    # S2R, scale with beta, convert to BF16, store back to smem `sM`
-                    # TODO: make a repro for the cutedsl team
-                    self.scale_M_inverse_with_beta(local_tidx, sBeta, curr_sM_f16, curr_sM)
+                        # S2R, scale with beta, convert to BF16, store back to smem `sM`
+                        # TODO: make a repro for the cutedsl team
+                        self.scale_M_inverse_with_beta(local_tidx, sBeta, curr_sM_f16, curr_sM)
 
                     # Make sure the inverse is done.
                     if True or cutlass.const_expr(PRINT_DEBUG):
@@ -3746,11 +3746,27 @@ class KDAChunkwise:
 
                     # QK is ready to consume
                     p_handle = p_producer.acquire_and_advance()
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
                     p_handle.commit()
 
-                    # TODO: inverse KK
-
                     smem_kk_handle = smem_kk_producer.acquire_and_advance()
+                    # inverse KK
+                    curr_sM = sM[None, None, smem_kk_handle.index]
+                    curr_sM_f16 = sM_f16[None, None, smem_kk_handle.index]
+
+                    self.compute_matrix_inverse_64x64(curr_sM_f16)
+
+                    # S2R, scale with beta, convert to BF16, store back to smem `sM`
+                    # TODO: make a repro for the cutedsl team
+                    self.scale_M_inverse_with_beta(local_tidx, sBeta, curr_sM_f16, curr_sM)
+
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
                     smem_kk_handle.commit()
 
                     # after inverse KK, release Beta
