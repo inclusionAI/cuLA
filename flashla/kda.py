@@ -820,10 +820,10 @@ class KDAChunkwise:
             # Write to SMEM
             smem_kk_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
             # KV
-            kv_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
-            kv16_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
+            kv_mbar_ptr: cute.struct.MemRange[Int64, 1 * 2] # type: ignore
+            kv16_mbar_ptr: cute.struct.MemRange[Int64, 1 * 2] # type: ignore
             p_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
-            o_intra_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
+            o_intra_mbar_ptr: cute.struct.MemRange[Int64, 1 * 2] # type: ignore
             ks_mbar_ptr: cute.struct.MemRange[Int64, self.ks_stage * 2] # type: ignore
             o_inter_mbar_ptr: cute.struct.MemRange[Int64, 1 * 2] # type: ignore
             smem_o_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
@@ -1150,7 +1150,7 @@ class KDAChunkwise:
             barrier_storage=storage.smem_kk_mbar_ptr.data_ptr(),
         ).make_participants()
         o_intra_producer, o_intra_consumer = pipeline.PipelineUmmaAsync.create(
-            num_stages=self.acc_stage,
+            num_stages=1,
             producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             consumer_group=make_thread_cooperative_group(
                 self.threads_per_warp * len(self.cuda_warp_ids)
@@ -2984,7 +2984,7 @@ class KDAChunkwise:
                 # epilogue
                 tiled_mma_epi_fake = cute.make_tiled_mma(
                     mma_op,
-                    atom_layout_mnk=(4, 1, 1),
+                    atom_layout_mnk=(4, 1, 1), # NOTE: 4 warps to process QK&KK
                     permutation_mnk=self.qk_mma_tiler,
                 )
                 thr_mma_epi_fake = tiled_mma_epi_fake.get_slice(local_tidx)
