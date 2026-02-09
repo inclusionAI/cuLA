@@ -98,7 +98,7 @@ class Constant:
     SC = 16  # subchunk size
     D = 128  # head dim
     SCALE = float(D) ** -0.5
-    BK_SC = 32 # tile size in subchunk MMA
+    BK_SC = 64 # tile size in subchunk MMA
 
 class MaskEnum:
     """Enumeration for different mask types."""
@@ -182,7 +182,7 @@ class KDAChunkwise:
         SC, BK_SC = (Constant.SC, Constant.BK_SC)
         self.qk_kk_subchunk_mma_tiler = (SC, SC, BK_SC) # (M, N, K)
         self.NK_SC = D // BK_SC # number of iterations for MMA K dimension
-        assert self.NK_SC == 4 # FIXME: try smaller NK due to enough registers?
+        assert self.NK_SC == 2 # FIXME: try smaller NK due to enough registers?
 
         # one-cta cluster shape
         self.cluster_shape_mnk = (1, 1, 1)
@@ -3469,8 +3469,8 @@ class KDAChunkwise:
 
                     # subchunk computation
                     # divide input/output
-                    tiler_subchunk_alpha = (16, (32, 1))
-                    tiler_subchunk_qk = (16, (32, 1))
+                    tiler_subchunk_alpha = (16, (32, 2))
+                    tiler_subchunk_qk = (16, (64, 1))
                     tiler_subchunk_beta = (16, )
                     sQqk_curr = sQ_flat[None, None, load_q_consumer._PipelineConsumer__state.index]
                     sKqk_curr = sK_flat[None, None, load_k_consumer._PipelineConsumer__state.index]
@@ -3478,9 +3478,11 @@ class KDAChunkwise:
                     sBeta_curr = sBeta[None, load_beta_consumer._PipelineConsumer__state.index]
 
                     # (_16,(_32,_1),_4,(_2,_2)):(_64,(_1,_0),_1024,(_32,_4096))
+                    # (_16,(_32,_2),_4,(_1,_2)):(_32,(_1,_2048),_512,(_0,_4096)):
                     sQqk_slice = cute.flat_divide(sQqk_curr, tiler_subchunk_qk)
                     sKqk_slice = cute.flat_divide(sKqk_curr, tiler_subchunk_qk)
                     # (_16,(_32,_1),_4,(_1,_4)):(_32,(_1,_0),_512,(_0,_2048))
+                    # (_16,(_64,_1),_4,(_1,_2)):(_64,(_1,_0),_1024,(_0,_4096))
                     sGqkq_slice = cute.flat_divide(sGqkq_curr, tiler_subchunk_alpha)
                     sBeta_slice = cute.flat_divide(sBeta_curr, tiler_subchunk_beta)
 
@@ -3532,8 +3534,6 @@ class KDAChunkwise:
 
                         for j in cutlass.range_constexpr(self.NK_SC):
                             # S2R g_r_j, g_r_j_first
-                            j0 = j % 2
-                            j1 = j // 2
                             sGqkq_0_j = sGqkq_slice[None, None, 0, (0, j)]
                             sG_first_0_j = cute.make_tensor(sGqkq_0_j.iterator, layout=layout_g_first)
                             tGsG_0_j = alpha_Q_thr_copy.partition_S(sGqkq_0_j)
@@ -3552,8 +3552,8 @@ class KDAChunkwise:
                             tGrG_0_j.store(g_0_j_val)
 
                             # S2R q_0_j, k_0_j
-                            sQqk_0_j = sQqk_slice[None, None, 0, (j0, j1)]
-                            sKqk_0_j = sKqk_slice[None, None, 0, (j0, j1)]
+                            sQqk_0_j = sQqk_slice[None, None, 0, (0, j)]
+                            sKqk_0_j = sKqk_slice[None, None, 0, (0, j)]
                             tQKrQ_0_j = thr_mma_subchunk.make_fragment_A(thr_mma_subchunk.partition_A(sQqk_0_j))
                             tQKrK_0_j = thr_mma_subchunk.make_fragment_A(thr_mma_subchunk.partition_A(sKqk_0_j))
                             tQKsQ_0_j = Q_thr_copy.partition_S(sQqk_0_j)
@@ -3623,7 +3623,6 @@ class KDAChunkwise:
 
                         # R2S qk_0_0, kk_0_0
                         # first subchunk, acquire data
-                        # FIXME: replace with producer_acquire(state)
                         smem_kk_producer.acquire()
                         self.r2s_subchunk_acc(0, 0, tKKrKK_0_0, sKK_inv_slice, 
                             O_tiled_copy_kk, O_thr_copy_kk, self.inverse_dtype)
@@ -3641,11 +3640,9 @@ class KDAChunkwise:
                         tKKrKK_3_2 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
                         tQKrQK_3_3 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
                         tKKrKK_3_3 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
-                        
+
                         for j in cutlass.range_constexpr(self.NK_SC):
                             # S2R g_3_j, g_3_j_first
-                            j0 = j % 2
-                            j1 = j // 2
                             sGqkq_3_j = sGqkq_slice[None, None, 3, (0, j)]
                             sG_first_3_j = cute.make_tensor(sGqkq_3_j.iterator, layout=layout_g_first)
                             tGsG_3_j = alpha_Q_thr_copy.partition_S(sGqkq_3_j)
@@ -3664,8 +3661,8 @@ class KDAChunkwise:
                             tGrG_3_j.store(g_3_j_val)
 
                             # S2R q_3_j, k_3_j
-                            sQqk_3_j = sQqk_slice[None, None, 3, (j0, j1)]
-                            sKqk_3_j = sKqk_slice[None, None, 3, (j0, j1)]
+                            sQqk_3_j = sQqk_slice[None, None, 3, (0, j)]
+                            sKqk_3_j = sKqk_slice[None, None, 3, (0, j)]
                             tQKrQ_3_j = thr_mma_subchunk.make_fragment_A(thr_mma_subchunk.partition_A(sQqk_3_j))
                             tQKrK_3_j = thr_mma_subchunk.make_fragment_A(thr_mma_subchunk.partition_A(sKqk_3_j))
                             tQKsQ_3_j = Q_thr_copy.partition_S(sQqk_3_j)
@@ -3703,7 +3700,7 @@ class KDAChunkwise:
                             tGrG_0_j.store(g_0_j_val)
 
                             # S2R k_0_j
-                            sKqk_0_j = sKqk_slice[None, None, 0, (j0, j1)]
+                            sKqk_0_j = sKqk_slice[None, None, 0, (0, j)]
                             tQKrKt_0_j = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_0_j))
                             tQKsKt_0_j = Kt_thr_copy.partition_S(sKqk_0_j)
                             tQKrKt_0_j_cv = Kt_thr_copy.retile(tQKrKt_0_j)
@@ -3732,7 +3729,7 @@ class KDAChunkwise:
                             tGrG_1_j.store(g_1_j_val)
 
                             # S2R k_1_j
-                            sKqk_1_j = sKqk_slice[None, None, 1, (j0, j1)]
+                            sKqk_1_j = sKqk_slice[None, None, 1, (0, j)]
                             tQKrKt_1_j = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_1_j))
                             tQKsKt_1_j = Kt_thr_copy.partition_S(sKqk_1_j)
                             tQKrKt_1_j_cv = Kt_thr_copy.retile(tQKrKt_1_j)
@@ -3761,7 +3758,7 @@ class KDAChunkwise:
                             tGrG_2_j_kt.store(g_2_j_val_kt)
 
                             # S2R k_2_j
-                            sKqk_2_j = sKqk_slice[None, None, 2, (j0, j1)]
+                            sKqk_2_j = sKqk_slice[None, None, 2, (0, j)]
                             tQKrKt_2_j = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_2_j))
                             tQKsKt_2_j = Kt_thr_copy.partition_S(sKqk_2_j)
                             tQKrKt_2_j_cv = Kt_thr_copy.retile(tQKrKt_2_j)
@@ -3866,8 +3863,6 @@ class KDAChunkwise:
 
                         for j in cutlass.range_constexpr(self.NK_SC):
                             # S2R g_1_j, g_1_j_first
-                            j0 = j % 2
-                            j1 = j // 2
                             sGqkq_1_j = sGqkq_slice[None, None, 1, (0, j)]
                             sG_first_1_j = cute.make_tensor(sGqkq_1_j.iterator, layout=layout_g_first)
                             tGsG_1_j = alpha_Q_thr_copy.partition_S(sGqkq_1_j)
@@ -3886,8 +3881,8 @@ class KDAChunkwise:
                             tGrG_1_j.store(g_1_j_val)
 
                             # S2R q_1_j, k_1_j
-                            sQqk_1_j = sQqk_slice[None, None, 1, (j0, j1)]
-                            sKqk_1_j = sKqk_slice[None, None, 1, (j0, j1)]
+                            sQqk_1_j = sQqk_slice[None, None, 1, (0, j)]
+                            sKqk_1_j = sKqk_slice[None, None, 1, (0, j)]
                             tQKrQ_1_j = thr_mma_subchunk.make_fragment_A(thr_mma_subchunk.partition_A(sQqk_1_j))
                             tQKrK_1_j = thr_mma_subchunk.make_fragment_A(thr_mma_subchunk.partition_A(sKqk_1_j))
                             tQKsQ_1_j = Q_thr_copy.partition_S(sQqk_1_j)
@@ -3925,7 +3920,7 @@ class KDAChunkwise:
                             tGrG_0_j.store(g_0_j_val)
 
                             # S2R k_0_j
-                            sKqk_0_j = sKqk_slice[None, None, 0, (j0, j1)]
+                            sKqk_0_j = sKqk_slice[None, None, 0, (0, j)]
                             tQKrKt_0_j = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_0_j))
                             tQKsKt_0_j = Kt_thr_copy.partition_S(sKqk_0_j)
                             tQKrKt_0_j_cv = Kt_thr_copy.retile(tQKrKt_0_j)
@@ -4012,8 +4007,6 @@ class KDAChunkwise:
                         
                         for j in cutlass.range_constexpr(self.NK_SC):
                             # S2R g_2_j, g_2_j_first
-                            j0 = j % 2
-                            j1 = j // 2
                             sGqkq_2_j = sGqkq_slice[None, None, 2, (0, j)]
                             sG_first_2_j = cute.make_tensor(sGqkq_2_j.iterator, layout=layout_g_first)
                             tGsG_2_j = alpha_Q_thr_copy.partition_S(sGqkq_2_j)
@@ -4032,8 +4025,8 @@ class KDAChunkwise:
                             tGrG_2_j.store(g_2_j_val)
 
                             # S2R q_2_j, k_2_j
-                            sQqk_2_j = sQqk_slice[None, None, 2, (j0, j1)]
-                            sKqk_2_j = sKqk_slice[None, None, 2, (j0, j1)]
+                            sQqk_2_j = sQqk_slice[None, None, 2, (0, j)]
+                            sKqk_2_j = sKqk_slice[None, None, 2, (0, j)]
                             tQKrQ_2_j = thr_mma_subchunk.make_fragment_A(thr_mma_subchunk.partition_A(sQqk_2_j))
                             tQKrK_2_j = thr_mma_subchunk.make_fragment_A(thr_mma_subchunk.partition_A(sKqk_2_j))
                             tQKsQ_2_j = Q_thr_copy.partition_S(sQqk_2_j)
@@ -4071,7 +4064,7 @@ class KDAChunkwise:
                             tGrG_0_j.store(g_0_j_val)
 
                             # S2R k_0_j
-                            sKqk_0_j = sKqk_slice[None, None, 0, (j0, j1)]
+                            sKqk_0_j = sKqk_slice[None, None, 0, (0, j)]
                             tQKrKt_0_j = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_0_j))
                             tQKsKt_0_j = Kt_thr_copy.partition_S(sKqk_0_j)
                             tQKrKt_0_j_cv = Kt_thr_copy.retile(tQKrKt_0_j)
@@ -4100,7 +4093,7 @@ class KDAChunkwise:
                             tGrG_1_j.store(g_1_j_val)
 
                             # S2R k_1_j
-                            sKqk_1_j = sKqk_slice[None, None, 1, (j0, j1)]
+                            sKqk_1_j = sKqk_slice[None, None, 1, (0, j)]
                             tQKrKt_1_j = thr_mma_subchunk.make_fragment_B(thr_mma_subchunk.partition_B(sKqk_1_j))
                             tQKsKt_1_j = Kt_thr_copy.partition_S(sKqk_1_j)
                             tQKrKt_1_j_cv = Kt_thr_copy.retile(tQKrKt_1_j)
