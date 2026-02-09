@@ -3532,7 +3532,7 @@ class KDAChunkwise:
                         q_handle = load_q_consumer.wait_and_advance()
                         k_handle = load_k_consumer.wait_and_advance()
 
-                        for j0 in range(self.NK_SC):
+                        for j0 in cutlass.range(self.NK_SC):
                             # S2R g_r_j0, g_r_j0_first
                             sGqkq_0_j0 = sGqkq_slice[None, None, 0, (0, j0)]
                             sG_first_0_j0 = cute.make_tensor(sGqkq_0_j0.iterator, layout=layout_g_first)
@@ -4006,7 +4006,7 @@ class KDAChunkwise:
                         tQKrQK_2_2 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
                         tKKrKK_2_2 = self.mma_sync_partition_c(tiled_mma_subchunk, self.qk_kk_subchunk_mma_tiler, zero_fill=True)
                         
-                        for j3 in range(self.NK_SC):
+                        for j3 in cutlass.range(self.NK_SC):
                             # S2R g_2_j3, g_2_j3_first
                             sGqkq_2_j3 = sGqkq_slice[None, None, 2, (0, j3)]
                             sG_first_2_j3 = cute.make_tensor(sGqkq_2_j3.iterator, layout=layout_g_first)
