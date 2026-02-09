@@ -456,6 +456,7 @@ def test_random_stress(
         print("PASSED")
     else:
         print("FAILED")
+        fail_diff.sort(reverse=True)
         print(f"failed counts: {len(fail_diff)}")
         print("failed postitions", fail_diff)
 
@@ -536,6 +537,7 @@ def test_dumped_stress(dump_path: str = "/tmp/kda_debug/dumped.pt"):
         print("PASSED")
     else:
         print("FAILED")
+        fail_diff.sort(reverse=True)
         print(f"failed counts: {len(fail_diff)}")
         print("failed diff", fail_diff)
     

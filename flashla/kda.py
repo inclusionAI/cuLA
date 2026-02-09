@@ -2617,6 +2617,11 @@ class KDAChunkwise:
 
                     # wait V
                     v_handle = load_v_consumer.wait_and_advance()
+                    # self.cuda_wg_sync_barrier.arrive_and_wait()
+                    # if should_debug2:
+                    #     cute.printf("chunk idx={}, V:", idx)
+                    #     cute.print_tensor(sV_flat_s2r[None, None, v_handle.index])
+                    # self.cuda_wg_sync_barrier.arrive_and_wait()
 
                     if idx != 0: 
                         # load V to reg
@@ -2699,11 +2704,12 @@ class KDAChunkwise:
                         cute.arch.ProxyKind.async_shared,
                         space=cute.arch.SharedSpace.shared_cta,
                     )
-                    # FIXME: NewV NAN race condition?
+                    # FIXME: when printing, accuracy issues, Why?
                     # self.cuda_wg_sync_barrier.arrive_and_wait()
                     # if should_debug2:
                     #     cute.printf("chunk idx={}, NewV:", idx)
-                    #     cute.print_tensor(sV_epi[None, None, pseudo_v_stage_idx])
+                    #     cute.print_tensor(sV_epi[None, None, v3_handle.index])
+                    # self.cuda_wg_sync_barrier.arrive_and_wait()
                     v3_handle.commit()
 
                     # decay S, S=S*g_last
@@ -2774,13 +2780,14 @@ class KDAChunkwise:
                     o_intra_handle.release()
 
                     if idx != 0:
-                        o_inter_handle = o_inter_consumer.wait_and_advance()
                         # T2R Q@S (O_inter)
-                        tTR_tAcc_sq_i = tTR_tAcc_base_sq[(None, None, None, 0, 0, o_inter_handle.index)]
+                        # NOTE: stage=1, always 0
+                        tTR_tAcc_sq_i = tTR_tAcc_base_sq[(None, None, None, 0, 0, 0)]
                         # Load O_INTER from TMEM to RMEM
                         cute.copy(tiled_copy_t2r_sq, tTR_tAcc_sq_i, tTR_rAcc_sq)
                         cute.arch.fence_view_async_tmem_load()
-                        o_inter_handle.release()
+                        o_inter_consumer.release()
+                        o_inter_consumer.advance()
 
                     # O=O1+O2
                     acc_vec = tTR_rAcc_pv.load()
@@ -3479,10 +3486,15 @@ class KDAChunkwise:
 
                     # Acc results
                     tiler_acc_qk_kk = (16, 16)
-                    sQK_curr = sQK_flat[None, None, p_producer._PipelineProducer__state.index]
+                    p_stage_idx = p_producer._PipelineProducer__state.index
+                    smem_kk_stage_idx = smem_kk_producer._PipelineProducer__state.index
+                    sQK_curr = sQK_flat[None, None, p_stage_idx]
                     sQK_slice = cute.flat_divide(sQK_curr, tiler_acc_qk_kk)
-                    sKK_inv_curr = sM_f16_flat[None, None, smem_kk_producer._PipelineProducer__state.index]
+                    sKK_inv_curr = sM_f16_flat[None, None, smem_kk_stage_idx]
                     sKK_inv_slice = cute.flat_divide(sKK_inv_curr, tiler_acc_qk_kk)
+                    curr_sM = sM[None, None, smem_kk_stage_idx]
+                    curr_sM_f16 = sM_f16[None, None, smem_kk_stage_idx]
+
 
                     # if should_debug:
                     #     cute.printf("q_pipe={}", load_q_consumer._PipelineConsumer__state.index)
@@ -4191,18 +4203,14 @@ class KDAChunkwise:
                     #     cute.print_tensor(sQK_slice[None, None, 0, 0])
 
                     # QK is ready to consume
-                    p_handle = p_producer.acquire_and_advance()
                     cute.arch.fence_proxy(
                         cute.arch.ProxyKind.async_shared,
                         space=cute.arch.SharedSpace.shared_cta,
                     )
-                    p_handle.commit()
+                    p_producer.commit()
+                    p_producer.advance()
 
-                    smem_kk_handle = smem_kk_producer.acquire_and_advance()
                     # inverse KK
-                    curr_sM = sM[None, None, smem_kk_handle.index]
-                    curr_sM_f16 = sM_f16[None, None, smem_kk_handle.index]
-
                     self.compute_matrix_inverse_64x64(curr_sM_f16)
 
                     # S2R, scale with beta, convert to BF16, store back to smem `sM`
@@ -4213,15 +4221,16 @@ class KDAChunkwise:
                         cute.arch.ProxyKind.async_shared,
                         space=cute.arch.SharedSpace.shared_cta,
                     )
-                    smem_kk_handle.commit()
+                    smem_kk_producer.commit()
+                    smem_kk_producer.advance()
                     # self.cuda_subchunk_wg_sync_barrier.arrive_and_wait()
                     # if should_debug:
                     #     cute.printf("chunk_idx={}, inv(KK)={}", idx, smem_kk_handle.index)
                     #     cute.print_tensor(curr_sM)
 
                     # after inverse KK, release Beta
-                    beta_handle = load_beta_consumer.wait_and_advance()
-                    beta_handle.release()
+                    load_beta_consumer.release()
+                    load_beta_consumer.advance()
 
             else:
                 for chunk_start in cutlass.range(0, S, C, unroll=0):
