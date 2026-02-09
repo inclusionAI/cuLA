@@ -1,5 +1,6 @@
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+import math
 
 import torch
 import torch.nn.functional as F
@@ -449,16 +450,40 @@ def test_random_stress(
     passed = True
     fail_diff = []
     for i in range(len(err_ratio_list)):
-        if err_ratio_list[i] > 1e-8:
+        if err_ratio_list[i] > 1e-8 or math.isnan(err_ratio_list[i]):
             passed = False
             fail_diff.append(err_ratio_list[i])
     if passed:
         print("PASSED")
     else:
-        print("FAILED")
         fail_diff.sort(reverse=True)
+        print("failed diff", fail_diff)
         print(f"failed counts: {len(fail_diff)}")
-        print("failed postitions", fail_diff)
+        print("FAILED")
+
+    from fla.ops.kda.gate import naive_kda_lowerbound_gate
+    naive_kda_gate_fn = naive_kda_lowerbound_gate if safe_gate else naive_kda_gate
+
+    print("\n=== Running naive_recurrent_kda ===")
+    set_seed(SEED)
+    ref, ref_ht = naive_recurrent_kda(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        g=(naive_kda_gate_fn(g.clone(), A_log, dt_bias) if use_gate_in_kernel else g.clone()),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+    )
+    print(f"ref shape: {ref.shape}, has nan: {torch.isnan(ref).any()}")
+
+    print("\n=== Accuracy ===")
+    abs_err = get_abs_err(ref_tri, ref)
+    err_ratio = get_err_ratio(ref_tri, ref)
+    print(f"Absolute error: {abs_err:.6e}, Relative error: {err_ratio:.6e}")
+    
+    assert_close("o", ref, ref_tri, 0.005)
 
 # Stress test with dumped tensors
 def test_dumped_stress(dump_path: str = "/tmp/kda_debug/dumped.pt"):
@@ -530,38 +555,37 @@ def test_dumped_stress(dump_path: str = "/tmp/kda_debug/dumped.pt"):
     passed = True
     fail_diff = []
     for i in range(len(err_ratio_list)):
-        if err_ratio_list[i] > 1e-8:
+        if err_ratio_list[i] > 1e-8 or math.isnan(err_ratio_list[i]):
             passed = False
             fail_diff.append(err_ratio_list[i])
     if passed:
         print("PASSED")
     else:
-        print("FAILED")
         fail_diff.sort(reverse=True)
-        print(f"failed counts: {len(fail_diff)}")
         print("failed diff", fail_diff)
+        print(f"failed counts: {len(fail_diff)}")
+        print("FAILED")
     
-    # print("\n=== Running naive_recurrent_kda ===")
-    # ref, ref_ht = naive_recurrent_kda(
-    #     q=F.normalize(q.clone(), p=2, dim=-1),
-    #     k=F.normalize(k.clone(), p=2, dim=-1),
-    #     v=v.clone(),
-    #     g=(naive_kda_gate_fn(g.clone(), A_log, dt_bias) if use_gate_in_kernel else g.clone()),
-    #     beta=beta.clone(),
-    #     scale=scale,
-    #     initial_state=initial_state,
-    #     output_final_state=output_final_state,
-    # )
-    # print(f"ref shape: {ref.shape}, has nan: {torch.isnan(ref).any()}")
-    # print(ref)
+    print("\n=== Running naive_recurrent_kda ===")
+    set_seed(SEED)
+    ref, ref_ht = naive_recurrent_kda(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        g=(naive_kda_gate_fn(g.clone(), A_log, dt_bias) if use_gate_in_kernel else g.clone()),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+    )
+    print(f"ref shape: {ref.shape}, has nan: {torch.isnan(ref).any()}")
 
-    # print("\n=== Accuracy ===")
-    # abs_err = get_abs_err(tri, ref)
-    # err_ratio = get_err_ratio(tri, ref)
-    # print(f"Absolute error: {abs_err:.6e}, Relative error: {err_ratio:.6e}")
+    print("\n=== Accuracy ===")
+    abs_err = get_abs_err(ref_tri, ref)
+    err_ratio = get_err_ratio(ref_tri, ref)
+    print(f"Absolute error: {abs_err:.6e}, Relative error: {err_ratio:.6e}")
     
-    # assert_close("o", ref, tri, 0.005)
-    # print("PASSED!")
+    assert_close("o", ref, ref_tri, 0.005)
 
 if __name__ == "__main__":
     test_accuracy()
