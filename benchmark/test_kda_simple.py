@@ -372,5 +372,196 @@ def test_accuracy():
         assert_close("State accuracy: naive vs. flashkda", final_states_naive, final_states, 1e5)
         assert_close("State accuracy: fla vs. flashkda", final_states_fla, final_states, 1e5)
 
+# Stress test with random tensors
+def test_random_stress(
+    B: int = 2,
+    T: int = 2048,
+    H: int = 8,
+    D: int = 128,
+    n_repeat: int = 10000,
+    use_gate_in_kernel: bool = True,
+    safe_gate: bool = True,
+    use_qk_l2norm_in_kernel: bool = True,
+    initial_state = None,
+    output_final_state: bool = False,
+    lower_bound: float = -5.0,
+):
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+    set_seed(SEED)
+
+    seq_lens = [T] * B
+    num_seqs = len(seq_lens) # TODO: support varlen
+    assert num_seqs == B
+
+    scale = D ** (-0.5)
+    q = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
+    k = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
+    v = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
+    g = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
+    beta = torch.randn(B, T, H, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
+    # cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64, device=device)
+    # init_state = torch.randn(B, H, D, D, dtype=torch.float, device=device)
+
+    if use_gate_in_kernel:
+      A_log = torch.randn(H, dtype=torch.float)
+      dt_bias = torch.randn(H * D, dtype=torch.float)
+      A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(False), (A_log, dt_bias))
+    else:
+      g = F.logsigmoid(g)
+
+    if safe_gate:
+        lower_bound = -5.0
+        if not use_gate_in_kernel:
+            g = g.clamp(-5, 0)
+    else:
+        lower_bound = None
+
+    ref_tri = None
+    err_ratio_list = []
+    for i in range(n_repeat):
+        set_seed(SEED)
+        tri, tri_ht = flash_kda_prefill(
+            q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
+            k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),
+            v=v.clone(),
+            g=g.clone(),
+            beta=beta.clone(),
+            A_log=(A_log.clone() if A_log is not None else None),
+            dt_bias=(dt_bias.clone() if dt_bias is not None else None),
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=None,
+            use_gate_in_kernel=use_gate_in_kernel,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+        )
+        if i == 0:
+           ref_tri = tri.clone().detach()
+        err_ratio = get_err_ratio(tri, ref_tri)
+        print(f"tri shape: {tri.shape}, has nan: {torch.isnan(tri).any()}")
+        print(f"Iteration {i}: Relative error to first iter: {err_ratio:.6e}")
+        err_ratio_list.append(err_ratio)
+
+    # test if passed
+    passed = True
+    fail_diff = []
+    for i in range(len(err_ratio_list)):
+        if err_ratio_list[i] > 1e-8:
+            passed = False
+            fail_diff.append(err_ratio_list[i])
+    if passed:
+        print("PASSED")
+    else:
+        print("FAILED")
+        print(f"failed counts: {len(fail_diff)}")
+        print("failed postitions", fail_diff)
+
+# Stress test with dumped tensors
+def test_dumped_stress(dump_path: str = "/tmp/kda_debug/dumped.pt"):
+    from fla.ops.kda.gate import naive_kda_lowerbound_gate
+    
+    print(f"Loading dumped tensors from: {dump_path}")
+    device = torch.device("cuda")
+    data = torch.load(dump_path, map_location=device)
+    n_repeat = 10000
+    
+    print("\n=== Loaded Tensors ===")
+    for name, value in data.items():
+        if isinstance(value, torch.Tensor):
+            print(f"{name}: shape={value.shape}, dtype={value.dtype}")
+            print(f"  range: [{value.min():.6f}, {value.max():.6f}], nan: {torch.isnan(value).any()}")
+        else:
+            print(f"{name}: {value}")
+    
+    q = data["q"]
+    k = data["k"]
+    v = data["v"]
+    g = data["g"]
+    beta = data["beta"]
+    A_log = data.get("A_log", None)
+    dt_bias = data.get("dt_bias", None)
+    scale = data.get("scale", q.shape[-1] ** (-0.5))
+    use_gate_in_kernel = data.get("use_gate_in_kernel", False)
+    use_qk_l2norm_in_kernel = data.get("use_qk_l2norm_in_kernel", False)
+    safe_gate = data.get("safe_gate", False)
+    lower_bound = data.get("lower_bound", None)
+    output_final_state = data.get("output_final_state", False)
+    initial_state = data.get("initial_state", None)
+
+    print(f"\n=== Parameters ===")
+    print(f"scale={scale}, use_gate_in_kernel={use_gate_in_kernel}, safe_gate={safe_gate}, lower_bound={lower_bound}")
+    
+    naive_kda_gate_fn = naive_kda_lowerbound_gate if safe_gate else naive_kda_gate
+    
+    print("\n=== Running flash_kda_prefill ===")
+    err_ratio_list = []
+    ref_tri = None
+    for i in range(n_repeat):
+        set_seed(SEED)
+        tri, tri_ht = flash_kda_prefill(
+            q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
+            k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),
+            v=v.clone(),
+            g=g.clone(),
+            beta=beta.clone(),
+            A_log=(A_log.clone() if A_log is not None else None),
+            dt_bias=(dt_bias.clone() if dt_bias is not None else None),
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=None,
+            use_gate_in_kernel=use_gate_in_kernel,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+        )
+        if i == 0:
+           ref_tri = tri.clone().detach()
+        err_ratio = get_err_ratio(tri, ref_tri)
+        print(f"tri shape: {tri.shape}, has nan: {torch.isnan(tri).any()}")
+        print(f"Iteration {i}: Relative error to first iter: {err_ratio:.6e}")
+        err_ratio_list.append(err_ratio)
+    
+    # test if passed
+    passed = True
+    fail_diff = []
+    for i in range(len(err_ratio_list)):
+        if err_ratio_list[i] > 1e-8:
+            passed = False
+            fail_diff.append(err_ratio_list[i])
+    if passed:
+        print("PASSED")
+    else:
+        print("FAILED")
+        print(f"failed counts: {len(fail_diff)}")
+        print("failed diff", fail_diff)
+    
+    # print("\n=== Running naive_recurrent_kda ===")
+    # ref, ref_ht = naive_recurrent_kda(
+    #     q=F.normalize(q.clone(), p=2, dim=-1),
+    #     k=F.normalize(k.clone(), p=2, dim=-1),
+    #     v=v.clone(),
+    #     g=(naive_kda_gate_fn(g.clone(), A_log, dt_bias) if use_gate_in_kernel else g.clone()),
+    #     beta=beta.clone(),
+    #     scale=scale,
+    #     initial_state=initial_state,
+    #     output_final_state=output_final_state,
+    # )
+    # print(f"ref shape: {ref.shape}, has nan: {torch.isnan(ref).any()}")
+    # print(ref)
+
+    # print("\n=== Accuracy ===")
+    # abs_err = get_abs_err(tri, ref)
+    # err_ratio = get_err_ratio(tri, ref)
+    # print(f"Absolute error: {abs_err:.6e}, Relative error: {err_ratio:.6e}")
+    
+    # assert_close("o", ref, tri, 0.005)
+    # print("PASSED!")
+
 if __name__ == "__main__":
     test_accuracy()
+    # test_dumped_stress("B4-T2048-H8-D128-scale0.1-gate_logit_normalizer1-mask_p0-qk_l2normFalse-gateTrue-dtypetorch.bfloat16-safe_gateTrue.pt")
+    # test_random_stress()
