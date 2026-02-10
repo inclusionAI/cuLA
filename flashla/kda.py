@@ -182,7 +182,7 @@ class KDAChunkwise:
         SC, BK_SC = (Constant.SC, Constant.BK_SC)
         self.qk_kk_subchunk_mma_tiler = (SC, SC, BK_SC) # (M, N, K)
         self.NK_SC = D // BK_SC # number of iterations for MMA K dimension
-        assert self.NK_SC == 2 # FIXME: try smaller NK due to enough registers?
+        assert self.NK_SC == 2
 
         # one-cta cluster shape
         self.cluster_shape_mnk = (1, 1, 1)
@@ -810,7 +810,6 @@ class KDAChunkwise:
             end_v_mbar_ptr: cute.struct.MemRange[Int64, self.v_stage * 2] # type: ignore
             load_g_mbar_ptr: cute.struct.MemRange[Int64, self.g_stage * 2] # type: ignore  # NEW for KDA
             load_beta_mbar_ptr: cute.struct.MemRange[Int64, self.beta_stage * 2] # type: ignore
-            load_q_k_scaled_mbar_ptr: cute.struct.MemRange[Int64, self.q_k_scaled_stage * 2] # type: ignore
             load_q_scaled_mbar_ptr: cute.struct.MemRange[Int64, self.q_k_scaled_stage * 2] # type: ignore
             load_k_scaled_mbar_ptr: cute.struct.MemRange[Int64, self.q_k_scaled_stage * 2] # type: ignore
             load_k_scaled2_mbar_ptr: cute.struct.MemRange[Int64, self.q_k_scaled_stage * 2] # type: ignore
@@ -1091,16 +1090,6 @@ class KDAChunkwise:
             barrier_storage=storage.load_beta_mbar_ptr.data_ptr(),
         ).make_participants()
         # for Q/K prologue and Q@S, K@S, K^T@NewV MMA
-        load_q_k_scaled_producer, load_q_k_scaled_consumer = pipeline.PipelineAsyncUmma.create(
-            num_stages=self.q_k_scaled_stage,
-            producer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.cuda_warp_ids)
-            ),
-            consumer_group=make_thread_cooperative_group(
-                len([self.mma_warp_id])
-            ),
-            barrier_storage=storage.load_q_k_scaled_mbar_ptr.data_ptr(),
-        ).make_participants()
         load_q_scaled_producer, load_q_scaled_consumer = pipeline.PipelineAsyncUmma.create(
             num_stages=self.q_k_scaled_stage,
             producer_group=make_thread_cooperative_group(
@@ -2343,6 +2332,7 @@ class KDAChunkwise:
             #-------------------------------------------------------
             # G (gate/g_cumsum) - NEW for KDA Step 1
 
+            # TODO: replace these partitions with Ampere-MMA based partition, better perf
             shape_g = (Constant.C, Constant.D)
             # LOAD AS F32
             (
@@ -2393,17 +2383,6 @@ class KDAChunkwise:
                 print(f"tRS_sQ: {tRS_sQ}")
                 print(f"tRS_rQ: {tRS_rQ}")
             #-------------------------------------------------------
-            # scaled Q/K partitions
-            (
-                tiled_s2r_q_k_scaled,
-                thr_s2r_q_k_scaled,
-                tRS_sQ_K_scaled, # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N, INPUT_STAGE)
-                tRS_rQ_K_scaled, # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
-            ) = self.make_s2r_partitions_prologue(
-                local_tidx,
-                sQ_K_scaled_flat,
-                shape_q,
-            )
 
             #-------------------------------------------------------
             # K s2r partitions - NEW for KDA elementwise processing
@@ -2451,6 +2430,7 @@ class KDAChunkwise:
                 acc_dtype=self.acc_dtype,
                 shape_mnk=(16, 8, 16)
             )
+            # TODO: replace with smaller BK for head dim, maybe better perf
             tiled_mma_epi_fake = cute.make_tiled_mma(
                 mma_op,
                 atom_layout_mnk=(4, 1, 1), # NOTE: 4 warps to process prologue
@@ -2737,6 +2717,7 @@ class KDAChunkwise:
                     kv_decay_handle.commit()
 
                     # load K, G, exp(g_last-g)*K
+                    # TODO: can we have a better implementation here? maybe better perf
                     tQrG = cute.make_fragment_like(tQrQ_0, dtype=self.g_dtype)
                     tQrG_cv = thr_load_g.retile(tQrG)
                     cute.copy(tiled_load_g, tQsG[None, None, None, g_stage_idx], tQrG_cv)
@@ -3463,7 +3444,6 @@ class KDAChunkwise:
                 cM = cute.make_identity_tensor(self.qk_mma_tiler[:2])
                 tQKcMqk = thr_mma_epi_fake.partition_C(cM)
 
-                # TODO: implement subchunk first, easier for debugging
                 for chunk_start in cutlass.range(0, S, C, unroll=0):
                     idx = chunk_start // C
 
@@ -3472,16 +3452,15 @@ class KDAChunkwise:
                     tiler_subchunk_alpha = (16, (32, 2))
                     tiler_subchunk_qk = (16, (64, 1))
                     tiler_subchunk_beta = (16, )
+                    # TODO: change to pipeline.PipelineState declaration, hack currently
                     sQqk_curr = sQ_flat[None, None, load_q_consumer._PipelineConsumer__state.index]
                     sKqk_curr = sK_flat[None, None, load_k_consumer._PipelineConsumer__state.index]
                     sGqkq_curr = sG_flat[None, None, load_g_consumer._PipelineConsumer__state.index]
                     sBeta_curr = sBeta[None, load_beta_consumer._PipelineConsumer__state.index]
 
-                    # (_16,(_32,_1),_4,(_2,_2)):(_64,(_1,_0),_1024,(_32,_4096))
-                    # (_16,(_32,_2),_4,(_1,_2)):(_32,(_1,_2048),_512,(_0,_4096)):
+                    # (_16,(_32,_2),_4,(_1,_2)):(_32,(_1,_2048),_512,(_0,_4096))
                     sQqk_slice = cute.flat_divide(sQqk_curr, tiler_subchunk_qk)
                     sKqk_slice = cute.flat_divide(sKqk_curr, tiler_subchunk_qk)
-                    # (_16,(_32,_1),_4,(_1,_4)):(_32,(_1,_0),_512,(_0,_2048))
                     # (_16,(_64,_1),_4,(_1,_2)):(_64,(_1,_0),_1024,(_0,_4096))
                     sGqkq_slice = cute.flat_divide(sGqkq_curr, tiler_subchunk_alpha)
                     sBeta_slice = cute.flat_divide(sBeta_curr, tiler_subchunk_beta)
