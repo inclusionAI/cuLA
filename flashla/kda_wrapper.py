@@ -277,7 +277,22 @@ class ChunkKDAFunction(torch.autograd.Function):
         stream = cutlass_torch.default_stream()
 
         has_initial_state = initial_state is not None
-        cache_key = (has_initial_state, safe_gate, scale, chunk_size, D)
+        cache_key = (has_initial_state, output_final_state, safe_gate, scale, chunk_size, D)
+
+        # Prepare initial_state and final_state tensors
+        if has_initial_state:
+            initial_state_f32 = initial_state.to(torch.float32).contiguous()
+        else:
+            # Create a dummy tensor (won't be accessed when has_initial_state=False)
+            initial_state_f32 = torch.zeros(B, H, D, D, dtype=torch.float32, device=q.device)
+        initial_state_cute = from_dlpack(initial_state_f32.detach())
+
+        if output_final_state:
+            final_state_f32 = torch.zeros(B, H, D, D, dtype=torch.float32, device=q.device)
+        else:
+            # Create a dummy tensor (won't be accessed when output_final_state=False)
+            final_state_f32 = torch.zeros(B, H, D, D, dtype=torch.float32, device=q.device)
+        final_state_cute = from_dlpack(final_state_f32.detach())
 
         if cache_key in compiled_kernel_cache:
             compiled_kernel = compiled_kernel_cache[cache_key]
@@ -289,6 +304,8 @@ class ChunkKDAFunction(torch.autograd.Function):
                 io_dtype=cutlass.BFloat16,
                 scale=scale,
                 safe_gate=safe_gate,
+                has_initial_state=has_initial_state,
+                output_final_state=output_final_state,
             )
             compiled_kernel = cute.compile(
                 attn_kernel,
@@ -298,6 +315,8 @@ class ChunkKDAFunction(torch.autograd.Function):
                 g_cute.iterator,
                 o_cute.iterator,
                 beta_cute.iterator,
+                initial_state_cute.iterator,
+                final_state_cute.iterator,
                 (B, S, H, D),
                 stream,
                 options=COMPILE_OPTIONS,
@@ -311,6 +330,8 @@ class ChunkKDAFunction(torch.autograd.Function):
             g_cute.iterator,
             o_cute.iterator,
             beta_cute.iterator,
+            initial_state_cute.iterator,
+            final_state_cute.iterator,
             (B, S, H, D),
             stream,
             options=COMPILE_OPTIONS,
@@ -325,7 +346,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         # ctx.scale = scale
         # ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         # ctx.use_gate_in_kernel = use_gate_in_kernel
-        return o.to(q.dtype), None
+        return o.to(q.dtype), final_state_f32 if output_final_state else None
 
     @staticmethod
     @input_guard
@@ -457,7 +478,7 @@ def flash_kda_prefill(
     """
     # TODO
     # assert safe_gate == False, "safe_gate=True is not supported in flash_kda_prefill yet."
-    assert initial_state == None, "initial_state is not supported in cutedsl_kda_prefill yet."
+    # initial_state is now supported
     assert cu_seqlens == None, "cu_seqlens is not supported in cutedsl_kda_prefill yet."
     # assert output_final_state == False, "output_final_state=True is not supported in cutedsl_kda_prefill yet."
     if cu_seqlens is not None:

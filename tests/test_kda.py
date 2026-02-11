@@ -120,8 +120,6 @@ def test_safe_gate_chunk(
         g=(naive_kda_gate_fn(g, A_log, dt_bias) if use_gate_in_kernel else g.clone()),
         beta=beta.clone(),
         scale=scale,
-        # initial_state=h0.clone(),
-        # FIXME: not support return state currently
         initial_state=None,
         output_final_state=True,
     )
@@ -141,8 +139,6 @@ def test_safe_gate_chunk(
         A_log=(A_log.clone() if use_gate_in_kernel else None),
         dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
         scale=scale,
-        # initial_state=h0.clone(),
-        # FIXME: not support return state currently
         initial_state=None,
         output_final_state=True,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
@@ -292,3 +288,152 @@ def test_safe_gate_chunk_varlen(
     # if use_gate_in_kernel:
     #     assert_close("dA", ref_dA, tri_dA, 0.008, warning=True)
     #     assert_close("dbias", ref_dbias, tri_dbias, 0.005)
+
+
+# ---------------------------------- Tests for Initial State & Output Final State ----------------------------------
+
+@pytest.mark.parametrize(
+    ("B", "T", "H", "D", "scale", "dtype", "safe_gate"),
+    [
+        pytest.param(
+            *test,
+            id="B{}-T{}-H{}-D{}-scale{}-dtype{}-safe_gate{}".format(*test),
+        )
+        for test in [
+            (1, 128, 1, 128, 1.0, torch.bfloat16, True),
+            (2, 256, 2, 128, 0.1, torch.bfloat16, True),
+            (3, 1024, 4, 128, 1.0, torch.bfloat16, True),
+            (4, 1024, 4, 128, 0.1, torch.bfloat16, True),
+        ]
+    ],
+)
+def test_safe_gate_chunk_with_initial_state(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    scale: float,
+    dtype: torch.dtype,
+    safe_gate: bool,
+):
+    """Test KDA kernel with initial_state provided and output_final_state=True."""
+    try:
+        from fla.ops.kda.gate import naive_kda_lowerbound_gate
+    except Exception:
+        raise ImportError("Please install flash-linear-attention after this commit "
+            "https://github.com/fla-org/flash-linear-attention/tree/d1097c609b23b5f478f490da0fbd00060b0e9dc3")
+
+    torch.manual_seed(42)
+    q = torch.rand(B, T, H, D, dtype=dtype)
+    k = torch.rand(B, T, H, D, dtype=dtype)
+    v = torch.rand(B, T, H, D, dtype=dtype)
+    g = torch.randn(B, T, H, D, dtype=torch.float)
+    g = F.logsigmoid(g)
+    if safe_gate:
+        g = g.clamp(-5, 0)
+
+    beta = torch.randn(B, T, H, dtype=torch.float32).sigmoid()
+    h0 = torch.randn(B, H, D, D, dtype=torch.float32)
+
+    q, k, v, g, beta, h0 = map(lambda x: x.to(device), (q, k, v, g, beta, h0))
+
+    # Reference: naive recurrent with initial state
+    ref, ref_ht = naive_recurrent_kda(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=h0.clone(),
+        output_final_state=True,
+    )
+
+    # Test: flash_kda_prefill with initial state
+    tri, tri_ht = flash_kda_prefill(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=h0.clone(),
+        output_final_state=True,
+        safe_gate=safe_gate,
+    )
+
+    assert_close("o", ref, tri, 0.005)
+    assert tri_ht is not None, "output_final_state=True but got None"
+    assert_close("ht", ref_ht, tri_ht, 0.005)
+
+
+@pytest.mark.parametrize(
+    ("B", "T", "H", "D", "scale", "dtype", "safe_gate"),
+    [
+        pytest.param(
+            *test,
+            id="B{}-T{}-H{}-D{}-scale{}-dtype{}-safe_gate{}".format(*test),
+        )
+        for test in [
+            (2, 256, 2, 128, 0.1, torch.bfloat16, True),
+            (4, 1024, 4, 128, 0.1, torch.bfloat16, True),
+        ]
+    ],
+)
+def test_safe_gate_chunk_output_final_state_no_initial(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    scale: float,
+    dtype: torch.dtype,
+    safe_gate: bool,
+):
+    """Test KDA kernel with output_final_state=True but no initial_state (initial_state=None)."""
+    try:
+        from fla.ops.kda.gate import naive_kda_lowerbound_gate
+    except Exception:
+        raise ImportError("Please install flash-linear-attention after this commit "
+            "https://github.com/fla-org/flash-linear-attention/tree/d1097c609b23b5f478f490da0fbd00060b0e9dc3")
+
+    torch.manual_seed(42)
+    q = torch.rand(B, T, H, D, dtype=dtype)
+    k = torch.rand(B, T, H, D, dtype=dtype)
+    v = torch.rand(B, T, H, D, dtype=dtype)
+    g = torch.randn(B, T, H, D, dtype=torch.float)
+    g = F.logsigmoid(g)
+    if safe_gate:
+        g = g.clamp(-5, 0)
+
+    beta = torch.randn(B, T, H, dtype=torch.float32).sigmoid()
+
+    q, k, v, g, beta = map(lambda x: x.to(device), (q, k, v, g, beta))
+
+    # Reference: naive recurrent without initial state
+    ref, ref_ht = naive_recurrent_kda(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=None,
+        output_final_state=True,
+    )
+
+    # Test: flash_kda_prefill with output_final_state but no initial_state
+    tri, tri_ht = flash_kda_prefill(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=None,
+        output_final_state=True,
+        safe_gate=safe_gate,
+    )
+
+    assert_close("o", ref, tri, 0.005)
+    assert tri_ht is not None, "output_final_state=True but got None"
+    assert_close("ht", ref_ht, tri_ht, 0.005)

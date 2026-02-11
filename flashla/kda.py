@@ -131,6 +131,8 @@ class KDAChunkwise:
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         scale: cutlass.Float32 = 1.0,
         safe_gate: bool = False,
+        has_initial_state: bool = False,
+        output_final_state: bool = False,
         num_regs_cuda: int = 248,  # Critical: 248 provides 39% speedup over 160
         num_regs_subchunk: int = 192,
         num_regs_others: int = 64,  # Optimized: best config from comprehensive sweep
@@ -138,6 +140,8 @@ class KDAChunkwise:
         # make scale a constant
         self.scale = scale
         self.safe_gate = safe_gate
+        self.has_initial_state = has_initial_state
+        self.output_final_state = output_final_state
 
         self.chunk_size = chunk_size
         self.subchunk_size = 16
@@ -385,6 +389,8 @@ class KDAChunkwise:
         g_iter: cute.Pointer,  # NEW: gate values
         o_iter: cute.Pointer,
         beta_iter: cute.Pointer,  # NEW: beta tensor [B, S, H]
+        initial_state_iter: cute.Pointer,  # Initial state [B, H, D, D], float32 or nullptr
+        final_state_iter: cute.Pointer,    # Final state [B, H, D, D], float32 or nullptr
         problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B, S, H, D)
         stream: cuda.CUstream,
         options=None, # compile options
@@ -401,6 +407,10 @@ class KDAChunkwise:
             g_iter: Gate tensor [B, S, H, D] - NEW for KDA
             o_iter: Output tensor [B, S, H, D]
             beta_iter: Beta tensor [B, S, H] - NEW for KDA, scaling factor for K and V
+            initial_state_iter: Initial state [B, H, D, D] or nullptr
+            final_state_iter: Final state [B, H, D, D] or nullptr
+            has_initial_state: Whether initial_state is provided
+            output_final_state: Whether to output final state
             problem_size: (B, S, H, D) problem dimensions
             stream: CUDA stream
             options: compile options for the kernel
@@ -463,11 +473,14 @@ class KDAChunkwise:
         )
         o = cute.make_tensor(o_iter, o_layout)
 
-        # TODO: output final state
+        # Initial state / final state: [B, H, D, D] stored as row-major
+        # Layout: (D, D, (H, B)) with stride (1, D, (D*D, D*D*H))
         fstate_layout = cute.make_layout(
             (D, D, (H, B)),
-            stride=(1, D*H, (D, D*D*H)),
+            stride=(1, D, (D*D, D*D*H)),
         )
+        initial_state = cute.make_tensor(initial_state_iter, fstate_layout)
+        final_state = cute.make_tensor(final_state_iter, fstate_layout)
 
         self.q_dtype = q.element_type
         self.k_dtype = k.element_type
@@ -928,6 +941,8 @@ class KDAChunkwise:
             g_last_layout,
             beta_layout,
             state_tmem_layout_staged,
+            initial_state,
+            final_state,
             problem_size,
         ).launch(
             grid=self.grid,
@@ -971,6 +986,8 @@ class KDAChunkwise:
         g_last_layout: cute.Layout,
         beta_layout: cute.Layout,
         state_tmem_layout_staged: cute.ComposedLayout,
+        initial_state: cute.Tensor,  # (D, D, (H, B)), float32
+        final_state: cute.Tensor,    # (D, D, (H, B)), float32
         problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B, S, H, D)
     ):
         """
@@ -1801,7 +1818,7 @@ class KDAChunkwise:
                 for chunk_start in cutlass.range(0, S, C, unroll=0):
                     idx = chunk_start // C
 
-                    if idx != 0:
+                    if idx != 0 or cutlass.const_expr(self.has_initial_state):
                         # wait bf16 State for MMA
                         kv16_handle = kv16_consumer.wait_and_advance()
                         # wait for sQ_K_scaled ready
@@ -1904,7 +1921,7 @@ class KDAChunkwise:
                         a_stage_idx=v3_handle.index,
                         b_stage_idx=k_scaled2_handle.index,
                         acc_stage_idx=0,
-                        always_acc=True if idx != 0 else False, # always accumulate states
+                        always_acc=True if (idx != 0 or cutlass.const_expr(self.has_initial_state)) else False, # always accumulate states
                     )
 
                     k_scaled2_handle.release()
@@ -1948,8 +1965,7 @@ class KDAChunkwise:
                     if should_debug:
                         cute.printf("chunk idx={}, got q2 consumer={}", idx, q_handle.index)
 
-                    if idx != 0:
-                        # TODO: support initial state, should be trivial
+                    if idx != 0 or cutlass.const_expr(self.has_initial_state):
                         #############################################
                         # HANDLE KS
                         kv16_handle = kv16_consumer.wait_and_advance()
@@ -2071,9 +2087,8 @@ class KDAChunkwise:
                     o_intra_handle.commit()
 
                     ##########################################################
-                    # NOTE: Generate next state if you are not the last chunk
-                    # TODO: need to support output final state, need to remove this predicate 
-                    if idx != (S // C) - 1:
+                    # NOTE: Generate next state for all chunks (including last when output_final_state)
+                    if idx != (S // C) - 1 or cutlass.const_expr(self.output_final_state):
                         kv_handle = kv_producer.acquire_and_advance()
 
                         self.mma_sync_barrier.arrive_and_wait()
@@ -2097,7 +2112,7 @@ class KDAChunkwise:
                             a_stage_idx=v3_handle.index,
                             b_stage_idx=k_handle.index,
                             acc_stage_idx=0,
-                            always_acc=True if idx != 0 else False, # always accumulate states
+                            always_acc=True if (idx != 0 or cutlass.const_expr(self.has_initial_state)) else False, # always accumulate states
                         )
                         # Release K V here
                         kv_handle.commit()
@@ -2487,7 +2502,31 @@ class KDAChunkwise:
             # # # Note: add barrier here to make sure print make sense since we'll overwrite sG
             # self.cuda_wg_sync_barrier.arrive_and_wait()
 
-            # TODO: load State at first
+            # -------------- Initial State Loading -------------
+            # If has_initial_state, load initial state from GMEM into TMEM
+            # State shape: (D, D) per (H, B), stored as FP32
+            if cutlass.const_expr(self.has_initial_state):
+                # Load initial state from GMEM to RMEM respecting TMEM partition.
+                # TMEM stores S^T (transposed), so flat[i] = state[local_tidx, i]
+                # Each thread owns key position local_tidx, D elements cover value positions.
+                init_state_chunk = initial_state[None, None, (hidx, bidx)]
+                init_flat = cute.make_tensor(
+                    tTR_rKV.iterator, layout=cute.make_layout(Constant.D))
+                for init_i in cutlass.range(0, Constant.D, unroll=0):
+                    init_flat[init_i] = init_state_chunk[local_tidx, init_i]
+
+                # Store FP32 state to TMEM for accumulation (tCtAccKV)
+                init_tmem_store_tKVi = tmem_store_tAccKV_f32[None, None, None, None, 0]
+                cute.copy(tmem_store_kv_f32, tmem_store_rKV, init_tmem_store_tKVi)
+                cute.arch.fence_view_async_tmem_store()
+
+                # Also prepare BF16 version for Q@S and K@S MMA
+                tmem_store_rAccKVAsBF16.store(tTR_rKV.load().to(self.io_dtype))
+                init_kv16_handle = kv16_producer.acquire_and_advance()
+                init_tmem_store_tAccKVi = tmem_store_tAccKV[None, None, None, None, init_kv16_handle.index]
+                cute.copy(tmem_store_kv, tmem_store_rAccKV, init_tmem_store_tAccKVi)
+                cute.arch.fence_view_async_tmem_store()
+                init_kv16_handle.commit()
 
             final_blk = (S + C - 1) // C - 1
             if cutlass.const_expr(self.safe_gate):
@@ -2520,13 +2559,13 @@ class KDAChunkwise:
                         if index_q == Constant.C - 1:
                             sG_last[index_k, g_stage_idx] = tQrG[i]
 
-                    if idx != 0:
+                    if idx != 0 or cutlass.const_expr(self.has_initial_state):
                         exp_g = cute.exp2(g_f32)
                         tQrG.store(exp_g)
 
                     # wait Q
                     q_handle = load_q_consumer.wait_and_advance()
-                    if idx != 0:
+                    if idx != 0 or cutlass.const_expr(self.has_initial_state):
                         # load Q, g'*Q
                         q_stage_idx = q_handle.index
                         tQrQ = cute.make_fragment_like(tQrQ_0, self.q_dtype)
@@ -2557,7 +2596,7 @@ class KDAChunkwise:
                     # wait K
                     k_handle = load_k_consumer.wait_and_advance()
                     k_stage_idx = k_handle.index
-                    if idx != 0:
+                    if idx != 0 or cutlass.const_expr(self.has_initial_state):
                         # load K, g'*K
                         # NOTE: overlapped with Q@S MMA
                         tQrK = cute.make_fragment_like(tQrQ_0, self.q_dtype)
@@ -2603,7 +2642,7 @@ class KDAChunkwise:
                     #     cute.print_tensor(sV_flat_s2r[None, None, v_handle.index])
                     # self.cuda_wg_sync_barrier.arrive_and_wait()
 
-                    if idx != 0: 
+                    if idx != 0 or cutlass.const_expr(self.has_initial_state): 
                         # load V to reg
                         cute.copy(tiled_s2r_v, tRS_sV[(None, None, None, v_handle.index)], tRS_rV)
                         cute.arch.fence_proxy(
@@ -2696,7 +2735,7 @@ class KDAChunkwise:
                     # FIXME: currently do not support initial state, 
                     # so only decay S after first block K^T@NewV
                     kv_decay_handle = kv_decay_producer.acquire_and_advance()
-                    if idx != 0:
+                    if idx != 0 or cutlass.const_expr(self.has_initial_state):
                         # NOTE: TMEM S is always ready here
                         # T2R S
                         tTR_tKVi = tTR_tKV[(None, None, None, 0)] # kv stage == 1
@@ -2760,7 +2799,7 @@ class KDAChunkwise:
                     cute.arch.fence_view_async_tmem_load()
                     o_intra_handle.release()
 
-                    if idx != 0:
+                    if idx != 0 or cutlass.const_expr(self.has_initial_state):
                         # T2R Q@S (O_inter)
                         # NOTE: stage=1, always 0
                         tTR_tAcc_sq_i = tTR_tAcc_base_sq[(None, None, None, 0, 0, 0)]
@@ -2772,7 +2811,7 @@ class KDAChunkwise:
 
                     # O=O1+O2
                     acc_vec = tTR_rAcc_pv.load()
-                    if idx != 0:
+                    if idx != 0 or cutlass.const_expr(self.has_initial_state):
                         acc_vec_inter = tTR_rAcc_sq.load()
                         acc_vec = acc_vec + acc_vec_inter
                     tTR_rO.store(acc_vec.to(self.io_dtype))
@@ -2798,11 +2837,13 @@ class KDAChunkwise:
                     k_handle.release()
 
                     # convert State to BF16, except for final block
-                    if idx != final_blk:
+                    if idx != final_blk or cutlass.const_expr(self.output_final_state):
                         # T2R FP32 S
                         tTR_tKVi = tTR_tKV[(None, None, None, kv_handle.index)] # kv stage == 1
                         cute.copy(tiled_copy_t2r_kv, tTR_tKVi, tTR_rKV)
                         cute.arch.fence_view_async_tmem_load()
+
+                    if idx != final_blk:
                         # Store as a separated BF16 state for QS and KS MMA before decay
                         # tmem_store_rAccKVAsBF16 point to the same rmem as tmem_store_rKV
                         tmem_store_rAccKVAsBF16.store(tTR_rKV.load().to(self.io_dtype))
@@ -2812,9 +2853,6 @@ class KDAChunkwise:
                         # convert to BF16
                         # V^T*K -> (Dv, Dk)
                         tmem_store_tAccKVi = tmem_store_tAccKV[None, None, None, None, kv16_handle.index]
-                        # if should_debug2:
-                        #     cute.printf("chunk idx={}, BF16 S:", idx)
-                        #     cute.print_tensor(tmem_store_rAccKV)
 
                         # R2T BF16 S
                         # tmem_store_rAccKV is just an FP32 recast view of tmem_store_rAccKVAsBF16
@@ -2833,7 +2871,17 @@ class KDAChunkwise:
                     # TODO: move V to TMEM as operand A
                     v_handle.release()
 
-                    # 3. TODO: output final state if this is the last chunk
+                    # 3. Output final state if this is the last chunk
+                    if cutlass.const_expr(self.output_final_state):
+                        if idx == final_blk:
+                            # State is already in tTR_rKV from the BF16 conversion above
+                            # Write FP32 state from RMEM to GMEM
+                            # TMEM stores S^T (transposed), so flat[i] = state[local_tidx, i]
+                            state_out = final_state[None, None, (hidx, bidx)]
+                            out_flat = cute.make_tensor(
+                                tTR_rKV.iterator, layout=cute.make_layout(Constant.D))
+                            for out_i in cutlass.range(0, Constant.D, unroll=0):
+                                state_out[local_tidx, out_i] = out_flat[out_i]
 
             else:
                 for chunk_start in cutlass.range(0, S, C, unroll=0):
@@ -3084,7 +3132,7 @@ class KDAChunkwise:
                     if cutlass.const_expr(PRINT_DEBUG):
                         print(f"FIXME tTR_rAcc_pv: {tTR_rAcc_pv}")
                         print(f"FIXME tTR_rAcc_ks: {tTR_rAcc_ks}")
-                    if idx != 0:
+                    if idx != 0 or cutlass.const_expr(self.has_initial_state):
                         # Wait for KS
                         ks_handle = ks_consumer.wait_and_advance()
 
@@ -3109,7 +3157,7 @@ class KDAChunkwise:
                     if should_debug:
                         cute.printf("chunk idx={}, got v2 producer={}", idx, v2_handle.index)
 
-                    if idx != 0:
+                    if idx != 0 or cutlass.const_expr(self.has_initial_state):
                         # First V could be kept no changes, since the initial state is None
                         v_corrected = tRS_rV.load().to(cutlass.Float32)
 
@@ -3250,7 +3298,7 @@ class KDAChunkwise:
                     o_intra_handle.release()
 
                     # Wait for O_INTER
-                    if idx != 0:
+                    if idx != 0 or cutlass.const_expr(self.has_initial_state):
                         o_inter_handle = o_inter_consumer.wait_and_advance()
                         if should_debug:
                             cute.printf("chunk idx={}, got o_inter consumer={}", idx, o_inter_handle.index)
@@ -3262,7 +3310,7 @@ class KDAChunkwise:
 
                     # Perform addition and store to gmem
                     acc_vec = tTR_rAcc_pv.load()
-                    if idx != 0:
+                    if idx != 0 or cutlass.const_expr(self.has_initial_state):
                         acc_vec_inter = tTR_rAcc_sq.load()
                         acc_vec = acc_vec + acc_vec_inter
                     tTR_rO.store(acc_vec.to(self.io_dtype))
@@ -3280,10 +3328,10 @@ class KDAChunkwise:
                     smem_o_handle.commit()
 
                     # ------------------------------------------------------------
-                    # 1. Decay the state
-                    # 2. Convert to BF16
-                    # 3. TODO: output final state if this is the last chunk
-                    if idx != (S // C - 1):
+                    # 1. Decay the state (T2R FP32 read from TMEM to RMEM)
+                    # 2. Output final state if this is the last chunk
+                    # We split the T2R read (needed for final state) from kv16 produce (only for non-final)
+                    if idx != (S // C - 1) or cutlass.const_expr(self.output_final_state):
                         # Wait for kv mma from `idx-1` round of mma warp
                         kv_handle = kv_consumer.wait_and_advance()
                         if should_debug:
@@ -3326,6 +3374,8 @@ class KDAChunkwise:
                         cute.arch.fence_view_async_tmem_store()
                         kv_handle.release()
 
+                    # 3. Convert to BF16 and produce to kv16 pipeline (only for non-final blocks)
+                    if idx != (S // C - 1):
                         # Prepare bf16 state for tcgen05.mma
                         kv16_handle = kv16_producer.acquire_and_advance()
                         if should_debug:
@@ -3345,6 +3395,18 @@ class KDAChunkwise:
 
                     # Finally let us release v.
                     v_handle.release()
+
+                    # Output final state if this is the last chunk
+                    if cutlass.const_expr(self.output_final_state):
+                        if idx == (S // C - 1):
+                            # State is already in tTR_rKV from the BF16 conversion above
+                            # Write FP32 state from RMEM to GMEM
+                            # TMEM stores S^T (transposed), so flat[i] = state[local_tidx, i]
+                            state_out = final_state[None, None, (hidx, bidx)]
+                            out_flat = cute.make_tensor(
+                                tTR_rKV.iterator, layout=cute.make_layout(Constant.D))
+                            for out_i in cutlass.range(0, Constant.D, unroll=0):
+                                state_out[local_tidx, out_i] = out_flat[out_i]
 
         # CUDA core warps for subchunk computation
         elif warp_idx in self.cuda_subchunk_warp_ids:
