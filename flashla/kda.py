@@ -3131,10 +3131,7 @@ class KDAChunkwise:
                     if valid_len_chunk >= C:
                         rG_last = exp_g[Constant.C - 1]
                     else:
-                        rG_last = cutlass.Float32(0.0)
-                        for _g_row in cutlass.range(0, Constant.C, unroll_full=True):
-                            if _g_row < valid_len_chunk:
-                                rG_last = exp_g[_g_row]
+                        rG_last = exp_g[valid_len_chunk - 1]
                     # NOTE: each thread save one element
                     sG_last[local_tidx, g_stage_idx] = rG_last
 
