@@ -449,10 +449,47 @@ def test_safe_gate_chunk_output_final_state_no_initial(
             id="seqs{}-H{}-D{}-scale{}-dtype{}-safe_gate{}-h0{}-ht{}".format(*test),
         )
         for test in [
+            # equal lengths
             ([128, 128], 2, 128, 0.1, torch.bfloat16, True, False, False),
-            ([256, 128], 2, 128, 0.1, torch.bfloat16, True, False, True),
-            ([64, 192, 128], 2, 128, 0.1, torch.bfloat16, True, True, True),
             ([256, 256], 4, 128, 0.1, torch.bfloat16, True, True, True),
+            # 2 seqs, different lengths
+            ([256, 128], 2, 128, 0.1, torch.bfloat16, True, False, True),
+            ([64, 512], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            ([512, 64], 2, 128, 0.1, torch.bfloat16, True, True, False),
+            # 3 seqs, unbalanced
+            ([64, 192, 128], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            ([64, 64, 256], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            ([256, 64, 64], 2, 128, 0.1, torch.bfloat16, True, False, True),
+            # 4+ seqs, highly unbalanced
+            ([64, 128, 256, 512], 4, 128, 0.1, torch.bfloat16, True, True, True),
+            ([512, 64, 64, 64], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            ([64, 64, 64, 64, 64], 2, 128, 0.1, torch.bfloat16, True, False, False),
+            # single sequence (edge case)
+            ([256], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            ([64], 2, 128, 0.1, torch.bfloat16, True, False, False),
+            # longer sequences
+            ([1024, 128], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            ([128, 1024, 64], 4, 128, 0.1, torch.bfloat16, True, True, True),
+            # ---- non-aligned (seqlen not multiple of chunk_size=64) ----
+            # tile_size +1 / -1
+            ([65, 128], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            ([63, 128], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            ([128, 65], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            ([128, 63], 2, 128, 0.1, torch.bfloat16, True, False, True),
+            # single token remainder
+            ([129, 127], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            # multiple non-aligned
+            ([65, 63, 130], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            ([33, 95, 200], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            # single non-aligned sequence
+            ([65], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            ([127], 2, 128, 0.1, torch.bfloat16, True, False, False),
+            # mixed aligned and non-aligned
+            ([64, 65, 128], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            ([128, 100, 256], 4, 128, 0.1, torch.bfloat16, True, True, True),
+            # highly unbalanced with non-aligned
+            ([513, 63], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            ([1, 128], 2, 128, 0.1, torch.bfloat16, True, True, True),
         ]
     ],
 )

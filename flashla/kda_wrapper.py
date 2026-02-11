@@ -231,6 +231,45 @@ class ChunkKDAFunction(torch.autograd.Function):
             num_seqs = cu_seqlens.shape[0] - 1
         else:
             num_seqs = B
+
+        # Pad varlen sequences to chunk-aligned lengths if needed
+        needs_padding = False
+        orig_cu_seqlens = None
+        orig_S = S
+        if is_varlen:
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            needs_padding = not torch.all(seq_lens % chunk_size == 0).item()
+            if needs_padding:
+                orig_cu_seqlens = cu_seqlens
+                padded_lens = ((seq_lens + chunk_size - 1) // chunk_size) * chunk_size
+                padded_cu_seqlens = torch.zeros(num_seqs + 1, dtype=cu_seqlens.dtype, device=q.device)
+                padded_cu_seqlens[1:] = padded_lens.cumsum(0)
+                padded_S = padded_cu_seqlens[-1].item()
+
+                # Allocate padded tensors (zero-filled: Q/K/V=0, g=0 → exp(0)=1, beta=0)
+                q_p = q.new_zeros(1, padded_S, H, D)
+                k_p = k.new_zeros(1, padded_S, H, D)
+                v_p = v.new_zeros(1, padded_S, H, D)
+                g_p = g.new_zeros(1, padded_S, *g.shape[2:])  # (1, S', H, D) or (1, S', H)
+                beta_p = beta.new_zeros(1, padded_S, H)
+
+                # Copy valid data into padded positions
+                for i in range(num_seqs):
+                    s_o = orig_cu_seqlens[i].item()
+                    e_o = orig_cu_seqlens[i + 1].item()
+                    s_p = padded_cu_seqlens[i].item()
+                    ln = e_o - s_o
+                    q_p[0, s_p:s_p + ln] = q[0, s_o:e_o]
+                    k_p[0, s_p:s_p + ln] = k[0, s_o:e_o]
+                    v_p[0, s_p:s_p + ln] = v[0, s_o:e_o]
+                    g_p[0, s_p:s_p + ln] = g[0, s_o:e_o]
+                    beta_p[0, s_p:s_p + ln] = beta[0, s_o:e_o]
+
+                q, k, v, g, beta = q_p, k_p, v_p, g_p, beta_p
+                cu_seqlens = padded_cu_seqlens
+                S = padded_S
+                chunk_indices = None  # recompute from padded cu_seqlens
+
         g_org = None
         if use_gate_in_kernel:
             try:
@@ -368,6 +407,17 @@ class ChunkKDAFunction(torch.autograd.Function):
         # ctx.scale = scale
         # ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         # ctx.use_gate_in_kernel = use_gate_in_kernel
+        # Extract valid output from padded tensor if padding was applied
+        if needs_padding:
+            o_valid = torch.empty(1, orig_S, H, D, dtype=o.dtype, device=o.device)
+            for i in range(num_seqs):
+                s_o = orig_cu_seqlens[i].item()
+                e_o = orig_cu_seqlens[i + 1].item()
+                s_p = padded_cu_seqlens[i].item()
+                ln = e_o - s_o
+                o_valid[0, s_o:e_o] = o[0, s_p:s_p + ln]
+            o = o_valid
+
         return o.to(q.dtype), final_state_f32 if output_final_state else None
 
     @staticmethod
@@ -514,15 +564,7 @@ def flash_kda_prefill(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
             )
-        # Verify all sequence lengths are multiples of chunk size (64)
-        CHUNK_SIZE = 64
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        if not torch.all(seq_lens % CHUNK_SIZE == 0):
-            bad = seq_lens[seq_lens % CHUNK_SIZE != 0].tolist()
-            raise ValueError(
-                f"All sequence lengths must be multiples of chunk size ({CHUNK_SIZE}), "
-                f"but got non-aligned lengths: {bad}. Pad sequences to the nearest multiple."
-            )
+        # Non-aligned sequence lengths are automatically padded by the kernel wrapper
     if initial_state is not None:
         assert initial_state.dtype == torch.float32, "initial_state must be in float32."
 
