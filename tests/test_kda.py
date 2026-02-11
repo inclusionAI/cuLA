@@ -77,7 +77,7 @@ def test_safe_gate_chunk(
     safe_gate: bool,
 ):
     try:
-      from fla.ops.kda.gate import naive_kda_lowerbound_gate
+      from fla.ops.kda.naive import naive_recurrent_kda as _check
     except Exception:
       raise ImportError("Please install flash-linear-attention after this commit " \
       "https://github.com/fla-org/flash-linear-attention/tree/d1097c609b23b5f478f490da0fbd00060b0e9dc3")
@@ -195,7 +195,7 @@ def test_safe_gate_chunk_varlen(
     safe_gate: bool,
 ):
     try:
-      from fla.ops.kda.gate import naive_kda_lowerbound_gate
+      from fla.ops.kda.naive import naive_recurrent_kda as _check
     except Exception:
       raise ImportError("Please install flash-linear-attention after this commit " \
       "https://github.com/fla-org/flash-linear-attention/tree/d1097c609b23b5f478f490da0fbd00060b0e9dc3")
@@ -318,7 +318,7 @@ def test_safe_gate_chunk_with_initial_state(
 ):
     """Test KDA kernel with initial_state provided and output_final_state=True."""
     try:
-        from fla.ops.kda.gate import naive_kda_lowerbound_gate
+        from fla.ops.kda.naive import naive_recurrent_kda as _check
     except Exception:
         raise ImportError("Please install flash-linear-attention after this commit "
             "https://github.com/fla-org/flash-linear-attention/tree/d1097c609b23b5f478f490da0fbd00060b0e9dc3")
@@ -391,7 +391,7 @@ def test_safe_gate_chunk_output_final_state_no_initial(
 ):
     """Test KDA kernel with output_final_state=True but no initial_state (initial_state=None)."""
     try:
-        from fla.ops.kda.gate import naive_kda_lowerbound_gate
+        from fla.ops.kda.naive import naive_recurrent_kda as _check
     except Exception:
         raise ImportError("Please install flash-linear-attention after this commit "
             "https://github.com/fla-org/flash-linear-attention/tree/d1097c609b23b5f478f490da0fbd00060b0e9dc3")
@@ -437,3 +437,100 @@ def test_safe_gate_chunk_output_final_state_no_initial(
     assert_close("o", ref, tri, 0.005)
     assert tri_ht is not None, "output_final_state=True but got None"
     assert_close("ht", ref_ht, tri_ht, 0.005)
+
+
+# ---------------------------------- Tests for Varlen ----------------------------------
+
+@pytest.mark.parametrize(
+    ("seq_lens", "H", "D", "scale", "dtype", "safe_gate", "has_initial_state", "output_final_state"),
+    [
+        pytest.param(
+            *test,
+            id="seqs{}-H{}-D{}-scale{}-dtype{}-safe_gate{}-h0{}-ht{}".format(*test),
+        )
+        for test in [
+            ([128, 128], 2, 128, 0.1, torch.bfloat16, True, False, False),
+            ([256, 128], 2, 128, 0.1, torch.bfloat16, True, False, True),
+            ([64, 192, 128], 2, 128, 0.1, torch.bfloat16, True, True, True),
+            ([256, 256], 4, 128, 0.1, torch.bfloat16, True, True, True),
+        ]
+    ],
+)
+def test_varlen(
+    seq_lens: list,
+    H: int,
+    D: int,
+    scale: float,
+    dtype: torch.dtype,
+    safe_gate: bool,
+    has_initial_state: bool,
+    output_final_state: bool,
+):
+    """Test KDA kernel with variable-length sequences via cu_seqlens."""
+    try:
+        from fla.ops.kda.naive import naive_recurrent_kda as _check
+    except Exception:
+        raise ImportError("Please install flash-linear-attention")
+
+    torch.manual_seed(42)
+    num_seqs = len(seq_lens)
+    total_tokens = sum(seq_lens)
+    cu_seqlens = torch.tensor([0] + list(torch.cumsum(torch.tensor(seq_lens), 0)), dtype=torch.long, device=device)
+
+    # Generate concatenated data: [1, total_tokens, H, D]
+    q = torch.rand(1, total_tokens, H, D, dtype=dtype, device=device)
+    k = torch.rand(1, total_tokens, H, D, dtype=dtype, device=device)
+    v = torch.rand(1, total_tokens, H, D, dtype=dtype, device=device)
+    g = torch.randn(1, total_tokens, H, D, dtype=torch.float, device=device)
+    g = F.logsigmoid(g)
+    if safe_gate:
+        g = g.clamp(-5, 0)
+    beta = torch.randn(1, total_tokens, H, dtype=torch.float32, device=device).sigmoid()
+
+    if has_initial_state:
+        h0 = torch.randn(num_seqs, H, D, D, dtype=torch.float32, device=device)
+    else:
+        h0 = None
+
+    # Reference: run per-sequence using naive_recurrent_kda
+    ref_o_list = []
+    ref_ht_list = []
+    for i in range(num_seqs):
+        s, e = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+        seq_h0 = h0[i:i+1] if h0 is not None else None
+        ref_o_i, ref_ht_i = naive_recurrent_kda(
+            q=F.normalize(q[:, s:e].clone(), p=2, dim=-1),
+            k=F.normalize(k[:, s:e].clone(), p=2, dim=-1),
+            v=v[:, s:e].clone(),
+            g=g[:, s:e].clone(),
+            beta=beta[:, s:e].clone(),
+            scale=scale,
+            initial_state=seq_h0,
+            output_final_state=output_final_state,
+        )
+        ref_o_list.append(ref_o_i)
+        if output_final_state:
+            ref_ht_list.append(ref_ht_i)
+
+    ref_o = torch.cat(ref_o_list, dim=1)  # [1, total_tokens, H, D]
+    if output_final_state:
+        ref_ht = torch.cat(ref_ht_list, dim=0)  # [num_seqs, H, D, D]
+
+    # Test: flash_kda_prefill with cu_seqlens
+    tri_o, tri_ht = flash_kda_prefill(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=h0.clone() if h0 is not None else None,
+        output_final_state=output_final_state,
+        safe_gate=safe_gate,
+        cu_seqlens=cu_seqlens,
+    )
+
+    assert_close("varlen o", ref_o, tri_o, 0.005)
+    if output_final_state:
+        assert tri_ht is not None, "output_final_state=True but got None"
+        assert_close("varlen ht", ref_ht, tri_ht, 0.005)

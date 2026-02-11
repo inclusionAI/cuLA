@@ -225,6 +225,12 @@ class ChunkKDAFunction(torch.autograd.Function):
         global compiled_kernel_cache
     
         B, S, H, D = q.shape
+        is_varlen = cu_seqlens is not None
+        if is_varlen:
+            assert B == 1, "For varlen, batch size must be 1. Flatten variable-length inputs first."
+            num_seqs = cu_seqlens.shape[0] - 1
+        else:
+            num_seqs = B
         g_org = None
         if use_gate_in_kernel:
             try:
@@ -277,22 +283,35 @@ class ChunkKDAFunction(torch.autograd.Function):
         stream = cutlass_torch.default_stream()
 
         has_initial_state = initial_state is not None
-        cache_key = (has_initial_state, output_final_state, safe_gate, scale, chunk_size, D)
+        cache_key = (has_initial_state, output_final_state, safe_gate, is_varlen, scale, chunk_size, D)
 
+        # Prepare cu_seqlens as int32 for kernel
+        if is_varlen:
+            cu_seqlens_i32 = cu_seqlens.to(torch.int32).contiguous()
+        else:
+            cu_seqlens_i32 = torch.zeros(2, dtype=torch.int32, device=q.device)
+        cu_seqlens_cute = from_dlpack(cu_seqlens_i32.detach())
+
+        # State shape: [num_seqs, H, D, D]
+        # For non-varlen: num_seqs = B
+        # For varlen: num_seqs from cu_seqlens
         # Prepare initial_state and final_state tensors
         if has_initial_state:
             initial_state_f32 = initial_state.to(torch.float32).contiguous()
         else:
             # Create a dummy tensor (won't be accessed when has_initial_state=False)
-            initial_state_f32 = torch.zeros(B, H, D, D, dtype=torch.float32, device=q.device)
+            initial_state_f32 = torch.zeros(num_seqs, H, D, D, dtype=torch.float32, device=q.device)
         initial_state_cute = from_dlpack(initial_state_f32.detach())
 
         if output_final_state:
-            final_state_f32 = torch.zeros(B, H, D, D, dtype=torch.float32, device=q.device)
+            final_state_f32 = torch.zeros(num_seqs, H, D, D, dtype=torch.float32, device=q.device)
         else:
             # Create a dummy tensor (won't be accessed when output_final_state=False)
-            final_state_f32 = torch.zeros(B, H, D, D, dtype=torch.float32, device=q.device)
+            final_state_f32 = torch.zeros(num_seqs, H, D, D, dtype=torch.float32, device=q.device)
         final_state_cute = from_dlpack(final_state_f32.detach())
+
+        # problem_size: (num_seqs, total_tokens_or_seq_len, H, D)
+        problem_size = (num_seqs, S, H, D)
 
         if cache_key in compiled_kernel_cache:
             compiled_kernel = compiled_kernel_cache[cache_key]
@@ -306,6 +325,7 @@ class ChunkKDAFunction(torch.autograd.Function):
                 safe_gate=safe_gate,
                 has_initial_state=has_initial_state,
                 output_final_state=output_final_state,
+                is_varlen=is_varlen,
             )
             compiled_kernel = cute.compile(
                 attn_kernel,
@@ -317,7 +337,8 @@ class ChunkKDAFunction(torch.autograd.Function):
                 beta_cute.iterator,
                 initial_state_cute.iterator,
                 final_state_cute.iterator,
-                (B, S, H, D),
+                cu_seqlens_cute.iterator,
+                problem_size,
                 stream,
                 options=COMPILE_OPTIONS,
             )
@@ -332,7 +353,8 @@ class ChunkKDAFunction(torch.autograd.Function):
             beta_cute.iterator,
             initial_state_cute.iterator,
             final_state_cute.iterator,
-            (B, S, H, D),
+            cu_seqlens_cute.iterator,
+            problem_size,
             stream,
             options=COMPILE_OPTIONS,
         )
@@ -479,7 +501,7 @@ def flash_kda_prefill(
     # TODO
     # assert safe_gate == False, "safe_gate=True is not supported in flash_kda_prefill yet."
     # initial_state is now supported
-    assert cu_seqlens == None, "cu_seqlens is not supported in cutedsl_kda_prefill yet."
+    assert cu_seqlens is None or q.shape[0] == 1, "For varlen, batch size must be 1. Flatten sequences first."
     # assert output_final_state == False, "output_final_state=True is not supported in cutedsl_kda_prefill yet."
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -491,6 +513,15 @@ def flash_kda_prefill(
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
+            )
+        # Verify all sequence lengths are multiples of chunk size (64)
+        CHUNK_SIZE = 64
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        if not torch.all(seq_lens % CHUNK_SIZE == 0):
+            bad = seq_lens[seq_lens % CHUNK_SIZE != 0].tolist()
+            raise ValueError(
+                f"All sequence lengths must be multiples of chunk size ({CHUNK_SIZE}), "
+                f"but got non-aligned lengths: {bad}. Pad sequences to the nearest multiple."
             )
     if initial_state is not None:
         assert initial_state.dtype == torch.float32, "initial_state must be in float32."
