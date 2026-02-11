@@ -2601,14 +2601,18 @@ class KDAChunkwise:
                     g_f32 = g_val.to(cutlass.Float32)
 
                     # write g_last to sG_last
-                    # Use valid_len_chunk-1 as the last valid row for partial chunks
-                    g_last_row = valid_len_chunk - 1
-                    if g_last_row > Constant.C - 1:
-                        g_last_row = Constant.C - 1
-                    for i in cutlass.range_constexpr(cute.size(tQcMq)):
-                        index_q, index_k = index_transform(*tQcMq[i])
-                        if index_q == g_last_row:
-                            sG_last[index_k, g_stage_idx] = tQrG[i]
+                    # For full chunks, use constant C-1; for partial, use valid_len_chunk-1
+                    if valid_len_chunk >= C:
+                        for i in cutlass.range_constexpr(cute.size(tQcMq)):
+                            index_q, index_k = index_transform(*tQcMq[i])
+                            if index_q == Constant.C - 1:
+                                sG_last[index_k, g_stage_idx] = tQrG[i]
+                    else:
+                        g_last_row = valid_len_chunk - 1
+                        for i in cutlass.range_constexpr(cute.size(tQcMq)):
+                            index_q, index_k = index_transform(*tQcMq[i])
+                            if index_q == g_last_row:
+                                sG_last[index_k, g_stage_idx] = tQrG[i]
 
                     if idx != 0 or cutlass.const_expr(self.has_initial_state):
                         exp_g = cute.exp2(g_f32)
@@ -3051,15 +3055,13 @@ class KDAChunkwise:
                     tRS_rK.store(k_inter_bf16)        # K * exp(g) for intra-chunk
 
                     # Zero RMEM for invalid rows (non-aligned varlen support)
-                    # K*exp(g) is used by MMA warp for K^T@V state update.
-                    # Invalid rows must be zero to prevent state corruption.
-                    # Q*exp(g) invalid rows produce garbage output at padded positions (safe).
-                    # K*exp(-g) invalid rows are already handled by subchunk boundary mask.
-                    for _zr in cutlass.range(0, Constant.C, unroll_full=True):
-                        if _zr >= valid_len_chunk:
-                            tRS_rK[0, _zr, 0] = self.io_dtype(0.0)
-                            tRS_rQ[0, _zr, 0] = self.io_dtype(0.0)
-                            tRS_rG_bf16[0, _zr, 0] = self.io_dtype(0.0)
+                    # Only needed for partial chunks — skip for full chunks (zero overhead)
+                    if valid_len_chunk < C:
+                        for _zr in cutlass.range(0, Constant.C, unroll_full=True):
+                            if _zr >= valid_len_chunk:
+                                tRS_rK[0, _zr, 0] = self.io_dtype(0.0)
+                                tRS_rQ[0, _zr, 0] = self.io_dtype(0.0)
+                                tRS_rG_bf16[0, _zr, 0] = self.io_dtype(0.0)
                 
                     # ============================================================
                     # KDA Step 3: Write gated Q', K_inter, K_intra back to SMEM
@@ -3125,11 +3127,14 @@ class KDAChunkwise:
 
                     # ------------------------------------------------------------
                     # NOTE: Save exp(g) of last VALID row to rG_last for state update in next chunk
-                    # For non-aligned chunks, last valid row may be < C-1
-                    rG_last = cutlass.Float32(0.0)
-                    for _g_row in cutlass.range(0, Constant.C, unroll_full=True):
-                        if _g_row < valid_len_chunk:
-                            rG_last = exp_g[_g_row]
+                    # For full chunks, directly use C-1; only loop for partial chunks
+                    if valid_len_chunk >= C:
+                        rG_last = exp_g[Constant.C - 1]
+                    else:
+                        rG_last = cutlass.Float32(0.0)
+                        for _g_row in cutlass.range(0, Constant.C, unroll_full=True):
+                            if _g_row < valid_len_chunk:
+                                rG_last = exp_g[_g_row]
                     # NOTE: each thread save one element
                     sG_last[local_tidx, g_stage_idx] = rG_last
 
@@ -4136,10 +4141,13 @@ class KDAChunkwise:
                 # Load beta with boundary check for partial last chunk
                 valid_len_beta = seq_len - chunk_start
                 for data_idx in cutlass.range(local_tidx, Constant.C, self.threads_per_warp):
-                    if data_idx < valid_len_beta:
+                    if valid_len_beta >= C:
                         sBeta[data_idx, 0] = beta_chunk[data_idx, 0]
                     else:
-                        sBeta[data_idx, 0] = cutlass.Float32(0.0)
+                        if data_idx < valid_len_beta:
+                            sBeta[data_idx, 0] = beta_chunk[data_idx, 0]
+                        else:
+                            sBeta[data_idx, 0] = cutlass.Float32(0.0)
 
                 # Fence
                 cute.arch.fence_proxy(
@@ -5748,13 +5756,14 @@ class KDAChunkwise:
             if index_q < index_k:
                 qk[i] = cutlass.BFloat16(0.0)
                 kk[i] = cutlass.Float16(0.0)
-            # boundary mask for non-aligned chunks
-            if index_q >= valid_len_chunk:
-                qk[i] = cutlass.BFloat16(0.0)
-                kk[i] = cutlass.Float16(0.0)
-            if index_k >= valid_len_chunk:
-                qk[i] = cutlass.BFloat16(0.0)
-                kk[i] = cutlass.Float16(0.0)
+            # boundary mask for non-aligned chunks (only needed for partial chunks)
+            if valid_len_chunk < Constant.C:
+                if index_q >= valid_len_chunk:
+                    qk[i] = cutlass.BFloat16(0.0)
+                    kk[i] = cutlass.Float16(0.0)
+                if index_k >= valid_len_chunk:
+                    qk[i] = cutlass.BFloat16(0.0)
+                    kk[i] = cutlass.Float16(0.0)
             # fill 1.0 for kk diagonal
             if index_q == index_k:
                 kk[i] = cutlass.Float16(1.0)
