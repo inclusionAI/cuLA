@@ -394,7 +394,8 @@ class KDAChunkwise:
         initial_state_iter: cute.Pointer,  # Initial state [B, H, D, D], float32 or nullptr
         final_state_iter: cute.Pointer,    # Final state [B, H, D, D], float32 or nullptr
         cu_seqlens_iter: cute.Pointer,     # Cumulative seq lengths [num_seqs+1], int32 (varlen)
-        problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B/num_seqs, S/total_tokens, H, D)
+        o_cu_seqlens_iter: cute.Pointer,   # Padded cumulative seq lengths for O [num_seqs+1], int32
+        problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],  # (B/num_seqs, S/total_tokens, H, D, o_S)
         stream: cuda.CUstream,
         options=None, # compile options
     ):
@@ -417,7 +418,7 @@ class KDAChunkwise:
             stream: CUDA stream
             options: compile options for the kernel
         """
-        B,S,H,D = problem_size
+        B,S,H,D,o_S = problem_size
 
         # Setup attributes
         self._setup_attributes()
@@ -473,8 +474,8 @@ class KDAChunkwise:
         beta = cute.make_tensor(beta_iter, beta_layout)
 
         o_layout = cute.make_layout(
-            (D, S, (H, data_B)),
-            stride=(1, D*H, (D, D*H*S)),
+            (D, o_S, (H, data_B)),
+            stride=(1, D*H, (D, D*H*o_S)),
         )
         o = cute.make_tensor(o_iter, o_layout)
 
@@ -490,8 +491,10 @@ class KDAChunkwise:
         # cu_seqlens tensor for varlen
         if cutlass.const_expr(self.is_varlen):
             cu_seqlens = cute.make_tensor(cu_seqlens_iter, cute.make_layout((B + 1,)))
+            o_cu_seqlens = cute.make_tensor(o_cu_seqlens_iter, cute.make_layout((B + 1,)))
         else:
             cu_seqlens = cute.make_tensor(cu_seqlens_iter, cute.make_layout((2,)))
+            o_cu_seqlens = cute.make_tensor(o_cu_seqlens_iter, cute.make_layout((2,)))
 
         self.q_dtype = q.element_type
         self.k_dtype = k.element_type
@@ -958,6 +961,7 @@ class KDAChunkwise:
             initial_state,
             final_state,
             cu_seqlens,
+            o_cu_seqlens,
             problem_size,
         ).launch(
             grid=self.grid,
@@ -1004,7 +1008,8 @@ class KDAChunkwise:
         initial_state: cute.Tensor,  # (D, D, (H, B)), float32
         final_state: cute.Tensor,    # (D, D, (H, B)), float32
         cu_seqlens: cute.Tensor,     # int32 tensor for varlen
-        problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B, S, H, D)
+        o_cu_seqlens: cute.Tensor,   # padded int32 tensor for O varlen offsets
+        problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],  # (B, S, H, D, o_S)
     ):
         """
         KDA Kernel - Step 1: Gate processing
@@ -1570,16 +1575,18 @@ class KDAChunkwise:
             print(f"sQK: {cute.pretty_str(sQK)}")
 
         (_, hidx, bidx) = cute.arch.block_idx()
-        B, S, H, D = problem_size
+        B, S, H, D, o_S = problem_size
         C = self.chunk_size
 
         # Varlen: compute per-CTA sequence boundary and domain offsets
         if cutlass.const_expr(self.is_varlen):
             tok_offset = cu_seqlens[bidx]
             seq_len = cu_seqlens[bidx + 1] - tok_offset
+            o_tok_offset = o_cu_seqlens[bidx]
             data_bidx = Int32(0)
         else:
             tok_offset = Int32(0)
+            o_tok_offset = Int32(0)
             seq_len = S
             data_bidx = bidx
 
@@ -2129,7 +2136,7 @@ class KDAChunkwise:
 
                     ##########################################################
                     # NOTE: Generate next state for all chunks (including last when output_final_state)
-                    if idx != (seq_len // C) - 1 or cutlass.const_expr(self.output_final_state):
+                    if idx != ((seq_len + C - 1) // C) - 1 or cutlass.const_expr(self.output_final_state):
                         kv_handle = kv_producer.acquire_and_advance()
 
                         self.mma_sync_barrier.arrive_and_wait()
@@ -2574,6 +2581,7 @@ class KDAChunkwise:
                 # safe_gate version
                 for chunk_start in cutlass.range(0, seq_len, C, unroll=0):
                     idx = chunk_start // C
+                    valid_len_chunk = seq_len - chunk_start
 
                     # ============================================================
                     # KDA cuda core logic
@@ -2593,11 +2601,13 @@ class KDAChunkwise:
                     g_f32 = g_val.to(cutlass.Float32)
 
                     # write g_last to sG_last
-                    # FIXME: support final block with uneven chunk size
-                    # TODO: perf optimize
+                    # Use valid_len_chunk-1 as the last valid row for partial chunks
+                    g_last_row = valid_len_chunk - 1
+                    if g_last_row > Constant.C - 1:
+                        g_last_row = Constant.C - 1
                     for i in cutlass.range_constexpr(cute.size(tQcMq)):
                         index_q, index_k = index_transform(*tQcMq[i])
-                        if index_q == Constant.C - 1:
+                        if index_q == g_last_row:
                             sG_last[index_k, g_stage_idx] = tQrG[i]
 
                     if idx != 0 or cutlass.const_expr(self.has_initial_state):
@@ -2612,6 +2622,12 @@ class KDAChunkwise:
                         tQrQ = cute.make_fragment_like(tQrQ_0, self.q_dtype)
                         tQrQ_cv = thr_load_qk.retile(tQrQ)
                         cute.copy(tiled_load_qk, tQsQ[None, None, None, q_stage_idx], tQrQ_cv)
+                        # Zero Q for invalid positions in partial chunks
+                        if valid_len_chunk < C:
+                            for i in cutlass.range_constexpr(cute.size(tQcMq)):
+                                index_q, index_k = index_transform(*tQcMq[i])
+                                if index_q >= valid_len_chunk:
+                                    tQrQ[i] = self.q_dtype(0.0)
 
                         q_val = tQrQ.load()  # BF16 tensor
                         exp_g = tQrG.load()
@@ -2643,6 +2659,12 @@ class KDAChunkwise:
                         tQrK = cute.make_fragment_like(tQrQ_0, self.q_dtype)
                         tQrK_cv = thr_load_qk.retile(tQrK)
                         cute.copy(tiled_load_qk, tQsK[None, None, None, k_stage_idx], tQrK_cv)
+                        # Zero K for invalid positions in partial chunks
+                        if valid_len_chunk < C:
+                            for i in cutlass.range_constexpr(cute.size(tQcMq)):
+                                index_q, index_k = index_transform(*tQcMq[i])
+                                if index_q >= valid_len_chunk:
+                                    tQrK[i] = self.q_dtype(0.0)
                         k_val = tQrK.load()  # BF16 tensor
                         k_f32 = k_val.to(cutlass.Float32)
                         exp_g = tQrG.load()
@@ -2806,6 +2828,12 @@ class KDAChunkwise:
                     tQrK = cute.make_fragment_like(tQrQ_0, dtype=self.k_dtype)
                     tQrK_cv = thr_load_qk.retile(tQrK)
                     cute.copy(tiled_load_qk, tQsK[None, None, None, k_stage_idx], tQrK_cv)
+                    # Zero K for invalid positions in partial chunks (in RMEM before compute)
+                    if valid_len_chunk < C:
+                        for i in cutlass.range_constexpr(cute.size(tQcMq)):
+                            index_q, index_k = index_transform(*tQcMq[i])
+                            if index_q >= valid_len_chunk:
+                                tQrK[i] = self.k_dtype(0.0)
                     k_val = tQrK.load()  # BF16 tensor
                     k_f32 = k_val.to(cutlass.Float32)
 
@@ -2927,6 +2955,7 @@ class KDAChunkwise:
             else:
                 for chunk_start in cutlass.range(0, seq_len, C, unroll=0):
                     idx = chunk_start // C
+                    valid_len_chunk = seq_len - chunk_start
 
                     # ============================================================
                     # KDA Prologue: Load g, Q, K from SMEM to RMEM for elementwise
@@ -3020,6 +3049,17 @@ class KDAChunkwise:
                     tRS_rQ.store(q_gated_bf16)
                     tRS_rG_bf16.store(k_intra_bf16)  # K * exp(-g) for inter-chunk
                     tRS_rK.store(k_inter_bf16)        # K * exp(g) for intra-chunk
+
+                    # Zero RMEM for invalid rows (non-aligned varlen support)
+                    # K*exp(g) is used by MMA warp for K^T@V state update.
+                    # Invalid rows must be zero to prevent state corruption.
+                    # Q*exp(g) invalid rows produce garbage output at padded positions (safe).
+                    # K*exp(-g) invalid rows are already handled by subchunk boundary mask.
+                    for _zr in cutlass.range(0, Constant.C, unroll_full=True):
+                        if _zr >= valid_len_chunk:
+                            tRS_rK[0, _zr, 0] = self.io_dtype(0.0)
+                            tRS_rQ[0, _zr, 0] = self.io_dtype(0.0)
+                            tRS_rG_bf16[0, _zr, 0] = self.io_dtype(0.0)
                 
                     # ============================================================
                     # KDA Step 3: Write gated Q', K_inter, K_intra back to SMEM
@@ -3084,9 +3124,12 @@ class KDAChunkwise:
                     # ============================================================
 
                     # ------------------------------------------------------------
-                    # NOTE: Save exp(g) of last row to rG_last for state update in next chunk
+                    # NOTE: Save exp(g) of last VALID row to rG_last for state update in next chunk
+                    # For non-aligned chunks, last valid row may be < C-1
                     rG_last = cutlass.Float32(0.0)
-                    rG_last = exp_g[Constant.C - 1]
+                    for _g_row in cutlass.range(0, Constant.C, unroll_full=True):
+                        if _g_row < valid_len_chunk:
+                            rG_last = exp_g[_g_row]
                     # NOTE: each thread save one element
                     sG_last[local_tidx, g_stage_idx] = rG_last
 
@@ -3372,7 +3415,7 @@ class KDAChunkwise:
                     # 1. Decay the state (T2R FP32 read from TMEM to RMEM)
                     # 2. Output final state if this is the last chunk
                     # We split the T2R read (needed for final state) from kv16 produce (only for non-final)
-                    if idx != (seq_len // C - 1) or cutlass.const_expr(self.output_final_state):
+                    if idx != ((seq_len + C - 1) // C - 1) or cutlass.const_expr(self.output_final_state):
                         # Wait for kv mma from `idx-1` round of mma warp
                         kv_handle = kv_consumer.wait_and_advance()
                         if should_debug:
@@ -3416,7 +3459,7 @@ class KDAChunkwise:
                         kv_handle.release()
 
                     # 3. Convert to BF16 and produce to kv16 pipeline (only for non-final blocks)
-                    if idx != (seq_len // C - 1):
+                    if idx != ((seq_len + C - 1) // C - 1):
                         # Prepare bf16 state for tcgen05.mma
                         kv16_handle = kv16_producer.acquire_and_advance()
                         if should_debug:
@@ -3439,7 +3482,7 @@ class KDAChunkwise:
 
                     # Output final state if this is the last chunk
                     if cutlass.const_expr(self.output_final_state):
-                        if idx == (seq_len // C - 1):
+                        if idx == ((seq_len + C - 1) // C - 1):
                             # State is already in tTR_rKV from the BF16 conversion above
                             # Write FP32 state from RMEM to GMEM
                             # TMEM stores S^T (transposed), so flat[i] = state[local_tidx, i]
@@ -3959,8 +4002,8 @@ class KDAChunkwise:
                     cute.copy(tiled_load_qk, thr_load_qk.partition_S(sQK_curr), tQKrQK)
                     cute.copy(tiled_load_kk, thr_load_kk.partition_S(sKK_inv_curr), tKKrKK)
                     # triangular mask and boundary mask
-                    # FIXME: add boundary mask
-                    self.apply_qk_kk_mask(tQKcMqk, tQKrQK, tKKrKK)
+                    valid_len_chunk = seq_len - chunk_start
+                    self.apply_qk_kk_mask(tQKcMqk, tQKrQK, tKKrKK, valid_len_chunk)
                     # R2S QK/KK
                     cute.copy(tiled_store_qk, thr_store_qk.retile(tQKrQK), thr_store_qk.partition_D(sQK_curr))
                     cute.copy(tiled_store_kk, thr_store_kk.retile(tKKrKK), thr_store_kk.partition_D(sKK_inv_curr))
@@ -4033,7 +4076,7 @@ class KDAChunkwise:
             # Apply domain_offset for varlen
             tma_tensor_o_v = tma_tensor_o
             if cutlass.const_expr(self.is_varlen):
-                tma_tensor_o_v = cute.domain_offset((0, tok_offset, (0, 0)), tma_tensor_o)
+                tma_tensor_o_v = cute.domain_offset((0, o_tok_offset, (0, 0)), tma_tensor_o)
             # (MMA_M, MMA_N, TILES_M, TILES_N, (H, B))
             gO_pre_partition = cute.flat_divide(
                 tma_tensor_o_v, cute.select(self.vp_mma_tiler, mode=[0, 1])
@@ -4090,9 +4133,13 @@ class KDAChunkwise:
                 if cutlass.const_expr(PRINT_DEBUG):
                     print(f"sBeta: {sBeta}")
                     print(f"beta_chunk: {beta_chunk}")
-                # FIXME: update with the valid length for the last block
+                # Load beta with boundary check for partial last chunk
+                valid_len_beta = seq_len - chunk_start
                 for data_idx in cutlass.range(local_tidx, Constant.C, self.threads_per_warp):
-                    sBeta[data_idx, 0] = beta_chunk[data_idx, 0]
+                    if data_idx < valid_len_beta:
+                        sBeta[data_idx, 0] = beta_chunk[data_idx, 0]
+                    else:
+                        sBeta[data_idx, 0] = cutlass.Float32(0.0)
 
                 # Fence
                 cute.arch.fence_proxy(
@@ -5687,6 +5734,7 @@ class KDAChunkwise:
         index_qk: cute.Tensor,
         qk: cute.Tensor,
         kk: cute.Tensor,
+        valid_len_chunk: cutlass.Int32,
         index_transform: cutlass.Constexpr = lambda index_q, index_k: (
             index_q,
             index_k,
@@ -5698,6 +5746,13 @@ class KDAChunkwise:
             index_q, index_k = index_transform(*index_qk[i])
             # triangular for qk & kk
             if index_q < index_k:
+                qk[i] = cutlass.BFloat16(0.0)
+                kk[i] = cutlass.Float16(0.0)
+            # boundary mask for non-aligned chunks
+            if index_q >= valid_len_chunk:
+                qk[i] = cutlass.BFloat16(0.0)
+                kk[i] = cutlass.Float16(0.0)
+            if index_k >= valid_len_chunk:
                 qk[i] = cutlass.BFloat16(0.0)
                 kk[i] = cutlass.Float16(0.0)
             # fill 1.0 for kk diagonal

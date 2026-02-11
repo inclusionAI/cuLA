@@ -232,43 +232,19 @@ class ChunkKDAFunction(torch.autograd.Function):
         else:
             num_seqs = B
 
-        # Pad varlen sequences to chunk-aligned lengths if needed
-        needs_padding = False
-        orig_cu_seqlens = None
-        orig_S = S
+        # Compute output-only padding for non-aligned varlen sequences
+        # Input data is NOT padded - the kernel handles partial chunks natively.
+        # Only the output buffer is padded to avoid TMA store race conditions.
+        needs_o_padding = False
+        o_S = S  # default: output has same size as input
         if is_varlen:
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            needs_padding = not torch.all(seq_lens % chunk_size == 0).item()
-            if needs_padding:
-                orig_cu_seqlens = cu_seqlens
+            needs_o_padding = not torch.all(seq_lens % chunk_size == 0).item()
+            if needs_o_padding:
                 padded_lens = ((seq_lens + chunk_size - 1) // chunk_size) * chunk_size
-                padded_cu_seqlens = torch.zeros(num_seqs + 1, dtype=cu_seqlens.dtype, device=q.device)
-                padded_cu_seqlens[1:] = padded_lens.cumsum(0)
-                padded_S = padded_cu_seqlens[-1].item()
-
-                # Allocate padded tensors (zero-filled: Q/K/V=0, g=0 → exp(0)=1, beta=0)
-                q_p = q.new_zeros(1, padded_S, H, D)
-                k_p = k.new_zeros(1, padded_S, H, D)
-                v_p = v.new_zeros(1, padded_S, H, D)
-                g_p = g.new_zeros(1, padded_S, *g.shape[2:])  # (1, S', H, D) or (1, S', H)
-                beta_p = beta.new_zeros(1, padded_S, H)
-
-                # Copy valid data into padded positions
-                for i in range(num_seqs):
-                    s_o = orig_cu_seqlens[i].item()
-                    e_o = orig_cu_seqlens[i + 1].item()
-                    s_p = padded_cu_seqlens[i].item()
-                    ln = e_o - s_o
-                    q_p[0, s_p:s_p + ln] = q[0, s_o:e_o]
-                    k_p[0, s_p:s_p + ln] = k[0, s_o:e_o]
-                    v_p[0, s_p:s_p + ln] = v[0, s_o:e_o]
-                    g_p[0, s_p:s_p + ln] = g[0, s_o:e_o]
-                    beta_p[0, s_p:s_p + ln] = beta[0, s_o:e_o]
-
-                q, k, v, g, beta = q_p, k_p, v_p, g_p, beta_p
-                cu_seqlens = padded_cu_seqlens
-                S = padded_S
-                chunk_indices = None  # recompute from padded cu_seqlens
+                o_cu_seqlens = torch.zeros(num_seqs + 1, dtype=cu_seqlens.dtype, device=q.device)
+                o_cu_seqlens[1:] = padded_lens.cumsum(0)
+                o_S = o_cu_seqlens[-1].item()
 
         g_org = None
         if use_gate_in_kernel:
@@ -316,7 +292,11 @@ class ChunkKDAFunction(torch.autograd.Function):
         beta_cute = from_dlpack(beta.detach())
 
         # FIXME: support return final_states
-        o = torch.empty_like(q)
+        # Allocate O with padded size for non-aligned varlen
+        if needs_o_padding:
+            o = torch.empty(1, o_S, H, D, dtype=q.dtype, device=q.device)
+        else:
+            o = torch.empty_like(q)
         o_cute = from_dlpack(o.detach())
 
         stream = cutlass_torch.default_stream()
@@ -330,6 +310,14 @@ class ChunkKDAFunction(torch.autograd.Function):
         else:
             cu_seqlens_i32 = torch.zeros(2, dtype=torch.int32, device=q.device)
         cu_seqlens_cute = from_dlpack(cu_seqlens_i32.detach())
+
+        # Prepare o_cu_seqlens for output-only padding
+        if is_varlen and needs_o_padding:
+            o_cu_seqlens_i32 = o_cu_seqlens.to(torch.int32).contiguous()
+        else:
+            # When not needed, o_cu_seqlens == cu_seqlens (same offsets)
+            o_cu_seqlens_i32 = cu_seqlens_i32
+        o_cu_seqlens_cute = from_dlpack(o_cu_seqlens_i32.detach())
 
         # State shape: [num_seqs, H, D, D]
         # For non-varlen: num_seqs = B
@@ -349,8 +337,8 @@ class ChunkKDAFunction(torch.autograd.Function):
             final_state_f32 = torch.zeros(num_seqs, H, D, D, dtype=torch.float32, device=q.device)
         final_state_cute = from_dlpack(final_state_f32.detach())
 
-        # problem_size: (num_seqs, total_tokens_or_seq_len, H, D)
-        problem_size = (num_seqs, S, H, D)
+        # problem_size: (num_seqs, total_tokens_or_seq_len, H, D, o_S)
+        problem_size = (num_seqs, S, H, D, o_S)
 
         if cache_key in compiled_kernel_cache:
             compiled_kernel = compiled_kernel_cache[cache_key]
@@ -377,6 +365,7 @@ class ChunkKDAFunction(torch.autograd.Function):
                 initial_state_cute.iterator,
                 final_state_cute.iterator,
                 cu_seqlens_cute.iterator,
+                o_cu_seqlens_cute.iterator,
                 problem_size,
                 stream,
                 options=COMPILE_OPTIONS,
@@ -393,6 +382,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             initial_state_cute.iterator,
             final_state_cute.iterator,
             cu_seqlens_cute.iterator,
+            o_cu_seqlens_cute.iterator,
             problem_size,
             stream,
             options=COMPILE_OPTIONS,
@@ -407,13 +397,13 @@ class ChunkKDAFunction(torch.autograd.Function):
         # ctx.scale = scale
         # ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         # ctx.use_gate_in_kernel = use_gate_in_kernel
-        # Extract valid output from padded tensor if padding was applied
-        if needs_padding:
-            o_valid = torch.empty(1, orig_S, H, D, dtype=o.dtype, device=o.device)
+        # Extract valid output from padded O buffer
+        if needs_o_padding:
+            o_valid = torch.empty(1, S, H, D, dtype=o.dtype, device=o.device)
             for i in range(num_seqs):
-                s_o = orig_cu_seqlens[i].item()
-                e_o = orig_cu_seqlens[i + 1].item()
-                s_p = padded_cu_seqlens[i].item()
+                s_o = cu_seqlens[i].item()
+                e_o = cu_seqlens[i + 1].item()
+                s_p = o_cu_seqlens_i32[i].item()
                 ln = e_o - s_o
                 o_valid[0, s_o:e_o] = o[0, s_p:s_p + ln]
             o = o_valid
@@ -564,7 +554,7 @@ def flash_kda_prefill(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
             )
-        # Non-aligned sequence lengths are automatically padded by the kernel wrapper
+        # Non-aligned sequence lengths are handled natively by the kernel
     if initial_state is not None:
         assert initial_state.dtype == torch.float32, "initial_state must be in float32."
 
