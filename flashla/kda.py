@@ -134,7 +134,8 @@ class KDAChunkwise:
         has_initial_state: bool = False,
         output_final_state: bool = False,
         is_varlen: bool = False,
-        num_regs_cuda: int = 248,  # Critical: 248 provides 39% speedup over 160
+        # num_regs_cuda: int = 248,
+        num_regs_cuda: int = 224,
         num_regs_subchunk: int = 192,
         num_regs_others: int = 64,  # Optimized: best config from comprehensive sweep
     ):
