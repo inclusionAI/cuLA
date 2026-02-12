@@ -29,6 +29,10 @@ from flashla.kda import KDAChunkwise
 compiled_kernel_cache = {}
 COMPILE_OPTIONS = "--generate-line-info --ptxas-options '--verbose'"
 
+# Cached dummy tensors to avoid per-call allocation overhead (~0.12ms)
+# Key: device -> {cu_seqlens, state_dummy, cu_seqlens_cute, state_cute}
+_dummy_cache = {}
+
 def chunk_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -307,35 +311,68 @@ class ChunkKDAFunction(torch.autograd.Function):
         # Prepare cu_seqlens as int32 for kernel
         if is_varlen:
             cu_seqlens_i32 = cu_seqlens.to(torch.int32).contiguous()
+            cu_seqlens_cute = from_dlpack(cu_seqlens_i32.detach())
+            # Prepare o_cu_seqlens for output-only padding
+            if needs_o_padding:
+                o_cu_seqlens_i32 = o_cu_seqlens.to(torch.int32).contiguous()
+            else:
+                o_cu_seqlens_i32 = cu_seqlens_i32
+            o_cu_seqlens_cute = from_dlpack(o_cu_seqlens_i32.detach())
         else:
-            cu_seqlens_i32 = torch.zeros(2, dtype=torch.int32, device=q.device)
-        cu_seqlens_cute = from_dlpack(cu_seqlens_i32.detach())
-
-        # Prepare o_cu_seqlens for output-only padding
-        if is_varlen and needs_o_padding:
-            o_cu_seqlens_i32 = o_cu_seqlens.to(torch.int32).contiguous()
-        else:
-            # When not needed, o_cu_seqlens == cu_seqlens (same offsets)
+            # Use cached dummy cu_seqlens to avoid per-call allocation overhead
+            dev = q.device
+            if dev not in _dummy_cache:
+                _dummy_cu = torch.zeros(2, dtype=torch.int32, device=dev)
+                _dummy_st = torch.empty(1, dtype=torch.float32, device=dev)
+                _dummy_cache[dev] = {
+                    'cu_seqlens': _dummy_cu,
+                    'cu_seqlens_cute': from_dlpack(_dummy_cu.detach()),
+                    'state_dummy': _dummy_st,
+                    'state_cute': from_dlpack(_dummy_st.detach()),
+                }
+            dc = _dummy_cache[dev]
+            cu_seqlens_i32 = dc['cu_seqlens']
+            cu_seqlens_cute = dc['cu_seqlens_cute']
             o_cu_seqlens_i32 = cu_seqlens_i32
-        o_cu_seqlens_cute = from_dlpack(o_cu_seqlens_i32.detach())
+            o_cu_seqlens_cute = cu_seqlens_cute
 
         # State shape: [num_seqs, H, D, D]
-        # For non-varlen: num_seqs = B
-        # For varlen: num_seqs from cu_seqlens
         # Prepare initial_state and final_state tensors
         if has_initial_state:
             initial_state_f32 = initial_state.to(torch.float32).contiguous()
+            initial_state_cute = from_dlpack(initial_state_f32.detach())
         else:
-            # Create a dummy tensor (won't be accessed when has_initial_state=False)
-            initial_state_f32 = torch.zeros(num_seqs, H, D, D, dtype=torch.float32, device=q.device)
-        initial_state_cute = from_dlpack(initial_state_f32.detach())
+            # Use cached tiny dummy (pointer won't be dereferenced when has_initial_state=False)
+            initial_state_f32 = None
+            dev = q.device
+            if dev not in _dummy_cache:
+                _dummy_cu = torch.zeros(2, dtype=torch.int32, device=dev)
+                _dummy_st = torch.empty(1, dtype=torch.float32, device=dev)
+                _dummy_cache[dev] = {
+                    'cu_seqlens': _dummy_cu,
+                    'cu_seqlens_cute': from_dlpack(_dummy_cu.detach()),
+                    'state_dummy': _dummy_st,
+                    'state_cute': from_dlpack(_dummy_st.detach()),
+                }
+            initial_state_cute = _dummy_cache[dev]['state_cute']
 
         if output_final_state:
             final_state_f32 = torch.zeros(num_seqs, H, D, D, dtype=torch.float32, device=q.device)
+            final_state_cute = from_dlpack(final_state_f32.detach())
         else:
-            # Create a dummy tensor (won't be accessed when output_final_state=False)
-            final_state_f32 = torch.zeros(num_seqs, H, D, D, dtype=torch.float32, device=q.device)
-        final_state_cute = from_dlpack(final_state_f32.detach())
+            # Use cached tiny dummy (pointer won't be dereferenced when output_final_state=False)
+            final_state_f32 = None
+            dev = q.device
+            if dev not in _dummy_cache:
+                _dummy_cu = torch.zeros(2, dtype=torch.int32, device=dev)
+                _dummy_st = torch.empty(1, dtype=torch.float32, device=dev)
+                _dummy_cache[dev] = {
+                    'cu_seqlens': _dummy_cu,
+                    'cu_seqlens_cute': from_dlpack(_dummy_cu.detach()),
+                    'state_dummy': _dummy_st,
+                    'state_cute': from_dlpack(_dummy_st.detach()),
+                }
+            final_state_cute = _dummy_cache[dev]['state_cute']
 
         # problem_size: (num_seqs, total_tokens_or_seq_len, H, D, o_S)
         problem_size = (num_seqs, S, H, D, o_S)
