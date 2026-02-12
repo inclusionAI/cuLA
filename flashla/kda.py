@@ -2606,21 +2606,18 @@ class KDAChunkwise:
 
                     # write g_last to sG_last
                     # For full chunks, use constant C-1; for partial (varlen only), use valid_len_chunk-1
-                    if cutlass.const_expr(self.is_varlen):
-                      if valid_len_chunk < C:
-                        g_last_row = valid_len_chunk - 1
-                        for i in cutlass.range_constexpr(cute.size(tQcMq)):
-                            index_q, index_k = index_transform(*tQcMq[i])
-                            if index_q == g_last_row:
-                                sG_last[index_k, g_stage_idx] = tQrG[i]
-                      else:
-                        for i in cutlass.range_constexpr(cute.size(tQcMq)):
-                            index_q, index_k = index_transform(*tQcMq[i])
-                            if index_q == Constant.C - 1:
-                                sG_last[index_k, g_stage_idx] = tQrG[i]
-                    else:
-                        for i in cutlass.range_constexpr(cute.size(tQcMq)):
-                            index_q, index_k = index_transform(*tQcMq[i])
+                    # NOTE: index_q/index_k must be defined unconditionally by range_constexpr
+                    # to avoid DSL type-change-in-dynamic-if error in subsequent code
+                    for i in cutlass.range_constexpr(cute.size(tQcMq)):
+                        index_q, index_k = index_transform(*tQcMq[i])
+                        if cutlass.const_expr(self.is_varlen):
+                            if valid_len_chunk < C:
+                                if index_q == valid_len_chunk - 1:
+                                    sG_last[index_k, g_stage_idx] = tQrG[i]
+                            else:
+                                if index_q == Constant.C - 1:
+                                    sG_last[index_k, g_stage_idx] = tQrG[i]
+                        else:
                             if index_q == Constant.C - 1:
                                 sG_last[index_k, g_stage_idx] = tQrG[i]
 
