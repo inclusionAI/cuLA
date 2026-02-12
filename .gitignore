@@ -15,4 +15,9 @@ deprecated
 
 *.log
 *.ncu-rep
+benchmark_results
+*.nsys-rep
+*.sqlite
+
+*.txt
 
