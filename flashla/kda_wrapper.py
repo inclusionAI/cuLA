@@ -236,19 +236,9 @@ class ChunkKDAFunction(torch.autograd.Function):
         else:
             num_seqs = B
 
-        # Compute output-only padding for non-aligned varlen sequences
-        # Input data is NOT padded - the kernel handles partial chunks natively.
-        # Only the output buffer is padded to avoid TMA store race conditions.
-        needs_o_padding = False
-        o_S = S  # default: output has same size as input
-        if is_varlen:
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            needs_o_padding = not torch.all(seq_lens % chunk_size == 0).item()
-            if needs_o_padding:
-                padded_lens = ((seq_lens + chunk_size - 1) // chunk_size) * chunk_size
-                o_cu_seqlens = torch.zeros(num_seqs + 1, dtype=cu_seqlens.dtype, device=q.device)
-                o_cu_seqlens[1:] = padded_lens.cumsum(0)
-                o_S = o_cu_seqlens[-1].item()
+        # No output padding needed — the kernel handles tail tiles via
+        # TMA descriptor modification (like flashkda), preventing writes
+        # into the next sequence's output region.
 
         g_org = None
         if use_gate_in_kernel:
@@ -296,11 +286,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         beta_cute = from_dlpack(beta.detach())
 
         # FIXME: support return final_states
-        # Allocate O with padded size for non-aligned varlen
-        if needs_o_padding:
-            o = torch.empty(1, o_S, H, D, dtype=q.dtype, device=q.device)
-        else:
-            o = torch.empty_like(q)
+        o = torch.empty_like(q)
         o_cute = from_dlpack(o.detach())
 
         stream = cutlass_torch.default_stream()
@@ -312,12 +298,6 @@ class ChunkKDAFunction(torch.autograd.Function):
         if is_varlen:
             cu_seqlens_i32 = cu_seqlens.to(torch.int32).contiguous()
             cu_seqlens_cute = from_dlpack(cu_seqlens_i32.detach())
-            # Prepare o_cu_seqlens for output-only padding
-            if needs_o_padding:
-                o_cu_seqlens_i32 = o_cu_seqlens.to(torch.int32).contiguous()
-            else:
-                o_cu_seqlens_i32 = cu_seqlens_i32
-            o_cu_seqlens_cute = from_dlpack(o_cu_seqlens_i32.detach())
         else:
             # Use cached dummy cu_seqlens to avoid per-call allocation overhead
             dev = q.device
@@ -333,8 +313,35 @@ class ChunkKDAFunction(torch.autograd.Function):
             dc = _dummy_cache[dev]
             cu_seqlens_i32 = dc['cu_seqlens']
             cu_seqlens_cute = dc['cu_seqlens_cute']
-            o_cu_seqlens_i32 = cu_seqlens_i32
-            o_cu_seqlens_cute = cu_seqlens_cute
+
+        # Workspace buffer for TMA descriptor modification (varlen tail tiles)
+        # Same approach as flashkda: per-CTA slot for modified TMA descriptors
+        # 128 bytes per TMA descriptor, indexed by bidx (sequence index)
+        dev = q.device
+        if dev not in _dummy_cache:
+            _dummy_cu = torch.zeros(2, dtype=torch.int32, device=dev)
+            _dummy_st = torch.empty(1, dtype=torch.float32, device=dev)
+            _dummy_cache[dev] = {
+                'cu_seqlens': _dummy_cu,
+                'cu_seqlens_cute': from_dlpack(_dummy_cu.detach()),
+                'state_dummy': _dummy_st,
+                'state_cute': from_dlpack(_dummy_st.detach()),
+            }
+        dc = _dummy_cache[dev]
+        if is_varlen:
+            ws_size = num_seqs * 128
+            # Allocate/reuse workspace (grow if needed)
+            if 'workspace' not in dc or dc['workspace'].numel() < ws_size:
+                ws_buf = torch.zeros(ws_size, dtype=torch.uint8, device=dev)
+                dc['workspace'] = ws_buf
+                dc['workspace_cute'] = from_dlpack(ws_buf.detach())
+            workspace_cute = dc['workspace_cute']
+        else:
+            if 'workspace' not in dc:
+                ws_buf = torch.zeros(128, dtype=torch.uint8, device=dev)
+                dc['workspace'] = ws_buf
+                dc['workspace_cute'] = from_dlpack(ws_buf.detach())
+            workspace_cute = dc['workspace_cute']
 
         # State shape: [num_seqs, H, D, D]
         # Prepare initial_state and final_state tensors
@@ -344,17 +351,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         else:
             # Use cached tiny dummy (pointer won't be dereferenced when has_initial_state=False)
             initial_state_f32 = None
-            dev = q.device
-            if dev not in _dummy_cache:
-                _dummy_cu = torch.zeros(2, dtype=torch.int32, device=dev)
-                _dummy_st = torch.empty(1, dtype=torch.float32, device=dev)
-                _dummy_cache[dev] = {
-                    'cu_seqlens': _dummy_cu,
-                    'cu_seqlens_cute': from_dlpack(_dummy_cu.detach()),
-                    'state_dummy': _dummy_st,
-                    'state_cute': from_dlpack(_dummy_st.detach()),
-                }
-            initial_state_cute = _dummy_cache[dev]['state_cute']
+            initial_state_cute = _dummy_cache[q.device]['state_cute']
 
         if output_final_state:
             final_state_f32 = torch.zeros(num_seqs, H, D, D, dtype=torch.float32, device=q.device)
@@ -362,20 +359,10 @@ class ChunkKDAFunction(torch.autograd.Function):
         else:
             # Use cached tiny dummy (pointer won't be dereferenced when output_final_state=False)
             final_state_f32 = None
-            dev = q.device
-            if dev not in _dummy_cache:
-                _dummy_cu = torch.zeros(2, dtype=torch.int32, device=dev)
-                _dummy_st = torch.empty(1, dtype=torch.float32, device=dev)
-                _dummy_cache[dev] = {
-                    'cu_seqlens': _dummy_cu,
-                    'cu_seqlens_cute': from_dlpack(_dummy_cu.detach()),
-                    'state_dummy': _dummy_st,
-                    'state_cute': from_dlpack(_dummy_st.detach()),
-                }
-            final_state_cute = _dummy_cache[dev]['state_cute']
+            final_state_cute = _dummy_cache[q.device]['state_cute']
 
-        # problem_size: (num_seqs, total_tokens_or_seq_len, H, D, o_S)
-        problem_size = (num_seqs, S, H, D, o_S)
+        # problem_size: (num_seqs, total_tokens_or_seq_len, H, D)
+        problem_size = (num_seqs, S, H, D)
 
         if cache_key in compiled_kernel_cache:
             compiled_kernel = compiled_kernel_cache[cache_key]
@@ -402,7 +389,7 @@ class ChunkKDAFunction(torch.autograd.Function):
                 initial_state_cute.iterator,
                 final_state_cute.iterator,
                 cu_seqlens_cute.iterator,
-                o_cu_seqlens_cute.iterator,
+                workspace_cute.iterator,
                 problem_size,
                 stream,
                 options=COMPILE_OPTIONS,
@@ -419,7 +406,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             initial_state_cute.iterator,
             final_state_cute.iterator,
             cu_seqlens_cute.iterator,
-            o_cu_seqlens_cute.iterator,
+            workspace_cute.iterator,
             problem_size,
             stream,
             options=COMPILE_OPTIONS,
@@ -427,23 +414,6 @@ class ChunkKDAFunction(torch.autograd.Function):
 
         if use_gate_in_kernel:
             g = None
-        # ctx.save_for_backward(
-        #     q, q_rstd, k, k_rstd, v, g, g_org, beta, A_log, dt_bias, Aqk, Akk, initial_state, cu_seqlens, chunk_indices
-        # )
-        # ctx.chunk_size = chunk_size
-        # ctx.scale = scale
-        # ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
-        # ctx.use_gate_in_kernel = use_gate_in_kernel
-        # Extract valid output from padded O buffer
-        if needs_o_padding:
-            o_valid = torch.empty(1, S, H, D, dtype=o.dtype, device=o.device)
-            for i in range(num_seqs):
-                s_o = cu_seqlens[i].item()
-                e_o = cu_seqlens[i + 1].item()
-                s_p = o_cu_seqlens_i32[i].item()
-                ln = e_o - s_o
-                o_valid[0, s_o:e_o] = o[0, s_p:s_p + ln]
-            o = o_valid
 
         return o.to(q.dtype), final_state_f32 if output_final_state else None
 

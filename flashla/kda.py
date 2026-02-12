@@ -395,8 +395,8 @@ class KDAChunkwise:
         initial_state_iter: cute.Pointer,  # Initial state [B, H, D, D], float32 or nullptr
         final_state_iter: cute.Pointer,    # Final state [B, H, D, D], float32 or nullptr
         cu_seqlens_iter: cute.Pointer,     # Cumulative seq lengths [num_seqs+1], int32 (varlen)
-        o_cu_seqlens_iter: cute.Pointer,   # Padded cumulative seq lengths for O [num_seqs+1], int32
-        problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],  # (B/num_seqs, S/total_tokens, H, D, o_S)
+        workspace_iter: cute.Pointer,      # Workspace buffer for TMA descriptor modification
+        problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B/num_seqs, S/total_tokens, H, D)
         stream: cuda.CUstream,
         options=None, # compile options
     ):
@@ -415,11 +415,12 @@ class KDAChunkwise:
             initial_state_iter: Initial state [N, H, D, D] or nullptr (N=B or num_seqs)
             final_state_iter: Final state [N, H, D, D] or nullptr
             cu_seqlens_iter: Cumulative seq lengths [num_seqs+1], int32 (varlen only)
+            workspace_iter: Workspace buffer for TMA descriptor modification (varlen tail tiles)
             problem_size: (N, S, H, D) where N=B or num_seqs, S=seq_len or total_tokens
             stream: CUDA stream
             options: compile options for the kernel
         """
-        B,S,H,D,o_S = problem_size
+        B,S,H,D = problem_size
 
         # Setup attributes
         self._setup_attributes()
@@ -475,8 +476,8 @@ class KDAChunkwise:
         beta = cute.make_tensor(beta_iter, beta_layout)
 
         o_layout = cute.make_layout(
-            (D, o_S, (H, data_B)),
-            stride=(1, D*H, (D, D*H*o_S)),
+            (D, S, (H, data_B)),
+            stride=(1, D*H, (D, D*H*S)),
         )
         o = cute.make_tensor(o_iter, o_layout)
 
@@ -492,10 +493,8 @@ class KDAChunkwise:
         # cu_seqlens tensor for varlen
         if cutlass.const_expr(self.is_varlen):
             cu_seqlens = cute.make_tensor(cu_seqlens_iter, cute.make_layout((B + 1,)))
-            o_cu_seqlens = cute.make_tensor(o_cu_seqlens_iter, cute.make_layout((B + 1,)))
         else:
             cu_seqlens = cute.make_tensor(cu_seqlens_iter, cute.make_layout((2,)))
-            o_cu_seqlens = cute.make_tensor(o_cu_seqlens_iter, cute.make_layout((2,)))
 
         self.q_dtype = q.element_type
         self.k_dtype = k.element_type
@@ -918,6 +917,10 @@ class KDAChunkwise:
 
         if cutlass.const_expr(self.is_varlen):
             self.grid = (1, H, B)
+            # TensorMapManager for TMA descriptor modification in varlen tail tiles
+            self._tensormap_mgr = utils.TensorMapManager(
+                utils.TensorMapUpdateMode.GMEM, 128
+            )
         else:
             self.grid = self._compute_grid(
                 # (D, S, (H, B))
@@ -962,7 +965,8 @@ class KDAChunkwise:
             initial_state,
             final_state,
             cu_seqlens,
-            o_cu_seqlens,
+            o,
+            workspace_iter,
             problem_size,
         ).launch(
             grid=self.grid,
@@ -1009,8 +1013,9 @@ class KDAChunkwise:
         initial_state: cute.Tensor,  # (D, D, (H, B)), float32
         final_state: cute.Tensor,    # (D, D, (H, B)), float32
         cu_seqlens: cute.Tensor,     # int32 tensor for varlen
-        o_cu_seqlens: cute.Tensor,   # padded int32 tensor for O varlen offsets
-        problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],  # (B, S, H, D, o_S)
+        o_gmem: cute.Tensor,         # raw GMEM output tensor (D, S, (H, data_B)) for tail tile handling
+        workspace_iter: cute.Pointer,  # workspace buffer for TMA descriptor modification
+        problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B, S, H, D)
     ):
         """
         KDA Kernel - Step 1: Gate processing
@@ -1576,18 +1581,16 @@ class KDAChunkwise:
             print(f"sQK: {cute.pretty_str(sQK)}")
 
         (_, hidx, bidx) = cute.arch.block_idx()
-        B, S, H, D, o_S = problem_size
+        B, S, H, D = problem_size
         C = self.chunk_size
 
         # Varlen: compute per-CTA sequence boundary and domain offsets
         if cutlass.const_expr(self.is_varlen):
             tok_offset = cu_seqlens[bidx]
             seq_len = cu_seqlens[bidx + 1] - tok_offset
-            o_tok_offset = o_cu_seqlens[bidx]
             data_bidx = Int32(0)
         else:
             tok_offset = Int32(0)
-            o_tok_offset = Int32(0)
             seq_len = S
             data_bidx = bidx
 
@@ -4088,10 +4091,10 @@ class KDAChunkwise:
             should_debug = PRINT_DEBUG and tidx == warp_idx*32 and hidx == 0 and bidx == 0
             # TMA STORE
             # O: (D, S), column major
-            # Apply domain_offset for varlen
+            # Apply domain_offset for varlen (use tok_offset for both input and output)
             tma_tensor_o_v = tma_tensor_o
             if cutlass.const_expr(self.is_varlen):
-                tma_tensor_o_v = cute.domain_offset((0, o_tok_offset, (0, 0)), tma_tensor_o)
+                tma_tensor_o_v = cute.domain_offset((0, tok_offset, (0, 0)), tma_tensor_o)
             # (MMA_M, MMA_N, TILES_M, TILES_N, (H, B))
             gO_pre_partition = cute.flat_divide(
                 tma_tensor_o_v, cute.select(self.vp_mma_tiler, mode=[0, 1])
@@ -4111,13 +4114,55 @@ class KDAChunkwise:
                 print(f"bSG_sO: {bSG_sO}")
                 print(f"bSG_gO_partitioned: {bSG_gO}")
 
+            # Varlen tail tile handling: prepare modified TMA descriptor
+            # For the last chunk of a non-last sequence that isn't chunk-aligned,
+            # the TMA store would write past the sequence boundary into the next
+            # sequence's output region. We prevent this by creating a modified TMA
+            # descriptor with a truncated S dimension (like flashkda's approach).
+            if cutlass.const_expr(self.is_varlen):
+                # Get workspace pointer with proper TMA descriptor type and alignment
+                ws_desc_ptr = self._tensormap_mgr.get_tensormap_ptr(
+                    (workspace_iter + bidx * 128).align(128)
+                )
+                need_tail_fixup = (seq_len % C != 0) & (bidx < B - 1)
+                if need_tail_fixup:
+                    # Create a GMEM tensor view with truncated S dimension
+                    new_S = tok_offset + seq_len
+                    o_tail = cute.make_tensor(
+                        o_gmem.iterator,
+                        cute.make_layout(
+                            (D, new_S, (H, Int32(1))),
+                            stride=(Int32(1), D * H, (D, D * H * S)),
+                        ),
+                    )
+                    # Initialize: copy original TMA descriptor to workspace
+                    cpasync.copy_tensormap(tma_atom_o, ws_desc_ptr)
+                    # Update with truncated tensor (changes shape/stride in descriptor)
+                    cpasync.update_tma_descriptor(tma_atom_o, o_tail, ws_desc_ptr)
+                    # Fence: make descriptor update visible to subsequent TMA operations
+                    cpasync.fence_tma_desc_release()
+
             # TMA STORE
             for chunk_start in cutlass.range(0, seq_len, C, unroll=0):
                 idx = chunk_start // C
 
                 smem_o_handle = smem_o_consumer.wait_and_advance()
                 # TMA STORE O: SMEM -> GMEM
-                cute.copy(tma_atom_o, bSG_sO[None, smem_o_handle.index], bSG_gO[(None, 0, 0, 0, idx)])
+                if cutlass.const_expr(self.is_varlen):
+                    remaining = seq_len - chunk_start
+                    is_tail = (remaining < C) & (bidx < B - 1)
+                    if is_tail:
+                        # Use modified TMA descriptor for tail tile
+                        # The modified descriptor has S bound = tok_offset + seq_len,
+                        # so elements beyond the sequence boundary are silently dropped
+                        cpasync.fence_tma_desc_acquire(ws_desc_ptr)
+                        cute.copy(tma_atom_o, bSG_sO[None, smem_o_handle.index], bSG_gO[(None, 0, 0, 0, idx)],
+                                  tma_desc_ptr=self._tensormap_mgr.get_tensormap_ptr(
+                                      ws_desc_ptr, cute.AddressSpace.generic))
+                    else:
+                        cute.copy(tma_atom_o, bSG_sO[None, smem_o_handle.index], bSG_gO[(None, 0, 0, 0, idx)])
+                else:
+                    cute.copy(tma_atom_o, bSG_sO[None, smem_o_handle.index], bSG_gO[(None, 0, 0, 0, idx)])
                 # Ensure smem_o has been released.
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
