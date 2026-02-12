@@ -16,7 +16,7 @@ from benchmark.utils import set_seed, exclusive_cumsum
 from flashla.kda_wrapper import flash_kda_prefill
 
 # Constant params
-B, H, D = 1, 64, 128
+B, H, D = 2, 64, 128
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
