@@ -396,7 +396,7 @@ def run_safe_gate_sweep(B_list=[1, 2], H=64, D=128,
 
 
 if __name__ == "__main__":
-  run_safe_gate_sweep(B_list=[1, 2])
+  run_safe_gate_sweep(B_list=[1, 2, 4])
   # benchmark_safe_gate.run(print_data=True, save_path='./benchmarks_safe_gate')
   # benchmark.run(print_data=True, save_path='./benchmarks')
   # benchmark_kernel.run(print_data=True, save_path='./benchmark_kernel')
