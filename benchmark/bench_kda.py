@@ -322,7 +322,81 @@ def benchmark_kernel(T, provider):
 
     return results
 
+def run_safe_gate_sweep(B_list=[1, 2], H=64, D=128,
+                        T_list=[128, 256, 512, 1024, 2048, 4096, 8192, 16384]):
+    """Run safe_gate benchmark for multiple B values and print a combined table with speedup."""
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+    scale = D ** (-0.5)
+    use_gate_in_kernel = True
+    safe_gate = True
+    lower_bound = -5.0
+    quantiles = [0.5, 0.2, 0.8]
+
+    all_results = {}  # (B, T) -> {'flashla': ms, 'fla': ms}
+
+    for B in B_list:
+        for T in T_list:
+            set_seed(42)
+            q = torch.randn(B, T, H, D, dtype=dtype, device=device)
+            k = torch.randn(B, T, H, D, dtype=dtype, device=device)
+            v = torch.randn(B, T, H, D, dtype=dtype, device=device)
+            g = torch.randn(B, T, H, D, dtype=torch.float, device=device)
+            beta = torch.randn(B, T, H, dtype=torch.float, device=device).sigmoid()
+            A_log = torch.randn(H, dtype=torch.float, device=device)
+            dt_bias = torch.randn(H * D, dtype=torch.float, device=device)
+
+            flashla_ms = triton.testing.do_bench(
+                lambda: flash_kda_prefill(
+                    q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                    A_log=A_log.clone(), dt_bias=dt_bias.clone(),
+                    initial_state=None, output_final_state=True,
+                    use_qk_l2norm_in_kernel=True, use_gate_in_kernel=use_gate_in_kernel,
+                    safe_gate=safe_gate, lower_bound=lower_bound,
+                ),
+                quantiles=quantiles,
+            )[0]
+
+            fla_ms = triton.testing.do_bench(
+                lambda: chunk_kda(
+                    q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                    A_log=A_log.clone(), dt_bias=dt_bias.clone(),
+                    initial_state=None, output_final_state=True,
+                    use_qk_l2norm_in_kernel=True, use_gate_in_kernel=use_gate_in_kernel,
+                    safe_gate=safe_gate, lower_bound=lower_bound,
+                ),
+                quantiles=quantiles,
+            )[0]
+
+            all_results[(B, T)] = {'flashla': flashla_ms, 'fla': fla_ms}
+            speedup = fla_ms / flashla_ms
+            print(f"  B={B}, T={T:>5}: flashla={flashla_ms:7.3f}ms  fla={fla_ms:7.3f}ms  speedup={speedup:.2f}x")
+
+    # Print combined table
+    col_w = 33  # width per B column
+    total_w = 8 + len(B_list) * (col_w + 2)
+    print("\n" + "=" * total_w)
+    print(f"{'':>8}", end="")
+    for B in B_list:
+        print(f" |{'B=' + str(B):^{col_w}}", end="")
+    print()
+    print(f"{'T':>8}", end="")
+    for B in B_list:
+        print(f" | {'flashla':>8}  {'fla':>8}  {'speedup':>8}", end="")
+    print()
+    print("-" * total_w)
+    for T in T_list:
+        print(f"{T:>8}", end="")
+        for B in B_list:
+            r = all_results[(B, T)]
+            speedup = r['fla'] / r['flashla']
+            print(f" | {r['flashla']:>7.3f}ms {r['fla']:>7.3f}ms {speedup:>7.2f}x", end="")
+        print()
+    print("=" * total_w)
+
+
 if __name__ == "__main__":
-  benchmark_safe_gate.run(print_data=True, save_path='./benchmarks_safe_gate')
+  run_safe_gate_sweep(B_list=[1, 2])
+  # benchmark_safe_gate.run(print_data=True, save_path='./benchmarks_safe_gate')
   # benchmark.run(print_data=True, save_path='./benchmarks')
   # benchmark_kernel.run(print_data=True, save_path='./benchmark_kernel')
