@@ -395,8 +395,161 @@ def run_safe_gate_sweep(B_list=[1, 2], H=64, D=128,
     print("=" * total_w)
 
 
+def run_state_combo_sweep(B=2, H=64, D=128,
+                          T_list=[128, 256, 512, 1024, 2048, 4096, 8192, 16384]):
+    """Run benchmark for all 4 combinations of (has_init_state, output_final_state).
+
+    Columns: (init=F,out=F), (init=F,out=T), (init=T,out=F), (init=T,out=T)
+    Each column shows flashla ms, fla ms, and speedup.
+    """
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+    scale = D ** (-0.5)
+    use_gate_in_kernel = True
+    safe_gate = True
+    lower_bound = -5.0
+    quantiles = [0.5, 0.2, 0.8]
+
+    combos = [
+        (False, False),  # no init, no output
+        (False, True),   # no init, output final
+        (True, False),   # has init, no output
+        (True, True),    # has init, output final
+    ]
+    combo_labels = [
+        "init=N,out=N",
+        "init=N,out=Y",
+        "init=Y,out=N",
+        "init=Y,out=Y",
+    ]
+
+    # all_results[(has_init, out_final, T)] -> {'flashla': ms, 'fla': ms}
+    all_results = {}
+
+    # Warmup: compile all kernel variants before timing
+    print("Warming up all kernel variants...")
+    for has_init, out_final in combos:
+        set_seed(42)
+        T_warmup = T_list[0]
+        q = torch.randn(B, T_warmup, H, D, dtype=dtype, device=device)
+        k = torch.randn(B, T_warmup, H, D, dtype=dtype, device=device)
+        v = torch.randn(B, T_warmup, H, D, dtype=dtype, device=device)
+        g = torch.randn(B, T_warmup, H, D, dtype=torch.float, device=device)
+        beta = torch.randn(B, T_warmup, H, dtype=torch.float, device=device).sigmoid()
+        A_log = torch.randn(H, dtype=torch.float, device=device)
+        dt_bias = torch.randn(H * D, dtype=torch.float, device=device)
+        init_state = torch.randn(B, H, D, D, dtype=torch.float, device=device) if has_init else None
+        # Trigger compilation
+        flash_kda_prefill(
+            q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+            A_log=A_log.clone(), dt_bias=dt_bias.clone(),
+            initial_state=init_state, output_final_state=out_final,
+            use_qk_l2norm_in_kernel=True, use_gate_in_kernel=use_gate_in_kernel,
+            safe_gate=safe_gate, lower_bound=lower_bound,
+        )
+        chunk_kda(
+            q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+            A_log=A_log.clone(), dt_bias=dt_bias.clone(),
+            initial_state=init_state, output_final_state=out_final,
+            use_qk_l2norm_in_kernel=True, use_gate_in_kernel=use_gate_in_kernel,
+            safe_gate=safe_gate, lower_bound=lower_bound,
+        )
+        tag = f"init={'Y' if has_init else 'N'}, out={'Y' if out_final else 'N'}"
+        print(f"  {tag} compiled")
+    torch.cuda.synchronize()
+    print("Warmup done.\n")
+
+    for has_init, out_final in combos:
+        tag = f"init={'Y' if has_init else 'N'}, out={'Y' if out_final else 'N'}"
+        print(f"\n--- {tag} ---")
+        for T in T_list:
+            set_seed(42)
+            q = torch.randn(B, T, H, D, dtype=dtype, device=device)
+            k = torch.randn(B, T, H, D, dtype=dtype, device=device)
+            v = torch.randn(B, T, H, D, dtype=dtype, device=device)
+            g = torch.randn(B, T, H, D, dtype=torch.float, device=device)
+            beta = torch.randn(B, T, H, dtype=torch.float, device=device).sigmoid()
+            A_log = torch.randn(H, dtype=torch.float, device=device)
+            dt_bias = torch.randn(H * D, dtype=torch.float, device=device)
+
+            if has_init:
+                init_state = torch.randn(B, H, D, D, dtype=torch.float, device=device)
+            else:
+                init_state = None
+
+            flashla_ms = triton.testing.do_bench(
+                lambda: flash_kda_prefill(
+                    q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                    A_log=A_log.clone(), dt_bias=dt_bias.clone(),
+                    initial_state=init_state, output_final_state=out_final,
+                    use_qk_l2norm_in_kernel=True, use_gate_in_kernel=use_gate_in_kernel,
+                    safe_gate=safe_gate, lower_bound=lower_bound,
+                ),
+                quantiles=quantiles,
+            )[0]
+
+            fla_ms = triton.testing.do_bench(
+                lambda: chunk_kda(
+                    q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                    A_log=A_log.clone(), dt_bias=dt_bias.clone(),
+                    initial_state=init_state, output_final_state=out_final,
+                    use_qk_l2norm_in_kernel=True, use_gate_in_kernel=use_gate_in_kernel,
+                    safe_gate=safe_gate, lower_bound=lower_bound,
+                ),
+                quantiles=quantiles,
+            )[0]
+
+            all_results[(has_init, out_final, T)] = {'flashla': flashla_ms, 'fla': fla_ms}
+            speedup = fla_ms / flashla_ms
+            print(f"  T={T:>5}: flashla={flashla_ms:7.3f}ms  fla={fla_ms:7.3f}ms  speedup={speedup:.2f}x")
+
+    # Print combined table
+    col_w = 33  # width per combo column
+    total_w = 8 + len(combos) * (col_w + 2)
+    print(f"\n  State combo sweep  B={B}, H={H}, D={D}")
+    print("=" * total_w)
+    print(f"{'':>8}", end="")
+    for label in combo_labels:
+        print(f" |{label:^{col_w}}", end="")
+    print()
+    print(f"{'T':>8}", end="")
+    for _ in combos:
+        print(f" | {'flashla':>8}  {'fla':>8}  {'speedup':>8}", end="")
+    print()
+    print("-" * total_w)
+    for T in T_list:
+        print(f"{T:>8}", end="")
+        for has_init, out_final in combos:
+            r = all_results[(has_init, out_final, T)]
+            speedup = r['fla'] / r['flashla']
+            print(f" | {r['flashla']:>7.3f}ms {r['fla']:>7.3f}ms {speedup:>7.2f}x", end="")
+        print()
+    print("=" * total_w)
+
+    # Also print a delta table: how much each combo costs relative to (init=N, out=N) baseline
+    print(f"\n  Overhead vs baseline (init=N, out=N)  B={B}")
+    print("=" * (8 + len(combos) * 24))
+    print(f"{'T':>8}", end="")
+    for label in combo_labels:
+        print(f" | {'flashla':>8}  {'fla':>8}", end="")
+    print()
+    print("-" * (8 + len(combos) * 24))
+    for T in T_list:
+        print(f"{T:>8}", end="")
+        base_fl = all_results[(False, False, T)]['flashla']
+        base_fla = all_results[(False, False, T)]['fla']
+        for has_init, out_final in combos:
+            r = all_results[(has_init, out_final, T)]
+            delta_fl = (r['flashla'] / base_fl - 1) * 100
+            delta_fla = (r['fla'] / base_fla - 1) * 100
+            print(f" | {delta_fl:>+7.1f}%  {delta_fla:>+7.1f}%", end="")
+        print()
+    print("=" * (8 + len(combos) * 24))
+
+
 if __name__ == "__main__":
-  run_safe_gate_sweep(B_list=[1, 2, 4])
+  run_state_combo_sweep(B=2)
+  # run_safe_gate_sweep(B_list=[1, 2, 4])
   # benchmark_safe_gate.run(print_data=True, save_path='./benchmarks_safe_gate')
   # benchmark.run(print_data=True, save_path='./benchmarks')
   # benchmark_kernel.run(print_data=True, save_path='./benchmark_kernel')
