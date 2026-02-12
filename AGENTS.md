@@ -13,3 +13,8 @@ source /ossfs/workspace/venv/bin/activate
 ### 2. 请勿每次都创建总结性文档
 
 
+### 3. 请勿每次都创建总结性文档
+
+如果创建临时辅助脚本，请放在 /ossfs/workspace/flashla/tmp 下面
+
+
