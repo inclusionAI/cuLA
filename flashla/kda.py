@@ -2675,7 +2675,9 @@ class KDAChunkwise:
                     # ====================================================
                     # Partitioned S2R: G loading + g_last + Q gating
                     # Each half loads HALF_D=64 elements vs full D=128,
-                    # reducing per-thread register fragment by 2x during S2R
+                    # reducing per-thread register fragment by 2x during S2R.
+                    # exp2(g) persists in tQrG_persists[] across Q→K gating
+                    # to avoid redundant G SMEM reloads (flashkda pattern).
                     # ====================================================
 
                     # wait G
@@ -2684,6 +2686,12 @@ class KDAChunkwise:
 
                     # wait Q (always wait to advance pipeline)
                     q_handle = load_q_consumer.wait_and_advance()
+
+                    # Pre-allocate persistent G register fragments (outside if blocks)
+                    # These hold exp2(g) after Q gating for reuse in K gating
+                    tQrG_persists = []
+                    for half_idx in cutlass.range_constexpr(2):
+                        tQrG_persists.append(cute.make_fragment_like(tQrQ_half_0, dtype=self.g_dtype))
 
                     # Merged g_last + Q gating path: single G half-load per half
                     if idx != 0 or cutlass.const_expr(self.has_initial_state):
@@ -2694,9 +2702,8 @@ class KDAChunkwise:
                         for half_idx in cutlass.range_constexpr(2):
                             k_offset = half_idx * Constant.HALF_D
 
-                            # S2R G half — single load for g_last + exp(g) + Q gating
-                            tQrG_half = cute.make_fragment_like(tQrQ_half_0, dtype=self.g_dtype)
-                            tQrG_half_cv = thr_load_g_half.retile(tQrG_half)
+                            # S2R G half into persistent fragment
+                            tQrG_half_cv = thr_load_g_half.retile(tQrG_persists[half_idx])
                             cute.copy(tiled_load_g_half, tQsG_h[half_idx][None, None, None, g_stage_idx], tQrG_half_cv)
 
                             # Write g_last half (before exp transforms g values)
@@ -2705,17 +2712,17 @@ class KDAChunkwise:
                                 if cutlass.const_expr(self.is_varlen):
                                     if valid_len_chunk < C:
                                         if index_q == valid_len_chunk - 1:
-                                            sG_last[index_k + k_offset, g_stage_idx] = tQrG_half[i]
+                                            sG_last[index_k + k_offset, g_stage_idx] = tQrG_persists[half_idx][i]
                                     else:
                                         if index_q == Constant.C - 1:
-                                            sG_last[index_k + k_offset, g_stage_idx] = tQrG_half[i]
+                                            sG_last[index_k + k_offset, g_stage_idx] = tQrG_persists[half_idx][i]
                                 else:
                                     if index_q == Constant.C - 1:
-                                        sG_last[index_k + k_offset, g_stage_idx] = tQrG_half[i]
+                                        sG_last[index_k + k_offset, g_stage_idx] = tQrG_persists[half_idx][i]
 
-                            # exp(g) half in-place
+                            # exp(g) half in-place — persists for K gating reuse
                             for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
-                                tQrG_half[i] = cute.exp2(tQrG_half[i])
+                                tQrG_persists[half_idx][i] = cute.exp2(tQrG_persists[half_idx][i])
 
                             # S2R Q half
                             tQrQ_half = cute.make_fragment_like(tQrQ_half_0, self.q_dtype)
@@ -2733,7 +2740,7 @@ class KDAChunkwise:
                             # Q gating: Q' = Q * exp(g) * scale
                             for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
                                 q_i = tQrQ_half[i].to(cutlass.Float32)
-                                tQrQ_half[i] = (q_i * tQrG_half[i] * self.scale).to(self.io_dtype)
+                                tQrQ_half[i] = (q_i * tQrG_persists[half_idx][i] * self.scale).to(self.io_dtype)
 
                             # R2S Q' half to sQ_K_scaled
                             tQrQ_half_cv_src = thr_store_qk_half.retile(tQrQ_half)
@@ -2748,25 +2755,25 @@ class KDAChunkwise:
                         # idx==0 without initial state: only write g_last (no Q gating)
                         for half_idx in cutlass.range_constexpr(2):
                             k_offset = half_idx * Constant.HALF_D
-                            tQrG_half = cute.make_fragment_like(tQrQ_half_0, dtype=self.g_dtype)
-                            tQrG_half_cv = thr_load_g_half.retile(tQrG_half)
+                            tQrG_half_cv = thr_load_g_half.retile(tQrG_persists[half_idx])
                             cute.copy(tiled_load_g_half, tQsG_h[half_idx][None, None, None, g_stage_idx], tQrG_half_cv)
                             for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
                                 index_q, index_k = index_transform_half(*tQcMq_half[i])
                                 if cutlass.const_expr(self.is_varlen):
                                     if valid_len_chunk < C:
                                         if index_q == valid_len_chunk - 1:
-                                            sG_last[index_k + k_offset, g_stage_idx] = tQrG_half[i]
+                                            sG_last[index_k + k_offset, g_stage_idx] = tQrG_persists[half_idx][i]
                                     else:
                                         if index_q == Constant.C - 1:
-                                            sG_last[index_k + k_offset, g_stage_idx] = tQrG_half[i]
+                                            sG_last[index_k + k_offset, g_stage_idx] = tQrG_persists[half_idx][i]
                                 else:
                                     if index_q == Constant.C - 1:
-                                        sG_last[index_k + k_offset, g_stage_idx] = tQrG_half[i]
+                                        sG_last[index_k + k_offset, g_stage_idx] = tQrG_persists[half_idx][i]
 
                     # ====================================================
                     # Partitioned S2R: K gating (2 half-passes)
-                    # K' = K * exp(g), overlapping first half with Q@S MMA
+                    # K' = K * exp(g), reusing exp2(g) from tQrG_persists[]
+                    # (no redundant G SMEM reload!)
                     # ====================================================
 
                     # wait K
@@ -2781,13 +2788,6 @@ class KDAChunkwise:
                         for half_idx in cutlass.range_constexpr(2):
                             k_offset = half_idx * Constant.HALF_D
 
-                            # Reload G half from SMEM, compute exp(g)
-                            tQrG_half = cute.make_fragment_like(tQrQ_half_0, dtype=self.g_dtype)
-                            tQrG_half_cv = thr_load_g_half.retile(tQrG_half)
-                            cute.copy(tiled_load_g_half, tQsG_h[half_idx][None, None, None, g_stage_idx], tQrG_half_cv)
-                            for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
-                                tQrG_half[i] = cute.exp2(tQrG_half[i])
-
                             # S2R K half
                             tQrK_half = cute.make_fragment_like(tQrQ_half_0, self.q_dtype)
                             tQrK_half_cv = thr_load_qk_half.retile(tQrK_half)
@@ -2801,10 +2801,10 @@ class KDAChunkwise:
                                         if index_q >= valid_len_chunk:
                                             tQrK_half[i] = self.q_dtype(0.0)
 
-                            # K gating: K' = K * exp(g)
+                            # K gating: K' = K * exp(g) — reuse persisted exp2(g)
                             for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
                                 k_i = tQrK_half[i].to(cutlass.Float32)
-                                tQrK_half[i] = (k_i * tQrG_half[i]).to(self.io_dtype)
+                                tQrK_half[i] = (k_i * tQrG_persists[half_idx][i]).to(self.io_dtype)
 
                             # R2S K' half to sQ_K_scaled
                             tQrK_half_cv_src = thr_store_qk_half.retile(tQrK_half)

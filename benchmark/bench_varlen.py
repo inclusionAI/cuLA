@@ -1,13 +1,8 @@
 """
 Benchmark: flashla (CuTe DSL) vs FLA (Triton) for variable-length KDA.
 
-Tests multiple varlen configurations:
-  1. Scale total tokens (fixed num_seqs, balanced)
-  2. Scale number of sequences (fixed total tokens)
-  3. Balanced vs Unbalanced distribution
-  4. Aligned vs Non-aligned sequence lengths
-  5. Varlen overhead (non-varlen vs varlen single-seq)
-  6. Realistic prefill scenarios
+Focused test: T=8k/32k, N=15-25 quasi-balanced sequences (max/min ratio ≤ 2-3x),
+compared against non-varlen baseline and FLA.
 """
 
 import sys
@@ -169,6 +164,39 @@ def generate_nonaligned_seqlens(total_tokens: int, num_seqs: int) -> list[int]:
         remaining -= sl
     seqlens.append(max(1, remaining))
     return seqlens
+
+
+def generate_quasi_balanced_seqlens(
+    total_tokens: int,
+    num_seqs: int,
+    max_ratio: float = 2.5,
+    seed: int = 123,
+) -> list[int]:
+    """Generate quasi-balanced seq lens where max/min ratio ≤ max_ratio.
+    
+    Strategy: sample from uniform [1, max_ratio], normalize to hit total_tokens.
+    Each seq gets at least chunk_size=64 tokens.
+    """
+    import random
+    rng = random.Random(seed)
+    MIN_SEQ = 64
+    
+    # Sample raw weights in [1, max_ratio]
+    weights = [rng.uniform(1.0, max_ratio) for _ in range(num_seqs)]
+    w_sum = sum(weights)
+    
+    # Scale to total_tokens, enforce minimum
+    raw = [max(MIN_SEQ, int(w / w_sum * total_tokens)) for w in weights]
+    
+    # Adjust to hit exact total
+    diff = total_tokens - sum(raw)
+    # Distribute remainder to largest seqs
+    indices = sorted(range(num_seqs), key=lambda i: raw[i], reverse=True)
+    for i in range(abs(diff)):
+        idx = indices[i % num_seqs]
+        raw[idx] += 1 if diff > 0 else -1
+    
+    return raw
 
 
 # =============================================================================
@@ -386,6 +414,107 @@ def bench_realistic_prefill(H: int):
 
 
 # =============================================================================
+# Benchmark: Focused quasi-balanced varlen (T=8k/32k, N=15-25)
+# =============================================================================
+
+def bench_focused_varlen(H: int):
+    """Core benchmark: T=8k/32k, N=15-25, quasi-balanced (max/min ≤ 2-3x).
+    
+    For each (T, N) config:
+      - non-varlen baseline (B=1, T=total)
+      - varlen with quasi-balanced seq lens
+      - FLA comparison for both
+    """
+    scale = D ** -0.5
+    total_tokens_list = [8192, 32768]
+    num_seqs_list = [16, 20, 24]
+
+    print_header(f"Focused varlen: quasi-balanced, H={H}")
+    hdr = (f"{'Config':<40} {'fl_base':>9} {'fl_vl':>9} {'fl_ovhd':>8} "
+           f"{'fla_base':>9} {'fla_vl':>9} {'fla_ovhd':>9} "
+           f"{'base_sp':>8} {'vl_sp':>7}")
+    print(hdr)
+    print(f"{'-'*110}")
+
+    for total_T in total_tokens_list:
+        for N in num_seqs_list:
+            set_seed(42)
+            seq_lens = generate_quasi_balanced_seqlens(total_T, N)
+            mn, mx = min(seq_lens), max(seq_lens)
+            ratio = mx / mn
+
+            # ---- inputs for non-varlen baseline (B=1, T=total_T) ----
+            q = torch.randn(1, total_T, H, D, dtype=DTYPE, device=DEVICE)
+            k = torch.randn(1, total_T, H, D, dtype=DTYPE, device=DEVICE)
+            v = torch.randn(1, total_T, H, D, dtype=DTYPE, device=DEVICE)
+            g = F.logsigmoid(torch.randn(1, total_T, H, D, dtype=torch.float, device=DEVICE)).clamp(-5, 0)
+            beta = torch.randn(1, total_T, H, dtype=torch.float32, device=DEVICE).sigmoid()
+            q = F.normalize(q, p=2, dim=-1)
+            k = F.normalize(k, p=2, dim=-1)
+            h0 = torch.randn(1, H, D, D, dtype=torch.float32, device=DEVICE)
+
+            def mk_flashla_base():
+                def fn():
+                    return flash_kda_prefill(
+                        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                        initial_state=h0, output_final_state=True,
+                        safe_gate=True, cu_seqlens=None,
+                    )
+                return fn
+
+            def mk_fla_base():
+                def fn():
+                    return chunk_kda(
+                        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                        initial_state=h0, output_final_state=True,
+                        safe_gate=True, cu_seqlens=None,
+                    )
+                return fn
+
+            fl_base, _, _ = bench_fn(mk_flashla_base())
+            fla_base, _, _ = bench_fn(mk_fla_base())
+
+            # ---- inputs for varlen ----
+            cu_seqlens = torch.tensor(
+                exclusive_cumsum(seq_lens), dtype=torch.long, device=DEVICE
+            )
+            h0_vl = torch.randn(N, H, D, D, dtype=torch.float32, device=DEVICE)
+
+            def mk_flashla_vl():
+                def fn():
+                    return flash_kda_prefill(
+                        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                        initial_state=h0_vl, output_final_state=True,
+                        safe_gate=True, cu_seqlens=cu_seqlens,
+                    )
+                return fn
+
+            def mk_fla_vl():
+                def fn():
+                    return chunk_kda(
+                        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                        initial_state=h0_vl, output_final_state=True,
+                        safe_gate=True, cu_seqlens=cu_seqlens,
+                    )
+                return fn
+
+            fl_vl, _, _ = bench_fn(mk_flashla_vl())
+            fla_vl, _, _ = bench_fn(mk_fla_vl())
+
+            fl_ovhd = (fl_vl - fl_base) / fl_base * 100
+            fla_ovhd = (fla_vl - fla_base) / fla_base * 100
+            base_sp = fla_base / fl_base if fl_base > 0 else float("inf")
+            vl_sp = fla_vl / fl_vl if fl_vl > 0 else float("inf")
+
+            tag = f"T={total_T:>5} N={N:>2} ({mn}-{mx}, {ratio:.1f}x)"
+            print(f"{tag:<40} {fl_base:>8.3f}ms {fl_vl:>7.3f}ms {fl_ovhd:>+7.1f}% "
+                  f"{fla_base:>8.3f}ms {fla_vl:>7.3f}ms {fla_ovhd:>+8.1f}% "
+                  f"{base_sp:>7.2f}x {vl_sp:>6.2f}x")
+
+        print()  # blank line between total_T groups
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -400,12 +529,8 @@ def run_all_benchmarks(H: int):
     precompile_kernels(H)
     print(" done.")
 
-    bench_scale_total_seqlen(H)
-    bench_scale_num_seqs(H)
-    bench_balanced_vs_unbalanced(H)
-    bench_aligned_vs_nonaligned(H)
+    bench_focused_varlen(H)
     bench_varlen_overhead(H)
-    bench_realistic_prefill(H)
 
 
 if __name__ == "__main__":
