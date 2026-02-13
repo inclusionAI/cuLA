@@ -97,6 +97,7 @@ class Constant:
     C = 64   # chunk size
     SC = 16  # subchunk size
     D = 128  # head dim
+    HALF_D = 64  # half head dim for partitioned S2R
     SCALE = float(D) ** -0.5
     BK_SC = 64 # tile size in subchunk MMA
 
@@ -171,8 +172,11 @@ class KDAChunkwise:
         # K: (64, 128)
         # V: (64, 128)
         C, D = (Constant.C, Constant.D)
+        HALF_D = Constant.HALF_D
         # (C, C, D)
         self.qk_mma_tiler = (C, C, D)  # (M, N, K)
+        # Half-width tiler for partitioned S2R in elementwise gating
+        self.qk_mma_tiler_half = (C, C, HALF_D)  # (M, N, K/2)
         self.kk_mma_tiler = (C, C, D)  # (M, N, K)
         # (D, C, C)
         self.vp_mma_tiler = (D, C, C)  # (M, N, K)
@@ -2497,47 +2501,119 @@ class KDAChunkwise:
                 acc_dtype=self.acc_dtype,
                 shape_mnk=(16, 8, 16)
             )
-            # TODO: replace with smaller BK for head dim, maybe better perf
-            tiled_mma_epi_fake = cute.make_tiled_mma(
+            # Half-size MMA for partitioned S2R: K dim halved from D=128 to HALF_D=64
+            # This reduces per-thread register fragment by 2x during S2R loading
+            tiled_mma_epi_half = cute.make_tiled_mma(
                 mma_op,
                 atom_layout_mnk=(4, 1, 1), # NOTE: 4 warps to process prologue
-                permutation_mnk=self.qk_mma_tiler, # (64, 64, 128)
+                permutation_mnk=self.qk_mma_tiler_half, # (64, 64, 64)
             )
-            thr_mma_epi_fake = tiled_mma_epi_fake.get_slice(local_tidx)
+            thr_mma_epi_half = tiled_mma_epi_half.get_slice(local_tidx)
             copy_op_qk_s2r = cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4)
             copy_op_qk_r2s = cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4)
             # FIXME: only 2 FP32 elements (64 bits) compatible with ldmatrix, how to change to 128?
             copy_atom_g = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(), self.g_dtype, num_bits_per_copy=64
             )
-            tiled_load_g = cute.make_tiled_copy_A(
+            # Half-size tiled copies for partitioned S2R
+            tiled_load_g_half = cute.make_tiled_copy_A(
                 copy_atom_g,
-                tiled_mma_epi_fake
+                tiled_mma_epi_half
             )
-            thr_load_g = tiled_load_g.get_slice(local_tidx)
-            tiled_load_qk = cute.make_tiled_copy_A(
+            thr_load_g_half = tiled_load_g_half.get_slice(local_tidx)
+            tiled_load_qk_half = cute.make_tiled_copy_A(
                 cute.make_copy_atom(copy_op_qk_s2r, self.io_dtype),
-                tiled_mma_epi_fake
+                tiled_mma_epi_half
             )
-            thr_load_qk = tiled_load_qk.get_slice(local_tidx)
-            tiled_store_qk = cute.make_tiled_copy_A(
+            thr_load_qk_half = tiled_load_qk_half.get_slice(local_tidx)
+            tiled_store_qk_half = cute.make_tiled_copy_A(
                 cute.make_copy_atom(copy_op_qk_r2s, self.io_dtype),
-                tiled_mma_epi_fake
+                tiled_mma_epi_half
             )
-            thr_store_qk = tiled_store_qk.get_slice(local_tidx)
+            thr_store_qk_half = tiled_store_qk_half.get_slice(local_tidx)
 
-            tQsQ = thr_load_qk.partition_S(sQ_flat)
-            tQsK = thr_load_qk.partition_S(sK_flat_s2r)
-            # used for make_fragment_like
-            sQ_flat_0 = sQ_flat[None, None, 0]
-            tQrQ_0 = thr_mma_epi_fake.make_fragment_A(thr_mma_epi_fake.partition_A(sQ_flat_0))
-            tQsG = thr_load_g.partition_S(sG_flat)
-            tQsQ_K_scaled = thr_store_qk.partition_D(sQ_K_scaled_flat)
-            # index tensor
-            q_shape = (self.qk_mma_tiler[0], self.qk_mma_tiler[2])
-            cM = cute.make_identity_tensor(q_shape)
-            tQcMq = thr_mma_epi_fake.partition_A(cM)
-            index_transform = lambda index_q, index_k: (
+            # ---- Half-width SMEM views for partitioned S2R ----
+            # Each full SMEM tensor (C, D, stage) is split into two halves along D.
+            # First half: D=[0, HALF_D), same base pointer
+            # Second half: D=[HALF_D, D), base pointer + C*HALF_D elements
+            # NOTE: Use existing tensor iterators (NOT storage.get_tensor) to avoid
+            # SharedStorage reference leaking into DSL if-block iter args
+            HALF_SMEM_ELEMS = Constant.C * Constant.HALF_D  # 4096
+
+            # Q half SMEM views (from sQ_flat iterator)
+            q_sml_epi_half = sm100_utils.make_smem_layout_epi(
+                self.q_dtype, utils.LayoutEnum.ROW_MAJOR,
+                (Constant.C, Constant.HALF_D), self.q_stage,
+            )
+            q_sml_half = cute.coalesce(q_sml_epi_half, target_profile=(1, 1, 1))
+            # Fix stage stride: half layout has stride C*HALF_D but actual SMEM uses C*D
+            q_half_outer = cute.make_layout(
+                q_sml_half.outer.shape,
+                stride=(*q_sml_half.outer.stride[:-1], q_sml_half.outer.stride[-1] * 2)
+            )
+            sQ_flat_h0 = cute.make_tensor(sQ_flat.iterator, layout=q_half_outer)
+            sQ_flat_h1 = cute.make_tensor(sQ_flat.iterator + HALF_SMEM_ELEMS, layout=q_half_outer)
+
+            # K half SMEM views (from sK_flat_s2r iterator)
+            k_sml_epi_half = sm100_utils.make_smem_layout_epi(
+                self.k_dtype, utils.LayoutEnum.ROW_MAJOR,
+                (Constant.C, Constant.HALF_D), self.k_stage,
+            )
+            k_sml_half = cute.coalesce(k_sml_epi_half, target_profile=(1, 1, 1))
+            k_half_outer = cute.make_layout(
+                k_sml_half.outer.shape,
+                stride=(*k_sml_half.outer.stride[:-1], k_sml_half.outer.stride[-1] * 2)
+            )
+            sK_flat_h0 = cute.make_tensor(sK_flat_s2r.iterator, layout=k_half_outer)
+            sK_flat_h1 = cute.make_tensor(sK_flat_s2r.iterator + HALF_SMEM_ELEMS, layout=k_half_outer)
+
+            # G half SMEM views (FP32, from sG_flat iterator)
+            g_sml_epi_half = sm100_utils.make_smem_layout_epi(
+                self.g_dtype, utils.LayoutEnum.ROW_MAJOR,
+                (Constant.C, Constant.HALF_D), self.g_stage,
+            )
+            g_sml_half = cute.coalesce(g_sml_epi_half, target_profile=(1, 1, 1))
+            g_half_outer = cute.make_layout(
+                g_sml_half.outer.shape,
+                stride=(*g_sml_half.outer.stride[:-1], g_sml_half.outer.stride[-1] * 2)
+            )
+            sG_flat_h0 = cute.make_tensor(sG_flat.iterator, layout=g_half_outer)
+            sG_flat_h1 = cute.make_tensor(sG_flat.iterator + HALF_SMEM_ELEMS, layout=g_half_outer)
+
+            # Q_K_scaled half SMEM views (from sQ_K_scaled_flat iterator)
+            qks_sml_epi_half = sm100_utils.make_smem_layout_epi(
+                self.q_dtype, utils.LayoutEnum.ROW_MAJOR,
+                (Constant.C, Constant.HALF_D), self.q_k_scaled_stage,
+            )
+            qks_sml_half = cute.coalesce(qks_sml_epi_half, target_profile=(1, 1, 1))
+            qks_half_outer = cute.make_layout(
+                qks_sml_half.outer.shape,
+                stride=(*qks_sml_half.outer.stride[:-1], qks_sml_half.outer.stride[-1] * 2)
+            )
+            sQKS_flat_h0 = cute.make_tensor(sQ_K_scaled_flat.iterator, layout=qks_half_outer)
+            sQKS_flat_h1 = cute.make_tensor(sQ_K_scaled_flat.iterator + HALF_SMEM_ELEMS, layout=qks_half_outer)
+
+            # Lists for iteration in half-loops
+            sQ_flat_halves = [sQ_flat_h0, sQ_flat_h1]
+            sK_flat_halves = [sK_flat_h0, sK_flat_h1]
+            sG_flat_halves = [sG_flat_h0, sG_flat_h1]
+            sQKS_flat_halves = [sQKS_flat_h0, sQKS_flat_h1]
+
+            # Partition half SMEM views with half-size tiled copies
+            tQsQ_h = [thr_load_qk_half.partition_S(h) for h in sQ_flat_halves]
+            tQsK_h = [thr_load_qk_half.partition_S(h) for h in sK_flat_halves]
+            tQsG_h = [thr_load_g_half.partition_S(h) for h in sG_flat_halves]
+            tQsQKS_h = [thr_store_qk_half.partition_D(h) for h in sQKS_flat_halves]
+
+            # Half-size fragment prototype
+            sQ_h0_0 = sQ_flat_h0[None, None, 0]
+            tQrQ_half_0 = thr_mma_epi_half.make_fragment_A(thr_mma_epi_half.partition_A(sQ_h0_0))
+
+            # Half-size index tensor: maps thread elements to (row, col) in [0,C) x [0,HALF_D)
+            q_shape_half = (self.qk_mma_tiler_half[0], self.qk_mma_tiler_half[2])
+            cM_half = cute.make_identity_tensor(q_shape_half)
+            tQcMq_half = thr_mma_epi_half.partition_A(cM_half)
+            index_transform_half = lambda index_q, index_k: (
                 index_q,
                 index_k,
             )
@@ -2596,117 +2672,149 @@ class KDAChunkwise:
                     # 2. element-wise operations: V'=V-KS, S=S*g_last, O=O1+O2
                     # ============================================================
 
+                    # ====================================================
+                    # Partitioned S2R: G loading + g_last + Q gating
+                    # Each half loads HALF_D=64 elements vs full D=128,
+                    # reducing per-thread register fragment by 2x during S2R
+                    # ====================================================
+
                     # wait G
                     g_handle = load_g_consumer.wait_and_advance()
                     g_stage_idx = g_handle.index
 
-                    # load G in reg, g'=exp(g)
-                    tQrG = cute.make_fragment_like(tQrQ_0, dtype=self.g_dtype)
-                    tQrG_cv = thr_load_g.retile(tQrG)
-                    cute.copy(tiled_load_g, tQsG[None, None, None, g_stage_idx], tQrG_cv)
-
-                    # write g_last to sG_last
-                    # For full chunks, use constant C-1; for partial (varlen only), use valid_len_chunk-1
-                    # NOTE: index_q/index_k must be defined unconditionally by range_constexpr
-                    # to avoid DSL type-change-in-dynamic-if error in subsequent code
-                    for i in cutlass.range_constexpr(cute.size(tQcMq)):
-                        index_q, index_k = index_transform(*tQcMq[i])
-                        if cutlass.const_expr(self.is_varlen):
-                            if valid_len_chunk < C:
-                                if index_q == valid_len_chunk - 1:
-                                    sG_last[index_k, g_stage_idx] = tQrG[i]
-                            else:
-                                if index_q == Constant.C - 1:
-                                    sG_last[index_k, g_stage_idx] = tQrG[i]
-                        else:
-                            if index_q == Constant.C - 1:
-                                sG_last[index_k, g_stage_idx] = tQrG[i]
-
-                    # Compute exp(g) in-place, element-wise to reduce register pressure
-                    # (avoids bulk .load()/.to()/.exp2() creating 64-element SSA vectors)
-                    if idx != 0 or cutlass.const_expr(self.has_initial_state):
-                        for i in cutlass.range_constexpr(cute.size(tQcMq)):
-                            tQrG[i] = cute.exp2(tQrG[i])
-
-                    # wait Q
+                    # wait Q (always wait to advance pipeline)
                     q_handle = load_q_consumer.wait_and_advance()
+
+                    # Merged g_last + Q gating path: single G half-load per half
                     if idx != 0 or cutlass.const_expr(self.has_initial_state):
-                        # load Q, then apply gating element-wise: Q' = Q * exp(g) * scale
-                        # Element-wise processing avoids 64-element bulk SSA vectors,
-                        # reducing peak register usage by ~128 regs per thread
                         q_stage_idx = q_handle.index
-                        tQrQ = cute.make_fragment_like(tQrQ_0, self.q_dtype)
-                        tQrQ_cv = thr_load_qk.retile(tQrQ)
-                        cute.copy(tiled_load_qk, tQsQ[None, None, None, q_stage_idx], tQrQ_cv)
-                        # Zero Q for invalid positions in partial chunks (varlen only)
-                        if cutlass.const_expr(self.is_varlen):
-                            if valid_len_chunk < C:
-                                for i in cutlass.range_constexpr(cute.size(tQcMq)):
-                                    index_q, index_k = index_transform(*tQcMq[i])
-                                    if index_q >= valid_len_chunk:
-                                        tQrQ[i] = self.q_dtype(0.0)
-
-                        # Branch-free element-wise gating (zeroed positions give 0*exp(g)=0)
-                        for i in cutlass.range_constexpr(cute.size(tQcMq)):
-                            q_i = tQrQ[i].to(cutlass.Float32)
-                            tQrQ[i] = (q_i * tQrG[i] * self.scale).to(self.io_dtype)
-
-                        # write to sQ_K_scaled
                         q_scaled_handle = load_q_scaled_producer.acquire_and_advance()
                         q_scaled_stage_idx = q_scaled_handle.index
-                        
-                        tQrQ_cv_src = thr_store_qk.retile(tQrQ)
-                        cute.copy(tiled_store_qk, tQrQ_cv_src, tQsQ_K_scaled[None, None, None, q_scaled_stage_idx])
 
-                        # notify Q@S MMA
+                        for half_idx in cutlass.range_constexpr(2):
+                            k_offset = half_idx * Constant.HALF_D
+
+                            # S2R G half — single load for g_last + exp(g) + Q gating
+                            tQrG_half = cute.make_fragment_like(tQrQ_half_0, dtype=self.g_dtype)
+                            tQrG_half_cv = thr_load_g_half.retile(tQrG_half)
+                            cute.copy(tiled_load_g_half, tQsG_h[half_idx][None, None, None, g_stage_idx], tQrG_half_cv)
+
+                            # Write g_last half (before exp transforms g values)
+                            for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
+                                index_q, index_k = index_transform_half(*tQcMq_half[i])
+                                if cutlass.const_expr(self.is_varlen):
+                                    if valid_len_chunk < C:
+                                        if index_q == valid_len_chunk - 1:
+                                            sG_last[index_k + k_offset, g_stage_idx] = tQrG_half[i]
+                                    else:
+                                        if index_q == Constant.C - 1:
+                                            sG_last[index_k + k_offset, g_stage_idx] = tQrG_half[i]
+                                else:
+                                    if index_q == Constant.C - 1:
+                                        sG_last[index_k + k_offset, g_stage_idx] = tQrG_half[i]
+
+                            # exp(g) half in-place
+                            for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
+                                tQrG_half[i] = cute.exp2(tQrG_half[i])
+
+                            # S2R Q half
+                            tQrQ_half = cute.make_fragment_like(tQrQ_half_0, self.q_dtype)
+                            tQrQ_half_cv = thr_load_qk_half.retile(tQrQ_half)
+                            cute.copy(tiled_load_qk_half, tQsQ_h[half_idx][None, None, None, q_stage_idx], tQrQ_half_cv)
+
+                            # Zero Q for invalid positions (varlen only)
+                            if cutlass.const_expr(self.is_varlen):
+                                if valid_len_chunk < C:
+                                    for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
+                                        index_q, index_k = index_transform_half(*tQcMq_half[i])
+                                        if index_q >= valid_len_chunk:
+                                            tQrQ_half[i] = self.q_dtype(0.0)
+
+                            # Q gating: Q' = Q * exp(g) * scale
+                            for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
+                                q_i = tQrQ_half[i].to(cutlass.Float32)
+                                tQrQ_half[i] = (q_i * tQrG_half[i] * self.scale).to(self.io_dtype)
+
+                            # R2S Q' half to sQ_K_scaled
+                            tQrQ_half_cv_src = thr_store_qk_half.retile(tQrQ_half)
+                            cute.copy(tiled_store_qk_half, tQrQ_half_cv_src, tQsQKS_h[half_idx][None, None, None, q_scaled_stage_idx])
+
                         cute.arch.fence_proxy(
                             cute.arch.ProxyKind.async_shared,
                             space=cute.arch.SharedSpace.shared_cta,
                         )
                         q_scaled_handle.commit()
+                    else:
+                        # idx==0 without initial state: only write g_last (no Q gating)
+                        for half_idx in cutlass.range_constexpr(2):
+                            k_offset = half_idx * Constant.HALF_D
+                            tQrG_half = cute.make_fragment_like(tQrQ_half_0, dtype=self.g_dtype)
+                            tQrG_half_cv = thr_load_g_half.retile(tQrG_half)
+                            cute.copy(tiled_load_g_half, tQsG_h[half_idx][None, None, None, g_stage_idx], tQrG_half_cv)
+                            for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
+                                index_q, index_k = index_transform_half(*tQcMq_half[i])
+                                if cutlass.const_expr(self.is_varlen):
+                                    if valid_len_chunk < C:
+                                        if index_q == valid_len_chunk - 1:
+                                            sG_last[index_k + k_offset, g_stage_idx] = tQrG_half[i]
+                                    else:
+                                        if index_q == Constant.C - 1:
+                                            sG_last[index_k + k_offset, g_stage_idx] = tQrG_half[i]
+                                else:
+                                    if index_q == Constant.C - 1:
+                                        sG_last[index_k + k_offset, g_stage_idx] = tQrG_half[i]
+
+                    # ====================================================
+                    # Partitioned S2R: K gating (2 half-passes)
+                    # K' = K * exp(g), overlapping first half with Q@S MMA
+                    # ====================================================
 
                     # wait K
                     k_handle = load_k_consumer.wait_and_advance()
                     k_stage_idx = k_handle.index
                     if idx != 0 or cutlass.const_expr(self.has_initial_state):
-                        # load K, then apply gating element-wise: K' = K * exp(g)
-                        # NOTE: overlapped with Q@S MMA
-                        tQrK = cute.make_fragment_like(tQrQ_0, self.q_dtype)
-                        tQrK_cv = thr_load_qk.retile(tQrK)
-                        cute.copy(tiled_load_qk, tQsK[None, None, None, k_stage_idx], tQrK_cv)
-                        # Zero K for invalid positions in partial chunks (varlen only)
-                        if cutlass.const_expr(self.is_varlen):
-                            if valid_len_chunk < C:
-                                for i in cutlass.range_constexpr(cute.size(tQcMq)):
-                                    index_q, index_k = index_transform(*tQcMq[i])
-                                    if index_q >= valid_len_chunk:
-                                        tQrK[i] = self.q_dtype(0.0)
-
-                        # Branch-free element-wise K gating
-                        for i in cutlass.range_constexpr(cute.size(tQcMq)):
-                            k_i = tQrK[i].to(cutlass.Float32)
-                            tQrK[i] = (k_i * tQrG[i]).to(self.io_dtype)
-
-                        # wait Q@S MMA
-                        # NOTE: only wait for safely rewrite sQ_K_scaled, T2R store O below
+                        # Wait Q@S MMA before writing K' to sQ_K_scaled
                         o_inter_handle = o_inter_consumer.wait()
-
-                        # write to sQ_K_scaled
                         k_scaled_handle = load_k_scaled_producer.acquire_and_advance()
                         k_scaled_stage_idx = k_scaled_handle.index
 
-                        tQrK_cv_src = thr_store_qk.retile(tQrK)
-                        cute.copy(tiled_store_qk, tQrK_cv_src, tQsQ_K_scaled[None, None, None, k_scaled_stage_idx])
+                        for half_idx in cutlass.range_constexpr(2):
+                            k_offset = half_idx * Constant.HALF_D
 
-                        # notify K@S MMA
+                            # Reload G half from SMEM, compute exp(g)
+                            tQrG_half = cute.make_fragment_like(tQrQ_half_0, dtype=self.g_dtype)
+                            tQrG_half_cv = thr_load_g_half.retile(tQrG_half)
+                            cute.copy(tiled_load_g_half, tQsG_h[half_idx][None, None, None, g_stage_idx], tQrG_half_cv)
+                            for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
+                                tQrG_half[i] = cute.exp2(tQrG_half[i])
+
+                            # S2R K half
+                            tQrK_half = cute.make_fragment_like(tQrQ_half_0, self.q_dtype)
+                            tQrK_half_cv = thr_load_qk_half.retile(tQrK_half)
+                            cute.copy(tiled_load_qk_half, tQsK_h[half_idx][None, None, None, k_stage_idx], tQrK_half_cv)
+
+                            # Zero K for invalid positions (varlen only)
+                            if cutlass.const_expr(self.is_varlen):
+                                if valid_len_chunk < C:
+                                    for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
+                                        index_q, index_k = index_transform_half(*tQcMq_half[i])
+                                        if index_q >= valid_len_chunk:
+                                            tQrK_half[i] = self.q_dtype(0.0)
+
+                            # K gating: K' = K * exp(g)
+                            for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
+                                k_i = tQrK_half[i].to(cutlass.Float32)
+                                tQrK_half[i] = (k_i * tQrG_half[i]).to(self.io_dtype)
+
+                            # R2S K' half to sQ_K_scaled
+                            tQrK_half_cv_src = thr_store_qk_half.retile(tQrK_half)
+                            cute.copy(tiled_store_qk_half, tQrK_half_cv_src, tQsQKS_h[half_idx][None, None, None, k_scaled_stage_idx])
+
+                        # Commit K' after both halves written
                         cute.arch.fence_proxy(
                             cute.arch.ProxyKind.async_shared,
                             space=cute.arch.SharedSpace.shared_cta,
                         )
-                        # self.cuda_wg_sync_barrier.arrive_and_wait()
-                        # if should_debug2:
-                        #     cute.printf("chunk idx={}, exp(g)*K:", idx)
-                        #     cute.print_tensor(sQ_K_scaled_flat[None, None, q_k_scaled_stage_idx])
                         k_scaled_handle.commit()
 
                     # release Q
@@ -2833,36 +2941,44 @@ class KDAChunkwise:
 
                     kv_decay_handle.commit()
 
-                    # load K, G, compute exp(g_last-g)*K element-wise
-                    tQrG = cute.make_fragment_like(tQrQ_0, dtype=self.g_dtype)
-                    tQrG_cv = thr_load_g.retile(tQrG)
-                    cute.copy(tiled_load_g, tQsG[None, None, None, g_stage_idx], tQrG_cv)
-                    tQrK = cute.make_fragment_like(tQrQ_0, dtype=self.k_dtype)
-                    tQrK_cv = thr_load_qk.retile(tQrK)
-                    cute.copy(tiled_load_qk, tQsK[None, None, None, k_stage_idx], tQrK_cv)
-
-                    # Zero K for invalid positions (varlen only)
-                    if cutlass.const_expr(self.is_varlen):
-                        if valid_len_chunk < C:
-                            for i in cutlass.range_constexpr(cute.size(tQcMq)):
-                                index_q, index_k = index_transform(*tQcMq[i])
-                                if index_q >= valid_len_chunk:
-                                    tQrK[i] = self.k_dtype(0.0)
-
-                    # Element-wise: K_scaled = exp(g_last - g) * K
-                    # Directly access fragment elements to avoid bulk load/to SSA vectors
-                    for i in cutlass.range_constexpr(cute.size(tQcMq)):
-                        index_q, index_k = index_transform(*tQcMq[i])
-                        g_last = sG_last[index_k, g_stage_idx]
-                        k_i = tQrK[i].to(cutlass.Float32)
-                        g_i = tQrG[i]
-                        tQrK[i] = (cute.exp2(g_last - g_i) * k_i).to(self.k_dtype)
-
+                    # ====================================================
+                    # Partitioned S2R: K^T gating — exp(g_last-g)*K
+                    # ====================================================
                     k_scaled2_handle = load_k_scaled2_producer.acquire_and_advance()
                     k_scaled2_stage_idx = k_scaled2_handle.index
-                    # write to sQ_K_scaled
-                    tQrK_cv_src = thr_store_qk.retile(tQrK)
-                    cute.copy(tiled_store_qk, tQrK_cv_src, tQsQ_K_scaled[None, None, None, k_scaled2_stage_idx])
+
+                    for half_idx in cutlass.range_constexpr(2):
+                        k_offset = half_idx * Constant.HALF_D
+
+                        # S2R G half
+                        tQrG_half = cute.make_fragment_like(tQrQ_half_0, dtype=self.g_dtype)
+                        tQrG_half_cv = thr_load_g_half.retile(tQrG_half)
+                        cute.copy(tiled_load_g_half, tQsG_h[half_idx][None, None, None, g_stage_idx], tQrG_half_cv)
+
+                        # S2R K half
+                        tQrK_half = cute.make_fragment_like(tQrQ_half_0, dtype=self.k_dtype)
+                        tQrK_half_cv = thr_load_qk_half.retile(tQrK_half)
+                        cute.copy(tiled_load_qk_half, tQsK_h[half_idx][None, None, None, k_stage_idx], tQrK_half_cv)
+
+                        # Zero K half for invalid positions (varlen only)
+                        if cutlass.const_expr(self.is_varlen):
+                            if valid_len_chunk < C:
+                                for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
+                                    index_q, index_k = index_transform_half(*tQcMq_half[i])
+                                    if index_q >= valid_len_chunk:
+                                        tQrK_half[i] = self.k_dtype(0.0)
+
+                        # K^T gating: exp(g_last - g) * K
+                        for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
+                            index_q, index_k = index_transform_half(*tQcMq_half[i])
+                            g_last_val = sG_last[index_k + k_offset, g_stage_idx]
+                            k_i = tQrK_half[i].to(cutlass.Float32)
+                            g_i = tQrG_half[i]
+                            tQrK_half[i] = (cute.exp2(g_last_val - g_i) * k_i).to(self.k_dtype)
+
+                        # R2S K^T half to sQ_K_scaled
+                        tQrK_half_cv_src = thr_store_qk_half.retile(tQrK_half)
+                        cute.copy(tiled_store_qk_half, tQrK_half_cv_src, tQsQKS_h[half_idx][None, None, None, k_scaled2_stage_idx])
 
                     # notify K^T@NewV MMA
                     cute.arch.fence_proxy(
