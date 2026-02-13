@@ -2604,8 +2604,6 @@ class KDAChunkwise:
                     tQrG = cute.make_fragment_like(tQrQ_0, dtype=self.g_dtype)
                     tQrG_cv = thr_load_g.retile(tQrG)
                     cute.copy(tiled_load_g, tQsG[None, None, None, g_stage_idx], tQrG_cv)
-                    g_val = tQrG.load()  # BF16 tensor
-                    g_f32 = g_val.to(cutlass.Float32)
 
                     # write g_last to sG_last
                     # For full chunks, use constant C-1; for partial (varlen only), use valid_len_chunk-1
@@ -2624,14 +2622,18 @@ class KDAChunkwise:
                             if index_q == Constant.C - 1:
                                 sG_last[index_k, g_stage_idx] = tQrG[i]
 
+                    # Compute exp(g) in-place, element-wise to reduce register pressure
+                    # (avoids bulk .load()/.to()/.exp2() creating 64-element SSA vectors)
                     if idx != 0 or cutlass.const_expr(self.has_initial_state):
-                        exp_g = cute.exp2(g_f32)
-                        tQrG.store(exp_g)
+                        for i in cutlass.range_constexpr(cute.size(tQcMq)):
+                            tQrG[i] = cute.exp2(tQrG[i])
 
                     # wait Q
                     q_handle = load_q_consumer.wait_and_advance()
                     if idx != 0 or cutlass.const_expr(self.has_initial_state):
-                        # load Q, g'*Q
+                        # load Q, then apply gating element-wise: Q' = Q * exp(g) * scale
+                        # Element-wise processing avoids 64-element bulk SSA vectors,
+                        # reducing peak register usage by ~128 regs per thread
                         q_stage_idx = q_handle.index
                         tQrQ = cute.make_fragment_like(tQrQ_0, self.q_dtype)
                         tQrQ_cv = thr_load_qk.retile(tQrQ)
@@ -2644,12 +2646,10 @@ class KDAChunkwise:
                                     if index_q >= valid_len_chunk:
                                         tQrQ[i] = self.q_dtype(0.0)
 
-                        q_val = tQrQ.load()  # BF16 tensor
-                        exp_g = tQrG.load()
-                        q_f32 = q_val.to(cutlass.Float32)
-                        q_gated = q_f32 * exp_g * self.scale
-                        q_gated_bf16 = q_gated.to(self.io_dtype)
-                        tQrQ.store(q_gated_bf16)
+                        # Branch-free element-wise gating (zeroed positions give 0*exp(g)=0)
+                        for i in cutlass.range_constexpr(cute.size(tQcMq)):
+                            q_i = tQrQ[i].to(cutlass.Float32)
+                            tQrQ[i] = (q_i * tQrG[i] * self.scale).to(self.io_dtype)
 
                         # write to sQ_K_scaled
                         q_scaled_handle = load_q_scaled_producer.acquire_and_advance()
@@ -2669,7 +2669,7 @@ class KDAChunkwise:
                     k_handle = load_k_consumer.wait_and_advance()
                     k_stage_idx = k_handle.index
                     if idx != 0 or cutlass.const_expr(self.has_initial_state):
-                        # load K, g'*K
+                        # load K, then apply gating element-wise: K' = K * exp(g)
                         # NOTE: overlapped with Q@S MMA
                         tQrK = cute.make_fragment_like(tQrQ_0, self.q_dtype)
                         tQrK_cv = thr_load_qk.retile(tQrK)
@@ -2681,12 +2681,11 @@ class KDAChunkwise:
                                     index_q, index_k = index_transform(*tQcMq[i])
                                     if index_q >= valid_len_chunk:
                                         tQrK[i] = self.q_dtype(0.0)
-                        k_val = tQrK.load()  # BF16 tensor
-                        k_f32 = k_val.to(cutlass.Float32)
-                        exp_g = tQrG.load()
-                        k_inter = k_f32 * exp_g
-                        k_inter_bf16 = k_inter.to(self.io_dtype)
-                        tQrK.store(k_inter_bf16)
+
+                        # Branch-free element-wise K gating
+                        for i in cutlass.range_constexpr(cute.size(tQcMq)):
+                            k_i = tQrK[i].to(cutlass.Float32)
+                            tQrK[i] = (k_i * tQrG[i]).to(self.io_dtype)
 
                         # wait Q@S MMA
                         # NOTE: only wait for safely rewrite sQ_K_scaled, T2R store O below
@@ -2834,33 +2833,30 @@ class KDAChunkwise:
 
                     kv_decay_handle.commit()
 
-                    # load K, G, exp(g_last-g)*K
-                    # TODO: can we have a better implementation here? maybe better perf
+                    # load K, G, compute exp(g_last-g)*K element-wise
                     tQrG = cute.make_fragment_like(tQrQ_0, dtype=self.g_dtype)
                     tQrG_cv = thr_load_g.retile(tQrG)
                     cute.copy(tiled_load_g, tQsG[None, None, None, g_stage_idx], tQrG_cv)
-                    g_val = tQrG.load()
-                    g_f32 = g_val.to(cutlass.Float32)
                     tQrK = cute.make_fragment_like(tQrQ_0, dtype=self.k_dtype)
                     tQrK_cv = thr_load_qk.retile(tQrK)
                     cute.copy(tiled_load_qk, tQsK[None, None, None, k_stage_idx], tQrK_cv)
-                    # Zero K for invalid positions in partial chunks (varlen only)
+
+                    # Zero K for invalid positions (varlen only)
                     if cutlass.const_expr(self.is_varlen):
                         if valid_len_chunk < C:
                             for i in cutlass.range_constexpr(cute.size(tQcMq)):
                                 index_q, index_k = index_transform(*tQcMq[i])
                                 if index_q >= valid_len_chunk:
                                     tQrK[i] = self.k_dtype(0.0)
-                    k_val = tQrK.load()  # BF16 tensor
-                    k_f32 = k_val.to(cutlass.Float32)
 
+                    # Element-wise: K_scaled = exp(g_last - g) * K
+                    # Directly access fragment elements to avoid bulk load/to SSA vectors
                     for i in cutlass.range_constexpr(cute.size(tQcMq)):
                         index_q, index_k = index_transform(*tQcMq[i])
                         g_last = sG_last[index_k, g_stage_idx]
-                        k = k_f32[i]
-                        g = g_f32[i]
-                        k_scaled = cute.exp2(g_last - g) * k
-                        tQrK[i] = k_scaled.to(self.k_dtype)
+                        k_i = tQrK[i].to(cutlass.Float32)
+                        g_i = tQrG[i]
+                        tQrK[i] = (cute.exp2(g_last - g_i) * k_i).to(self.k_dtype)
 
                     k_scaled2_handle = load_k_scaled2_producer.acquire_and_advance()
                     k_scaled2_stage_idx = k_scaled2_handle.index
@@ -3035,47 +3031,31 @@ class KDAChunkwise:
                     # 3. wait for QS finish, g'*K, write to sQ_K_scaled
                     # 3. wait for KS finish, exp(g_last-g)*K, write to sQ_K_scaled
 
-                    # Load g, Q, K values and compute gated values
-                    # TODO: reorder to reduce register peak
-                    g_val = tRS_rG.load()  # BF16 tensor
-                    q_val = tRS_rQ.load()  # BF16 tensor
-                    k_val = tRS_rK.load()  # BF16 tensor
-                
-                    # Convert to F32 for exp computation
-                    g_f32 = g_val.to(cutlass.Float32) # assert dtype here
-                    q_f32 = q_val.to(cutlass.Float32)
-                    k_f32 = k_val.to(cutlass.Float32)
-                
-                    exp_g = cute.exp2(g_f32)      # exp(g) for Q' and K_inter
-                    exp_neg_g = cute.exp2(-g_f32)  # exp(-g) for K_intra
-                
-                    # Apply gates with KDA beta scaling:
-                    # Q' = Q * exp(g)
-                    # TODO: compare perf of two different impl
-                    q_gated = q_f32 * exp_g * self.scale
-                    # K_inter = K * exp(g) - for inter-chunk KV state update (W matrix)
-                    k_inter = k_f32 * exp_g
-                    # K_intra = K * exp(-g) - for intra-chunk QK^T computation
-                    k_intra = k_f32 * exp_neg_g
-                
-                    # Convert back to BF16
-                    q_gated_bf16 = q_gated.to(self.io_dtype)
-                    k_inter_bf16 = k_inter.to(self.io_dtype)
-                    k_intra_bf16 = k_intra.to(self.io_dtype)
-                
-                    # Store gated values to RMEM tensors
-                    tRS_rQ.store(q_gated_bf16)
-                    tRS_rG_bf16.store(k_intra_bf16)  # K * exp(-g) for inter-chunk
-                    tRS_rK.store(k_inter_bf16)        # K * exp(g) for intra-chunk
-
-                    # Zero RMEM for invalid rows (varlen only — non-aligned chunks)
-                    if cutlass.const_expr(self.is_varlen):
-                        if valid_len_chunk < C:
-                            for _zr in cutlass.range(0, Constant.C, unroll_full=True):
-                                if _zr >= valid_len_chunk:
-                                    tRS_rK[0, _zr, 0] = self.io_dtype(0.0)
-                                    tRS_rQ[0, _zr, 0] = self.io_dtype(0.0)
-                                    tRS_rG_bf16[0, _zr, 0] = self.io_dtype(0.0)
+                    # Load g, Q, K and compute gated values element-wise
+                    # Element-wise processing avoids bulk .load()/.to() creating
+                    # ~300+ register SSA vectors from G, Q, K simultaneously
+                    for _zr in cutlass.range(0, Constant.C, unroll_full=True):
+                        if cutlass.const_expr(self.is_varlen):
+                            if valid_len_chunk < C and _zr >= valid_len_chunk:
+                                tRS_rQ[0, _zr, 0] = self.io_dtype(0.0)
+                                tRS_rK[0, _zr, 0] = self.io_dtype(0.0)
+                                tRS_rG_bf16[0, _zr, 0] = self.io_dtype(0.0)
+                            else:
+                                g_i = tRS_rG[0, _zr, 0]
+                                exp_g_i = cute.exp2(g_i)
+                                q_i = tRS_rQ[0, _zr, 0].to(cutlass.Float32)
+                                tRS_rQ[0, _zr, 0] = (q_i * exp_g_i * self.scale).to(self.io_dtype)
+                                k_i = tRS_rK[0, _zr, 0].to(cutlass.Float32)
+                                tRS_rK[0, _zr, 0] = (k_i * exp_g_i).to(self.io_dtype)
+                                tRS_rG_bf16[0, _zr, 0] = (k_i * cute.exp2(-g_i)).to(self.io_dtype)
+                        else:
+                            g_i = tRS_rG[0, _zr, 0]
+                            exp_g_i = cute.exp2(g_i)
+                            q_i = tRS_rQ[0, _zr, 0].to(cutlass.Float32)
+                            tRS_rQ[0, _zr, 0] = (q_i * exp_g_i * self.scale).to(self.io_dtype)
+                            k_i = tRS_rK[0, _zr, 0].to(cutlass.Float32)
+                            tRS_rK[0, _zr, 0] = (k_i * exp_g_i).to(self.io_dtype)
+                            tRS_rG_bf16[0, _zr, 0] = (k_i * cute.exp2(-g_i)).to(self.io_dtype)
                 
                     # ============================================================
                     # KDA Step 3: Write gated Q', K_inter, K_intra back to SMEM
