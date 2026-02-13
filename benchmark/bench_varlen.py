@@ -426,7 +426,7 @@ def bench_focused_varlen(H: int):
       - FLA comparison for both
     """
     scale = D ** -0.5
-    total_tokens_list = [8192, 32768]
+    total_tokens_list = [8192, 32768, 262144]
     num_seqs_list = [16, 20, 24]
 
     print_header(f"Focused varlen: quasi-balanced, H={H}")
