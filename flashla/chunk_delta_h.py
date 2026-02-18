@@ -55,7 +55,11 @@ import cutlass.cute.testing as testing
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64, Float32
 
-PRINT_DEBUG = True
+PRINT_DEBUG = False
+
+# Constants for exp2 vs exp conversion
+LN2 = 0.6931471805599453  # ln(2)
+INV_LN2 = 1.4426950408889634  # 1/ln(2)
 
 
 def make_thread_cooperative_group(size: int):
@@ -347,6 +351,15 @@ class ChunkDeltaRuleFwdH:
         h0 = cute.make_tensor(h0_ptr, h0_layout)
         ht = cute.make_tensor(ht_ptr, h0_layout)
 
+        # h0/ht transposed GMEM view for TMA load/store (V, K, (H, B))
+        # Same layout as h_out_T but without NT dimension
+        h0_T_layout = cute.make_layout(
+            (V, K, (H, B)),
+            stride=(1, V, (K * V, H * K * V)),
+        )
+        h0_T = cute.make_tensor(h0_ptr, h0_T_layout)
+        ht_T = cute.make_tensor(ht_ptr, h0_T_layout)
+
         # g: (B, T, H) -> (T, (H, B))
         g_layout = cute.make_layout(
             (T, (H, B)),
@@ -554,6 +567,26 @@ class ChunkDeltaRuleFwdH:
             cluster_layout_vmnk.shape,
         )
 
+        # TMA load for h0 (initial state) from GMEM to sH_state
+        # Uses h0_T transposed view: (V, K, (H, B))
+        tma_atom_h0_load, tma_tensor_h0_load = cute.nvgpu.make_tiled_tma_atom_B(
+            tma_load_op,
+            h0_T,
+            h_state_mma_smem_layout,
+            self.wh_mma_tiler,
+            wh_tiled_mma,
+            cluster_layout_vmnk.shape,
+        )
+
+        # TMA store for ht (final state) from sH_epi to GMEM
+        # Uses ht_T transposed view: (V, K, (H, B))
+        tma_atom_ht_store, tma_tensor_ht_store = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            tma_store_op,
+            ht_T,
+            h_epi_smem_layout,
+            (self.BV, self.BK),
+        )
+
         self.tma_copy_vnew_bytes = cute.size_in_bytes(self.io_dtype, vnew_mma_smem_layout)
         self.tma_copy_h_bytes = cute.size_in_bytes(self.io_dtype, h_state_mma_smem_layout)
 
@@ -620,8 +653,12 @@ class ChunkDeltaRuleFwdH:
             tma_tensor_vnew_load,
             tma_atom_h_load,
             tma_tensor_h_load,
+            tma_atom_h0_load,
+            tma_tensor_h0_load,
             tma_atom_h_out,
             tma_tensor_h_out,
+            tma_atom_ht_store,
+            tma_tensor_ht_store,
             tma_atom_vnew_store,
             tma_tensor_vnew_store,
             g,
@@ -664,8 +701,12 @@ class ChunkDeltaRuleFwdH:
         tma_tensor_vnew_load: cute.Tensor,
         tma_atom_h_load: cute.CopyAtom,
         tma_tensor_h_load: cute.Tensor,
+        tma_atom_h0_load: cute.CopyAtom,
+        tma_tensor_h0_load: cute.Tensor,
         tma_atom_h_out: cute.CopyAtom,
         tma_tensor_h_out: cute.Tensor,
+        tma_atom_ht_store: cute.CopyAtom,
+        tma_tensor_ht_store: cute.Tensor,
         tma_atom_vnew_store: cute.CopyAtom,
         tma_tensor_vnew_store: cute.Tensor,
         g: cute.Tensor,
@@ -706,6 +747,7 @@ class ChunkDeltaRuleFwdH:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k_kv)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_vnew_load)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_h_load)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_h0_load)
 
         # Allocate shared memory
         smem = utils.SmemAllocator()
@@ -907,14 +949,40 @@ class ChunkDeltaRuleFwdH:
                 cute.group_modes(tCgH, 0, 3),
             )
 
-            # Initial h_state: h_out[0] is pre-zeroed by host, TMA load directly
-            h_load_init_handle = h_load_producer.acquire_and_advance()
-            cute.copy(
-                atom=tma_atom_h_load,
-                src=tHgH_load[None, 0, 0, 0],
-                dst=tHsH_load[None, h_load_init_handle.index],
-                tma_bar_ptr=h_load_init_handle.barrier,
+            # TMA partition for h0 (initial state) load (GMEM → sH_state)
+            # h0_T has (V, K, (H, B)) - no NT dimension
+            gH0_load = cute.local_tile(
+                tma_tensor_h0_load,
+                cute.slice_(self.wh_mma_tiler, coord_h),
+                (None, None, (hidx_load, bidx_load))
             )
+            tCgH0 = thr_mma_h.partition_B(gH0_load)
+            tH0sH_load, tH0gH_load = cute.nvgpu.cpasync.tma_partition(
+                tma_atom_h0_load,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sH_state, 0, 3),
+                cute.group_modes(tCgH0, 0, 3),
+            )
+
+            # Initial h_state: load h0 if use_initial_state, else load h_out[0] (zeros)
+            h_load_init_handle = h_load_producer.acquire_and_advance()
+            if use_initial_state:
+                # Load h0 (initial state) using h0-specific partition
+                cute.copy(
+                    atom=tma_atom_h0_load,
+                    src=tH0gH_load[None, 0, 0],
+                    dst=tH0sH_load[None, h_load_init_handle.index],
+                    tma_bar_ptr=h_load_init_handle.barrier,
+                )
+            else:
+                # Load h_out[0] (pre-zeroed by host)
+                cute.copy(
+                    atom=tma_atom_h_load,
+                    src=tHgH_load[None, 0, 0, 0],
+                    dst=tHsH_load[None, h_load_init_handle.index],
+                    tma_bar_ptr=h_load_init_handle.barrier,
+                )
 
             # Main loop over chunks
             for chunk_idx in cutlass.range(0, NT, unroll=0):
@@ -1089,6 +1157,24 @@ class ChunkDeltaRuleFwdH:
             )
             tTR_gU = thr_copy_t2r_wh.partition_D(gU_all)
 
+            # ===== Setup g (scalar gate) GMEM input =====
+            # g: (T, (H, B)) -> each thread loads one value per timestep
+            # For now, load g[chunk*BT : (chunk+1)*BT] for each chunk
+            # g_last is g at timestep (chunk+1)*BT - 1
+            gG_all = cute.local_tile(
+                g,
+                (self.BT,),
+                (None, (hidx, bidx)),
+            )  # (BT, chunk, 1) per block
+
+            # ===== Setup gk (vector gate) GMEM input =====
+            # gk: (T, K, (H, B)) -> each thread loads K values per timestep
+            gGK_all = cute.local_tile(
+                gk,
+                (self.BT, self.BK),
+                (None, None, (hidx, bidx)),
+            )  # (BT, BK, chunk, 1) per block
+
             # ===== Setup h_out R2S epilogue (register → sH_epi → TMA store) =====
             copy_atom_r2s_h = sm100_utils.get_smem_store_op(
                 utils.LayoutEnum.COL_MAJOR,
@@ -1122,6 +1208,22 @@ class ChunkDeltaRuleFwdH:
                 wh_vec = tTR_rWH.load()
                 u_vec = tTR_rU.load().to(self.acc_dtype)  # bf16 → fp32
                 vnew_vec = u_vec - wh_vec
+
+                # GATE APPLICATION (NOT YET IMPLEMENTED)
+                # ======================================
+                # When use_g=1, need to apply: v_new[t,:] *= exp(g_last - g[t])
+                # where g_last = g[(chunk+1)*BT - 1] and t is the row index.
+                # 
+                # Challenge: TMEM partition distributes (BT, BV) elements across 128 threads
+                # in a complex pattern. Need to:
+                # 1. Determine which row index each element in vnew_vec corresponds to
+                # 2. Load the corresponding g[t] value
+                # 3. Broadcast g_last and compute exp(g_last - g[t])
+                # 4. Multiply vnew_vec elements
+                #
+                # For now, use_g/use_gk are always 0, so this is deferred.
+                # The reference functions now support gating for correctness validation.
+
                 tTR_rVnew.store(vnew_vec.to(self.io_dtype))
 
                 # R2S: v_new register → sVnew_epi (SMEM epilogue buffer)
@@ -1169,6 +1271,7 @@ class ChunkDeltaRuleFwdH:
             # Prefetch TMA store descriptors
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_h_out)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_vnew_store)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_ht_store)
 
             # TMA partition for h_out store: sH_epi → GMEM h_out
             (_, hidx_s, bidx_s) = cute.arch.block_idx()
@@ -1177,6 +1280,16 @@ class ChunkDeltaRuleFwdH:
             tma_atom_h_st, bSG_sH, bSG_gH = self._epilog_gmem_copy_partition(
                 tma_atom_h_out,
                 gH_store,
+                (self.BV, self.BK),
+                sH_epi,
+            )
+
+            # TMA partition for ht (final state) store: sH_epi → GMEM ht
+            # ht_T has (V, K, (H, B)) - no NT dimension
+            gHt_store = tma_tensor_ht_store[None, None, (hidx_s, bidx_s)]
+            tma_atom_ht_st, bSG_sHt, bSG_gHt = self._epilog_gmem_copy_partition(
+                tma_atom_ht_store,
+                gHt_store,
                 (self.BV, self.BK),
                 sH_epi,
             )
@@ -1232,6 +1345,23 @@ class ChunkDeltaRuleFwdH:
                 # Signal load warp that GMEM h_out is ready for TMA load
                 h_gmem_handle = h_gmem_producer.acquire_and_advance()
                 h_gmem_handle.commit()
+
+            # After all chunks: store final state ht if requested
+            # Note: h_out[NT-1] contains the final accumulated h_state
+            # But we already stored it during the last iteration.
+            # For ht, we need to store the h_state AFTER the last chunk's KV update.
+            # The last h_out_handle stored to h_out[NT-1] is the final state.
+            # We can simply TMA store from h_out[NT-1] to ht, but that requires
+            # another TMA load-store cycle. Simpler: store to ht directly as well.
+            # 
+            # Actually, the sH_epi already contains the final state after last iteration.
+            # But we released the handle and may have missed it. 
+            # For now, the host can copy h_out[NT-1] to ht after kernel completes.
+            # 
+            # TODO: Implement proper ht store by either:
+            # 1. Having CUDA warps signal a final h_out write for ht
+            # 2. Having host copy h_out[NT-1] to ht after kernel
+            # For simplicity, we rely on option 2 in the test harness.
 
         # Cleanup
         tmem.relinquish_alloc_permit()
@@ -1354,19 +1484,26 @@ class ChunkDeltaRuleFwdH:
         return atom, bSG_sC, bSG_gC
 
 
-def reference_chunk_delta_rule_fwd_h(k, w, u, h0=None, chunk_size=64):
+def reference_chunk_delta_rule_fwd_h(k, w, u, g=None, gk=None, h0=None, chunk_size=64):
     """
-    PyTorch reference: chunk_gated_delta_rule_fwd_h WITHOUT gates.
+    PyTorch reference: chunk_gated_delta_rule_fwd_h with optional gates.
+    
+    Implements the FLA gating math:
+    - Scalar gate g: v_new *= exp(g_last - g), h *= exp(g_last)
+    - Vector gate gk: h *= exp(gk_last)  (per K dimension)
     
     Args:
         k: (B, T, H, K) bf16
         w: (B, T, H, K) bf16
         u: (B, T, H, V) bf16
+        g: (B, T, H) fp32 or None - scalar gate in log space
+        gk: (B, T, H, K) fp32 or None - vector gate in log space
         h0: (B, H, K, V) fp32 or None
         chunk_size: int
     Returns:
         h_out: (B, NT, H, K, V) bf16  - state at each chunk start (before update)
         v_new: (B, T, H, V) bf16  - corrected values
+        h_after_list: list of (K, V) bf16 - h state after each chunk (for debugging)
     """
     B, T, H, K = k.shape
     V = u.shape[-1]
@@ -1379,7 +1516,7 @@ def reference_chunk_delta_rule_fwd_h(k, w, u, h0=None, chunk_size=64):
     # h state [B, H, K, V] in fp32
     h = torch.zeros(B, H, K, V, device=k.device, dtype=torch.float32)
     if h0 is not None:
-        h = h0.clone()
+        h = h0.clone().float()
     
     # Track h_state AFTER each chunk's update (for comparing with kernel's KV result)
     h_after_list = []
@@ -1387,6 +1524,7 @@ def reference_chunk_delta_rule_fwd_h(k, w, u, h0=None, chunk_size=64):
     for t in range(NT):
         start = t * BT
         end = min((t + 1) * BT, T)
+        actual_bt = end - start  # handle last chunk potentially being smaller
         
         # Store h_out[t] = h (before update)
         h_out[:, t] = h.to(torch.bfloat16)
@@ -1400,10 +1538,34 @@ def reference_chunk_delta_rule_fwd_h(k, w, u, h0=None, chunk_size=64):
         wh = torch.matmul(w_chunk, h)  # (B, H, BT, V)
         v_new_chunk = u_chunk - wh  # (B, H, BT, V)
         
-        # Save v_new
+        # Apply scalar gate g to v_new: v_new[i] *= exp(g_last - g[i])
+        if g is not None:
+            # g_chunk: (B, BT, H) -> (B, H, BT)
+            g_chunk = g[:, start:end].permute(0, 2, 1).float()  # (B, H, BT)
+            g_last = g_chunk[:, :, -1:].float()  # (B, H, 1) - last timestep
+            # Expand for broadcast: (B, H, BT, 1)
+            g_scale = torch.exp(g_last - g_chunk).unsqueeze(-1)  # (B, H, BT, 1)
+            v_new_chunk = v_new_chunk * g_scale
+        
+        # Save v_new (after g scaling, before KV)
         v_new_out[:, start:end] = v_new_chunk.permute(0, 2, 1, 3).to(torch.bfloat16)
         
-        # h += K^T @ v_new  (no gating)
+        # Apply scalar gate g to h_state: h *= exp(g_last)
+        if g is not None:
+            g_last_scalar = g_chunk[:, :, -1].float()  # (B, H)
+            h_scale = torch.exp(g_last_scalar).unsqueeze(-1).unsqueeze(-1)  # (B, H, 1, 1)
+            h = h * h_scale
+        
+        # Apply vector gate gk to h_state: h[k,:] *= exp(gk_last[k])
+        if gk is not None:
+            # gk_chunk: (B, BT, H, K) -> (B, H, BT, K)
+            gk_chunk = gk[:, start:end].permute(0, 2, 1, 3).float()  # (B, H, BT, K)
+            gk_last = gk_chunk[:, :, -1, :].float()  # (B, H, K) - last timestep
+            # Scale h per K dimension: h @ diag(exp(gk_last))
+            gk_scale = torch.exp(gk_last).unsqueeze(-1)  # (B, H, K, 1)
+            h = h * gk_scale
+        
+        # h += K^T @ v_new
         # k^T: (B, H, K, BT), v_new: (B, H, BT, V)
         k_t = k_chunk.transpose(-2, -1)  # (B, H, K, BT)
         h = h + torch.matmul(k_t, v_new_chunk)
@@ -1414,11 +1576,12 @@ def reference_chunk_delta_rule_fwd_h(k, w, u, h0=None, chunk_size=64):
     return h_out, v_new_out, h_after_list
 
 
-def reference_chunk_delta_rule_bf16_roundtrip(k, w, u, h0=None, chunk_size=64):
+def reference_chunk_delta_rule_bf16_roundtrip(k, w, u, g=None, gk=None, h0=None, chunk_size=64):
     """
     Reference that mimics the kernel's bf16 precision:
     - h_state goes through bf16 before W@H (GMEM roundtrip simulation)
     - v_new goes through bf16 before K^T@V_new (GMEM roundtrip simulation)
+    - Includes gate (g, gk) support
     """
     B, T, H, K = k.shape
     V = u.shape[-1]
@@ -1429,7 +1592,7 @@ def reference_chunk_delta_rule_bf16_roundtrip(k, w, u, h0=None, chunk_size=64):
     
     h = torch.zeros(B, H, K, V, device=k.device, dtype=torch.float32)
     if h0 is not None:
-        h = h0.clone()
+        h = h0.clone().float()
     
     h_after_list = []
     
@@ -1446,7 +1609,27 @@ def reference_chunk_delta_rule_bf16_roundtrip(k, w, u, h0=None, chunk_size=64):
         wh = torch.matmul(w_chunk, h_bf16)  # (B, H, BT, V)
         v_new_chunk = u_chunk - wh  # fp32
         
+        # Apply scalar gate g to v_new: v_new[i] *= exp(g_last - g[i])
+        if g is not None:
+            g_chunk = g[:, start:end].permute(0, 2, 1).float()  # (B, H, BT)
+            g_last = g_chunk[:, :, -1:].float()  # (B, H, 1)
+            g_scale = torch.exp(g_last - g_chunk).unsqueeze(-1)  # (B, H, BT, 1)
+            v_new_chunk = v_new_chunk * g_scale
+        
         v_new_out[:, start:end] = v_new_chunk.permute(0, 2, 1, 3).to(torch.bfloat16)
+        
+        # Apply scalar gate g to h_state: h *= exp(g_last)
+        if g is not None:
+            g_last_scalar = g_chunk[:, :, -1].float()  # (B, H)
+            h_scale = torch.exp(g_last_scalar).unsqueeze(-1).unsqueeze(-1)  # (B, H, 1, 1)
+            h = h * h_scale
+        
+        # Apply vector gate gk to h_state: h[k,:] *= exp(gk_last[k])
+        if gk is not None:
+            gk_chunk = gk[:, start:end].permute(0, 2, 1, 3).float()  # (B, H, BT, K)
+            gk_last = gk_chunk[:, :, -1, :].float()  # (B, H, K)
+            gk_scale = torch.exp(gk_last).unsqueeze(-1)  # (B, H, K, 1)
+            h = h * gk_scale
         
         # Simulate bf16 roundtrip: v_new goes through bf16 before K^T@V_new
         v_new_bf16 = v_new_chunk.to(torch.bfloat16).float()
