@@ -628,14 +628,26 @@ class ChunkDeltaRuleFwdH:
             gG = cute.local_tile(g, (self.BT,), (None, (hidx, bidx)))
             gGK = cute.local_tile(gk, (self.BT, self.BK), (None, None, (hidx, bidx)))
 
-            # ----- Identity tensor for element coordinates -----
+            # ----- Identity tensor for WH tile (BV, BT) → v_new coords -----
             vnew_tile = cute.dice(self.wh_mma_tiler, (1, 1, None))  # (BV, BT)
             cM_vnew = cute.make_identity_tensor(vnew_tile)
             tTR_cM = thr_t2r_wh.partition_D(cM_vnew)
 
-            # ===== Initialize h = 0 in registers =====
-            for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
-                tTR_rKV[ei] = Float32(0.0)
+            # ----- Identity tensor for KV tile (BV, BK) → h coords -----
+            h_tile = cute.dice(self.kv_mma_tiler, (1, 1, None))  # (BV, BK)
+            cM_h = cute.make_identity_tensor(h_tile)
+            tTR_cM_h = thr_t2r_kv.partition_D(cM_h)
+
+            # ===== Initialize h in registers =====
+            if use_initial_state:
+                # Load h0 from GMEM into registers using identity tensor mapping
+                gH0 = h0[None, None, (hidx, bidx)]  # (K, V)
+                for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
+                    v_coord, k_coord = tTR_cM_h[ei]
+                    tTR_rKV[ei] = gH0[k_coord, v_coord + v_tile_idx * self.BV].to(self.acc_dtype)
+            else:
+                for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
+                    tTR_rKV[ei] = Float32(0.0)
 
             # ===== Main loop =====
             for chunk_idx in cutlass.range(0, NT, unroll=0):
@@ -673,6 +685,13 @@ class ChunkDeltaRuleFwdH:
                     g_scale_h = cute.exp2(g_last * INV_LN2)
                     h_vec = h_vec * g_scale_h
                     tTR_rKV.store(h_vec)
+                if use_gk:
+                    g_off = chunk_idx * self.BT
+                    for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
+                        v_coord, k_coord = tTR_cM_h[ei]
+                        gk_val = gk[(g_off + self.BT - 1, k_coord, (hidx, bidx))]
+                        gk_scale = cute.exp2(gk_val * INV_LN2)
+                        tTR_rKV[ei] = tTR_rKV[ei] * gk_scale
 
                 # ========================================
                 # Phase 2: v_new from WH result
@@ -732,6 +751,19 @@ class ChunkDeltaRuleFwdH:
                 update_vec = tTR_rUpdate.load()
                 tTR_rKV.store(h_vec + update_vec)
 
+            # ===== After main loop: store final state ht =====
+            if store_final_state:
+                h_vec = tTR_rKV.load()
+                tTR_rKV_bf16.store(h_vec.to(self.io_dtype))
+                tRS_rH = tiled_r2s_h.retile(tTR_rKV_bf16)
+                h_handle = h_out_P.acquire_and_advance()
+                cute.copy(tiled_r2s_h, tRS_rH, tRS_sH[(None, None, None, h_handle.index)])
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
+                h_handle.commit()
+
         # =========================================================================
         # STORE WARP
         # =========================================================================
@@ -759,6 +791,15 @@ class ChunkDeltaRuleFwdH:
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
 
+                h_handle.release()
+
+            # Store final state ht
+            if store_final_state:
+                h_handle = h_out_C.wait_and_advance()
+                cute.copy(tma_ht_st, bSG_sHt[None, h_handle.index],
+                          bSG_gHt[(None, v_tile_idx, 0)])
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
                 h_handle.release()
 
         # =========================================================================
@@ -893,69 +934,303 @@ def main():
     k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16) * 0.1
     w = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16) * 0.1
     u = torch.randn(B, T, H, V, device="cuda", dtype=torch.bfloat16) * 0.1
-    g = torch.zeros(B, T, H, device="cuda", dtype=torch.float32)
-    gk = torch.zeros(B, T, H, K, device="cuda", dtype=torch.float32)
-    h0 = torch.zeros(B, H, K, V, device="cuda", dtype=torch.float32)
-    h_out = torch.zeros(B, NT, H, K, V, device="cuda", dtype=torch.bfloat16)
-    v_new = torch.zeros(B, T, H, V, device="cuda", dtype=torch.bfloat16)
-    ht = torch.zeros(B, H, K, V, device="cuda", dtype=torch.float32)
-
-    _, _, h_ref_fp32 = reference_chunk_delta_rule_fwd_h(k, w, u, h0=None, chunk_size=BT)
-    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, h0=None, chunk_size=BT)
 
     kernel = ChunkDeltaRuleFwdH(chunk_size=BT, head_dim_k=K, head_dim_v=V)
     stream = cutlass_torch.default_stream()
 
-    kc, wc, uc = from_dlpack(k), from_dlpack(w), from_dlpack(u)
-    gc, gkc = from_dlpack(g), from_dlpack(gk)
-    h0c, hc, vnc, htc = from_dlpack(h0), from_dlpack(h_out), from_dlpack(v_new), from_dlpack(ht)
+    compiled_kernel = None
 
-    print("\nCompiling...")
-    t0 = time.time()
-    compiled = cute.compile(
-        kernel,
-        kc.iterator, wc.iterator, uc.iterator,
-        gc.iterator, gkc.iterator,
-        hc.iterator, vnc.iterator, h0c.iterator, htc.iterator,
-        (B, T, H, K, V), 0, 0, 0, 0, 0, stream,
+    def run_kernel(k_t, w_t, u_t, g_t, gk_t, h0_t, use_g_val, use_gk_val, use_h0, store_ht):
+        nonlocal compiled_kernel
+        h_out = torch.zeros(B, NT, H, K, V, device="cuda", dtype=torch.bfloat16)
+        v_new = torch.zeros(B, T, H, V, device="cuda", dtype=torch.bfloat16)
+        ht = torch.zeros(B, H, K, V, device="cuda", dtype=torch.bfloat16)
+
+        kc, wc, uc = from_dlpack(k_t), from_dlpack(w_t), from_dlpack(u_t)
+        gc, gkc = from_dlpack(g_t), from_dlpack(gk_t)
+        h0c = from_dlpack(h0_t)
+        hc, vnc, htc = from_dlpack(h_out), from_dlpack(v_new), from_dlpack(ht)
+
+        args_tuple = (
+            kc.iterator, wc.iterator, uc.iterator,
+            gc.iterator, gkc.iterator,
+            hc.iterator, vnc.iterator, h0c.iterator, htc.iterator,
+            (B, T, H, K, V),
+            int(use_g_val), int(use_gk_val), int(use_h0), int(store_ht), 0,
+            stream,
+        )
+
+        if compiled_kernel is None:
+            print("Compiling...")
+            t0 = time.time()
+            compiled_kernel = cute.compile(kernel, *args_tuple)
+            print(f"Compiled in {time.time()-t0:.2f}s")
+
+        compiled_kernel(*args_tuple)
+        torch.cuda.synchronize()
+        return h_out, v_new, ht
+
+    all_pass = True
+
+    # ===== Test 1: No gating, no h0 =====
+    print("\n" + "="*60)
+    print("Test 1: No gating, no h0")
+    g_z = torch.zeros(B, T, H, device="cuda", dtype=torch.float32)
+    gk_z = torch.zeros(B, T, H, K, device="cuda", dtype=torch.float32)
+    h0_z = torch.zeros(B, H, K, V, device="cuda", dtype=torch.float32)
+
+    h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_z, h0_z, 0, 0, 0, 0)
+    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, h0=None, chunk_size=BT)
+
+    max_diff = 0.0
+    for t in range(min(NT - 1, len(h_ref_bf16))):
+        d = (h_out[0, t + 1, 0].float() - h_ref_bf16[t].float()).abs().max().item()
+        max_diff = max(max_diff, d)
+    print(f"  max diff h_out: {max_diff:.6f}")
+    t1_pass = max_diff < 0.5
+    print(f"  {'PASS' if t1_pass else 'FAIL'}")
+    all_pass = all_pass and t1_pass
+
+    # ===== Test 2: With g gating =====
+    print("\n" + "="*60)
+    print("Test 2: With g gating")
+    g_val = torch.randn(B, T, H, device="cuda", dtype=torch.float32) * 0.1
+    g_val = -torch.abs(g_val)  # ensure negative (decay)
+    g_val = g_val.cumsum(dim=1)  # cumulative sum
+
+    compiled_kernel = None  # recompile since use_g changes
+    h_out, v_new, ht = run_kernel(k, w, u, g_val, gk_z, h0_z, 1, 0, 0, 0)
+    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, g=g_val, h0=None, chunk_size=BT)
+
+    max_diff = 0.0
+    for t in range(min(NT - 1, len(h_ref_bf16))):
+        d = (h_out[0, t + 1, 0].float() - h_ref_bf16[t].float()).abs().max().item()
+        max_diff = max(max_diff, d)
+    print(f"  max diff h_out: {max_diff:.6f}")
+    t2_pass = max_diff < 0.5
+    print(f"  {'PASS' if t2_pass else 'FAIL'}")
+    all_pass = all_pass and t2_pass
+
+    # ===== Test 3: With gk gating =====
+    print("\n" + "="*60)
+    print("Test 3: With gk gating")
+    gk_val = torch.randn(B, T, H, K, device="cuda", dtype=torch.float32) * 0.1
+    gk_val = -torch.abs(gk_val)
+    gk_val = gk_val.cumsum(dim=1)
+
+    compiled_kernel = None  # recompile
+    h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_val, h0_z, 0, 1, 0, 0)
+    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, gk=gk_val, h0=None, chunk_size=BT)
+
+    max_diff = 0.0
+    for t in range(min(NT - 1, len(h_ref_bf16))):
+        d = (h_out[0, t + 1, 0].float() - h_ref_bf16[t].float()).abs().max().item()
+        max_diff = max(max_diff, d)
+    print(f"  max diff h_out: {max_diff:.6f}")
+    t3_pass = max_diff < 0.5
+    print(f"  {'PASS' if t3_pass else 'FAIL'}")
+    all_pass = all_pass and t3_pass
+
+    # ===== Test 4: With h0 initial state =====
+    print("\n" + "="*60)
+    print("Test 4: With h0 initial state")
+    h0_val = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) * 0.01
+
+    compiled_kernel = None  # recompile
+    h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_z, h0_val, 0, 0, 1, 0)
+    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, h0=h0_val, chunk_size=BT)
+
+    # h_out[0] should be h0 (bf16 rounded)
+    h0_bf16 = h0_val.to(torch.bfloat16)
+    d0 = (h_out[0, 0, 0].float() - h0_bf16[0, 0].float()).abs().max().item()
+    print(f"  h_out[0] vs h0 bf16: {d0:.6f}")
+
+    max_diff = d0
+    for t in range(min(NT - 1, len(h_ref_bf16))):
+        d = (h_out[0, t + 1, 0].float() - h_ref_bf16[t].float()).abs().max().item()
+        max_diff = max(max_diff, d)
+    print(f"  max diff h_out: {max_diff:.6f}")
+    t4_pass = max_diff < 0.5
+    print(f"  {'PASS' if t4_pass else 'FAIL'}")
+    all_pass = all_pass and t4_pass
+
+    # ===== Test 5: With store_final_state (ht) =====
+    print("\n" + "="*60)
+    print("Test 5: store_final_state")
+
+    compiled_kernel = None  # recompile
+    h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_z, h0_z, 0, 0, 0, 1)
+    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, h0=None, chunk_size=BT)
+
+    # ht should match the last h_ref (after all chunks)
+    ht_ref = h_ref_bf16[-1]  # last chunk's state
+    # ht layout: (B, H, K, V) but kernel writes in transposed (V, K) format
+    # Compare ht[0, 0] with ht_ref
+    d_ht = (ht[0, 0].float() - ht_ref.float()).abs().max().item()
+    print(f"  ht vs ref: {d_ht:.6f}")
+    t5_pass = d_ht < 0.5
+    print(f"  {'PASS' if t5_pass else 'FAIL'}")
+    all_pass = all_pass and t5_pass
+
+    # ===== Test 6: g + gk + h0 + ht (all features) =====
+    print("\n" + "="*60)
+    print("Test 6: g + gk + h0 + ht (all features)")
+
+    compiled_kernel = None
+    h_out, v_new, ht = run_kernel(k, w, u, g_val, gk_val, h0_val, 1, 1, 1, 1)
+    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, g=g_val, gk=gk_val, h0=h0_val, chunk_size=BT)
+
+    max_diff = 0.0
+    for t in range(min(NT - 1, len(h_ref_bf16))):
+        d = (h_out[0, t + 1, 0].float() - h_ref_bf16[t].float()).abs().max().item()
+        max_diff = max(max_diff, d)
+    d_ht = (ht[0, 0].float() - h_ref_bf16[-1].float()).abs().max().item()
+    max_diff = max(max_diff, d_ht)
+    print(f"  max diff (h_out + ht): {max_diff:.6f}")
+    t6_pass = max_diff < 0.5
+    print(f"  {'PASS' if t6_pass else 'FAIL'}")
+    all_pass = all_pass and t6_pass
+
+    # ===== Test 7: Larger config =====
+    print("\n" + "="*60)
+    print("Test 7: B=2, T=512, H=4 (no gating)")
+    B2, T2, H2 = 2, 512, 4
+    NT2 = (T2 + BT - 1) // BT
+    torch.manual_seed(123)
+    k2 = torch.randn(B2, T2, H2, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    w2 = torch.randn(B2, T2, H2, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    u2 = torch.randn(B2, T2, H2, V, device="cuda", dtype=torch.bfloat16) * 0.1
+    g_z2 = torch.zeros(B2, T2, H2, device="cuda", dtype=torch.float32)
+    gk_z2 = torch.zeros(B2, T2, H2, K, device="cuda", dtype=torch.float32)
+    h0_z2 = torch.zeros(B2, H2, K, V, device="cuda", dtype=torch.float32)
+
+    # Need new kernel instance for different B/T/H
+    kernel2 = ChunkDeltaRuleFwdH(chunk_size=BT, head_dim_k=K, head_dim_v=V)
+    h_out2 = torch.zeros(B2, NT2, H2, K, V, device="cuda", dtype=torch.bfloat16)
+    v_new2 = torch.zeros(B2, T2, H2, V, device="cuda", dtype=torch.bfloat16)
+    ht2 = torch.zeros(B2, H2, K, V, device="cuda", dtype=torch.bfloat16)
+
+    kc2, wc2, uc2 = from_dlpack(k2), from_dlpack(w2), from_dlpack(u2)
+    gc2, gkc2 = from_dlpack(g_z2), from_dlpack(gk_z2)
+    h0c2 = from_dlpack(h0_z2)
+    hc2, vnc2, htc2 = from_dlpack(h_out2), from_dlpack(v_new2), from_dlpack(ht2)
+
+    compiled2 = cute.compile(
+        kernel2,
+        kc2.iterator, wc2.iterator, uc2.iterator,
+        gc2.iterator, gkc2.iterator,
+        hc2.iterator, vnc2.iterator, h0c2.iterator, htc2.iterator,
+        (B2, T2, H2, K, V), 0, 0, 0, 0, 0, stream,
     )
-    print(f"Compiled in {time.time()-t0:.2f}s")
-
-    print("Running...")
-    compiled(
-        kc.iterator, wc.iterator, uc.iterator,
-        gc.iterator, gkc.iterator,
-        hc.iterator, vnc.iterator, h0c.iterator, htc.iterator,
-        (B, T, H, K, V), 0, 0, 0, 0, 0, stream,
+    compiled2(
+        kc2.iterator, wc2.iterator, uc2.iterator,
+        gc2.iterator, gkc2.iterator,
+        hc2.iterator, vnc2.iterator, h0c2.iterator, htc2.iterator,
+        (B2, T2, H2, K, V), 0, 0, 0, 0, 0, stream,
     )
     torch.cuda.synchronize()
 
-    # h_out[0] should be zeros (h=0 before first chunk)
-    h0_ok = (h_out[0, 0, 0] == 0).all().item()
-    print(f"\nh_out[0] all zeros: {h0_ok}")
+    _, h_ref2 = reference_bf16_roundtrip(k2, w2, u2, h0=None, chunk_size=BT)
 
-    # Compare: h_out[t+1] should match h_ref[t] (state after chunk t)
-    print(f"\n{'Chunk':<8} {'h_out[t+1] vs bf16_ref[t]':>28}")
     max_diff = 0.0
-    for t in range(min(NT - 1, len(h_ref_bf16))):
-        hk = h_out[0, t + 1, 0]
-        hr = h_ref_bf16[t]
-        d = (hk.float() - hr.float()).abs().max().item()
+    for t in range(min(NT2 - 1, len(h_ref2))):
+        d = (h_out2[0, t + 1, 0].float() - h_ref2[t].float()).abs().max().item()
         max_diff = max(max_diff, d)
-        print(f"  {t:<6} {d:>28.6f}")
+    print(f"  max diff h_out: {max_diff:.6f}")
+    t7_pass = max_diff < 0.5
+    print(f"  {'PASS' if t7_pass else 'FAIL'}")
+    all_pass = all_pass and t7_pass
 
-    if NT > 1:
-        print(f"\n  kernel h_out[1][0,:8]: {h_out[0, 1, 0, 0, :8].tolist()}")
-        print(f"  ref    h_bf16[0][0,:8]: {h_ref_bf16[0][0,:8].tolist()}")
-    if NT > 2:
-        print(f"\n  kernel h_out[2][0,:8]: {h_out[0, 2, 0, 0, :8].tolist()}")
-        print(f"  ref    h_bf16[1][0,:8]: {h_ref_bf16[1][0,:8].tolist()}")
+    # ===== Summary =====
+    print("\n" + "="*60)
+    results = [t1_pass, t2_pass, t3_pass, t4_pass, t5_pass, t6_pass, t7_pass]
+    names = ["No gate", "g gate", "gk gate", "h0 init", "ht store", "All features", "Larger config"]
+    for i, (name, r) in enumerate(zip(names, results)):
+        print(f"  Test {i+1} ({name}): {'PASS' if r else 'FAIL'}")
+    n_pass = sum(results)
+    print(f"\n{n_pass}/{len(results)} tests passed")
+    print("ALL PASS" if all_pass else "SOME FAILED")
 
-    print(f"\nMax diff (h_out[t+1] vs ref[t]): {max_diff:.6f}")
-    if NT > 2:
-        d_consecutive = (h_out[0, 2, 0].float() - h_out[0, 1, 0].float()).abs().max().item()
-        print(f"h_out[2] vs h_out[1] max diff: {d_consecutive:.8f}")
-    print("PASS" if max_diff < 0.5 else "FAIL")
+    # ===== Benchmark =====
+    print("\n" + "="*60)
+    print("Benchmark: B=4, T=4096, H=64, K=128, V=128")
+    Bb, Tb, Hb = 4, 4096, 64
+    NTb = (Tb + BT - 1) // BT
+    torch.manual_seed(999)
+    kb = torch.randn(Bb, Tb, Hb, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    wb = torch.randn(Bb, Tb, Hb, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    ub = torch.randn(Bb, Tb, Hb, V, device="cuda", dtype=torch.bfloat16) * 0.1
+    gb = torch.zeros(Bb, Tb, Hb, device="cuda", dtype=torch.float32)
+    gkb = torch.zeros(Bb, Tb, Hb, K, device="cuda", dtype=torch.float32)
+    h0b = torch.zeros(Bb, Hb, K, V, device="cuda", dtype=torch.float32)
+    h_outb = torch.zeros(Bb, NTb, Hb, K, V, device="cuda", dtype=torch.bfloat16)
+    v_newb = torch.zeros(Bb, Tb, Hb, V, device="cuda", dtype=torch.bfloat16)
+    htb = torch.zeros(Bb, Hb, K, V, device="cuda", dtype=torch.bfloat16)
+
+    kernelb = ChunkDeltaRuleFwdH(chunk_size=BT, head_dim_k=K, head_dim_v=V)
+
+    kcb, wcb, ucb = from_dlpack(kb), from_dlpack(wb), from_dlpack(ub)
+    gcb, gkcb = from_dlpack(gb), from_dlpack(gkb)
+    h0cb = from_dlpack(h0b)
+    hcb, vncb, htcb = from_dlpack(h_outb), from_dlpack(v_newb), from_dlpack(htb)
+
+    bench_args = (
+        kcb.iterator, wcb.iterator, ucb.iterator,
+        gcb.iterator, gkcb.iterator,
+        hcb.iterator, vncb.iterator, h0cb.iterator, htcb.iterator,
+        (Bb, Tb, Hb, K, V), 0, 0, 0, 0, 0, stream,
+    )
+    compiled_b = cute.compile(kernelb, *bench_args)
+
+    # Warmup
+    for _ in range(3):
+        compiled_b(*bench_args)
+    torch.cuda.synchronize()
+
+    # Benchmark
+    n_iter = 20
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    for _ in range(n_iter):
+        compiled_b(*bench_args)
+    end_event.record()
+    torch.cuda.synchronize()
+    elapsed_ms = start_event.elapsed_time(end_event) / n_iter
+    print(f"  V2 kernel: {elapsed_ms:.3f} ms")
+
+    # FLA reference
+    try:
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+        q_fla = torch.randn(Bb, Tb, Hb, K, device="cuda", dtype=torch.bfloat16) * 0.1
+        k_fla = kb.clone()
+        v_fla = ub.clone()
+        beta = torch.ones(Bb, Tb, Hb, device="cuda", dtype=torch.float32)
+        g_fla = torch.zeros(Bb, Tb, Hb, K, device="cuda", dtype=torch.float32)
+        # Warmup
+        for _ in range(3):
+            chunk_gated_delta_rule(
+                q_fla, k_fla, v_fla, g_fla, beta,
+                scale=K**-0.5,
+                initial_state=None,
+                output_final_state=False,
+            )
+        torch.cuda.synchronize()
+        start_event.record()
+        for _ in range(n_iter):
+            chunk_gated_delta_rule(
+                q_fla, k_fla, v_fla, g_fla, beta,
+                scale=K**-0.5,
+                initial_state=None,
+                output_final_state=False,
+            )
+        end_event.record()
+        torch.cuda.synchronize()
+        fla_ms = start_event.elapsed_time(end_event) / n_iter
+        print(f"  FLA kernel: {fla_ms:.3f} ms")
+        print(f"  Speedup vs FLA: {fla_ms / elapsed_ms:.2f}x")
+    except Exception as e:
+        print(f"  FLA not available: {e}")
 
 
 if __name__ == "__main__":
