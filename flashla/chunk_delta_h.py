@@ -113,6 +113,13 @@ class ChunkDeltaRuleFwdH:
         self.mma_warp_id = 4
         self.load_warp_id = 5
         self.store_warp_id = 6
+        # NOTE: setmaxnreg is a warpgroup-wide instruction, so we need thread count
+        # to be a multiple of warpgroup (4 warps). Warp 7 is an empty warp to complete
+        # warp group 1 (warps 4,5,6,7) so they can all cooperatively set reg count.
+        self.empty_warp_id = 7
+
+        self.num_regs_cuda = 232     # Warp group 0: CUDA core warps (alloc)
+        self.num_regs_others = 40    # Warp group 1: MMA/load/store/empty (dealloc)
 
         self.threads_per_cta = self.threads_per_warp * len(
             (
@@ -120,6 +127,7 @@ class ChunkDeltaRuleFwdH:
                 self.mma_warp_id,
                 self.load_warp_id,
                 self.store_warp_id,
+                self.empty_warp_id,
             )
         )
 
@@ -150,6 +158,13 @@ class ChunkDeltaRuleFwdH:
         self.tmem_dealloc_sync_barrier = pipeline.NamedBarrier(
             barrier_id=2,
             num_threads=self.threads_per_cta,
+        )
+        
+        # Barrier for h0 TMEM initialization sync between CUDA warps and MMA warp
+        # CUDA warps (4) + MMA warp (1) = 5 warps = 160 threads
+        self.h0_init_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=3,
+            num_threads=(self.threads_per_warp * len(self.cuda_warp_ids)) + self.threads_per_warp,
         )
 
         self.buffer_align_bytes = 1024
@@ -913,7 +928,7 @@ class ChunkDeltaRuleFwdH:
         # LOAD WARP
         # =========================================================================
         if warp_idx == self.load_warp_id:
-            cute.arch.warpgroup_reg_alloc(160)
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
             # TMA partition for W
             tWsW, tWgW = self._tma_partition_for_operand(
@@ -1036,7 +1051,11 @@ class ChunkDeltaRuleFwdH:
         # MMA WARP
         # =========================================================================
         elif warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(24)
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
+
+            # Wait for CUDA warp to finish h0 TMEM initialization before MMA loop
+            if use_initial_state:
+                self.h0_init_sync_barrier.arrive_and_wait()
 
             for chunk_idx in cutlass.range(0, NT, unroll=0):
                 # Wait for h_state loaded via TMA (from GMEM roundtrip)
@@ -1075,8 +1094,13 @@ class ChunkDeltaRuleFwdH:
                 # For now, we use cross-chunk accumulation which is only correct
                 # when g=0 and gk=0 (no decay on h_state).
                 kv_handle = kv_producer.acquire_and_advance()
-                kv_always_acc = True if chunk_idx != 0 else False
+                # Always accumulate if: not first chunk, OR has initial state (h0 pre-loaded to TMEM)
+                kv_always_acc = True if (chunk_idx != 0 or use_initial_state) else False
                 for kphase_idx in cutlass.range(cute.size(tCrK_kv, mode=[2]), unroll_full=True):
+                    kv_tiled_mma.set(
+                        tcgen05.Field.ACCUMULATE,
+                        cutlass.Boolean(kphase_idx != 0 or kv_always_acc),
+                    )
                     kv_tiled_mma.set(
                         tcgen05.Field.ACCUMULATE,
                         cutlass.Boolean(kphase_idx != 0 or kv_always_acc),
@@ -1096,7 +1120,7 @@ class ChunkDeltaRuleFwdH:
         # CUDA CORE WARPS - Apply gates and compute v_new = u - (W @ H)
         # =========================================================================
         elif warp_idx in self.cuda_warp_ids:
-            cute.arch.warpgroup_reg_alloc(160)
+            cute.arch.warpgroup_reg_alloc(self.num_regs_cuda)
 
             local_tidx = tidx % (self.threads_per_warp * len(self.cuda_warp_ids))
 
@@ -1195,6 +1219,50 @@ class ChunkDeltaRuleFwdH:
 
             # Pre-allocate bf16 register tensor for h_state R2S
             tTR_rH_bf16 = cute.make_rmem_tensor(tTR_rKV.shape, self.io_dtype)
+
+            # ===== Setup TMEM store for KV accumulator (for h0 initialization) =====
+            # Reference: kda.py tmem_store_and_partition_acc + initial_state loading
+            # This is done in CUDA warp (warp group 0), same warp group that owns TMEM.
+            tmem_store_copy_atom_kv = cute.make_copy_atom(
+                tcgen05.St32x32bOp(tcgen05.Repetition(32), tcgen05.Unpack.NONE),
+                self.acc_dtype,
+            )
+            tmem_store_tiled_kv = tcgen05.make_tmem_copy(tmem_store_copy_atom_kv, tCtAccKV)
+            tmem_store_thr_kv = tmem_store_tiled_kv.get_slice(local_tidx)
+            tmem_store_tAccKV_f32 = tmem_store_thr_kv.partition_D(tCtAccKV)
+            tmem_store_rAccKV_f32_src = tmem_store_thr_kv.partition_S(tCtAccKV)
+            tmem_store_rAccKV_f32 = cute.make_rmem_tensor(
+                cute.slice_(tmem_store_rAccKV_f32_src.shape, (None, None, None, None, 0)),
+                self.acc_dtype,
+            )
+            # Alias register memory: use tTR_rKV's iterator with the store partition's layout
+            tmem_store_rKV = cute.make_tensor(
+                tTR_rKV.iterator, layout=tmem_store_rAccKV_f32.layout
+            )
+
+            # ===== Load h0 into KV TMEM accumulator (if use_initial_state) =====
+            if use_initial_state:
+                # h0 layout: (K, V, (H, B)) with stride (V, 1, ...)
+                # KV TMEM stores h^T = (V, K), so TMEM row = V, TMEM col = K
+                # Each of 128 CUDA threads maps to one V position (local_tidx → V dim)
+                # We iterate over K dimension to fill all columns.
+                # Reference: kda.py init_state_chunk[local_tidx, init_i] where
+                #   local_tidx → contiguous dim (key), init_i → strided dim (value)
+                gH0_chunk = h0[None, None, (hidx, bidx)]  # (K, V) tile
+                init_flat = cute.make_tensor(
+                    tTR_rKV.iterator, layout=cute.make_layout(self.BK)
+                )
+                for init_i in cutlass.range(0, self.BK, unroll=0):
+                    # init_i indexes K dim, local_tidx indexes V dim
+                    init_flat[init_i] = gH0_chunk[init_i, local_tidx].to(self.acc_dtype)
+
+                # Store FP32 state values to KV TMEM accumulator
+                init_tmem_store_tKVi = tmem_store_tAccKV_f32[(None, None, None, None, 0)]
+                cute.copy(tmem_store_tiled_kv, tmem_store_rKV, init_tmem_store_tKVi)
+                cute.arch.fence_view_async_tmem_store()
+
+                # Sync with MMA warp to ensure h0 is in TMEM before KV MMA starts
+                self.h0_init_sync_barrier.arrive_and_wait()
 
             # ===== Setup identity tensor for (row, col) coordinates =====
             # This allows us to know which logical (t, v) position each register element corresponds to.
@@ -1312,7 +1380,7 @@ class ChunkDeltaRuleFwdH:
         # STORE WARP - TMA store v_new and h_state from SMEM to GMEM
         # =========================================================================
         elif warp_idx == self.store_warp_id:
-            cute.arch.warpgroup_reg_dealloc(24)
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
             # Prefetch TMA store descriptors
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_h_out)
@@ -1408,6 +1476,12 @@ class ChunkDeltaRuleFwdH:
             # 1. Having CUDA warps signal a final h_out write for ht
             # 2. Having host copy h_out[NT-1] to ht after kernel
             # For simplicity, we rely on option 2 in the test harness.
+
+        # =========================================================================
+        # EMPTY WARP - completes warp group 1 (warps 4,5,6,7) for cooperative setmaxnreg
+        # =========================================================================
+        elif warp_idx == self.empty_warp_id:
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
         # Cleanup
         tmem.relinquish_alloc_permit()

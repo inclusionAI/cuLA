@@ -168,9 +168,15 @@ def compare_with_fla(
     
     # Initial state (optional)
     if use_h0:
-        h0 = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) * 0.1
+        # Note: FLA uses float32 for h0, but our kernel uses bf16 TMA loads
+        # So we need to convert h0 to bf16 for kernel, but use float32 for reference
+        h0_fp32 = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) * 0.1
+        h0_bf16 = h0_fp32.to(torch.bfloat16)  # For kernel
+        h0 = h0_fp32  # For reference (uses float32 internally)
     else:
         h0 = None
+        h0_fp32 = None
+        h0_bf16 = None
     
     print(f"\n--- Running FLA reference (full gate: apply_h_gate=True) ---")
     # FLA reference implementation (fp32 precision, full gating)
@@ -215,7 +221,8 @@ def compare_with_fla(
     # Gates in our format
     g_ours = g if g is not None else torch.zeros(B, T, H, device="cuda", dtype=torch.float32)
     gk_ours = gk if gk is not None else torch.zeros(B, T, H, K, device="cuda", dtype=torch.float32)
-    h0_ours = h0 if h0 is not None else torch.zeros(B, H, K, V, device="cuda", dtype=torch.float32)
+    # Use bf16 h0 for kernel (TMA requires matching dtype)
+    h0_ours = h0_bf16 if h0_bf16 is not None else torch.zeros(B, H, K, V, device="cuda", dtype=torch.bfloat16)
     
     # Convert to CuTe
     k_cute = from_dlpack(k)
