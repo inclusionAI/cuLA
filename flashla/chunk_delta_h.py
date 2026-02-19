@@ -726,6 +726,14 @@ class ChunkDeltaRuleFwdH:
                         val = tTR_rVnew_bf16[ei].to(self.acc_dtype)
                         tTR_rVnew_bf16[ei] = (val * gs).to(self.io_dtype)
 
+                # Save v_new to GMEM (after g gating)
+                if save_v_new:
+                    for ei in cutlass.range_constexpr(cute.size(tTR_rVnew_bf16)):
+                        v_coord, t_coord = tTR_cM[ei]
+                        v_new_tensor[(chunk_idx * self.BT + t_coord,
+                                      v_coord + v_tile_idx * self.BV,
+                                      (hidx, bidx))] = tTR_rVnew_bf16[ei]
+
                 # R2S: v_new → sVnew_epi
                 tRS_rVnew = tiled_r2s_vnew.retile(tTR_rVnew_bf16)
                 vnew_h = vnew_smem_P.acquire_and_advance()
@@ -940,7 +948,7 @@ def main():
 
     compiled_kernel = None
 
-    def run_kernel(k_t, w_t, u_t, g_t, gk_t, h0_t, use_g_val, use_gk_val, use_h0, store_ht):
+    def run_kernel(k_t, w_t, u_t, g_t, gk_t, h0_t, use_g_val, use_gk_val, use_h0, store_ht, do_save_vnew=0):
         nonlocal compiled_kernel
         h_out = torch.zeros(B, NT, H, K, V, device="cuda", dtype=torch.bfloat16)
         v_new = torch.zeros(B, T, H, V, device="cuda", dtype=torch.bfloat16)
@@ -956,7 +964,7 @@ def main():
             gc.iterator, gkc.iterator,
             hc.iterator, vnc.iterator, h0c.iterator, htc.iterator,
             (B, T, H, K, V),
-            int(use_g_val), int(use_gk_val), int(use_h0), int(store_ht), 0,
+            int(use_g_val), int(use_gk_val), int(use_h0), int(store_ht), int(do_save_vnew),
             stream,
         )
 
@@ -1141,10 +1149,38 @@ def main():
     print(f"  {'PASS' if t7_pass else 'FAIL'}")
     all_pass = all_pass and t7_pass
 
+    # ===== Test 8: v_new output (no gating) =====
+    print("\n" + "="*60)
+    print("Test 8: v_new output (no gating)")
+
+    compiled_kernel = None  # recompile
+    h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_z, h0_z, 0, 0, 0, 0, do_save_vnew=1)
+    vnew_ref, _ = reference_bf16_roundtrip(k, w, u, h0=None, chunk_size=BT)
+
+    d_vnew = (v_new.float() - vnew_ref.float()).abs().max().item()
+    print(f"  v_new max diff: {d_vnew:.6f}")
+    t8_pass = d_vnew < 0.5
+    print(f"  {'PASS' if t8_pass else 'FAIL'}")
+    all_pass = all_pass and t8_pass
+
+    # ===== Test 9: v_new output (with g gating) =====
+    print("\n" + "="*60)
+    print("Test 9: v_new output (with g gating)")
+
+    compiled_kernel = None  # recompile
+    h_out, v_new, ht = run_kernel(k, w, u, g_val, gk_z, h0_z, 1, 0, 0, 0, do_save_vnew=1)
+    vnew_ref, _ = reference_bf16_roundtrip(k, w, u, g=g_val, h0=None, chunk_size=BT)
+
+    d_vnew = (v_new.float() - vnew_ref.float()).abs().max().item()
+    print(f"  v_new max diff: {d_vnew:.6f}")
+    t9_pass = d_vnew < 0.5
+    print(f"  {'PASS' if t9_pass else 'FAIL'}")
+    all_pass = all_pass and t9_pass
+
     # ===== Summary =====
     print("\n" + "="*60)
-    results = [t1_pass, t2_pass, t3_pass, t4_pass, t5_pass, t6_pass, t7_pass]
-    names = ["No gate", "g gate", "gk gate", "h0 init", "ht store", "All features", "Larger config"]
+    results = [t1_pass, t2_pass, t3_pass, t4_pass, t5_pass, t6_pass, t7_pass, t8_pass, t9_pass]
+    names = ["No gate", "g gate", "gk gate", "h0 init", "ht store", "All features", "Larger config", "v_new (no g)", "v_new (g)"]
     for i, (name, r) in enumerate(zip(names, results)):
         print(f"  Test {i+1} ({name}): {'PASS' if r else 'FAIL'}")
     n_pass = sum(results)
