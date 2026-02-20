@@ -255,20 +255,6 @@ class ChunkDeltaRuleFwdH:
             (self.BV, self.BK),  # (64, 128)
             1,
         )
-        # U SMEM for TMA load — COL_MAJOR (BV, BT), BV contiguous matches u_T GMEM
-        u_epi_staged = sm100_utils.make_smem_layout_epi(
-            self.io_dtype,
-            utils.LayoutEnum.COL_MAJOR,
-            (self.BV, self.BT),  # (64, 64)
-            1,
-        )
-        # v_new store SMEM — COL_MAJOR (BV, BT) for TMA S2G
-        vnew_store_epi_staged = sm100_utils.make_smem_layout_epi(
-            self.io_dtype,
-            utils.LayoutEnum.COL_MAJOR,
-            (self.BV, self.BT),  # (64, 64)
-            1,
-        )
 
         cluster_layout = cute.tiled_divide(
             cute.make_layout(self.cluster_shape_mnk),
@@ -295,40 +281,19 @@ class ChunkDeltaRuleFwdH:
             tma_store_op, ht_T, h_epi_smem, (self.BV, self.BK),
         )
 
-        # TMA descriptor for U load (G2S) — non-MMA operand
-        u_smem = cute.select(u_epi_staged, mode=[0, 1])
-        tma_atom_u, tma_tensor_u = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            tma_load_op, u_T, u_smem, (self.BV, self.BT),
-        )
-
-        # v_new transposed GMEM view: (V, T, (H,B)) for TMA store
-        v_new_T_layout = cute.make_layout(
-            (V, T, (H, B)), stride=(1, H * V, (V, T * H * V)),
-        )
-        v_new_T = cute.make_tensor(v_new_ptr, v_new_T_layout)
-
-        # TMA descriptor for v_new store (S2G)
-        vnew_store_smem = cute.select(vnew_store_epi_staged, mode=[0, 1])
-        tma_atom_vnew_st, tma_tensor_vnew_st = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            tma_store_op, v_new_T, vnew_store_smem, (self.BV, self.BT),
-        )
-
         self.tma_w_bytes = cute.size_in_bytes(self.io_dtype, w_smem)
         self.tma_kt_bytes = cute.size_in_bytes(self.io_dtype, kt_smem)
-        self.tma_u_bytes = cute.size_in_bytes(self.io_dtype, u_smem)
 
         # ===================== SharedStorage =====================
         @cute.struct
         class SharedStorage:
             load_w_mbar: cute.struct.MemRange[Int64, self.w_stage * 2]
             load_kt_mbar: cute.struct.MemRange[Int64, self.k_stage * 2]
-            load_u_mbar: cute.struct.MemRange[Int64, 1 * 2]           # Load→CUDA: sU ready
             state_smem_mbar: cute.struct.MemRange[Int64, 1 * 2]       # CUDA→MMA: sState ready
             wh_done_mbar: cute.struct.MemRange[Int64, self.acc_stage * 2]  # MMA→CUDA: WH done
             vnew_smem_mbar: cute.struct.MemRange[Int64, 1 * 2]        # CUDA→MMA: sVnew ready
             kv_done_mbar: cute.struct.MemRange[Int64, 1 * 2]          # MMA→CUDA: KV done
             h_out_mbar: cute.struct.MemRange[Int64, 1 * 2]            # CUDA→Store: sH_epi ready
-            vnew_store_mbar: cute.struct.MemRange[Int64, 1 * 2]       # CUDA→Store: sVnew_store ready
             tmem_holding_buf: Int32
             sW: cute.struct.Align[
                 cute.struct.MemRange[self.io_dtype, cute.cosize(w_smem_staged)],
@@ -350,14 +315,6 @@ class ChunkDeltaRuleFwdH:
                 cute.struct.MemRange[self.io_dtype, cute.cosize(h_out_epi_staged)],
                 self.buffer_align_bytes,
             ]
-            sU: cute.struct.Align[
-                cute.struct.MemRange[self.io_dtype, cute.cosize(u_epi_staged)],
-                self.buffer_align_bytes,
-            ]
-            sVnew_store: cute.struct.Align[
-                cute.struct.MemRange[self.io_dtype, cute.cosize(vnew_store_epi_staged)],
-                self.buffer_align_bytes,
-            ]
 
         self.shared_storage = SharedStorage
         self.grid = self._compute_grid(B, H, V)
@@ -368,14 +325,11 @@ class ChunkDeltaRuleFwdH:
             tma_atom_kt, tma_tensor_kt,
             tma_atom_h_out, tma_tensor_h_out,
             tma_atom_ht, tma_tensor_ht,
-            tma_atom_u, tma_tensor_u,
-            tma_atom_vnew_st, tma_tensor_vnew_st,
             g, gk, h0, u, u_T, h_out_T, v_new,
             w_smem_staged, kt_smem_staged,
             state_mma_staged, state_epi_staged,
             vnew_mma_staged, vnew_epi_staged,
             h_out_epi_staged,
-            u_epi_staged, vnew_store_epi_staged,
             problem_size,
             use_g, use_gk, use_initial_state, store_final_state, save_v_new,
         ).launch(
@@ -399,10 +353,6 @@ class ChunkDeltaRuleFwdH:
         tma_tensor_h_out: cute.Tensor,
         tma_atom_ht: cute.CopyAtom,
         tma_tensor_ht: cute.Tensor,
-        tma_atom_u: cute.CopyAtom,
-        tma_tensor_u: cute.Tensor,
-        tma_atom_vnew_st: cute.CopyAtom,
-        tma_tensor_vnew_st: cute.Tensor,
         g: cute.Tensor,
         gk: cute.Tensor,
         h0: cute.Tensor,
@@ -417,8 +367,6 @@ class ChunkDeltaRuleFwdH:
         vnew_mma_staged: cute.ComposedLayout,
         vnew_epi_staged: cute.ComposedLayout,
         h_out_epi_staged: cute.ComposedLayout,
-        u_epi_staged: cute.ComposedLayout,
-        vnew_store_epi_staged: cute.ComposedLayout,
         problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],
         use_g: Int32,
         use_gk: Int32,
@@ -432,7 +380,6 @@ class ChunkDeltaRuleFwdH:
         if warp_idx == self.load_warp_id:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_w)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_kt)
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_u)
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -494,24 +441,6 @@ class ChunkDeltaRuleFwdH:
             barrier_storage=storage.h_out_mbar.data_ptr(),
         ).make_participants()
 
-        load_u_P, load_u_C = pipeline.PipelineTmaAsync.create(
-            num_stages=1,
-            producer_group=make_thread_cooperative_group(
-                len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(
-                len(self.cuda_warp_ids)),
-            tx_count=self.tma_u_bytes,
-            barrier_storage=storage.load_u_mbar.data_ptr(),
-        ).make_participants()
-
-        vnew_store_P, vnew_store_C = pipeline.PipelineAsync.create(
-            num_stages=1,
-            producer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.cuda_warp_ids)),
-            consumer_group=make_thread_cooperative_group(self.threads_per_warp),
-            barrier_storage=storage.vnew_store_mbar.data_ptr(),
-        ).make_participants()
-
         # ===================== TMEM =====================
         tmem_alloc_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=self.threads_per_cta)
         tmem = utils.TmemAllocator(
@@ -531,10 +460,6 @@ class ChunkDeltaRuleFwdH:
         sVnew_mma = storage.sVnew.get_tensor(vnew_mma_staged.outer, swizzle=vnew_mma_staged.inner)
         sVnew_epi = storage.sVnew.get_tensor(vnew_epi_staged.outer, swizzle=vnew_epi_staged.inner)
         sH_epi = storage.sH_epi.get_tensor(h_out_epi_staged.outer, swizzle=h_out_epi_staged.inner)
-        sU_epi = storage.sU.get_tensor(u_epi_staged.outer, swizzle=u_epi_staged.inner)
-        sVnew_store_epi = storage.sVnew_store.get_tensor(
-            vnew_store_epi_staged.outer, swizzle=vnew_store_epi_staged.inner,
-        )
 
         # ===================== MMA fragments =====================
         # WH MMA: A=sState, B=sW, acc=WH TMEM
@@ -570,12 +495,6 @@ class ChunkDeltaRuleFwdH:
                 tma_atom_kt, tma_tensor_kt, sKt, self.kv_mma_tiler, kv_tiled_mma,
             )
 
-            # U TMA load partition (non-MMA, epilog-style)
-            gU_ld = tma_tensor_u[None, None, (hidx, bidx)]
-            _, bSG_sU, bSG_gU = self._epilog_partition(
-                tma_atom_u, gU_ld, (self.BV, self.BT), sU_epi,
-            )
-
             for chunk_idx in cutlass.range(0, NT, unroll=0):
                 w_h = load_w_P.acquire_and_advance()
                 cute.copy(atom=tma_atom_w, src=tWgW[None, chunk_idx, 0],
@@ -584,12 +503,6 @@ class ChunkDeltaRuleFwdH:
                 kt_h = load_kt_P.acquire_and_advance()
                 cute.copy(atom=tma_atom_kt, src=tKgK[None, 0, chunk_idx],
                           dst=tKsK[None, kt_h.index], tma_bar_ptr=kt_h.barrier)
-
-                u_h = load_u_P.acquire_and_advance()
-                cute.copy(atom=tma_atom_u,
-                          src=bSG_gU[(None, v_tile_idx, chunk_idx)],
-                          dst=bSG_sU[None, u_h.index],
-                          tma_bar_ptr=u_h.barrier)
 
         # =========================================================================
         # MMA WARP
@@ -702,12 +615,14 @@ class ChunkDeltaRuleFwdH:
             tTR_rKV_bf16 = cute.make_rmem_tensor(tTR_rKV.shape, self.io_dtype)
             tTR_rVnew_bf16 = cute.make_rmem_tensor(tTR_rWH.shape, self.io_dtype)
 
-            # ----- U register tensor (for S2R from sU SMEM) -----
-            tTR_rU = cute.make_rmem_tensor(tTR_rWH.shape, self.io_dtype)
-
-            # ----- R2S: WH T2R regs → sVnew_store_epi (COL_MAJOR, BV×BT) for TMA store -----
-            thr_r2s_vnew_st = tiled_r2s_vnew.get_slice(local_tidx)
-            tRS_sVnew_store = thr_r2s_vnew_st.partition_D(sVnew_store_epi)
+            # ----- U GMEM (direct read, bypass SMEM) -----
+            # Use transposed U view (V, T, ...) to match WH acc layout (M=BV, N=BT)
+            gU_all = cute.local_tile(u_T_tensor, (self.BV, self.BT), (None, None, (hidx, bidx)))
+            tTR_gU = thr_t2r_wh.partition_D(gU_all)
+            copy_atom_s2r = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), self.io_dtype,
+                num_bits_per_copy=self.io_dtype.width,
+            )
 
             # ----- g/gk GMEM -----
             gG = cute.local_tile(g, (self.BT,), (None, (hidx, bidx)))
@@ -788,12 +703,10 @@ class ChunkDeltaRuleFwdH:
                 cute.arch.fence_view_async_tmem_load()
                 wh_h.release()
 
-                # Load U from SMEM (TMA-loaded sU)
-                u_handle = load_u_C.wait_and_advance()
-                for ei in cutlass.range_constexpr(cute.size(tTR_rU)):
-                    v_coord, t_coord = tTR_cM[ei]
-                    tTR_rU[ei] = sU_epi[(v_coord, t_coord, u_handle.index)]
-                u_handle.release()
+                # Load U from GMEM (u_T indexed: v_tile, chunk)
+                tTR_gU_i = tTR_gU[(None, None, None, v_tile_idx, chunk_idx)]
+                tTR_rU = cute.make_rmem_tensor(tTR_gU_i.shape, self.io_dtype)
+                cute.copy(copy_atom_s2r, tTR_gU_i, tTR_rU)
 
                 # v_new = u - WH (FP32)
                 wh_vec = tTR_rWH.load()
@@ -812,18 +725,6 @@ class ChunkDeltaRuleFwdH:
                         gs = cute.exp2(g_diff * INV_LN2)
                         val = tTR_rVnew_bf16[ei].to(self.acc_dtype)
                         tTR_rVnew_bf16[ei] = (val * gs).to(self.io_dtype)
-
-                # Save v_new to SMEM for TMA store (after g gating)
-                if save_v_new:
-                    tRS_rVnew_st = tiled_r2s_vnew.retile(tTR_rVnew_bf16)
-                    vnew_st_h = vnew_store_P.acquire_and_advance()
-                    cute.copy(tiled_r2s_vnew, tRS_rVnew_st,
-                              tRS_sVnew_store[(None, None, None, vnew_st_h.index)])
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
-                    )
-                    vnew_st_h.commit()
 
                 # R2S: v_new → sVnew_epi
                 tRS_rVnew = tiled_r2s_vnew.retile(tTR_rVnew_bf16)
@@ -871,7 +772,6 @@ class ChunkDeltaRuleFwdH:
 
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_h_out)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_ht)
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_vnew_st)
 
             gH_st = tma_tensor_h_out[None, None, (None, hidx, bidx)]
             tma_h_st, bSG_sH, bSG_gH = self._epilog_partition(
@@ -883,12 +783,6 @@ class ChunkDeltaRuleFwdH:
                 tma_atom_ht, gHt_st, (self.BV, self.BK), sH_epi,
             )
 
-            # v_new TMA store partition
-            gVnew_st = tma_tensor_vnew_st[None, None, (hidx, bidx)]
-            tma_vnew_st, bSG_sVnew_st, bSG_gVnew_st = self._epilog_partition(
-                tma_atom_vnew_st, gVnew_st, (self.BV, self.BT), sVnew_store_epi,
-            )
-
             for chunk_idx in cutlass.range(0, NT, unroll=0):
                 h_handle = h_out_C.wait_and_advance()
 
@@ -898,16 +792,6 @@ class ChunkDeltaRuleFwdH:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
 
                 h_handle.release()
-
-                # v_new TMA store
-                if save_v_new:
-                    vnew_handle = vnew_store_C.wait_and_advance()
-                    cute.copy(tma_vnew_st,
-                              bSG_sVnew_st[None, vnew_handle.index],
-                              bSG_gVnew_st[(None, v_tile_idx, chunk_idx)])
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    vnew_handle.release()
 
             # Store final state ht
             if store_final_state:
@@ -1056,7 +940,7 @@ def main():
 
     compiled_kernel = None
 
-    def run_kernel(k_t, w_t, u_t, g_t, gk_t, h0_t, use_g_val, use_gk_val, use_h0, store_ht, do_save_vnew=0):
+    def run_kernel(k_t, w_t, u_t, g_t, gk_t, h0_t, use_g_val, use_gk_val, use_h0, store_ht):
         nonlocal compiled_kernel
         h_out = torch.zeros(B, NT, H, K, V, device="cuda", dtype=torch.bfloat16)
         v_new = torch.zeros(B, T, H, V, device="cuda", dtype=torch.bfloat16)
@@ -1072,7 +956,7 @@ def main():
             gc.iterator, gkc.iterator,
             hc.iterator, vnc.iterator, h0c.iterator, htc.iterator,
             (B, T, H, K, V),
-            int(use_g_val), int(use_gk_val), int(use_h0), int(store_ht), int(do_save_vnew),
+            int(use_g_val), int(use_gk_val), int(use_h0), int(store_ht), 0,
             stream,
         )
 
@@ -1257,38 +1141,10 @@ def main():
     print(f"  {'PASS' if t7_pass else 'FAIL'}")
     all_pass = all_pass and t7_pass
 
-    # ===== Test 8: v_new output (no gating) =====
-    print("\n" + "="*60)
-    print("Test 8: v_new output (no gating)")
-
-    compiled_kernel = None  # recompile
-    h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_z, h0_z, 0, 0, 0, 0, do_save_vnew=1)
-    vnew_ref, _ = reference_bf16_roundtrip(k, w, u, h0=None, chunk_size=BT)
-
-    d_vnew = (v_new.float() - vnew_ref.float()).abs().max().item()
-    print(f"  v_new max diff: {d_vnew:.6f}")
-    t8_pass = d_vnew < 0.5
-    print(f"  {'PASS' if t8_pass else 'FAIL'}")
-    all_pass = all_pass and t8_pass
-
-    # ===== Test 9: v_new output (with g gating) =====
-    print("\n" + "="*60)
-    print("Test 9: v_new output (with g gating)")
-
-    compiled_kernel = None  # recompile
-    h_out, v_new, ht = run_kernel(k, w, u, g_val, gk_z, h0_z, 1, 0, 0, 0, do_save_vnew=1)
-    vnew_ref, _ = reference_bf16_roundtrip(k, w, u, g=g_val, h0=None, chunk_size=BT)
-
-    d_vnew = (v_new.float() - vnew_ref.float()).abs().max().item()
-    print(f"  v_new max diff: {d_vnew:.6f}")
-    t9_pass = d_vnew < 0.5
-    print(f"  {'PASS' if t9_pass else 'FAIL'}")
-    all_pass = all_pass and t9_pass
-
     # ===== Summary =====
     print("\n" + "="*60)
-    results = [t1_pass, t2_pass, t3_pass, t4_pass, t5_pass, t6_pass, t7_pass, t8_pass, t9_pass]
-    names = ["No gate", "g gate", "gk gate", "h0 init", "ht store", "All features", "Larger config", "v_new (no g)", "v_new (g)"]
+    results = [t1_pass, t2_pass, t3_pass, t4_pass, t5_pass, t6_pass, t7_pass]
+    names = ["No gate", "g gate", "gk gate", "h0 init", "ht store", "All features", "Larger config"]
     for i, (name, r) in enumerate(zip(names, results)):
         print(f"  Test {i+1} ({name}): {'PASS' if r else 'FAIL'}")
     n_pass = sum(results)
