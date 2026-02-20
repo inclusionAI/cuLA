@@ -94,6 +94,11 @@ class ChunkDeltaRuleFwdH:
         self.tmem_dealloc_sync_barrier = pipeline.NamedBarrier(
             barrier_id=2, num_threads=self.threads_per_cta,
         )
+        # NamedBarrier for CUDA warps cooperative g/gk SMEM load
+        self.g_gk_load_bar = pipeline.NamedBarrier(
+            barrier_id=3,
+            num_threads=self.threads_per_warp * len(self.cuda_warp_ids),  # 128
+        )
         self.buffer_align_bytes = 1024
 
     @staticmethod
@@ -436,6 +441,11 @@ class ChunkDeltaRuleFwdH:
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+        # Allocate g/gk SMEM separately (Float32 fields in struct cause DSL issues)
+        sG_smem = smem.allocate_tensor(cutlass.Float32, cute.make_layout(self.BT),
+                                       byte_alignment=128)
+        sGK_smem = smem.allocate_tensor(cutlass.Float32, cute.make_layout(self.BK),
+                                        byte_alignment=128)
 
         # ===================== Pipelines =====================
         load_w_P, load_w_C = pipeline.PipelineTmaUmma.create(
@@ -709,10 +719,6 @@ class ChunkDeltaRuleFwdH:
             thr_r2s_vnew_st = tiled_r2s_vnew.get_slice(local_tidx)
             tRS_sVnew_store = thr_r2s_vnew_st.partition_D(sVnew_store_epi)
 
-            # ----- g/gk GMEM -----
-            gG = cute.local_tile(g, (self.BT,), (None, (hidx, bidx)))
-            gGK = cute.local_tile(gk, (self.BT, self.BK), (None, None, (hidx, bidx)))
-
             # ----- Identity tensor for WH tile (BV, BT) → v_new coords -----
             vnew_tile = cute.dice(self.wh_mma_tiler, (1, 1, None))  # (BV, BT)
             cM_vnew = cute.make_identity_tensor(vnew_tile)
@@ -736,6 +742,20 @@ class ChunkDeltaRuleFwdH:
 
             # ===== Main loop =====
             for chunk_idx in cutlass.range(0, NT, unroll=0):
+                # ========================================
+                # Phase 0: Cooperative g/gk load to SMEM
+                # ========================================
+                if use_g or use_gk:
+                    g_off = chunk_idx * self.BT
+                    if use_g:
+                        if local_tidx < self.BT:
+                            sG_smem[local_tidx] = g[(g_off + local_tidx, (hidx, bidx))]
+                    if use_gk:
+                        if local_tidx < self.BK:
+                            sGK_smem[local_tidx] = gk[(g_off + self.BT - 1,
+                                                       local_tidx, (hidx, bidx))]
+                    self.g_gk_load_bar.arrive_and_wait()
+
                 # ========================================
                 # Phase 1: h state → sState + sH_epi
                 # ========================================
@@ -765,16 +785,14 @@ class ChunkDeltaRuleFwdH:
 
                 # Decay h in registers (R2S already done, safe to modify)
                 if use_g:
-                    g_off = chunk_idx * self.BT
-                    g_last = g[(g_off + self.BT - 1, (hidx, bidx))]
+                    g_last = sG_smem[self.BT - 1]
                     g_scale_h = cute.exp2(g_last * INV_LN2)
                     h_vec = h_vec * g_scale_h
                     tTR_rKV.store(h_vec)
                 if use_gk:
-                    g_off = chunk_idx * self.BT
                     for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
                         v_coord, k_coord = tTR_cM_h[ei]
-                        gk_val = gk[(g_off + self.BT - 1, k_coord, (hidx, bidx))]
+                        gk_val = sGK_smem[k_coord]
                         gk_scale = cute.exp2(gk_val * INV_LN2)
                         tTR_rKV[ei] = tTR_rKV[ei] * gk_scale
 
@@ -803,11 +821,10 @@ class ChunkDeltaRuleFwdH:
                 # Apply g gate to v_new (per-timestep scaling)
                 tTR_rVnew_bf16.store(vnew_vec.to(self.io_dtype))
                 if use_g:
-                    g_off = chunk_idx * self.BT
-                    g_last_v = g[(g_off + self.BT - 1, (hidx, bidx))]
+                    g_last_v = sG_smem[self.BT - 1]
                     for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                         v_coord, t_coord = tTR_cM[ei]  # (BV dim, BT dim)
-                        g_row = g[(g_off + t_coord, (hidx, bidx))]  # time index
+                        g_row = sG_smem[t_coord]  # from SMEM
                         g_diff = g_last_v - g_row
                         gs = cute.exp2(g_diff * INV_LN2)
                         val = tTR_rVnew_bf16[ei].to(self.acc_dtype)
