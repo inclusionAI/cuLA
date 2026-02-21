@@ -94,13 +94,10 @@ class ChunkDeltaRuleFwdH:
         self.cluster_shape_mnk = (1, 1, 1)
         self.cta_group = tcgen05.CtaGroup.ONE
 
+        self.gk_stage = 2
+
         self.tmem_dealloc_sync_barrier = pipeline.NamedBarrier(
             barrier_id=2, num_threads=self.threads_per_cta,
-        )
-        # NamedBarrier for CUDA warps cooperative g/gk SMEM load
-        self.g_gk_load_bar = pipeline.NamedBarrier(
-            barrier_id=3,
-            num_threads=self.threads_per_warp * len(self.cuda_warp_ids),  # 128
         )
         self.buffer_align_bytes = 1024
 
@@ -179,6 +176,10 @@ class ChunkDeltaRuleFwdH:
 
         gk_layout = cute.make_layout((T, K, (H, B)), stride=(H * K, 1, (K, T * H * K)))
         gk = cute.make_tensor(gk_ptr, gk_layout)
+
+        # gk K-first view for TMA: (K, T, (H, B)) with K contiguous
+        gk_K_layout = cute.make_layout((K, T, (H, B)), stride=(1, H * K, (K, T * H * K)))
+        gk_K = cute.make_tensor(gk_ptr, gk_K_layout)
 
         # Transposed U view: (V, T, (H,B)) to match WH acc shape (M=BV, N=BT)
         u_T_layout = cute.make_layout((V, T, (H, B)), stride=(1, H * V, (V, T * H * V)))
@@ -318,9 +319,16 @@ class ChunkDeltaRuleFwdH:
             tma_store_op, v_new_T, vnew_store_smem, (self.BV, self.BT),
         )
 
+        # TMA descriptor for gk load (G2S) — 2D tile (BK, 1) along K dimension
+        gk_smem_2d = cute.make_layout((self.BK, 1))
+        tma_atom_gk, tma_tensor_gk = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            tma_load_op, gk_K, gk_smem_2d, (self.BK, 1),
+        )
+
         self.tma_w_bytes = cute.size_in_bytes(self.io_dtype, w_smem)
         self.tma_kt_bytes = cute.size_in_bytes(self.io_dtype, kt_smem)
         self.tma_u_bytes = cute.size_in_bytes(self.io_dtype, u_smem)
+        self.tma_gk_bytes = self.BK * 4  # BK Float32 elements
 
         # ===================== SharedStorage =====================
         @cute.struct
@@ -328,6 +336,7 @@ class ChunkDeltaRuleFwdH:
             load_w_mbar: cute.struct.MemRange[Int64, self.w_stage * 2]
             load_kt_mbar: cute.struct.MemRange[Int64, self.k_stage * 2]
             load_u_mbar: cute.struct.MemRange[Int64, self.u_stage * 2]         # Load→CUDA: sU ready
+            load_gk_mbar: cute.struct.MemRange[Int64, self.gk_stage * 2]       # Load→CUDA: sGK ready
             state_smem_mbar: cute.struct.MemRange[Int64, 1 * 2]       # CUDA→MMA: sState ready
             wh_done_mbar: cute.struct.MemRange[Int64, self.acc_stage * 2]  # MMA→CUDA: WH done
             vnew_smem_mbar: cute.struct.MemRange[Int64, 1 * 2]        # CUDA→MMA: sVnew ready
@@ -379,7 +388,8 @@ class ChunkDeltaRuleFwdH:
             tma_atom_ht, tma_tensor_ht,
             tma_atom_u, tma_tensor_u,
             tma_atom_vnew_st, tma_tensor_vnew_st,
-            gk, h0, u, u_T, h_out_T, v_new,
+            tma_atom_gk, tma_tensor_gk,
+            h0, u, u_T, h_out_T, v_new,
             w_smem_staged, kt_smem_staged,
             state_mma_staged, state_epi_staged,
             vnew_mma_staged, vnew_epi_staged,
@@ -412,7 +422,8 @@ class ChunkDeltaRuleFwdH:
         tma_tensor_u: cute.Tensor,
         tma_atom_vnew_st: cute.CopyAtom,
         tma_tensor_vnew_st: cute.Tensor,
-        gk: cute.Tensor,
+        tma_atom_gk: cute.CopyAtom,
+        tma_tensor_gk: cute.Tensor,
         h0: cute.Tensor,
         u_tensor: cute.Tensor,
         u_T_tensor: cute.Tensor,
@@ -440,10 +451,14 @@ class ChunkDeltaRuleFwdH:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_w)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_kt)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_u)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_gk)
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
-        sGK_smem = storage.sGK.get_tensor(cute.make_layout((self.BK, 2)))
+        sGK_smem = storage.sGK.get_tensor(cute.make_layout((self.BK, self.gk_stage)))
+        # 3D SMEM view for _epilog_partition in Load warp: (BK, 1, gk_stage)
+        sGK_3d = storage.sGK.get_tensor(cute.make_layout(
+            (self.BK, 1, self.gk_stage), stride=(1, self.BK, self.BK)))
 
         # ===================== Pipelines =====================
         load_w_P, load_w_C = pipeline.PipelineTmaUmma.create(
@@ -520,6 +535,16 @@ class ChunkDeltaRuleFwdH:
             barrier_storage=storage.vnew_store_mbar.data_ptr(),
         ).make_participants()
 
+        load_gk_P, load_gk_C = pipeline.PipelineTmaAsync.create(
+            num_stages=self.gk_stage,
+            producer_group=make_thread_cooperative_group(
+                len([self.load_warp_id])),
+            consumer_group=make_thread_cooperative_group(
+                len(self.cuda_warp_ids)),
+            tx_count=self.tma_gk_bytes,
+            barrier_storage=storage.load_gk_mbar.data_ptr(),
+        ).make_participants()
+
         # ===================== TMEM =====================
         tmem_alloc_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=self.threads_per_cta)
         tmem = utils.TmemAllocator(
@@ -584,6 +609,12 @@ class ChunkDeltaRuleFwdH:
                 tma_atom_u, gU_ld, (self.BV, self.BT), sU_epi,
             )
 
+            # gk TMA load partition: gk_K shape (K, T, (H,B)), load (BK, 1) per timestep
+            gGK_ld = tma_tensor_gk[None, None, (hidx, bidx)]  # (K, T)
+            _, bSG_sGK, bSG_gGK = self._epilog_partition(
+                tma_atom_gk, gGK_ld, (self.BK, 1), sGK_3d,
+            )
+
             for chunk_idx in cutlass.range(0, NT, unroll=0):
                 w_h = load_w_P.acquire_and_advance()
                 cute.copy(atom=tma_atom_w, src=tWgW[None, chunk_idx, 0],
@@ -598,6 +629,15 @@ class ChunkDeltaRuleFwdH:
                           src=bSG_gU[(None, v_tile_idx, chunk_idx)],
                           dst=bSG_sU[None, u_h.index],
                           tma_bar_ptr=u_h.barrier)
+
+                # TMA load gk for this chunk (BK Float32 values)
+                if use_gk:
+                    gk_t_idx = chunk_idx * self.BT + self.BT - 1
+                    gk_h = load_gk_P.acquire_and_advance()
+                    cute.copy(atom=tma_atom_gk,
+                              src=bSG_gGK[(None, 0, gk_t_idx)],
+                              dst=bSG_sGK[None, gk_h.index],
+                              tma_bar_ptr=gk_h.barrier)
 
         # =========================================================================
         # MMA WARP
@@ -736,21 +776,12 @@ class ChunkDeltaRuleFwdH:
                     tTR_rKV[ei] = Float32(0.0)
 
             # ===== Main loop (gk-only optimized pipeline) =====
-            # Pipeline: Phase1(R2S)→WH MMA→Phase2(v_new)→KV MMA→Phase3(gk decay+prefetch)→Phase4(h update)
-            # gk double-buffered: prefetch gk[N+1] in Phase 3 of chunk N, use in Phase 3 of chunk N+1
-
-            # Prefetch gk[0] into stage 0 before main loop
-            gk_stage = Int32(0)
-            if use_gk:
-                if local_tidx < self.BK:
-                    gk_raw = gk[(self.BT - 1,
-                                 local_tidx, (hidx, bidx))]
-                    sGK_smem[(local_tidx, 0)] = cute.exp2(gk_raw * INV_LN2)
-                self.g_gk_load_bar.arrive_and_wait()
+            # Pipeline: Phase1(R2S)→WH MMA→Phase2(v_new)→KV MMA→Phase3(gk TMA wait+decay)→Phase4(h update)
+            # gk loaded by Load warp via TMA, double-buffered with PipelineTmaAsync
 
             for chunk_idx in cutlass.range(0, NT, unroll=0):
                 # ========================================
-                # Phase 1: Publish h for WH MMA + h_out store (NO gk load!)
+                # Phase 1: Publish h for WH MMA + h_out store
                 # ========================================
                 h_vec = tTR_rKV.load()
                 tTR_rKV_bf16.store(h_vec.to(self.io_dtype))
@@ -815,26 +846,16 @@ class ChunkDeltaRuleFwdH:
                 vnew_h.commit()  # KV MMA starts now!
 
                 # ========================================
-                # Phase 3: gk multiply (current stage) + prefetch next chunk (other stage)
-                # Both hidden behind KV MMA!
+                # Phase 3: gk decay (TMA-loaded, hidden behind KV MMA!)
                 # ========================================
                 if use_gk:
-                    # Multiply h by gk_scale from current stage
+                    gk_h = load_gk_C.wait_and_advance()
                     for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
                         v_coord, k_coord = tTR_cM_h[ei]
-                        gk_scale = sGK_smem[(k_coord, gk_stage)]
+                        gk_raw = sGK_smem[(k_coord, gk_h.index)]
+                        gk_scale = cute.exp2(gk_raw * INV_LN2)
                         tTR_rKV[ei] = tTR_rKV[ei] * gk_scale
-
-                    # Prefetch gk[chunk_idx+1] into OTHER stage
-                    next_stage = Int32(1) - gk_stage
-                    if chunk_idx < NT - 1:
-                        g_off_next = (chunk_idx + 1) * self.BT
-                        if local_tidx < self.BK:
-                            gk_raw = gk[(g_off_next + self.BT - 1,
-                                         local_tidx, (hidx, bidx))]
-                            sGK_smem[(local_tidx, next_stage)] = cute.exp2(gk_raw * INV_LN2)
-                        self.g_gk_load_bar.arrive_and_wait()
-                    gk_stage = next_stage
+                    gk_h.release()
 
                 # ========================================
                 # Phase 4: KV update → h
