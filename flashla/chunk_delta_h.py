@@ -1360,36 +1360,35 @@ def main():
     elapsed_ms = start_event.elapsed_time(end_event) / n_iter
     print(f"  V2 kernel: {elapsed_ms:.3f} ms")
 
-    # FLA reference
+    # FLA h-kernel reference (apples-to-apples: h-state recurrence only)
     try:
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-        q_fla = torch.randn(Bb, Tb, Hb, K, device="cuda", dtype=torch.bfloat16) * 0.1
-        k_fla = kb.clone()
-        v_fla = ub.clone()
-        beta = torch.ones(Bb, Tb, Hb, device="cuda", dtype=torch.float32)
-        g_fla = torch.zeros(Bb, Tb, Hb, K, device="cuda", dtype=torch.float32)
+        from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as fla_fwd_h
         # Warmup
         for _ in range(3):
-            chunk_gated_delta_rule(
-                q_fla, k_fla, v_fla, g_fla, beta,
-                scale=K**-0.5,
+            fla_fwd_h(
+                k=kb, w=wb, u=ub,
+                g=None, gk=None,
                 initial_state=None,
                 output_final_state=False,
+                chunk_size=BT,
+                save_new_value=True,
             )
         torch.cuda.synchronize()
         start_event.record()
         for _ in range(n_iter):
-            chunk_gated_delta_rule(
-                q_fla, k_fla, v_fla, g_fla, beta,
-                scale=K**-0.5,
+            fla_fwd_h(
+                k=kb, w=wb, u=ub,
+                g=None, gk=None,
                 initial_state=None,
                 output_final_state=False,
+                chunk_size=BT,
+                save_new_value=True,
             )
         end_event.record()
         torch.cuda.synchronize()
         fla_ms = start_event.elapsed_time(end_event) / n_iter
-        print(f"  FLA kernel: {fla_ms:.3f} ms")
-        print(f"  Speedup vs FLA: {fla_ms / elapsed_ms:.2f}x")
+        print(f"  FLA h-kernel: {fla_ms:.3f} ms")
+        print(f"  Speedup vs FLA h-kernel: {fla_ms / elapsed_ms:.2f}x")
     except Exception as e:
         print(f"  FLA not available: {e}")
 
