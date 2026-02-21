@@ -120,14 +120,28 @@ def main():
 
     configs = [
         # (B, T, H, use_g, use_gk, use_h0, store_ht, save_vnew)
-        (1, 2048, 64, False, False, False, False, True),
-        (2, 2048, 64, False, False, False, False, True),
-        (4, 2048, 64, False, False, False, False, True),
-        (4, 4096, 64, False, False, False, False, True),
-        (4, 4096, 64, False, True,  False, False, True),
+        # --- T=8192, all features (gk, h0, ht, vn), sweep B × H ---
+        (1,  8192, 32,  False, True, True, True, True),
+        (1,  8192, 64,  False, True, True, True, True),
+        (1,  8192, 128, False, True, True, True, True),
+        (2,  8192, 32,  False, True, True, True, True),
+        (2,  8192, 64,  False, True, True, True, True),
+        (2,  8192, 128, False, True, True, True, True),
+        (4,  8192, 32,  False, True, True, True, True),
+        (4,  8192, 64,  False, True, True, True, True),
+        (4,  8192, 128, False, True, True, True, True),
+        (8,  8192, 32,  False, True, True, True, True),
+        (8,  8192, 64,  False, True, True, True, True),
+        (8,  8192, 128, False, True, True, True, True),
+        (16, 8192, 32,  False, True, True, True, True),
+        (16, 8192, 64,  False, True, True, True, True),
+        # --- T=8192, minimal features, sweep B × H ---
+        (1,  8192, 64,  False, False, False, False, True),
+        (4,  8192, 64,  False, False, False, False, True),
+        (8,  8192, 64,  False, False, False, False, True),
+        # --- Original configs for reference ---
         (4, 4096, 64, False, True,  True,  True,  True),
-        (8, 2048, 64, False, False, False, False, True),
-        (8, 4096, 64, False, False, False, False, True),
+        (8, 4096, 64, False, True,  True,  True,  True),
     ]
 
     print(f"{'Config':<40} {'Ours (ms)':>10} {'FLA (ms)':>10} {'Speedup':>10}")
