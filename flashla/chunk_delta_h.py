@@ -174,9 +174,6 @@ class ChunkDeltaRuleFwdH:
         ht_T_layout = cute.make_layout((V, K, (H, B)), stride=(1, V, (K * V, H * K * V)))
         ht_T = cute.make_tensor(ht_ptr, ht_T_layout)
 
-        g_layout = cute.make_layout((T, (H, B)), stride=(H, (1, T * H)))
-        g = cute.make_tensor(g_ptr, g_layout)
-
         gk_layout = cute.make_layout((T, K, (H, B)), stride=(H * K, 1, (K, T * H * K)))
         gk = cute.make_tensor(gk_ptr, gk_layout)
 
@@ -375,14 +372,14 @@ class ChunkDeltaRuleFwdH:
             tma_atom_ht, tma_tensor_ht,
             tma_atom_u, tma_tensor_u,
             tma_atom_vnew_st, tma_tensor_vnew_st,
-            g, gk, h0, u, u_T, h_out_T, v_new,
+            gk, h0, u, u_T, h_out_T, v_new,
             w_smem_staged, kt_smem_staged,
             state_mma_staged, state_epi_staged,
             vnew_mma_staged, vnew_epi_staged,
             h_out_epi_staged,
             u_epi_staged, vnew_store_epi_staged,
             problem_size,
-            use_g, use_gk, use_initial_state, store_final_state, save_v_new,
+            use_gk, use_initial_state, store_final_state, save_v_new,
         ).launch(
             grid=self.grid,
             block=[self.threads_per_cta, 1, 1],
@@ -408,7 +405,6 @@ class ChunkDeltaRuleFwdH:
         tma_tensor_u: cute.Tensor,
         tma_atom_vnew_st: cute.CopyAtom,
         tma_tensor_vnew_st: cute.Tensor,
-        g: cute.Tensor,
         gk: cute.Tensor,
         h0: cute.Tensor,
         u_tensor: cute.Tensor,
@@ -425,7 +421,6 @@ class ChunkDeltaRuleFwdH:
         u_epi_staged: cute.ComposedLayout,
         vnew_store_epi_staged: cute.ComposedLayout,
         problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],
-        use_g: Int32,
         use_gk: Int32,
         use_initial_state: Int32,
         store_final_state: Int32,
@@ -441,9 +436,7 @@ class ChunkDeltaRuleFwdH:
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
-        # Allocate g/gk SMEM separately (Float32 fields in struct cause DSL issues)
-        sG_smem = smem.allocate_tensor(cutlass.Float32, cute.make_layout(self.BT),
-                                       byte_alignment=128)
+        # Allocate gk SMEM separately (Float32 fields in struct cause DSL issues)
         sGK_smem = smem.allocate_tensor(cutlass.Float32, cute.make_layout(self.BK),
                                         byte_alignment=128)
 
@@ -712,9 +705,6 @@ class ChunkDeltaRuleFwdH:
             tTR_rKV_bf16 = cute.make_rmem_tensor(tTR_rKV.shape, self.io_dtype)
             tTR_rVnew_bf16 = cute.make_rmem_tensor(tTR_rWH.shape, self.io_dtype)
 
-            # ----- U register tensor (for S2R from sU SMEM) -----
-            tTR_rU = cute.make_rmem_tensor(tTR_rWH.shape, self.io_dtype)
-
             # ----- R2S: WH T2R regs → sVnew_store_epi (COL_MAJOR, BV×BT) for TMA store -----
             thr_r2s_vnew_st = tiled_r2s_vnew.get_slice(local_tidx)
             tRS_sVnew_store = thr_r2s_vnew_st.partition_D(sVnew_store_epi)
@@ -740,30 +730,27 @@ class ChunkDeltaRuleFwdH:
                 for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
                     tTR_rKV[ei] = Float32(0.0)
 
-            # ===== Main loop =====
+            # ===== Main loop (gk-only optimized pipeline) =====
+            # Pipeline: Phase1(R2S)→WH MMA→Phase2(v_new)→KV MMA→Phase3(gk decay)→Phase4(h update)
+            # Pipeline: gk LOAD in Phase 1 (behind WH MMA), gk MULTIPLY in Phase 3 (behind KV MMA)
             for chunk_idx in cutlass.range(0, NT, unroll=0):
                 # ========================================
-                # Phase 0: Cooperative g/gk load to SMEM
+                # Phase 1: Publish h for WH MMA + h_out store + gk preload
                 # ========================================
-                if use_g or use_gk:
-                    g_off = chunk_idx * self.BT
-                    if use_g:
-                        if local_tidx < self.BT:
-                            sG_smem[local_tidx] = g[(g_off + local_tidx, (hidx, bidx))]
-                    if use_gk:
-                        if local_tidx < self.BK:
-                            sGK_smem[local_tidx] = gk[(g_off + self.BT - 1,
-                                                       local_tidx, (hidx, bidx))]
-                    self.g_gk_load_bar.arrive_and_wait()
-
-                # ========================================
-                # Phase 1: h state → sState + sH_epi
-                # ========================================
-                # Convert h (FP32) to BF16 for R2S
                 h_vec = tTR_rKV.load()
                 tTR_rKV_bf16.store(h_vec.to(self.io_dtype))
 
-                # R2S to sH_epi (for h_out TMA store)
+                # R2S to sState FIRST → WH MMA starts ASAP
+                tRS_rState = tiled_r2s_state.retile(tTR_rKV_bf16)
+                state_h = state_smem_P.acquire_and_advance()
+                cute.copy(tiled_r2s_state, tRS_rState, tRS_sState[(None, None, None, state_h.index)])
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
+                state_h.commit()  # WH MMA can start now!
+
+                # R2S to sH_epi (overlaps with WH MMA)
                 tRS_rH = tiled_r2s_h.retile(tTR_rKV_bf16)
                 h_handle = h_out_P.acquire_and_advance()
                 cute.copy(tiled_r2s_h, tRS_rH, tRS_sH[(None, None, None, h_handle.index)])
@@ -773,64 +760,33 @@ class ChunkDeltaRuleFwdH:
                 )
                 h_handle.commit()
 
-                # R2S to sState (for WH MMA A operand)
-                tRS_rState = tiled_r2s_state.retile(tTR_rKV_bf16)
-                state_h = state_smem_P.acquire_and_advance()
-                cute.copy(tiled_r2s_state, tRS_rState, tRS_sState[(None, None, None, state_h.index)])
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
-                state_h.commit()
-
-                # Decay h in registers (R2S already done, safe to modify)
-                if use_g:
-                    g_last = sG_smem[self.BT - 1]
-                    g_scale_h = cute.exp2(g_last * INV_LN2)
-                    h_vec = h_vec * g_scale_h
-                    tTR_rKV.store(h_vec)
+                # Preload gk into SMEM (hidden behind WH MMA!)
                 if use_gk:
-                    for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
-                        v_coord, k_coord = tTR_cM_h[ei]
-                        gk_val = sGK_smem[k_coord]
-                        gk_scale = cute.exp2(gk_val * INV_LN2)
-                        tTR_rKV[ei] = tTR_rKV[ei] * gk_scale
+                    g_off = chunk_idx * self.BT
+                    if local_tidx < self.BK:
+                        gk_raw = gk[(g_off + self.BT - 1,
+                                     local_tidx, (hidx, bidx))]
+                        sGK_smem[local_tidx] = cute.exp2(gk_raw * INV_LN2)
+                    self.g_gk_load_bar.arrive_and_wait()
 
                 # ========================================
-                # Phase 2: v_new from WH result
+                # Phase 2: v_new from WH result → triggers KV MMA
                 # ========================================
                 wh_h = wh_done_C.wait_and_advance()
-
-                # T2R: WH acc FP32 → registers
                 cute.copy(tiled_t2r_wh, tTR_tWH[(None, None, None, wh_h.index)], tTR_rWH)
                 cute.arch.fence_view_async_tmem_load()
                 wh_h.release()
 
-                # Load U from SMEM (TMA-loaded sU)
+                # Inline U-load + v_new = u - WH (no g-scaling needed)
                 u_handle = load_u_C.wait_and_advance()
-                for ei in cutlass.range_constexpr(cute.size(tTR_rU)):
+                for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                     v_coord, t_coord = tTR_cM[ei]
-                    tTR_rU[ei] = sU_epi[(v_coord, t_coord, u_handle.index)]
+                    u_val = sU_epi[(v_coord, t_coord, u_handle.index)].to(self.acc_dtype)
+                    tTR_rWH[ei] = u_val - tTR_rWH[ei]
                 u_handle.release()
+                tTR_rVnew_bf16.store(tTR_rWH.load().to(self.io_dtype))
 
-                # v_new = u - WH (FP32)
-                wh_vec = tTR_rWH.load()
-                u_vec = tTR_rU.load().to(self.acc_dtype)
-                vnew_vec = u_vec - wh_vec
-
-                # Apply g gate to v_new (per-timestep scaling)
-                tTR_rVnew_bf16.store(vnew_vec.to(self.io_dtype))
-                if use_g:
-                    g_last_v = sG_smem[self.BT - 1]
-                    for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
-                        v_coord, t_coord = tTR_cM[ei]  # (BV dim, BT dim)
-                        g_row = sG_smem[t_coord]  # from SMEM
-                        g_diff = g_last_v - g_row
-                        gs = cute.exp2(g_diff * INV_LN2)
-                        val = tTR_rVnew_bf16[ei].to(self.acc_dtype)
-                        tTR_rVnew_bf16[ei] = (val * gs).to(self.io_dtype)
-
-                # Save v_new to SMEM for TMA store (after g gating)
+                # Save v_new to SMEM for TMA store
                 if save_v_new:
                     tRS_rVnew_st = tiled_r2s_vnew.retile(tTR_rVnew_bf16)
                     vnew_st_h = vnew_store_P.acquire_and_advance()
@@ -842,7 +798,7 @@ class ChunkDeltaRuleFwdH:
                     )
                     vnew_st_h.commit()
 
-                # R2S: v_new → sVnew_epi
+                # R2S v_new → sVnew (triggers KV MMA)
                 tRS_rVnew = tiled_r2s_vnew.retile(tTR_rVnew_bf16)
                 vnew_h = vnew_smem_P.acquire_and_advance()
                 cute.copy(tiled_r2s_vnew, tRS_rVnew, tRS_sVnew[(None, None, None, vnew_h.index)])
@@ -850,19 +806,25 @@ class ChunkDeltaRuleFwdH:
                     cute.arch.ProxyKind.async_shared,
                     space=cute.arch.SharedSpace.shared_cta,
                 )
-                vnew_h.commit()
+                vnew_h.commit()  # KV MMA starts now!
 
                 # ========================================
-                # Phase 3: KV update → h
+                # Phase 3: gk multiply ONLY (no load/barrier - pure compute behind KV MMA)
+                # ========================================
+                if use_gk:
+                    for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
+                        v_coord, k_coord = tTR_cM_h[ei]
+                        gk_scale = sGK_smem[k_coord]
+                        tTR_rKV[ei] = tTR_rKV[ei] * gk_scale
+
+                # ========================================
+                # Phase 4: KV update → h
                 # ========================================
                 kv_h = kv_done_C.wait_and_advance()
-
-                # T2R: KV acc (update = K^T × v_new) → tTR_rUpdate
                 cute.copy(tiled_t2r_kv, tTR_tKV[(None, None, None, 0)], tTR_rUpdate)
                 cute.arch.fence_view_async_tmem_load()
                 kv_h.release()
 
-                # h_new = h_decayed + update (vectorized in registers)
                 h_vec = tTR_rKV.load()
                 update_vec = tTR_rUpdate.load()
                 tTR_rKV.store(h_vec + update_vec)
@@ -1124,16 +1086,17 @@ def main():
     print(f"  {'PASS' if t1_pass else 'FAIL'}")
     all_pass = all_pass and t1_pass
 
-    # ===== Test 2: With g gating =====
+    # ===== Test 2: With gk + h0 =====
     print("\n" + "="*60)
-    print("Test 2: With g gating")
-    g_val = torch.randn(B, T, H, device="cuda", dtype=torch.float32) * 0.1
-    g_val = -torch.abs(g_val)  # ensure negative (decay)
-    g_val = g_val.cumsum(dim=1)  # cumulative sum
+    print("Test 2: With gk + h0")
+    gk_val = torch.randn(B, T, H, K, device="cuda", dtype=torch.float32) * 0.1
+    gk_val = -torch.abs(gk_val)
+    gk_val = gk_val.cumsum(dim=1)
+    h0_val = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) * 0.01
 
-    compiled_kernel = None  # recompile since use_g changes
-    h_out, v_new, ht = run_kernel(k, w, u, g_val, gk_z, h0_z, 1, 0, 0, 0)
-    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, g=g_val, h0=None, chunk_size=BT)
+    compiled_kernel = None  # recompile since use_gk changes
+    h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_val, h0_val, 0, 1, 1, 0)
+    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, gk=gk_val, h0=h0_val, chunk_size=BT)
 
     max_diff = 0.0
     for t in range(min(NT - 1, len(h_ref_bf16))):
@@ -1205,13 +1168,13 @@ def main():
     print(f"  {'PASS' if t5_pass else 'FAIL'}")
     all_pass = all_pass and t5_pass
 
-    # ===== Test 6: g + gk + h0 + ht (all features) =====
+    # ===== Test 6: gk + h0 + ht (all features) =====
     print("\n" + "="*60)
-    print("Test 6: g + gk + h0 + ht (all features)")
+    print("Test 6: gk + h0 + ht (all features)")
 
     compiled_kernel = None
-    h_out, v_new, ht = run_kernel(k, w, u, g_val, gk_val, h0_val, 1, 1, 1, 1)
-    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, g=g_val, gk=gk_val, h0=h0_val, chunk_size=BT)
+    h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_val, h0_val, 0, 1, 1, 1)
+    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, gk=gk_val, h0=h0_val, chunk_size=BT)
 
     max_diff = 0.0
     for t in range(min(NT - 1, len(h_ref_bf16))):
@@ -1288,13 +1251,13 @@ def main():
     print(f"  {'PASS' if t8_pass else 'FAIL'}")
     all_pass = all_pass and t8_pass
 
-    # ===== Test 9: v_new output (with g gating) =====
+    # ===== Test 9: v_new output (with gk gating) =====
     print("\n" + "="*60)
-    print("Test 9: v_new output (with g gating)")
+    print("Test 9: v_new output (with gk gating)")
 
     compiled_kernel = None  # recompile
-    h_out, v_new, ht = run_kernel(k, w, u, g_val, gk_z, h0_z, 1, 0, 0, 0, do_save_vnew=1)
-    vnew_ref, _ = reference_bf16_roundtrip(k, w, u, g=g_val, h0=None, chunk_size=BT)
+    h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_val, h0_z, 0, 1, 0, 0, do_save_vnew=1)
+    vnew_ref, _ = reference_bf16_roundtrip(k, w, u, gk=gk_val, h0=None, chunk_size=BT)
 
     d_vnew = (v_new.float() - vnew_ref.float()).abs().max().item()
     print(f"  v_new max diff: {d_vnew:.6f}")
@@ -1305,7 +1268,7 @@ def main():
     # ===== Summary =====
     print("\n" + "="*60)
     results = [t1_pass, t2_pass, t3_pass, t4_pass, t5_pass, t6_pass, t7_pass, t8_pass, t9_pass]
-    names = ["No gate", "g gate", "gk gate", "h0 init", "ht store", "All features", "Larger config", "v_new (no g)", "v_new (g)"]
+    names = ["No gate", "gk + h0", "gk gate", "h0 init", "ht store", "All features", "Larger config", "v_new (no gk)", "v_new (gk)"]
     for i, (name, r) in enumerate(zip(names, results)):
         print(f"  Test {i+1} ({name}): {'PASS' if r else 'FAIL'}")
     n_pass = sum(results)

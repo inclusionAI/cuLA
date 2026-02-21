@@ -124,8 +124,8 @@ def main():
         (2, 2048, 64, False, False, False, False, True),
         (4, 2048, 64, False, False, False, False, True),
         (4, 4096, 64, False, False, False, False, True),
-        (4, 4096, 64, True,  False, False, False, True),
-        (4, 4096, 64, True,  False, True,  True,  True),
+        (4, 4096, 64, False, True,  False, False, True),
+        (4, 4096, 64, False, True,  True,  True,  True),
         (8, 2048, 64, False, False, False, False, True),
         (8, 4096, 64, False, False, False, False, True),
     ]
