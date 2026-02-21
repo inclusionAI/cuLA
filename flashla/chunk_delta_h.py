@@ -102,27 +102,31 @@ class ChunkDeltaRuleFwdH:
         self.buffer_align_bytes = 1024
 
     @staticmethod
-    def _plan_tmem_offsets(tiled_mma_wh, tile_wh, tiled_mma_kv, tile_kv, acc_stages):
+    def _plan_tmem_offsets(tiled_mma_wh, tile_wh, tiled_mma_kv, tile_kv, vnew_tmem_layout, acc_stages):
         SM100_TMEM_CAPACITY_COLS = 512
         # WH acc: (BV=64, BT=64) FP32
         wh_shape = tiled_mma_wh.partition_shape_C(tile_wh[:2])
         wh_fake = tiled_mma_wh.make_fragment_C(cute.append(wh_shape, acc_stages))
         num_wh = tcgen05.find_tmem_tensor_col_offset(wh_fake)
+        # v_new TMEM A operand for KV MMA: (BV=64, BT=64) BF16
+        tCrVnew_fake = tiled_mma_kv.make_fragment_A(vnew_tmem_layout.outer.shape)
+        num_vnew = tcgen05.find_tmem_tensor_col_offset(tCrVnew_fake)
         # KV acc: (BV=64, BK=128) FP32
         kv_shape = tiled_mma_kv.partition_shape_C(tile_kv[:2])
         kv_fake = tiled_mma_kv.make_fragment_C(cute.append(kv_shape, 1))
         num_kv = tcgen05.find_tmem_tensor_col_offset(kv_fake)
 
         wh_off = 0
-        kv_off = wh_off + num_wh
+        vnew_off = wh_off + num_wh
+        kv_off = vnew_off + num_vnew
         total_tmp = kv_off + num_kv
         total = 1
         while total < total_tmp:
             total *= 2
         assert total <= SM100_TMEM_CAPACITY_COLS
         if cutlass.const_expr(PRINT_DEBUG):
-            print(f"  TMEM: WH={num_wh}@{wh_off}, KV={num_kv}@{kv_off}, total={total}")
-        return wh_off, kv_off, total
+            print(f"  TMEM: WH={num_wh}@{wh_off}, Vnew={num_vnew}@{vnew_off}, KV={num_kv}@{kv_off}, total={total}")
+        return wh_off, vnew_off, kv_off, total
 
     def _compute_grid(self, B, H, V):
         return ((V + self.BV - 1) // self.BV, H, B)
@@ -200,20 +204,27 @@ class ChunkDeltaRuleFwdH:
             self.wh_mma_tiler[:2],
         )
 
-        # KV MMA: A=v_new^T(SMEM, MN-major), B=K^T(SMEM, MN-major)
+        # KV MMA: A=v_new^T(TMEM, K-major required), B=K^T(SMEM, MN-major)
         kv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.MN,  # A: v_new^T, MN-major (BV contiguous)
+            tcgen05.OperandMajorMode.K,   # A: v_new, K-major (required for TMEM source)
             tcgen05.OperandMajorMode.MN,  # B: K^T, MN-major (BK contiguous)
             self.acc_dtype,
             self.cta_group,
             self.kv_mma_tiler[:2],
+            tcgen05.OperandSource.TMEM,   # A operand from TMEM (zero-copy)
+        )
+
+        # v_new TMEM layout for KV MMA A operand (used for TMEM offset planning)
+        vnew_tmem_layout = sm100_utils.make_smem_layout_a(
+            kv_tiled_mma, self.kv_mma_tiler, self.io_dtype, 1,
         )
 
         # ===================== TMEM offsets =====================
-        (self.tmem_wh_off, self.tmem_kv_off, self.tmem_total) = self._plan_tmem_offsets(
+        (self.tmem_wh_off, self.tmem_vnew_off, self.tmem_kv_off, self.tmem_total) = self._plan_tmem_offsets(
             wh_tiled_mma, self.wh_mma_tiler,
             kv_tiled_mma, self.kv_mma_tiler,
+            vnew_tmem_layout,
             self.acc_stage,
         )
 
@@ -241,18 +252,7 @@ class ChunkDeltaRuleFwdH:
             (self.BV, self.BK),  # (64, 128)
             1,
         )
-        # v_new^T as A operand of KV MMA — MMA read view
-        vnew_mma_staged = sm100_utils.make_smem_layout_a(
-            kv_tiled_mma, self.kv_mma_tiler, self.io_dtype, 1,
-        )
-        # v_new epilogue for CUDA R2S writes — dual-view of same buffer
-        # COL_MAJOR for (BV, BT): BV contiguous → MN-major for KV A operand
-        vnew_epi_staged = sm100_utils.make_smem_layout_epi(
-            self.io_dtype,
-            utils.LayoutEnum.COL_MAJOR,
-            (self.BV, self.BT),  # (64, 64)
-            1,
-        )
+        # v_new A operand now from TMEM (no SMEM layout needed for MMA path)
         # h_out epilogue for TMA store
         # COL_MAJOR for (BV, BK): BV contiguous → matches V stride 1 in h_out_T GMEM
         h_out_epi_staged = sm100_utils.make_smem_layout_epi(
@@ -356,10 +356,7 @@ class ChunkDeltaRuleFwdH:
                 cute.struct.MemRange[self.io_dtype, max(cute.cosize(state_mma_staged), cute.cosize(state_epi_staged))],
                 self.buffer_align_bytes,
             ]
-            sVnew: cute.struct.Align[
-                cute.struct.MemRange[self.io_dtype, max(cute.cosize(vnew_mma_staged), cute.cosize(vnew_epi_staged))],
-                self.buffer_align_bytes,
-            ]
+            # sVnew removed: v_new now goes through TMEM, not SMEM
             sH_epi: cute.struct.Align[
                 cute.struct.MemRange[self.io_dtype, cute.cosize(h_out_epi_staged)],
                 self.buffer_align_bytes,
@@ -392,7 +389,7 @@ class ChunkDeltaRuleFwdH:
             h0, u, u_T, h_out_T, v_new,
             w_smem_staged, kt_smem_staged,
             state_mma_staged, state_epi_staged,
-            vnew_mma_staged, vnew_epi_staged,
+            vnew_tmem_layout,
             h_out_epi_staged,
             u_epi_staged, vnew_store_epi_staged,
             problem_size,
@@ -433,8 +430,7 @@ class ChunkDeltaRuleFwdH:
         kt_smem_staged: cute.ComposedLayout,
         state_mma_staged: cute.ComposedLayout,
         state_epi_staged: cute.ComposedLayout,
-        vnew_mma_staged: cute.ComposedLayout,
-        vnew_epi_staged: cute.ComposedLayout,
+        vnew_tmem_layout: cute.ComposedLayout,
         h_out_epi_staged: cute.ComposedLayout,
         u_epi_staged: cute.ComposedLayout,
         vnew_store_epi_staged: cute.ComposedLayout,
@@ -561,8 +557,6 @@ class ChunkDeltaRuleFwdH:
         sKt = storage.sKt.get_tensor(kt_smem_staged.outer, swizzle=kt_smem_staged.inner)
         sState_mma = storage.sState.get_tensor(state_mma_staged.outer, swizzle=state_mma_staged.inner)
         sState_epi = storage.sState.get_tensor(state_epi_staged.outer, swizzle=state_epi_staged.inner)
-        sVnew_mma = storage.sVnew.get_tensor(vnew_mma_staged.outer, swizzle=vnew_mma_staged.inner)
-        sVnew_epi = storage.sVnew.get_tensor(vnew_epi_staged.outer, swizzle=vnew_epi_staged.inner)
         sH_epi = storage.sH_epi.get_tensor(h_out_epi_staged.outer, swizzle=h_out_epi_staged.inner)
         sU_epi = storage.sU.get_tensor(u_epi_staged.outer, swizzle=u_epi_staged.inner)
         sVnew_store_epi = storage.sVnew_store.get_tensor(
@@ -577,8 +571,13 @@ class ChunkDeltaRuleFwdH:
         tCtAccWH_fake = wh_tiled_mma.make_fragment_C(cute.append(wh_shape, self.acc_stage))
         tCtAccWH = cute.make_tensor(tmem_ptr + self.tmem_wh_off, tCtAccWH_fake.layout)
 
-        # KV MMA: A=sVnew, B=sKt, acc=KV TMEM
-        tCrVnew = kv_tiled_mma.make_fragment_A(sVnew_mma)
+        # KV MMA: A=v_new(TMEM), B=sKt, acc=KV TMEM
+        # Create v_new TMEM A fragment (Mamba2-style: get layout from fake, bind TMEM ptr)
+        tCrVnew_fake = kv_tiled_mma.make_fragment_A(vnew_tmem_layout.outer.shape)
+        tCrVnew = cute.make_tensor(
+            cute.recast_ptr(tmem_ptr + self.tmem_vnew_off, dtype=tCrVnew_fake.element_type),
+            tCrVnew_fake.layout,
+        )
         tCrKt = kv_tiled_mma.make_fragment_B(sKt)
         kv_shape = kv_tiled_mma.partition_shape_C(self.kv_mma_tiler[:2])
         tCtAccKV_fake = kv_tiled_mma.make_fragment_C(cute.append(kv_shape, 1))
@@ -662,7 +661,7 @@ class ChunkDeltaRuleFwdH:
                 w_h.release()
                 state_h.release()
 
-                # --- KV MMA: v_new(SMEM) × K^T(SMEM) → update (ACCUMULATE=False always) ---
+                # --- KV MMA: v_new(TMEM) × K^T(SMEM) → update (ACCUMULATE=False always) ---
                 vnew_h = vnew_smem_C.wait_and_advance()
                 kt_h = load_kt_C.wait_and_advance()
 
@@ -738,21 +737,30 @@ class ChunkDeltaRuleFwdH:
             thr_r2s_h = tiled_r2s_h.get_slice(local_tidx)
             tRS_sH = thr_r2s_h.partition_D(sH_epi)
 
-            # ----- R2S: WH T2R regs → sVnew_epi (COL_MAJOR, BV×BT) -----
+            # ----- R2S: WH T2R regs → sVnew_store_epi (COL_MAJOR, BV×BT) for TMA store -----
             r2s_atom_vnew = sm100_utils.get_smem_store_op(
                 utils.LayoutEnum.COL_MAJOR, self.io_dtype, self.acc_dtype, tiled_t2r_wh,
             )
             tiled_r2s_vnew = cute.make_tiled_copy_D(r2s_atom_vnew, tiled_t2r_wh)
             thr_r2s_vnew = tiled_r2s_vnew.get_slice(local_tidx)
-            tRS_sVnew = thr_r2s_vnew.partition_D(sVnew_epi)
+            tRS_sVnew_store = thr_r2s_vnew.partition_D(sVnew_store_epi)
+
+            # ----- R2T: v_new regs → TMEM for KV MMA A operand -----
+            copy_atom_r2t_vnew = cute.make_copy_atom(
+                tcgen05.St16x128bOp(tcgen05.Repetition(8), tcgen05.Unpack.NONE),
+                self.io_dtype,
+            )
+            tiled_r2t_vnew = tcgen05.make_tmem_copy(copy_atom_r2t_vnew, tCrVnew)
+            thr_r2t_vnew = tiled_r2t_vnew.get_slice(local_tidx)
+            tRT_rVnew = cute.make_rmem_tensor(
+                cute.slice_(thr_r2t_vnew.partition_S(tCrVnew).shape, (None, None, None, None, 0)),
+                self.io_dtype,
+            )
+            tRT_tVnew = thr_r2t_vnew.partition_D(tCrVnew)
 
             # ----- BF16 register tensors -----
             tTR_rKV_bf16 = cute.make_rmem_tensor(tTR_rKV.shape, self.io_dtype)
             tTR_rVnew_bf16 = cute.make_rmem_tensor(tTR_rWH.shape, self.io_dtype)
-
-            # ----- R2S: WH T2R regs → sVnew_store_epi (COL_MAJOR, BV×BT) for TMA store -----
-            thr_r2s_vnew_st = tiled_r2s_vnew.get_slice(local_tidx)
-            tRS_sVnew_store = thr_r2s_vnew_st.partition_D(sVnew_store_epi)
 
             # ----- Identity tensor for WH tile (BV, BT) → v_new coords -----
             vnew_tile = cute.dice(self.wh_mma_tiler, (1, 1, None))  # (BV, BT)
@@ -835,14 +843,11 @@ class ChunkDeltaRuleFwdH:
                     )
                     vnew_st_h.commit()
 
-                # R2S v_new → sVnew (triggers KV MMA)
-                tRS_rVnew = tiled_r2s_vnew.retile(tTR_rVnew_bf16)
+                # R2T v_new → TMEM (triggers KV MMA — zero-copy A operand)
+                tRT_rVnew.store(tTR_rWH.load().to(self.io_dtype))
                 vnew_h = vnew_smem_P.acquire_and_advance()
-                cute.copy(tiled_r2s_vnew, tRS_rVnew, tRS_sVnew[(None, None, None, vnew_h.index)])
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
+                cute.copy(tiled_r2t_vnew, tRT_rVnew, tRT_tVnew[(None, None, None, None, 0)])
+                cute.arch.fence_view_async_tmem_store()
                 vnew_h.commit()  # KV MMA starts now!
 
                 # ========================================
