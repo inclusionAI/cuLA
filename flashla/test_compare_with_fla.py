@@ -216,7 +216,7 @@ def compare_with_fla(
     # Create output tensors for our kernel
     h_out = torch.zeros(B, NT, H, K, V, device="cuda", dtype=torch.bfloat16)
     v_new_out = torch.zeros(B, T, H, V, device="cuda", dtype=torch.bfloat16)
-    ht_out = torch.zeros(B, H, K, V, device="cuda", dtype=torch.float32)
+    ht_out = torch.zeros(B, H, K, V, device="cuda", dtype=torch.bfloat16)
     
     # Gates in our format
     g_ours = g if g is not None else torch.zeros(B, T, H, device="cuda", dtype=torch.float32)
@@ -283,52 +283,62 @@ def compare_with_fla(
         print(f"  v_new vs full-gate ref: {v_new_diff_full:.6f}")
     
     # Compare h (per-chunk states)
-    # Note: FLA stores h BEFORE chunk update, we store AFTER
-    # So FLA h_out[t] = state at START of chunk t (before update)
-    #    Our h_out[t] = state at END of chunk t (after update)
-    # Therefore: FLA h_out[t+1] ≈ Our h_out[t]
+    # Both FLA and our kernel store h BEFORE chunk update:
+    #   FLA h_out[t] = state at START of chunk t (before update)
+    #   Our h_out[t] = state at START of chunk t (before update)
+    # So they should match directly: Our h_out[t] ≈ FLA h_out[t]
     
-    # Use vnew-only reference for h comparison (matches kernel behavior)
-    h_fla = h_fla_vnew
-    ht_fla = ht_fla_vnew
-    
-    # Offset comparison: FLA h_out[t+1] vs Our h_out[t]
-    print(f"\n  Semantic offset check: FLA h_out[t+1] vs Our h_out[t] (vnew-only ref)")
-    offset_diffs = []
-    for t in range(NT - 1):  # Can't compare last chunk this way
-        diff = (h_out[:, t].float() - h_fla[:, t+1].float()).abs().max().item()
-        offset_diffs.append(diff)
-        print(f"    Chunk {t} (our) vs Chunk {t+1} (FLA): {diff:.6f}")
-    
-    if offset_diffs:
-        h_offset_diff = max(offset_diffs)
-        print(f"  h (offset semantic) max diff: {h_offset_diff:.6f}")
+    # Use full-gate reference when gk is enabled (kernel applies gk to h),
+    # otherwise use vnew-only reference
+    if use_gk:
+        h_fla = h_fla_full
+        ht_fla = ht_fla_full
+        v_new_ref = v_new_fla_full
+        v_new_diff = (v_new_out.float() - v_new_fla_full.float()).abs().max().item()
+        ref_label = "full-gate"
     else:
-        h_offset_diff = 0.0
+        h_fla = h_fla_vnew
+        ht_fla = ht_fla_vnew
+        v_new_ref = v_new_fla_vnew
+        v_new_diff = v_new_diff_vnew
+        ref_label = "vnew-only"
     
-    # Compare final state
-    # Our h_out[NT-1] = state after last chunk update
-    h_last_vs_ht_fla = (h_out[:, NT-1].float() - ht_fla.float()).abs().max().item()
-    print(f"\n  Our h_out[{NT-1}] vs FLA ht (vnew ref): {h_last_vs_ht_fla:.6f}")
+    # Direct comparison: Our h_out[t] vs FLA h_out[t]
+    print(f"\n  Direct h_out comparison (vs {ref_label} ref):")
+    h_diffs = []
+    for t in range(NT):
+        diff = (h_out[:, t].float() - h_fla[:, t].float()).abs().max().item()
+        h_diffs.append(diff)
+        print(f"    Chunk {t}: {diff:.6f}")
+    
+    if h_diffs:
+        h_max_diff = max(h_diffs)
+        print(f"  h max diff: {h_max_diff:.6f}")
+    else:
+        h_max_diff = 0.0
+    
+    # Compare final state: our ht vs FLA ht (state after all chunks)
+    ht_diff = (ht_out.float() - ht_fla.float()).abs().max().item()
+    print(f"\n  Our ht vs FLA ht ({ref_label} ref): {ht_diff:.6f}")
     
     # Per-chunk v_new breakdown
-    print(f"\n  Per-chunk v_new diff (vs vnew-only ref):")
+    print(f"\n  Per-chunk v_new diff (vs {ref_label} ref):")
     for t in range(NT):
         start = t * BT
         end = min((t + 1) * BT, T)
-        chunk_diff = (v_new_out[:, start:end].float() - v_new_fla_vnew[:, start:end].float()).abs().max().item()
+        chunk_diff = (v_new_out[:, start:end].float() - v_new_ref[:, start:end].float()).abs().max().item()
         print(f"    Chunk {t}: {chunk_diff:.6f}")
     
-    # Tolerance check - use vnew-only reference
+    # Tolerance check
     tolerance = 0.01  # bf16 tolerance
-    passed = v_new_diff_vnew < tolerance and h_offset_diff < tolerance
+    passed = v_new_diff < tolerance and h_max_diff < tolerance
     
     if passed:
-        print(f"\n✅ PASS - v_new and h match vnew-only ref within tolerance ({tolerance})")
+        print(f"\n✅ PASS - v_new and h match {ref_label} ref within tolerance ({tolerance})")
     else:
         print(f"\n❌ FAIL - Outputs exceed tolerance ({tolerance})")
-        print(f"  v_new diff (vs vnew-only ref): {v_new_diff_vnew:.6f} {'✓' if v_new_diff_vnew < tolerance else '✗'}")
-        print(f"  h diff (offset): {h_offset_diff:.6f} {'✓' if h_offset_diff < tolerance else '✗'}")
+        print(f"  v_new diff (vs {ref_label} ref): {v_new_diff:.6f} {'✓' if v_new_diff < tolerance else '✗'}")
+        print(f"  h diff: {h_max_diff:.6f} {'✓' if h_max_diff < tolerance else '✗'}")
     
     return passed
 
@@ -355,11 +365,11 @@ def main():
             (128, False, False, False),  # Basic 2 chunks
             (192, False, False, False),  # Basic 3 chunks
             (256, False, False, False),  # Basic 4 chunks
-            (128, True, False, False),   # With g gate
-            (192, True, False, False),   # With g gate, 3 chunks
+            (128, False, True, False),   # With gk gate
+            (192, False, True, False),   # With gk gate, 3 chunks
             (128, False, False, True),   # With initial state
             (192, False, False, True),   # With initial state, 3 chunks
-            (128, True, False, True),    # With g and h0
+            (128, False, True, True),    # With gk and h0
         ]
         
         results = []
