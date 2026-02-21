@@ -363,6 +363,10 @@ class ChunkDeltaRuleFwdH:
                 cute.struct.MemRange[self.io_dtype, cute.cosize(vnew_store_epi_staged)],
                 self.buffer_align_bytes,
             ]
+            sGK: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.BK * 2],
+                128,
+            ]
 
         self.shared_storage = SharedStorage
         self.grid = self._compute_grid(B, H, V)
@@ -439,9 +443,7 @@ class ChunkDeltaRuleFwdH:
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
-        # Allocate gk SMEM separately (Float32 fields in struct cause DSL issues)
-        sGK_smem = smem.allocate_tensor(cutlass.Float32, cute.make_layout(self.BK),
-                                        byte_alignment=128)
+        sGK_smem = storage.sGK.get_tensor(cute.make_layout((self.BK, 2)))
 
         # ===================== Pipelines =====================
         load_w_P, load_w_C = pipeline.PipelineTmaUmma.create(
@@ -734,11 +736,21 @@ class ChunkDeltaRuleFwdH:
                     tTR_rKV[ei] = Float32(0.0)
 
             # ===== Main loop (gk-only optimized pipeline) =====
-            # Pipeline: Phase1(R2S)→WH MMA→Phase2(v_new)→KV MMA→Phase3(gk decay)→Phase4(h update)
-            # Pipeline: gk LOAD in Phase 1 (behind WH MMA), gk MULTIPLY in Phase 3 (behind KV MMA)
+            # Pipeline: Phase1(R2S)→WH MMA→Phase2(v_new)→KV MMA→Phase3(gk decay+prefetch)→Phase4(h update)
+            # gk double-buffered: prefetch gk[N+1] in Phase 3 of chunk N, use in Phase 3 of chunk N+1
+
+            # Prefetch gk[0] into stage 0 before main loop
+            gk_stage = Int32(0)
+            if use_gk:
+                if local_tidx < self.BK:
+                    gk_raw = gk[(self.BT - 1,
+                                 local_tidx, (hidx, bidx))]
+                    sGK_smem[(local_tidx, 0)] = cute.exp2(gk_raw * INV_LN2)
+                self.g_gk_load_bar.arrive_and_wait()
+
             for chunk_idx in cutlass.range(0, NT, unroll=0):
                 # ========================================
-                # Phase 1: Publish h for WH MMA + h_out store + gk preload
+                # Phase 1: Publish h for WH MMA + h_out store (NO gk load!)
                 # ========================================
                 h_vec = tTR_rKV.load()
                 tTR_rKV_bf16.store(h_vec.to(self.io_dtype))
@@ -762,15 +774,6 @@ class ChunkDeltaRuleFwdH:
                     space=cute.arch.SharedSpace.shared_cta,
                 )
                 h_handle.commit()
-
-                # Preload gk into SMEM (hidden behind WH MMA!)
-                if use_gk:
-                    g_off = chunk_idx * self.BT
-                    if local_tidx < self.BK:
-                        gk_raw = gk[(g_off + self.BT - 1,
-                                     local_tidx, (hidx, bidx))]
-                        sGK_smem[local_tidx] = cute.exp2(gk_raw * INV_LN2)
-                    self.g_gk_load_bar.arrive_and_wait()
 
                 # ========================================
                 # Phase 2: v_new from WH result → triggers KV MMA
@@ -812,13 +815,26 @@ class ChunkDeltaRuleFwdH:
                 vnew_h.commit()  # KV MMA starts now!
 
                 # ========================================
-                # Phase 3: gk multiply ONLY (no load/barrier - pure compute behind KV MMA)
+                # Phase 3: gk multiply (current stage) + prefetch next chunk (other stage)
+                # Both hidden behind KV MMA!
                 # ========================================
                 if use_gk:
+                    # Multiply h by gk_scale from current stage
                     for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
                         v_coord, k_coord = tTR_cM_h[ei]
-                        gk_scale = sGK_smem[k_coord]
+                        gk_scale = sGK_smem[(k_coord, gk_stage)]
                         tTR_rKV[ei] = tTR_rKV[ei] * gk_scale
+
+                    # Prefetch gk[chunk_idx+1] into OTHER stage
+                    next_stage = Int32(1) - gk_stage
+                    if chunk_idx < NT - 1:
+                        g_off_next = (chunk_idx + 1) * self.BT
+                        if local_tidx < self.BK:
+                            gk_raw = gk[(g_off_next + self.BT - 1,
+                                         local_tidx, (hidx, bidx))]
+                            sGK_smem[(local_tidx, next_stage)] = cute.exp2(gk_raw * INV_LN2)
+                        self.g_gk_load_bar.arrive_and_wait()
+                    gk_stage = next_stage
 
                 # ========================================
                 # Phase 4: KV update → h
