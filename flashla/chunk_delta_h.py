@@ -99,7 +99,7 @@ class ChunkDeltaRuleFwdH:
         self.tmem_dealloc_sync_barrier = pipeline.NamedBarrier(
             barrier_id=2, num_threads=self.threads_per_cta,
         )
-        self.buffer_align_bytes = 1024
+        self.buffer_align_bytes = 128
 
     @staticmethod
     def _plan_tmem_offsets(tiled_mma_wh, tile_wh, tiled_mma_kv, tile_kv, state_tmem_layout, vnew_tmem_layout, acc_stages):
