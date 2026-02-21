@@ -828,7 +828,14 @@ class ChunkDeltaRuleFwdH:
                 u_handle.release()
                 tTR_rVnew_bf16.store(tTR_rWH.load().to(self.io_dtype))
 
-                # Save v_new to SMEM for TMA store
+                # R2T v_new → TMEM FIRST (triggers KV MMA — zero-copy A operand)
+                tRT_rVnew.store(tTR_rWH.load().to(self.io_dtype))
+                vnew_h = vnew_smem_P.acquire_and_advance()
+                cute.copy(tiled_r2t_vnew, tRT_rVnew, tRT_tVnew[(None, None, None, None, 0)])
+                cute.arch.fence_view_async_tmem_store()
+                vnew_h.commit()  # KV MMA starts now!
+
+                # Save v_new to SMEM for TMA store (overlaps with KV MMA)
                 if save_v_new:
                     tRS_rVnew_st = tiled_r2s_vnew.retile(tTR_rVnew_bf16)
                     vnew_st_h = vnew_store_P.acquire_and_advance()
@@ -839,13 +846,6 @@ class ChunkDeltaRuleFwdH:
                         space=cute.arch.SharedSpace.shared_cta,
                     )
                     vnew_st_h.commit()
-
-                # R2T v_new → TMEM (triggers KV MMA — zero-copy A operand)
-                tRT_rVnew.store(tTR_rWH.load().to(self.io_dtype))
-                vnew_h = vnew_smem_P.acquire_and_advance()
-                cute.copy(tiled_r2t_vnew, tRT_rVnew, tRT_tVnew[(None, None, None, None, 0)])
-                cute.arch.fence_view_async_tmem_store()
-                vnew_h.commit()  # KV MMA starts now!
 
                 # ========================================
                 # Phase 3: gk decay (TMA-loaded, hidden behind KV MMA!)
