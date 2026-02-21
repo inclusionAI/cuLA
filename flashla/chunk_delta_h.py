@@ -85,8 +85,11 @@ class ChunkDeltaRuleFwdH:
         # KV MMA tiler: (M=BV=64, N=BK=128, K=BT=64), A & B both SS
         self.kv_mma_tiler = (self.BV, self.BK, self.BT)
 
-        self.k_stage = 1
-        self.w_stage = 1
+        self.k_stage = 2
+        self.w_stage = 2
+        self.u_stage = 2
+        self.h_out_stage = 2
+        self.vnew_store_stage = 2
         self.acc_stage = 1
         self.cluster_shape_mnk = (1, 1, 1)
         self.cta_group = tcgen05.CtaGroup.ONE
@@ -255,21 +258,21 @@ class ChunkDeltaRuleFwdH:
             self.io_dtype,
             utils.LayoutEnum.COL_MAJOR,
             (self.BV, self.BK),  # (64, 128)
-            1,
+            self.h_out_stage,
         )
         # U SMEM for TMA load — COL_MAJOR (BV, BT), BV contiguous matches u_T GMEM
         u_epi_staged = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
             utils.LayoutEnum.COL_MAJOR,
             (self.BV, self.BT),  # (64, 64)
-            1,
+            self.u_stage,
         )
         # v_new store SMEM — COL_MAJOR (BV, BT) for TMA S2G
         vnew_store_epi_staged = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
             utils.LayoutEnum.COL_MAJOR,
             (self.BV, self.BT),  # (64, 64)
-            1,
+            self.vnew_store_stage,
         )
 
         cluster_layout = cute.tiled_divide(
@@ -324,13 +327,13 @@ class ChunkDeltaRuleFwdH:
         class SharedStorage:
             load_w_mbar: cute.struct.MemRange[Int64, self.w_stage * 2]
             load_kt_mbar: cute.struct.MemRange[Int64, self.k_stage * 2]
-            load_u_mbar: cute.struct.MemRange[Int64, 1 * 2]           # Load→CUDA: sU ready
+            load_u_mbar: cute.struct.MemRange[Int64, self.u_stage * 2]         # Load→CUDA: sU ready
             state_smem_mbar: cute.struct.MemRange[Int64, 1 * 2]       # CUDA→MMA: sState ready
             wh_done_mbar: cute.struct.MemRange[Int64, self.acc_stage * 2]  # MMA→CUDA: WH done
             vnew_smem_mbar: cute.struct.MemRange[Int64, 1 * 2]        # CUDA→MMA: sVnew ready
             kv_done_mbar: cute.struct.MemRange[Int64, 1 * 2]          # MMA→CUDA: KV done
-            h_out_mbar: cute.struct.MemRange[Int64, 1 * 2]            # CUDA→Store: sH_epi ready
-            vnew_store_mbar: cute.struct.MemRange[Int64, 1 * 2]       # CUDA→Store: sVnew_store ready
+            h_out_mbar: cute.struct.MemRange[Int64, self.h_out_stage * 2]  # CUDA→Store: sH_epi ready
+            vnew_store_mbar: cute.struct.MemRange[Int64, self.vnew_store_stage * 2]  # CUDA→Store: sVnew_store ready
             tmem_holding_buf: Int32
             sW: cute.struct.Align[
                 cute.struct.MemRange[self.io_dtype, cute.cosize(w_smem_staged)],
@@ -490,7 +493,7 @@ class ChunkDeltaRuleFwdH:
         ).make_participants()
 
         h_out_P, h_out_C = pipeline.PipelineAsync.create(
-            num_stages=1,
+            num_stages=self.h_out_stage,
             producer_group=make_thread_cooperative_group(
                 self.threads_per_warp * len(self.cuda_warp_ids)),
             consumer_group=make_thread_cooperative_group(self.threads_per_warp),
@@ -498,7 +501,7 @@ class ChunkDeltaRuleFwdH:
         ).make_participants()
 
         load_u_P, load_u_C = pipeline.PipelineTmaAsync.create(
-            num_stages=1,
+            num_stages=self.u_stage,
             producer_group=make_thread_cooperative_group(
                 len([self.load_warp_id])),
             consumer_group=make_thread_cooperative_group(
@@ -508,7 +511,7 @@ class ChunkDeltaRuleFwdH:
         ).make_participants()
 
         vnew_store_P, vnew_store_C = pipeline.PipelineAsync.create(
-            num_stages=1,
+            num_stages=self.vnew_store_stage,
             producer_group=make_thread_cooperative_group(
                 self.threads_per_warp * len(self.cuda_warp_ids)),
             consumer_group=make_thread_cooperative_group(self.threads_per_warp),
