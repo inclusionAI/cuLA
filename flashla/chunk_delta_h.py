@@ -784,8 +784,8 @@ class ChunkDeltaRuleFwdH:
                     tTR_rKV[ei] = Float32(0.0)
 
             # ===== Main loop (gk-only optimized pipeline) =====
-            # Pipeline: Phase1(R2S)→WH MMA→Phase2(v_new)→KV MMA→Phase3(gk TMA wait+decay)→Phase4(h update)
-            # gk loaded by Load warp via TMA, double-buffered with PipelineTmaAsync
+            # Pipeline: Phase1(R2T+R2S+gk_decay)→WH MMA→Phase2(v_new)→KV MMA→Phase4(h update)
+            # gk decay moved to Phase1 to overlap with longer WH MMA (K=128) window
 
             for chunk_idx in cutlass.range(0, NT, unroll=0):
                 # ========================================
@@ -811,6 +811,17 @@ class ChunkDeltaRuleFwdH:
                 )
                 h_handle.commit()
 
+                # gk decay: h *= gk (overlaps with WH MMA — longer K=128 window!)
+                # Safe: R2T/R2S already captured pre-decay h; registers free until Phase 4
+                if use_gk:
+                    gk_h = load_gk_C.wait_and_advance()
+                    for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
+                        v_coord, k_coord = tTR_cM_h[ei]
+                        gk_raw = sGK_smem[(k_coord, gk_h.index)]
+                        gk_scale = cute.exp2(gk_raw * INV_LN2)
+                        tTR_rKV[ei] = tTR_rKV[ei] * gk_scale
+                    gk_h.release()
+
                 # ========================================
                 # Phase 2: v_new from WH result → triggers KV MMA
                 # ========================================
@@ -826,6 +837,8 @@ class ChunkDeltaRuleFwdH:
                     u_val = sU_epi[(v_coord, t_coord, u_handle.index)].to(self.acc_dtype)
                     tTR_rWH[ei] = u_val - tTR_rWH[ei]
                 u_handle.release()
+
+                # Prepare bf16 v_new for both R2T and R2S
                 tTR_rVnew_bf16.store(tTR_rWH.load().to(self.io_dtype))
 
                 # R2T v_new → TMEM FIRST (triggers KV MMA — zero-copy A operand)
@@ -846,18 +859,6 @@ class ChunkDeltaRuleFwdH:
                         space=cute.arch.SharedSpace.shared_cta,
                     )
                     vnew_st_h.commit()
-
-                # ========================================
-                # Phase 3: gk decay (TMA-loaded, hidden behind KV MMA!)
-                # ========================================
-                if use_gk:
-                    gk_h = load_gk_C.wait_and_advance()
-                    for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
-                        v_coord, k_coord = tTR_cM_h[ei]
-                        gk_raw = sGK_smem[(k_coord, gk_h.index)]
-                        gk_scale = cute.exp2(gk_raw * INV_LN2)
-                        tTR_rKV[ei] = tTR_rKV[ei] * gk_scale
-                    gk_h.release()
 
                 # ========================================
                 # Phase 4: KV update → h
