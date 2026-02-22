@@ -92,14 +92,16 @@ def run_benchmark(B, T, H, K, V, BT, use_g, use_gk, use_h0, store_ht, save_vnew)
     hc, vnc, htc = from_dlpack(h_out), from_dlpack(v_new_out), from_dlpack(ht_out)
     cu_seqlens_d = torch.zeros(2, dtype=torch.int32, device=device)
     chunk_offsets_d = torch.zeros(2, dtype=torch.int32, device=device)
+    workspace_d = torch.zeros(128, dtype=torch.uint8, device=device)
     csd = from_dlpack(cu_seqlens_d)
     cod = from_dlpack(chunk_offsets_d)
+    wsd = from_dlpack(workspace_d)
 
     args = (
         kc.iterator, wc.iterator, uc.iterator,
         gc.iterator, gkc.iterator,
         hc.iterator, vnc.iterator, h0c.iterator, htc.iterator,
-        csd.iterator, cod.iterator,
+        csd.iterator, cod.iterator, wsd.iterator,
         (B, T, H, K, V), NT,
         int(use_g), int(use_gk), int(use_h0), int(store_ht), int(save_vnew),
         stream,

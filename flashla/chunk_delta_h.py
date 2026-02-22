@@ -68,6 +68,11 @@ class ChunkDeltaRuleFwdH:
         self.io_dtype = io_dtype
         self.is_varlen = is_varlen
 
+        if is_varlen:
+            self._tensormap_mgr = utils.TensorMapManager(
+                utils.TensorMapUpdateMode.GMEM, 128
+            )
+
         self.BT = chunk_size   # 64
         self.BK = head_dim_k   # 128
         self.BV = 64           # V tiling
@@ -151,6 +156,7 @@ class ChunkDeltaRuleFwdH:
         ht_ptr: cute.Pointer,
         cu_seqlens_ptr: cute.Pointer,
         chunk_offsets_ptr: cute.Pointer,
+        workspace_ptr: cute.Pointer,
         problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],
         total_nt: Int32,
         use_g: Int32,
@@ -411,6 +417,7 @@ class ChunkDeltaRuleFwdH:
             h_out_epi_staged,
             u_epi_staged, vnew_store_epi_staged,
             cu_seqlens, chunk_offsets,
+            workspace_ptr,
             problem_size,
             use_gk, use_initial_state, store_final_state, save_v_new,
         ).launch(
@@ -454,6 +461,7 @@ class ChunkDeltaRuleFwdH:
         vnew_store_epi_staged: cute.ComposedLayout,
         cu_seqlens: cute.Tensor,
         chunk_offsets: cute.Tensor,
+        workspace_iter: cute.Pointer,
         problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],
         use_gk: Int32,
         use_initial_state: Int32,
@@ -678,7 +686,12 @@ class ChunkDeltaRuleFwdH:
 
                 # TMA load gk for this chunk (BK Float32 values)
                 if use_gk:
+                    # For tail chunk in varlen, use last valid position
                     gk_t_idx = chunk_idx * self.BT + self.BT - 1
+                    if cutlass.const_expr(self.is_varlen):
+                        remaining = seq_len - chunk_idx * self.BT
+                        if remaining < self.BT:
+                            gk_t_idx = seq_len - 1
                     gk_h = load_gk_P.acquire_and_advance()
                     cute.copy(atom=tma_atom_gk,
                               src=bSG_gGK[(None, 0, gk_t_idx)],
@@ -890,6 +903,15 @@ class ChunkDeltaRuleFwdH:
                     tTR_rWH[ei] = u_val - tTR_rWH[ei]
                 u_handle.release()
 
+                # Zero v_new for positions beyond sequence boundary (varlen tail chunk)
+                if cutlass.const_expr(self.is_varlen):
+                    valid_len_chunk = seq_len - chunk_idx * self.BT
+                    if valid_len_chunk < self.BT:
+                        for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
+                            v_coord, t_coord = tTR_cM[ei]
+                            if t_coord >= valid_len_chunk:
+                                tTR_rWH[ei] = Float32(0.0)
+
                 # Prepare bf16 v_new for both R2T and R2S
                 tTR_rVnew_bf16.store(tTR_rWH.load().to(self.io_dtype))
 
@@ -974,6 +996,28 @@ class ChunkDeltaRuleFwdH:
                 tma_atom_vnew_st, gVnew_st, (self.BV, self.BT), sVnew_store_epi,
             )
 
+            # Varlen tail tile handling: prepare modified TMA descriptor for v_new store
+            # For the last chunk of a non-last sequence that isn't chunk-aligned,
+            # TMA store would write past the sequence boundary. We prevent this by
+            # modifying the TMA descriptor to truncate the T dimension.
+            if cutlass.const_expr(self.is_varlen):
+                ws_desc_ptr = self._tensormap_mgr.get_tensormap_ptr(
+                    (workspace_iter + bidx * 128).align(128)
+                )
+                need_tail_fixup = (seq_len % self.BT != 0) & (bidx < B - 1)
+                if need_tail_fixup:
+                    new_T = tok_offset + seq_len
+                    vnew_tail = cute.make_tensor(
+                        v_new_tensor.iterator,
+                        cute.make_layout(
+                            (V, new_T, (H, Int32(1))),
+                            stride=(Int32(1), H * V, (V, T * H * V)),
+                        ),
+                    )
+                    cpasync.copy_tensormap(tma_atom_vnew_st, ws_desc_ptr)
+                    cpasync.update_tma_descriptor(tma_atom_vnew_st, vnew_tail, ws_desc_ptr)
+                    cpasync.fence_tma_desc_release()
+
             for chunk_idx in cutlass.range(0, NT, unroll=0):
                 h_handle = h_out_C.wait_and_advance()
 
@@ -984,12 +1028,27 @@ class ChunkDeltaRuleFwdH:
 
                 h_handle.release()
 
-                # v_new TMA store
+                # v_new TMA store (with tail tile protection for varlen)
                 if save_v_new:
                     vnew_handle = vnew_store_C.wait_and_advance()
-                    cute.copy(tma_vnew_st,
-                              bSG_sVnew_st[None, vnew_handle.index],
-                              bSG_gVnew_st[(None, v_tile_idx, chunk_idx)])
+                    if cutlass.const_expr(self.is_varlen):
+                        remaining = seq_len - chunk_idx * self.BT
+                        is_tail = (remaining < self.BT) & (bidx < B - 1)
+                        if is_tail:
+                            cpasync.fence_tma_desc_acquire(ws_desc_ptr)
+                            cute.copy(tma_vnew_st,
+                                      bSG_sVnew_st[None, vnew_handle.index],
+                                      bSG_gVnew_st[(None, v_tile_idx, chunk_idx)],
+                                      tma_desc_ptr=self._tensormap_mgr.get_tensormap_ptr(
+                                          ws_desc_ptr, cute.AddressSpace.generic))
+                        else:
+                            cute.copy(tma_vnew_st,
+                                      bSG_sVnew_st[None, vnew_handle.index],
+                                      bSG_gVnew_st[(None, v_tile_idx, chunk_idx)])
+                    else:
+                        cute.copy(tma_vnew_st,
+                                  bSG_sVnew_st[None, vnew_handle.index],
+                                  bSG_gVnew_st[(None, v_tile_idx, chunk_idx)])
                     cute.arch.cp_async_bulk_commit_group()
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
                     vnew_handle.release()
@@ -1141,11 +1200,13 @@ def main():
 
     compiled_kernel = None
 
-    # Dummy cu_seqlens/chunk_offsets for non-varlen mode
+    # Dummy cu_seqlens/chunk_offsets/workspace for non-varlen mode
     cu_seqlens_dummy = torch.zeros(2, dtype=torch.int32, device="cuda")
     chunk_offsets_dummy = torch.zeros(2, dtype=torch.int32, device="cuda")
+    workspace_dummy = torch.zeros(128, dtype=torch.uint8, device="cuda")
     cu_seqlens_c = from_dlpack(cu_seqlens_dummy)
     chunk_offsets_c = from_dlpack(chunk_offsets_dummy)
+    workspace_c = from_dlpack(workspace_dummy)
 
     def run_kernel(k_t, w_t, u_t, g_t, gk_t, h0_t, use_g_val, use_gk_val, use_h0, store_ht, do_save_vnew=0):
         nonlocal compiled_kernel
@@ -1163,6 +1224,7 @@ def main():
             gc.iterator, gkc.iterator,
             hc.iterator, vnc.iterator, h0c.iterator, htc.iterator,
             cu_seqlens_c.iterator, chunk_offsets_c.iterator,
+            workspace_c.iterator,
             (B, T, H, K, V), NT,
             int(use_g_val), int(use_gk_val), int(use_h0), int(store_ht), int(do_save_vnew),
             stream,
@@ -1325,22 +1387,24 @@ def main():
     hc2, vnc2, htc2 = from_dlpack(h_out2), from_dlpack(v_new2), from_dlpack(ht2)
     cu_seqlens_d2 = torch.zeros(2, dtype=torch.int32, device="cuda")
     chunk_offsets_d2 = torch.zeros(2, dtype=torch.int32, device="cuda")
+    workspace_d2 = torch.zeros(128, dtype=torch.uint8, device="cuda")
     csd2 = from_dlpack(cu_seqlens_d2)
     cod2 = from_dlpack(chunk_offsets_d2)
+    wsd2 = from_dlpack(workspace_d2)
 
     compiled2 = cute.compile(
         kernel2,
         kc2.iterator, wc2.iterator, uc2.iterator,
         gc2.iterator, gkc2.iterator,
         hc2.iterator, vnc2.iterator, h0c2.iterator, htc2.iterator,
-        csd2.iterator, cod2.iterator,
+        csd2.iterator, cod2.iterator, wsd2.iterator,
         (B2, T2, H2, K, V), NT2, 0, 0, 0, 0, 0, stream,
     )
     compiled2(
         kc2.iterator, wc2.iterator, uc2.iterator,
         gc2.iterator, gkc2.iterator,
         hc2.iterator, vnc2.iterator, h0c2.iterator, htc2.iterator,
-        csd2.iterator, cod2.iterator,
+        csd2.iterator, cod2.iterator, wsd2.iterator,
         (B2, T2, H2, K, V), NT2, 0, 0, 0, 0, 0, stream,
     )
     torch.cuda.synchronize()
@@ -1418,14 +1482,16 @@ def main():
     hcb, vncb, htcb = from_dlpack(h_outb), from_dlpack(v_newb), from_dlpack(htb)
     cu_seqlens_db = torch.zeros(2, dtype=torch.int32, device="cuda")
     chunk_offsets_db = torch.zeros(2, dtype=torch.int32, device="cuda")
+    workspace_db = torch.zeros(128, dtype=torch.uint8, device="cuda")
     csdb = from_dlpack(cu_seqlens_db)
     codb = from_dlpack(chunk_offsets_db)
+    wsdb = from_dlpack(workspace_db)
 
     bench_args = (
         kcb.iterator, wcb.iterator, ucb.iterator,
         gcb.iterator, gkcb.iterator,
         hcb.iterator, vncb.iterator, h0cb.iterator, htcb.iterator,
-        csdb.iterator, codb.iterator,
+        csdb.iterator, codb.iterator, wsdb.iterator,
         (Bb, Tb, Hb, K, V), NTb, 0, 0, 0, 0, 0, stream,
     )
     compiled_b = cute.compile(kernelb, *bench_args)

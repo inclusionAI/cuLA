@@ -65,11 +65,15 @@ def run_varlen_kernel(k, w, u, gk, h0, cu_seqlens, chunk_offsets,
     csc = from_dlpack(cu_seqlens)
     coc = from_dlpack(chunk_offsets)
 
+    # Workspace for TensorMapManager (128 bytes per sequence)
+    workspace = torch.zeros(num_seqs * 128, dtype=torch.uint8, device=device)
+    wsc = from_dlpack(workspace)
+
     args = (
         kc.iterator, wc.iterator, uc.iterator,
         gc.iterator, gkc.iterator,
         hc.iterator, vnc.iterator, h0c.iterator, htc.iterator,
-        csc.iterator, coc.iterator,
+        csc.iterator, coc.iterator, wsc.iterator,
         (num_seqs, total_T, H, K, V), total_NT,
         0, int(use_gk), int(use_h0), int(store_ht), int(save_vnew),
         stream,
@@ -186,9 +190,9 @@ def test_varlen_basic():
 def test_varlen_mixed():
     """Test varlen with different-length sequences."""
     print("\n" + "="*60)
-    print("Test Varlen 2: 3 sequences of different lengths (64, 192, 128)")
+    print("Test Varlen 2: 3 sequences of different lengths (50, 192, 100)")
     H, K, V, BT = 1, 128, 128, 64
-    seq_lens = [64, 192, 128]
+    seq_lens = [50, 192, 100]  # 50 and 100 are NOT multiples of BT=64
     k, w, u, cu_seqlens, chunk_offsets, total_T, total_NT, NTs = \
         make_varlen_data(seq_lens, H, K, V, BT)
 
@@ -221,9 +225,9 @@ def test_varlen_mixed():
 def test_varlen_with_gk_h0_ht():
     """Test varlen with gk gating, h0, and ht."""
     print("\n" + "="*60)
-    print("Test Varlen 3: With gk + h0 + ht (3 seqs, H=2)")
+    print("Test Varlen 3: With gk + h0 + ht (3 seqs, H=2, non-aligned lengths)")
     H, K, V, BT = 2, 128, 128, 64
-    seq_lens = [128, 256, 64]
+    seq_lens = [100, 256, 30]  # 100 and 30 are NOT multiples of BT=64
     num_seqs = len(seq_lens)
     k, w, u, cu_seqlens, chunk_offsets, total_T, total_NT, NTs = \
         make_varlen_data(seq_lens, H, K, V, BT)
@@ -275,9 +279,9 @@ def test_varlen_with_gk_h0_ht():
 def test_varlen_multi_head():
     """Test varlen with multiple heads and V-tiles."""
     print("\n" + "="*60)
-    print("Test Varlen 4: Multi-head H=4, 4 sequences")
+    print("Test Varlen 4: Multi-head H=4, 4 sequences (non-aligned)")
     H, K, V, BT = 4, 128, 128, 64
-    seq_lens = [64, 128, 256, 192]
+    seq_lens = [33, 128, 200, 95]  # 33, 200, 95 are NOT multiples of BT=64
     k, w, u, cu_seqlens, chunk_offsets, total_T, total_NT, NTs = \
         make_varlen_data(seq_lens, H, K, V, BT)
 
@@ -338,14 +342,16 @@ def test_varlen_vs_nonvarlen():
     hc, vnc, htc = from_dlpack(h_out_nv), from_dlpack(v_new_nv), from_dlpack(ht_nv)
     cu_seqlens_d = torch.zeros(2, dtype=torch.int32, device="cuda")
     chunk_offsets_d = torch.zeros(2, dtype=torch.int32, device="cuda")
+    workspace_d = torch.zeros(128, dtype=torch.uint8, device="cuda")
     csd = from_dlpack(cu_seqlens_d)
     cod = from_dlpack(chunk_offsets_d)
+    wsd = from_dlpack(workspace_d)
 
     args_nv = (
         kc.iterator, wc.iterator, uc.iterator,
         gc.iterator, gkc.iterator,
         hc.iterator, vnc.iterator, h0c.iterator, htc.iterator,
-        csd.iterator, cod.iterator,
+        csd.iterator, cod.iterator, wsd.iterator,
         (B, T, H, K, V), NT,
         0, 0, 0, 0, 1,
         stream,
@@ -367,12 +373,14 @@ def test_varlen_vs_nonvarlen():
     hc_v, vnc_v, htc_v = from_dlpack(h_out_v), from_dlpack(v_new_v), from_dlpack(ht_v)
     csv = from_dlpack(cu_seqlens_v)
     cov = from_dlpack(chunk_offsets_v)
+    workspace_v = torch.zeros(128, dtype=torch.uint8, device="cuda")
+    wsv = from_dlpack(workspace_v)
 
     args_v = (
         kc.iterator, wc.iterator, uc.iterator,
         gc.iterator, gkc.iterator,
         hc_v.iterator, vnc_v.iterator, h0c.iterator, htc_v.iterator,
-        csv.iterator, cov.iterator,
+        csv.iterator, cov.iterator, wsv.iterator,
         (1, T, H, K, V), NT,
         0, 0, 0, 0, 1,
         stream,
