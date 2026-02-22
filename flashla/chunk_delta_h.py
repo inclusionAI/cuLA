@@ -60,6 +60,7 @@ class ChunkDeltaRuleFwdH:
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         is_varlen: bool = False,
+        BV: int = None,
     ):
         self.chunk_size = chunk_size
         self.head_dim_k = head_dim_k
@@ -75,7 +76,7 @@ class ChunkDeltaRuleFwdH:
 
         self.BT = chunk_size   # 64
         self.BK = head_dim_k   # 128
-        self.BV = 64           # V tiling
+        self.BV = BV if BV is not None else head_dim_v  # V tiling (default: no tiling)
 
         self.threads_per_warp = 32
         self.cuda_warp_ids = (0, 1, 2, 3)
@@ -83,7 +84,8 @@ class ChunkDeltaRuleFwdH:
         self.load_warp_id = 5
         self.store_warp_id = 6
         self.empty_warp_id = 7
-        self.num_regs_cuda = 232
+        # Lower register count for varlen (persistent kernel benefits from tighter allocation)
+        self.num_regs_cuda = 160 if is_varlen else 232
         self.num_regs_others = 40
         self.threads_per_cta = self.threads_per_warp * 8
 
@@ -799,8 +801,6 @@ class ChunkDeltaRuleFwdH:
             tTR_sKV = thr_t2r_kv.partition_D(fake_sKV)
             # h state in registers (persistent across chunks)
             tTR_rKV = cute.make_rmem_tensor(tTR_sKV.shape, self.acc_dtype)
-            # Update from KV MMA (temporary)
-            tTR_rUpdate = cute.make_rmem_tensor(tTR_sKV.shape, self.acc_dtype)
 
             # ----- T2R setup for WH acc (BV=64, BT=64 FP32) -----
             t2r_atom_wh = cute.make_copy_atom(
@@ -816,7 +816,6 @@ class ChunkDeltaRuleFwdH:
             thr_t2r_wh = tiled_t2r_wh.get_slice(local_tidx)
             tTR_tWH = thr_t2r_wh.partition_S(tCtAccWH_flat)
             tTR_sWH = thr_t2r_wh.partition_D(fake_sWH)
-            tTR_rWH = cute.make_rmem_tensor(tTR_sWH.shape, self.acc_dtype)
 
             # ----- R2T: h state regs → TMEM for WH MMA A operand -----
             copy_atom_r2t_state = cute.make_copy_atom(
@@ -825,10 +824,7 @@ class ChunkDeltaRuleFwdH:
             )
             tiled_r2t_state = tcgen05.make_tmem_copy(copy_atom_r2t_state, tCrState)
             thr_r2t_state = tiled_r2t_state.get_slice(local_tidx)
-            tRT_rState = cute.make_rmem_tensor(
-                cute.slice_(thr_r2t_state.partition_S(tCrState).shape, (None, None, None, None, 0)),
-                self.io_dtype,
-            )
+            r2t_state_shape = cute.slice_(thr_r2t_state.partition_S(tCrState).shape, (None, None, None, None, 0))
             tRT_tState = thr_r2t_state.partition_D(tCrState)
 
             # ----- R2S: KV T2R regs → sH_epi (COL_MAJOR, BV×BK) -----
@@ -854,15 +850,8 @@ class ChunkDeltaRuleFwdH:
             )
             tiled_r2t_vnew = tcgen05.make_tmem_copy(copy_atom_r2t_vnew, tCrVnew)
             thr_r2t_vnew = tiled_r2t_vnew.get_slice(local_tidx)
-            tRT_rVnew = cute.make_rmem_tensor(
-                cute.slice_(thr_r2t_vnew.partition_S(tCrVnew).shape, (None, None, None, None, 0)),
-                self.io_dtype,
-            )
+            r2t_vnew_shape = cute.slice_(thr_r2t_vnew.partition_S(tCrVnew).shape, (None, None, None, None, 0))
             tRT_tVnew = thr_r2t_vnew.partition_D(tCrVnew)
-
-            # ----- BF16 register tensors -----
-            tTR_rKV_bf16 = cute.make_rmem_tensor(tTR_rKV.shape, self.io_dtype)
-            tTR_rVnew_bf16 = cute.make_rmem_tensor(tTR_rWH.shape, self.io_dtype)
 
             # ----- Identity tensor for WH tile (BV, BT) → v_new coords -----
             vnew_tile = cute.dice(self.wh_mma_tiler, (1, 1, None))  # (BV, BT)
@@ -906,6 +895,10 @@ class ChunkDeltaRuleFwdH:
                     # ========================================
                     # Phase 1: Publish h for WH MMA + h_out store
                     # ========================================
+                    # Declare per-phase register tensors at point of use
+                    # to help compiler see non-overlapping lifetimes
+                    tTR_rKV_bf16 = cute.make_rmem_tensor(tTR_rKV.shape, self.io_dtype)
+                    tRT_rState = cute.make_rmem_tensor(r2t_state_shape, self.io_dtype)
                     h_vec = tTR_rKV.load()
                     tTR_rKV_bf16.store(h_vec.to(self.io_dtype))
 
@@ -941,6 +934,7 @@ class ChunkDeltaRuleFwdH:
                     # Phase 2: v_new from WH result → triggers KV MMA
                     # ========================================
                     wh_h = wh_done_C.wait_and_advance()
+                    tTR_rWH = cute.make_rmem_tensor(tTR_sWH.shape, self.acc_dtype)
                     cute.copy(tiled_t2r_wh, tTR_tWH[(None, None, None, wh_h.index)], tTR_rWH)
                     cute.arch.fence_view_async_tmem_load()
                     wh_h.release()
@@ -963,9 +957,11 @@ class ChunkDeltaRuleFwdH:
                                     tTR_rWH[ei] = Float32(0.0)
 
                     # Prepare bf16 v_new for both R2T and R2S
+                    tTR_rVnew_bf16 = cute.make_rmem_tensor(tTR_rWH.shape, self.io_dtype)
                     tTR_rVnew_bf16.store(tTR_rWH.load().to(self.io_dtype))
 
                     # R2T v_new → TMEM FIRST (triggers KV MMA — zero-copy A operand)
+                    tRT_rVnew = cute.make_rmem_tensor(r2t_vnew_shape, self.io_dtype)
                     tRT_rVnew.store(tTR_rWH.load().to(self.io_dtype))
                     vnew_h = vnew_smem_P.acquire_and_advance()
                     cute.copy(tiled_r2t_vnew, tRT_rVnew, tRT_tVnew[(None, None, None, None, 0)])
@@ -988,6 +984,7 @@ class ChunkDeltaRuleFwdH:
                     # Phase 4: KV update → h
                     # ========================================
                     kv_h = kv_done_C.wait_and_advance()
+                    tTR_rUpdate = cute.make_rmem_tensor(tTR_sKV.shape, self.acc_dtype)
                     cute.copy(tiled_t2r_kv, tTR_tKV[(None, None, None, 0)], tTR_rUpdate)
                     cute.arch.fence_view_async_tmem_load()
                     kv_h.release()
@@ -998,6 +995,7 @@ class ChunkDeltaRuleFwdH:
 
                 # ===== After main loop: store final state ht =====
                 if store_final_state:
+                    tTR_rKV_bf16 = cute.make_rmem_tensor(tTR_rKV.shape, self.io_dtype)
                     h_vec = tTR_rKV.load()
                     tTR_rKV_bf16.store(h_vec.to(self.io_dtype))
                     tRS_rH = tiled_r2s_h.retile(tTR_rKV_bf16)

@@ -86,10 +86,13 @@ def bench_fn(fn, warmup=5, n_iter=20):
 
 def run_varlen_benchmark(num_seqs, total_T, H, K, V, BT, ratio,
                          use_gk=True, use_h0=True, store_ht=True, save_vnew=True,
-                         seed=42):
+                         seed=42, BV=None):
     """Run one varlen benchmark config: our kernel vs FLA."""
     device = "cuda"
     dtype = torch.bfloat16
+    
+    if BV is None:
+        BV = V
     
     seq_lens = generate_seq_lens(num_seqs, total_T, ratio, seed=seed)
     cu_seqlens = make_cu_seqlens(seq_lens, device)
@@ -144,7 +147,7 @@ def run_varlen_benchmark(num_seqs, total_T, H, K, V, BT, ratio,
     ht_out = torch.zeros(num_seqs, H, K, V, device=device, dtype=dtype)
     workspace = torch.zeros(num_seqs * 128, dtype=torch.uint8, device=device)
     
-    kernel = ChunkDeltaRuleFwdH(chunk_size=BT, head_dim_k=K, head_dim_v=V, is_varlen=True)
+    kernel = ChunkDeltaRuleFwdH(chunk_size=BT, head_dim_k=K, head_dim_v=V, is_varlen=True, BV=BV)
     stream = cutlass_torch.default_stream()
     
     kc, wc, uc = from_dlpack(k), from_dlpack(w), from_dlpack(u)
@@ -181,10 +184,14 @@ def main():
     parser.add_argument("--chunk_size", type=int, default=64)
     parser.add_argument("--head_dim_k", type=int, default=128)
     parser.add_argument("--head_dim_v", type=int, default=128)
+    parser.add_argument("--bv", type=int, nargs="+", default=None,
+                        help="BV tile sizes to benchmark (default: [V]). "
+                             "Multiple values compare different BV splits.")
     args = parser.parse_args()
     
     K, V, BT = args.head_dim_k, args.head_dim_v, args.chunk_size
     total_T = args.total_T
+    bv_list = args.bv if args.bv else [V]
     
     configs = [
         # (num_seqs, H, ratio, use_gk, use_h0, store_ht, save_vnew, description)
@@ -203,24 +210,39 @@ def main():
         (40, 64,  3.0, True, True, True, True, "40 seqs, ratio=3x, H=64"),
     ]
     
-    print(f"Varlen Benchmark: total_T={total_T}, K={K}, V={V}, BT={BT}")
-    print(f"{'Config':<45} {'Ours':>8} {'FLA':>8} {'Speed':>7} {'MinL':>5} {'MaxL':>5} {'Ratio':>6}")
-    print("-" * 90)
+    print(f"Varlen Benchmark: total_T={total_T}, K={K}, V={V}, BT={BT}, BV={bv_list}")
     
-    speedups = []
+    # Build header
+    bv_cols = "".join(f" {'BV='+str(bv):>10}" for bv in bv_list)
+    print(f"{'Config':<45}{bv_cols} {'FLA':>10} {'Best':>7} {'MinL':>5} {'MaxL':>5} {'Ratio':>6}")
+    print("-" * (45 + 10 * len(bv_list) + 10 + 7 + 5 + 5 + 6 + 6))
+    
+    all_speedups = {bv: [] for bv in bv_list}
     for (num_seqs, H, ratio, use_gk, use_h0, store_ht, save_vnew, desc) in configs:
-        our_ms, fla_ms, seq_lens, actual_ratio = run_varlen_benchmark(
-            num_seqs, total_T, H, K, V, BT, ratio,
-            use_gk, use_h0, store_ht, save_vnew,
-        )
-        sp = fla_ms / our_ms
-        speedups.append(sp)
+        fla_ms = None
+        results = {}
+        for bv in bv_list:
+            our_ms, fla_ms_cur, seq_lens, actual_ratio = run_varlen_benchmark(
+                num_seqs, total_T, H, K, V, BT, ratio,
+                use_gk, use_h0, store_ht, save_vnew, BV=bv,
+            )
+            results[bv] = our_ms
+            fla_ms = fla_ms_cur  # same for all BV
+        
+        best_bv = min(results, key=results.get)
+        best_sp = fla_ms / results[best_bv]
         min_l, max_l = min(seq_lens), max(seq_lens)
-        print(f"{desc:<45} {our_ms:>7.3f}ms {fla_ms:>7.3f}ms {sp:>6.2f}x {min_l:>5} {max_l:>5} {actual_ratio:>5.1f}x")
+        
+        bv_str = "".join(f" {results[bv]:>9.3f}ms" for bv in bv_list)
+        print(f"{desc:<45}{bv_str} {fla_ms:>9.3f}ms {best_sp:>6.2f}x {min_l:>5} {max_l:>5} {actual_ratio:>5.1f}x")
+        
+        for bv in bv_list:
+            all_speedups[bv].append(fla_ms / results[bv])
     
-    geo_mean = math.exp(sum(math.log(s) for s in speedups) / len(speedups))
-    print("-" * 90)
-    print(f"{'Geometric mean speedup':<45} {'':>8} {'':>8} {geo_mean:>6.2f}x")
+    print("-" * (45 + 10 * len(bv_list) + 10 + 7 + 5 + 5 + 6 + 6))
+    for bv in bv_list:
+        geo = math.exp(sum(math.log(s) for s in all_speedups[bv]) / len(all_speedups[bv]))
+        print(f"{'Geomean BV=' + str(bv):<45} {geo:>6.2f}x")
 
 
 if __name__ == "__main__":
