@@ -191,7 +191,7 @@ def main():
     
     K, V, BT = args.head_dim_k, args.head_dim_v, args.chunk_size
     total_T = args.total_T
-    bv_list = args.bv if args.bv else [V]
+    bv_list = args.bv if args.bv else [64]
     
     configs = [
         # (num_seqs, H, ratio, use_gk, use_h0, store_ht, save_vnew, description)
