@@ -140,7 +140,13 @@ class ChunkDeltaRuleFwdH:
         return wh_off, state_off, vnew_off, kv_off, total
 
     def _compute_grid(self, B, H, V):
-        return ((V + self.BV - 1) // self.BV, H, B)
+        num_v_tiles = (V + self.BV - 1) // self.BV
+        if self.is_varlen:
+            import torch
+            sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+            # Always use sm_count CTAs; surplus CTAs have num_iters=0 and skip
+            return (sm_count, 1, 1)
+        return (num_v_tiles, H, B)
 
     @cute.jit
     def __call__(
@@ -614,23 +620,33 @@ class ChunkDeltaRuleFwdH:
         tCtAccKV = cute.make_tensor(tmem_ptr + self.tmem_kv_off, tCtAccKV_fake.layout)
 
         # ===================== Block indices =====================
-        (v_tile_idx, hidx, bidx) = cute.arch.block_idx()
         B, T, H, K, V = problem_size
         BT = self.BT
 
-        # Per-CTA varlen info: compute sequence boundaries and chunk offsets
         if cutlass.const_expr(self.is_varlen):
-            tok_offset = cu_seqlens[bidx]
-            seq_len = cu_seqlens[bidx + 1] - tok_offset
-            NT = (seq_len + BT - 1) // BT
+            # Persistent kernel: 1D grid, decode work per-warp in outer loop
+            block_idx_x = cute.arch.block_idx()[0]
+            grid_dim_x = cute.arch.grid_dim()[0]
+            num_v_tiles = (V + self.BV - 1) // self.BV
+            total_work_units = num_v_tiles * H * B
+            num_iters = (total_work_units - block_idx_x + grid_dim_x - 1) // grid_dim_x
+            # Pre-initialize variables reassigned inside persistent loop (CuTe DSL requirement)
+            v_tile_idx = Int32(0)
+            hidx = Int32(0)
+            bidx = Int32(0)
+            tok_offset = Int32(0)
+            seq_len = Int32(0)
+            NT = Int32(0)
             data_bidx = Int32(0)
-            chunk_off = chunk_offsets[bidx]
+            chunk_off = Int32(0)
         else:
+            (v_tile_idx, hidx, bidx) = cute.arch.block_idx()
             tok_offset = Int32(0)
             seq_len = T
             NT = (T + BT - 1) // BT
             data_bidx = bidx
             chunk_off = Int32(0)
+            num_iters = Int32(1)
 
         # =========================================================================
         # LOAD WARP
@@ -638,65 +654,78 @@ class ChunkDeltaRuleFwdH:
         if warp_idx == self.load_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
-            # Apply domain_offset for varlen TMA tensors (shift T dim by tok_offset)
-            if cutlass.const_expr(self.is_varlen):
-                tma_tensor_w_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_w)
-                tma_tensor_kt_v = cute.domain_offset((0, tok_offset, (0, 0)), tma_tensor_kt)
-                tma_tensor_u_v = cute.domain_offset((0, tok_offset, (0, 0)), tma_tensor_u)
-                tma_tensor_gk_v = cute.domain_offset((0, tok_offset, (0, 0)), tma_tensor_gk)
-            else:
-                tma_tensor_w_v = tma_tensor_w
-                tma_tensor_kt_v = tma_tensor_kt
-                tma_tensor_u_v = tma_tensor_u
-                tma_tensor_gk_v = tma_tensor_gk
+            for wu_iter in cutlass.range(0, num_iters, unroll=0):
+                # --- Persistent work decode ---
+                if cutlass.const_expr(self.is_varlen):
+                    work_idx = block_idx_x + wu_iter * grid_dim_x
+                    v_tile_idx = work_idx % num_v_tiles
+                    temp_work = work_idx // num_v_tiles
+                    hidx = temp_work % H
+                    bidx = temp_work // H
+                    tok_offset = cu_seqlens[bidx]
+                    seq_len = cu_seqlens[bidx + 1] - tok_offset
+                    NT = (seq_len + BT - 1) // BT
+                    data_bidx = Int32(0)
 
-            tWsW, tWgW = self._tma_partition_B(
-                tma_atom_w, tma_tensor_w_v, sW, self.wh_mma_tiler, wh_tiled_mma, data_bidx,
-            )
-            tKsK, tKgK = self._tma_partition_B(
-                tma_atom_kt, tma_tensor_kt_v, sKt, self.kv_mma_tiler, kv_tiled_mma, data_bidx,
-            )
+                # Apply domain_offset for varlen TMA tensors (shift T dim by tok_offset)
+                if cutlass.const_expr(self.is_varlen):
+                    tma_tensor_w_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_w)
+                    tma_tensor_kt_v = cute.domain_offset((0, tok_offset, (0, 0)), tma_tensor_kt)
+                    tma_tensor_u_v = cute.domain_offset((0, tok_offset, (0, 0)), tma_tensor_u)
+                    tma_tensor_gk_v = cute.domain_offset((0, tok_offset, (0, 0)), tma_tensor_gk)
+                else:
+                    tma_tensor_w_v = tma_tensor_w
+                    tma_tensor_kt_v = tma_tensor_kt
+                    tma_tensor_u_v = tma_tensor_u
+                    tma_tensor_gk_v = tma_tensor_gk
 
-            # U TMA load partition (non-MMA, epilog-style)
-            gU_ld = tma_tensor_u_v[None, None, (hidx, data_bidx)]
-            _, bSG_sU, bSG_gU = self._epilog_partition(
-                tma_atom_u, gU_ld, (self.BV, self.BT), sU_epi,
-            )
+                tWsW, tWgW = self._tma_partition_B(
+                    tma_atom_w, tma_tensor_w_v, sW, self.wh_mma_tiler, wh_tiled_mma, data_bidx, hidx,
+                )
+                tKsK, tKgK = self._tma_partition_B(
+                    tma_atom_kt, tma_tensor_kt_v, sKt, self.kv_mma_tiler, kv_tiled_mma, data_bidx, hidx,
+                )
 
-            # gk TMA load partition: gk_K shape (K, T, (H, data_B)), load (BK, 1) per timestep
-            gGK_ld = tma_tensor_gk_v[None, None, (hidx, data_bidx)]  # (K, T)
-            _, bSG_sGK, bSG_gGK = self._epilog_partition(
-                tma_atom_gk, gGK_ld, (self.BK, 1), sGK_3d,
-            )
+                # U TMA load partition (non-MMA, epilog-style)
+                gU_ld = tma_tensor_u_v[None, None, (hidx, data_bidx)]
+                _, bSG_sU, bSG_gU = self._epilog_partition(
+                    tma_atom_u, gU_ld, (self.BV, self.BT), sU_epi,
+                )
 
-            for chunk_idx in cutlass.range(0, NT, unroll=0):
-                w_h = load_w_P.acquire_and_advance()
-                cute.copy(atom=tma_atom_w, src=tWgW[None, chunk_idx, 0],
-                          dst=tWsW[None, w_h.index], tma_bar_ptr=w_h.barrier)
+                # gk TMA load partition: gk_K shape (K, T, (H, data_B)), load (BK, 1) per timestep
+                gGK_ld = tma_tensor_gk_v[None, None, (hidx, data_bidx)]  # (K, T)
+                _, bSG_sGK, bSG_gGK = self._epilog_partition(
+                    tma_atom_gk, gGK_ld, (self.BK, 1), sGK_3d,
+                )
 
-                kt_h = load_kt_P.acquire_and_advance()
-                cute.copy(atom=tma_atom_kt, src=tKgK[None, 0, chunk_idx],
-                          dst=tKsK[None, kt_h.index], tma_bar_ptr=kt_h.barrier)
+                for chunk_idx in cutlass.range(0, NT, unroll=0):
+                    w_h = load_w_P.acquire_and_advance()
+                    cute.copy(atom=tma_atom_w, src=tWgW[None, chunk_idx, 0],
+                              dst=tWsW[None, w_h.index], tma_bar_ptr=w_h.barrier)
 
-                u_h = load_u_P.acquire_and_advance()
-                cute.copy(atom=tma_atom_u,
-                          src=bSG_gU[(None, v_tile_idx, chunk_idx)],
-                          dst=bSG_sU[None, u_h.index],
-                          tma_bar_ptr=u_h.barrier)
+                    kt_h = load_kt_P.acquire_and_advance()
+                    cute.copy(atom=tma_atom_kt, src=tKgK[None, 0, chunk_idx],
+                              dst=tKsK[None, kt_h.index], tma_bar_ptr=kt_h.barrier)
 
-                # TMA load gk for this chunk (BK Float32 values)
-                if use_gk:
-                    # For tail chunk in varlen, use last valid position
-                    gk_t_idx = chunk_idx * self.BT + self.BT - 1
-                    if cutlass.const_expr(self.is_varlen):
-                        remaining = seq_len - chunk_idx * self.BT
-                        if remaining < self.BT:
-                            gk_t_idx = seq_len - 1
-                    gk_h = load_gk_P.acquire_and_advance()
-                    cute.copy(atom=tma_atom_gk,
-                              src=bSG_gGK[(None, 0, gk_t_idx)],
-                              dst=bSG_sGK[None, gk_h.index],
-                              tma_bar_ptr=gk_h.barrier)
+                    u_h = load_u_P.acquire_and_advance()
+                    cute.copy(atom=tma_atom_u,
+                              src=bSG_gU[(None, v_tile_idx, chunk_idx)],
+                              dst=bSG_sU[None, u_h.index],
+                              tma_bar_ptr=u_h.barrier)
+
+                    # TMA load gk for this chunk (BK Float32 values)
+                    if use_gk:
+                        # For tail chunk in varlen, use last valid position
+                        gk_t_idx = chunk_idx * self.BT + self.BT - 1
+                        if cutlass.const_expr(self.is_varlen):
+                            remaining = seq_len - chunk_idx * self.BT
+                            if remaining < self.BT:
+                                gk_t_idx = seq_len - 1
+                        gk_h = load_gk_P.acquire_and_advance()
+                        cute.copy(atom=tma_atom_gk,
+                                  src=bSG_gGK[(None, 0, gk_t_idx)],
+                                  dst=bSG_sGK[None, gk_h.index],
+                                  tma_bar_ptr=gk_h.barrier)
 
         # =========================================================================
         # MMA WARP
@@ -704,39 +733,47 @@ class ChunkDeltaRuleFwdH:
         elif warp_idx == self.mma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
-            for chunk_idx in cutlass.range(0, NT, unroll=0):
-                # --- WH MMA: state(SMEM) × W(SMEM) → acc_wh ---
-                state_h = state_smem_C.wait_and_advance()
-                w_h = load_w_C.wait_and_advance()
+            for wu_iter in cutlass.range(0, num_iters, unroll=0):
+                # --- Persistent work decode (MMA only needs NT) ---
+                if cutlass.const_expr(self.is_varlen):
+                    work_idx = block_idx_x + wu_iter * grid_dim_x
+                    bidx_mma = (work_idx // num_v_tiles) // H
+                    tok_off_mma = cu_seqlens[bidx_mma]
+                    NT = (cu_seqlens[bidx_mma + 1] - tok_off_mma + BT - 1) // BT
 
-                wh_h = wh_done_P.acquire_and_advance()
-                for kp in cutlass.range(cute.size(tCrW, mode=[2]), unroll_full=True):
-                    wh_tiled_mma.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
-                    cute.gemm(wh_tiled_mma,
-                              tCtAccWH[None, None, None, wh_h.index],
-                              tCrState[None, None, kp, state_h.index],
-                              tCrW[None, None, kp, w_h.index],
-                              tCtAccWH[None, None, None, wh_h.index])
-                wh_h.commit()
-                w_h.release()
-                state_h.release()
+                for chunk_idx in cutlass.range(0, NT, unroll=0):
+                    # --- WH MMA: state(SMEM) × W(SMEM) → acc_wh ---
+                    state_h = state_smem_C.wait_and_advance()
+                    w_h = load_w_C.wait_and_advance()
 
-                # --- KV MMA: v_new(TMEM) × K^T(SMEM) → update (ACCUMULATE=False always) ---
-                vnew_h = vnew_smem_C.wait_and_advance()
-                kt_h = load_kt_C.wait_and_advance()
+                    wh_h = wh_done_P.acquire_and_advance()
+                    for kp in cutlass.range(cute.size(tCrW, mode=[2]), unroll_full=True):
+                        wh_tiled_mma.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
+                        cute.gemm(wh_tiled_mma,
+                                  tCtAccWH[None, None, None, wh_h.index],
+                                  tCrState[None, None, kp, state_h.index],
+                                  tCrW[None, None, kp, w_h.index],
+                                  tCtAccWH[None, None, None, wh_h.index])
+                    wh_h.commit()
+                    w_h.release()
+                    state_h.release()
 
-                kv_h = kv_done_P.acquire_and_advance()
-                for kp in cutlass.range(cute.size(tCrKt, mode=[2]), unroll_full=True):
-                    # Always ACCUMULATE=False: we only compute the update term
-                    kv_tiled_mma.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
-                    cute.gemm(kv_tiled_mma,
-                              tCtAccKV[None, None, None, 0],
-                              tCrVnew[None, None, kp, vnew_h.index],
-                              tCrKt[None, None, kp, kt_h.index],
-                              tCtAccKV[None, None, None, 0])
-                kv_h.commit()
-                kt_h.release()
-                vnew_h.release()
+                    # --- KV MMA: v_new(TMEM) × K^T(SMEM) → update (ACCUMULATE=False always) ---
+                    vnew_h = vnew_smem_C.wait_and_advance()
+                    kt_h = load_kt_C.wait_and_advance()
+
+                    kv_h = kv_done_P.acquire_and_advance()
+                    for kp in cutlass.range(cute.size(tCrKt, mode=[2]), unroll_full=True):
+                        # Always ACCUMULATE=False: we only compute the update term
+                        kv_tiled_mma.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
+                        cute.gemm(kv_tiled_mma,
+                                  tCtAccKV[None, None, None, 0],
+                                  tCrVnew[None, None, kp, vnew_h.index],
+                                  tCrKt[None, None, kp, kt_h.index],
+                                  tCtAccKV[None, None, None, 0])
+                    kv_h.commit()
+                    kt_h.release()
+                    vnew_h.release()
 
         # =========================================================================
         # CUDA CORE WARPS
@@ -837,127 +874,140 @@ class ChunkDeltaRuleFwdH:
             cM_h = cute.make_identity_tensor(h_tile)
             tTR_cM_h = thr_t2r_kv.partition_D(cM_h)
 
-            # ===== Initialize h in registers =====
-            if use_initial_state:
-                # Load h0 from GMEM into registers using identity tensor mapping
-                gH0 = h0[None, None, (hidx, bidx)]  # (K, V)
-                for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
-                    v_coord, k_coord = tTR_cM_h[ei]
-                    tTR_rKV[ei] = gH0[k_coord, v_coord + v_tile_idx * self.BV].to(self.acc_dtype)
-            else:
-                for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
-                    tTR_rKV[ei] = Float32(0.0)
+            # ===== Persistent outer loop =====
+            for wu_iter in cutlass.range(0, num_iters, unroll=0):
+                # --- Persistent work decode ---
+                if cutlass.const_expr(self.is_varlen):
+                    work_idx = block_idx_x + wu_iter * grid_dim_x
+                    v_tile_idx = work_idx % num_v_tiles
+                    temp_work = work_idx // num_v_tiles
+                    hidx = temp_work % H
+                    bidx = temp_work // H
+                    tok_offset = cu_seqlens[bidx]
+                    seq_len = cu_seqlens[bidx + 1] - tok_offset
+                    NT = (seq_len + BT - 1) // BT
 
-            # ===== Main loop (gk-only optimized pipeline) =====
-            # Pipeline: Phase1(R2T+R2S+gk_decay)→WH MMA→Phase2(v_new)→KV MMA→Phase4(h update)
-            # gk decay moved to Phase1 to overlap with longer WH MMA (K=128) window
-
-            for chunk_idx in cutlass.range(0, NT, unroll=0):
-                # ========================================
-                # Phase 1: Publish h for WH MMA + h_out store
-                # ========================================
-                h_vec = tTR_rKV.load()
-                tTR_rKV_bf16.store(h_vec.to(self.io_dtype))
-
-                # R2T h state → TMEM (triggers WH MMA — zero-copy A operand)
-                tRT_rState.store(h_vec.to(self.io_dtype))
-                state_h = state_smem_P.acquire_and_advance()
-                cute.copy(tiled_r2t_state, tRT_rState, tRT_tState[(None, None, None, None, 0)])
-                cute.arch.fence_view_async_tmem_store()
-                state_h.commit()  # WH MMA can start now!
-
-                # R2S to sH_epi (overlaps with WH MMA)
-                tRS_rH = tiled_r2s_h.retile(tTR_rKV_bf16)
-                h_handle = h_out_P.acquire_and_advance()
-                cute.copy(tiled_r2s_h, tRS_rH, tRS_sH[(None, None, None, h_handle.index)])
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
-                h_handle.commit()
-
-                # gk decay: h *= gk (overlaps with WH MMA — longer K=128 window!)
-                # Safe: R2T/R2S already captured pre-decay h; registers free until Phase 4
-                if use_gk:
-                    gk_h = load_gk_C.wait_and_advance()
+                # ===== Initialize h in registers =====
+                if use_initial_state:
+                    # Load h0 from GMEM into registers using identity tensor mapping
+                    gH0 = h0[None, None, (hidx, bidx)]  # (K, V)
                     for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
                         v_coord, k_coord = tTR_cM_h[ei]
-                        gk_raw = sGK_smem[(k_coord, gk_h.index)]
-                        gk_scale = cute.exp2(gk_raw * INV_LN2)
-                        tTR_rKV[ei] = tTR_rKV[ei] * gk_scale
-                    gk_h.release()
+                        tTR_rKV[ei] = gH0[k_coord, v_coord + v_tile_idx * self.BV].to(self.acc_dtype)
+                else:
+                    for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
+                        tTR_rKV[ei] = Float32(0.0)
 
-                # ========================================
-                # Phase 2: v_new from WH result → triggers KV MMA
-                # ========================================
-                wh_h = wh_done_C.wait_and_advance()
-                cute.copy(tiled_t2r_wh, tTR_tWH[(None, None, None, wh_h.index)], tTR_rWH)
-                cute.arch.fence_view_async_tmem_load()
-                wh_h.release()
+                # ===== Main loop (gk-only optimized pipeline) =====
+                # Pipeline: Phase1(R2T+R2S+gk_decay)→WH MMA→Phase2(v_new)→KV MMA→Phase4(h update)
+                # gk decay moved to Phase1 to overlap with longer WH MMA (K=128) window
 
-                # Inline U-load + v_new = u - WH (no g-scaling needed)
-                u_handle = load_u_C.wait_and_advance()
-                for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
-                    v_coord, t_coord = tTR_cM[ei]
-                    u_val = sU_epi[(v_coord, t_coord, u_handle.index)].to(self.acc_dtype)
-                    tTR_rWH[ei] = u_val - tTR_rWH[ei]
-                u_handle.release()
+                for chunk_idx in cutlass.range(0, NT, unroll=0):
+                    # ========================================
+                    # Phase 1: Publish h for WH MMA + h_out store
+                    # ========================================
+                    h_vec = tTR_rKV.load()
+                    tTR_rKV_bf16.store(h_vec.to(self.io_dtype))
 
-                # Zero v_new for positions beyond sequence boundary (varlen tail chunk)
-                if cutlass.const_expr(self.is_varlen):
-                    valid_len_chunk = seq_len - chunk_idx * self.BT
-                    if valid_len_chunk < self.BT:
-                        for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
-                            v_coord, t_coord = tTR_cM[ei]
-                            if t_coord >= valid_len_chunk:
-                                tTR_rWH[ei] = Float32(0.0)
+                    # R2T h state → TMEM (triggers WH MMA — zero-copy A operand)
+                    tRT_rState.store(h_vec.to(self.io_dtype))
+                    state_h = state_smem_P.acquire_and_advance()
+                    cute.copy(tiled_r2t_state, tRT_rState, tRT_tState[(None, None, None, None, 0)])
+                    cute.arch.fence_view_async_tmem_store()
+                    state_h.commit()  # WH MMA can start now!
 
-                # Prepare bf16 v_new for both R2T and R2S
-                tTR_rVnew_bf16.store(tTR_rWH.load().to(self.io_dtype))
-
-                # R2T v_new → TMEM FIRST (triggers KV MMA — zero-copy A operand)
-                tRT_rVnew.store(tTR_rWH.load().to(self.io_dtype))
-                vnew_h = vnew_smem_P.acquire_and_advance()
-                cute.copy(tiled_r2t_vnew, tRT_rVnew, tRT_tVnew[(None, None, None, None, 0)])
-                cute.arch.fence_view_async_tmem_store()
-                vnew_h.commit()  # KV MMA starts now!
-
-                # Save v_new to SMEM for TMA store (overlaps with KV MMA)
-                if save_v_new:
-                    tRS_rVnew_st = tiled_r2s_vnew.retile(tTR_rVnew_bf16)
-                    vnew_st_h = vnew_store_P.acquire_and_advance()
-                    cute.copy(tiled_r2s_vnew, tRS_rVnew_st,
-                              tRS_sVnew_store[(None, None, None, vnew_st_h.index)])
+                    # R2S to sH_epi (overlaps with WH MMA)
+                    tRS_rH = tiled_r2s_h.retile(tTR_rKV_bf16)
+                    h_handle = h_out_P.acquire_and_advance()
+                    cute.copy(tiled_r2s_h, tRS_rH, tRS_sH[(None, None, None, h_handle.index)])
                     cute.arch.fence_proxy(
                         cute.arch.ProxyKind.async_shared,
                         space=cute.arch.SharedSpace.shared_cta,
                     )
-                    vnew_st_h.commit()
+                    h_handle.commit()
 
-                # ========================================
-                # Phase 4: KV update → h
-                # ========================================
-                kv_h = kv_done_C.wait_and_advance()
-                cute.copy(tiled_t2r_kv, tTR_tKV[(None, None, None, 0)], tTR_rUpdate)
-                cute.arch.fence_view_async_tmem_load()
-                kv_h.release()
+                    # gk decay: h *= gk (overlaps with WH MMA — longer K=128 window!)
+                    # Safe: R2T/R2S already captured pre-decay h; registers free until Phase 4
+                    if use_gk:
+                        gk_h = load_gk_C.wait_and_advance()
+                        for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
+                            v_coord, k_coord = tTR_cM_h[ei]
+                            gk_raw = sGK_smem[(k_coord, gk_h.index)]
+                            gk_scale = cute.exp2(gk_raw * INV_LN2)
+                            tTR_rKV[ei] = tTR_rKV[ei] * gk_scale
+                        gk_h.release()
 
-                h_vec = tTR_rKV.load()
-                update_vec = tTR_rUpdate.load()
-                tTR_rKV.store(h_vec + update_vec)
+                    # ========================================
+                    # Phase 2: v_new from WH result → triggers KV MMA
+                    # ========================================
+                    wh_h = wh_done_C.wait_and_advance()
+                    cute.copy(tiled_t2r_wh, tTR_tWH[(None, None, None, wh_h.index)], tTR_rWH)
+                    cute.arch.fence_view_async_tmem_load()
+                    wh_h.release()
 
-            # ===== After main loop: store final state ht =====
-            if store_final_state:
-                h_vec = tTR_rKV.load()
-                tTR_rKV_bf16.store(h_vec.to(self.io_dtype))
-                tRS_rH = tiled_r2s_h.retile(tTR_rKV_bf16)
-                h_handle = h_out_P.acquire_and_advance()
-                cute.copy(tiled_r2s_h, tRS_rH, tRS_sH[(None, None, None, h_handle.index)])
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
-                h_handle.commit()
+                    # Inline U-load + v_new = u - WH (no g-scaling needed)
+                    u_handle = load_u_C.wait_and_advance()
+                    for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
+                        v_coord, t_coord = tTR_cM[ei]
+                        u_val = sU_epi[(v_coord, t_coord, u_handle.index)].to(self.acc_dtype)
+                        tTR_rWH[ei] = u_val - tTR_rWH[ei]
+                    u_handle.release()
+
+                    # Zero v_new for positions beyond sequence boundary (varlen tail chunk)
+                    if cutlass.const_expr(self.is_varlen):
+                        valid_len_chunk = seq_len - chunk_idx * self.BT
+                        if valid_len_chunk < self.BT:
+                            for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
+                                v_coord, t_coord = tTR_cM[ei]
+                                if t_coord >= valid_len_chunk:
+                                    tTR_rWH[ei] = Float32(0.0)
+
+                    # Prepare bf16 v_new for both R2T and R2S
+                    tTR_rVnew_bf16.store(tTR_rWH.load().to(self.io_dtype))
+
+                    # R2T v_new → TMEM FIRST (triggers KV MMA — zero-copy A operand)
+                    tRT_rVnew.store(tTR_rWH.load().to(self.io_dtype))
+                    vnew_h = vnew_smem_P.acquire_and_advance()
+                    cute.copy(tiled_r2t_vnew, tRT_rVnew, tRT_tVnew[(None, None, None, None, 0)])
+                    cute.arch.fence_view_async_tmem_store()
+                    vnew_h.commit()  # KV MMA starts now!
+
+                    # Save v_new to SMEM for TMA store (overlaps with KV MMA)
+                    if save_v_new:
+                        tRS_rVnew_st = tiled_r2s_vnew.retile(tTR_rVnew_bf16)
+                        vnew_st_h = vnew_store_P.acquire_and_advance()
+                        cute.copy(tiled_r2s_vnew, tRS_rVnew_st,
+                                  tRS_sVnew_store[(None, None, None, vnew_st_h.index)])
+                        cute.arch.fence_proxy(
+                            cute.arch.ProxyKind.async_shared,
+                            space=cute.arch.SharedSpace.shared_cta,
+                        )
+                        vnew_st_h.commit()
+
+                    # ========================================
+                    # Phase 4: KV update → h
+                    # ========================================
+                    kv_h = kv_done_C.wait_and_advance()
+                    cute.copy(tiled_t2r_kv, tTR_tKV[(None, None, None, 0)], tTR_rUpdate)
+                    cute.arch.fence_view_async_tmem_load()
+                    kv_h.release()
+
+                    h_vec = tTR_rKV.load()
+                    update_vec = tTR_rUpdate.load()
+                    tTR_rKV.store(h_vec + update_vec)
+
+                # ===== After main loop: store final state ht =====
+                if store_final_state:
+                    h_vec = tTR_rKV.load()
+                    tTR_rKV_bf16.store(h_vec.to(self.io_dtype))
+                    tRS_rH = tiled_r2s_h.retile(tTR_rKV_bf16)
+                    h_handle = h_out_P.acquire_and_advance()
+                    cute.copy(tiled_r2s_h, tRS_rH, tRS_sH[(None, None, None, h_handle.index)])
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
+                    h_handle.commit()
 
         # =========================================================================
         # STORE WARP
@@ -969,98 +1019,109 @@ class ChunkDeltaRuleFwdH:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_ht)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_vnew_st)
 
-            # Apply domain_offset for varlen store TMA tensors
-            if cutlass.const_expr(self.is_varlen):
-                tma_tensor_h_out_v = cute.domain_offset(
-                    (0, 0, (chunk_off, 0, 0)), tma_tensor_h_out)
-                tma_tensor_vnew_v = cute.domain_offset(
-                    (0, tok_offset, (0, 0)), tma_tensor_vnew_st)
-            else:
-                tma_tensor_h_out_v = tma_tensor_h_out
-                tma_tensor_vnew_v = tma_tensor_vnew_st
+            for wu_iter in cutlass.range(0, num_iters, unroll=0):
+                # --- Persistent work decode ---
+                if cutlass.const_expr(self.is_varlen):
+                    work_idx = block_idx_x + wu_iter * grid_dim_x
+                    v_tile_idx = work_idx % num_v_tiles
+                    temp_work = work_idx // num_v_tiles
+                    hidx = temp_work % H
+                    bidx = temp_work // H
+                    tok_offset = cu_seqlens[bidx]
+                    seq_len = cu_seqlens[bidx + 1] - tok_offset
+                    NT = (seq_len + BT - 1) // BT
+                    data_bidx = Int32(0)
+                    chunk_off = chunk_offsets[bidx]
 
-            gH_st = tma_tensor_h_out_v[None, None, (None, hidx, data_bidx)]
-            tma_h_st, bSG_sH, bSG_gH = self._epilog_partition(
-                tma_atom_h_out, gH_st, (self.BV, self.BK), sH_epi,
-            )
+                # Apply domain_offset for varlen store TMA tensors
+                if cutlass.const_expr(self.is_varlen):
+                    tma_tensor_h_out_v = cute.domain_offset(
+                        (0, 0, (chunk_off, 0, 0)), tma_tensor_h_out)
+                    tma_tensor_vnew_v = cute.domain_offset(
+                        (0, tok_offset, (0, 0)), tma_tensor_vnew_st)
+                else:
+                    tma_tensor_h_out_v = tma_tensor_h_out
+                    tma_tensor_vnew_v = tma_tensor_vnew_st
 
-            # ht uses B=num_seqs always, bidx is correct
-            gHt_st = tma_tensor_ht[None, None, (hidx, bidx)]
-            tma_ht_st, bSG_sHt, bSG_gHt = self._epilog_partition(
-                tma_atom_ht, gHt_st, (self.BV, self.BK), sH_epi,
-            )
-
-            # v_new TMA store partition
-            gVnew_st = tma_tensor_vnew_v[None, None, (hidx, data_bidx)]
-            tma_vnew_st, bSG_sVnew_st, bSG_gVnew_st = self._epilog_partition(
-                tma_atom_vnew_st, gVnew_st, (self.BV, self.BT), sVnew_store_epi,
-            )
-
-            # Varlen tail tile handling: prepare modified TMA descriptor for v_new store
-            # For the last chunk of a non-last sequence that isn't chunk-aligned,
-            # TMA store would write past the sequence boundary. We prevent this by
-            # modifying the TMA descriptor to truncate the T dimension.
-            if cutlass.const_expr(self.is_varlen):
-                ws_desc_ptr = self._tensormap_mgr.get_tensormap_ptr(
-                    (workspace_iter + bidx * 128).align(128)
+                gH_st = tma_tensor_h_out_v[None, None, (None, hidx, data_bidx)]
+                tma_h_st, bSG_sH, bSG_gH = self._epilog_partition(
+                    tma_atom_h_out, gH_st, (self.BV, self.BK), sH_epi,
                 )
-                need_tail_fixup = (seq_len % self.BT != 0) & (bidx < B - 1)
-                if need_tail_fixup:
-                    new_T = tok_offset + seq_len
-                    vnew_tail = cute.make_tensor(
-                        v_new_tensor.iterator,
-                        cute.make_layout(
-                            (V, new_T, (H, Int32(1))),
-                            stride=(Int32(1), H * V, (V, T * H * V)),
-                        ),
+
+                # ht uses B=num_seqs always, bidx is correct
+                gHt_st = tma_tensor_ht[None, None, (hidx, bidx)]
+                tma_ht_st, bSG_sHt, bSG_gHt = self._epilog_partition(
+                    tma_atom_ht, gHt_st, (self.BV, self.BK), sH_epi,
+                )
+
+                # v_new TMA store partition
+                gVnew_st = tma_tensor_vnew_v[None, None, (hidx, data_bidx)]
+                tma_vnew_st, bSG_sVnew_st, bSG_gVnew_st = self._epilog_partition(
+                    tma_atom_vnew_st, gVnew_st, (self.BV, self.BT), sVnew_store_epi,
+                )
+
+                # Varlen tail tile handling: prepare modified TMA descriptor for v_new store
+                if cutlass.const_expr(self.is_varlen):
+                    ws_desc_ptr = self._tensormap_mgr.get_tensormap_ptr(
+                        (workspace_iter + bidx * 128).align(128)
                     )
-                    cpasync.copy_tensormap(tma_atom_vnew_st, ws_desc_ptr)
-                    cpasync.update_tma_descriptor(tma_atom_vnew_st, vnew_tail, ws_desc_ptr)
-                    cpasync.fence_tma_desc_release()
+                    need_tail_fixup = (seq_len % self.BT != 0) & (bidx < B - 1)
+                    if need_tail_fixup:
+                        new_T = tok_offset + seq_len
+                        vnew_tail = cute.make_tensor(
+                            v_new_tensor.iterator,
+                            cute.make_layout(
+                                (V, new_T, (H, Int32(1))),
+                                stride=(Int32(1), H * V, (V, T * H * V)),
+                            ),
+                        )
+                        cpasync.copy_tensormap(tma_atom_vnew_st, ws_desc_ptr)
+                        cpasync.update_tma_descriptor(tma_atom_vnew_st, vnew_tail, ws_desc_ptr)
+                        cpasync.fence_tma_desc_release()
 
-            for chunk_idx in cutlass.range(0, NT, unroll=0):
-                h_handle = h_out_C.wait_and_advance()
+                for chunk_idx in cutlass.range(0, NT, unroll=0):
+                    h_handle = h_out_C.wait_and_advance()
 
-                cute.copy(tma_h_st, bSG_sH[None, h_handle.index],
-                          bSG_gH[(None, v_tile_idx, 0, chunk_idx)])
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    cute.copy(tma_h_st, bSG_sH[None, h_handle.index],
+                              bSG_gH[(None, v_tile_idx, 0, chunk_idx)])
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
 
-                h_handle.release()
+                    h_handle.release()
 
-                # v_new TMA store (with tail tile protection for varlen)
-                if save_v_new:
-                    vnew_handle = vnew_store_C.wait_and_advance()
-                    if cutlass.const_expr(self.is_varlen):
-                        remaining = seq_len - chunk_idx * self.BT
-                        is_tail = (remaining < self.BT) & (bidx < B - 1)
-                        if is_tail:
-                            cpasync.fence_tma_desc_acquire(ws_desc_ptr)
-                            cute.copy(tma_vnew_st,
-                                      bSG_sVnew_st[None, vnew_handle.index],
-                                      bSG_gVnew_st[(None, v_tile_idx, chunk_idx)],
-                                      tma_desc_ptr=self._tensormap_mgr.get_tensormap_ptr(
-                                          ws_desc_ptr, cute.AddressSpace.generic))
+                    # v_new TMA store (with tail tile protection for varlen)
+                    if save_v_new:
+                        vnew_handle = vnew_store_C.wait_and_advance()
+                        if cutlass.const_expr(self.is_varlen):
+                            remaining = seq_len - chunk_idx * self.BT
+                            is_tail = (remaining < self.BT) & (bidx < B - 1)
+                            if is_tail:
+                                cpasync.fence_tma_desc_acquire(ws_desc_ptr)
+                                cute.copy(tma_vnew_st,
+                                          bSG_sVnew_st[None, vnew_handle.index],
+                                          bSG_gVnew_st[(None, v_tile_idx, chunk_idx)],
+                                          tma_desc_ptr=self._tensormap_mgr.get_tensormap_ptr(
+                                              ws_desc_ptr, cute.AddressSpace.generic))
+                            else:
+                                cute.copy(tma_vnew_st,
+                                          bSG_sVnew_st[None, vnew_handle.index],
+                                          bSG_gVnew_st[(None, v_tile_idx, chunk_idx)])
                         else:
                             cute.copy(tma_vnew_st,
                                       bSG_sVnew_st[None, vnew_handle.index],
                                       bSG_gVnew_st[(None, v_tile_idx, chunk_idx)])
-                    else:
-                        cute.copy(tma_vnew_st,
-                                  bSG_sVnew_st[None, vnew_handle.index],
-                                  bSG_gVnew_st[(None, v_tile_idx, chunk_idx)])
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        vnew_handle.release()
+
+                # Store final state ht
+                if store_final_state:
+                    h_handle = h_out_C.wait_and_advance()
+                    cute.copy(tma_ht_st, bSG_sHt[None, h_handle.index],
+                              bSG_gHt[(None, v_tile_idx, 0)])
                     cute.arch.cp_async_bulk_commit_group()
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    vnew_handle.release()
-
-            # Store final state ht
-            if store_final_state:
-                h_handle = h_out_C.wait_and_advance()
-                cute.copy(tma_ht_st, bSG_sHt[None, h_handle.index],
-                          bSG_gHt[(None, v_tile_idx, 0)])
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
-                h_handle.release()
+                    h_handle.release()
 
         # =========================================================================
         # EMPTY WARP
@@ -1073,9 +1134,8 @@ class ChunkDeltaRuleFwdH:
         tmem.free(tmem_ptr)
 
     @cute.jit
-    def _tma_partition_B(self, tma_atom, tma_tensor, smem, tile_shape, tiled_mma, batch_idx):
+    def _tma_partition_B(self, tma_atom, tma_tensor, smem, tile_shape, tiled_mma, batch_idx, hidx):
         """Partition B operand tensors for TMA copy."""
-        _, hidx, _ = cute.arch.block_idx()
         coord = (0, None, None)
         gX = cute.local_tile(
             tma_tensor, cute.slice_(tile_shape, coord), (None, None, (hidx, batch_idx))
