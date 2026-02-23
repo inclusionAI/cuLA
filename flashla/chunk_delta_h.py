@@ -61,6 +61,7 @@ class ChunkDeltaRuleFwdH:
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         is_varlen: bool = False,
         BV: int = None,
+        num_stages: int = 2,
     ):
         self.chunk_size = chunk_size
         self.head_dim_k = head_dim_k
@@ -94,8 +95,8 @@ class ChunkDeltaRuleFwdH:
         # KV MMA tiler: (M=BV=64, N=BK=128, K=BT=64), A & B both SS
         self.kv_mma_tiler = (self.BV, self.BK, self.BT)
 
-        self.k_stage = 2
-        self.w_stage = 2
+        self.k_stage = num_stages
+        self.w_stage = num_stages
         self.u_stage = 2
         self.h_out_stage = 2
         self.vnew_store_stage = 2
@@ -107,6 +108,11 @@ class ChunkDeltaRuleFwdH:
 
         self.tmem_dealloc_sync_barrier = pipeline.NamedBarrier(
             barrier_id=2, num_threads=self.threads_per_cta,
+        )
+        # Barrier for CUDA warp-group sync during cooperative gk_scale precomputation
+        self.gk_precompute_bar = pipeline.NamedBarrier(
+            barrier_id=3,
+            num_threads=self.threads_per_warp * len(self.cuda_warp_ids),  # 128
         )
         self.buffer_align_bytes = 128
 
@@ -919,15 +925,20 @@ class ChunkDeltaRuleFwdH:
                     )
                     h_handle.commit()
 
-                    # gk decay: h *= gk (overlaps with WH MMA — longer K=128 window!)
-                    # Safe: R2T/R2S already captured pre-decay h; registers free until Phase 4
+                    # gk decay: h *= exp(gk) — cooperative precomputation
+                    # 128 CUDA threads cooperatively compute 128 gk_scale values (1 per K position)
+                    # then each thread applies only SMEM reads (no redundant exp2/SFU ops)
                     if use_gk:
                         gk_h = load_gk_C.wait_and_advance()
+                        # Step 1: Each CUDA thread (tidx 0-127) computes one exp2 and overwrites sGK in-place
+                        gk_raw = sGK_smem[(tidx, gk_h.index)]
+                        sGK_smem[(tidx, gk_h.index)] = cute.exp2(gk_raw * INV_LN2)
+                        # Step 2: Sync all 4 CUDA warps so all 128 scales are visible
+                        self.gk_precompute_bar.arrive_and_wait()
+                        # Step 3: Apply precomputed scales (SMEM read only, no exp2)
                         for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
                             v_coord, k_coord = tTR_cM_h[ei]
-                            gk_raw = sGK_smem[(k_coord, gk_h.index)]
-                            gk_scale = cute.exp2(gk_raw * INV_LN2)
-                            tTR_rKV[ei] = tTR_rKV[ei] * gk_scale
+                            tTR_rKV[ei] = tTR_rKV[ei] * sGK_smem[(k_coord, gk_h.index)]
                         gk_h.release()
 
                     # ========================================
