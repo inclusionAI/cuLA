@@ -950,10 +950,11 @@ class ChunkDeltaRuleFwdH:
                     tTR_rKV_bf16 = cute.make_rmem_tensor(tTR_rKV.shape, self.io_dtype)
                     tRT_rState = cute.make_rmem_tensor(r2t_state_shape, self.io_dtype)
                     h_vec = tTR_rKV.load()
-                    tTR_rKV_bf16.store(h_vec.to(self.io_dtype))
+                    h_vec_bf16 = h_vec.to(self.io_dtype)  # single FP32→BF16 conversion
+                    tTR_rKV_bf16.store(h_vec_bf16)
 
                     # R2T h state → TMEM (triggers WH MMA — zero-copy A operand)
-                    tRT_rState.store(h_vec.to(self.io_dtype))
+                    tRT_rState.store(h_vec_bf16)
                     state_h = state_smem_P.acquire_and_advance()
                     cute.copy(tiled_r2t_state, tRT_rState, tRT_tState[(None, None, None, None, 0)])
                     cute.arch.fence_view_async_tmem_store()
@@ -1011,13 +1012,14 @@ class ChunkDeltaRuleFwdH:
                                 if t_coord >= valid_len_chunk:
                                     tTR_rWH[ei] = Float32(0.0)
 
-                    # Prepare bf16 v_new for both R2T and R2S
+                    # Prepare bf16 v_new for both R2T and R2S (single conversion)
+                    vnew_vec_bf16 = tTR_rWH.load().to(self.io_dtype)
                     tTR_rVnew_bf16 = cute.make_rmem_tensor(tTR_rWH.shape, self.io_dtype)
-                    tTR_rVnew_bf16.store(tTR_rWH.load().to(self.io_dtype))
+                    tTR_rVnew_bf16.store(vnew_vec_bf16)
 
                     # R2T v_new → TMEM FIRST (triggers KV MMA — zero-copy A operand)
                     tRT_rVnew = cute.make_rmem_tensor(r2t_vnew_shape, self.io_dtype)
-                    tRT_rVnew.store(tTR_rWH.load().to(self.io_dtype))
+                    tRT_rVnew.store(vnew_vec_bf16)
                     vnew_h = vnew_smem_P.acquire_and_advance()
                     cute.copy(tiled_r2t_vnew, tRT_rVnew, tRT_tVnew[(None, None, None, None, 0)])
                     cute.arch.fence_view_async_tmem_store()
