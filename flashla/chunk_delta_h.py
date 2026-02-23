@@ -63,6 +63,7 @@ class ChunkDeltaRuleFwdH:
         BV: int = None,
         num_stages: int = 2,
         min_occupancy: int = 1,
+        persistent: bool = True,
     ):
         self.chunk_size = chunk_size
         self.head_dim_k = head_dim_k
@@ -86,6 +87,7 @@ class ChunkDeltaRuleFwdH:
         #   208 is the minimum to eliminate all register spilling in varlen mode
         # - occ=2: 128 regs (just enough for 64 h-state regs + 64 spare)
         self.min_occupancy = min_occupancy
+        self.persistent = persistent if is_varlen else False  # only meaningful for varlen
         if min_occupancy >= 2:
             self.num_regs_cuda = 128
         else:
@@ -160,10 +162,15 @@ class ChunkDeltaRuleFwdH:
     def _compute_grid(self, B, H, V):
         num_v_tiles = (V + self.BV - 1) // self.BV
         if self.is_varlen:
-            import torch
-            sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-            # Scale grid by min_occupancy: more CTAs to fill higher occupancy
-            return (sm_count * self.min_occupancy, 1, 1)
+            if self.persistent:
+                import torch
+                sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+                # Scale grid by min_occupancy: more CTAs to fill higher occupancy
+                return (sm_count * self.min_occupancy, 1, 1)
+            else:
+                # Non-persistent: one CTA per work unit, free HW scheduling
+                total_work_units = num_v_tiles * H * B
+                return (total_work_units, 1, 1)
         return (num_v_tiles, H, B)
 
     @cute.jit
@@ -668,7 +675,8 @@ class ChunkDeltaRuleFwdH:
         BT = self.BT
 
         if cutlass.const_expr(self.is_varlen):
-            # Persistent kernel: 1D grid, decode work per-warp in outer loop
+            # 1D grid work decode: persistent (grid=SM_count, multi-iter) or
+            # non-persistent (grid=total_work_units, single iter per CTA)
             block_idx_x = cute.arch.block_idx()[0]
             grid_dim_x = cute.arch.grid_dim()[0]
             num_v_tiles = (V + self.BV - 1) // self.BV
