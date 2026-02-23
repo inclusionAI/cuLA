@@ -85,13 +85,11 @@ class ChunkDeltaRuleFwdH:
         # Register allocation:
         # - occ=1: 208 regs (varlen) / 232 regs (non-varlen) for CUDA warps
         #   208 is the minimum to eliminate all register spilling in varlen mode
-        # - occ=2: 128 regs (just enough for 64 h-state regs + 64 spare)
+        # - occ=2: KEEP same reg counts! warpgroup_reg_alloc/dealloc redistributes
+        #   within CTA budget. Per CTA: 4×208×32 + 4×40×32 = 31,744 ≤ 128×256 = 32,768
         self.min_occupancy = min_occupancy
         self.persistent = persistent if is_varlen else False  # only meaningful for varlen
-        if min_occupancy >= 2:
-            self.num_regs_cuda = 128
-        else:
-            self.num_regs_cuda = 208 if is_varlen else 232
+        self.num_regs_cuda = 208 if is_varlen else 232
         self.num_regs_others = 40
         self.threads_per_cta = self.threads_per_warp * 8
 
