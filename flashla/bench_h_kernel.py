@@ -128,18 +128,23 @@ def main():
     configs = [
         # (B, T, H, use_g, use_gk, use_h0, store_ht, save_vnew)
         # --- T=8192, all features (gk, h0, ht, vn), sweep B × H ---
+        (1,  8192, 16,  False, True, True, True, True),
         (1,  8192, 32,  False, True, True, True, True),
         (1,  8192, 64,  False, True, True, True, True),
         (1,  8192, 128, False, True, True, True, True),
+        (2,  8192, 16,  False, True, True, True, True),
         (2,  8192, 32,  False, True, True, True, True),
         (2,  8192, 64,  False, True, True, True, True),
         (2,  8192, 128, False, True, True, True, True),
+        (4,  8192, 16,  False, True, True, True, True),
         (4,  8192, 32,  False, True, True, True, True),
         (4,  8192, 64,  False, True, True, True, True),
         (4,  8192, 128, False, True, True, True, True),
+        (8,  8192, 16,  False, True, True, True, True),
         (8,  8192, 32,  False, True, True, True, True),
         (8,  8192, 64,  False, True, True, True, True),
         (8,  8192, 128, False, True, True, True, True),
+        (16, 8192, 16,  False, True, True, True, True),
         (16, 8192, 32,  False, True, True, True, True),
         (16, 8192, 64,  False, True, True, True, True),
         # --- T=8192, minimal features, sweep B × H ---

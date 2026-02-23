@@ -209,8 +209,10 @@ def main():
     configs = [
         # (num_seqs, H, ratio, use_gk, use_h0, store_ht, save_vnew, description)
         # Core target scenario: 20-25 seqs, ratio 2-4x, all features
+        (20, 16,  2.0, True, True, True, True, "20 seqs, ratio=2x, H=16"),
         (20, 32,  2.0, True, True, True, True, "20 seqs, ratio=2x, H=32"),
         (20, 64,  2.0, True, True, True, True, "20 seqs, ratio=2x, H=64"),
+        (25, 16,  3.0, True, True, True, True, "25 seqs, ratio=3x, H=16"),
         (25, 32,  3.0, True, True, True, True, "25 seqs, ratio=3x, H=32"),
         (25, 64,  3.0, True, True, True, True, "25 seqs, ratio=3x, H=64"),
         (20, 64,  4.0, True, True, True, True, "20 seqs, ratio=4x, H=64"),
