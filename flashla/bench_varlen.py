@@ -86,7 +86,7 @@ def bench_fn(fn, warmup=5, n_iter=20):
 
 def run_varlen_benchmark(num_seqs, total_T, H, K, V, BT, ratio,
                          use_gk=True, use_h0=True, store_ht=True, save_vnew=True,
-                         seed=42, BV=None, num_stages=2):
+                         seed=42, BV=None, num_stages=2, min_occupancy=1):
     """Run one varlen benchmark config: our kernel vs FLA."""
     device = "cuda"
     dtype = torch.bfloat16
@@ -147,7 +147,7 @@ def run_varlen_benchmark(num_seqs, total_T, H, K, V, BT, ratio,
     ht_out = torch.zeros(num_seqs, H, K, V, device=device, dtype=dtype)
     workspace = torch.zeros(num_seqs * 128, dtype=torch.uint8, device=device)
     
-    kernel = ChunkDeltaRuleFwdH(chunk_size=BT, head_dim_k=K, head_dim_v=V, is_varlen=True, BV=BV, num_stages=num_stages)
+    kernel = ChunkDeltaRuleFwdH(chunk_size=BT, head_dim_k=K, head_dim_v=V, is_varlen=True, BV=BV, num_stages=num_stages, min_occupancy=min_occupancy)
     stream = cutlass_torch.default_stream()
     
     kc, wc, uc = from_dlpack(k), from_dlpack(w), from_dlpack(u)
@@ -190,12 +190,16 @@ def main():
     parser.add_argument("--stages", type=int, nargs="+", default=None,
                         help="Pipeline stage counts to sweep (default: [2]). "
                              "Multiple values compare different stage depths.")
+    parser.add_argument("--occ", type=int, nargs="+", default=None,
+                        help="Min occupancy levels to sweep (default: [1]). "
+                             "occ=2 reduces regs to 128 and SMEM stages for 2 CTAs/SM.")
     args = parser.parse_args()
     
     K, V, BT = args.head_dim_k, args.head_dim_v, args.chunk_size
     total_T = args.total_T
     bv_list = args.bv if args.bv else [64]
     stages_list = args.stages if args.stages else [2]
+    occ_list = args.occ if args.occ else [1]
     
     configs = [
         # (num_seqs, H, ratio, use_gk, use_h0, store_ht, save_vnew, description)
@@ -214,43 +218,44 @@ def main():
         (40, 64,  3.0, True, True, True, True, "40 seqs, ratio=3x, H=64"),
     ]
     
-    # Build variant keys: (BV, stages) combinations
-    variants = [(bv, s) for bv in bv_list for s in stages_list]
+    # Build variant keys: (BV, stages, occ) combinations
+    variants = [(bv, s, occ) for bv in bv_list for s in stages_list for occ in occ_list]
     
-    print(f"Varlen Benchmark: total_T={total_T}, K={K}, V={V}, BT={BT}, BV={bv_list}, stages={stages_list}")
+    print(f"Varlen Benchmark: total_T={total_T}, K={K}, V={V}, BT={BT}, BV={bv_list}, stages={stages_list}, occ={occ_list}")
     
     # Build header
-    var_cols = "".join(f" {f'B{bv}S{s}':>10}" for bv, s in variants)
+    var_cols = "".join(f" {f'B{bv}S{s}O{occ}':>12}" for bv, s, occ in variants)
     print(f"{'Config':<45}{var_cols} {'FLA':>10} {'Best':>7} {'MinL':>5} {'MaxL':>5} {'Ratio':>6}")
-    print("-" * (45 + 10 * len(variants) + 10 + 7 + 5 + 5 + 6 + 6))
+    print("-" * (45 + 12 * len(variants) + 10 + 7 + 5 + 5 + 6 + 6))
     
     all_speedups = {v: [] for v in variants}
     for (num_seqs, H, ratio, use_gk, use_h0, store_ht, save_vnew, desc) in configs:
         fla_ms = None
         results = {}
-        for bv, s in variants:
+        for bv, s, occ in variants:
             our_ms, fla_ms_cur, seq_lens, actual_ratio = run_varlen_benchmark(
                 num_seqs, total_T, H, K, V, BT, ratio,
                 use_gk, use_h0, store_ht, save_vnew, BV=bv, num_stages=s,
+                min_occupancy=occ,
             )
-            results[(bv, s)] = our_ms
+            results[(bv, s, occ)] = our_ms
             fla_ms = fla_ms_cur  # same for all variants
         
         best_var = min(results, key=results.get)
         best_sp = fla_ms / results[best_var]
         min_l, max_l = min(seq_lens), max(seq_lens)
         
-        var_str = "".join(f" {results[v]:>9.3f}ms" for v in variants)
+        var_str = "".join(f" {results[v]:>11.3f}ms" for v in variants)
         print(f"{desc:<45}{var_str} {fla_ms:>9.3f}ms {best_sp:>6.2f}x {min_l:>5} {max_l:>5} {actual_ratio:>5.1f}x")
         
         for v in variants:
             all_speedups[v].append(fla_ms / results[v])
     
-    print("-" * (45 + 10 * len(variants) + 10 + 7 + 5 + 5 + 6 + 6))
+    print("-" * (45 + 12 * len(variants) + 10 + 7 + 5 + 5 + 6 + 6))
     for v in variants:
         geo = math.exp(sum(math.log(s) for s in all_speedups[v]) / len(all_speedups[v]))
-        bv, s = v
-        print(f"{'Geomean B'+str(bv)+'S'+str(s):<45} {geo:>6.2f}x")
+        bv, s, occ = v
+        print(f"{'Geomean B'+str(bv)+'S'+str(s)+'O'+str(occ):<45} {geo:>6.2f}x")
 
 
 if __name__ == "__main__":
