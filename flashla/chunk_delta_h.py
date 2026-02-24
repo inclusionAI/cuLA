@@ -8,11 +8,13 @@ Optimized version eliminating GMEM roundtrip:
 - h_state: carried in CUDA registers across chunks (no R2T needed)
 - v_new: computed in registers → R2S to sVnew (SMEM) → KV MMA A operand
 
-Both MMAs share M=BV=64 and use SS (SMEM×SMEM) operand mode:
+Both MMAs share M=BV and use TMEM×SMEM operand mode:
 - WH MMA: state(BV,BK) @ W(BT,BK) → WH_acc(BV,BT)
 - KV MMA: v_new^T(BV,BT) @ K^T(BK,BT) → update(BV,BK)  [ACCUMULATE=False]
 
 After KV MMA:  h_new = G * h + update  (in registers)
+
+BV must be a multiple of 64 (tcgen05.mma.ws M-mode constraint for bf16).
 """
 
 import argparse
@@ -48,7 +50,7 @@ def make_thread_cooperative_group(size: int):
 
 class ChunkDeltaRuleFwdH:
     """
-    V2: No GMEM roundtrip. Both MMAs share M=BV=64, SS operand mode.
+    V2: No GMEM roundtrip. Both MMAs share M=BV (32 or 64), TMEM×SMEM operand mode.
     h carried in CUDA registers; KV MMA only computes update term.
     """
 
@@ -93,9 +95,9 @@ class ChunkDeltaRuleFwdH:
         self.num_regs_others = 40
         self.threads_per_cta = self.threads_per_warp * 8
 
-        # WH MMA tiler: (M=BV=64, N=BT=64, K=BK=128), A & B both SS
+        # WH MMA tiler: (M=BV, N=BT=64, K=BK=128), A from TMEM, B from SMEM
         self.wh_mma_tiler = (self.BV, self.BT, self.BK)
-        # KV MMA tiler: (M=BV=64, N=BK=128, K=BT=64), A & B both SS
+        # KV MMA tiler: (M=BV, N=BK=128, K=BT=64), A from TMEM, B from SMEM
         self.kv_mma_tiler = (self.BV, self.BK, self.BT)
 
         self.k_stage = num_stages
@@ -129,17 +131,17 @@ class ChunkDeltaRuleFwdH:
     @staticmethod
     def _plan_tmem_offsets(tiled_mma_wh, tile_wh, tiled_mma_kv, tile_kv, state_tmem_layout, vnew_tmem_layout, acc_stages):
         SM100_TMEM_CAPACITY_COLS = 512
-        # WH acc: (BV=64, BT=64) FP32
+        # WH acc: (BV, BT) FP32
         wh_shape = tiled_mma_wh.partition_shape_C(tile_wh[:2])
         wh_fake = tiled_mma_wh.make_fragment_C(cute.append(wh_shape, acc_stages))
         num_wh = tcgen05.find_tmem_tensor_col_offset(wh_fake)
-        # State TMEM A operand for WH MMA: (BV=64, BK=128) BF16
+        # State TMEM A operand for WH MMA: (BV, BK) BF16
         tCrState_fake = tiled_mma_wh.make_fragment_A(state_tmem_layout.outer.shape)
         num_state = tcgen05.find_tmem_tensor_col_offset(tCrState_fake)
-        # v_new TMEM A operand for KV MMA: (BV=64, BT=64) BF16
+        # v_new TMEM A operand for KV MMA: (BV, BT) BF16
         tCrVnew_fake = tiled_mma_kv.make_fragment_A(vnew_tmem_layout.outer.shape)
         num_vnew = tcgen05.find_tmem_tensor_col_offset(tCrVnew_fake)
-        # KV acc: (BV=64, BK=128) FP32
+        # KV acc: (BV, BK) FP32
         kv_shape = tiled_mma_kv.partition_shape_C(tile_kv[:2])
         kv_fake = tiled_mma_kv.make_fragment_C(cute.append(kv_shape, 1))
         num_kv = tcgen05.find_tmem_tensor_col_offset(kv_fake)
@@ -307,21 +309,21 @@ class ChunkDeltaRuleFwdH:
         h_out_epi_staged = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
             utils.LayoutEnum.COL_MAJOR,
-            (self.BV, self.BK),  # (64, 128)
+            (self.BV, self.BK),
             self.h_out_stage,
         )
         # U SMEM for TMA load — COL_MAJOR (BV, BT), BV contiguous matches u_T GMEM
         u_epi_staged = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
             utils.LayoutEnum.COL_MAJOR,
-            (self.BV, self.BT),  # (64, 64)
+            (self.BV, self.BT),
             self.u_stage,
         )
         # v_new store SMEM — COL_MAJOR (BV, BT) for TMA S2G
         vnew_store_epi_staged = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
             utils.LayoutEnum.COL_MAJOR,
-            (self.BV, self.BT),  # (64, 64)
+            (self.BV, self.BT),
             self.vnew_store_stage,
         )
 
@@ -387,10 +389,10 @@ class ChunkDeltaRuleFwdH:
             num_bits_per_copy=universal_copy_bits,
         )
         # Thread layout for 32 store-warp threads over (BV, BT) tile:
-        # - BV (mode 0, contiguous): 8 thread-groups × 8 values = 64
-        # - BT (mode 1): 4 threads × 1 value = 4 per iteration, 16 repeats
-        vnew_thr_dim0 = self.BV // async_copy_elems  # 8
-        vnew_thr_dim1 = self.threads_per_warp // vnew_thr_dim0  # 4
+        # BV=64: dim0=8 thread-groups × 8 values = 64, dim1=4 threads, 16 BT-repeats
+        # BV=32: dim0=4 thread-groups × 8 values = 32, dim1=8 threads, 8 BT-repeats
+        vnew_thr_dim0 = self.BV // async_copy_elems  # BV=64→8, BV=32→4
+        vnew_thr_dim1 = self.threads_per_warp // vnew_thr_dim0  # BV=64→4, BV=32→8
         assert self.BT % vnew_thr_dim1 == 0
         vnew_thr_layout = cute.make_ordered_layout(
             (vnew_thr_dim0, vnew_thr_dim1), order=(0, 1),
@@ -833,7 +835,9 @@ class ChunkDeltaRuleFwdH:
 
             local_tidx = tidx % (self.threads_per_warp * len(self.cuda_warp_ids))
 
-            # ----- T2R setup for KV acc (BV=64, BK=128 FP32) -----
+            # ----- T2R setup for KV acc (BV, BK FP32) -----
+            # Repetition determined by N(=BK) cols: BK=128 FP32 → Rep=16
+            # Independent of M(=BV): same Rep for BV=32 and BV=64
             t2r_atom_kv = cute.make_copy_atom(
                 tcgen05.Ld16x256bOp(tcgen05.Repetition(16), tcgen05.Pack.NONE),
                 self.acc_dtype,
@@ -850,7 +854,8 @@ class ChunkDeltaRuleFwdH:
             # h state in registers (persistent across chunks)
             tTR_rKV = cute.make_rmem_tensor(tTR_sKV.shape, self.acc_dtype)
 
-            # ----- T2R setup for WH acc (BV=64, BT=64 FP32) -----
+            # ----- T2R setup for WH acc (BV, BT FP32) -----
+            # Repetition determined by N(=BT) cols: BT=64 FP32 → Rep=8
             t2r_atom_wh = cute.make_copy_atom(
                 tcgen05.Ld16x256bOp(tcgen05.Repetition(8), tcgen05.Pack.NONE),
                 self.acc_dtype,
@@ -866,6 +871,7 @@ class ChunkDeltaRuleFwdH:
             tTR_sWH = thr_t2r_wh.partition_D(fake_sWH)
 
             # ----- R2T: h state regs → TMEM for WH MMA A operand -----
+            # Repetition by N(=BK) col count: BK=128 BF16 → 64 cols → Rep=16
             copy_atom_r2t_state = cute.make_copy_atom(
                 tcgen05.St16x128bOp(tcgen05.Repetition(16), tcgen05.Unpack.NONE),
                 self.io_dtype,
@@ -892,6 +898,7 @@ class ChunkDeltaRuleFwdH:
             tRS_sVnew_store = thr_r2s_vnew.partition_D(sVnew_store_epi)
 
             # ----- R2T: v_new regs → TMEM for KV MMA A operand -----
+            # Repetition by N(=BT) col count: BT=64 BF16 → 32 cols → Rep=8
             copy_atom_r2t_vnew = cute.make_copy_atom(
                 tcgen05.St16x128bOp(tcgen05.Repetition(8), tcgen05.Unpack.NONE),
                 self.io_dtype,
