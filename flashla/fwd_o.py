@@ -23,7 +23,7 @@ Scale is folded into the gating: qg = q * 2^g * scale.
 
 Kernel design (TMEM A-operand approach):
   Grid: (ceil(V/BV), NT, B*H)
-  6 warps = 192 threads
+  8 warps = 256 threads (occ=2 enabled)
 
   Warp specialization:
     Warps 0-3 (CUDA):
@@ -34,11 +34,13 @@ Kernel design (TMEM A-operand approach):
     Warp 4 (MMA):
         - QH MMA: qg(TMEM) × h(SMEM) → acc(TMEM)
         - AV MMA: am(TMEM) × v(SMEM) → acc(TMEM, ACCUMULATE)
-        - tcgen05.st: acc → sO
-        - TMA S2G: sO → GMEM
     Warp 5 (Load):
         - TMA G2S: q, g, A → epilog SMEM
         - TMA G2S: h, v → MMA B-operand SMEM
+    Warp 6 (Store):
+        - TMA S2G: sO → GMEM
+    Warp 7 (Empty):
+        - Required for warp group register redistribution
 
   TMEM layout:
     ACC:   (BT, BV) fp32 — shared accumulator for QH and AV
@@ -46,10 +48,16 @@ Kernel design (TMEM A-operand approach):
     AM_A:  (BT, BT) bf16 — A-operand for AV MMA
 
   Pipeline:
-    Load→CUDA: q, g, A  (PipelineTmaAsync, 2-stage)
-    Load→MMA:  h, v      (PipelineTmaUmma, 2-stage)
+    Load→CUDA: q, g, A  (PipelineTmaAsync, 1-stage)
+    Load→MMA:  h, v      (PipelineTmaUmma, 1-stage)
     CUDA→MMA:  qg_ready  (PipelineAsyncUmma, 1-stage)
     CUDA→MMA:  am_ready  (PipelineAsyncUmma, 1-stage)
+    MMA→CUDA:  acc_done  (PipelineUmmaAsync, 1-stage)
+    CUDA→Store: o_ready  (PipelineAsync, 1-stage)
+
+  Output epilog:
+    CUDA warps: T2R (ACC TMEM → FP32 regs) → FP32→BF16 → R2S (regs → sO)
+    Load warp:  TMA store sO → GMEM
 """
 
 import argparse
@@ -101,6 +109,7 @@ class ChunkGlaFwdO:
         is_varlen: bool = False,
         BK: int = 128,
         BV: int = 128,
+        min_occupancy: int = 2,
     ):
         self.chunk_size = chunk_size
         self.head_dim_k = head_dim_k
@@ -118,10 +127,15 @@ class ChunkGlaFwdO:
         self.cuda_warp_ids = (0, 1, 2, 3)
         self.mma_warp_id = 4
         self.load_warp_id = 5
-        self.threads_per_cta = self.threads_per_warp * 6  # 192
+        self.store_warp_id = 6
+        self.empty_warp_id = 7
+        self.threads_per_cta = self.threads_per_warp * 8  # 256
 
-        self.num_regs_cuda = 232
+        # Register allocation for occ=2:
+        # Per CTA: 4×208×32 + 4×40×32 = 31,744 ≤ 32,768
+        self.num_regs_cuda = 208
         self.num_regs_others = 40
+        self.min_occupancy = min_occupancy
 
         self.cluster_shape_mnk = (1, 1, 1)
         self.cta_group = tcgen05.CtaGroup.ONE
@@ -129,12 +143,13 @@ class ChunkGlaFwdO:
         # Number of K tiles for QH MMA (K=BK for KDA)
         self.num_k_tiles = (head_dim_k + BK - 1) // BK  # 1
 
-        # Pipeline stages
-        self.q_stage = 2
-        self.g_stage = 2
-        self.h_stage = 2
-        self.v_stage = 2
-        self.a_stage = 2
+        # Pipeline stages — 1-stage since kernel has no chunk loop;
+        # 2-stage would waste SMEM without pipelining benefit.
+        self.q_stage = 1
+        self.g_stage = 1
+        self.h_stage = 1
+        self.v_stage = 1
+        self.a_stage = 1
         self.acc_stage = 1
 
         # MMA tiler shapes:
@@ -445,6 +460,7 @@ class ChunkGlaFwdO:
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
             stream=stream,
+            min_blocks_per_mp=self.min_occupancy,
         )
 
     @cute.kernel
@@ -679,6 +695,12 @@ class ChunkGlaFwdO:
                       dst=bSG_sA[None, a_h.index],
                       tma_bar_ptr=a_h.barrier)
 
+        # =====================================================================
+        # STORE WARP
+        # =====================================================================
+        elif warp_idx == self.store_warp_id:
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
+
             # Wait for CUDA warps to write O to SMEM, then TMA store
             cpasync.prefetch_descriptor(tma_atom_o)
             o_h = o_ready_C.wait_and_advance()
@@ -686,6 +708,12 @@ class ChunkGlaFwdO:
             cute.arch.cp_async_bulk_commit_group()
             cute.arch.cp_async_bulk_wait_group(0, read=True)
             o_h.release()
+
+        # =====================================================================
+        # EMPTY WARP
+        # =====================================================================
+        elif warp_idx == self.empty_warp_id:
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
         # =====================================================================
         # MMA WARP
@@ -884,9 +912,6 @@ class ChunkGlaFwdO:
 
             # Retile BF16 regs for R2S and copy to sO
             tRS_rO = tiled_r2s_o.retile(tTR_rAcc_bf16)
-            if cutlass.const_expr(PRINT_DEBUG):
-                print(f"tRS_rO: {tRS_rO}")
-
             o_h = o_ready_P.acquire_and_advance()
             cute.copy(tiled_r2s_o, tRS_rO, tRS_sO[(None, None, None, 0)])
             cute.arch.fence_proxy(
