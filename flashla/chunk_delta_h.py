@@ -76,7 +76,7 @@ class ChunkDeltaRuleFwdH:
 
         self.BT = chunk_size   # 64
         self.BK = head_dim_k   # 128
-        self.BV = BV if BV is not None else head_dim_v  # V tiling (default: no tiling)
+        self.BV = BV if BV is not None else 64  # V tiling (default: 64, must be multiple of 64)
 
         self.threads_per_warp = 32
         self.cuda_warp_ids = (0, 1, 2, 3)
@@ -126,7 +126,7 @@ class ChunkDeltaRuleFwdH:
             barrier_id=3,
             num_threads=self.threads_per_warp * len(self.cuda_warp_ids),  # 128
         )
-        self.buffer_align_bytes = 128
+        self.buffer_align_bytes = 1024
 
     @staticmethod
     def _plan_tmem_offsets(tiled_mma_wh, tile_wh, tiled_mma_kv, tile_kv, state_tmem_layout, vnew_tmem_layout, acc_stages):
