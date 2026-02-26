@@ -100,7 +100,7 @@ class ChunkDeltaRuleFwdH:
         self.w_stage = 3
         self.u_stage = 3
         self.h_out_stage = 2
-        self.vnew_store_stage = 2
+        self.vnew_store_stage = 3
         self.acc_stage = 1
         self.cluster_shape_mnk = (1, 1, 1)
         self.cta_group = tcgen05.CtaGroup.ONE
