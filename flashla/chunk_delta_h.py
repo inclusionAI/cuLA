@@ -336,10 +336,6 @@ class ChunkDeltaRuleFwdH:
             tma_store_op, h_out_T, h_epi_smem, (self.BV, self.BK),
         )
 
-        tma_atom_ht, tma_tensor_ht = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            tma_store_op, ht_T, h_epi_smem, (self.BV, self.BK),
-        )
-
         # TMA descriptor for U load (G2S) — non-MMA operand
         u_smem = cute.select(u_epi_staged, mode=[0, 1])
         tma_atom_u, tma_tensor_u = cute.nvgpu.cpasync.make_tiled_tma_atom(
@@ -449,12 +445,11 @@ class ChunkDeltaRuleFwdH:
             tma_atom_w, tma_tensor_w,
             tma_atom_kt, tma_tensor_kt,
             tma_atom_h_out, tma_tensor_h_out,
-            tma_atom_ht, tma_tensor_ht,
             tma_atom_u, tma_tensor_u,
             tma_atom_vnew_st, tma_tensor_vnew_st,
             tma_atom_gk, tma_tensor_gk,
             gmem_tiled_copy_vnew,
-            h0, u, u_T, h_out_T, v_new,
+            h0, ht_T, u, u_T, h_out_T, v_new,
             w_smem_staged, kt_smem_staged,
             state_tmem_layout, vnew_tmem_layout,
             h_out_epi_staged,
@@ -482,8 +477,6 @@ class ChunkDeltaRuleFwdH:
         tma_tensor_kt: cute.Tensor,
         tma_atom_h_out: cute.CopyAtom,
         tma_tensor_h_out: cute.Tensor,
-        tma_atom_ht: cute.CopyAtom,
-        tma_tensor_ht: cute.Tensor,
         tma_atom_u: cute.CopyAtom,
         tma_tensor_u: cute.Tensor,
         tma_atom_vnew_st: cute.CopyAtom,
@@ -492,6 +485,7 @@ class ChunkDeltaRuleFwdH:
         tma_tensor_gk: cute.Tensor,
         gmem_tiled_copy_vnew: cute.TiledCopy,
         h0: cute.Tensor,
+        ht_tensor: cute.Tensor,
         u_tensor: cute.Tensor,
         u_T_tensor: cute.Tensor,
         h_out_T_tensor: cute.Tensor,
@@ -634,6 +628,11 @@ class ChunkDeltaRuleFwdH:
         )
 
         # ===================== MMA fragments =====================
+        sVnew_store_epi = storage.sVnew_store.get_tensor(
+            vnew_store_epi_staged.outer, swizzle=vnew_store_epi_staged.inner,
+        )
+
+        # ===================== MMA fragments ======================
         # WH MMA: A=state(TMEM), B=sW, acc=WH TMEM
         tCrState_fake = wh_tiled_mma.make_fragment_A(state_tmem_layout.outer.shape)
         tCrState = cute.make_tensor(
@@ -1051,19 +1050,12 @@ class ChunkDeltaRuleFwdH:
                     update_vec = tTR_rUpdate.load()
                     tTR_rKV.store(h_vec + update_vec)
 
-                # ===== After main loop: store final state ht =====
+                # ===== After main loop: store final state ht (fp32 reg → fp32 GMEM) =====
                 if store_final_state:
-                    tTR_rKV_bf16 = cute.make_rmem_tensor(tTR_rKV.shape, self.io_dtype)
-                    h_vec = tTR_rKV.load()
-                    tTR_rKV_bf16.store(h_vec.to(self.io_dtype))
-                    tRS_rH = tiled_r2s_h.retile(tTR_rKV_bf16)
-                    h_handle = h_out_P.acquire_and_advance()
-                    cute.copy(tiled_r2s_h, tRS_rH, tRS_sH[(None, None, None, h_handle.index)])
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
-                    )
-                    h_handle.commit()
+                    gHt = ht_tensor[None, None, (hidx, bidx)]  # (V, K)
+                    for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
+                        v_coord, k_coord = tTR_cM_h[ei]
+                        gHt[v_coord + v_tile_idx * self.BV, k_coord] = tTR_rKV[ei]
 
         # =========================================================================
         # STORE WARP
@@ -1072,7 +1064,6 @@ class ChunkDeltaRuleFwdH:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_h_out)
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_ht)
             if cutlass.const_expr(not self.is_varlen):
                 cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_vnew_st)
 
@@ -1104,12 +1095,6 @@ class ChunkDeltaRuleFwdH:
                 gH_st = tma_tensor_h_out_v[None, None, (None, hidx, data_bidx)]
                 tma_h_st, bSG_sH, bSG_gH = self._epilog_partition(
                     tma_atom_h_out, gH_st, (self.BV, self.BK), sH_epi,
-                )
-
-                # ht uses B=num_seqs always, bidx is correct
-                gHt_st = tma_tensor_ht[None, None, (hidx, bidx)]
-                tma_ht_st, bSG_sHt, bSG_gHt = self._epilog_partition(
-                    tma_atom_ht, gHt_st, (self.BV, self.BK), sH_epi,
                 )
 
                 # v_new store partition: TMA for non-varlen, direct GMEM for varlen
@@ -1199,15 +1184,6 @@ class ChunkDeltaRuleFwdH:
                             cute.arch.cp_async_bulk_commit_group()
                             cute.arch.cp_async_bulk_wait_group(0, read=True)
                         vnew_handle.release()
-
-                # Store final state ht
-                if store_final_state:
-                    h_handle = h_out_C.wait_and_advance()
-                    cute.copy(tma_ht_st, bSG_sHt[None, h_handle.index],
-                              bSG_gHt[(None, v_tile_idx, 0)])
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    h_handle.release()
 
         # =========================================================================
         # EMPTY WARP

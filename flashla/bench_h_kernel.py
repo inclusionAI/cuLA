@@ -81,7 +81,7 @@ def run_benchmark(B, T, H, K, V, BT, use_g, use_gk, use_h0, store_ht, save_vnew)
 
     h_out = torch.zeros(B, NT, H, K, V, device=device, dtype=dtype)
     v_new_out = torch.zeros(B, T, H, V, device=device, dtype=dtype)
-    ht_out = torch.zeros(B, H, K, V, device=device, dtype=dtype)
+    ht_out = torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
 
     kernel = ChunkDeltaRuleFwdH(chunk_size=BT, head_dim_k=K, head_dim_v=V)
     stream = cutlass_torch.default_stream()

@@ -82,7 +82,7 @@ def run_test(
 
     h_out = torch.zeros(1, total_NT, H, K, V, device=device, dtype=dtype)
     v_new_out = torch.zeros(1, total_T, H, V, device=device, dtype=dtype)
-    ht_out = torch.zeros(num_seqs, H, K, V, device=device, dtype=dtype)
+    ht_out = torch.zeros(num_seqs, H, K, V, device=device, dtype=torch.float32)
     workspace = torch.zeros(128, dtype=torch.uint8, device=device)
     stream = cutlass_torch.default_stream()
 
