@@ -62,7 +62,6 @@ class ChunkDeltaRuleFwdH:
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         is_varlen: bool = False,
-        min_occupancy: int = 1,
         persistent: bool = True,
     ):
         self.chunk_size = chunk_size
@@ -82,12 +81,10 @@ class ChunkDeltaRuleFwdH:
         self.load_warp_id = 5
         self.store_warp_id = 6
         self.empty_warp_id = 7
-        # Register allocation:
-        # - occ=1: 208 regs (varlen) / 232 regs (non-varlen) for CUDA warps
+        # Register allocation (occ=1 only):
+        # - 208 regs (varlen) / 232 regs (non-varlen) for CUDA warps
         #   208 is the minimum to eliminate all register spilling in varlen mode
-        # - occ=2: KEEP same reg counts! warpgroup_reg_alloc/dealloc redistributes
-        #   within CTA budget. Per CTA: 4×208×32 + 4×40×32 = 31,744 ≤ 128×256 = 32,768
-        self.min_occupancy = min_occupancy
+        self.min_occupancy = 1
         self.persistent = persistent if is_varlen else False  # only meaningful for varlen
         self.num_regs_cuda = 208 if is_varlen else 232
         self.num_regs_others = 40
@@ -98,26 +95,17 @@ class ChunkDeltaRuleFwdH:
         # KV MMA tiler: (M=BV, N=BK=128, K=BT=64), A from TMEM, B from SMEM
         self.kv_mma_tiler = (self.BV, self.BK, self.BT)
 
-        # Pipeline stage assignment (hardcoded optimal for BV=64):
-        # occ=1 (228KB SMEM):  W/K/U=3 stages, h_out/vnew=2  → ~175KB
-        # occ≥2 (114KB SMEM):  W/K=2 stages, U/h_out/vnew=1  → fits budget
-        if min_occupancy >= 2:
-            self.k_stage = 2
-            self.w_stage = 2
-            self.u_stage = 1
-            self.h_out_stage = 1
-            self.vnew_store_stage = 1
-        else:
-            self.k_stage = 3
-            self.w_stage = 3
-            self.u_stage = 3
-            self.h_out_stage = 2
-            self.vnew_store_stage = 2
+        # Pipeline stage assignment (hardcoded optimal for BV=64, occ=1, 228KB SMEM):
+        self.k_stage = 3
+        self.w_stage = 3
+        self.u_stage = 3
+        self.h_out_stage = 2
+        self.vnew_store_stage = 2
         self.acc_stage = 1
         self.cluster_shape_mnk = (1, 1, 1)
         self.cta_group = tcgen05.CtaGroup.ONE
 
-        self.gk_stage = 2
+        self.gk_stage = 3
 
         self.tmem_dealloc_sync_barrier = pipeline.NamedBarrier(
             barrier_id=2, num_threads=self.threads_per_cta,
@@ -166,8 +154,7 @@ class ChunkDeltaRuleFwdH:
             if self.persistent:
                 import torch
                 sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-                # Scale grid by min_occupancy: more CTAs to fill higher occupancy
-                return (sm_count * self.min_occupancy, 1, 1)
+                return (sm_count, 1, 1)
             else:
                 # Non-persistent: one CTA per work unit, free HW scheduling
                 total_work_units = num_v_tiles * H * B
@@ -450,7 +437,7 @@ class ChunkDeltaRuleFwdH:
                 self.buffer_align_bytes,
             ]
             sGK: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.BK * 2],
+                cute.struct.MemRange[cutlass.Float32, self.BK * self.gk_stage],
                 128,
             ]
 
