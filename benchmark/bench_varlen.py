@@ -335,58 +335,63 @@ def bench_aligned_vs_nonaligned(H: int):
 # =============================================================================
 
 def bench_varlen_overhead(H: int):
-    print_header(f"5. Varlen overhead: non-varlen vs varlen single-seq (H={H})")
-    hdr = (f"{'T':<7} {'fl_base':>9} {'fl_vl':>9} {'fl_ovhd':>8} "
-           f"{'fla_base':>9} {'fla_vl':>9} {'fla_ovhd':>9} "
-           f"{'base_sp':>8} {'vl_sp':>7}")
-    print(hdr)
-    print(f"{'-'*90}")
+    state_configs = [
+        (True,  True,  "w/ h0,ht"),
+        (False, False, "no h0,ht"),
+    ]
+    for has_h0, has_ht, state_label in state_configs:
+        print_header(f"5. Varlen overhead: non-varlen vs varlen single-seq (H={H}, {state_label})")
+        hdr = (f"{'T':<7} {'fl_base':>9} {'fl_vl':>9} {'fl_ovhd':>8} "
+               f"{'fla_base':>9} {'fla_vl':>9} {'fla_ovhd':>9} "
+               f"{'base_sp':>8} {'vl_sp':>7}")
+        print(hdr)
+        print(f"{'-'*90}")
 
-    for T in [1024, 2048, 4096, 8192, 16384, 32768]:
-        set_seed(42)
-        scale = D ** -0.5
+        for T in [1024, 2048, 4096, 8192, 16384, 32768]:
+            set_seed(42)
+            scale = D ** -0.5
 
-        q = torch.randn(1, T, H, D, dtype=DTYPE, device=DEVICE)
-        k = torch.randn(1, T, H, D, dtype=DTYPE, device=DEVICE)
-        v = torch.randn(1, T, H, D, dtype=DTYPE, device=DEVICE)
-        g = F.logsigmoid(torch.randn(1, T, H, D, dtype=torch.float, device=DEVICE)).clamp(-5, 0)
-        beta = torch.randn(1, T, H, dtype=torch.float32, device=DEVICE).sigmoid()
-        q = F.normalize(q, p=2, dim=-1)
-        k = F.normalize(k, p=2, dim=-1)
-        cu = torch.tensor([0, T], dtype=torch.long, device=DEVICE)
-        h0 = torch.randn(1, H, D, D, dtype=torch.float32, device=DEVICE)
+            q = torch.randn(1, T, H, D, dtype=DTYPE, device=DEVICE)
+            k = torch.randn(1, T, H, D, dtype=DTYPE, device=DEVICE)
+            v = torch.randn(1, T, H, D, dtype=DTYPE, device=DEVICE)
+            g = F.logsigmoid(torch.randn(1, T, H, D, dtype=torch.float, device=DEVICE)).clamp(-5, 0)
+            beta = torch.randn(1, T, H, dtype=torch.float32, device=DEVICE).sigmoid()
+            q = F.normalize(q, p=2, dim=-1)
+            k = F.normalize(k, p=2, dim=-1)
+            cu = torch.tensor([0, T], dtype=torch.long, device=DEVICE)
+            h0 = torch.randn(1, H, D, D, dtype=torch.float32, device=DEVICE) if has_h0 else None
 
-        def mk_flashla(cu_seqlens):
-            def fn():
-                return flash_kda_prefill(
-                    q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-                    initial_state=h0, output_final_state=True,
-                    safe_gate=True, cu_seqlens=cu_seqlens,
-                )
-            return fn
+            def mk_flashla(cu_seqlens):
+                def fn():
+                    return flash_kda_prefill(
+                        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                        initial_state=h0, output_final_state=has_ht,
+                        safe_gate=True, cu_seqlens=cu_seqlens,
+                    )
+                return fn
 
-        def mk_fla(cu_seqlens):
-            def fn():
-                return chunk_kda(
-                    q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-                    initial_state=h0, output_final_state=True,
-                    safe_gate=True, cu_seqlens=cu_seqlens,
-                )
-            return fn
+            def mk_fla(cu_seqlens):
+                def fn():
+                    return chunk_kda(
+                        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                        initial_state=h0, output_final_state=has_ht,
+                        safe_gate=True, cu_seqlens=cu_seqlens,
+                    )
+                return fn
 
-        fl_no, _, _ = bench_fn(mk_flashla(None))
-        fl_vl, _, _ = bench_fn(mk_flashla(cu))
-        fla_no, _, _ = bench_fn(mk_fla(None))
-        fla_vl, _, _ = bench_fn(mk_fla(cu))
+            fl_no, _, _ = bench_fn(mk_flashla(None))
+            fl_vl, _, _ = bench_fn(mk_flashla(cu))
+            fla_no, _, _ = bench_fn(mk_fla(None))
+            fla_vl, _, _ = bench_fn(mk_fla(cu))
 
-        fl_ovhd = (fl_vl - fl_no) / fl_no * 100
-        fla_ovhd = (fla_vl - fla_no) / fla_no * 100
-        base_sp = fla_no / fl_no if fl_no > 0 else float("inf")
-        vl_sp = fla_vl / fl_vl if fl_vl > 0 else float("inf")
+            fl_ovhd = (fl_vl - fl_no) / fl_no * 100
+            fla_ovhd = (fla_vl - fla_no) / fla_no * 100
+            base_sp = fla_no / fl_no if fl_no > 0 else float("inf")
+            vl_sp = fla_vl / fl_vl if fl_vl > 0 else float("inf")
 
-        print(f"T={T:<5} {fl_no:>8.3f}ms {fl_vl:>7.3f}ms {fl_ovhd:>+7.1f}% "
-              f"{fla_no:>8.3f}ms {fla_vl:>7.3f}ms {fla_ovhd:>+8.1f}% "
-              f"{base_sp:>7.2f}x {vl_sp:>6.2f}x")
+            print(f"T={T:<5} {fl_no:>8.3f}ms {fl_vl:>7.3f}ms {fl_ovhd:>+7.1f}% "
+                  f"{fla_no:>8.3f}ms {fla_vl:>7.3f}ms {fla_ovhd:>+8.1f}% "
+                  f"{base_sp:>7.2f}x {vl_sp:>6.2f}x")
 
 
 # =============================================================================
@@ -424,94 +429,100 @@ def bench_focused_varlen(H: int):
       - non-varlen baseline (B=1, T=total)
       - varlen with quasi-balanced seq lens
       - FLA comparison for both
+    Tests both with and without initial/final state (h0/ht).
     """
     scale = D ** -0.5
     total_tokens_list = [8192, 32768, 262144]
     num_seqs_list = [16, 20, 24]
+    state_configs = [
+        (True,  True,  "w/ h0,ht"),
+        (False, False, "no h0,ht"),
+    ]
 
-    print_header(f"Focused varlen: quasi-balanced, H={H}")
-    hdr = (f"{'Config':<40} {'fl_base':>9} {'fl_vl':>9} {'fl_ovhd':>8} "
-           f"{'fla_base':>9} {'fla_vl':>9} {'fla_ovhd':>9} "
-           f"{'base_sp':>8} {'vl_sp':>7}")
-    print(hdr)
-    print(f"{'-'*110}")
+    for has_h0, has_ht, state_label in state_configs:
+        print_header(f"Focused varlen: quasi-balanced, H={H}, {state_label}")
+        hdr = (f"{'Config':<40} {'fl_base':>9} {'fl_vl':>9} {'fl_ovhd':>8} "
+               f"{'fla_base':>9} {'fla_vl':>9} {'fla_ovhd':>9} "
+               f"{'base_sp':>8} {'vl_sp':>7}")
+        print(hdr)
+        print(f"{'-'*110}")
 
-    for total_T in total_tokens_list:
-        for N in num_seqs_list:
-            set_seed(42)
-            seq_lens = generate_quasi_balanced_seqlens(total_T, N)
-            mn, mx = min(seq_lens), max(seq_lens)
-            ratio = mx / mn
+        for total_T in total_tokens_list:
+            for N in num_seqs_list:
+                set_seed(42)
+                seq_lens = generate_quasi_balanced_seqlens(total_T, N)
+                mn, mx = min(seq_lens), max(seq_lens)
+                ratio = mx / mn
 
-            # ---- inputs for non-varlen baseline (B=1, T=total_T) ----
-            q = torch.randn(1, total_T, H, D, dtype=DTYPE, device=DEVICE)
-            k = torch.randn(1, total_T, H, D, dtype=DTYPE, device=DEVICE)
-            v = torch.randn(1, total_T, H, D, dtype=DTYPE, device=DEVICE)
-            g = F.logsigmoid(torch.randn(1, total_T, H, D, dtype=torch.float, device=DEVICE)).clamp(-5, 0)
-            beta = torch.randn(1, total_T, H, dtype=torch.float32, device=DEVICE).sigmoid()
-            q = F.normalize(q, p=2, dim=-1)
-            k = F.normalize(k, p=2, dim=-1)
-            h0 = torch.randn(1, H, D, D, dtype=torch.float32, device=DEVICE)
+                # ---- inputs for non-varlen baseline (B=1, T=total_T) ----
+                q = torch.randn(1, total_T, H, D, dtype=DTYPE, device=DEVICE)
+                k = torch.randn(1, total_T, H, D, dtype=DTYPE, device=DEVICE)
+                v = torch.randn(1, total_T, H, D, dtype=DTYPE, device=DEVICE)
+                g = F.logsigmoid(torch.randn(1, total_T, H, D, dtype=torch.float, device=DEVICE)).clamp(-5, 0)
+                beta = torch.randn(1, total_T, H, dtype=torch.float32, device=DEVICE).sigmoid()
+                q = F.normalize(q, p=2, dim=-1)
+                k = F.normalize(k, p=2, dim=-1)
+                h0_base = torch.randn(1, H, D, D, dtype=torch.float32, device=DEVICE) if has_h0 else None
 
-            def mk_flashla_base():
-                def fn():
-                    return flash_kda_prefill(
-                        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-                        initial_state=h0, output_final_state=True,
-                        safe_gate=True, cu_seqlens=None,
-                    )
-                return fn
+                def mk_flashla_base():
+                    def fn():
+                        return flash_kda_prefill(
+                            q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                            initial_state=h0_base, output_final_state=has_ht,
+                            safe_gate=True, cu_seqlens=None,
+                        )
+                    return fn
 
-            def mk_fla_base():
-                def fn():
-                    return chunk_kda(
-                        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-                        initial_state=h0, output_final_state=True,
-                        safe_gate=True, cu_seqlens=None,
-                    )
-                return fn
+                def mk_fla_base():
+                    def fn():
+                        return chunk_kda(
+                            q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                            initial_state=h0_base, output_final_state=has_ht,
+                            safe_gate=True, cu_seqlens=None,
+                        )
+                    return fn
 
-            fl_base, _, _ = bench_fn(mk_flashla_base())
-            fla_base, _, _ = bench_fn(mk_fla_base())
+                fl_base, _, _ = bench_fn(mk_flashla_base())
+                fla_base, _, _ = bench_fn(mk_fla_base())
 
-            # ---- inputs for varlen ----
-            cu_seqlens = torch.tensor(
-                exclusive_cumsum(seq_lens), dtype=torch.long, device=DEVICE
-            )
-            h0_vl = torch.randn(N, H, D, D, dtype=torch.float32, device=DEVICE)
+                # ---- inputs for varlen ----
+                cu_seqlens = torch.tensor(
+                    exclusive_cumsum(seq_lens), dtype=torch.long, device=DEVICE
+                )
+                h0_vl = torch.randn(N, H, D, D, dtype=torch.float32, device=DEVICE) if has_h0 else None
 
-            def mk_flashla_vl():
-                def fn():
-                    return flash_kda_prefill(
-                        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-                        initial_state=h0_vl, output_final_state=True,
-                        safe_gate=True, cu_seqlens=cu_seqlens,
-                    )
-                return fn
+                def mk_flashla_vl():
+                    def fn():
+                        return flash_kda_prefill(
+                            q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                            initial_state=h0_vl, output_final_state=has_ht,
+                            safe_gate=True, cu_seqlens=cu_seqlens,
+                        )
+                    return fn
 
-            def mk_fla_vl():
-                def fn():
-                    return chunk_kda(
-                        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-                        initial_state=h0_vl, output_final_state=True,
-                        safe_gate=True, cu_seqlens=cu_seqlens,
-                    )
-                return fn
+                def mk_fla_vl():
+                    def fn():
+                        return chunk_kda(
+                            q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                            initial_state=h0_vl, output_final_state=has_ht,
+                            safe_gate=True, cu_seqlens=cu_seqlens,
+                        )
+                    return fn
 
-            fl_vl, _, _ = bench_fn(mk_flashla_vl())
-            fla_vl, _, _ = bench_fn(mk_fla_vl())
+                fl_vl, _, _ = bench_fn(mk_flashla_vl())
+                fla_vl, _, _ = bench_fn(mk_fla_vl())
 
-            fl_ovhd = (fl_vl - fl_base) / fl_base * 100
-            fla_ovhd = (fla_vl - fla_base) / fla_base * 100
-            base_sp = fla_base / fl_base if fl_base > 0 else float("inf")
-            vl_sp = fla_vl / fl_vl if fl_vl > 0 else float("inf")
+                fl_ovhd = (fl_vl - fl_base) / fl_base * 100
+                fla_ovhd = (fla_vl - fla_base) / fla_base * 100
+                base_sp = fla_base / fl_base if fl_base > 0 else float("inf")
+                vl_sp = fla_vl / fl_vl if fl_vl > 0 else float("inf")
 
-            tag = f"T={total_T:>5} N={N:>2} ({mn}-{mx}, {ratio:.1f}x)"
-            print(f"{tag:<40} {fl_base:>8.3f}ms {fl_vl:>7.3f}ms {fl_ovhd:>+7.1f}% "
-                  f"{fla_base:>8.3f}ms {fla_vl:>7.3f}ms {fla_ovhd:>+8.1f}% "
-                  f"{base_sp:>7.2f}x {vl_sp:>6.2f}x")
+                tag = f"T={total_T:>5} N={N:>2} ({mn}-{mx}, {ratio:.1f}x)"
+                print(f"{tag:<40} {fl_base:>8.3f}ms {fl_vl:>7.3f}ms {fl_ovhd:>+7.1f}% "
+                      f"{fla_base:>8.3f}ms {fla_vl:>7.3f}ms {fla_ovhd:>+8.1f}% "
+                      f"{base_sp:>7.2f}x {vl_sp:>6.2f}x")
 
-        print()  # blank line between total_T groups
+            print()  # blank line between total_T groups
 
 
 # =============================================================================
@@ -541,7 +552,7 @@ if __name__ == "__main__":
     print(f"GPU: {gpu_name}")
     print(f"D={D}, dtype={DTYPE}, warmup={WARMUP}, rep={REP}")
 
-    for H in [32, 64]:
+    for H in [16, 32, 64]:
         run_all_benchmarks(H)
 
     print(f"\n{'='*90}")
