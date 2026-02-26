@@ -42,8 +42,8 @@ def get_arch_flags():
     arch_flags = []
     if not DISABLE_SM100:
         arch_flags.extend(["-gencode", "arch=compute_100a,code=sm_100a"])
-    if not DISABLE_SM90:
-        arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
+    # if not DISABLE_SM90:
+    #     arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
     return arch_flags
 
 
@@ -66,16 +66,19 @@ ext_modules.append(
     CUDAExtension(
         name="flashla.cudac",
         sources=[
-            "csrc/pybind.cpp",
+            "csrc/pybind.cu",
             "csrc/lightning/sm100/prefill_fwd.cu",
+            "csrc/kda_api.cu",
+            "csrc/kda_bwd/kda_bwd_intra_sm100.cu",
+            "csrc/kda_bwd/kda_bwd_wy_dqkg_fused_sm100.cu",
         ],
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),
             "nvcc": [
                 "-O3",
                 "-std=c++17",
-                "-DNDEBUG",
-                "-D_USE_MATH_DEFINES",
+                # "-DNDEBUG",
+                # "-D_USE_MATH_DEFINES",
                 "-Wno-deprecated-declarations",
                 "-U__CUDA_NO_HALF_OPERATORS__",
                 "-U__CUDA_NO_HALF_CONVERSIONS__",
@@ -84,7 +87,8 @@ ext_modules.append(
                 "--expt-relaxed-constexpr",
                 "--expt-extended-lambda",
                 "--use_fast_math",
-                "--ptxas-options=-v,--register-usage-level=10",
+                "-lineinfo",
+                "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
             ]
             + get_features_args()
             + get_arch_flags()
