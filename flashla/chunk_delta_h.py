@@ -50,7 +50,7 @@ def make_thread_cooperative_group(size: int):
 
 class ChunkDeltaRuleFwdH:
     """
-    V2: No GMEM roundtrip. Both MMAs share M=BV (32 or 64), TMEM×SMEM operand mode.
+    V2: No GMEM roundtrip. Both MMAs share M=BV=64, TMEM×SMEM operand mode.
     h carried in CUDA registers; KV MMA only computes update term.
     """
 
@@ -62,8 +62,6 @@ class ChunkDeltaRuleFwdH:
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         is_varlen: bool = False,
-        BV: int = None,
-        num_stages: int = 2,
         min_occupancy: int = 1,
         persistent: bool = True,
     ):
@@ -76,7 +74,7 @@ class ChunkDeltaRuleFwdH:
 
         self.BT = chunk_size   # 64
         self.BK = head_dim_k   # 128
-        self.BV = BV if BV is not None else 64  # V tiling (default: 64, must be multiple of 64)
+        self.BV = 64  # V tiling fixed at 64
 
         self.threads_per_warp = 32
         self.cuda_warp_ids = (0, 1, 2, 3)
@@ -100,16 +98,19 @@ class ChunkDeltaRuleFwdH:
         # KV MMA tiler: (M=BV, N=BK=128, K=BT=64), A from TMEM, B from SMEM
         self.kv_mma_tiler = (self.BV, self.BK, self.BT)
 
-        self.k_stage = num_stages
-        self.w_stage = num_stages
-        # For occ>=2: reduce CUDA→Store / Load→CUDA stages to 1
-        # to fit SMEM under 114KB (228KB/2)
+        # Pipeline stage assignment (hardcoded optimal for BV=64):
+        # occ=1 (228KB SMEM):  W/K/U=3 stages, h_out/vnew=2  → ~175KB
+        # occ≥2 (114KB SMEM):  W/K=2 stages, U/h_out/vnew=1  → fits budget
         if min_occupancy >= 2:
+            self.k_stage = 2
+            self.w_stage = 2
             self.u_stage = 1
             self.h_out_stage = 1
             self.vnew_store_stage = 1
         else:
-            self.u_stage = 2
+            self.k_stage = 3
+            self.w_stage = 3
+            self.u_stage = 3
             self.h_out_stage = 2
             self.vnew_store_stage = 2
         self.acc_stage = 1
@@ -388,11 +389,10 @@ class ChunkDeltaRuleFwdH:
             self.io_dtype,
             num_bits_per_copy=universal_copy_bits,
         )
-        # Thread layout for 32 store-warp threads over (BV, BT) tile:
-        # BV=64: dim0=8 thread-groups × 8 values = 64, dim1=4 threads, 16 BT-repeats
-        # BV=32: dim0=4 thread-groups × 8 values = 32, dim1=8 threads, 8 BT-repeats
-        vnew_thr_dim0 = self.BV // async_copy_elems  # BV=64→8, BV=32→4
-        vnew_thr_dim1 = self.threads_per_warp // vnew_thr_dim0  # BV=64→4, BV=32→8
+        # Thread layout for 32 store-warp threads over (BV=64, BT=64) tile:
+        # dim0=8 thread-groups × 8 values = 64, dim1=4 threads, 16 BT-repeats
+        vnew_thr_dim0 = self.BV // async_copy_elems  # 8
+        vnew_thr_dim1 = self.threads_per_warp // vnew_thr_dim0  # 4
         assert self.BT % vnew_thr_dim1 == 0
         vnew_thr_layout = cute.make_ordered_layout(
             (vnew_thr_dim0, vnew_thr_dim1), order=(0, 1),

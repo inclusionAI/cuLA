@@ -43,8 +43,6 @@ def run_test(
     seq_lengths: list,
     use_gk: bool = True,
     use_h0: bool = True,
-    BV: int = 64,
-    num_stages: int = 2,
     seed: int = 42,
 ):
     global PASS_COUNT, FAIL_COUNT, FAIL_DETAILS
@@ -90,7 +88,7 @@ def run_test(
 
     kernel = ChunkDeltaRuleFwdH(
         chunk_size=BT, head_dim_k=K, head_dim_v=V,
-        is_varlen=True, BV=BV, num_stages=num_stages,
+        is_varlen=True,
     )
     kc, wc, uc = from_dlpack(k), from_dlpack(w), from_dlpack(u)
     gc, gkc = from_dlpack(g), from_dlpack(gk_input)
@@ -256,25 +254,7 @@ run_test("5seq H=8 no h0 aligned",    5, 8,  [128]*5, use_h0=False)
 run_test("5seq H=8 no h0 unaligned",  5, 8,  [100,128,90,110,72], use_h0=False)
 run_test("10seq H=64 no h0 gk",       10, 64, gen_random_lengths(10, 4096, seed=55), use_gk=True, use_h0=False)
 
-# ---- Group 8: BV=128 (no V tiling) ----
-print("\n--- BV=128 (no V tiling) ---")
-run_test("5seq H=8 BV=128 aligned",   5, 8,  [128]*5, BV=128)
-run_test("5seq H=8 BV=128 unaligned", 5, 8,  [100,128,90,110,72], BV=128)
-run_test("10seq H=64 BV=128 mixed",   10, 64, gen_random_lengths(10, 4096, seed=55), BV=128)
-run_test("20seq H=64 BV=128 real gk", 20, 64,
-         [378, 563, 485, 442, 325, 325, 304, 532, 443, 477,
-          296, 571, 520, 338, 331, 331, 360, 420, 394, 357], BV=128, use_gk=True)
-
-# ---- Group 9: num_stages=3 ----
-print("\n--- num_stages=3 ---")
-run_test("5seq H=8 3stage aligned",   5, 8,  [128]*5, num_stages=3)
-run_test("5seq H=8 3stage unaligned", 5, 8,  [100,128,90,110,72], num_stages=3)
-run_test("10seq H=64 3stage mixed",   10, 64, gen_random_lengths(10, 4096, seed=55), num_stages=3)
-run_test("20seq H=64 3stage gk",      20, 64,
-         [378, 563, 485, 442, 325, 325, 304, 532, 443, 477,
-          296, 571, 520, 338, 331, 331, 360, 420, 394, 357], num_stages=3, use_gk=True)
-
-# ---- Group 10: Edge cases ----
+# ---- Group 8: Edge cases ----
 print("\n--- Edge cases ---")
 run_test("1seq H=2 exactly BT [64]",  1, 2,  [64])
 run_test("2seq H=2 [64,64]",          2, 2,  [64, 64])

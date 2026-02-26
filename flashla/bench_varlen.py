@@ -86,14 +86,11 @@ def bench_fn(fn, warmup=5, n_iter=20):
 
 def run_varlen_benchmark(num_seqs, total_T, H, K, V, BT, ratio,
                          use_gk=True, use_h0=True, store_ht=True, save_vnew=True,
-                         seed=42, BV=None, num_stages=2, min_occupancy=1,
+                         seed=42, min_occupancy=1,
                          persistent=True):
     """Run one varlen benchmark config: our kernel vs FLA."""
     device = "cuda"
     dtype = torch.bfloat16
-    
-    if BV is None:
-        BV = V
     
     seq_lens = generate_seq_lens(num_seqs, total_T, ratio, seed=seed)
     cu_seqlens = make_cu_seqlens(seq_lens, device)
@@ -148,7 +145,7 @@ def run_varlen_benchmark(num_seqs, total_T, H, K, V, BT, ratio,
     ht_out = torch.zeros(num_seqs, H, K, V, device=device, dtype=dtype)
     workspace = torch.zeros(num_seqs * 128, dtype=torch.uint8, device=device)
     
-    kernel = ChunkDeltaRuleFwdH(chunk_size=BT, head_dim_k=K, head_dim_v=V, is_varlen=True, BV=BV, num_stages=num_stages, min_occupancy=min_occupancy, persistent=persistent)
+    kernel = ChunkDeltaRuleFwdH(chunk_size=BT, head_dim_k=K, head_dim_v=V, is_varlen=True, min_occupancy=min_occupancy, persistent=persistent)
     stream = cutlass_torch.default_stream()
     
     kc, wc, uc = from_dlpack(k), from_dlpack(w), from_dlpack(u)
@@ -185,12 +182,6 @@ def main():
     parser.add_argument("--chunk_size", type=int, default=64)
     parser.add_argument("--head_dim_k", type=int, default=128)
     parser.add_argument("--head_dim_v", type=int, default=128)
-    parser.add_argument("--bv", type=int, nargs="+", default=None,
-                        help="BV tile sizes to benchmark (default: [V]). "
-                             "Multiple values compare different BV splits.")
-    parser.add_argument("--stages", type=int, nargs="+", default=None,
-                        help="Pipeline stage counts to sweep (default: [2]). "
-                             "Multiple values compare different stage depths.")
     parser.add_argument("--occ", type=int, nargs="+", default=None,
                         help="Min occupancy levels to sweep (default: [1]). "
                              "occ=2 reduces regs to 128 and SMEM stages for 2 CTAs/SM.")
@@ -201,8 +192,6 @@ def main():
     
     K, V, BT = args.head_dim_k, args.head_dim_v, args.chunk_size
     total_T = args.total_T
-    bv_list = args.bv if args.bv else [64]
-    stages_list = args.stages if args.stages else [2]
     occ_list = args.occ if args.occ else [1]
     persist_list = args.persistent if args.persistent else [1]
     
@@ -225,14 +214,14 @@ def main():
         (40, 64,  3.0, True, True, True, True, "40 seqs, ratio=3x, H=64"),
     ]
     
-    # Build variant keys: (BV, stages, occ, persistent) combinations
-    variants = [(bv, s, occ, p) for bv in bv_list for s in stages_list for occ in occ_list for p in persist_list]
+    # Build variant keys: (occ, persistent) combinations
+    variants = [(occ, p) for occ in occ_list for p in persist_list]
     
-    print(f"Varlen Benchmark: total_T={total_T}, K={K}, V={V}, BT={BT}, BV={bv_list}, stages={stages_list}, occ={occ_list}, persist={persist_list}")
+    print(f"Varlen Benchmark: total_T={total_T}, K={K}, V={V}, BT={BT}, occ={occ_list}, persist={persist_list}")
     
     # Build header
-    def var_label(bv, s, occ, p):
-        return f'B{bv}S{s}O{occ}{"P" if p else "F"}'  # P=persistent, F=free
+    def var_label(occ, p):
+        return f'O{occ}{"P" if p else "F"}'  # P=persistent, F=free
     var_cols = "".join(f" {var_label(*v):>12}" for v in variants)
     print(f"{'Config':<45}{var_cols} {'FLA':>10} {'Best':>7} {'MinL':>5} {'MaxL':>5} {'Ratio':>6}")
     print("-" * (45 + 12 * len(variants) + 10 + 7 + 5 + 5 + 6 + 6))
@@ -241,13 +230,13 @@ def main():
     for (num_seqs, H, ratio, use_gk, use_h0, store_ht, save_vnew, desc) in configs:
         fla_ms = None
         results = {}
-        for bv, s, occ, p in variants:
+        for occ, p in variants:
             our_ms, fla_ms_cur, seq_lens, actual_ratio = run_varlen_benchmark(
                 num_seqs, total_T, H, K, V, BT, ratio,
-                use_gk, use_h0, store_ht, save_vnew, BV=bv, num_stages=s,
+                use_gk, use_h0, store_ht, save_vnew,
                 min_occupancy=occ, persistent=bool(p),
             )
-            results[(bv, s, occ, p)] = our_ms
+            results[(occ, p)] = our_ms
             fla_ms = fla_ms_cur  # same for all variants
         
         best_var = min(results, key=results.get)
