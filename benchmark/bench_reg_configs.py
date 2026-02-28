@@ -23,7 +23,7 @@ import cutlass
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from flashla.kda import KDAChunkwise
+from flashla.kda_fully_fused import KDAChunkwise
 from fla.modules.l2norm import l2norm_fwd
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack

@@ -21,7 +21,7 @@ import numpy as np
 from datetime import datetime
 
 sys.path.append(str(pathlib.Path(__file__).parent))
-from flashla.kda import KDAChunkwise
+from flashla.kda_fully_fused import KDAChunkwise
 
 # Configuration
 CHUNK_SIZE = 64

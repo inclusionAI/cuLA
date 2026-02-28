@@ -58,7 +58,7 @@ print(f"{'Label':<25} {'cuda':>5} {'sub':>5} {'others':>7} {'ms':>8} {'vs base':
 print("-" * 62)
 
 baseline_ms = None
-from flashla.kda import KDAChunkwise
+from flashla.kda_fully_fused import KDAChunkwise
 from flashla.kda_wrapper import flash_kda_prefill, compiled_kernel_cache
 import cutlass
 import cutlass.cute as cute

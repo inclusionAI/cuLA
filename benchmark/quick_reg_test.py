@@ -11,7 +11,7 @@ os.environ['LD_LIBRARY_PATH'] = '/usr/local/lib:/usr/lib/x86_64-linux-gnu'
 import torch
 sys.path.insert(0, '/ossfs/workspace/flashla')
 
-from flashla.kda import KDAChunkwise
+from flashla.kda_fully_fused import KDAChunkwise
 from fla.modules.l2norm import l2norm_fwd
 import cutlass
 import cutlass.cute as cute

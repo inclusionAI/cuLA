@@ -18,7 +18,7 @@ import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
-from flashla.kda import KDAChunkwise
+from flashla.kda_fully_fused import KDAChunkwise
 
 # Config
 CHUNK_SIZE = 64
