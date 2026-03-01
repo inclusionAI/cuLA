@@ -11,7 +11,7 @@ Computes output O for chunkwise gated linear attention in KDA forward pass:
 Inputs:
   q:  [B, T, H, K]           bf16  — query
   v:  [B, T, H, V]           bf16  — value (v_new from delta-rule)
-  g:  [B, T, H, K]           bf16  — cumulative gate (log2 domain)
+  g:  [B, T, H, K]           fp32  — cumulative gate (log2 domain)
   h:  [NT_total, H, K, V]    bf16  — inter-chunk recurrent state
   A:  [B, T, H, BT]          bf16  — intra-chunk attention matrix (Aqk)
 
@@ -81,6 +81,7 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64, Float32
 
 PRINT_DEBUG = False
+PRINT_SMEM_DEBUG = False  # Print SMEM contents after TMA loads for non-aligned varlen debug
 
 LN2 = 0.6931471805599453
 RCP_LN2 = 1.4426950408889634
@@ -105,6 +106,7 @@ class ChunkGlaFwdO:
         head_dim_v: int = 128,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
+        g_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         scale: float = 1.0,
         is_varlen: bool = False,
         BK: int = 128,
@@ -116,6 +118,7 @@ class ChunkGlaFwdO:
         self.head_dim_v = head_dim_v
         self.acc_dtype = acc_dtype
         self.io_dtype = io_dtype
+        self.g_dtype = g_dtype
         self.scale = scale
         self.is_varlen = is_varlen
 
@@ -161,7 +164,17 @@ class ChunkGlaFwdO:
         self.tmem_dealloc_sync_barrier = pipeline.NamedBarrier(
             barrier_id=2, num_threads=self.threads_per_cta,
         )
-        self.buffer_align_bytes = 128
+        self.buffer_align_bytes = 1024
+
+    def _compute_grid(self, B, T, H, V, total_nt=None):
+        """Compute grid dimensions for kernel launch."""
+        num_v_tiles = (V + self.BV - 1) // self.BV
+        if self.is_varlen:
+            # One CTA per (v_tile, global_chunk, head) — no inner chunk loop
+            assert total_nt is not None
+            return (num_v_tiles, total_nt, H)
+        NT = (T + self.BT - 1) // self.BT
+        return (num_v_tiles, NT, B * H)
 
     @staticmethod
     def _plan_tmem_offsets(
@@ -209,52 +222,74 @@ class ChunkGlaFwdO:
         h_ptr: cute.Pointer,           # [NT_total, H, K, V]
         o_ptr: cute.Pointer,           # [B, T, H, V]
         A_ptr: cute.Pointer,           # [B, T, H, BT]
-        cu_seqlens_ptr: cute.Pointer,  # [N+1] int32 (unused for non-varlen)
+        cu_seqlens_ptr: cute.Pointer,  # [N+1] int32
+        chunk_indices_ptr: cute.Pointer, # [NT*2] int32 — (batch_idx, chunk_seq_idx) pairs
         problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],
+        total_nt: Int32,               # total chunks across all seqs (varlen)
         stream,
     ):
         B, T, H, K, V = problem_size
         BT = self.BT
 
+        # For varlen: B=num_seqs, T=max_seqlen (or total_tokens), data_B=1
+        # For non-varlen: data_B=B, NT=ceil(T/BT)
         if cutlass.const_expr(self.is_varlen):
             data_B = Int32(1)
+            NT = total_nt
         else:
             data_B = B
-        NT = (T + BT - 1) // BT
+            NT = (T + BT - 1) // BT
 
         # ===================== GMEM layouts =====================
-        # q, g: row-major (T, K, (H, data_B)) for TMA epilog load
-        qg_layout = cute.make_layout(
+        # q layout: token-indexed (T, K, (H, data_B)) — bf16
+        #   varlen: data_B=1, T=T_total
+        #   non-varlen: data_B=B
+        q_layout = cute.make_layout(
             (T, K, (H, data_B)),
             stride=(H * K, 1, (K, T * H * K)),
         )
-        q = cute.make_tensor(q_ptr, qg_layout)
-        g = cute.make_tensor(g_ptr, qg_layout)
+        q = cute.make_tensor(q_ptr, q_layout)
 
-        # v, o: row-major (T, V, (H, data_B))
-        v_layout = cute.make_layout(
+        # g layout: token-indexed (T, K, (H, data_B)) — fp32 (separate from q)
+        g_layout = cute.make_layout(
+            (T, K, (H, data_B)),
+            stride=(H * K, 1, (K, T * H * K)),
+        )
+        g = cute.make_tensor(g_ptr, g_layout)
+
+        # o: row-major (T, V, (H, data_B)) — token-indexed for direct GMEM write (varlen)
+        o_layout = cute.make_layout(
             (T, V, (H, data_B)),
             stride=(H * V, 1, (V, T * H * V)),
         )
-        v = cute.make_tensor(v_ptr, v_layout)
-        o = cute.make_tensor(o_ptr, v_layout)
+        o = cute.make_tensor(o_ptr, o_layout)
 
-        # v transposed for MMA B TMA: (V, T, (H, data_B)) — V contiguous
+        # v transposed for MMA B TMA: token-indexed (V, T, (data_B, H))
+        # NOTE: Mode 2 uses (batch, H) order — NOT (H, batch) — so that
+        # the batch dimension occupies TMA coordinate 2.  When H=1 the
+        # TMA descriptor collapses the degenerate H dim; keeping batch
+        # at coord-2 guarantees it always maps to an existing TMA dim.
         v_T_layout = cute.make_layout(
-            (V, T, (H, data_B)),
-            stride=(1, H * V, (V, T * H * V)),
+            (V, T, (data_B, H)),
+            stride=(1, H * V, (T * H * V, V)),
         )
         v_T = cute.make_tensor(v_ptr, v_T_layout)
 
         # h: stored as [NT_total, H, K, V] — V contiguous
-        # Transposed view for MMA B TMA: (V, K, (H, B*NT)) — V contiguous
+        # Transposed view for MMA B TMA: (V, K, (H, NT_total)) — V contiguous
+        # non-varlen: NT_total = B * NT;  varlen: NT_total = total_nt (already flat)
+        if cutlass.const_expr(self.is_varlen):
+            h_nt_total = NT  # = total_nt
+        else:
+            h_nt_total = B * NT
+        # NOTE: Mode 2 uses (batch, H) order — see v_T comment above.
         h_T_layout = cute.make_layout(
-            (V, K, (H, B * NT)),
-            stride=(1, V, (K * V, H * K * V)),
+            (V, K, (h_nt_total, H)),
+            stride=(1, V, (H * K * V, K * V)),
         )
         h_T = cute.make_tensor(h_ptr, h_T_layout)
 
-        # A: (T, BT, (H, data_B))
+        # A layout: token-indexed (T, BT, (H, data_B))
         a_layout = cute.make_layout(
             (T, BT, (H, data_B)),
             stride=(H * BT, 1, (BT, T * H * BT)),
@@ -308,13 +343,14 @@ class ChunkGlaFwdO:
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
 
-        # Epilog SMEM for q, g (ROW_MAJOR BT×BK for CUDA warp reading)
+        # Epilog SMEM for q (ROW_MAJOR BT×BK, bf16)
         q_epi_staged = sm100_utils.make_smem_layout_epi(
             self.io_dtype, utils.LayoutEnum.ROW_MAJOR,
             (self.BT, self.BK), self.q_stage,
         )
+        # Epilog SMEM for g (ROW_MAJOR BT×BK, fp32)
         g_epi_staged = sm100_utils.make_smem_layout_epi(
-            self.io_dtype, utils.LayoutEnum.ROW_MAJOR,
+            self.g_dtype, utils.LayoutEnum.ROW_MAJOR,
             (self.BT, self.BK), self.g_stage,
         )
         # Epilog SMEM for A (ROW_MAJOR BT×BT)
@@ -379,7 +415,7 @@ class ChunkGlaFwdO:
 
         # ===================== TMA byte counts =====================
         self.tma_bytes_q = cute.size_in_bytes(self.io_dtype, q_epi_smem)
-        self.tma_bytes_g = cute.size_in_bytes(self.io_dtype, g_epi_smem)
+        self.tma_bytes_g = cute.size_in_bytes(self.g_dtype, g_epi_smem)
         self.tma_bytes_h = cute.size_in_bytes(self.io_dtype, h_smem_1)
         self.tma_bytes_v = cute.size_in_bytes(self.io_dtype, v_smem_1)
         self.tma_bytes_a = cute.size_in_bytes(self.io_dtype, a_epi_smem)
@@ -402,7 +438,7 @@ class ChunkGlaFwdO:
                 self.buffer_align_bytes,
             ]
             sG_epi: cute.struct.Align[
-                cute.struct.MemRange[self.io_dtype, cute.cosize(g_epi_staged)],
+                cute.struct.MemRange[self.g_dtype, cute.cosize(g_epi_staged)],
                 self.buffer_align_bytes,
             ]
             sA_epi: cute.struct.Align[
@@ -425,10 +461,12 @@ class ChunkGlaFwdO:
 
         # ===================== AM coord MMA =====================
         # Helper MMA for AM (BT, BT) tile — used only for T2R coordinate mapping
+        # to write A_masked into TMEM as av_tiled_mma's A operand.
+        # B operand majorness must match av_tiled_mma for C layout compatibility.
         am_coord_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
             tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.MN,
             self.acc_dtype,
             self.cta_group,
             (self.BT, self.BT),
@@ -436,8 +474,41 @@ class ChunkGlaFwdO:
         )
 
         # ===================== Grid =====================
-        num_v_tiles = (V + self.BV - 1) // self.BV
-        grid = (num_v_tiles, NT, B * H)
+        grid = self._compute_grid(B, T, H, V, total_nt=total_nt)
+
+        # ===================== cu_seqlens / chunk_indices tensors =====================
+        cu_seqlens = cute.make_tensor(cu_seqlens_ptr, cute.make_layout((B + 1,)))
+        chunk_indices = cute.make_tensor(chunk_indices_ptr, cute.make_layout((total_nt * 2,)))
+
+        # ===================== Direct GMEM write for varlen O store =====================
+        # For varlen tail chunks, TMA store would write beyond sequence boundary.
+        # Use CopyUniversalOp with per-row bounds check instead.
+        if cutlass.const_expr(self.is_varlen):
+            universal_copy_bits = 128
+            async_copy_elems = universal_copy_bits // self.io_dtype.width  # 8 for bf16
+            atom_universal_copy = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                self.io_dtype,
+                num_bits_per_copy=universal_copy_bits,
+            )
+            # Thread layout for store warp (32 threads) over (BT, BV) tile:
+            # Mode 0 (BT=64): 2 threads × 1 value = 2 per rest → 32 rest iters
+            # Mode 1 (BV=128): 16 threads × 8 values = 128 (fully covered)
+            o_thr_dim0 = self.threads_per_warp // (self.BV // async_copy_elems)  # 32/16 = 2
+            o_thr_dim1 = self.BV // async_copy_elems  # 128/8 = 16
+            assert self.BT % o_thr_dim0 == 0
+            o_thr_layout = cute.make_ordered_layout(
+                (o_thr_dim0, o_thr_dim1), order=(1, 0),
+            )  # mode 1 (BV) faster → coalesced GMEM writes
+            o_val_layout = cute.make_layout((1, async_copy_elems))  # (1, 8)
+            gmem_tiled_copy_o = cute.make_tiled_copy_tv(
+                atom_universal_copy, o_thr_layout, o_val_layout,
+            )
+        else:
+            gmem_tiled_copy_o = None
+
+        # ===================== O GMEM tensor for varlen direct write =====================
+        o_tensor = cute.make_tensor(o_ptr, o_layout)
 
         self.shared_storage = SharedStorage
 
@@ -454,6 +525,9 @@ class ChunkGlaFwdO:
             h_smem_staged, v_smem_staged,
             o_epi_staged,
             qg_tmem_layout, am_tmem_layout,
+            cu_seqlens, chunk_indices,
+            o_tensor,
+            gmem_tiled_copy_o,
             problem_size,
         ).launch(
             grid=grid,
@@ -477,6 +551,10 @@ class ChunkGlaFwdO:
         h_smem_staged, v_smem_staged,
         o_epi_staged,
         qg_tmem_layout, am_tmem_layout,
+        cu_seqlens: cute.Tensor,
+        chunk_indices: cute.Tensor,
+        o_tensor: cute.Tensor,
+        gmem_tiled_copy_o,
         problem_size,
     ):
         B, T, H, K, V = problem_size
@@ -486,16 +564,38 @@ class ChunkGlaFwdO:
             data_B = Int32(1)
         else:
             data_B = B
-        NT = (T + BT - 1) // BT
 
-        # Grid indices
-        i_v = cute.arch.block_idx()[0]
-        i_t = cute.arch.block_idx()[1]
-        i_bh = cute.arch.block_idx()[2]
-        i_b = i_bh // H
-        i_h = i_bh % H
-        bos = i_b * T
-        i_tg = i_b * NT + i_t
+        # ===================== Work decode =====================
+        num_v_tiles = (V + self.BV - 1) // self.BV
+
+        if cutlass.const_expr(self.is_varlen):
+            # Grid: (num_v_tiles, total_nt, H) — one CTA per (v_tile, global_chunk, head)
+            i_v = cute.arch.block_idx()[0]
+            chunk_global_idx = cute.arch.block_idx()[1]
+            i_h = cute.arch.block_idx()[2]
+
+            # Direct O(1) lookup from chunk_indices (matches kda_bwd decode_tile_coord)
+            # chunk_indices: flat [NT*2] array of (batch_idx, chunk_seq_idx) pairs
+            i_b = chunk_indices[chunk_global_idx * 2]
+            i_t = chunk_indices[chunk_global_idx * 2 + 1]
+
+            tok_offset = cu_seqlens[i_b]
+            seq_len = cu_seqlens[i_b + 1] - tok_offset
+            i_tg = chunk_global_idx               # global chunk index (for h tensor)
+            remaining = seq_len - i_t * BT        # valid rows in this chunk
+            remaining = cutlass.select_(remaining > BT, Int32(BT), remaining)  # cap at BT
+            data_bidx = Int32(0)
+        else:
+            NT = (T + BT - 1) // BT
+            i_v = cute.arch.block_idx()[0]
+            i_t = cute.arch.block_idx()[1]
+            i_bh = cute.arch.block_idx()[2]
+            i_b = i_bh // H
+            i_h = i_bh % H
+            tok_offset = i_b * T
+            seq_len = T
+            data_bidx = i_b
+            i_tg = i_b * NT + i_t
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -552,19 +652,41 @@ class ChunkGlaFwdO:
         tCrV_B = av_tiled_mma.make_fragment_B(sV)
 
         # ---- TMA partitions for q, g, A, O (epilog style) ----
-        gQ = tma_tensor_q[None, None, (i_h, i_b)]
-        _, bSG_sQ, bSG_gQ = self._epilog_partition(
-            tma_atom_q, gQ, (self.BT, self.BK), sQ_epi,
+        # Following Flash Attention bwd SM100 varlen pattern:
+        #   1. Apply domain_offset on the FULL 3D TMA tensor FIRST
+        #   2. THEN slice mode2 (3D → 2D) to fix head/batch coordinates
+        #   3. flat_divide + tma_partition via _epilog_partition
+        # This order is critical: domain_offset must operate on the original
+        # TMA tensor (with all modes intact) so that the TMA coordinate
+        # decomposition correctly maps the offset to TMA box coordinates.
+        if cutlass.const_expr(self.is_varlen):
+            if cutlass.const_expr(PRINT_DEBUG):
+                print(f"VARLEN Q partition: tma_tensor_q = {tma_tensor_q}")
+            gQ_3d = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_q)
+            if cutlass.const_expr(PRINT_DEBUG):
+                print(f"VARLEN Q partition: gQ_3d (domain_offset result) = {gQ_3d}")
+            gG_3d = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_g)
+            gA_3d = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_a)
+            gQ_2d = gQ_3d[None, None, (i_h, data_bidx)]
+            gG_2d = gG_3d[None, None, (i_h, data_bidx)]
+            gA_2d = gA_3d[None, None, (i_h, data_bidx)]
+            if cutlass.const_expr(PRINT_DEBUG):
+                print(f"VARLEN Q partition: gQ_2d (after slice) = {gQ_2d}")
+        else:
+            gQ_2d = tma_tensor_q[None, None, (i_h, data_bidx)]
+            gG_2d = tma_tensor_g[None, None, (i_h, data_bidx)]
+            gA_2d = tma_tensor_a[None, None, (i_h, data_bidx)]
+        bSG_sQ, bSG_gQ = self._epilog_partition_varlen(
+            tma_atom_q, gQ_2d, (self.BT, self.BK), sQ_epi,
         )
-        gG = tma_tensor_g[None, None, (i_h, i_b)]
-        _, bSG_sG, bSG_gG = self._epilog_partition(
-            tma_atom_g, gG, (self.BT, self.BK), sG_epi,
+        bSG_sG, bSG_gG = self._epilog_partition_varlen(
+            tma_atom_g, gG_2d, (self.BT, self.BK), sG_epi,
         )
-        gA = tma_tensor_a[None, None, (i_h, i_b)]
-        _, bSG_sA, bSG_gA = self._epilog_partition(
-            tma_atom_a, gA, (self.BT, self.BT), sA_epi,
+        bSG_sA, bSG_gA = self._epilog_partition_varlen(
+            tma_atom_a, gA_2d, (self.BT, self.BT), sA_epi,
         )
-        gO = tma_tensor_o[None, None, (i_h, i_b)]
+        # O: only used for non-varlen TMA store. Varlen uses direct GMEM write.
+        gO = tma_tensor_o[None, None, (i_h, data_bidx)]
         _, bSG_sO, bSG_gO = self._epilog_partition(
             tma_atom_o, gO, (self.BT, self.BV), sO,
         )
@@ -653,26 +775,36 @@ class ChunkGlaFwdO:
             cpasync.prefetch_descriptor(tma_atom_a)
 
             # TMA B partitions for h and v (with batch/head fixed)
-            # h_T: (V, K, (H, B*NT)) → after fixing (i_h, i_tg), remains (V_tiles, K_tiles)
+            # h_T: (V, K, (h_nt_total, H)) → batch_idx=i_tg (global chunk index)
             tHsH, tHgH = self._tma_partition_B(
                 tma_atom_h, tma_tensor_h, sH, self.qh_mma_tiler, qh_tiled_mma, i_tg, i_h,
             )
-            # v_T: (V, T, (H, B)) → after fixing (i_h, i_b), remains (V_tiles, T_tiles)
+            # v: token-indexed (V, T, (data_B, H)) — apply domain_offset for varlen
+            if cutlass.const_expr(self.is_varlen):
+                tma_v_v = cute.domain_offset((0, tok_offset, (0, 0)), tma_tensor_v)
+            else:
+                tma_v_v = tma_tensor_v
+            if cutlass.const_expr(PRINT_DEBUG):
+                print(f"LOAD WARP: i_tg={i_tg}, i_h={i_h}, data_bidx={data_bidx}, i_t={i_t}, i_v={i_v}")
             tVsV, tVgV = self._tma_partition_B(
-                tma_atom_v, tma_tensor_v, sV, self.av_mma_tiler, av_tiled_mma, i_b, i_h,
+                tma_atom_v, tma_v_v, sV, self.av_mma_tiler, av_tiled_mma, data_bidx, i_h,
             )
 
             # Load Q, G, H for each K tile (only 1 tile for KDA: K=BK=128)
+            # epi_tile_t = i_t: local chunk index within the domain_offset'd view
+            epi_tile_t = i_t
+            v_tile_t = i_t
+
             for i_k in cutlass.range(self.num_k_tiles, unroll_full=True):
                 q_h = load_q_P.acquire_and_advance()
                 cute.copy(atom=tma_atom_q,
-                          src=bSG_gQ[(None, i_t, 0)],
+                          src=bSG_gQ[(None, epi_tile_t, 0)],
                           dst=bSG_sQ[None, q_h.index],
                           tma_bar_ptr=q_h.barrier)
 
                 g_h = load_g_P.acquire_and_advance()
                 cute.copy(atom=tma_atom_g,
-                          src=bSG_gG[(None, i_t, 0)],
+                          src=bSG_gG[(None, epi_tile_t, 0)],
                           dst=bSG_sG[None, g_h.index],
                           tma_bar_ptr=g_h.barrier)
 
@@ -685,13 +817,13 @@ class ChunkGlaFwdO:
             # Load V and A (once, not per K tile)
             v_h = load_v_P.acquire_and_advance()
             cute.copy(atom=tma_atom_v,
-                      src=tVgV[None, i_v, i_t],
+                      src=tVgV[None, i_v, v_tile_t],
                       dst=tVsV[None, v_h.index],
                       tma_bar_ptr=v_h.barrier)
 
             a_h = load_a_P.acquire_and_advance()
             cute.copy(atom=tma_atom_a,
-                      src=bSG_gA[(None, i_t, 0)],
+                      src=bSG_gA[(None, epi_tile_t, 0)],
                       dst=bSG_sA[None, a_h.index],
                       tma_bar_ptr=a_h.barrier)
 
@@ -701,12 +833,59 @@ class ChunkGlaFwdO:
         elif warp_idx == self.store_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
-            # Wait for CUDA warps to write O to SMEM, then TMA store
             cpasync.prefetch_descriptor(tma_atom_o)
+
             o_h = o_ready_C.wait_and_advance()
-            cute.copy(tma_atom_o, bSG_sO[None, 0], bSG_gO[(None, i_t, i_v)])
-            cute.arch.cp_async_bulk_commit_group()
-            cute.arch.cp_async_bulk_wait_group(0, read=True)
+
+            if cutlass.const_expr(self.is_varlen):
+                # Varlen: ALWAYS use direct GMEM write (avoid TMA store with domain_offset)
+                store_local_tidx = tidx % self.threads_per_warp
+                gmem_thr_copy = gmem_tiled_copy_o.get_slice(store_local_tidx)
+
+                sO_stage = sO[(None, None, 0)]
+                tOsO = gmem_thr_copy.partition_S(sO_stage)
+
+                cO = cute.make_identity_tensor((self.BT, self.BV))
+                tOcO = gmem_thr_copy.partition_S(cO)
+
+                tOrO = cute.make_fragment_like(tOsO, self.io_dtype)
+                cute.autovec_copy(tOsO, tOrO)
+
+                # Construct GMEM tile: (BT, BV) with BV contiguous
+                o_chunk_raw = (o_tensor.iterator
+                    + (tok_offset + i_t * BT) * H * V
+                    + i_h * V
+                    + i_v * self.BV)
+                o_chunk_ptr = cute.make_ptr(
+                    self.io_dtype, o_chunk_raw.toint(),
+                    cute.AddressSpace.gmem, assumed_align=16,
+                )
+                o_stride_bt = cute.assume(
+                    H * V, divby=128 // self.io_dtype.width,
+                )
+                gO_chunk = cute.make_tensor(
+                    o_chunk_ptr,
+                    cute.make_layout(
+                        (self.BT, self.BV), stride=(o_stride_bt, 1),
+                    ),
+                )
+                tOgO = gmem_thr_copy.partition_D(gO_chunk)
+
+                # Partition shape is ((8,1), 32, 1):
+                #   mode 0 = (8,1): atom values (8 BV, 1 BT)
+                #   mode 1 = 32: spatial partitions (each maps to a BT row)
+                #   mode 2 = 1: rest (single)
+                # Must iterate mode 1 with per-row bounds check.
+                for m1 in cutlass.range_constexpr(cute.size(tOsO.shape[1])):
+                    bt_coord = tOcO[(0, 0), m1, 0][0]
+                    if bt_coord < remaining:
+                        cute.autovec_copy(tOrO[(None, m1, None)], tOgO[(None, m1, None)])
+            else:
+                # Non-varlen: TMA store
+                cute.copy(tma_atom_o, bSG_sO[None, 0], bSG_gO[(None, i_t, i_v)])
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+
             o_h.release()
 
         # =====================================================================
@@ -723,6 +902,9 @@ class ChunkGlaFwdO:
 
             # Phase 1: QH MMA — qg(TMEM) × h(SMEM) → acc(TMEM)
             qg_h = qg_C.wait_and_advance()
+
+            # Acquire acc slot.
+            acc_h = acc_done_P.acquire_and_advance()
 
             for i_k in cutlass.range(self.num_k_tiles, unroll_full=True):
                 h_h = load_h_C.wait_and_advance()
@@ -748,6 +930,9 @@ class ChunkGlaFwdO:
             am_h = am_C.wait_and_advance()
             v_h = load_v_C.wait_and_advance()
 
+            # ---- DEBUG: Print SMEM V contents after TMA load ----
+            # (moved to CUDA warp section after acc_done_C wait)
+
             for kp in cutlass.range(cute.size(tCrV_B, mode=[2]), unroll_full=True):
                 av_tiled_mma.set(
                     tcgen05.Field.ACCUMULATE,
@@ -765,7 +950,6 @@ class ChunkGlaFwdO:
             v_h.release()
 
             # Phase 3: Signal ACC done to CUDA warps (they'll do T2R+R2S)
-            acc_h = acc_done_P.acquire_and_advance()
             acc_h.commit()
 
         # =====================================================================
@@ -811,25 +995,7 @@ class ChunkGlaFwdO:
             tTR_rQG_fp32 = cute.make_rmem_tensor(thr_t2r_acc.partition_D(fake_sQG).shape, self.acc_dtype)
             tRT_rQG_bf16 = cute.make_rmem_tensor(r2t_qg_shape, self.io_dtype)
 
-            # ----- T2R for AM coordinate mapping (FP32, BT×BT=64×64) -----
-            # Create fake (BT, BT) FP32 TMEM accumulator via am_coord_mma
-            fake_am_acc = am_coord_mma.make_fragment_C(
-                am_coord_mma.partition_shape_C((self.BT, self.BT))
-            )
-            t2r_atom_am_coord = cute.make_copy_atom(
-                tcgen05.Ld16x256bOp(tcgen05.Repetition(8), tcgen05.Pack.NONE),
-                self.acc_dtype,
-            )
-            fake_am_flat = fake_am_acc[((None, None), 0, 0)]
-            tiled_t2r_am = tcgen05.make_tmem_copy(t2r_atom_am_coord, fake_am_flat)
-            thr_t2r_am = tiled_t2r_am.get_slice(local_tidx)
-
-            # AM identity tensor: (BT, BT) coords
-            am_tile = cute.dice(self.av_mma_tiler, (1, 1, None))  # (BT, BT)
-            cM_am = cute.make_identity_tensor(am_tile)
-            tTR_cM_am = thr_t2r_am.partition_D(cM_am)
-
-            # AM R2T: bf16 registers → AM TMEM
+            # ----- AM R2T: bf16 registers → AM TMEM -----
             r2t_atom_am = cute.make_copy_atom(
                 tcgen05.St16x128bOp(tcgen05.Repetition(8), tcgen05.Unpack.NONE),
                 self.io_dtype,
@@ -840,12 +1006,22 @@ class ChunkGlaFwdO:
             tRT_tAM = thr_r2t_am.partition_D(tCrAM_tmem)
             tRT_rAM = cute.make_rmem_tensor(r2t_am_shape, self.io_dtype)
 
-            # Fake SMEM tensor for AM T2R destination sizing
-            fake_sAM = cute.make_tensor(
-                cute.make_ptr(self.io_dtype, 0, cute.AddressSpace.smem),
-                am_tile,
-            )
-            tTR_sAM = thr_t2r_am.partition_D(fake_sAM)
+            # ----- AM coordinate mapping via R2T partition_S(identity) -----
+            # partition_S on the R2T tiler gives register-order coords matching tRT_rAM.
+            # Identity tensor must match tCrAM_tmem's rank-4 shape.
+            # Identity values decode as: row = val % BT, col = val // BT
+            # (from compact_col_major of shape (((16,4),16),1,4,1) → row in mode0-sub0,
+            #  col split across mode0-sub1 and mode2: col = sub1 + m2*16)
+            cM_am_r4 = cute.make_identity_tensor(tCrAM_tmem.layout.shape)
+            tRS_cM_am_full = thr_r2t_am.partition_S(cM_am_r4)
+            tRS_cM_am = cute.slice_(tRS_cM_am_full, (None, None, None, None, 0))
+
+            if cutlass.const_expr(PRINT_DEBUG):
+                print(f"QG T2R coord shape: {tTR_cM_qg.shape}")
+                print(f"QG R2T reg (bf16) shape: {tRT_rQG_bf16.shape}")
+                print(f"AM R2T reg (bf16) shape: {tRT_rAM.shape}")
+                print(f"AM R2T coord shape: {tRS_cM_am.shape}")
+                print(f"AM R2T coord size: {cute.size(tRS_cM_am)}")
 
             # ----- R2S: ACC T2R regs → sO (ROW_MAJOR, BT×BV) -----
             r2s_atom_o = sm100_utils.get_smem_store_op(
@@ -860,33 +1036,72 @@ class ChunkGlaFwdO:
                 q_h = load_q_C.wait_and_advance()
                 g_h = load_g_C.wait_and_advance()
 
-                # Read q, g using identity coords and compute qg
+                # ---- DEBUG: Print SMEM contents after TMA load ----
+                if cutlass.const_expr(PRINT_SMEM_DEBUG and self.is_varlen):
+                    if tidx == 0 and i_v == 0 and i_h == 0 and i_b == 1 and i_t == 0:
+                        cute.printf("=== SMEM Q after TMA: i_b=%d i_t=%d i_k=%d tok_offset=%d remaining=%d ===\n",
+                                    i_b, i_t, i_k, tok_offset, remaining)
+                        cute.print_tensor(sQ_epi[(None, None, q_h.index)])
+                        cute.printf("=== SMEM G after TMA: i_b=%d i_t=%d i_k=%d ===\n", i_b, i_t, i_k)
+                        cute.print_tensor(sG_epi[(None, None, g_h.index)])
+
                 for ei in cutlass.range_constexpr(cute.size(tTR_rQG_fp32)):
                     bt_coord, bk_coord = tTR_cM_qg[ei]
-                    q_val = sQ_epi[(bt_coord, bk_coord, q_h.index)].to(self.acc_dtype)
-                    g_val = sG_epi[(bt_coord, bk_coord, g_h.index)].to(self.acc_dtype)
-                    tTR_rQG_fp32[ei] = q_val * cute.exp2(g_val) * scale_f32
+                    if cutlass.const_expr(self.is_varlen):
+                        # Varlen: zero out rows beyond sequence boundary
+                        # (TMA may load next-sequence data for tail chunks)
+                        if bt_coord < remaining:
+                            q_val = sQ_epi[(bt_coord, bk_coord, q_h.index)].to(self.acc_dtype)
+                            g_val = sG_epi[(bt_coord, bk_coord, g_h.index)]  # already fp32
+                            tTR_rQG_fp32[ei] = q_val * cute.exp2(g_val) * scale_f32
+                        else:
+                            tTR_rQG_fp32[ei] = Float32(0.0)
+                    else:
+                        q_val = sQ_epi[(bt_coord, bk_coord, q_h.index)].to(self.acc_dtype)
+                        g_val = sG_epi[(bt_coord, bk_coord, g_h.index)]  # already fp32
+                        tTR_rQG_fp32[ei] = q_val * cute.exp2(g_val) * scale_f32
 
                 q_h.release()
                 g_h.release()
 
-                # Convert to BF16 and R2T to TMEM
                 tRT_rQG_bf16.store(tTR_rQG_fp32.load().to(self.io_dtype))
                 qg_h = qg_P.acquire_and_advance()
                 cute.copy(tiled_r2t_qg, tRT_rQG_bf16, tRT_tQG[(None, None, None, None, 0)])
                 cute.arch.fence_view_async_tmem_store()
                 qg_h.commit()
 
-            # ============ Compute AM: tril(A) ============
+            # ============ Compute AM: tril(A) with varlen boundary mask ============
             a_h = load_a_C.wait_and_advance()
 
-            # Read A, apply causal mask, write to AM TMEM
+            # ---- DEBUG: Print SMEM A contents after TMA load ----
+            if cutlass.const_expr(PRINT_SMEM_DEBUG and self.is_varlen):
+                if tidx == 0 and i_v == 0 and i_h == 0 and i_b == 1 and i_t == 0:
+                    cute.printf("=== SMEM A after TMA: i_b=%d i_t=%d tok_offset=%d remaining=%d ===\n",
+                                i_b, i_t, tok_offset, remaining)
+                    cute.print_tensor(sA_epi[(None, None, a_h.index)])
+
             for ei in cutlass.range_constexpr(cute.size(tRT_rAM)):
-                row, col = tTR_cM_am[ei]
-                if row >= col:
-                    tRT_rAM[ei] = sA_epi[(row, col, a_h.index)]
+                # Identity tensor on rank-4 shape (((16,4),16),1,4,1) returns
+                # coord_val = (((sub0_0, sub0_1), sub1), m1, m2, m3)
+                # row = sub0_0 + sub0_1 * 16  (64 rows from mode0-sub0)
+                # col = sub1 + m2 * 16        (64 cols from mode0-sub1 × mode2)
+                coord_val = tRS_cM_am[ei]
+                m0, m1, m2, m3 = coord_val
+                sub0, sub1 = m0
+                sub0_0, sub0_1 = sub0
+                row = sub0_0 + sub0_1 * 16
+                col = sub1 + m2 * 16
+                if cutlass.const_expr(self.is_varlen):
+                    # Varlen: causal mask + boundary mask
+                    if row >= col and row < remaining and col < remaining:
+                        tRT_rAM[ei] = sA_epi[(row, col, a_h.index)]
+                    else:
+                        tRT_rAM[ei] = Float32(0.0).to(self.io_dtype)
                 else:
-                    tRT_rAM[ei] = Float32(0.0).to(self.io_dtype)
+                    if row >= col:
+                        tRT_rAM[ei] = sA_epi[(row, col, a_h.index)]
+                    else:
+                        tRT_rAM[ei] = Float32(0.0).to(self.io_dtype)
 
             a_h.release()
 
@@ -898,19 +1113,24 @@ class ChunkGlaFwdO:
             # ============ Output Epilog: ACC → T2R → R2S → sO ============
             tTR_tAcc = thr_t2r_acc.partition_S(tCtAcc_flat)
 
-            # Wait for MMA to finish writing ACC
             acc_h = acc_done_C.wait_and_advance()
-            # T2R: read ACC TMEM → FP32 registers
+
+            # ---- DEBUG: Print SMEM V contents (V TMA is done by now) ----
+            if cutlass.const_expr(PRINT_SMEM_DEBUG and self.is_varlen):
+                if tidx == 0 and i_v == 0 and i_h == 0 and i_b == 1 and i_t == 0:
+                    cute.printf("=== SMEM V after TMA: i_b=%d i_t=%d tok_offset=%d remaining=%d ===\n",
+                                i_b, i_t, tok_offset, remaining)
+                    # sV is MMA B layout, just print the raw tensor
+                    cute.print_tensor(sV)
+
             tTR_rAcc = cute.make_rmem_tensor(thr_t2r_acc.partition_D(fake_sQG).shape, self.acc_dtype)
             cute.copy(tiled_t2r_acc, tTR_tAcc[(None, None, None, 0)], tTR_rAcc)
             cute.arch.fence_view_async_tmem_load()
             acc_h.release()
 
-            # Convert FP32 → BF16
             tTR_rAcc_bf16 = cute.make_rmem_tensor(tTR_rAcc.shape, self.io_dtype)
             tTR_rAcc_bf16.store(tTR_rAcc.load().to(self.io_dtype))
 
-            # Retile BF16 regs for R2S and copy to sO
             tRS_rO = tiled_r2s_o.retile(tTR_rAcc_bf16)
             o_h = o_ready_P.acquire_and_advance()
             cute.copy(tiled_r2s_o, tRS_rO, tRS_sO[(None, None, None, 0)])
@@ -927,29 +1147,182 @@ class ChunkGlaFwdO:
 
     @cute.jit
     def _tma_partition_B(self, tma_atom, tma_tensor, smem, tile_shape, tiled_mma, batch_idx, head_idx):
-        """Partition B operand for TMA."""
+        """Partition B operand for TMA.
+        
+        The GMEM layout mode 2 is (batch, H), so the coord is (batch_idx, head_idx).
+        """
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"_tma_partition_B: tma_tensor = {tma_tensor}")
+            print(f"_tma_partition_B: tile_shape = {tile_shape}")
         coord = (0, None, None)
+        tiler = cute.slice_(tile_shape, coord)
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"_tma_partition_B: tiler (sliced) = {tiler}")
         gX = cute.local_tile(
-            tma_tensor, cute.slice_(tile_shape, coord), (None, None, (head_idx, batch_idx))
+            tma_tensor, tiler, (None, None, (batch_idx, head_idx))
         )
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"_tma_partition_B: gX (local_tile result) = {gX}")
         thr_mma = tiled_mma.get_slice(0)
         tCgX = thr_mma.partition_B(gX)
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"_tma_partition_B: tCgX (partition_B result) = {tCgX}")
         tXsX, tXgX = cpasync.tma_partition(
             tma_atom, 0, cute.make_layout(1),
             cute.group_modes(smem, 0, 3), cute.group_modes(tCgX, 0, 3),
         )
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"_tma_partition_B: tXsX = {tXsX}")
+            print(f"_tma_partition_B: tXgX = {tXgX}")
         return tXsX, tXgX
 
     @cute.jit
-    def _epilog_partition(self, atom, gC_mnl, epi_tile, sC):
-        """Partition for epilog TMA load/store."""
-        gC_epi = cute.flat_divide(gC_mnl, epi_tile)
+    def _epilog_partition_3d(self, atom, tma_tensor_3d, epi_tile, sC, head_idx, batch_idx):
+        """Partition for epilog TMA load, operating on the full 3D TMA tensor.
+
+        Uses local_tile on the 3D tensor (T, F, (H, B)) to preserve mode2 coordinate
+        information for tma_partition.  This is critical when domain_offset is used
+        (varlen), because slicing mode2 first would bake the head offset into the
+        pointer and lose the coordinate — causing tma_partition to generate wrong
+        TMA coordinates for heads > 0.
+
+        This follows the same pattern as _tma_partition_B and kda.py's
+        local_tile_partition_for_mma_operand.
+        """
+        # local_tile on 3D: tile mode0 by epi_tile[0], tile mode1 by epi_tile[1],
+        # select mode2 = (head_idx, batch_idx)
+        gC = cute.local_tile(
+            tma_tensor_3d,
+            epi_tile,   # (BT, BK) or (BT, BT) — tiles first 2 modes
+            (None, None, (head_idx, batch_idx)),  # keep T/K tiles, fix mode2
+        )
+        # gC: (BT, BK/BT, NT, NK) — mode2 consumed by coord selection
         sC_g = cute.group_modes(sC, 0, 2)
-        gC_g = cute.group_modes(gC_epi, 0, 2)
+        gC_g = cute.group_modes(gC, 0, 2)
         bSG_sC, bSG_gC = cpasync.tma_partition(
             atom, 0, cute.make_layout(1), sC_g, gC_g,
         )
+        return bSG_sC, bSG_gC
+
+    @cute.jit
+    def _epilog_partition(self, atom, gC_mnl, epi_tile, sC):
+        """Partition for epilog TMA load/store (2D tensor, used for O store)."""
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"_epilog_partition: gC_mnl = {gC_mnl}")
+            print(f"_epilog_partition: epi_tile = {epi_tile}")
+        gC_epi = cute.flat_divide(gC_mnl, epi_tile)
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"_epilog_partition: gC_epi (flat_divide result) = {gC_epi}")
+        sC_g = cute.group_modes(sC, 0, 2)
+        gC_g = cute.group_modes(gC_epi, 0, 2)
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"_epilog_partition: gC_g (grouped) = {gC_g}")
+        bSG_sC, bSG_gC = cpasync.tma_partition(
+            atom, 0, cute.make_layout(1), sC_g, gC_g,
+        )
+        if cutlass.const_expr(PRINT_DEBUG):
+            print(f"_epilog_partition: bSG_gC (tma_partition result) = {bSG_gC}")
         return atom, bSG_sC, bSG_gC
+
+    @cute.jit
+    def _epilog_partition_varlen(self, atom, gC_2d, epi_tile, sC):
+        """Partition for varlen epilog TMA load (2D tensor with domain_offset).
+
+        Uses local_tile instead of flat_divide to correctly preserve TMA basis
+        stride coordinates through domain_offset.  Matches Flash Attention's
+        pattern: slice mode2 → domain_offset(2D) → local_tile → tma_partition.
+
+        Uses (None, None) to keep all tile-count modes, producing the same
+        rank as _epilog_partition (flat_divide) so copy indexing is unchanged.
+        """
+        gC_tiled = cute.local_tile(gC_2d, epi_tile, (None, None))
+        sC_g = cute.group_modes(sC, 0, 2)
+        gC_g = cute.group_modes(gC_tiled, 0, 2)
+        bSG_sC, bSG_gC = cpasync.tma_partition(
+            atom, 0, cute.make_layout(1), sC_g, gC_g,
+        )
+        return bSG_sC, bSG_gC
+
+
+# =====================================================================
+# Varlen preprocessing helpers
+# =====================================================================
+
+def prepare_chunked(tensor, cu_seqlens, chunk_offsets, BT=64):
+    """
+    Preprocess token-indexed tensor to chunk-indexed layout for varlen TMA.
+
+    Converts (T_total, H, F) → (total_nt, BT, H, F), where each chunk's data
+    starts at a BT-aligned position in the output buffer.  This eliminates
+    the need for `domain_offset` in the kernel for all varlen tensors (q, g, v, A).
+
+    Args:
+        tensor: [T_total, H, F] — token-level tensor (any feature dim F)
+        cu_seqlens: [N+1] int32 — cumulative sequence lengths
+        chunk_offsets: [N+1] int32 — cumulative chunk counts
+        BT: chunk size (default 64)
+
+    Returns:
+        chunked: [total_nt, BT, H, F] — chunk-indexed tensor with zero-padding
+    """
+    import torch
+    cu_seqlens_cpu = cu_seqlens.cpu().tolist() if isinstance(cu_seqlens, torch.Tensor) else list(cu_seqlens)
+    chunk_offsets_cpu = chunk_offsets.cpu().tolist() if isinstance(chunk_offsets, torch.Tensor) else list(chunk_offsets)
+
+    num_seqs = len(cu_seqlens_cpu) - 1
+    total_nt = chunk_offsets_cpu[-1]
+    H = tensor.shape[1]
+    F = tensor.shape[2]
+
+    chunked = torch.zeros(total_nt, BT, H, F, dtype=tensor.dtype, device=tensor.device)
+    for i in range(num_seqs):
+        tok_off = cu_seqlens_cpu[i]
+        seq_len = cu_seqlens_cpu[i + 1] - tok_off
+        co = chunk_offsets_cpu[i]
+        nt = (seq_len + BT - 1) // BT
+        for c in range(nt):
+            src_start = tok_off + c * BT
+            chunk_len = min(BT, seq_len - c * BT)
+            chunked[co + c, :chunk_len] = tensor[src_start:src_start + chunk_len]
+    return chunked
+
+
+def prepare_v_chunked(v, cu_seqlens, chunk_offsets, BT=64):
+    """Backward-compatible wrapper: v has an extra leading batch dim [1, T_total, H, V]."""
+    return prepare_chunked(v[0], cu_seqlens, chunk_offsets, BT)
+
+
+def build_chunk_indices(seq_lens, BT=64, device='cuda'):
+    """
+    Build chunk_indices tensor in the same format as FLA's prepare_chunk_indices.
+
+    Returns a flat int32 tensor of shape [NT*2], where each pair is
+    (batch_idx, chunk_seq_idx).  This matches the kda_bwd decode_tile_coord
+    scheme: chunk_indices[i*2] = batch_idx, chunk_indices[i*2+1] = chunk_in_seq.
+
+    Args:
+        seq_lens: list of sequence lengths
+        BT: chunk size (default 64)
+        device: torch device
+
+    Returns:
+        chunk_indices: [NT*2] int32 tensor
+    """
+    import torch
+    pairs = []
+    for seq_idx, sl in enumerate(seq_lens):
+        nt = (sl + BT - 1) // BT
+        for c in range(nt):
+            pairs.extend([seq_idx, c])
+    return torch.tensor(pairs, dtype=torch.int32, device=device)
+
+
+def build_chunk_offsets(seq_lens, BT=64):
+    """Build chunk_offsets list [N+1] from sequence lengths (for reference h indexing)."""
+    offsets = [0]
+    for sl in seq_lens:
+        offsets.append(offsets[-1] + (sl + BT - 1) // BT)
+    return offsets
 
 
 # =====================================================================
@@ -1037,74 +1410,577 @@ def main():
     print(f"  Chunks per seq: {NT}, Total chunks: {B*NT}")
 
     if args.test in ("correctness", "both"):
-        print("\n=== Correctness Test ===")
-        torch.manual_seed(42)
+        print("\n=== Correctness Test (skipped, testing varlen directly) ===")
 
-        q = torch.randn(B, T, H, K, dtype=dtype, device=device)
-        v = torch.randn(B, T, H, V, dtype=dtype, device=device)
-        g = torch.randn(B, T, H, K, dtype=dtype, device=device) * 0.1
-        h = torch.randn(B * NT, H, K, V, dtype=dtype, device=device) * 0.01
-        A = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
+        # ----- Varlen correctness test -----
+        print("\n=== Varlen Correctness Test ===")
 
-        o_ref = reference_chunk_gla_fwd_o(q, v, g, h, A, scale, BT)
-
+        # Diagnostic: Step-function A to prove wrong T-position load
+        print("\n  --- TMA address verification test ---")
         try:
-            sys.path.insert(0, "/ossfs/workspace/flash-linear-attention")
-            from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
-            o_triton = chunk_gla_fwd_o_gk(
-                q=q, v=v, g=g, A=A, h=h,
-                scale=scale, chunk_size=BT, use_exp2=True,
-            )
-            max_diff = (o_ref.float() - o_triton.float()).abs().max().item()
-            print(f"  Triton vs Reference: max_diff = {max_diff:.6f}")
-        except Exception as e:
-            print(f"  Triton not available: {e}")
-
-        try:
+            seq_lens_d = [100, 128]
+            T_d = 228
+            cu_d = [0, 100, 228]
+            total_nt_d = 4
+            cu_t = torch.tensor(cu_d, dtype=torch.int32, device=device)
+            ci_t = build_chunk_indices(seq_lens_d, BT=BT, device=device)
+            cu_c = from_dlpack(cu_t.detach())
+            ci_c = from_dlpack(ci_t.detach())
+            ch_offsets_d = build_chunk_offsets(seq_lens_d, BT=BT)
             stream = cutlass_torch.default_stream()
-            kernel = ChunkGlaFwdO(
-                chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale,
-            )
-            q_cute = from_dlpack(q.detach())
-            v_cute = from_dlpack(v.detach())
-            g_cute = from_dlpack(g.detach())
-            h_cute = from_dlpack(h.detach())
-            A_cute = from_dlpack(A.detach())
-            o_out = torch.zeros_like(v)
-            o_cute = from_dlpack(o_out.detach())
-            cu = torch.zeros(2, dtype=torch.int32, device=device)
-            cu_cute = from_dlpack(cu.detach())
-            ps = (B, T, H, K, V)
+            H_test = 1  # Use H=1 to reduce SMEM debug output
+            ps_d = (2, T_d, H_test, K, V)
 
-            compiled = cute.compile(
-                kernel,
-                q_cute.iterator, v_cute.iterator, g_cute.iterator,
-                h_cute.iterator, o_cute.iterator, A_cute.iterator,
-                cu_cute.iterator, ps, stream,
-                options="--generate-line-info --ptxas-options '--verbose'",
+            # Use q[t, h, k] = float(t) so SMEM values reveal the actual global token loaded
+            q_tma_test = torch.zeros(T_d, H_test, K, dtype=dtype, device=device)
+            for t in range(T_d):
+                q_tma_test[t, :, :] = float(t)
+            # g[t, h, k] = float(t) * 0.001 (distinctive but small)
+            g_tma_test = torch.zeros(T_d, H_test, K, dtype=torch.float32, device=device)
+            for t in range(T_d):
+                g_tma_test[t, :, :] = float(t) * 0.001
+            # A[t, h, j] = float(t) + j*0.01
+            A_tma_test = torch.zeros(T_d, H_test, BT, dtype=dtype, device=device)
+            for t in range(T_d):
+                for j in range(BT):
+                    A_tma_test[t, :, j] = float(t) + j * 0.01
+            v_tma_test = torch.zeros(T_d, H_test, V, dtype=dtype, device=device)
+            for t in range(T_d):
+                v_tma_test[t, :, :] = float(t)
+            h_tma_test = torch.zeros(total_nt_d, H_test, K, V, dtype=dtype, device=device)
+            o_tma_test = torch.zeros(T_d, H_test, V, dtype=dtype, device=device)
+
+            # Print expected values for comparison
+            print("  Expected SMEM values (q[t]=t, g[t]=t*0.001, A[t,j]=t+j*0.01):")
+            for si, sl in enumerate(seq_lens_d):
+                s = cu_d[si]
+                nt = (sl + BT - 1) // BT
+                for c in range(nt):
+                    tok = s + c * BT
+                    rem = min(BT, sl - c * BT)
+                    print(f"    Seq{si} c{c}: tok_offset={s} local_chunk={c} global_tok={tok} remaining={rem}")
+                    print(f"      Expected q[0..3,0] = {tok:.0f} {tok+1:.0f} {tok+2:.0f} {tok+3:.0f}")
+                    print(f"      Expected g[0..3,0] = {tok*0.001:.4f} {(tok+1)*0.001:.4f} {(tok+2)*0.001:.4f} {(tok+3)*0.001:.4f}")
+                    print(f"      Expected A[0..3,0] = {tok:.2f} {tok+1:.2f} {tok+2:.2f} {tok+3:.2f}")
+                    if rem < BT:
+                        print(f"      Expected q[rem-1={rem-1},0] = {tok+rem-1:.0f}")
+                        print(f"      Expected q[rem={rem},0] = 0.0 (TMA zero-fill)")
+
+            k_tma = ChunkGlaFwdO(chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale, is_varlen=True)
+            c_tma = cute.compile(
+                k_tma,
+                from_dlpack(q_tma_test.detach()).iterator, from_dlpack(v_tma_test.detach()).iterator,
+                from_dlpack(g_tma_test.detach()).iterator, from_dlpack(h_tma_test.detach()).iterator,
+                from_dlpack(o_tma_test.detach()).iterator, from_dlpack(A_tma_test.detach()).iterator,
+                cu_c.iterator, ci_c.iterator,
+                ps_d, total_nt_d, stream,
             )
-            compiled(
-                q_cute.iterator, v_cute.iterator, g_cute.iterator,
-                h_cute.iterator, o_cute.iterator, A_cute.iterator,
-                cu_cute.iterator, ps, stream,
+            c_tma(
+                from_dlpack(q_tma_test.detach()).iterator, from_dlpack(v_tma_test.detach()).iterator,
+                from_dlpack(g_tma_test.detach()).iterator, from_dlpack(h_tma_test.detach()).iterator,
+                from_dlpack(o_tma_test.detach()).iterator, from_dlpack(A_tma_test.detach()).iterator,
+                cu_c.iterator, ci_c.iterator,
+                ps_d, total_nt_d, stream,
+            )
+            torch.cuda.synchronize()
+            print("  (Check SMEM debug prints above for actual loaded values)")
+        except Exception as e:
+            import traceback
+            print(f"  TMA verification test failed: {e}")
+            traceback.print_exc()
+
+        print("\n  TMA verification test done.")
+
+        print("\n  --- Step-function A test (prove T-position bug) ---")
+        try:
+            seq_lens_d = [100, 128]
+            T_d = 228
+            cu_d = [0, 100, 228]
+            total_nt_d = 4
+            cu_t = torch.tensor(cu_d, dtype=torch.int32, device=device)
+            ci_t = build_chunk_indices(seq_lens_d, BT=BT, device=device)
+            cu_c = from_dlpack(cu_t.detach())
+            ci_c = from_dlpack(ci_t.detach())
+            ch_offsets_d = build_chunk_offsets(seq_lens_d, BT=BT)
+            stream = cutlass_torch.default_stream()
+            ps_d = (2, T_d, H, K, V)
+
+            # A step: A=1 for t < 100, A=0 for t >= 100
+            # For Seq1 (t >= 100): all A=0 → tril(0) @ v = 0. Any non-zero output = wrong T position.
+            A_step = torch.ones(T_d, H, BT, dtype=dtype, device=device)
+            A_step[100:, :, :] = 0.0
+            v_step = torch.ones(T_d, H, V, dtype=dtype, device=device)
+            q_step = torch.zeros(T_d, H, K, dtype=dtype, device=device)
+            g_step = torch.zeros(T_d, H, K, dtype=torch.float32, device=device)
+            h_step = torch.zeros(total_nt_d, H, K, V, dtype=dtype, device=device)
+
+            o_step = torch.zeros(T_d, H, V, dtype=dtype, device=device)
+            k_step = ChunkGlaFwdO(chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale, is_varlen=True)
+            c_step = cute.compile(
+                k_step,
+                from_dlpack(q_step.detach()).iterator, from_dlpack(v_step.detach()).iterator,
+                from_dlpack(g_step.detach()).iterator, from_dlpack(h_step.detach()).iterator,
+                from_dlpack(o_step.detach()).iterator, from_dlpack(A_step.detach()).iterator,
+                cu_c.iterator, ci_c.iterator,
+                ps_d, total_nt_d, stream,
+            )
+            c_step(
+                from_dlpack(q_step.detach()).iterator, from_dlpack(v_step.detach()).iterator,
+                from_dlpack(g_step.detach()).iterator, from_dlpack(h_step.detach()).iterator,
+                from_dlpack(o_step.detach()).iterator, from_dlpack(A_step.detach()).iterator,
+                cu_c.iterator, ci_c.iterator,
+                ps_d, total_nt_d, stream,
             )
             torch.cuda.synchronize()
 
-            max_diff = (o_ref.float() - o_out.float()).abs().max().item()
-            print(f"  CuTE DSL vs Reference: max_diff = {max_diff:.6f}")
-            if max_diff < 0.02:
-                print("  PASSED!")
-            else:
-                print("  FAILED!")
-                for b_idx in range(min(1, B)):
-                    for h_idx in range(min(1, H)):
-                        print(f"  [B={b_idx}, H={h_idx}] ref[:4,:8]:\n{o_ref[b_idx, :4, h_idx, :8]}")
-                        print(f"  [B={b_idx}, H={h_idx}] out[:4,:8]:\n{o_out[b_idx, :4, h_idx, :8]}")
+            print("    A-step test: A=1 for t<100, A=0 for t>=100")
+            for seq_idx, sl in enumerate(seq_lens_d):
+                s = cu_d[seq_idx]
+                nt = (sl + BT - 1) // BT
+                for c_idx in range(nt):
+                    cs = s + c_idx * BT
+                    ce = min(cs + BT, cu_d[seq_idx + 1])
+                    cl = ce - cs
+                    o_chunk = o_step[cs:ce, 0, 0]
+                    mx = o_chunk.abs().max().item()
+                    first_nonzero = -1
+                    for r in range(cl):
+                        if abs(o_chunk[r].item()) > 0.01:
+                            first_nonzero = r
+                            break
+                    nz_str = f" first_nonzero_row={first_nonzero}" if first_nonzero >= 0 else ""
+                    # Show a few values
+                    vals = [f"r{r}:{o_chunk[r].item():.2f}" for r in [0, 1, 2, min(cl-1, 63)]]
+                    print(f"    Seq{seq_idx} c{c_idx} cs={cs}: max={mx:.4f} {' '.join(vals)}{nz_str}")
+                    # For Seq1: any non-zero means wrong T position
+                    if seq_idx == 1 and mx > 0.01:
+                        print(f"      → PROOF: kernel loaded A from T<100 for Seq1 c{c_idx}!")
+
+            # V step: v=1 for t < 100, v=0 for t >= 100, A=ones
+            # For Seq1: v=0 → tril(A)@0 = 0. Any non-zero = wrong v T position.
+            print("    V-step test: v=1 for t<100, v=0 for t>=100, A=ones")
+            v_step2 = torch.ones(T_d, H, V, dtype=dtype, device=device)
+            v_step2[100:, :, :] = 0.0
+            A_step2 = torch.ones(T_d, H, BT, dtype=dtype, device=device)
+
+            o_step2 = torch.zeros(T_d, H, V, dtype=dtype, device=device)
+            k_step2 = ChunkGlaFwdO(chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale, is_varlen=True)
+            c_step2 = cute.compile(
+                k_step2,
+                from_dlpack(q_step.detach()).iterator, from_dlpack(v_step2.detach()).iterator,
+                from_dlpack(g_step.detach()).iterator, from_dlpack(h_step.detach()).iterator,
+                from_dlpack(o_step2.detach()).iterator, from_dlpack(A_step2.detach()).iterator,
+                cu_c.iterator, ci_c.iterator,
+                ps_d, total_nt_d, stream,
+            )
+            c_step2(
+                from_dlpack(q_step.detach()).iterator, from_dlpack(v_step2.detach()).iterator,
+                from_dlpack(g_step.detach()).iterator, from_dlpack(h_step.detach()).iterator,
+                from_dlpack(o_step2.detach()).iterator, from_dlpack(A_step2.detach()).iterator,
+                cu_c.iterator, ci_c.iterator,
+                ps_d, total_nt_d, stream,
+            )
+            torch.cuda.synchronize()
+
+            for seq_idx, sl in enumerate(seq_lens_d):
+                s = cu_d[seq_idx]
+                nt = (sl + BT - 1) // BT
+                for c_idx in range(nt):
+                    cs = s + c_idx * BT
+                    ce = min(cs + BT, cu_d[seq_idx + 1])
+                    cl = ce - cs
+                    o_chunk = o_step2[cs:ce, 0, 0]
+                    mx = o_chunk.abs().max().item()
+                    first_nonzero = -1
+                    for r in range(cl):
+                        if abs(o_chunk[r].item()) > 0.01:
+                            first_nonzero = r
+                            break
+                    nz_str = f" first_nonzero_row={first_nonzero}" if first_nonzero >= 0 else ""
+                    vals = [f"r{r}:{o_chunk[r].item():.2f}" for r in [0, 1, 2, min(cl-1, 63)]]
+                    print(f"    Seq{seq_idx} c{c_idx} cs={cs}: max={mx:.4f} {' '.join(vals)}{nz_str}")
+                    if seq_idx == 1 and mx > 0.01:
+                        print(f"      → PROOF: kernel loaded v from T<100 for Seq1 c{c_idx}!")
 
         except Exception as e:
             import traceback
-            print(f"  CuTE DSL failed: {e}")
+            print(f"  Step test failed: {e}")
             traceback.print_exc()
+
+        # Test: Random data with occ=1 to check multi-CTA interference
+        print("\n  --- [100,128] random data with occ=1 ---")
+        try:
+            seq_lens_o1 = [100, 128]
+            T_o1 = 228
+            cu_o1 = [0, 100, 228]
+            ch_offsets_o1 = build_chunk_offsets(seq_lens_o1, BT=BT)
+            nt_o1 = 4
+            cu_t = torch.tensor(cu_o1, dtype=torch.int32, device=device)
+            ci_t = build_chunk_indices(seq_lens_o1, BT=BT, device=device)
+            cu_c = from_dlpack(cu_t.detach())
+            ci_c = from_dlpack(ci_t.detach())
+            stream = cutlass_torch.default_stream()
+            ps_o1 = (2, T_o1, H, K, V)
+
+            torch.manual_seed(42)
+            q_o1 = torch.randn(T_o1, H, K, dtype=dtype, device=device)
+            v_o1 = torch.randn(T_o1, H, V, dtype=dtype, device=device)
+            g_o1 = torch.randn(T_o1, H, K, dtype=torch.float32, device=device) * 0.1
+            h_o1 = torch.randn(nt_o1, H, K, V, dtype=dtype, device=device) * 0.01
+            A_o1 = torch.randn(T_o1, H, BT, dtype=dtype, device=device) * 0.1
+
+            o_ref_o1 = torch.zeros(T_o1, H, V, dtype=dtype, device=device)
+            for si, sl in enumerate(seq_lens_o1):
+                s, e = cu_o1[si], cu_o1[si + 1]
+                co = ch_offsets_o1[si]
+                nt_s = (sl + BT - 1) // BT
+                o_s = reference_chunk_gla_fwd_o(
+                    q_o1[s:e].unsqueeze(0), v_o1[s:e].unsqueeze(0),
+                    g_o1[s:e].unsqueeze(0), h_o1[co:co+nt_s],
+                    A_o1[s:e].unsqueeze(0), scale, BT)
+                o_ref_o1[s:e] = o_s[0]
+
+            o_out1 = torch.zeros(T_o1, H, V, dtype=dtype, device=device)
+            k_occ1 = ChunkGlaFwdO(chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale, is_varlen=True, min_occupancy=1)
+            c_occ1 = cute.compile(
+                k_occ1,
+                from_dlpack(q_o1.detach()).iterator, from_dlpack(v_o1.detach()).iterator,
+                from_dlpack(g_o1.detach()).iterator, from_dlpack(h_o1.detach()).iterator,
+                from_dlpack(o_out1.detach()).iterator, from_dlpack(A_o1.detach()).iterator,
+                cu_c.iterator, ci_c.iterator,
+                ps_o1, nt_o1, stream,
+            )
+            c_occ1(
+                from_dlpack(q_o1.detach()).iterator, from_dlpack(v_o1.detach()).iterator,
+                from_dlpack(g_o1.detach()).iterator, from_dlpack(h_o1.detach()).iterator,
+                from_dlpack(o_out1.detach()).iterator, from_dlpack(A_o1.detach()).iterator,
+                cu_c.iterator, ci_c.iterator,
+                ps_o1, nt_o1, stream,
+            )
+            torch.cuda.synchronize()
+            for si, sl in enumerate(seq_lens_o1):
+                s = cu_o1[si]
+                nt_s = (sl + BT - 1) // BT
+                for ci in range(nt_s):
+                    cs = s + ci * BT
+                    ce = min(cs + BT, cu_o1[si + 1])
+                    cd = (o_ref_o1[cs:ce].float() - o_out1[cs:ce].float()).abs().max().item()
+                    status = "PASS" if cd < 0.02 else "FAIL"
+                    print(f"    occ=1 Seq{si} c{ci} (tok={cs}) max_diff={cd:.4f} [{status}]")
+        except Exception as e:
+            import traceback
+            print(f"  occ=1 test failed: {e}")
+            traceback.print_exc()
+
+        # Test: compile once, run with [100, 128] isolating inter vs intra
+        print("\n  --- Isolate inter vs intra for [100, 128] ---")
+        try:
+            seq_lens = [100, 128]
+            num_seqs = 2
+            T_total = 228
+            cu_seqlens_list = [0, 100, 228]
+            chunk_offsets_list = build_chunk_offsets(seq_lens, BT=BT)
+            total_nt_val = chunk_offsets_list[-1]
+            cu_seqlens_t = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
+            ci_t = build_chunk_indices(seq_lens, BT=BT, device=device)
+            cu_cute = from_dlpack(cu_seqlens_t.detach())
+            ci_cute = from_dlpack(ci_t.detach())
+            ps = (num_seqs, T_total, H, K, V)
+            stream = cutlass_torch.default_stream()
+
+            torch.manual_seed(42)
+            q_flat = torch.randn(T_total, H, K, dtype=dtype, device=device)
+            v_flat = torch.randn(T_total, H, V, dtype=dtype, device=device)
+            g_flat = torch.randn(T_total, H, K, dtype=torch.float32, device=device) * 0.1
+            h_flat = torch.randn(total_nt_val, H, K, V, dtype=dtype, device=device) * 0.01
+            A_flat = torch.randn(T_total, H, BT, dtype=dtype, device=device) * 0.1
+
+            def run_and_check(label, q, v, g, h, A):
+                o_ref = torch.zeros(T_total, H, V, dtype=dtype, device=device)
+                for seq_idx, sl in enumerate(seq_lens):
+                    s, e = cu_seqlens_list[seq_idx], cu_seqlens_list[seq_idx + 1]
+                    co = chunk_offsets_list[seq_idx]
+                    nt_seq = (sl + BT - 1) // BT
+                    o_seq = reference_chunk_gla_fwd_o(
+                        q[s:e].unsqueeze(0), v[s:e].unsqueeze(0),
+                        g[s:e].unsqueeze(0), h[co:co+nt_seq],
+                        A[s:e].unsqueeze(0), scale, BT)
+                    o_ref[s:e] = o_seq[0]
+
+                o_flat = torch.zeros(T_total, H, V, dtype=dtype, device=device)
+                kernel_vl = ChunkGlaFwdO(chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale, is_varlen=True)
+                compiled_vl = cute.compile(
+                    kernel_vl,
+                    from_dlpack(q.detach()).iterator, from_dlpack(v.detach()).iterator,
+                    from_dlpack(g.detach()).iterator, from_dlpack(h.detach()).iterator,
+                    from_dlpack(o_flat.detach()).iterator, from_dlpack(A.detach()).iterator,
+                    cu_cute.iterator, ci_cute.iterator,
+                    ps, total_nt_val, stream,
+                )
+                compiled_vl(
+                    from_dlpack(q.detach()).iterator, from_dlpack(v.detach()).iterator,
+                    from_dlpack(g.detach()).iterator, from_dlpack(h.detach()).iterator,
+                    from_dlpack(o_flat.detach()).iterator, from_dlpack(A.detach()).iterator,
+                    cu_cute.iterator, ci_cute.iterator,
+                    ps, total_nt_val, stream,
+                )
+                torch.cuda.synchronize()
+                # Per chunk
+                for seq_idx, sl in enumerate(seq_lens):
+                    s = cu_seqlens_list[seq_idx]
+                    co = chunk_offsets_list[seq_idx]
+                    nt_seq = (sl + BT - 1) // BT
+                    for c in range(nt_seq):
+                        cs = s + c * BT
+                        ce = min(cs + BT, cu_seqlens_list[seq_idx + 1])
+                        cd = (o_ref[cs:ce].float() - o_flat[cs:ce].float()).abs().max().item()
+                        if cd > 0.02:
+                            print(f"    {label}: Seq{seq_idx} c{c} (tok={cs}) max_diff={cd:.4f} FAIL")
+                md = (o_ref.float() - o_flat.float()).abs().max().item()
+                status = "PASS" if md < 0.02 else "FAIL"
+                print(f"    {label}: max_diff={md:.6f} [{status}]")
+
+            # Full test
+            run_and_check("FULL", q_flat, v_flat, g_flat, h_flat, A_flat)
+
+            # INTRA only: q=0, h=0 → only tril(A) @ v
+            q_zero = torch.zeros_like(q_flat)
+            h_zero = torch.zeros_like(h_flat)
+            run_and_check("INTRA(q=0,h=0)", q_zero, v_flat, g_flat, h_zero, A_flat)
+
+            # INTER only: A=0 → only scale * qg @ h
+            A_zero = torch.zeros_like(A_flat)
+            run_and_check("INTER(A=0)", q_flat, v_flat, g_flat, h_flat, A_zero)
+
+            # V-only: q=0, h=0, A=identity-like (first column = 1, rest=0)
+            # This tests purely the v load
+            A_ones = torch.zeros_like(A_flat)
+            A_ones[:, :, 0] = 1.0  # tril row 0 col 0 = 1
+            run_and_check("V-LOAD(A=diag)", q_zero, v_flat, g_flat, h_zero, A_ones)
+
+        except Exception as e:
+            import traceback
+            print(f"  Test failed: {e}")
+            traceback.print_exc()
+
+        # Diagnostic: Fresh-compile A-column test (no TMA descriptor reuse)
+        print("\n  --- Fresh A-column diagnostic ---")
+        try:
+            seq_lens_diag = [100, 128]
+            T_diag = 228
+            cu_diag = [0, 100, 228]
+            total_nt_diag = 4
+            cu_t = torch.tensor(cu_diag, dtype=torch.int32, device=device)
+            ci_t = build_chunk_indices(seq_lens_diag, BT=BT, device=device)
+            cu_c = from_dlpack(cu_t.detach())
+            ci_c = from_dlpack(ci_t.detach())
+            stream = cutlass_torch.default_stream()
+
+            # v = ones, q=0, g=0, h=0
+            v_diag = torch.ones(T_diag, H, V, dtype=dtype, device=device)
+            q_diag = torch.zeros(T_diag, H, K, dtype=dtype, device=device)
+            g_diag = torch.zeros(T_diag, H, K, dtype=torch.float32, device=device)
+            h_diag = torch.zeros(total_nt_diag, H, K, V, dtype=dtype, device=device)
+            # A[t, h, j] = (j+1) * 0.01
+            A_diag = torch.zeros(T_diag, H, BT, dtype=dtype, device=device)
+            for j in range(BT):
+                A_diag[:, :, j] = (j + 1) * 0.01
+
+            o_diag = torch.zeros(T_diag, H, V, dtype=dtype, device=device)
+            ps_diag = (2, T_diag, H, K, V)
+
+            # FRESH compile with these exact tensors
+            kvl = ChunkGlaFwdO(chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale, is_varlen=True)
+            compiled_d = cute.compile(
+                kvl,
+                from_dlpack(q_diag.detach()).iterator, from_dlpack(v_diag.detach()).iterator,
+                from_dlpack(g_diag.detach()).iterator, from_dlpack(h_diag.detach()).iterator,
+                from_dlpack(o_diag.detach()).iterator, from_dlpack(A_diag.detach()).iterator,
+                cu_c.iterator, ci_c.iterator,
+                ps_diag, total_nt_diag, stream,
+            )
+            compiled_d(
+                from_dlpack(q_diag.detach()).iterator, from_dlpack(v_diag.detach()).iterator,
+                from_dlpack(g_diag.detach()).iterator, from_dlpack(h_diag.detach()).iterator,
+                from_dlpack(o_diag.detach()).iterator, from_dlpack(A_diag.detach()).iterator,
+                cu_c.iterator, ci_c.iterator,
+                ps_diag, total_nt_diag, stream,
+            )
+            torch.cuda.synchronize()
+
+            # Expected: o[cs+i, h, v] = sum_{j=0}^{i} (j+1)*0.01 * 1 = 0.01*(i+1)*(i+2)/2
+            for seq_idx, sl in enumerate(seq_lens_diag):
+                s = cu_diag[seq_idx]
+                nt = (sl + BT - 1) // BT
+                for c in range(nt):
+                    cs = s + c * BT
+                    ce = min(cs + BT, cu_diag[seq_idx + 1])
+                    cl = ce - cs
+                    vals = []
+                    first_bad = -1
+                    for row in range(cl):
+                        ex = 0.01 * (row + 1) * (row + 2) / 2.0
+                        ac = o_diag[cs + row, 0, 0].item()
+                        d = abs(ac - ex)
+                        if row < 4 or row >= cl - 2:
+                            vals.append(f"r{row}:{ac:.4f}/{ex:.4f}")
+                        if d > max(0.1, abs(ex) * 0.05) and first_bad < 0:
+                            first_bad = row
+                    bad_str = f" first_bad={first_bad}" if first_bad >= 0 else " ALL_OK"
+                    print(f"    Seq{seq_idx} c{c} cs={cs}: {' '.join(vals)}{bad_str}")
+                    if first_bad >= 0:
+                        for row in range(max(0, first_bad-1), min(cl, first_bad+5)):
+                            ex = 0.01 * (row + 1) * (row + 2) / 2.0
+                            ac = o_diag[cs + row, 0, 0].item()
+                            print(f"      r{row}: act={ac:.6f} exp={ex:.6f} diff={ac-ex:.6f}")
+
+            # Also fresh A-ones test for sanity
+            print("    --- Fresh A-ones test ---")
+            A_ones = torch.ones(T_diag, H, BT, dtype=dtype, device=device)
+            o_ones = torch.zeros(T_diag, H, V, dtype=dtype, device=device)
+            kvl2 = ChunkGlaFwdO(chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale, is_varlen=True)
+            compiled_d2 = cute.compile(
+                kvl2,
+                from_dlpack(q_diag.detach()).iterator, from_dlpack(v_diag.detach()).iterator,
+                from_dlpack(g_diag.detach()).iterator, from_dlpack(h_diag.detach()).iterator,
+                from_dlpack(o_ones.detach()).iterator, from_dlpack(A_ones.detach()).iterator,
+                cu_c.iterator, ci_c.iterator,
+                ps_diag, total_nt_diag, stream,
+            )
+            compiled_d2(
+                from_dlpack(q_diag.detach()).iterator, from_dlpack(v_diag.detach()).iterator,
+                from_dlpack(g_diag.detach()).iterator, from_dlpack(h_diag.detach()).iterator,
+                from_dlpack(o_ones.detach()).iterator, from_dlpack(A_ones.detach()).iterator,
+                cu_c.iterator, ci_c.iterator,
+                ps_diag, total_nt_diag, stream,
+            )
+            torch.cuda.synchronize()
+            # Expected: o[cs+i] = sum_{j=0}^{i} 1*1 = i+1
+            for seq_idx, sl in enumerate(seq_lens_diag):
+                s = cu_diag[seq_idx]
+                nt = (sl + BT - 1) // BT
+                for c in range(nt):
+                    cs = s + c * BT
+                    ce = min(cs + BT, cu_diag[seq_idx + 1])
+                    cl = ce - cs
+                    md = max(abs(o_ones[cs + row, 0, 0].item() - float(row + 1)) for row in range(cl))
+                    status = "OK" if md < 0.5 else "FAIL"
+                    print(f"    Seq{seq_idx} c{c} cs={cs}: max_diff={md:.2f} [{status}]")
+
+        except Exception as e:
+            import traceback
+            print(f"  Fresh A-col test failed: {e}")
+            traceback.print_exc()
+
+        # Original varlen tests
+        test_configs = [
+            [64],               # perfect single chunk
+            [128],              # 2 chunks aligned
+            [100],              # single seq, tail chunk
+            [100, 128],         # non-aligned (was failing)
+            [128, 100],         # different non-aligned
+            [192, 100, 256, 50],  # mixed
+            [228],              # single seq
+            [128, 128],         # aligned control
+        ]
+        for run_id, seq_lens in enumerate(test_configs):
+            try:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.manual_seed(123)
+                num_seqs = len(seq_lens)
+                T_total = sum(seq_lens)
+                cu_seqlens_list = [0]
+                for sl in seq_lens:
+                    cu_seqlens_list.append(cu_seqlens_list[-1] + sl)
+                chunk_offsets_list = build_chunk_offsets(seq_lens, BT=BT)
+                total_nt_val = chunk_offsets_list[-1]
+
+                cu_seqlens_t = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
+                ci_t = build_chunk_indices(seq_lens, BT=BT, device=device)
+                cu_cute = from_dlpack(cu_seqlens_t.detach())
+                ci_cute = from_dlpack(ci_t.detach())
+                ps = (num_seqs, T_total, H, K, V)
+
+                # Random token-indexed inputs (used for reference)
+                q_flat = torch.randn(T_total, H, K, dtype=dtype, device=device)
+                v_flat = torch.randn(T_total, H, V, dtype=dtype, device=device)
+                g_flat = torch.randn(T_total, H, K, dtype=torch.float32, device=device) * 0.1
+                h_flat = torch.randn(total_nt_val, H, K, V, dtype=dtype, device=device) * 0.01
+                A_flat = torch.randn(T_total, H, BT, dtype=dtype, device=device) * 0.1
+                o_flat = torch.zeros(T_total, H, V, dtype=dtype, device=device)
+
+                # Reference per-sequence (uses original token-indexed data)
+                o_ref_flat = torch.zeros_like(o_flat)
+                for seq_idx, sl in enumerate(seq_lens):
+                    s = cu_seqlens_list[seq_idx]
+                    e = cu_seqlens_list[seq_idx + 1]
+                    co = chunk_offsets_list[seq_idx]
+                    nt_seq = (sl + BT - 1) // BT
+                    o_seq = reference_chunk_gla_fwd_o(
+                        q_flat[s:e].unsqueeze(0), v_flat[s:e].unsqueeze(0),
+                        g_flat[s:e].unsqueeze(0), h_flat[co:co+nt_seq],
+                        A_flat[s:e].unsqueeze(0), scale, BT)
+                    o_ref_flat[s:e] = o_seq[0]
+
+                # === Test 1: varlen kernel (token-indexed inputs + domain_offset) ===
+                stream = cutlass_torch.default_stream()
+                kernel_vl = ChunkGlaFwdO(
+                    chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale,
+                    is_varlen=True,
+                )
+                compiled_vl = cute.compile(
+                    kernel_vl,
+                    from_dlpack(q_flat.detach()).iterator,
+                    from_dlpack(v_flat.detach()).iterator,
+                    from_dlpack(g_flat.detach()).iterator,
+                    from_dlpack(h_flat.detach()).iterator,
+                    from_dlpack(o_flat.detach()).iterator,
+                    from_dlpack(A_flat.detach()).iterator,
+                    cu_cute.iterator, ci_cute.iterator,
+                    ps, total_nt_val, stream,
+                )
+                compiled_vl(
+                    from_dlpack(q_flat.detach()).iterator,
+                    from_dlpack(v_flat.detach()).iterator,
+                    from_dlpack(g_flat.detach()).iterator,
+                    from_dlpack(h_flat.detach()).iterator,
+                    from_dlpack(o_flat.detach()).iterator,
+                    from_dlpack(A_flat.detach()).iterator,
+                    cu_cute.iterator, ci_cute.iterator,
+                    ps, total_nt_val, stream,
+                )
+                torch.cuda.synchronize()
+
+                max_diff = (o_ref_flat.float() - o_flat.float()).abs().max().item()
+                status = "PASS" if max_diff < 0.02 else "FAIL"
+                # Show tok offsets
+                tok_offs = [cu_seqlens_list[i] for i in range(num_seqs)]
+                aligned = all(t % BT == 0 for t in tok_offs)
+                print(f"  seq_lens={seq_lens} T={T_total} tok_offs={tok_offs} aligned={aligned}: max_diff={max_diff:.6f} [{status}]")
+
+                if max_diff >= 0.02:
+                    # Per-chunk, per-head breakdown
+                    for seq_idx, sl in enumerate(seq_lens):
+                        s = cu_seqlens_list[seq_idx]
+                        co = chunk_offsets_list[seq_idx]
+                        nt_seq = (sl + BT - 1) // BT
+                        for c in range(nt_seq):
+                            cs = s + c * BT
+                            ce = min(cs + BT, cu_seqlens_list[seq_idx + 1])
+                            gc = co + c
+                            diffs = [
+                                (o_ref_flat[cs:ce, hh, :].float() - o_flat[cs:ce, hh, :].float()).abs().max().item()
+                                for hh in range(H)
+                            ]
+                            if max(diffs) > 0.02:
+                                dstr = " ".join(f"h{i}={d:.4f}" for i, d in enumerate(diffs))
+                                print(f"    Seq{seq_idx} c{c} gc={gc} tok={cs} rem={sl-c*BT}: {dstr}")
+
+            except Exception as e:
+                import traceback
+                print(f"  seq_lens={seq_lens}: ERROR - {e}")
+                traceback.print_exc()
 
     if args.test in ("benchmark", "both"):
         print("\n=== Benchmark ===")

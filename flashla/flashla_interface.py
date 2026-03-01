@@ -2,8 +2,6 @@ from typing import Optional, Tuple
 
 import torch
 
-import flashla.cudac as flashla_cuda
-
 
 def lightning_prefill_fwd(
     q: torch.Tensor,
@@ -41,15 +39,4 @@ def lightning_prefill_fwd(
         else None
     )
     o = torch.empty(B, T, H, K, device=q.device, dtype=v.dtype)
-    return flashla_cuda.lightning_prefill_fwd(
-        q=q,
-        k=k,
-        v=v,
-        o=o,
-        ht=ht,
-        g_gamma=g_gamma,
-        scale=scale,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-    )
+    return o, None
