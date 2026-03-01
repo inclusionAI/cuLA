@@ -148,20 +148,21 @@ class ChunkGlaFwdO:
         # Number of K tiles for QH MMA (K=BK for KDA)
         self.num_k_tiles = (head_dim_k + BK - 1) // BK  # 1
 
-        # Pipeline stages — all 1-stage.
-        # SMEM budget at occ=2: ~114KB per CTA (228KB / 2).
-        # Per-buffer sizes (1 stage): q=16K, g=32K, h≈32K, v≈16K, A=8K, O=16K = ~120K
+        # Pipeline stages — double-buffer TMA inputs for prefetch overlap.
+        # SMEM budget at occ=1 (persistent): 228KB total.
+        # Per-buffer sizes:
+        #   q=16K, g=32K, h≈32K, v≈16K, A=8K, O=16K
+        # With q=2, h=2, v=2, A=2 (g=1, O=1):
+        #   32 + 32 + 64 + 32 + 16 + 16 = ~192K + alignment ≈ 200K < 228K ✓
         #
-        # Persistent kernel mode (varlen): grid = SM_count, each CTA
-        # grid-stride loops over work units.  All pipelines stay 1-stage;
-        # the benefit comes from eliminating CTA launch overhead, not from
-        # TMA prefetch overlap.  min_occupancy is set to 1 so the full
-        # 228KB SMEM budget is available (not split between 2 CTAs).
-        self.q_stage = 1
+        # Double-buffering lets LOAD warp issue TMA for WU[i+1] while
+        # CUDA/MMA warps process WU[i], hiding DRAM latency.
+        # g is kept 1-stage (32K fp32 is too expensive to double).
+        self.q_stage = 2
         self.g_stage = 1
-        self.h_stage = 1
-        self.v_stage = 1
-        self.a_stage = 1
+        self.h_stage = 2
+        self.v_stage = 2
+        self.a_stage = 2
         self.o_stage = 1
         self.acc_stage = 1
         if self.persistent:
