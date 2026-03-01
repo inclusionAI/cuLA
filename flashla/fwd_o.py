@@ -167,6 +167,12 @@ class ChunkGlaFwdO:
         self.acc_stage = 1
         if self.persistent:
             self.min_occupancy = 1
+            # With occ=1 (65536 regs/CTA), we can give more registers to
+            # the store warp so it can hold the full O tile partition in
+            # registers (~128 regs for 256 bf16), enabling bulk SMEM→REG
+            # prefetch before GMEM writes.
+            # Budget: 4×32×208 + 4×32×168 = 48128 ≤ 65536 ✓
+            self.num_regs_others = 168
 
         # MMA tiler shapes:
         # QH: qg(BT, BK) @ h(BK, BV) → (BT, BV)
@@ -838,19 +844,17 @@ class ChunkGlaFwdO:
 
             if cutlass.const_expr(self.is_varlen):
                 # ---- Persistent varlen store ----
-                # Read directly from SMEM to GMEM row-by-row instead of
-                # bulk-copying the entire tile into a register buffer (tOrO).
-                # The old approach allocated ~128 registers for tOrO, but the
-                # store warp only has num_regs_others=40, causing massive
-                # register spills to local memory (NCU: "local stores to DRAM
-                # 1.0/32 bytes per sector").  Reading from SMEM per-row uses
-                # only ~4 temp registers per iteration.
+                # With num_regs_others=168 (persistent, occ=1), the store warp
+                # can hold the full O tile partition in registers (~128 regs
+                # for 256 bf16).  Bulk SMEM→REG prefetch so GMEM writes don't
+                # stall on SMEM reads.
                 store_local_tidx = tidx % self.threads_per_warp
                 gmem_thr_copy = gmem_tiled_copy_o.get_slice(store_local_tidx)
                 sO_stage = sO[(None, None, 0)]
                 tOsO = gmem_thr_copy.partition_S(sO_stage)
                 cO = cute.make_identity_tensor((self.BT, self.BV))
                 tOcO = gmem_thr_copy.partition_S(cO)
+                tOrO = cute.make_fragment_like(tOsO, self.io_dtype)
 
                 for wu_iter in cutlass.range(0, num_iters, unroll=0):
                     o_h = o_ready_C.wait_and_advance()
@@ -867,6 +871,8 @@ class ChunkGlaFwdO:
                     remaining = seq_len - i_t * BT
                     remaining = cutlass.select_(remaining > BT, Int32(BT), remaining)
 
+                    # Bulk prefetch: SMEM → registers (all 256 bf16 at once)
+                    cute.autovec_copy(tOsO, tOrO)
                     o_chunk_raw = (o_tensor.iterator
                         + (tok_offset + i_t * BT) * H * V
                         + i_h * V
@@ -886,10 +892,11 @@ class ChunkGlaFwdO:
                     )
                     tOgO = gmem_thr_copy.partition_D(gO_chunk)
 
+                    # Registers → GMEM with bounds check
                     for m1 in cutlass.range_constexpr(cute.size(tOsO.shape[1])):
                         bt_coord = tOcO[(0, 0), m1, 0][0]
                         if bt_coord < remaining:
-                            cute.autovec_copy(tOsO[(None, m1, None)], tOgO[(None, m1, None)])
+                            cute.autovec_copy(tOrO[(None, m1, None)], tOgO[(None, m1, None)])
 
                     o_h.release()
             else:
