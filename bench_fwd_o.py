@@ -121,7 +121,7 @@ def bench_non_varlen(configs):
 
         kernel = ChunkGlaFwdO(
             chunk_size=BT, head_dim_k=K, head_dim_v=V,
-            scale=scale, is_varlen=False,
+            scale=scale, is_varlen=False, persistent=True,
         )
 
         # Pre-compute iterators (avoid Python overhead in timing loop)

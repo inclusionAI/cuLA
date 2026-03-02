@@ -122,7 +122,7 @@ class ChunkGlaFwdO:
         self.g_dtype = g_dtype
         self.scale = scale
         self.is_varlen = is_varlen
-        self.persistent = persistent if is_varlen else False
+        self.persistent = persistent
 
         self.BT = chunk_size    # 64
         self.BK = BK            # 128
@@ -190,18 +190,16 @@ class ChunkGlaFwdO:
     def _compute_grid(self, B, T, H, V, total_nt=None):
         """Compute grid dimensions for kernel launch."""
         num_v_tiles = (V + self.BV - 1) // self.BV
-        if self.is_varlen:
-            if self.persistent:
-                # Persistent kernel: grid = SM_count.  Each CTA loops over
-                # multiple work units via grid-stride.  All pipelines are
-                # 1-stage; benefit is from reduced CTA launch overhead.
-                import torch
-                sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-                return (sm_count, 1, 1)
-            else:
-                # Non-persistent: one CTA per work unit.
-                total_work_units = num_v_tiles * total_nt * H
-                return (total_work_units, 1, 1)
+        if self.persistent:
+            # Persistent kernel: grid = SM_count.  Each CTA loops over
+            # multiple work units via grid-stride.
+            import torch
+            sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+            return (sm_count, 1, 1)
+        elif self.is_varlen:
+            # Non-persistent varlen: one CTA per work unit.
+            total_work_units = num_v_tiles * total_nt * H
+            return (total_work_units, 1, 1)
         NT = (T + self.BT - 1) // self.BT
         return (num_v_tiles, NT, B * H)
 
@@ -599,9 +597,8 @@ class ChunkGlaFwdO:
         # ===================== Work decode =====================
         num_v_tiles = (V + self.BV - 1) // self.BV
 
-        if cutlass.const_expr(self.is_varlen):
+        if cutlass.const_expr(self.persistent):
             # Persistent kernel: 1D grid, work decoded inside each warp's loop
-            data_B = Int32(1)
             block_idx_x = cute.arch.block_idx()[0]
             grid_dim_x = cute.arch.grid_dim()[0]
             total_work_units = num_v_tiles * total_nt * H
@@ -617,6 +614,8 @@ class ChunkGlaFwdO:
             remaining = Int32(BT)
             i_tg = Int32(0)
             data_bidx = Int32(0)
+            if cutlass.const_expr(not self.is_varlen):
+                NT = (T + BT - 1) // BT
         else:
             NT = (T + BT - 1) // BT
             i_v = cute.arch.block_idx()[0]
@@ -776,17 +775,23 @@ class ChunkGlaFwdO:
 
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 # --- Persistent work decode ---
-                if cutlass.const_expr(self.is_varlen):
+                if cutlass.const_expr(self.persistent):
                     work_idx = block_idx_x + wu_iter * grid_dim_x
                     i_v = work_idx % num_v_tiles
                     temp_work = work_idx // num_v_tiles
-                    chunk_global_idx = temp_work % total_nt
+                    chunk_flat = temp_work % total_nt
                     i_h = temp_work // total_nt
-                    i_b = chunk_indices[chunk_global_idx * 2]
-                    i_t = chunk_indices[chunk_global_idx * 2 + 1]
-                    tok_offset = cu_seqlens[i_b]
-                    i_tg = chunk_global_idx
-                    data_bidx = Int32(0)
+                    if cutlass.const_expr(self.is_varlen):
+                        i_b = chunk_indices[chunk_flat * 2]
+                        i_t = chunk_indices[chunk_flat * 2 + 1]
+                        tok_offset = cu_seqlens[i_b]
+                        data_bidx = Int32(0)
+                    else:
+                        i_b = chunk_flat // NT
+                        i_t = chunk_flat % NT
+                        tok_offset = i_b * T
+                        data_bidx = i_b
+                    i_tg = chunk_flat
 
                 # --- Domain offset for varlen, alias for non-varlen ---
                 if cutlass.const_expr(self.is_varlen):
@@ -901,8 +906,30 @@ class ChunkGlaFwdO:
                             cute.autovec_copy(tOrO[(None, m1, None)], tOgO[(None, m1, None)])
 
                     o_h.release()
+            elif cutlass.const_expr(self.persistent):
+                # ---- Persistent non-varlen: TMA store per WU ----
+                for wu_iter in cutlass.range(0, num_iters, unroll=0):
+                    o_h = o_ready_C.wait_and_advance()
+
+                    work_idx = block_idx_x + wu_iter * grid_dim_x
+                    i_v = work_idx % num_v_tiles
+                    temp_work = work_idx // num_v_tiles
+                    chunk_flat = temp_work % total_nt
+                    i_h = temp_work // total_nt
+                    i_b = chunk_flat // NT
+                    i_t = chunk_flat % NT
+                    data_bidx = i_b
+
+                    gO = tma_tensor_o[None, None, (i_h, data_bidx)]
+                    _, bSG_sO, bSG_gO = self._epilog_partition(
+                        tma_atom_o, gO, (self.BT, self.BV), sO,
+                    )
+                    cute.copy(tma_atom_o, bSG_sO[None, 0], bSG_gO[(None, i_t, i_v)])
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    o_h.release()
             else:
-                # ---- Non-varlen: single TMA store ----
+                # ---- Non-persistent non-varlen: single TMA store ----
                 gO = tma_tensor_o[None, None, (i_h, data_bidx)]
                 _, bSG_sO, bSG_gO = self._epilog_partition(
                     tma_atom_o, gO, (self.BT, self.BV), sO,
@@ -985,8 +1012,8 @@ class ChunkGlaFwdO:
 
             # ====== Persistent computation loop ======
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
-                if cutlass.const_expr(self.is_varlen):
-                    # Work decode for remaining
+                if cutlass.const_expr(self.persistent and self.is_varlen):
+                    # Work decode for remaining (persistent varlen)
                     work_idx = block_idx_x + wu_iter * grid_dim_x
                     i_v = work_idx % num_v_tiles
                     temp_work = work_idx // num_v_tiles
