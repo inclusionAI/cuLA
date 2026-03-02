@@ -148,31 +148,33 @@ class ChunkGlaFwdO:
         # Number of K tiles for QH MMA (K=BK for KDA)
         self.num_k_tiles = (head_dim_k + BK - 1) // BK  # 1
 
-        # Pipeline stages — double-buffer TMA inputs for prefetch overlap.
-        # SMEM budget at occ=1 (persistent): 228KB total.
-        # Per-buffer sizes:
-        #   q=16K, g=32K, h≈32K, v≈16K, A=8K, O=16K
-        # With q=2, h=2, v=2, A=2 (g=1, O=1):
-        #   32 + 32 + 64 + 32 + 16 + 16 = ~192K + alignment ≈ 200K < 228K ✓
-        #
-        # Double-buffering lets LOAD warp issue TMA for WU[i+1] while
-        # CUDA/MMA warps process WU[i], hiding DRAM latency.
-        # g is kept 1-stage (32K fp32 is too expensive to double).
-        self.q_stage = 2
-        self.g_stage = 1
-        self.h_stage = 2
-        self.v_stage = 2
-        self.a_stage = 2
+        # Pipeline stages for TMA inputs.
+        # Non-persistent (occ=2): single-buffered to keep SMEM ≤ 114K (228K/2).
+        #   q=16K + g=32K + h=32K + v=16K + A=8K + O=16K = ~120K ✓
+        # Persistent (occ=1): double-buffer to overlap TMA prefetch with compute.
+        #   q=32K + g=32K + h=64K + v=32K + A=16K + O=16K = ~192K < 228K ✓
+        #   g is kept 1-stage (32K fp32 too expensive to double).
         self.o_stage = 1
         self.acc_stage = 1
         if self.persistent:
             self.min_occupancy = 1
+            self.q_stage = 2
+            self.g_stage = 1
+            self.h_stage = 2
+            self.v_stage = 2
+            self.a_stage = 2
             # With occ=1 (65536 regs/CTA), we can give more registers to
             # the store warp so it can hold the full O tile partition in
             # registers (~128 regs for 256 bf16), enabling bulk SMEM→REG
             # prefetch before GMEM writes.
             # Budget: 4×32×208 + 4×32×168 = 48128 ≤ 65536 ✓
             self.num_regs_others = 168
+        else:
+            self.q_stage = 1
+            self.g_stage = 1
+            self.h_stage = 1
+            self.v_stage = 1
+            self.a_stage = 1
 
         # MMA tiler shapes:
         # QH: qg(BT, BK) @ h(BK, BV) → (BT, BV)
