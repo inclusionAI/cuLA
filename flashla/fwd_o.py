@@ -1010,6 +1010,70 @@ class ChunkGlaFwdO:
             local_tidx = tidx % (self.threads_per_warp * len(self.cuda_warp_ids))
             scale_f32 = Float32(self.scale)
 
+            # ---- Hoist loop-invariant T2R/R2T/R2S setup ----
+            # All of these depend only on compile-time constants and local_tidx.
+            # Hoisting them out of the persistent loop reduces loop body size
+            # and instruction cache pressure.
+
+            # T2R for ACC (FP32, BT×BV=64×128) — for QG coordinate mapping
+            t2r_atom_acc = cute.make_copy_atom(
+                tcgen05.Ld16x256bOp(tcgen05.Repetition(16), tcgen05.Pack.NONE),
+                self.acc_dtype,
+            )
+            tCtAcc_flat = tCtAcc[((None, None), 0, 0, None)]
+            fake_sQG = cute.make_tensor(
+                cute.make_ptr(self.io_dtype, 0, cute.AddressSpace.smem),
+                cute.dice(self.qh_mma_tiler, (1, 1, None)),
+            )
+            tiled_t2r_acc = tcgen05.make_tmem_copy(t2r_atom_acc, tCtAcc_flat[(None, None, 0)])
+            thr_t2r_acc = tiled_t2r_acc.get_slice(local_tidx)
+
+            # QG identity tensor: (BT, BK) coords
+            qg_tile = cute.dice(self.qh_mma_tiler, (1, 1, None))  # (BT, BK)
+            cM_qg = cute.make_identity_tensor(qg_tile)
+            tTR_cM_qg = thr_t2r_acc.partition_D(cM_qg)
+
+            # QG R2T: bf16 registers → QG TMEM
+            r2t_atom_qg = cute.make_copy_atom(
+                tcgen05.St16x128bOp(tcgen05.Repetition(16), tcgen05.Unpack.NONE),
+                self.io_dtype,
+            )
+            tiled_r2t_qg = tcgen05.make_tmem_copy(r2t_atom_qg, tCrQG_tmem)
+            thr_r2t_qg = tiled_r2t_qg.get_slice(local_tidx)
+            r2t_qg_shape = cute.slice_(thr_r2t_qg.partition_S(tCrQG_tmem).shape, (None, None, None, None, 0))
+            tRT_tQG = thr_r2t_qg.partition_D(tCrQG_tmem)
+
+            # Register tensors for QG computation
+            tTR_rQG_fp32 = cute.make_rmem_tensor(thr_t2r_acc.partition_D(fake_sQG).shape, self.acc_dtype)
+            tRT_rQG_bf16 = cute.make_rmem_tensor(r2t_qg_shape, self.io_dtype)
+
+            # AM R2T: bf16 registers → AM TMEM
+            r2t_atom_am = cute.make_copy_atom(
+                tcgen05.St16x128bOp(tcgen05.Repetition(8), tcgen05.Unpack.NONE),
+                self.io_dtype,
+            )
+            tiled_r2t_am = tcgen05.make_tmem_copy(r2t_atom_am, tCrAM_tmem)
+            thr_r2t_am = tiled_r2t_am.get_slice(local_tidx)
+            r2t_am_shape = cute.slice_(thr_r2t_am.partition_S(tCrAM_tmem).shape, (None, None, None, None, 0))
+            tRT_tAM = thr_r2t_am.partition_D(tCrAM_tmem)
+            tRT_rAM = cute.make_rmem_tensor(r2t_am_shape, self.io_dtype)
+
+            # AM coordinate mapping via R2T partition_S(identity)
+            cM_am_r4 = cute.make_identity_tensor(tCrAM_tmem.layout.shape)
+            tRS_cM_am_full = thr_r2t_am.partition_S(cM_am_r4)
+            tRS_cM_am = cute.slice_(tRS_cM_am_full, (None, None, None, None, 0))
+
+            # R2S: ACC T2R regs → sO (ROW_MAJOR, BT×BV)
+            r2s_atom_o = sm100_utils.get_smem_store_op(
+                utils.LayoutEnum.ROW_MAJOR, self.io_dtype, self.acc_dtype, tiled_t2r_acc,
+            )
+            tiled_r2s_o = cute.make_tiled_copy_D(r2s_atom_o, tiled_t2r_acc)
+            thr_r2s_o = tiled_r2s_o.get_slice(local_tidx)
+            tRS_sO = thr_r2s_o.partition_D(sO)
+
+            # Output epilog setup
+            tTR_tAcc = thr_t2r_acc.partition_S(tCtAcc_flat)
+
             # ====== Persistent computation loop ======
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 if cutlass.const_expr(self.persistent and self.is_varlen):
@@ -1026,66 +1090,9 @@ class ChunkGlaFwdO:
                     remaining = seq_len - i_t * BT
                     remaining = cutlass.select_(remaining > BT, Int32(BT), remaining)
 
-                # ----- T2R for ACC (FP32, BT×BV=64×128) — for QG coordinate mapping -----
-                t2r_atom_acc = cute.make_copy_atom(
-                    tcgen05.Ld16x256bOp(tcgen05.Repetition(16), tcgen05.Pack.NONE),
-                    self.acc_dtype,
-                )
-                tCtAcc_flat = tCtAcc[((None, None), 0, 0, None)]
-                fake_sQG = cute.make_tensor(
-                    cute.make_ptr(self.io_dtype, 0, cute.AddressSpace.smem),
-                    cute.dice(self.qh_mma_tiler, (1, 1, None)),
-                )
-                tiled_t2r_acc = tcgen05.make_tmem_copy(t2r_atom_acc, tCtAcc_flat[(None, None, 0)])
-                thr_t2r_acc = tiled_t2r_acc.get_slice(local_tidx)
-
-                # QG identity tensor: (BT, BK) coords
-                qg_tile = cute.dice(self.qh_mma_tiler, (1, 1, None))  # (BT, BK)
-                cM_qg = cute.make_identity_tensor(qg_tile)
-                tTR_cM_qg = thr_t2r_acc.partition_D(cM_qg)
-
-                # QG R2T: bf16 registers → QG TMEM
-                r2t_atom_qg = cute.make_copy_atom(
-                    tcgen05.St16x128bOp(tcgen05.Repetition(16), tcgen05.Unpack.NONE),
-                    self.io_dtype,
-                )
-                tiled_r2t_qg = tcgen05.make_tmem_copy(r2t_atom_qg, tCrQG_tmem)
-                thr_r2t_qg = tiled_r2t_qg.get_slice(local_tidx)
-                r2t_qg_shape = cute.slice_(thr_r2t_qg.partition_S(tCrQG_tmem).shape, (None, None, None, None, 0))
-                tRT_tQG = thr_r2t_qg.partition_D(tCrQG_tmem)
-
-                # Register tensors for QG computation
-                tTR_rQG_fp32 = cute.make_rmem_tensor(thr_t2r_acc.partition_D(fake_sQG).shape, self.acc_dtype)
-                tRT_rQG_bf16 = cute.make_rmem_tensor(r2t_qg_shape, self.io_dtype)
-
-                # ----- AM R2T: bf16 registers → AM TMEM -----
-                r2t_atom_am = cute.make_copy_atom(
-                    tcgen05.St16x128bOp(tcgen05.Repetition(8), tcgen05.Unpack.NONE),
-                    self.io_dtype,
-                )
-                tiled_r2t_am = tcgen05.make_tmem_copy(r2t_atom_am, tCrAM_tmem)
-                thr_r2t_am = tiled_r2t_am.get_slice(local_tidx)
-                r2t_am_shape = cute.slice_(thr_r2t_am.partition_S(tCrAM_tmem).shape, (None, None, None, None, 0))
-                tRT_tAM = thr_r2t_am.partition_D(tCrAM_tmem)
-                tRT_rAM = cute.make_rmem_tensor(r2t_am_shape, self.io_dtype)
-
-                # AM coordinate mapping via R2T partition_S(identity)
-                cM_am_r4 = cute.make_identity_tensor(tCrAM_tmem.layout.shape)
-                tRS_cM_am_full = thr_r2t_am.partition_S(cM_am_r4)
-                tRS_cM_am = cute.slice_(tRS_cM_am_full, (None, None, None, None, 0))
-
-                # ----- R2S: ACC T2R regs → sO (ROW_MAJOR, BT×BV) -----
-                r2s_atom_o = sm100_utils.get_smem_store_op(
-                    utils.LayoutEnum.ROW_MAJOR, self.io_dtype, self.acc_dtype, tiled_t2r_acc,
-                )
-                tiled_r2s_o = cute.make_tiled_copy_D(r2s_atom_o, tiled_t2r_acc)
-                thr_r2s_o = tiled_r2s_o.get_slice(local_tidx)
-                tRS_sO = thr_r2s_o.partition_D(sO)
-
-                # Output epilog setup
-                tTR_tAcc = thr_t2r_acc.partition_S(tCtAcc_flat)
-
-                # ============ Compute QG: q * exp2(g) * scale ============
+                # ============ Compute QG: (q * scale) * exp2(g) ============
+                # Reorder: q*scale (FMA pipe) can overlap with exp2(g) (XU pipe).
+                # Varlen: unconditional SMEM loads + branchless select.
                 for i_k in cutlass.range(self.num_k_tiles, unroll_full=True):
                     q_h = load_q_C.wait_and_advance()
                     g_h = load_g_C.wait_and_advance()
@@ -1093,16 +1100,19 @@ class ChunkGlaFwdO:
                     for ei in cutlass.range_constexpr(cute.size(tTR_rQG_fp32)):
                         bt_coord, bk_coord = tTR_cM_qg[ei]
                         if cutlass.const_expr(self.is_varlen):
-                            if bt_coord < remaining:
-                                q_val = sQ_epi[(bt_coord, bk_coord, q_h.index)].to(self.acc_dtype)
-                                g_val = sG_epi[(bt_coord, bk_coord, g_h.index)]
-                                tTR_rQG_fp32[ei] = q_val * cute.exp2(g_val) * scale_f32
-                            else:
-                                tTR_rQG_fp32[ei] = Float32(0.0)
+                            # Unconditional loads — safe because SMEM always
+                            # contains valid data (from this or next sequence).
+                            # Branchless select zeros out-of-bounds results.
+                            q_val = sQ_epi[(bt_coord, bk_coord, q_h.index)].to(self.acc_dtype)
+                            g_val = sG_epi[(bt_coord, bk_coord, g_h.index)]
+                            qs_val = q_val * scale_f32
+                            result = qs_val * cute.exp2(g_val)
+                            tTR_rQG_fp32[ei] = cutlass.select_(bt_coord < remaining, result, Float32(0.0))
                         else:
                             q_val = sQ_epi[(bt_coord, bk_coord, q_h.index)].to(self.acc_dtype)
                             g_val = sG_epi[(bt_coord, bk_coord, g_h.index)]
-                            tTR_rQG_fp32[ei] = q_val * cute.exp2(g_val) * scale_f32
+                            qs_val = q_val * scale_f32
+                            tTR_rQG_fp32[ei] = qs_val * cute.exp2(g_val)
 
                     q_h.release()
                     g_h.release()
@@ -1124,8 +1134,11 @@ class ChunkGlaFwdO:
                     row = sub0_0 + sub0_1 * 16
                     col = sub1 + m2 * 16
                     if cutlass.const_expr(self.is_varlen):
-                        if row >= col and row < remaining and col < remaining:
-                            tRT_rAM[ei] = sA_epi[(row, col, a_h.index)]
+                        # row >= col is constexpr; row < remaining implies
+                        # col < remaining since col <= row.
+                        if row >= col:
+                            a_val = sA_epi[(row, col, a_h.index)]
+                            tRT_rAM[ei] = cutlass.select_(row < remaining, a_val, Float32(0.0).to(self.io_dtype))
                         else:
                             tRT_rAM[ei] = Float32(0.0).to(self.io_dtype)
                     else:
@@ -1144,13 +1157,13 @@ class ChunkGlaFwdO:
                 # ============ Output Epilog: ACC → T2R → R2S → sO ============
                 acc_h = acc_done_C.wait_and_advance()
 
-                tTR_rAcc = cute.make_rmem_tensor(thr_t2r_acc.partition_D(fake_sQG).shape, self.acc_dtype)
-                cute.copy(tiled_t2r_acc, tTR_tAcc[(None, None, None, 0)], tTR_rAcc)
+                # Reuse tTR_rQG_fp32 as ACC readback buffer (same shape, no overlap)
+                cute.copy(tiled_t2r_acc, tTR_tAcc[(None, None, None, 0)], tTR_rQG_fp32)
                 cute.arch.fence_view_async_tmem_load()
                 acc_h.release()
 
-                tTR_rAcc_bf16 = cute.make_rmem_tensor(tTR_rAcc.shape, self.io_dtype)
-                tTR_rAcc_bf16.store(tTR_rAcc.load().to(self.io_dtype))
+                tTR_rAcc_bf16 = cute.make_rmem_tensor(tTR_rQG_fp32.shape, self.io_dtype)
+                tTR_rAcc_bf16.store(tTR_rQG_fp32.load().to(self.io_dtype))
 
                 tRS_rO = tiled_r2s_o.retile(tTR_rAcc_bf16)
                 o_h = o_ready_P.acquire_and_advance()
