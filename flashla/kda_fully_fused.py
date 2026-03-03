@@ -320,12 +320,9 @@ class KDAChunkwise:
             print(f"tCtAccSQ_fake={tCtAccSQ_fake}, num_qs_acc_cols={num_qs_acc_cols}")
 
         num_qk_acc_cols_offset = 0
-        print(f"qk_acc_cols={num_qk_acc_cols}")
         num_pv_acc_cols_offset = num_qk_acc_cols_offset + num_qk_acc_cols
         num_kv_acc_cols_offset = num_pv_acc_cols_offset + num_pv_acc_cols
-        print(f"kv_acc_cols={num_kv_acc_cols}")
         num_kv16_acc_cols_offset = num_kv_acc_cols_offset + num_kv_acc_cols
-        print(f"num_kv16_acc_cols={num_kv16_acc_cols}")
         num_qs_acc_cols_offset = num_kv16_acc_cols_offset + num_kv16_acc_cols
         num_kk_acc_cols_offset = num_qs_acc_cols_offset + num_qs_acc_cols
 
