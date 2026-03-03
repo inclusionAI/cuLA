@@ -101,15 +101,13 @@ def bench_non_varlen(configs):
 
         q = torch.randn(B, T, H, K, dtype=dtype, device=device)
         v = torch.randn(B, T, H, V, dtype=dtype, device=device)
-        g_fp32 = torch.randn(B, T, H, K, dtype=torch.float32, device=device) * 0.1
-        g = g_fp32.bfloat16()          # CuTe kernel uses bf16 g
-        g_fla = g.float()              # FLA uses fp32 g (same bf16-rounded values for fair comparison)
+        g = torch.randn(B, T, H, K, dtype=torch.float32, device=device) * 0.1
         h = torch.randn(B * NT, H, K, V, dtype=dtype, device=device) * 0.01
         A = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
 
         # ---- FLA baseline (accuracy) ----
         o_fla = chunk_gla_fwd_o_gk(
-            q=q, v=v, g=g_fla, A=A, h=h,
+            q=q, v=v, g=g, A=A, h=h,
             scale=scale, chunk_size=BT, use_exp2=True,
         )
 
@@ -149,9 +147,9 @@ def bench_non_varlen(configs):
         max_diff, mean_diff = accuracy_stats(o_fla, o_cute_t)
 
         # ---- Performance timing ----
-        def run_fla(q=q, v=v, g_fla=g_fla, A=A, h=h, scale=scale):
+        def run_fla(q=q, v=v, g=g, A=A, h=h, scale=scale):
             chunk_gla_fwd_o_gk(
-                q=q, v=v, g=g_fla, A=A, h=h,
+                q=q, v=v, g=g, A=A, h=h,
                 scale=scale, chunk_size=BT, use_exp2=True,
             )
 
@@ -222,16 +220,14 @@ def bench_varlen(configs):
         # Flat token-indexed tensors (shared data for both kernels)
         q_flat = torch.randn(T_total, H, K, dtype=dtype, device=device)
         v_flat = torch.randn(T_total, H, V, dtype=dtype, device=device)
-        g_flat_fp32 = torch.randn(T_total, H, K, dtype=torch.float32, device=device) * 0.1
-        g_flat = g_flat_fp32.bfloat16()     # CuTe kernel uses bf16 g
-        g_flat_fla = g_flat.float()          # FLA uses fp32 g (same bf16-rounded values)
+        g_flat = torch.randn(T_total, H, K, dtype=torch.float32, device=device) * 0.1
         h_flat = torch.randn(total_nt_val, H, K, V, dtype=dtype, device=device) * 0.01
         A_flat = torch.randn(T_total, H, BT, dtype=dtype, device=device) * 0.1
 
         # ---- FLA baseline (needs [1, T_total, H, *] + cu_seqlens int64) ----
         q_fla = q_flat.unsqueeze(0)          # [1, T_total, H, K]
         v_fla = v_flat.unsqueeze(0)          # [1, T_total, H, V]
-        g_fla = g_flat_fla.unsqueeze(0)      # [1, T_total, H, K]
+        g_fla = g_flat.unsqueeze(0)          # [1, T_total, H, K]
         A_fla = A_flat.unsqueeze(0)          # [1, T_total, H, BT]
         cu_fla = torch.tensor(cu_seqlens_list, dtype=torch.long, device=device)
 
@@ -276,11 +272,10 @@ def bench_varlen(configs):
         max_diff, mean_diff = accuracy_stats(o_fla.squeeze(0), o_cute_flat)
 
         # ---- Performance timing ----
-        g_fla_4d = g_fla  # already [1, T_total, H, K]
-        def run_fla(q_fla=q_fla, v_fla=v_fla, g_fla_4d=g_fla_4d, A_fla=A_fla,
+        def run_fla(q_fla=q_fla, v_fla=v_fla, g_fla=g_fla, A_fla=A_fla,
                     h_flat=h_flat, cu_fla=cu_fla, scale=scale):
             chunk_gla_fwd_o_gk(
-                q=q_fla, v=v_fla, g=g_fla_4d, A=A_fla, h=h_flat,
+                q=q_fla, v=v_fla, g=g_fla, A=A_fla, h=h_flat,
                 scale=scale, cu_seqlens=cu_fla,
                 chunk_size=BT, use_exp2=True,
             )
