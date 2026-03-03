@@ -14,29 +14,20 @@
    - [2.2 Persistent Kernel + 双缓冲 TMA (1.03x → 1.59x non-varlen; 1.24x → 1.34x varlen)](#22-persistent-kernel--双缓冲-tma)
    - [2.3 Store Warp 寄存器调优 (varlen +4%)](#23-store-warp-寄存器调优)
    - [2.4 ⭐ 循环不变量外提 + 乘法重排 + 无分支 varlen (varlen 1.28x → 1.63x)](#24-循环不变量外提--乘法重排--无分支-varlen)
-3. [失败尝试与教训](#3-失败尝试与教训)
-4. [最终性能](#4-最终性能)
-5. [NCU 指标对比](#5-ncu-指标对比)
-6. [核心经验总结](#6-核心经验总结)
+3. [最终性能](#3-最终性能)
+4. [NCU 指标对比](#4-ncu-指标对比)
+5. [核心经验总结](#5-核心经验总结)
 
 ---
 
 ## 1. 版本演进与性能里程碑
 
-| Commit | 描述 | Non-Varlen | Varlen | 关键改动 |
-|--------|------|-----------|--------|---------|
-| `eb60537` | 初始版本 | 0.85-1.69x | — | 6 warps, TMEM A-op, T2R+R2S epilog |
-| `046ef65` | occ=2 优化 | **1.36-1.65x** | — | 8 warps, 208 regs, pipeline 2→1 stage |
-| `dc2a15c` | varlen 修正 | — | 通过测试 | O store OOB fix, AM coord fix |
-| `a2ec808` | persistent varlen | — | 基线建立 | grid=SM_count, grid-stride loop |
-| `e4e5f0c` | 双缓冲 TMA | 同上 | 1.24-1.30x | q/h/v/A=2 stages, occ=1 |
-| `f2f8a47` | 消除 store warp spill | — | — | 消除 local memory spill |
-| `605dd1e` | store warp bulk S2R→R2G | — | **1.29-1.34x** | regs 40→168, bulk SMEM→REG |
-| `a1cbf51` | non-varlen 恢复 occ=2 | 1.03-1.05x | 同上 | multi-stage 仅用于 persistent |
-| `aa145d0` | persistent non-varlen | **1.53-1.59x** | 同上 | persistent + double-buffer 全路径 |
-| `b9c0010` | g 改 bf16 (已回退) | 1.63-1.64x | — | g SMEM 减半, g_stage=2 |
-| `697c4f5` | 回退: g 必须 fp32 | 1.53-1.59x | 1.28-1.34x | 接口约束 |
-| **`6699190`** | **外提 + 重排 + 无分支** | **1.54-1.60x** | **1.59-1.63x** | **本文重点** |
+| 阶段 | Non-Varlen | Varlen | 关键改动 |
+|------|-----------|--------|--------|
+| 初始版本 | 0.85-1.69x | — | 6 warps, TMEM A-op, T2R+R2S epilog |
+| occ=2 优化 | **1.36-1.65x** | — | 8 warps, 208 regs, 1-stage pipeline |
+| Persistent + 双缓冲 TMA | **1.53-1.59x** | **1.29-1.34x** | grid-stride loop, occ=1, 2-stage TMA, store warp regs 40→168 |
+| **外提 + 重排 + 无分支** | **1.54-1.60x** | **1.59-1.63x** | 循环不变量外提, FMA/XU 重排, branchless select |
 
 ---
 
@@ -44,7 +35,6 @@
 
 ### 2.1 occ=2 寄存器优化 (1.07x → 1.43x)
 
-**Commit:** `046ef65`
 **提升幅度:** geomean 1.07x → 1.43x (全面 >1.0x)
 
 初始版本仅 6 个 warp，占用率低。参考 chunk_delta_h 的优化模式：
@@ -63,7 +53,6 @@
 
 ### 2.2 Persistent Kernel + 双缓冲 TMA
 
-**Commits:** `a2ec808` → `e4e5f0c` → `aa145d0`
 **提升幅度：** Non-varlen 1.03x → 1.59x; Varlen 建立 → 1.34x
 
 #### Persistent Kernel（grid-stride loop）
@@ -102,7 +91,6 @@ LOAD warp 可以为 WU[i+1] 发起 TMA，同时 CUDA/MMA warps 处理 WU[i]，�
 
 ### 2.3 Store Warp 寄存器调优
 
-**Commits:** `f2f8a47` → `605dd1e`
 **提升幅度：** Varlen 1.26x → 1.34x (+~4%)
 
 初始 store warp 只有 40 个寄存器，无法容纳完整 O tile partition（~128 regs for 256 bf16 values），导致严重的 register spill → local memory 访问。
@@ -111,8 +99,8 @@ LOAD warp 可以为 WU[i+1] 发起 TMA，同时 CUDA/MMA warps 处理 WU[i]，�
 
 **修复策略：**
 
-1. **First pass (f2f8a47):** 完全移除 bulk SMEM→REG copy，改为逐行读 SMEM → 写 GMEM
-2. **Second pass (605dd1e):** Persistent 模式下 occ=1，寄存器充裕，将 store warp 寄存器 40→168
+1. **First pass:** 完全移除 bulk SMEM→REG copy，改为逐行读 SMEM → 写 GMEM
+2. **Second pass:** Persistent 模式下 occ=1，寄存器充裕，将 store warp 寄存器 40→168
    ```
    4×32×208 + 4×32×168 = 48,128 ≤ 65,536 (occ=1 上限)
    ```
@@ -124,13 +112,12 @@ LOAD warp 可以为 WU[i+1] 发起 TMA，同时 CUDA/MMA warps 处理 WU[i]，�
 
 ### 2.4 ⭐ 循环不变量外提 + 乘法重排 + 无分支 varlen
 
-**Commit:** `6699190`
 **提升幅度：**
 - Varlen: **1.28-1.34x → 1.59-1.63x (+19% ~ +27%)**
 - Non-varlen: 1.53-1.59x → 1.54-1.60x (+1%)
 - NCU Duration: **403,584 → 328,288 ns (-18.7%)**
 
-这是本轮优化中**提升最大**的单次 commit，包含三个正交的改动：
+这是本轮优化中**提升最大**的一次改动，包含三个正交的优化：
 
 #### 改动 1: T2R/R2T/R2S Setup 代码外提 (最关键)
 
@@ -276,36 +263,7 @@ cute.copy(tiled_t2r_acc, tTR_tAcc[(None, None, None, 0)], tTR_rQG_fp32)
 
 ---
 
-## 3. 失败尝试与教训
-
-### 3.1 g 转 bf16 存储 (b9c0010, 已回退 697c4f5)
-
-**想法：** g tensor 从 fp32 改 bf16，SMEM 占用减半 (32K→16K)，腾出空间给 g_stage=2。
-**结果：** 性能提升 ~5%，但 **g 必须是 fp32 是接口约束**，无法采用。
-**教训：** 优化前先确认接口约束。
-
-### 3.2 两阶段 h/v 分裂
-
-**想法：** 将 h 和 v 的 MMA 拆成两个阶段，先做 QH 再做 AV。
-**结果：** 最高仅 1.20x，远低于统一 persistent 方案。
-**教训：** 增加阶段数 ≠ 更好的 overlap，需要有足够的独立计算来填充。
-
-### 3.3 QG 三阶段分裂 (load_q → load_g → compute)
-
-**想法：** QG 计算拆成三个阶段，引入独立的 `g_buf` 寄存器 buffer 来存 g 值。
-**结果：** Varlen 从 1.28-1.34x 暴降到 1.03-1.06x。
-**根因：** 新增的 `g_buf` register tensor 导致 CUDA warp 寄存器超标（已经 208），产生灾难性 register spill。
-**教训：** 在寄存器压力已经接近上限 (208 regs) 时，**绝不能新增 register tensor**。成功的优化必须零寄存器增量。
-
-### 3.4 全组合 staging 扫描
-
-**想法：** 系统性测试所有 (q_stage, g_stage, h_stage, v_stage, a_stage) 组合。
-**结果：** 所有组合均不优于 baseline (q=2, g=1, h=2, v=2, a=2)。
-**教训：** Staging 配置不是银弹，需要与实际的 compute/memory overlap 机会匹配。
-
----
-
-## 4. 最终性能
+## 3. 最终性能
 
 ### vs FLA Triton (H=64)
 
@@ -329,12 +287,12 @@ cute.copy(tiled_t2r_acc, tTR_tAcc[(None, None, None, 0)], tTR_rQG_fp32)
 
 ---
 
-## 5. NCU 指标对比
+## 4. NCU 指标对比
 
 基于 non-varlen B=2 T=8192 H=64 配置:
 
-| 指标 | Baseline (697c4f5) | Optimized (6699190) | 变化 |
-|------|-------------------|---------------------|------|
+| 指标 | Baseline | Optimized | 变化 |
+|------|---------|-----------|------|
 | **Duration** | 403,584 ns | **328,288 ns** | **-18.7%** |
 | IPC | 1.49 | 1.56 | +4.7% |
 | **总指令数** | 94,362,616 | **81,491,736** | **-13.6%** |
@@ -349,7 +307,7 @@ cute.copy(tiled_t2r_acc, tTR_tAcc[(None, None, None, 0)], tTR_rQG_fp32)
 
 ---
 
-## 6. 核心经验总结
+## 5. 核心经验总结
 
 ### 原则 1: 循环不变量必须外提
 
@@ -395,5 +353,3 @@ SM100a 有独立的 FMA / XU (SFU) / Tensor / LSU 管线。通过调整运算顺
 - Duration 和总指令数是最终判据
 
 ---
-
-*文档生成于 commit `6699190` (feat/fwd_o)*
