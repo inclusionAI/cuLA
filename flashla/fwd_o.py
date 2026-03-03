@@ -106,7 +106,7 @@ class ChunkGlaFwdO:
         head_dim_v: int = 128,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
-        g_dtype: Type[cutlass.Numeric] = cutlass.Float32,
+        g_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         scale: float = 1.0,
         is_varlen: bool = False,
         BK: int = 128,
@@ -150,16 +150,19 @@ class ChunkGlaFwdO:
 
         # Pipeline stages for TMA inputs.
         # Non-persistent (occ=2): single-buffered to keep SMEM ≤ 114K (228K/2).
-        #   q=16K + g=32K + h=32K + v=16K + A=8K + O=16K = ~120K ✓
+        #   q=16K + g=16K + h=32K + v=16K + A=8K + O=16K = ~104K ✓
         # Persistent (occ=1): double-buffer to overlap TMA prefetch with compute.
-        #   q=32K + g=32K + h=64K + v=32K + A=16K + O=16K = ~192K < 228K ✓
-        #   g is kept 1-stage (32K fp32 too expensive to double).
+        #   Non-varlen: q=32K + g=32K(bf16×2) + h=64K + v=32K + A=16K + O=16K = ~192K ✓
+        #   Varlen:     q=32K + g=16K(bf16×1) + h=64K + v=32K + A=16K + O=16K = ~176K ✓
+        #   g stored as bf16 (halves SMEM vs fp32). Non-varlen uses g_stage=2
+        #   for double-buffered g TMA prefetch; varlen uses g_stage=1 to avoid
+        #   pipeline overhead on short variable-length chunks.
         self.o_stage = 1
         self.acc_stage = 1
         if self.persistent:
             self.min_occupancy = 1
             self.q_stage = 2
-            self.g_stage = 1
+            self.g_stage = 1 if self.is_varlen else 2
             self.h_stage = 2
             self.v_stage = 2
             self.a_stage = 2
@@ -277,7 +280,7 @@ class ChunkGlaFwdO:
         )
         q = cute.make_tensor(q_ptr, q_layout)
 
-        # g layout: token-indexed (T, K, (H, data_B)) — fp32 (separate from q)
+        # g layout: token-indexed (T, K, (H, data_B)) — bf16 (same shape as q)
         g_layout = cute.make_layout(
             (T, K, (H, data_B)),
             stride=(H * K, 1, (K, T * H * K)),
@@ -1095,13 +1098,13 @@ class ChunkGlaFwdO:
                         if cutlass.const_expr(self.is_varlen):
                             if bt_coord < remaining:
                                 q_val = sQ_epi[(bt_coord, bk_coord, q_h.index)].to(self.acc_dtype)
-                                g_val = sG_epi[(bt_coord, bk_coord, g_h.index)]
+                                g_val = sG_epi[(bt_coord, bk_coord, g_h.index)].to(self.acc_dtype)
                                 tTR_rQG_fp32[ei] = q_val * cute.exp2(g_val) * scale_f32
                             else:
                                 tTR_rQG_fp32[ei] = Float32(0.0)
                         else:
                             q_val = sQ_epi[(bt_coord, bk_coord, q_h.index)].to(self.acc_dtype)
-                            g_val = sG_epi[(bt_coord, bk_coord, g_h.index)]
+                            g_val = sG_epi[(bt_coord, bk_coord, g_h.index)].to(self.acc_dtype)
                             tTR_rQG_fp32[ei] = q_val * cute.exp2(g_val) * scale_f32
 
                     q_h.release()
