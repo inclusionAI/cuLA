@@ -29,6 +29,19 @@ struct Arch {
     }
 };
 
+void ChunkKDAFwdIntra(
+    at::Tensor q,
+    at::Tensor k,
+    at::Tensor g,
+    at::Tensor beta,
+    at::Tensor cu_seqlens,
+    at::Tensor chunk_indices,
+    at::Tensor Aqk_out,
+    at::Tensor Akk_out,
+    at::Tensor tile_counter,
+    float scale,
+    int chunk_size);
+
 void ChunkKDABwdIntra(
     at::Tensor q,
     at::Tensor k,
@@ -75,6 +88,7 @@ void ChunkKDABwdWYDqkgFused(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashLA";
     m.def("lightning_prefill_fwd", &FLACutlassSM100FwdRun);
+    m.def("chunk_kda_fwd_intra_cuda", &ChunkKDAFwdIntra);
     m.def("chunk_kda_bwd_intra_cuda", &ChunkKDABwdIntra);
     m.def("chunk_kda_bwd_wy_dqkg_fused_cuda", &ChunkKDABwdWYDqkgFused);
 }
