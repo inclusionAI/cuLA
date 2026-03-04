@@ -6,6 +6,7 @@ dist/
 *perf.csv
 *.png
 *.csv
+*.html
 /.vscode
 compile_commands.json
 .cache

@@ -1,7 +1,7 @@
 from typing import Tuple, Optional, List
 import torch
 
-from kda.kda_cuda import chunk_kda_bwd_intra_cuda, chunk_kda_bwd_wy_dqkg_fused_cuda
+import flashla.cudac as flashla_cuda
 
 def kda_bwd_intra(
     q: torch.Tensor,
@@ -29,7 +29,7 @@ def kda_bwd_intra(
         tile_counter.zero_()
     else:
         tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
-    chunk_kda_bwd_intra_cuda(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices, dq_out, dk_out, db_out, dg_out, tile_counter, chunk_size)
+    flashla_cuda.chunk_kda_bwd_intra_cuda(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices, dq_out, dk_out, db_out, dg_out, tile_counter, chunk_size)
     return dq_out, dk_out, db_out, dg_out
 
 

@@ -10,6 +10,8 @@ from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2, gather
 from fla.utils import IS_GATHER_SUPPORTED, IS_TF32_SUPPORTED, autotune_cache_kwargs
 
+import flashla.cudac as flashla_cuda
+
 if IS_TF32_SUPPORTED:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr('tf32')
 else:
@@ -749,11 +751,13 @@ def chunk_kda_fwd_intra(
     safe_gate: bool = False,
     disable_recompute: bool = False,
 ):
+    assert safe_gate, "Only safe_gate=True is supported in chunk_kda_fwd_intra for now"
     B, T, H, K = k.shape
     BT = chunk_size
     BC = 16
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+    assert cu_seqlens is not None and chunk_indices is not None, "cu_seqlens and chunk_indices must be provided for cuda impl"
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     NC = triton.cdiv(BT, BC)
 
@@ -763,64 +767,12 @@ def chunk_kda_fwd_intra(
     # Separate fp32 buffer for diagonal 16x16 blocks (for precision in solve_tril)
     Akkd = torch.empty(B, T, H, BC, device=k.device, dtype=torch.float32)
 
-    # Step 1: Run token_parallel first to compute diagonal blocks into Akkd (fp32)
-    # Step 1: compute diagonal blocks into Akk_diag (fp32)
-    if safe_gate:
-        # TODO: replace with flashla implementation
-        grid = (NT, NC, B * H)
-        BK = triton.next_power_of_2(K)
-        chunk_kda_fwd_kernel_intra_sub_chunk[grid](
-            q=q,
-            k=k,
-            g=gk,
-            beta=beta,
-            Aqk=Aqk,
-            Akk=Akkd,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            T=T,
-            H=H,
-            K=K,
-            BT=BT,
-            BC=BC,
-            BK=BK,
-            USE_GATHER=IS_GATHER_SUPPORTED,
-        )
-    else:
-        Aqk, Akkd = chunk_kda_fwd_intra_token_parallel(
-            q=q,
-            k=k,
-            gk=gk,
-            beta=beta,
-            Aqk=Aqk,
-            Akk=Akkd,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            chunk_size=BT,
-            sub_chunk_size=BC,
-        )
-
-    # Step 2: Fused inter + solve_tril (works for both fixed-len and varlen)
-    grid = (NT, B * H)
-    chunk_kda_fwd_kernel_inter_solve_fused[grid](
-        q=q,
-        k=k,
-        g=gk,
-        beta=beta,
-        Aqk=Aqk,
-        Akkd=Akkd,
-        Akk=Akk,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        K=K,
-        BT=BT,
-        BC=BC,
-        USE_SAFE_GATE=safe_gate,
+    tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
+    flashla_cuda.chunk_kda_fwd_intra_cuda(
+        q, k, gk, beta, cu_seqlens, chunk_indices,
+        Aqk, Akk, tile_counter, scale, chunk_size
     )
+
     w, u, qg, kg = recompute_w_u_fwd(
         k=k,
         v=v,

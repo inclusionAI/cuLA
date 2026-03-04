@@ -7,6 +7,7 @@
 namespace sm100 {
     using tf32 = cutlass::tfloat32_t;
     using bf16 = cutlass::bfloat16_t;
+    using fp16 = cutlass::half_t;
     using transac_bar_t = cutlass::arch::ClusterTransactionBarrier;
 
     struct bf16x4 {
