@@ -807,6 +807,7 @@ class LinearAttentionChunkwiseDecay:
             ),
             barrier_storage=storage.k_weighted_mbar_ptr.data_ptr(),
         ).make_participants()
+        # (state_load pipeline removed — h0/ht now use direct GMEM↔RMEM)
 
         # TMEM
         tmem_alloc_barrier = pipeline.NamedBarrier(
@@ -1413,17 +1414,26 @@ class LinearAttentionChunkwiseDecay:
                 print(f"tKcK_half: {cute.pretty_str(tKcK_half)}")
             #-------------------------------------------------------
 
+            # RMEM flat view of KV state (D FP32 values per thread)
+            init_flat = cute.make_tensor(
+                tTR_rKV.iterator, layout=cute.make_layout(_D))
+
+            # GMEM tensor for this CTA's state: (D, D) column-major
+            gState_h0 = initial_state[None, None, (hidx, bidx)]   # (D, D) stride (1, D)
+            gState_ht = final_state[None, None, (hidx, bidx)]     # (D, D) stride (1, D)
+            # Per-thread GMEM row view: thread local_tidx owns row local_tidx
+            # Row elements at GMEM offsets: local_tidx, local_tidx+D, ..., local_tidx+(D-1)*D
+            gRow_h0 = cute.make_tensor(
+                gState_h0.iterator + local_tidx,
+                cute.make_layout(_D, stride=_D))
+            gRow_ht = cute.make_tensor(
+                gState_ht.iterator + local_tidx,
+                cute.make_layout(_D, stride=_D))
+
             # -------------- Initial State Loading (h0) ----------------
-            # If has_initial_state, load h0 from GMEM into TMEM (both FP32 and BF16)
+            # Direct GMEM → RMEM: each thread loads its row via cute.copy
             if cutlass.const_expr(self.has_initial_state):
-                # Load initial state from GMEM to RMEM respecting TMEM partition.
-                # TMEM stores S^T (transposed), so flat[i] = state[local_tidx, i]
-                # Each thread owns key position local_tidx, D elements cover value positions.
-                init_state_chunk = initial_state[None, None, (hidx, bidx)]
-                init_flat = cute.make_tensor(
-                    tTR_rKV.iterator, layout=cute.make_layout(D))
-                for init_i in cutlass.range(0, D, unroll=0):
-                    init_flat[init_i] = init_state_chunk[local_tidx, init_i]
+                cute.autovec_copy(gRow_h0, init_flat)
 
                 # Store raw h0 as BF16 to kv16 TMEM for SQ MMA at idx=0
                 tmem_store_rAccKVAsBF16.store(tTR_rKV.load().to(self.io_dtype))
@@ -1598,13 +1608,10 @@ class LinearAttentionChunkwiseDecay:
                 cute.arch.fence_view_async_tmem_load()
                 kv_handle.release()
 
-                # Write FP32 state from RMEM to GMEM
-                # TMEM stores S^T (transposed), so flat[i] = state[local_tidx, i]
-                state_out = final_state[None, None, (hidx, bidx)]
+                # Direct RMEM → GMEM: each thread writes its row via cute.copy
                 out_flat = cute.make_tensor(
-                    tTR_rKV.iterator, layout=cute.make_layout(D))
-                for out_i in cutlass.range(0, D, unroll=0):
-                    state_out[local_tidx, out_i] = out_flat[out_i]
+                    tTR_rKV.iterator, layout=cute.make_layout(_D))
+                cute.autovec_copy(out_flat, gRow_ht)
 
         elif warp_idx == self.epilogue_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
