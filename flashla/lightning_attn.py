@@ -88,25 +88,23 @@ class LinearAttentionChunkwiseDecay:
     
     Args:
         chunk_size: Size of each attention chunk (default: 64)
-        qk_acc_dtype: Accumulator data type for QK computation (default: Float32)
-        kv_acc_dtype: Accumulator data type for PV computation (default: Float32)
+        acc_dtype: Accumulator data type for all MMA computations (default: Float32)
         io_dtype: Input/output data type (default: Float16)
     """
 
     def __init__(
         self,
         chunk_size: int = 64,
-        qk_acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
-        kv_acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
+        has_initial_state: bool = False,
+        output_final_state: bool = False,
     ):
         self.chunk_size = chunk_size
-        self.qk_acc_dtype = qk_acc_dtype
-        self.kv_acc_dtype = kv_acc_dtype
-        self.pv_acc_dtype = kv_acc_dtype
         self.acc_dtype = acc_dtype
         self.io_dtype = io_dtype
+        self.has_initial_state = has_initial_state
+        self.output_final_state = output_final_state
 
         # Warp specialization
         self.num_load_warps = 1
@@ -280,10 +278,6 @@ class LinearAttentionChunkwiseDecay:
         """Compute tile scheduler parameters based on the chunk size and MMA tiler."""
         # (D, S, (H, B))
         return (
-            # S / CHUNK
-            # cute.ceil_div(o_shape[0], chunk_size),
-            # For Loop to tile over chunk size,
-            # TODO: varlen will make parallelism good enough
             1,
             # H
             cute.size(o_shape[2][0]),
@@ -299,8 +293,10 @@ class LinearAttentionChunkwiseDecay:
         v_iter: cute.Pointer,
         o_iter: cute.Pointer,
         decay: cute.Pointer,
+        scale: Float32,
+        initial_state_iter: cute.Pointer,
+        final_state_iter: cute.Pointer,
         problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B, S, H, D)
-        # problem_size: Tuple[int, int, int, int],  # (B, S, H, D)
         stream,  # CUstream type annotation removed to avoid import issues
     ):
         """
@@ -311,7 +307,10 @@ class LinearAttentionChunkwiseDecay:
             k_iter: Key tensor
             v_iter: Value tensor
             o_iter: Output tensor
-            decay_iter: Per-head decay coefficients pointer [H]
+            decay: Per-head decay coefficients pointer [H]
+            scale: Scale factor for attention (typically 1/sqrt(D))
+            initial_state_iter: Initial state pointer [B, H, D, D] (FP32) or nullptr
+            final_state_iter: Final state pointer [B, H, D, D] (FP32) or nullptr
             problem_size: (B, S, H, D) problem dimensions
             stream: CUDA stream
         """
@@ -346,10 +345,6 @@ class LinearAttentionChunkwiseDecay:
             (D, S, (H,B)),
             stride=(1, D*H, (D, D*H*S)),
         )
-        # v_layout = cute.make_layout(
-        #     (S, D, (H,B)),
-        #     stride=(D*H, 1, (D, D*H*S)),
-        # )
         v = cute.make_tensor(v_iter, v_layout)
 
         o_layout = cute.make_layout(
@@ -358,11 +353,13 @@ class LinearAttentionChunkwiseDecay:
         )
         o = cute.make_tensor(o_iter, o_layout)
 
-        # TODO: output final state
+        # Initial state / final state: [B, H, D, D] stored as row-major FP32
         fstate_layout = cute.make_layout(
             (D, D, (H, B)),
-            stride=(1, D*H, (D, D*D*H)),
+            stride=(1, D, (D*D, D*D*H)),
         )
+        initial_state = cute.make_tensor(initial_state_iter, fstate_layout)
+        final_state = cute.make_tensor(final_state_iter, fstate_layout)
 
         self.q_dtype = q.element_type
         self.k_dtype = k.element_type
@@ -389,7 +386,7 @@ class LinearAttentionChunkwiseDecay:
             self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
-            self.qk_acc_dtype,
+            self.acc_dtype,
             self.cta_group,
             self.qk_mma_tiler[:2],
         )
@@ -398,7 +395,7 @@ class LinearAttentionChunkwiseDecay:
             self.k_dtype,
             self.v_major_mode,
             self.k_major_mode_kv,
-            self.kv_acc_dtype,
+            self.acc_dtype,
             self.cta_group,
             self.kv_mma_tiler[:2],
         )
@@ -418,7 +415,7 @@ class LinearAttentionChunkwiseDecay:
             self.v_dtype,
             self.v_major_mode,
             p_major_mode,
-            self.pv_acc_dtype,
+            self.acc_dtype,
             self.cta_group,
             self.vp_mma_tiler[:2],
         )
@@ -558,8 +555,7 @@ class LinearAttentionChunkwiseDecay:
         k_copy_size = cute.size_in_bytes(self.k_dtype, k_smem_layout)
         v_copy_size = cute.size_in_bytes(self.v_dtype, v_smem_layout)
         self.tma_copy_q_bytes = q_copy_size
-        self.tma_copy_k_bytes = k_copy_size        
-        # self.tma_copy_v_bytes = v_copy_size        
+        self.tma_copy_k_bytes = k_copy_size
         self.tma_copy_v_bytes = k_copy_size        
 
         if cutlass.const_expr(PRINT_DEBUG):
@@ -621,6 +617,7 @@ class LinearAttentionChunkwiseDecay:
             o_intra_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
             o_inter_mbar_ptr: cute.struct.MemRange[Int64, 1 * 2] # type: ignore
             smem_o_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
+            k_weighted_mbar_ptr: cute.struct.MemRange[Int64, 1 * 2] # type: ignore
             # Tmem holding buffer
             tmem_holding_buf: Int32
             # Smem tensors
@@ -646,15 +643,12 @@ class LinearAttentionChunkwiseDecay:
                 self.buffer_align_bytes,
             ]
 
-        self.shared_storage = SharedStorage        
-        # print(f"size of storage: {SharedStorage.__sizeof__()}")
+        self.shared_storage = SharedStorage
 
         self.grid = self._compute_grid(
-            # (D, S, (H, B))
             o_shape=cute.shape(o),
             chunk_size=self.chunk_size,
         )
-        # print(f"grid: {self.grid}")
 
         self.kernel(
             qk_tiled_mma,
@@ -672,6 +666,9 @@ class LinearAttentionChunkwiseDecay:
             tma_atom_o,
             tma_tensor_o,
             decay,
+            scale,
+            initial_state,
+            final_state,
             q_smem_layout_staged,
             k_smem_layout_staged,
             kv_k_smem_layout_staged,
@@ -706,6 +703,9 @@ class LinearAttentionChunkwiseDecay:
         tma_atom_o: cute.CopyAtom,
         tma_tensor_o: cute.Tensor,
         decay: cute.Pointer,
+        scale: Float32,
+        initial_state: cute.Tensor,
+        final_state: cute.Tensor,
         q_smem_layout_staged: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
         kv_k_smem_layout_staged: cute.ComposedLayout,
@@ -715,27 +715,7 @@ class LinearAttentionChunkwiseDecay:
         state_tmem_layout_staged: cute.ComposedLayout,
         problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B, S, H, D)
     ):
-        """Kernel for linear attention.
-
-        Args:
-            qk_tiled_mma (cute.TiledMma): qk tiled mma
-            kv_tiled_mma (cute.TiledMma): kv tiled mma
-            vp_tiled_mma (cute.TiledMma): pv tiled mma
-            tma_atom_q (cute.CopyAtom): _description_
-            tma_tensor_q (cute.Tensor): _description_
-            tma_atom_k (cute.CopyAtom): _description_
-            tma_tensor_k (cute.Tensor): _description_
-            tma_atom_v (cute.CopyAtom): _description_
-            mV_vdl (cute.Tensor): _description_
-            o (cute.Tensor): _description_
-            decay (cute.Pointer): _description_
-            q_smem_layout_staged (cute.ComposedLayout): _description_
-            k_smem_layout_staged (cute.ComposedLayout): _description_
-            v_smem_layout_staged (cute.ComposedLayout): _description_
-            o_smem_layout_staged (cute.ComposedLayout): _description_
-            p_smem_layout_staged (cute.ComposedLayout): _description_
-            chunk_size (int): _description_
-        """
+        """Kernel for chunkwise linear attention with per-position decay."""
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
 
@@ -798,7 +778,7 @@ class LinearAttentionChunkwiseDecay:
             barrier_storage=storage.kv16_mbar_ptr.data_ptr(),
         ).make_participants()
         p_producer, p_consumer = pipeline.PipelineAsync.create(
-            num_stages=self.acc_stage, # TODO: check p stages
+            num_stages=self.acc_stage,
             producer_group=make_thread_cooperative_group(
                 self.threads_per_warp * len(self.cuda_warp_ids)
             ),
@@ -834,6 +814,17 @@ class LinearAttentionChunkwiseDecay:
             ),
             barrier_storage=storage.smem_o_mbar_ptr.data_ptr(),
         ).make_participants()
+        # K weighted signal: CUDA core weights K in SMEM, MMA waits before KV GEMM
+        k_weighted_producer, k_weighted_consumer = pipeline.PipelineAsync.create(
+            num_stages=1,
+            producer_group=make_thread_cooperative_group(
+                self.threads_per_warp * len(self.cuda_warp_ids)
+            ),
+            consumer_group=make_thread_cooperative_group(
+                self.threads_per_warp * len([self.mma_warp_id])
+            ),
+            barrier_storage=storage.k_weighted_mbar_ptr.data_ptr(),
+        ).make_participants()
 
         # TMEM
         tmem_alloc_barrier = pipeline.NamedBarrier(
@@ -851,7 +842,7 @@ class LinearAttentionChunkwiseDecay:
         tmem.wait_for_alloc()
 
         # Retrieve tmem ptr
-        tmem_ptr_base = tmem.retrieve_ptr(self.qk_acc_dtype)
+        tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
 
         # Generate smem tensor Q/K/V/O
         # (MMA, MMA_Q, MMA_D, STAGE_Q)
@@ -874,15 +865,7 @@ class LinearAttentionChunkwiseDecay:
         sK = storage.sK.get_tensor(
             k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
         )
-        # TODO: Avoid duplicated loading of k even through L2 cache might make it fine.
-        swizzle_mode_k_for_kv = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            # cute.nvgpu.warpgroup.SmemLayoutAtomKind.MN_SW128,
-            cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128,
-            self.io_dtype,
-        )
         sK_kv = storage.sK.get_tensor(
-            # kv_k_smem_layout_staged.outer, swizzle=kv_k_smem_layout_staged.inner
-            # NOTE: same swizzle atom (k-major) as k_smem_layout_staged
             kv_k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
         )
         # (((64,2),16),1,4,2):(((1,4096),64),0,1024,8192)>
@@ -898,38 +881,18 @@ class LinearAttentionChunkwiseDecay:
             o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner
         )
 
-        # NOTE: row major has the same majorness as mma operand B
         qk_smem_layout_staged = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
             utils.LayoutEnum.ROW_MAJOR,
-            # utils.LayoutEnum.from_tensor(sP),
             self.qk_mma_tiler[:2],
             self.acc_stage,
         )
         sQK = storage.sP.get_tensor(
             qk_smem_layout_staged.outer, swizzle=qk_smem_layout_staged.inner,
         )
-        state_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-            self.io_dtype,
-            utils.LayoutEnum.ROW_MAJOR,
-            self.kv_mma_tiler[:2],
-            1,
-        )
-        # ROW MAJOR
-        sQK_flat_layout = cute.make_layout((64, 64, 2), stride=(64,1,4096))
-        sQK_flat = storage.sP.get_tensor(
-            sQK_flat_layout, swizzle=qk_smem_layout_staged.inner,
-        )
-        # ROW MAJOR
-        sV_flat_layout = cute.make_layout((64, 64, 2, 2), stride=(1,64,4096,8192))
-        # sV_flat_layout = cute.make_layout((128, 64, 2), stride=(64,1,8192))
-        # sV_flat_layout = cute.make_layout((128, 64, 2), stride=(128,1,64))
-        sV_flat = storage.sV.get_tensor(
-            sV_flat_layout, swizzle=v_smem_layout_staged.inner,
-        )
 
-        # ((64,16),1,(4,2),2):
-        # ((64,1),0,(16,4096),8192)>
+        # Flat view of K SMEM for per-position decay weighting
+        # Layout: (seq_pos, d_lo, d_hi, stage) with k-major swizzle
         sK_flat_layout = cute.make_layout((64, 64, 2, 2), stride=(64,1,4096,8192))
         sK_flat = storage.sK.get_tensor(
             sK_flat_layout, swizzle=k_smem_layout_staged.inner,
@@ -961,8 +924,6 @@ class LinearAttentionChunkwiseDecay:
         block_decay = cute.exp(-decay_s * cutlass.Float32(C))
 
         qk_thr_mma = qk_tiled_mma.get_slice(0)
-        vp_thr_mma = vp_tiled_mma.get_slice(0)
-        kv_thr_mma = kv_tiled_mma.get_slice(0)
         sq_thr_mma = sq_tiled_mma.get_slice(0)
 
         #-------------------------------------------------------------
@@ -1083,7 +1044,6 @@ class LinearAttentionChunkwiseDecay:
             for chunk_start in cutlass.range(0, S, C, unroll=0):
                 # Chunk iterate over TILES_M, TILES_K is 1 in our case since max D is 128
                 idx = chunk_start // C
-                should_debug = PRINT_DEBUG and tidx == warp_idx * 32 and hidx == 0 and bidx == 0
 
                 # Qi
                 # SRC: ((ATOM_V, REST_V), TILES_M, TILES_K)
@@ -1118,26 +1078,12 @@ class LinearAttentionChunkwiseDecay:
                     tma_bar_ptr=v_handle.barrier,
                 )
 
-                if should_debug:
-                    # cute.printf("tKgK={}", tKgK)
-                    # cute.printf("tKgKT={}", tKgKT)
-                    # cute.printf("tVgV={}", tVgV)
-                    # cute.printf("tVsV={}", tVsV)
-                    # cute.printf("tma produce v, index={}", v_handle.index)
-                    # # cute.print_tensor(tVsV[None, v_handle.index])
-                    # cute.printf("Full SV")
-                    # cute.print_tensor(sV_flat)
-                    # cute.printf("Full SK")
-                    # cute.print_tensor(sK_flat)
-                    pass
 
         # ///////////////////////////////////////////////////////////////////////////////
         # COMPUTE WARPS
         # ///////////////////////////////////////////////////////////////////////////////
         elif warp_idx == self.mma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_mma)
-
-            should_debug = PRINT_DEBUG and tidx == warp_idx * 32 and hidx == 0 and bidx == 0
 
             for chunk_start in cutlass.range(0, S, C, unroll=0):
                 # Process chunk from chunk_start to chunk_start + chunk_size
@@ -1146,11 +1092,10 @@ class LinearAttentionChunkwiseDecay:
                 # Wait for Qi.
                 q_handle = load_q_consumer.wait_and_advance()
 
-                if idx != 0:
+                if idx != 0 or cutlass.const_expr(self.has_initial_state):
                     kv16_handle = kv16_consumer.wait_and_advance()
                     o_inter_handle = o_inter_producer.acquire_and_advance()
 
-                    # TODO: support initial state
                     # Compute SQ once Qi is ready.
                     sq_tiled_mma = self.exec_mma(
                         tiled_mma=sq_tiled_mma,
@@ -1189,11 +1134,16 @@ class LinearAttentionChunkwiseDecay:
                 # Also apply block decay directly in MMA warp to avoid extra TMEM round-trip
                 ####################################################
                 
+                # Wait for CUDA core to finish weighting K for per-position decay
+                kw_handle = k_weighted_consumer.wait_and_advance()
+                
                 # Wait for V, then execute KV GEMM (moved earlier)
                 v_handle = load_v_consumer.wait_and_advance()
                 kv_handle = kv_producer.acquire_and_advance()
                 
-                # Execute KV GEMM: State = K^T @ V
+                # Execute KV GEMM: State = K_weighted^T @ V
+                # K has been weighted in SMEM by exp(-s*(C-1-t)) per position
+                # This gives correct per-position decay: Σ_t exp(-s*(C-1-t)) * k_t v_t^T
                 # NOTE: Always ACC to avoid adding in cuda core.
                 kv_tiled_mma = self.exec_mma(
                     tiled_mma=kv_tiled_mma,
@@ -1203,10 +1153,11 @@ class LinearAttentionChunkwiseDecay:
                     a_stage_idx=v_handle.index,
                     b_stage_idx=k_handle.index,
                     acc_stage_idx=0,
-                    always_acc=True if idx != 0 else False,
+                    always_acc=True if (idx != 0 or cutlass.const_expr(self.has_initial_state)) else False,
                 )
                 kv_handle.commit()
                 k_handle.release()
+                kw_handle.release()
                 
                 # Now wait for P and execute VP GEMM
                 # By this time, KV GEMM has completed in parallel with decay mask computation
@@ -1252,10 +1203,6 @@ class LinearAttentionChunkwiseDecay:
             # Optimization: Cache block decay to reduce register reloads
             block_decay = cute.exp(-decay_s_cuda * cutlass.Float32(C))
             
-            # Pre-compute chunk-based decay factors (optimization to reduce exp() calls)
-            # These will be reused across iterations
-            decay_factor_C = block_decay  # exp(-s*C)
-
             # With ACC_STAGE
             # O1
             (
@@ -1291,27 +1238,12 @@ class LinearAttentionChunkwiseDecay:
                 tidx, tCtAccSQ, self.sq_mma_tiler, use_2cta_instrs=False
             )
 
-            ### ############################################
-            ### # DEBUG BEGIN
-            ### tAccSQ_epi = cute.flat_divide(
-            ###     tCtAccSQ[(None, None), 0, 0, None],
-            ###     self.epi_tile,
-            ### )
-            ### fake_smem_sq_layout = sm100_utils.make_smem_layout_epi(
-            ###     self.io_dtype,
-            ###     utils.LayoutEnum.ROW_MAJOR,
-            ###     self.sq_mma_tiler[:2],
-            ###     1,
-            ### )
-            ### fake_smem_sq = cute.make_tensor(
-            ###     cute.make_ptr(self.io_dtype, 0, cute.AddressSpace.smem),
-            ###     fake_smem_sq_layout,
-            ### )
-            ### (
-            ###     tmem_load_sq,
-            ###     tmem_load_tAccSQ,
-            ###     tmem_load_rAccSQ,
-            ### ) = self.epilog_tmem_load_and_partition_acc(local_tidx, tAccSQ_epi, fake_smem_sq)
+            # Position identity tensor for SQ output (D, C)
+            # Used to apply per-position inter-chunk decay: exp(-s*(pos+1))
+            cM_sq = cute.make_identity_tensor(self.sq_mma_tiler[:2])
+            thr_copy_t2r_sq_thread = tiled_copy_t2r_sq.get_slice(tidx)
+            tTR_cSQ = thr_copy_t2r_sq_thread.partition_D(cM_sq)
+
 
             if cutlass.const_expr(PRINT_DEBUG):
                 print(f"tiled_copy_t2r_pv: {tiled_copy_t2r_pv}")
@@ -1340,11 +1272,7 @@ class LinearAttentionChunkwiseDecay:
                 tCtAccQK[((None,None), 0, 0, None)]
             )
             # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
-            # tCcM = qk_thr_mma.partition_C(cM)
             tTR_cS = thr_t2r_S.partition_D(cM)
-            # print(f"thr_t2r_S: {thr_t2r_S}")
-            # print(f"tCcM: {tCcM}")
-            # print(f"tTR_cS: {tTR_cS}")
 
             tTR_rP = cute.make_rmem_tensor_like(
                 src=tTR_rS,
@@ -1360,7 +1288,6 @@ class LinearAttentionChunkwiseDecay:
                 smem_p=sQK,
                 tiled_t2r_qk=tiled_t2r_S,
                 tPrP_t2r=tTR_rP,
-                # tiled_mma=vp_tiled_mma,
                 tiled_mma=qk_tiled_mma,
             )
 
@@ -1389,6 +1316,19 @@ class LinearAttentionChunkwiseDecay:
             )
 
             ############################################################
+            # FP32 TMEM store partition (for h0 initial state loading)
+            (
+                tmem_store_kv_f32,
+                tmem_store_tAccKV_f32,
+                tmem_store_rAccKV_f32,
+            ) = self.tmem_store_and_partition_acc(
+                local_tidx,
+                tCtAcc=tCtAccKV,
+            )
+            tmem_store_rKV = cute.make_tensor(tTR_rKV.iterator,
+                                              layout=tmem_store_rAccKV_f32.layout)
+
+            # BF16 TMEM store partition (for kv16 state used by SQ MMA)
             (
                 tmem_store_kv,
                 tmem_store_tAccKV,
@@ -1410,7 +1350,33 @@ class LinearAttentionChunkwiseDecay:
 
             #-------------------------------------------------------
 
-            should_debug = PRINT_DEBUG and tidx == self.cuda_warp_ids[0]*32 and hidx == 0 and bidx == 0
+            # -------------- Initial State Loading (h0) ----------------
+            # If has_initial_state, load h0 from GMEM into TMEM (both FP32 and BF16)
+            if cutlass.const_expr(self.has_initial_state):
+                # Load initial state from GMEM to RMEM respecting TMEM partition.
+                # TMEM stores S^T (transposed), so flat[i] = state[local_tidx, i]
+                # Each thread owns key position local_tidx, D elements cover value positions.
+                init_state_chunk = initial_state[None, None, (hidx, bidx)]
+                init_flat = cute.make_tensor(
+                    tTR_rKV.iterator, layout=cute.make_layout(D))
+                for init_i in cutlass.range(0, D, unroll=0):
+                    init_flat[init_i] = init_state_chunk[local_tidx, init_i]
+
+                # Store raw h0 as BF16 to kv16 TMEM for SQ MMA at idx=0
+                tmem_store_rAccKVAsBF16.store(tTR_rKV.load().to(self.io_dtype))
+                init_kv16_handle = kv16_producer.acquire_and_advance()
+                init_tmem_store_tAccKVi = tmem_store_tAccKV[None, None, None, None, init_kv16_handle.index]
+                cute.copy(tmem_store_kv, tmem_store_rAccKV, init_tmem_store_tAccKVi)
+                cute.arch.fence_view_async_tmem_store()
+                init_kv16_handle.commit()
+
+                # Store h0 * block_decay to FP32 TMEM accumulator for proper decay accumulation
+                # The MMA KV GEMM at idx=0 will do: TMEM = h0*λ^C + K0^TV0 (always_acc=True)
+                h0_decayed = tTR_rKV.load() * block_decay
+                tTR_rKV.store(h0_decayed)
+                init_tmem_store_tKVi = tmem_store_tAccKV_f32[None, None, None, None, 0]
+                cute.copy(tmem_store_kv_f32, tmem_store_rKV, init_tmem_store_tKVi)
+                cute.arch.fence_view_async_tmem_store()
 
             for chunk_start in cutlass.range(0, S, C, unroll=0):
                 idx = chunk_start // C
@@ -1425,25 +1391,61 @@ class LinearAttentionChunkwiseDecay:
                     kv_handle = kv_consumer.wait_and_advance()
                     tTR_tKVi = tTR_tKV[(None, None, None, kv_handle.index)]
                     
-                    # Load KV state from TMEM to RMEM
+                    # Load KV state from TMEM to RMEM (this is S_j from MMA accumulation)
                     cute.copy(tiled_copy_t2r_kv, tTR_tKVi, tTR_rKV)
                     cute.arch.fence_view_async_tmem_load()
                     kv_handle.release()
-                    # Apply block-level decay: State *= λ^C
-                    kv_state_vec = tTR_rKV.load()
-                    kv_state_vec = kv_state_vec * block_decay
-                    
-                    # Convert to BF16 and store to kv16 region
+
+                    # Store correctly-weighted state S_j as BF16 to kv16
+                    # SQ MMA will compute S_j @ Q_j, then per-position decay
+                    # exp(-s*(t+1)) is applied in CUDA core for correct inter-chunk output
                     kv16_handle = kv16_producer.acquire_and_advance()
-                    tmem_store_rAccKVAsBF16.store(kv_state_vec.to(self.io_dtype))
+                    tmem_store_rAccKVAsBF16.store(tTR_rKV.load().to(self.io_dtype))
                     tmem_store_tAccKVi = tmem_store_tAccKV[None, None, None, None, kv16_handle.index]
                     cute.copy(tmem_store_kv, tmem_store_rAccKV, tmem_store_tAccKVi)
+                    cute.arch.fence_view_async_tmem_store()
+                    
+                    # Write back S_j * block_decay to FP32 TMEM accumulator
+                    # MMA will accumulate: TMEM = S_j*λ^C + K_weighted_j^TV_j = S_{j+1}
+                    kv_state_decayed = tTR_rKV.load() * block_decay
+                    tTR_rKV.store(kv_state_decayed)
+                    tmem_store_tKVi_f32 = tmem_store_tAccKV_f32[None, None, None, None, 0]
+                    cute.copy(tmem_store_kv_f32, tmem_store_rKV, tmem_store_tKVi_f32)
                     cute.arch.fence_view_async_tmem_store()
                     
                     kv16_handle.commit()
 
                 # Wait for S = QK^T
                 s0_handle = mma_s0_consumer.wait_and_advance()
+
+                # ============================================================
+                # Weight K in SMEM for per-position decay in KV state update
+                # Apply exp(-s*(C-1-t)) to K at each position t in the chunk.
+                # This gives correct weighted KV: Σ_t exp(-s*(C-1-t)) * k_t v_t^T
+                # K has already been consumed by QK GEMM; KV GEMM will read
+                # the weighted K via sK_kv (same SMEM, different layout view).
+                # Iterate BACKWARDS from t=C-1 (weight=1.0) to avoid FP32
+                # underflow when decay is large (e.g. exp(-s*63) → 0).
+                # ============================================================
+                k_stage_idx = idx % 2
+                d1_idx = local_tidx % 64
+                d2_idx = local_tidx // 64
+                weight_k = cutlass.Float32(1.0)  # weight for position C-1
+                decay_step = cute.exp(-decay_s_cuda)  # multiply each step going backwards
+                for t_wt_rev in cutlass.range(0, C, unroll=0):
+                    t_wt = C - 1 - t_wt_rev  # process from C-1 down to 0
+                    elem = sK_flat[t_wt, d1_idx, d2_idx, k_stage_idx]
+                    sK_flat[t_wt, d1_idx, d2_idx, k_stage_idx] = (
+                        cutlass.Float32(elem) * weight_k
+                    ).to(self.k_dtype)
+                    weight_k = weight_k * decay_step
+                # Fence SMEM writes so MMA warp sees weighted K
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
+                kw_prod_handle = k_weighted_producer.acquire_and_advance()
+                kw_prod_handle.commit()
 
                 # (MMA, MMA_M, MMA_N, ACC_STAGE)
                 tTR_tSi = tTR_tS[None, None, None, s0_handle.index]
@@ -1479,7 +1481,7 @@ class LinearAttentionChunkwiseDecay:
                 o_intra_handle.release()
 
                 # Wait for O_INTER
-                if idx != 0:
+                if idx != 0 or cutlass.const_expr(self.has_initial_state):
                     o_inter_handle = o_inter_consumer.wait_and_advance()
                     tTR_tAcc_sq_i = tTR_tAcc_base_sq[(None, None, None, 0, 0, o_inter_handle.index)]
                     # Load O_INTER from TMEM to RMEM
@@ -1487,14 +1489,17 @@ class LinearAttentionChunkwiseDecay:
                     cute.arch.fence_view_async_tmem_load()
                     o_inter_handle.release()
 
-                # Perform addition with query position decay for inter-chunk output
+                # Perform addition with per-position inter-chunk decay
                 acc_vec = tTR_rAcc_pv.load()
-                if idx != 0:
-                    # Apply query position decay: exp(-s * chunk_offset)
-                    # Phase 3 opt: Pre-compute to avoid redundant exp (block_decay cached)
-                    query_decay = cute.exp(-decay_s_cuda * cutlass.Float32(idx * C))
-                    acc_vec_inter = tTR_rAcc_sq.load() * query_decay
-                    acc_vec = acc_vec + acc_vec_inter
+                if idx != 0 or cutlass.const_expr(self.has_initial_state):
+                    # Apply per-position inter-chunk decay: exp(-s*(pos+1))
+                    # where pos is the position within the chunk (0..C-1).
+                    # The state S_j already has correct per-position weighted
+                    # accumulation, so the chunk index is NOT needed here.
+                    self.apply_inter_chunk_decay(tTR_rAcc_sq, tTR_cSQ, decay_s_cuda)
+                    acc_vec = acc_vec + tTR_rAcc_sq.load()
+                # Apply attention scale factor
+                acc_vec = acc_vec * scale
                 tTR_rO.store(acc_vec.to(self.io_dtype))
 
                 # Store output to smem
@@ -1507,10 +1512,29 @@ class LinearAttentionChunkwiseDecay:
                 )
                 smem_o_handle.commit()
 
+            # -------------- Final State Output (ht) ----------------
+            # After the last chunk, if output_final_state, read the final KV state
+            # from TMEM and write to GMEM as FP32
+            if cutlass.const_expr(self.output_final_state):
+                # Wait for the last KV GEMM to complete
+                kv_handle = kv_consumer.wait_and_advance()
+                tTR_tKVi = tTR_tKV[(None, None, None, kv_handle.index)]
+                # Load final KV state from TMEM to RMEM (FP32)
+                cute.copy(tiled_copy_t2r_kv, tTR_tKVi, tTR_rKV)
+                cute.arch.fence_view_async_tmem_load()
+                kv_handle.release()
+
+                # Write FP32 state from RMEM to GMEM
+                # TMEM stores S^T (transposed), so flat[i] = state[local_tidx, i]
+                state_out = final_state[None, None, (hidx, bidx)]
+                out_flat = cute.make_tensor(
+                    tTR_rKV.iterator, layout=cute.make_layout(D))
+                for out_i in cutlass.range(0, D, unroll=0):
+                    state_out[local_tidx, out_i] = out_flat[out_i]
+
         elif warp_idx == self.epilogue_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_epilogue_warps)
 
-            should_debug = PRINT_DEBUG and tidx == warp_idx*32 and hidx == 0 and bidx == 0
             # TMA STORE
             # O: (D, S), column major
             # (MMA_M, MMA_N, TILES_M, TILES_N, (H, B))
@@ -1554,23 +1578,6 @@ class LinearAttentionChunkwiseDecay:
 
         return
 
-    def tmem_load_kv16(self, local_tidx, tState):
-        copy_atom_t2r = sm100_utils.get_tmem_load_op(
-            self.kv_mma_tiler,
-            utils.LayoutEnum.ROW_MAJOR,
-            self.io_dtype,
-            self.io_dtype,
-            self.kv_mma_tiler[:2],
-            use_2cta_instrs=False,
-        )
-        fake_sState = cute.make_tensor(
-            cute.make_ptr(self.io_dtype, 0, cute.AddressSpace.smem),
-            cute.dice(self.kv_mma_tiler, (1,1,None)),
-        )
-        return self.make_tmem_load_and_partition(
-            copy_atom_t2r, tState, (None, None, 0), local_tidx, fake_sState
-        )
-
     def epilog_smem_copy_and_partition_o(
         self,
         tiled_copy_t2r: cute.TiledCopy,
@@ -1597,11 +1604,6 @@ class LinearAttentionChunkwiseDecay:
             - tRS_sO: The partitioned tensor C (smem destination)
         :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
         """
-        # copy_atom_r2s = cute.make_copy_atom(
-        #     # NOTE: TRANSPOSE
-        #     cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=True, num_matrices=4),
-        #     self.io_dtype,
-        # )
         copy_atom_r2s = sm100_utils.get_smem_store_op(
             self.o_layout, self.io_dtype, self.acc_dtype, tiled_copy_t2r
         )
@@ -1713,8 +1715,6 @@ class LinearAttentionChunkwiseDecay:
         # Make tiledCopy for tensor memory store
         # (D, D), 128,128, 16b
         copy_atom_r2t = cute.make_copy_atom(
-            # TODO: check unpack
-            # tcgen05.St32x32bOp(tcgen05.Repetition(8), tcgen05.Unpack.NONE),
             tcgen05.St32x32bOp(tcgen05.Repetition(8), tcgen05.Unpack.UNPACK_32b_IN_16b),
             dtype,
         )
@@ -1768,15 +1768,6 @@ class LinearAttentionChunkwiseDecay:
             tcgen05.Ld16x256bOp(tcgen05.Repetition(8), tcgen05.Pack.NONE),
             self.acc_dtype,
         ) 
-        # copy_atom_t2r_qk = sm100_utils.get_tmem_load_op(
-        #     self.qk_mma_tiler,
-        #     # TODO:
-        #     utils.LayoutEnum.ROW_MAJOR,
-        #     self.io_dtype,
-        #     self.acc_dtype,
-        #     self.qk_epi_tile,
-        #     use_2cta_instrs=False,
-        # )
         fake_sQK = cute.make_tensor(
             cute.make_ptr(self.io_dtype, 0, cute.AddressSpace.smem),
             cute.dice(self.qk_mma_tiler, (1, 1, None)),
@@ -1858,11 +1849,6 @@ class LinearAttentionChunkwiseDecay:
         return tiled_r2s_x, thr_r2s_x, tXrX_r2s, tXsX_r2s
 
     def epilog_tmem_load_and_partition_acc(self, local_tidx, tIntra, smem_y):
-        # copy_atom_t2r_inter2_intra2 = cute.make_copy_atom(
-        #     tcgen05.Ld16x256bOp(tcgen05.Repetition(4), tcgen05.Pack.NONE),
-        #     self.acc_dtype,
-        # )
-        # TODO: 16x256b might be faster, but 32x32b is easier to debug now.
         copy_atom_t2r_inter2_intra2 = cute.make_copy_atom(
             tcgen05.Ld32x32bOp(tcgen05.Repetition(32), tcgen05.Pack.NONE),
             self.acc_dtype,
@@ -1916,21 +1902,10 @@ class LinearAttentionChunkwiseDecay:
         # Make tiledCopy for tensor memory load
         epitile = mma_tiler[:2]
         assert epitile[0] == 128
-        # TODO: 32dp ease DEBUGGING
         copy_atom_t2r = cute.make_copy_atom(
             tcgen05.Ld32x32bOp(tcgen05.Repetition(32), tcgen05.Pack.NONE),
             self.acc_dtype,
         ) 
-        # copy_atom_t2r = sm100_utils.get_tmem_load_op(
-        #     mma_tiler,
-        #     # self.o_layout,
-        #     # TODO
-        #     utils.LayoutEnum.ROW_MAJOR,
-        #     self.io_dtype,
-        #     self.acc_dtype,
-        #     epitile,
-        #     use_2cta_instrs,
-        # )
         # (EPI_TILE_M, EPI_TILE_N, 1, 1, STAGE)
         tAcc_epi = cute.flat_divide(
             # ((EPI_TILE_M, EPI_TILE_N), EPI_M, EPI_N, STAGE)
@@ -1971,30 +1946,6 @@ class LinearAttentionChunkwiseDecay:
             print(f"------------ EPILOG TMEM COPY AND PARTITION END --------------")
 
         return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
-
-    @cute.jit
-    def apply_mask(
-        self,
-        acc_qk: cute.Tensor,
-        index_qk: cute.Tensor,
-        p: cute.Tensor,
-        debug: bool = False,
-        index_transform: cutlass.Constexpr = lambda index_q, index_k: (
-            index_q,
-            index_k,
-        ),
-    ):
-        # Apply causal mask (non-decay version, kept for backward compatibility)
-        for i in cutlass.range_constexpr(cute.size(acc_qk)):
-            index_q, index_k = index_transform(*index_qk[i])
-            if debug:
-                cute.printf("index_qk, {},{}", index_q, index_k)
-            # Mask causal
-            if index_q < index_k:
-                acc_qk[i] = cutlass.Float32(0.0)
-                p[i] = cutlass.BFloat16(0.0)
-            else:
-                p[i] = acc_qk[i].to(self.q_dtype)
 
     @cute.jit
     def apply_decay_mask(
@@ -2055,6 +2006,44 @@ class LinearAttentionChunkwiseDecay:
         """Scale TMEM accumulator tensor by a scalar factor (for block-level decay)."""
         for i in cutlass.range_constexpr(cute.size(tmem_acc)):
             tmem_acc[i] = tmem_acc[i] * scale_factor
+
+    @cute.jit
+    def apply_inter_chunk_decay(
+        self,
+        acc_sq: cute.Tensor,
+        index_sq: cute.Tensor,
+        decay_s: cutlass.Float32,
+    ):
+        """Apply per-position inter-chunk decay to SQ MMA output.
+        
+        For position t within the chunk, multiply by exp(-s*(t+1)).
+        The state S_j already has correct per-position weighted accumulation,
+        so only within-chunk position decay is needed (no chunk index factor).
+        
+        Args:
+            acc_sq: SQ MMA output register tensor (FP32)
+            index_sq: Position identity partition giving (d_idx, pos_idx) per element
+            decay_s: Per-head decay parameter s > 0
+        """
+        size = cute.size(acc_sq)
+        for i in cutlass.range_constexpr(0, size - 1, 2):
+            # Element i: get position within chunk (column index of SQ output)
+            pos0 = cutlass.Float32(index_sq[i][1])
+            acc_sq[i] = cutlass.Float32(acc_sq[i]) * cute.exp(
+                -decay_s * (pos0 + cutlass.Float32(1.0))
+            )
+            # Element i+1 (unrolled for ILP)
+            pos1 = cutlass.Float32(index_sq[i + 1][1])
+            acc_sq[i + 1] = cutlass.Float32(acc_sq[i + 1]) * cute.exp(
+                -decay_s * (pos1 + cutlass.Float32(1.0))
+            )
+        # Handle last element if size is odd
+        if size % 2 == 1:
+            i_last = size - 1
+            pos_last = cutlass.Float32(index_sq[i_last][1])
+            acc_sq[i_last] = cutlass.Float32(acc_sq[i_last]) * cute.exp(
+                -decay_s * (pos_last + cutlass.Float32(1.0))
+            )
 
     @cute.jit
     def make_tmem_store_and_partition(
@@ -2296,11 +2285,18 @@ def main():
     
     o_cute = from_dlpack(torch.zeros_like(Q))
     
+    # Initial and final state tensors [B, H, D, D] in FP32
+    h0 = torch.zeros(B, H, D, D, device="cuda", dtype=torch.float32)
+    ht = torch.zeros(B, H, D, D, device="cuda", dtype=torch.float32)
+    h0_cute = from_dlpack(h0)
+    ht_cute = from_dlpack(ht)
+    
+    scale = 1.0 / (D ** 0.5)
+    
     # Create kernel instance with decay support
     attn_kernel = LinearAttentionChunkwiseDecay(
         chunk_size=args.chunk_size,
-        qk_acc_dtype=args.acc_dtype,
-        kv_acc_dtype=args.acc_dtype,
+        acc_dtype=args.acc_dtype,
         io_dtype=args.io_dtype,
     )
 
@@ -2315,6 +2311,9 @@ def main():
         v_cute.iterator,
         o_cute.iterator,
         decay_cute.iterator,
+        scale,
+        h0_cute.iterator,
+        ht_cute.iterator,
         (B, S, H, D),
         stream,
     )
@@ -2331,6 +2330,9 @@ def main():
             v_cute.iterator,
             o_cute.iterator,
             decay_cute.iterator,
+            scale,
+            h0_cute.iterator,
+            ht_cute.iterator,
             (B, S, H, D),
             stream,
         )
@@ -2346,6 +2348,9 @@ def main():
             v_cute.iterator,
             o_cute.iterator,
             decay_cute.iterator,
+            scale,
+            h0_cute.iterator,
+            ht_cute.iterator,
             (B, S, H, D),
             stream,
         )
