@@ -1,19 +1,27 @@
+#!/usr/bin/env python3
+"""
+Benchmark Lightning Attention with decay: CuteDSL vs Triton (FLA).
+Tests various prefill scenarios including with/without initial state (h0) and final state (ht).
+"""
+
 import torch
 import time
 import ctypes
+import argparse
+import sys
+import numpy as np
 
-from fla.ops.lightning_attn import chunk_lightning_attn
-from fla.utils import assert_close, device
+from fla.ops.simple_gla.chunk import chunk_simple_gla_fwd
+from fla.utils import device
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Int32, Int64, Float32
+from cutlass.cute.typing import Float32
 
+sys.path.insert(0, '/ossfs/workspace/flashla')
 from flashla.lightning_attn import LinearAttentionChunkwiseDecay
-
-import torch
-from einops import rearrange
 
 
 PRINT_DEBUG = False
@@ -22,715 +30,524 @@ PRINT_DEBUG = False
 def reset_cuda_error():
     """Reset CUDA error state after an error occurs."""
     try:
-        # Get CUDA error and reset
         torch.cuda.synchronize()
-        # Call cudaGetLastError to clear the error
         libcudart = ctypes.CDLL('libcudart.so')
         libcudart.cudaGetLastError()
         torch.cuda.empty_cache()
-    except:
+    except Exception:
         pass
 
-def print_chunkwise(t, name):
-    if not PRINT_DEBUG:
-        return
-    print(f"--------{name}:")
-    c = t.shape[1] // 64
-    for i in range(c):
-        beg = i*64
-        end = beg + 64
-        print(t[:, beg:end])
+
+def compute_fla_decay(H, layer_idx, num_layers):
+    """Compute FLA-style per-head decay. Returns (H,) tensor on CUDA."""
+    # FLA: g_gamma = -(8/H * (1 - layer_idx/num_layers)) * range(H)
+    # g_gamma is negative, our decay_s is positive => decay_s[h] = -g_gamma[h]
+    return (8 / H * (1 - layer_idx / num_layers)) * torch.arange(H, dtype=torch.float32, device=device)
 
 
-def test_triton_lightning_attn(
-  args,
-  Q,
-  K,
-  V,  
-  decay,
-  problem_size,
-  layer_idx,
-) -> torch.Tensor:
-    B, S, H, D = problem_size
-    (
-        chunk_size,
-        acc_dtype,
-        io_dtype,
-        iterations,
-        num_layers,
-    ) = args
+# ---------------------------------------------------------------------------
+# Triton (FLA) runner
+# ---------------------------------------------------------------------------
+def run_triton(
+    Q, K, V, decay,
+    initial_state, output_final_state,
+    warmup, iterations,
+):
+    """Run FLA chunk_simple_gla_fwd directly and return (output, final_state, elapsed_ms).
 
-    # warmup
-    for _ in range(2):
-        tri, _ = chunk_lightning_attn(Q, K, V, scale=1, num_layers=num_layers, layer_idx=layer_idx, output_final_state=True)
+    Uses g_gamma = -decay to avoid FLA's internal decay recomputation.
+    Output tensors (o, ht) are allocated inside chunk_simple_gla_fwd.
+    """
+    scale = 1.0
+    g_gamma = -decay  # Our decay s > 0 => FLA g_gamma = -s
+
+    for _ in range(warmup):
+        chunk_simple_gla_fwd(
+            q=Q, k=K, v=V,
+            g_gamma=g_gamma,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            chunk_size=64,
+        )
     torch.cuda.synchronize()
 
     start = time.perf_counter()
-    tri = None
     for _ in range(iterations):
-        tri, _ = chunk_lightning_attn(Q, K, V, scale=1, num_layers=num_layers, layer_idx=layer_idx, output_final_state=True)
-
+        o_tri, ht_tri = chunk_simple_gla_fwd(
+            q=Q, k=K, v=V,
+            g_gamma=g_gamma,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            chunk_size=64,
+        )
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
-    print(f"Triton Execution time: {elapsed*1000/iterations:.2f} ms (average over {iterations} iterations)")
-    return tri, elapsed
+    return o_tri, ht_tri, elapsed * 1000 / iterations
 
-def test_cutedsl_lightning_attn(
-  args,
-  Q,
-  K,
-  V,  
-  decay,
-  problem_size,
-) -> torch.Tensor:
-    B, S, H, D = problem_size
-    (
-        chunk_size,
-        acc_dtype,
-        io_dtype,
-        iterations,
-        num_layers,
-    ) = args
-    attn_kernel = LinearAttentionChunkwiseDecay(
-        chunk_size=chunk_size,
-        qk_acc_dtype=acc_dtype,
-        kv_acc_dtype=acc_dtype,
-        io_dtype=io_dtype,
-    )
 
-    # Convert to dlpack for CuTe
+# ---------------------------------------------------------------------------
+# CuteDSL runner
+# ---------------------------------------------------------------------------
+def run_cutedsl(
+    Q, K, V, decay,
+    has_initial_state, output_final_state,
+    h0,
+    warmup, iterations,
+):
+    """Run CuteDSL kernel and return (output, ht_tensor, elapsed_ms, compile_ms).
+
+    Output tensors (O, ht) are allocated fresh each iteration to match
+    FLA's internal allocation pattern for a fair comparison.
+    """
+    B, S, H, D = Q.shape
+    scale = 1.0
+
+    # Allocate dummy outputs for compilation only
+    O_dummy = torch.zeros_like(Q)
+    ht_dummy = torch.zeros(B, H, D, D, dtype=torch.float32, device=Q.device)
+
     q_cute = from_dlpack(Q)
     k_cute = from_dlpack(K)
     v_cute = from_dlpack(V)
     decay_cute = from_dlpack(decay)
-    
-    O = torch.zeros_like(Q)
-    o_cute = from_dlpack(O)
+    h0_cute = from_dlpack(h0)
 
-    # Get default stream
-    stream = cutlass.torch.default_stream()
-
-    start_time = time.time()
-    compiled = cute.compile(
-        attn_kernel,
-        q_cute.iterator,
-        k_cute.iterator,
-        v_cute.iterator,
-        o_cute.iterator,
-        decay_cute.iterator,
-        (B, S, H, D),
-        stream,
+    kernel = LinearAttentionChunkwiseDecay(
+        chunk_size=64,
+        acc_dtype=cutlass.Float32,
+        io_dtype=cutlass.BFloat16,
+        has_initial_state=has_initial_state,
+        output_final_state=output_final_state,
     )
-    compilation_time = time.time() - start_time
-    print(f"Compilation time: {compilation_time:.4f} seconds")
 
-    print(f"B, S, H, D: {(B, S, H, D)}")
+    stream = cutlass_torch.default_stream()
 
-    # warm up
-    for _ in range(2):
+    t0 = time.time()
+    compiled = cute.compile(
+        kernel,
+        q_cute.iterator, k_cute.iterator, v_cute.iterator,
+        from_dlpack(O_dummy).iterator, decay_cute.iterator, scale,
+        h0_cute.iterator, from_dlpack(ht_dummy).iterator,
+        (B, S, H, D), stream,
+    )
+    compile_ms = (time.time() - t0) * 1000
+
+    def _run():
+        # Allocate fresh output tensors each iteration (like FLA internally)
+        O = torch.zeros_like(Q)
+        ht = torch.zeros(B, H, D, D, dtype=torch.float32, device=Q.device)
+        o_cute = from_dlpack(O)
+        ht_cute = from_dlpack(ht)
         compiled(
-            q_cute.iterator,
-            k_cute.iterator,
-            v_cute.iterator,
-            o_cute.iterator,
-            decay_cute.iterator,
-            (B, S, H, D),
-            stream,
+            q_cute.iterator, k_cute.iterator, v_cute.iterator,
+            o_cute.iterator, decay_cute.iterator, scale,
+            h0_cute.iterator, ht_cute.iterator,
+            (B, S, H, D), stream,
         )
+        return O, ht
+
+    for _ in range(warmup):
+        _run()
     torch.cuda.synchronize()
 
-    # Run
     start = time.perf_counter()
     for _ in range(iterations):
-        compiled(
-            q_cute.iterator,
-            k_cute.iterator,
-            v_cute.iterator,
-            o_cute.iterator,
-            decay_cute.iterator,
-            (B, S, H, D),
-            stream,
-        )
-
+        O_out, ht_out = _run()
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
-    print(f"\nCuteDSL Execution time: {elapsed*1000/iterations:.2f} ms (average over {iterations} iterations)")
 
-    return O, elapsed
+    return O_out, ht_out, elapsed * 1000 / iterations, compile_ms
 
-def benchmark_lightning_attn(
-    B: int,
-    T: int,
-    H: int,
-    D: int,
-    scale: float | None,
-    dtype: torch.dtype,
-    layer_idx: int = 0,
-    num_layers: int = 24,
-    iterations: int = 10,
+
+# ---------------------------------------------------------------------------
+# Single config benchmark
+# ---------------------------------------------------------------------------
+def benchmark_config(
+    B, T, H, D,
+    layer_idx, num_layers,
+    mode,  # "no_state" | "h0_ht"
+    warmup=2, iterations=10,
 ):
     """
-    Benchmark Lightning Attention with decay.
-    
-    Args:
-        B: Batch size
-        T: Sequence length
-        H: Number of heads
-        D: Head dimension
-        scale: Attention scale (default 1.0)
-        dtype: Data type for tensors
-        layer_idx: Layer index (for FLA decay calculation)
-        num_layers: Number of layers (for FLA decay calculation)
-        iterations: Number of benchmark iterations
+    Benchmark a single configuration.
+    mode: "no_state"  - no initial/final state
+          "h0_ht"     - provide random h0 and output ht
+    Returns dict with timing and accuracy info.
     """
     torch.manual_seed(42)
-    q = torch.randn((B, T, H, D), dtype=dtype, device=device)
-    k = torch.randn((B, T, H, D), dtype=dtype, device=device)
-    v = torch.randn((B, T, H, D), dtype=dtype, device=device)
-    
-    # Per-head decay parameters
-    # Match FLA's decay calculation: g_gamma = -(8 / H * (1 - layer_idx / num_layers)) * range(H)
-    # FLA's gamma is negative, our decay_s is positive, so: decay_s[h] = -gamma[h]
-    decay = 8 / H * (1 - layer_idx / num_layers) * torch.arange(H, dtype=torch.float32, device=device)
-    
-    print(f"\n{'='*60}")
-    print(f"Benchmarking Lightning Attention with Decay")
-    print(f"{'='*60}")
-    print(f"Problem size: B={B}, T={T}, H={H}, D={D}")
-    print(f"Layer: {layer_idx}/{num_layers}")
-    print(f"Decay range: [{decay[0]:.4f}, {decay[-1]:.4f}]")
-    print(f"Iterations: {iterations}")
-    print(f"{'='*60}\n")
+    Q = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    K = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    V = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
 
-    with torch.no_grad():
-        args = (
-            64,  # chunk_size
-            cutlass.Float32,  # acc_dtype
-            cutlass.BFloat16,  # io_dtype
-            iterations,
-            num_layers,
-        )
+    decay = compute_fla_decay(H, layer_idx, num_layers)
 
-        # Test Triton (FLA) implementation
-        tri = None
-        triton_elapsed = None
-        triton_error = None
-        print("Testing Triton (FLA) implementation...")
-        try:
-            tri, triton_elapsed = test_triton_lightning_attn(args, q, k, v, decay, problem_size=(B, T, H, D), layer_idx=layer_idx)
-            print_chunkwise(tri, 'TRITON_O')
-        except Exception as e:
-            triton_error = str(e)
-            print(f"✗ Triton (FLA) failed: {e}")
-            # Clear CUDA error state
-            reset_cuda_error()
+    has_initial_state = mode == "h0_ht"
+    output_final_state = mode == "h0_ht"
 
-        # Test CuteDSL implementation
-        cutedsl_o = None
-        cutedsl_elapsed = None
-        cutedsl_error = None
-        print("\nTesting CuteDSL implementation...")
-        try:
-            cutedsl_o, cutedsl_elapsed = test_cutedsl_lightning_attn(args, q, k, v, decay, problem_size=(B, T, H, D))
-            print_chunkwise(cutedsl_o, 'CUTEDSL_O')
-        except Exception as e:
-            cutedsl_error = str(e)
-            print(f"✗ CuteDSL failed: {e}")
-            # Clear CUDA error state
-            reset_cuda_error()
-
-        # Check if both failed
-        if tri is None and cutedsl_o is None:
-            print("\n" + "="*60)
-            print("Both Implementations Failed")
-            print("="*60)
-            print(f"✗ Triton (FLA) error: {triton_error}")
-            print(f"✗ CuteDSL error: {cutedsl_error}")
-            print("="*60 + "\n")
-            
-            return {
-                'max_diff': float('nan'),
-                'mean_diff': float('nan'),
-                'rel_error': float('nan'),
-                'triton_time': float('nan'),
-                'cutedsl_time': float('nan'),
-                'speedup': float('nan'),
-                'triton_error': triton_error,
-                'cutedsl_error': cutedsl_error,
-            }
-        
-        # If only one succeeded, return partial results
-        if tri is None or cutedsl_o is None:
-            print("\n" + "="*60)
-            print("Partial Results (one implementation failed)")
-            print("="*60)
-            if tri is None:
-                print(f"✗ Triton (FLA) failed: {triton_error}")
-                print(f"✓ CuteDSL succeeded: {cutedsl_elapsed*1000/iterations:.3f} ms/iter")
-            else:
-                print(f"✓ Triton (FLA) succeeded: {triton_elapsed*1000/iterations:.3f} ms/iter")
-                print(f"✗ CuteDSL failed: {cutedsl_error}")
-            print("="*60 + "\n")
-            
-            return {
-                'max_diff': float('nan'),
-                'mean_diff': float('nan'),
-                'rel_error': float('nan'),
-                'triton_time': triton_elapsed * 1000 / iterations if triton_elapsed else float('nan'),
-                'cutedsl_time': cutedsl_elapsed * 1000 / iterations if cutedsl_elapsed else float('nan'),
-                'speedup': float('nan'),
-                'triton_error': triton_error,
-                'cutedsl_error': cutedsl_error,
-            }
-
-        # Compare outputs (both succeeded)
-        print("\n" + "="*60)
-        print("Numerical Comparison")
-        print("="*60)
-        max_diff = torch.max(torch.abs(tri - cutedsl_o)).item()
-        mean_diff = torch.mean(torch.abs(tri - cutedsl_o)).item()
-        rel_error = mean_diff / (torch.mean(torch.abs(tri)).item() + 1e-8)
-        
-        print(f"Max absolute difference: {max_diff:.6f}")
-        print(f"Mean absolute difference: {mean_diff:.6f}")
-        print(f"Relative error: {rel_error:.6f}")
-        
-        # Note: FLA uses per-head decay based on head index
-        try:
-            assert_close('o', tri, cutedsl_o, 0.03)
-            print("✓ Outputs match within tolerance (0.03)")
-        except AssertionError as e:
-            print(f"✗ Outputs differ: {e}")
-
-        # Performance comparison
-        print("\n" + "="*60)
-        print("Performance Results")
-        print("="*60)
-        speedup = triton_elapsed / cutedsl_elapsed
-        print(f"Triton time:  {triton_elapsed*1000/iterations:.3f} ms/iter")
-        print(f"CuteDSL time: {cutedsl_elapsed*1000/iterations:.3f} ms/iter")
-        print(f"Speedup (Triton/CuteDSL): {speedup:.2f}x")
-        
-        if speedup > 1:
-            print(f"✓ CuteDSL is {speedup:.2f}x faster than Triton")
-        else:
-            print(f"✗ Triton is {1/speedup:.2f}x faster than CuteDSL")
-        print("="*60 + "\n")
-        
-        # Return results for plotting
-        return {
-            'max_diff': max_diff,
-            'mean_diff': mean_diff,
-            'rel_error': rel_error,
-            'triton_time': triton_elapsed * 1000 / iterations,
-            'cutedsl_time': cutedsl_elapsed * 1000 / iterations,
-            'speedup': speedup,
-            'triton_error': None,
-            'cutedsl_error': None,
-        }
-
-
-def run_benchmark_suite():
-    """
-    Run comprehensive benchmarks with multiple configurations.
-    Tests different batch sizes and head counts, then plots results.
-    """
-    import matplotlib.pyplot as plt
-    import numpy as np
-    
-    # Test configurations
-    batch_sizes = [2, 8, 16]  # Removed 64 to avoid CUDA context corruption
-    num_heads_list = [16, 64]  # Test H=16 and H=64
-    seq_lens = [128, 512, 1024, 2048, 4096, 8192]  # Test short to long sequence lengths
-    head_dim = 128
-    layer_idx = 12
-    num_layers = 24
-    iterations = 10
-    
-    results = []
-    configs = []
-    
-    print("\n" + "="*80)
-    print("Running Comprehensive Benchmark Suite")
-    print("="*80)
-    print(f"Batch sizes: {batch_sizes}")
-    print(f"Num heads: {num_heads_list}")
-    print(f"Seq lens: {seq_lens}, Head dim: {head_dim}")
-    print(f"Layer: {layer_idx}/{num_layers}, Iterations: {iterations}")
-    print("="*80 + "\n")
-    
-    for B in batch_sizes:
-        for T in seq_lens:
-            for H in num_heads_list:
-                # Skip configurations that cause int32 overflow
-                # B*T*H*D must be < 2^31 (2,147,483,648) for signed int32
-                # B=16, T=32768: 16*32768*64*128 = 4,294,967,296 > 2^32 (overflow!)
-                total_elements = B * T * H * head_dim
-                if total_elements > 2_147_483_648:  # 2^31
-                    print(f"\n{'='*60}")
-                    print(f"Skipping B={B}, T={T}, H={H} (int32 overflow: {total_elements:,} > 2^31)")
-                    print(f"{'='*60}\n")
-                    continue
-                
-                config_name = f"B={B}, T={T}, H={H}"
-                configs.append(config_name)
-                
-                print(f"\n{'='*60}")
-                print(f"Testing configuration: {config_name}")
-                print(f"{'='*60}")
-                
-                result = benchmark_lightning_attn(
-                    B=B,
-                    T=T,
-                    H=H,
-                    D=head_dim,
-                    scale=1.0,
-                    dtype=torch.bfloat16,
-                    layer_idx=layer_idx,
-                    num_layers=num_layers,
-                    iterations=iterations,
-                )
-                results.append(result)
-    
-    # Plot results
-    plot_benchmark_results(configs, results, batch_sizes, num_heads_list, seq_lens)
-    
-    # Generate markdown report
-    generate_markdown_report(configs, results, batch_sizes, num_heads_list, seq_lens, layer_idx, num_layers, iterations)
-    
-    return results
-
-
-def plot_benchmark_results(configs, results, batch_sizes, num_heads_list, seq_lens):
-    """
-    Create visualization of benchmark results.
-    """
-    import matplotlib.pyplot as plt
-    import numpy as np
-    
-    # Extract data
-    max_diffs = [r['max_diff'] for r in results]
-    mean_diffs = [r['mean_diff'] for r in results]
-    rel_errors = [r['rel_error'] for r in results]
-    triton_times = [r['triton_time'] for r in results]
-    cutedsl_times = [r['cutedsl_time'] for r in results]
-    speedups = [r['speedup'] for r in results]
-    
-    # Create figure with subplots
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle('Lightning Attention Benchmark: CuteDSL vs Triton (FLA)', fontsize=16, fontweight='bold')
-    
-    x = np.arange(len(configs))
-    width = 0.35
-    
-    # Plot 1: Max Difference
-    ax1 = axes[0, 0]
-    bars1 = ax1.bar(x, max_diffs, color='coral')
-    ax1.set_ylabel('Max Absolute Difference', fontsize=10)
-    ax1.set_title('Maximum Difference', fontsize=12, fontweight='bold')
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(configs, rotation=45, ha='right', fontsize=8)
-    ax1.grid(axis='y', alpha=0.3)
-    for i, (bar, val) in enumerate(zip(bars1, max_diffs)):
-        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{val:.1f}',
-                ha='center', va='bottom', fontsize=8)
-    
-    # Plot 2: Mean Difference
-    ax2 = axes[0, 1]
-    bars2 = ax2.bar(x, mean_diffs, color='lightblue')
-    ax2.set_ylabel('Mean Absolute Difference', fontsize=10)
-    ax2.set_title('Mean Difference', fontsize=12, fontweight='bold')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(configs, rotation=45, ha='right', fontsize=8)
-    ax2.grid(axis='y', alpha=0.3)
-    for i, (bar, val) in enumerate(zip(bars2, mean_diffs)):
-        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{val:.3f}',
-                ha='center', va='bottom', fontsize=8)
-    
-    # Plot 3: Relative Error
-    ax3 = axes[0, 2]
-    bars3 = ax3.bar(x, [r*100 for r in rel_errors], color='lightgreen')
-    ax3.set_ylabel('Relative Error (%)', fontsize=10)
-    ax3.set_title('Relative Error', fontsize=12, fontweight='bold')
-    ax3.set_xticks(x)
-    ax3.set_xticklabels(configs, rotation=45, ha='right', fontsize=8)
-    ax3.grid(axis='y', alpha=0.3)
-    ax3.axhline(y=3.0, color='r', linestyle='--', linewidth=1, alpha=0.5, label='Tolerance (3%)')
-    ax3.legend(fontsize=8)
-    for i, (bar, val) in enumerate(zip(bars3, rel_errors)):
-        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{val*100:.2f}%',
-                ha='center', va='bottom', fontsize=8)
-    
-    # Plot 4: Execution Time Comparison
-    ax4 = axes[1, 0]
-    bars4a = ax4.bar(x - width/2, triton_times, width, label='Triton (FLA)', color='steelblue')
-    bars4b = ax4.bar(x + width/2, cutedsl_times, width, label='CuteDSL', color='orange')
-    ax4.set_ylabel('Time (ms/iter)', fontsize=10)
-    ax4.set_title('Execution Time Comparison', fontsize=12, fontweight='bold')
-    ax4.set_xticks(x)
-    ax4.set_xticklabels(configs, rotation=45, ha='right', fontsize=8)
-    ax4.legend(fontsize=9)
-    ax4.grid(axis='y', alpha=0.3)
-    
-    # Plot 5: Speedup
-    ax5 = axes[1, 1]
-    bars5 = ax5.bar(x, speedups, color='gold')
-    ax5.set_ylabel('Speedup (Triton/CuteDSL)', fontsize=10)
-    ax5.set_title('Performance Speedup', fontsize=12, fontweight='bold')
-    ax5.set_xticks(x)
-    ax5.set_xticklabels(configs, rotation=45, ha='right', fontsize=8)
-    ax5.axhline(y=1.0, color='r', linestyle='--', linewidth=1, alpha=0.5, label='Baseline')
-    ax5.legend(fontsize=8)
-    ax5.grid(axis='y', alpha=0.3)
-    for i, (bar, val) in enumerate(zip(bars5, speedups)):
-        ax5.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{val:.2f}x',
-                ha='center', va='bottom', fontsize=8)
-    
-    # Plot 6: Grouped comparison by batch size and sequence length
-    ax6 = axes[1, 2]
-    
-    # Build speedup matrix with actual data (handle skipped configs)
-    n_batch = len(batch_sizes)
-    n_seqlen = len(seq_lens)
-    speedup_matrix = np.full((n_batch, n_seqlen), np.nan)
-    
-    # Fill matrix with available results
-    for config, result in zip(configs, results):
-        # Parse config string like "B=16, T=32768, H=64"
-        parts = config.split(', ')
-        B_val = int(parts[0].split('=')[1])
-        T_val = int(parts[1].split('=')[1])
-        
-        b_idx = batch_sizes.index(B_val)
-        t_idx = seq_lens.index(T_val)
-        speedup_matrix[b_idx, t_idx] = result['speedup']
-    
-    x_pos = np.arange(n_batch)
-    width = 0.35
-    
-    for i, T in enumerate(seq_lens):
-        offset = (i - n_seqlen/2 + 0.5) * width
-        # Only plot non-NaN values
-        data = speedup_matrix[:, i]
-        ax6.bar(x_pos + offset, np.nan_to_num(data), width, label=f'T={T}')
-    
-    ax6.set_ylabel('Speedup (Triton/CuteDSL)', fontsize=10)
-    ax6.set_title('Speedup by Batch Size and Seq Length', fontsize=12, fontweight='bold')
-    ax6.set_xlabel('Batch Size', fontsize=10)
-    ax6.set_xticks(x_pos)
-    ax6.set_xticklabels([f'B={b}' for b in batch_sizes], fontsize=9)
-    ax6.legend(fontsize=9)
-    ax6.axhline(y=1.0, color='r', linestyle='--', linewidth=1, alpha=0.5)
-    ax6.grid(axis='y', alpha=0.3)
-    
-    plt.tight_layout()
-    
-    # Save figure
-    output_path = 'benchmark_results.png'
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    print(f"\n{'='*60}")
-    print(f"Benchmark results saved to: {output_path}")
-    print(f"{'='*60}\n")
-    
-    # Print summary table
-    print("\n" + "="*110)
-    print("BENCHMARK SUMMARY TABLE")
-    print("="*110)
-    print(f"{'Config':<25} {'Max Diff':>12} {'Mean Diff':>12} {'Rel Err %':>10} "
-          f"{'Triton(ms)':>12} {'CuteDSL(ms)':>12} {'Speedup':>10}")
-    print("-"*110)
-    for cfg, res in zip(configs, results):
-        if np.isnan(res['speedup']):
-            # Check which implementation failed
-            error_msg = ""
-            if res.get('triton_error') and res.get('cutedsl_error'):
-                error_msg = f"BOTH FAILED (T: {res['triton_error'][:30]}..., C: {res['cutedsl_error'][:30]}...)"
-            elif res.get('triton_error'):
-                error_msg = f"Triton FAILED: {res['triton_error'][:60]}..."
-            elif res.get('cutedsl_error'):
-                error_msg = f"CuteDSL FAILED: {res['cutedsl_error'][:60]}..."
-            else:
-                error_msg = "FAILED"
-            print(f"{cfg:<25} {error_msg}")
-        else:
-            print(f"{cfg:<25} {res['max_diff']:>12.2f} {res['mean_diff']:>12.4f} {res['rel_error']*100:>9.2f}% "
-                  f"{res['triton_time']:>12.3f} {res['cutedsl_time']:>12.3f} {res['speedup']:>9.2f}x")
-    print("="*110 + "\n")
-    
-    # Calculate and print averages (excluding failed tests)
-    valid_speedups = [s for s in speedups if not np.isnan(s)]
-    valid_rel_errors = [r for r in rel_errors if not np.isnan(r)]
-    if valid_speedups:
-        avg_speedup = np.mean(valid_speedups)
-        avg_rel_error = np.mean(valid_rel_errors) * 100
-        print(f"Average Speedup: {avg_speedup:.2f}x (from {len(valid_speedups)} successful tests)")
-        print(f"Average Relative Error: {avg_rel_error:.2f}%")
+    if has_initial_state:
+        h0 = torch.randn(B, H, D, D, dtype=torch.float32, device=device) * 0.01
+        initial_state_fla = h0.clone()
     else:
-        print("No successful tests to calculate averages.")
-    print()
+        h0 = torch.zeros(B, H, D, D, dtype=torch.float32, device=device)
+        initial_state_fla = None
 
+    result = {
+        "B": B, "T": T, "H": H, "D": D,
+        "mode": mode,
+        "layer_idx": layer_idx,
+        "num_layers": num_layers,
+    }
 
-def generate_markdown_report(configs, results, batch_sizes, num_heads_list, seq_lens, layer_idx, num_layers, iterations):
-    """
-    Generate a markdown report of benchmark results.
-    """
-    from datetime import datetime
-    import numpy as np
-    
-    # Fixed report filename
-    report_path = 'benchmark_report.md'
-    
-    with open(report_path, 'w') as f:
-        # Header
-        f.write("# Lightning Attention Benchmark Report\n\n")
-        f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        
-        # Configuration
-        f.write("## Test Configuration\n\n")
-        f.write(f"- **Batch Sizes:** {batch_sizes}\n")
-        f.write(f"- **Number of Heads:** {num_heads_list}\n")
-        f.write(f"- **Sequence Lengths:** {seq_lens}\n")
-        f.write(f"- **Head Dimension:** 128\n")
-        f.write(f"- **Layer:** {layer_idx}/{num_layers}\n")
-        f.write(f"- **Iterations:** {iterations}\n")
-        f.write(f"- **Data Type:** BFloat16 (I/O), Float32 (Accumulation)\n\n")
-        
-        # Summary statistics
-        valid_speedups = [r['speedup'] for r in results if not np.isnan(r['speedup'])]
-        valid_rel_errors = [r['rel_error'] for r in results if not np.isnan(r['rel_error'])]
-        
-        f.write("## Summary\n\n")
-        if valid_speedups:
-            avg_speedup = np.mean(valid_speedups)
-            min_speedup = np.min(valid_speedups)
-            max_speedup = np.max(valid_speedups)
-            avg_rel_error = np.mean(valid_rel_errors) * 100
-            
-            f.write(f"- **Average Speedup:** {avg_speedup:.2f}x\n")
-            f.write(f"- **Speedup Range:** {min_speedup:.2f}x - {max_speedup:.2f}x\n")
-            f.write(f"- **Average Relative Error:** {avg_rel_error:.2f}%\n")
-            f.write(f"- **Successful Tests:** {len(valid_speedups)}/{len(results)}\n")
-            f.write(f"- **Failed Tests:** {len(results) - len(valid_speedups)}\n\n")
+    # --- Triton (FLA) ---
+    triton_error = None
+    try:
+        o_tri, ht_tri, triton_ms = run_triton(
+            Q, K, V, decay,
+            initial_state=initial_state_fla,
+            output_final_state=output_final_state,
+            warmup=warmup, iterations=iterations,
+        )
+        result["triton_ms"] = triton_ms
+    except Exception as e:
+        triton_error = str(e)
+        o_tri = None
+        result["triton_ms"] = float("nan")
+        reset_cuda_error()
+
+    # --- CuteDSL ---
+    cutedsl_error = None
+    try:
+        o_cute, ht_cute_out, cutedsl_ms, compile_ms = run_cutedsl(
+            Q, K, V, decay,
+            has_initial_state=has_initial_state,
+            output_final_state=output_final_state,
+            h0=h0,
+            warmup=warmup, iterations=iterations,
+        )
+        result["cutedsl_ms"] = cutedsl_ms
+        result["compile_ms"] = compile_ms
+    except Exception as e:
+        cutedsl_error = str(e)
+        o_cute = None
+        result["cutedsl_ms"] = float("nan")
+        result["compile_ms"] = float("nan")
+        reset_cuda_error()
+
+    result["triton_error"] = triton_error
+    result["cutedsl_error"] = cutedsl_error
+
+    # --- Accuracy ---
+    if o_tri is not None and o_cute is not None:
+        diff_o = (o_tri - o_cute).abs()
+        result["o_max_diff"] = diff_o.max().item()
+        result["o_mean_diff"] = diff_o.mean().item()
+        ref_mag = o_tri.abs().max().item() + 1e-8
+        result["o_rel_error"] = result["o_max_diff"] / ref_mag
+
+        if output_final_state and ht_tri is not None:
+            diff_ht = (ht_tri - ht_cute_out).abs()
+            result["ht_max_diff"] = diff_ht.max().item()
+            result["ht_mean_diff"] = diff_ht.mean().item()
+            ht_ref_mag = ht_tri.abs().max().item() + 1e-8
+            result["ht_rel_error"] = result["ht_max_diff"] / ht_ref_mag
         else:
-            f.write("⚠️ **No successful tests to report.**\n\n")
-        
-        # Detailed results table
-        f.write("## Detailed Results\n\n")
-        f.write("| Configuration | Max Diff | Mean Diff | Rel Error (%) | Triton (ms) | CuteDSL (ms) | Speedup | Status |\n")
-        f.write("|--------------|----------|-----------|---------------|-------------|--------------|---------|--------|\n")
-        
-        for cfg, res in zip(configs, results):
-            if np.isnan(res['speedup']):
-                # Failed test
-                status = "❌"
-                if res.get('triton_error') and res.get('cutedsl_error'):
-                    status += " Both Failed"
-                elif res.get('triton_error'):
-                    status += " Triton Failed"
-                elif res.get('cutedsl_error'):
-                    status += " CuteDSL Failed"
-                else:
-                    status += " Failed"
-                f.write(f"| {cfg} | - | - | - | - | - | - | {status} |\n")
-            else:
-                # Successful test
-                status = "✅"
-                if res['rel_error'] > 0.03:  # > 3% tolerance
-                    status += " ⚠️ High Error"
-                f.write(f"| {cfg} | {res['max_diff']:.2f} | {res['mean_diff']:.4f} | {res['rel_error']*100:.2f}% | "
-                       f"{res['triton_time']:.3f} | {res['cutedsl_time']:.3f} | {res['speedup']:.2f}x | {status} |\n")
-        
-        f.write("\n")
-        
-        # Performance analysis by configuration
-        f.write("## Performance Analysis\n\n")
-        
-        # Group by batch size
-        f.write("### Performance by Batch Size\n\n")
-        f.write("| Batch Size | Avg Speedup | Avg Triton (ms) | Avg CuteDSL (ms) |\n")
-        f.write("|------------|-------------|-----------------|------------------|\n")
-        
+            result["ht_max_diff"] = float("nan")
+            result["ht_mean_diff"] = float("nan")
+            result["ht_rel_error"] = float("nan")
+    else:
+        result["o_max_diff"] = float("nan")
+        result["o_mean_diff"] = float("nan")
+        result["o_rel_error"] = float("nan")
+        result["ht_max_diff"] = float("nan")
+        result["ht_mean_diff"] = float("nan")
+        result["ht_rel_error"] = float("nan")
+
+    # --- Speedup ---
+    if not np.isnan(result["triton_ms"]) and not np.isnan(result["cutedsl_ms"]):
+        result["speedup"] = result["triton_ms"] / result["cutedsl_ms"]
+    else:
+        result["speedup"] = float("nan")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Print helpers
+# ---------------------------------------------------------------------------
+def print_header():
+    hdr = (
+        f"{'Config':<30} {'Mode':<10} "
+        f"{'Triton(ms)':>11} {'CuteDSL(ms)':>12} {'Speedup':>8} "
+        f"{'O_maxdiff':>10} {'O_rel%':>8} "
+        f"{'Ht_maxdiff':>11} {'Ht_rel%':>8} "
+        f"{'Status':>8}"
+    )
+    print(hdr)
+    print("-" * len(hdr))
+
+
+def print_result(r):
+    config = f"B={r['B']},T={r['T']},H={r['H']}"
+    status = "OK"
+    if r["triton_error"]:
+        status = "TRI_ERR"
+    elif r["cutedsl_error"]:
+        status = "DSL_ERR"
+    elif r["o_rel_error"] > 0.05:
+        status = "HI_ERR"
+
+    ht_max = f"{r['ht_max_diff']:.4f}" if not np.isnan(r['ht_max_diff']) else "-"
+    ht_rel = f"{r['ht_rel_error']*100:.2f}" if not np.isnan(r['ht_rel_error']) else "-"
+
+    tri_ms = f"{r['triton_ms']:.3f}" if not np.isnan(r['triton_ms']) else "ERR"
+    dsl_ms = f"{r['cutedsl_ms']:.3f}" if not np.isnan(r['cutedsl_ms']) else "ERR"
+    sp = f"{r['speedup']:.2f}x" if not np.isnan(r['speedup']) else "-"
+    omd = f"{r['o_max_diff']:.4f}" if not np.isnan(r['o_max_diff']) else "-"
+    orel = f"{r['o_rel_error']*100:.2f}%" if not np.isnan(r['o_rel_error']) else "-"
+
+    print(
+        f"{config:<30} {r['mode']:<10} "
+        f"{tri_ms:>11} {dsl_ms:>12} {sp:>8} "
+        f"{omd:>10} {orel:>8} "
+        f"{ht_max:>11} {ht_rel:>7}% "
+        f"{status:>8}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Benchmark suite
+# ---------------------------------------------------------------------------
+def run_benchmark_suite(args):
+    """Run benchmarks across various prefill scenarios."""
+    batch_sizes = args.batch_sizes
+    seq_lens = args.seq_lens
+    num_heads_list = args.num_heads
+    D = args.head_dim
+    layer_idx = args.layer_idx
+    num_layers = args.num_layers
+    iterations = args.iterations
+    warmup = args.warmup
+    modes = args.modes  # list of "no_state", "h0_ht"
+
+    print("\n" + "=" * 80)
+    print("Lightning Attention Benchmark: Prefill Scenarios")
+    print("=" * 80)
+    print(f"  Batch sizes:    {batch_sizes}")
+    print(f"  Seq lengths:    {seq_lens}")
+    print(f"  Num heads:      {num_heads_list}")
+    print(f"  Head dim:       {D}")
+    print(f"  Layer:          {layer_idx}/{num_layers}")
+    print(f"  Modes:          {modes}")
+    print(f"  Warmup/Iters:   {warmup}/{iterations}")
+    print("=" * 80 + "\n")
+
+    all_results = []
+    print_header()
+
+    for mode in modes:
         for B in batch_sizes:
-            batch_results = [r for cfg, r in zip(configs, results) if f"B={B}" in cfg and not np.isnan(r['speedup'])]
-            if batch_results:
-                avg_speedup = np.mean([r['speedup'] for r in batch_results])
-                avg_triton = np.mean([r['triton_time'] for r in batch_results])
-                avg_cutedsl = np.mean([r['cutedsl_time'] for r in batch_results])
-                f.write(f"| {B} | {avg_speedup:.2f}x | {avg_triton:.3f} | {avg_cutedsl:.3f} |\n")
-            else:
-                f.write(f"| {B} | - | - | - |\n")
-        
-        f.write("\n")
-        
-        # Group by sequence length
-        f.write("### Performance by Sequence Length\n\n")
-        f.write("| Sequence Length | Avg Speedup | Avg Triton (ms) | Avg CuteDSL (ms) |\n")
-        f.write("|-----------------|-------------|-----------------|------------------|\n")
-        
-        for T in seq_lens:
-            seq_results = [r for cfg, r in zip(configs, results) if f"T={T}" in cfg and not np.isnan(r['speedup'])]
-            if seq_results:
-                avg_speedup = np.mean([r['speedup'] for r in seq_results])
-                avg_triton = np.mean([r['triton_time'] for r in seq_results])
-                avg_cutedsl = np.mean([r['cutedsl_time'] for r in seq_results])
-                f.write(f"| {T} | {avg_speedup:.2f}x | {avg_triton:.3f} | {avg_cutedsl:.3f} |\n")
-            else:
-                f.write(f"| {T} | - | - | - |\n")
-        
-        f.write("\n")
-        
-        # Group by number of heads
-        f.write("### Performance by Number of Heads\n\n")
-        f.write("| Num Heads | Avg Speedup | Avg Triton (ms) | Avg CuteDSL (ms) |\n")
-        f.write("|-----------|-------------|-----------------|------------------|\n")
-        
-        for H in num_heads_list:
-            head_results = [r for cfg, r in zip(configs, results) if f"H={H}" in cfg and not np.isnan(r['speedup'])]
-            if head_results:
-                avg_speedup = np.mean([r['speedup'] for r in head_results])
-                avg_triton = np.mean([r['triton_time'] for r in head_results])
-                avg_cutedsl = np.mean([r['cutedsl_time'] for r in head_results])
-                f.write(f"| {H} | {avg_speedup:.2f}x | {avg_triton:.3f} | {avg_cutedsl:.3f} |\n")
-            else:
-                f.write(f"| {H} | - | - | - |\n")
-        
-        f.write("\n")
-        
-        # Accuracy analysis
-        f.write("## Accuracy Analysis\n\n")
-        f.write("### Error Distribution\n\n")
-        
-        if valid_rel_errors:
-            f.write(f"- **Mean Relative Error:** {np.mean(valid_rel_errors)*100:.2f}%\n")
-            f.write(f"- **Median Relative Error:** {np.median(valid_rel_errors)*100:.2f}%\n")
-            f.write(f"- **Min Relative Error:** {np.min(valid_rel_errors)*100:.2f}%\n")
-            f.write(f"- **Max Relative Error:** {np.max(valid_rel_errors)*100:.2f}%\n")
-            f.write(f"- **Tests within 3% tolerance:** {sum(1 for e in valid_rel_errors if e <= 0.03)}/{len(valid_rel_errors)}\n\n")
-        
-        # Failure analysis
-        failed_tests = [cfg for cfg, r in zip(configs, results) if np.isnan(r['speedup'])]
-        if failed_tests:
-            f.write("## Failed Tests\n\n")
-            for cfg in failed_tests:
-                idx = configs.index(cfg)
-                res = results[idx]
-                f.write(f"### {cfg}\n\n")
-                if res.get('triton_error'):
-                    f.write(f"**Triton Error:** `{res['triton_error']}`\n\n")
-                if res.get('cutedsl_error'):
-                    f.write(f"**CuteDSL Error:** `{res['cutedsl_error']}`\n\n")
-        
-        # Footer
-        f.write("---\n\n")
-        f.write("*Report generated by bench_lightning_attn.py*\n")
-    
-    print(f"\n{'='*60}")
-    print(f"Markdown report saved to: {report_path}")
-    print(f"{'='*60}\n")
-    
-    return report_path
+            for T in seq_lens:
+                for H in num_heads_list:
+                    total_elems = B * T * H * D
+                    if total_elems > 2_147_483_648:
+                        continue
+                    if T > 4096 and B > 2:
+                        continue
+
+                    r = benchmark_config(
+                        B, T, H, D,
+                        layer_idx, num_layers,
+                        mode=mode,
+                        warmup=warmup,
+                        iterations=iterations,
+                    )
+                    all_results.append(r)
+                    print_result(r)
+
+    # --- Summary ---
+    print("\n" + "=" * 80)
+    print("SUMMARY BY MODE")
+    print("=" * 80)
+
+    for mode in modes:
+        mode_results = [r for r in all_results if r["mode"] == mode and not np.isnan(r["speedup"])]
+        if not mode_results:
+            print(f"\n  [{mode}]  No successful results.")
+            continue
+
+        speedups = [r["speedup"] for r in mode_results]
+        triton_times = [r["triton_ms"] for r in mode_results]
+        cutedsl_times = [r["cutedsl_ms"] for r in mode_results]
+        o_rels = [r["o_rel_error"] * 100 for r in mode_results]
+
+        print(f"\n  [{mode}]  ({len(mode_results)} configs)")
+        print(f"    Speedup:       avg={np.mean(speedups):.2f}x  min={np.min(speedups):.2f}x  max={np.max(speedups):.2f}x")
+        print(f"    Triton  (ms):  avg={np.mean(triton_times):.3f}  min={np.min(triton_times):.3f}  max={np.max(triton_times):.3f}")
+        print(f"    CuteDSL (ms):  avg={np.mean(cutedsl_times):.3f}  min={np.min(cutedsl_times):.3f}  max={np.max(cutedsl_times):.3f}")
+        print(f"    O rel err (%): avg={np.mean(o_rels):.2f}  max={np.max(o_rels):.2f}")
+
+        if mode == "h0_ht":
+            ht_rels = [r["ht_rel_error"] * 100 for r in mode_results if not np.isnan(r["ht_rel_error"])]
+            if ht_rels:
+                print(f"    Ht rel err(%): avg={np.mean(ht_rels):.2f}  max={np.max(ht_rels):.2f}")
+
+    # --- Plot if requested ---
+    if args.plot:
+        plot_results(all_results, modes)
+
+    # --- Markdown report ---
+    if args.report:
+        generate_report(all_results, modes, args)
+
+    print()
+    return all_results
 
 
-if __name__ == '__main__':
-    # Run comprehensive benchmark suite
-    run_benchmark_suite()
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+def plot_results(all_results, modes):
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not available, skipping plot")
+        return
+
+    # Group by mode
+    fig, axes = plt.subplots(1, len(modes), figsize=(8 * len(modes), 6), squeeze=False)
+    fig.suptitle("CuteDSL vs Triton (FLA) -- Lightning Attention Prefill", fontsize=14, fontweight="bold")
+
+    for col, mode in enumerate(modes):
+        ax = axes[0, col]
+        mode_r = [r for r in all_results if r["mode"] == mode and not np.isnan(r["speedup"])]
+        if not mode_r:
+            ax.set_title(f"{mode} (no data)")
+            continue
+
+        labels = [f"B{r['B']}T{r['T']}H{r['H']}" for r in mode_r]
+        tri_ms = [r["triton_ms"] for r in mode_r]
+        dsl_ms = [r["cutedsl_ms"] for r in mode_r]
+
+        x = np.arange(len(labels))
+        w = 0.35
+        ax.bar(x - w / 2, tri_ms, w, label="Triton", color="steelblue")
+        ax.bar(x + w / 2, dsl_ms, w, label="CuteDSL", color="orange")
+        ax.set_ylabel("Time (ms)")
+        ax.set_title(f"Mode: {mode}")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+        ax.legend()
+        ax.grid(axis="y", alpha=0.3)
+
+        # Add speedup labels
+        for i, r in enumerate(mode_r):
+            ax.text(i, max(tri_ms[i], dsl_ms[i]) * 1.02,
+                    f"{r['speedup']:.1f}x", ha="center", va="bottom", fontsize=7, color="green")
+
+    plt.tight_layout()
+    out = "benchmark_results.png"
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    print(f"\nPlot saved to {out}")
+
+
+# ---------------------------------------------------------------------------
+# Markdown report
+# ---------------------------------------------------------------------------
+def generate_report(all_results, modes, args):
+    from datetime import datetime
+    path = "benchmark_report.md"
+    with open(path, "w") as f:
+        f.write("# Lightning Attention Benchmark Report\n\n")
+        f.write(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+        f.write("## Configuration\n\n")
+        f.write(f"- Batch sizes: {args.batch_sizes}\n")
+        f.write(f"- Seq lengths: {args.seq_lens}\n")
+        f.write(f"- Num heads: {args.num_heads}\n")
+        f.write(f"- Head dim: {args.head_dim}\n")
+        f.write(f"- Layer: {args.layer_idx}/{args.num_layers}\n")
+        f.write(f"- Modes: {modes}\n")
+        f.write(f"- Warmup/Iters: {args.warmup}/{args.iterations}\n\n")
+
+        for mode in modes:
+            mode_r = [r for r in all_results if r["mode"] == mode]
+            f.write(f"## Mode: {mode}\n\n")
+
+            if mode == "h0_ht":
+                f.write("| Config | Triton(ms) | CuteDSL(ms) | Speedup | O_maxdiff | O_rel% | Ht_maxdiff | Ht_rel% | Status |\n")
+                f.write("|--------|-----------|------------|---------|-----------|--------|------------|---------|--------|\n")
+            else:
+                f.write("| Config | Triton(ms) | CuteDSL(ms) | Speedup | O_maxdiff | O_rel% | Status |\n")
+                f.write("|--------|-----------|------------|---------|-----------|--------|--------|\n")
+
+            for r in mode_r:
+                cfg = f"B={r['B']},T={r['T']},H={r['H']}"
+                sp = f"{r['speedup']:.2f}x" if not np.isnan(r['speedup']) else "-"
+                status = "OK"
+                if r["triton_error"]:
+                    status = "Triton Failed"
+                elif r["cutedsl_error"]:
+                    status = "CuteDSL Failed"
+
+                tri = f"{r['triton_ms']:.3f}" if not np.isnan(r['triton_ms']) else "-"
+                dsl = f"{r['cutedsl_ms']:.3f}" if not np.isnan(r['cutedsl_ms']) else "-"
+                omd = f"{r['o_max_diff']:.4f}" if not np.isnan(r['o_max_diff']) else "-"
+                orel = f"{r['o_rel_error']*100:.2f}%" if not np.isnan(r['o_rel_error']) else "-"
+
+                if mode == "h0_ht":
+                    htmd = f"{r['ht_max_diff']:.4f}" if not np.isnan(r['ht_max_diff']) else "-"
+                    htrel = f"{r['ht_rel_error']*100:.2f}%" if not np.isnan(r['ht_rel_error']) else "-"
+                    f.write(f"| {cfg} | {tri} | {dsl} | {sp} | {omd} | {orel} | {htmd} | {htrel} | {status} |\n")
+                else:
+                    f.write(f"| {cfg} | {tri} | {dsl} | {sp} | {omd} | {orel} | {status} |\n")
+            f.write("\n")
+
+        # Summary
+        f.write("## Summary\n\n")
+        for mode in modes:
+            mode_r = [r for r in all_results if r["mode"] == mode and not np.isnan(r["speedup"])]
+            if not mode_r:
+                continue
+            speedups = [r["speedup"] for r in mode_r]
+            f.write(f"- **{mode}**: avg speedup {np.mean(speedups):.2f}x "
+                    f"(min {np.min(speedups):.2f}x, max {np.max(speedups):.2f}x) "
+                    f"over {len(mode_r)} configs\n")
+
+        f.write("\n---\n*Generated by bench_lightning_attn.py*\n")
+
+    print(f"Report saved to {path}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Benchmark Lightning Attention prefill scenarios")
+    p.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 8],
+                    help="Batch sizes to test")
+    p.add_argument("--seq-lens", type=int, nargs="+",
+                    default=[256, 1024, 4096, 8192, 32768],
+                    help="Sequence lengths to test")
+    p.add_argument("--num-heads", type=int, nargs="+", default=[32, 64],
+                    help="Number of heads to test")
+    p.add_argument("--head-dim", type=int, default=128)
+    p.add_argument("--layer-idx", type=int, default=12)
+    p.add_argument("--num-layers", type=int, default=24)
+    p.add_argument("--warmup", type=int, default=2)
+    p.add_argument("--iterations", type=int, default=10)
+    p.add_argument("--modes", type=str, nargs="+",
+                    default=["no_state", "h0_ht"],
+                    choices=["no_state", "h0_ht"],
+                    help="State modes to benchmark")
+    p.add_argument("--plot", action="store_true", help="Save bar chart PNG")
+    p.add_argument("--report", action="store_true", help="Generate markdown report")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    run_benchmark_suite(args)
