@@ -335,11 +335,6 @@ class LinearAttentionChunkwiseDecay:
             stride=(D*H, 1, (D, D*H*S)),
         )
         k = cute.make_tensor(k_iter, k_layout)
-        kt_layout = cute.make_layout(
-            (D, S, (H,B)),
-            stride=(1, D*H, (D, D*H*S)),
-        )
-        kt = cute.make_tensor(k_iter, kt_layout)
         # v
         v_layout = cute.make_layout(
             (D, S, (H,B)),
@@ -524,15 +519,6 @@ class LinearAttentionChunkwiseDecay:
             qk_tiled_mma,
             cluster_layout_vmnk.shape,
         )
-        kv_k_smem_layout = cute.select(kv_k_smem_layout_staged, mode=[0, 1, 2])
-        tma_atom_kt, tma_tensor_kt = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            kt,
-            kv_k_smem_layout,
-            self.kv_mma_tiler,
-            kv_tiled_mma,
-            cluster_layout_vmnk.shape,
-        )
         # TMA load for V
         v_smem_layout = cute.select(v_smem_layout_staged, mode=[0, 1, 2])
         tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_A(
@@ -659,8 +645,6 @@ class LinearAttentionChunkwiseDecay:
             tma_tensor_q,
             tma_atom_k,
             tma_tensor_k,
-            tma_atom_kt,
-            tma_tensor_kt,
             tma_atom_v,
             tma_tensor_v,
             tma_atom_o,
@@ -696,8 +680,6 @@ class LinearAttentionChunkwiseDecay:
         tma_tensor_q: cute.Tensor,
         tma_atom_k: cute.CopyAtom,
         tma_tensor_k: cute.Tensor,
-        tma_atom_kt: cute.CopyAtom,
-        tma_tensor_kt: cute.Tensor,
         tma_atom_v: cute.CopyAtom,
         tma_tensor_v: cute.Tensor,
         tma_atom_o: cute.CopyAtom,
