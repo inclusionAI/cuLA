@@ -302,17 +302,17 @@ class LinearAttentionChunkwiseDecay:
         o_in: cute.Tensor,
         decay_in: cute.Tensor,
         scale: Float32,
-        initial_state_iter: cute.Pointer,
-        final_state_iter: cute.Pointer,
+        initial_state_in: cute.Tensor,
+        final_state_in: cute.Tensor,
         problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B, S, H, D)
         stream,  # CUstream type annotation removed to avoid import issues
     ):
         """
         Execute the Chunkwise Linear Attention operation on the provided tensors.
 
-        With --enable-tvm-ffi, q_in/k_in/v_in/o_in/decay_in accept torch.Tensor
-        directly (zero-copy C-level dlpack). h0/ht remain cute.Pointer for null
-        pointer support.
+        With --enable-tvm-ffi, all tensor args accept torch.Tensor directly
+        (zero-copy C-level dlpack). Pass None for initial_state_in / final_state_in
+        when has_initial_state / output_final_state is False.
 
         Args:
             q_in: Query tensor [B, S, H, D] (cute.Tensor or torch via TVM-FFI)
@@ -321,8 +321,8 @@ class LinearAttentionChunkwiseDecay:
             o_in: Output tensor [B, S, H, D]
             decay_in: Per-head decay tensor [H] (FP32)
             scale: Scale factor for attention (typically 1/sqrt(D))
-            initial_state_iter: Initial state pointer [B, H, D, D] (FP32) or nullptr
-            final_state_iter: Final state pointer [B, H, D, D] (FP32) or nullptr
+            initial_state_in: Initial state [B, H, D, D] (FP32) or None
+            final_state_in: Final state [B, H, D, D] (FP32) or None
             problem_size: (B, S, H, D) problem dimensions
             stream: CUDA stream
         """
@@ -360,15 +360,20 @@ class LinearAttentionChunkwiseDecay:
         o = cute.make_tensor(o_in.iterator, o_layout)
 
         # Initial state / final state: [B, H, D, D] stored as row-major FP32
-        # Pointers may be null (0x0) when has_initial_state / output_final_state is False.
-        # cute.make_tensor just wraps pointer+layout metadata without accessing memory,
-        # so null pointers are safe here. Actual memory access is guarded by const_expr.
+        # When has_initial_state / output_final_state is False, None is passed
+        # and the parameter is eliminated at compile time via const_expr guards.
         fstate_layout = cute.make_layout(
             (D, D, (H, B)),
             stride=(1, D, (D*D, D*D*H)),
         )
-        initial_state = cute.make_tensor(initial_state_iter, fstate_layout)
-        final_state = cute.make_tensor(final_state_iter, fstate_layout)
+        if cutlass.const_expr(self.has_initial_state):
+            initial_state = cute.make_tensor(initial_state_in.iterator, fstate_layout)
+        else:
+            initial_state = initial_state_in
+        if cutlass.const_expr(self.output_final_state):
+            final_state = cute.make_tensor(final_state_in.iterator, fstate_layout)
+        else:
+            final_state = final_state_in
 
         self.q_dtype = q.element_type
         self.k_dtype = k.element_type
@@ -2437,13 +2442,14 @@ def lightning_attn_fwd(
     o_ = from_dlpack(O, assumed_align=128, enable_tvm_ffi=True)
     decay_ = from_dlpack(decay, assumed_align=128, enable_tvm_ffi=True)
 
-    h0_ptr = initial_state.data_ptr() if has_initial_state else 0
+    # h0/ht: from_dlpack when provided, None when absent
+    h0_ = from_dlpack(initial_state, assumed_align=128, enable_tvm_ffi=True) if has_initial_state else None
     if output_final_state:
         ht = torch.zeros(B, H, D, D, dtype=torch.float32, device=Q.device)
-        ht_ptr = ht.data_ptr()
+        ht_ = from_dlpack(ht, assumed_align=128, enable_tvm_ffi=True)
     else:
         ht = None
-        ht_ptr = 0
+        ht_ = None
 
     scale_f32 = Float32(scale)
     shape_info = (Int32(B), Int32(S), Int32(H), Int32(D))
@@ -2451,8 +2457,6 @@ def lightning_attn_fwd(
 
     cache_key = (has_initial_state, output_final_state, B, S, H, D, chunk_size)
     if cache_key not in _compiled_kernels:
-        from cutlass.cute.runtime import make_ptr
-
         kernel_obj = LinearAttentionChunkwiseDecay(
             chunk_size=chunk_size,
             acc_dtype=cutlass.Float32,
@@ -2460,15 +2464,11 @@ def lightning_attn_fwd(
             has_initial_state=has_initial_state,
             output_final_state=output_final_state,
         )
-        # h0/ht are typed pointers (may be null) — use make_ptr for compile-time
-        # type inference; at runtime raw int values (data_ptr or 0) are passed.
-        h0_compile = make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, 16)
-        ht_compile = make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, 16)
         _compiled_kernels[cache_key] = cute.compile(
             kernel_obj,
             q_, k_, v_, o_, decay_,
             scale_f32,
-            h0_compile, ht_compile,
+            h0_, ht_,
             shape_info,
             stream,
             options="--enable-tvm-ffi",
@@ -2478,7 +2478,7 @@ def lightning_attn_fwd(
     _compiled_kernels[cache_key](
         q_, k_, v_, o_, decay_,
         scale_f32,
-        h0_ptr, ht_ptr,
+        h0_, ht_,
         shape_info,
         stream,
     )
