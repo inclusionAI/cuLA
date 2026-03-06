@@ -15,13 +15,13 @@ import torch
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack, make_ptr
 
 # Suppress third-party deprecation warnings (e.g. torch.jit)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 sys.path.insert(0, "/ossfs/workspace/flashla")
-from flashla.lightning_attn import LinearAttentionChunkwiseDecay
+from flashla.lightning_attn import LinearAttentionChunkwiseDecay, lightning_attn_fwd
 
 try:
     from fla.ops.simple_gla import chunk_simple_gla
@@ -42,6 +42,8 @@ def run_cute_kernel(
 ):
     """Run the CuTeDSL LinearAttentionChunkwiseDecay kernel.
 
+    Uses TVM-FFI compile cache: first call per config compiles, subsequent reuse.
+
     Args:
         Q, K, V: (B, S, H, D) bfloat16 tensors on CUDA
         decay: (H,) float32 per-head decay parameter s (s > 0)
@@ -54,44 +56,15 @@ def run_cute_kernel(
         O: (B, S, H, D) bfloat16 output
         ht: (B, H, D, D) float32 final state (or None)
     """
-    B, S, H, D = Q.shape
-    O = torch.zeros_like(Q)
-
-    has_h0 = initial_state is not None
-    h0 = initial_state if has_h0 else torch.zeros(B, H, D, D, device="cuda", dtype=torch.float32)
-    ht = torch.zeros(B, H, D, D, device="cuda", dtype=torch.float32)
-
-    q_c = from_dlpack(Q)
-    k_c = from_dlpack(K)
-    v_c = from_dlpack(V)
-    o_c = from_dlpack(O)
-    d_c = from_dlpack(decay)
-    h0_c = from_dlpack(h0)
-    ht_c = from_dlpack(ht)
-
-    kernel = LinearAttentionChunkwiseDecay(
-        chunk_size=chunk_size,
-        acc_dtype=cutlass.Float32,
-        io_dtype=cutlass.BFloat16,
-        has_initial_state=has_h0,
+    O, ht = lightning_attn_fwd(
+        Q, K, V, decay,
+        scale=scale,
+        initial_state=initial_state,
         output_final_state=output_final_state,
-    )
-    stream = cutlass_torch.default_stream()
-
-    compiled = cute.compile(
-        kernel,
-        q_c.iterator, k_c.iterator, v_c.iterator, o_c.iterator,
-        d_c.iterator, scale, h0_c.iterator, ht_c.iterator,
-        (B, S, H, D), stream,
-    )
-    compiled(
-        q_c.iterator, k_c.iterator, v_c.iterator, o_c.iterator,
-        d_c.iterator, scale, h0_c.iterator, ht_c.iterator,
-        (B, S, H, D), stream,
+        chunk_size=chunk_size,
     )
     torch.cuda.synchronize()
-
-    return O, (ht if output_final_state else None)
+    return O, ht
 
 
 # ---------------------------------------------------------------------------

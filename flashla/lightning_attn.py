@@ -296,11 +296,11 @@ class LinearAttentionChunkwiseDecay:
     @cute.jit
     def __call__(
         self,
-        q_iter: cute.Pointer,
-        k_iter: cute.Pointer,
-        v_iter: cute.Pointer,
-        o_iter: cute.Pointer,
-        decay: cute.Pointer,
+        q_in: cute.Tensor,
+        k_in: cute.Tensor,
+        v_in: cute.Tensor,
+        o_in: cute.Tensor,
+        decay_in: cute.Tensor,
         scale: Float32,
         initial_state_iter: cute.Pointer,
         final_state_iter: cute.Pointer,
@@ -309,13 +309,17 @@ class LinearAttentionChunkwiseDecay:
     ):
         """
         Execute the Chunkwise Linear Attention operation on the provided tensors.
-        
+
+        With --enable-tvm-ffi, q_in/k_in/v_in/o_in/decay_in accept torch.Tensor
+        directly (zero-copy C-level dlpack). h0/ht remain cute.Pointer for null
+        pointer support.
+
         Args:
-            q_iter: Query tensor
-            k_iter: Key tensor
-            v_iter: Value tensor
-            o_iter: Output tensor
-            decay: Per-head decay coefficients pointer [H]
+            q_in: Query tensor [B, S, H, D] (cute.Tensor or torch via TVM-FFI)
+            k_in: Key tensor [B, S, H, D]
+            v_in: Value tensor [B, S, H, D]
+            o_in: Output tensor [B, S, H, D]
+            decay_in: Per-head decay tensor [H] (FP32)
             scale: Scale factor for attention (typically 1/sqrt(D))
             initial_state_iter: Initial state pointer [B, H, D, D] (FP32) or nullptr
             final_state_iter: Final state pointer [B, H, D, D] (FP32) or nullptr
@@ -335,27 +339,30 @@ class LinearAttentionChunkwiseDecay:
             (S, D, (H,B)),
             stride=(D*H, 1, (D, D*H*S)),
         )
-        q = cute.make_tensor(q_iter, q_layout)
+        q = cute.make_tensor(q_in.iterator, q_layout)
         # (S, D, (H,B))
         k_layout = cute.make_layout(
             (S, D, (H,B)),
             stride=(D*H, 1, (D, D*H*S)),
         )
-        k = cute.make_tensor(k_iter, k_layout)
+        k = cute.make_tensor(k_in.iterator, k_layout)
         # v
         v_layout = cute.make_layout(
             (D, S, (H,B)),
             stride=(1, D*H, (D, D*H*S)),
         )
-        v = cute.make_tensor(v_iter, v_layout)
+        v = cute.make_tensor(v_in.iterator, v_layout)
 
         o_layout = cute.make_layout(
             (D, S, (H,B)),
             stride=(1, D*H, (D, D*H*S)),
         )
-        o = cute.make_tensor(o_iter, o_layout)
+        o = cute.make_tensor(o_in.iterator, o_layout)
 
         # Initial state / final state: [B, H, D, D] stored as row-major FP32
+        # Pointers may be null (0x0) when has_initial_state / output_final_state is False.
+        # cute.make_tensor just wraps pointer+layout metadata without accessing memory,
+        # so null pointers are safe here. Actual memory access is guarded by const_expr.
         fstate_layout = cute.make_layout(
             (D, D, (H, B)),
             stride=(1, D, (D*D, D*D*H)),
@@ -674,7 +681,7 @@ class LinearAttentionChunkwiseDecay:
             tma_tensor_v,
             tma_atom_o,
             tma_tensor_o,
-            decay,
+            decay_in.iterator,
             scale,
             initial_state,
             final_state,
@@ -1477,21 +1484,14 @@ class LinearAttentionChunkwiseDecay:
             init_flat = cute.make_tensor(
                 tTR_rKV.iterator, layout=cute.make_layout(_D))
 
-            # GMEM tensor for this CTA's state: (D, D) column-major
-            gState_h0 = initial_state[None, None, (hidx, bidx)]   # (D, D) stride (1, D)
-            gState_ht = final_state[None, None, (hidx, bidx)]     # (D, D) stride (1, D)
-            # Per-thread GMEM row view: thread local_tidx owns row local_tidx
-            # Row elements at GMEM offsets: local_tidx, local_tidx+D, ..., local_tidx+(D-1)*D
-            gRow_h0 = cute.make_tensor(
-                gState_h0.iterator + local_tidx,
-                cute.make_layout(_D, stride=_D))
-            gRow_ht = cute.make_tensor(
-                gState_ht.iterator + local_tidx,
-                cute.make_layout(_D, stride=_D))
-
             # -------------- Initial State Loading (h0) ----------------
             # Direct GMEM → RMEM: each thread loads its row via cute.copy
+            # Only construct GMEM tensor views when needed (pointers may be null)
             if cutlass.const_expr(self.has_initial_state):
+                gState_h0 = initial_state[None, None, (hidx, bidx)]
+                gRow_h0 = cute.make_tensor(
+                    gState_h0.iterator + local_tidx,
+                    cute.make_layout(_D, stride=_D))
                 cute.autovec_copy(gRow_h0, init_flat)
 
                 # Store raw h0 as BF16 to kv16 TMEM for SQ MMA at idx=0
@@ -1684,6 +1684,12 @@ class LinearAttentionChunkwiseDecay:
                 cute.copy(tiled_copy_t2r_kv, tTR_tKVi, tTR_rKV)
                 cute.arch.fence_view_async_tmem_load()
                 kv_handle.release()
+
+                # Construct GMEM tensor view for final state output
+                gState_ht = final_state[None, None, (hidx, bidx)]
+                gRow_ht = cute.make_tensor(
+                    gState_ht.iterator + local_tidx,
+                    cute.make_layout(_D, stride=_D))
 
                 # Direct RMEM → GMEM: each thread writes its row via cute.copy
                 out_flat = cute.make_tensor(
@@ -2379,6 +2385,107 @@ def make_thread_cooperative_group(size: int):
     return pipeline.CooperativeGroup(pipeline.Agent.Thread, size)
 
 
+# ---------------------------------------------------------------------------
+# Compile cache + TVM-FFI API
+# ---------------------------------------------------------------------------
+_compiled_kernels = {}
+
+
+def lightning_attn_fwd(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    decay: torch.Tensor,
+    scale: float = 1.0,
+    initial_state: torch.Tensor = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Lightning Attention forward pass with compile cache and TVM-FFI.
+
+    First call for each (has_initial_state, output_final_state, B, S, H, D,
+    chunk_size) compiles the kernel with real input tensors.  Subsequent calls
+    with the same cache key reuse the compiled kernel.  Torch tensors are
+    wrapped via ``from_dlpack(..., enable_tvm_ffi=True)`` and passed to the
+    compiled kernel at zero-copy C-level dlpack cost.
+
+    Args:
+        Q: (B, S, H, D) bf16 query
+        K: (B, S, H, D) bf16 key
+        V: (B, S, H, D) bf16 value
+        decay: (H,) f32 per-head decay coefficients
+        scale: attention scale factor (default: 1.0)
+        initial_state: (B, H, D, D) f32 initial state or None
+        output_final_state: whether to output final state
+        chunk_size: chunk size (default: 64)
+
+    Returns:
+        (O, ht): output tensor (B,S,H,D) bf16, final state (B,H,D,D) f32 or None
+    """
+    import cuda.bindings.driver as cuda_drv
+
+    B, S, H, D = Q.shape
+    O = torch.zeros_like(Q)
+
+    has_initial_state = initial_state is not None
+
+    # Wrap real tensors for TVM-FFI (zero-copy)
+    q_ = from_dlpack(Q, assumed_align=128, enable_tvm_ffi=True)
+    k_ = from_dlpack(K, assumed_align=128, enable_tvm_ffi=True)
+    v_ = from_dlpack(V, assumed_align=128, enable_tvm_ffi=True)
+    o_ = from_dlpack(O, assumed_align=128, enable_tvm_ffi=True)
+    decay_ = from_dlpack(decay, assumed_align=128, enable_tvm_ffi=True)
+
+    h0_ptr = initial_state.data_ptr() if has_initial_state else 0
+    if output_final_state:
+        ht = torch.zeros(B, H, D, D, dtype=torch.float32, device=Q.device)
+        ht_ptr = ht.data_ptr()
+    else:
+        ht = None
+        ht_ptr = 0
+
+    scale_f32 = Float32(scale)
+    shape_info = (Int32(B), Int32(S), Int32(H), Int32(D))
+    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    cache_key = (has_initial_state, output_final_state, B, S, H, D, chunk_size)
+    if cache_key not in _compiled_kernels:
+        from cutlass.cute.runtime import make_ptr
+
+        kernel_obj = LinearAttentionChunkwiseDecay(
+            chunk_size=chunk_size,
+            acc_dtype=cutlass.Float32,
+            io_dtype=cutlass.BFloat16,
+            has_initial_state=has_initial_state,
+            output_final_state=output_final_state,
+        )
+        # h0/ht are typed pointers (may be null) — use make_ptr for compile-time
+        # type inference; at runtime raw int values (data_ptr or 0) are passed.
+        h0_compile = make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, 16)
+        ht_compile = make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, 16)
+        _compiled_kernels[cache_key] = cute.compile(
+            kernel_obj,
+            q_, k_, v_, o_, decay_,
+            scale_f32,
+            h0_compile, ht_compile,
+            shape_info,
+            stream,
+            options="--enable-tvm-ffi",
+        )
+
+    # Execute
+    _compiled_kernels[cache_key](
+        q_, k_, v_, o_, decay_,
+        scale_f32,
+        h0_ptr, ht_ptr,
+        shape_info,
+        stream,
+    )
+
+    return O, ht
+
+
 def main():
     """
     Example usage of LinearAttentionChunkwise with CuTe DSL
@@ -2435,65 +2542,27 @@ def main():
     
     # Per-head decay coefficients [H]
     decay = torch.full((H,), args.decay, device="cuda", dtype=torch.float32)
-    
-    # Convert to dlpack for CuTe
-    q_cute = from_dlpack(Q)
-    k_cute = from_dlpack(K)
-    v_cute = from_dlpack(V)
-    decay_cute = from_dlpack(decay)
-    
-    o_cute = from_dlpack(torch.zeros_like(Q))
-    
-    # Initial and final state tensors [B, H, D, D] in FP32
-    h0 = torch.zeros(B, H, D, D, device="cuda", dtype=torch.float32)
-    ht = torch.zeros(B, H, D, D, device="cuda", dtype=torch.float32)
-    h0_cute = from_dlpack(h0)
-    ht_cute = from_dlpack(ht)
-    
+
     scale = 1.0 / (D ** 0.5)
-    
-    # Create kernel instance with decay support
-    attn_kernel = LinearAttentionChunkwiseDecay(
-        chunk_size=args.chunk_size,
-        acc_dtype=args.acc_dtype,
-        io_dtype=args.io_dtype,
-    )
 
-    # Get default stream
-    stream = cutlass_torch.default_stream()
-
+    # Compile with TVM-FFI cache (first call compiles, subsequent calls reuse)
     start_time = time.time()
-    compiled = cute.compile(
-        attn_kernel,
-        q_cute.iterator,
-        k_cute.iterator,
-        v_cute.iterator,
-        o_cute.iterator,
-        decay_cute.iterator,
-        scale,
-        h0_cute.iterator,
-        ht_cute.iterator,
-        (B, S, H, D),
-        stream,
+    O, ht = lightning_attn_fwd(
+        Q, K, V, decay, scale=scale,
+        initial_state=None, output_final_state=True,
+        chunk_size=args.chunk_size,
     )
     compilation_time = time.time() - start_time
-    print(f"Compilation time: {compilation_time:.4f} seconds")
+    print(f"Compilation + first run time: {compilation_time:.4f} seconds")
 
     print(f"B, S, H, D: {(B, S, H, D)}")
 
-    # Warmup
+    # Warmup (uses cached kernel — no recompilation)
     for _ in range(args.warmup_iterations):
-        compiled(
-            q_cute.iterator,
-            k_cute.iterator,
-            v_cute.iterator,
-            o_cute.iterator,
-            decay_cute.iterator,
-            scale,
-            h0_cute.iterator,
-            ht_cute.iterator,
-            (B, S, H, D),
-            stream,
+        O, ht = lightning_attn_fwd(
+            Q, K, V, decay, scale=scale,
+            initial_state=None, output_final_state=True,
+            chunk_size=args.chunk_size,
         )
     
     # Benchmark
@@ -2501,17 +2570,10 @@ def main():
     start = time.perf_counter()
     
     for _ in range(args.iterations):
-        compiled(
-            q_cute.iterator,
-            k_cute.iterator,
-            v_cute.iterator,
-            o_cute.iterator,
-            decay_cute.iterator,
-            scale,
-            h0_cute.iterator,
-            ht_cute.iterator,
-            (B, S, H, D),
-            stream,
+        O, ht = lightning_attn_fwd(
+            Q, K, V, decay, scale=scale,
+            initial_state=None, output_final_state=True,
+            chunk_size=args.chunk_size,
         )
     
     torch.cuda.synchronize()

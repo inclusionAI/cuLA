@@ -14,14 +14,8 @@ import numpy as np
 from fla.ops.simple_gla.chunk import chunk_simple_gla_fwd
 from fla.utils import device
 
-import cutlass
-import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Float32
-
 sys.path.insert(0, '/ossfs/workspace/flashla')
-from flashla.lightning_attn import LinearAttentionChunkwiseDecay
+from flashla.lightning_attn import lightning_attn_fwd
 
 
 PRINT_DEBUG = False
@@ -53,10 +47,10 @@ def run_triton(
     initial_state, output_final_state,
     warmup, iterations,
 ):
-    """Run FLA chunk_simple_gla_fwd directly and return (output, final_state, elapsed_ms).
+    """Run FLA chunk_simple_gla_fwd and return (output, final_state, elapsed_ms).
 
-    Uses g_gamma = -decay to avoid FLA's internal decay recomputation.
-    Output tensors (o, ht) are allocated inside chunk_simple_gla_fwd.
+    Uses CUDA events for accurate GPU-only timing (excludes CPU/alloc overhead).
+    FLA allocates output internally, so we measure end-to-end including that.
     """
     scale = 1.0
     g_gamma = -decay  # Our decay s > 0 => FLA g_gamma = -s
@@ -72,7 +66,10 @@ def run_triton(
         )
     torch.cuda.synchronize()
 
-    start = time.perf_counter()
+    # CUDA event timing — measures GPU time only
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
     for _ in range(iterations):
         o_tri, ht_tri = chunk_simple_gla_fwd(
             q=Q, k=K, v=V,
@@ -82,9 +79,10 @@ def run_triton(
             output_final_state=output_final_state,
             chunk_size=64,
         )
+    end_event.record()
     torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
-    return o_tri, ht_tri, elapsed * 1000 / iterations
+    elapsed_ms = start_event.elapsed_time(end_event) / iterations
+    return o_tri, ht_tri, elapsed_ms
 
 
 # ---------------------------------------------------------------------------
@@ -98,67 +96,40 @@ def run_cutedsl(
 ):
     """Run CuteDSL kernel and return (output, ht_tensor, elapsed_ms, compile_ms).
 
-    Output tensors (O, ht) are allocated fresh each iteration to match
-    FLA's internal allocation pattern for a fair comparison.
+    Uses TVM-FFI compile cache: first call compiles, subsequent calls reuse.
+    CUDA events for accurate GPU-only timing.
     """
     B, S, H, D = Q.shape
     scale = 1.0
 
-    # Allocate dummy outputs for compilation only
-    O_dummy = torch.zeros_like(Q)
-    ht_dummy = torch.zeros(B, H, D, D, dtype=torch.float32, device=Q.device)
-
-    q_cute = from_dlpack(Q)
-    k_cute = from_dlpack(K)
-    v_cute = from_dlpack(V)
-    decay_cute = from_dlpack(decay)
-    h0_cute = from_dlpack(h0)
-
-    kernel = LinearAttentionChunkwiseDecay(
-        chunk_size=64,
-        acc_dtype=cutlass.Float32,
-        io_dtype=cutlass.BFloat16,
-        has_initial_state=has_initial_state,
-        output_final_state=output_final_state,
-    )
-
-    stream = cutlass_torch.default_stream()
-
-    t0 = time.time()
-    compiled = cute.compile(
-        kernel,
-        q_cute.iterator, k_cute.iterator, v_cute.iterator,
-        from_dlpack(O_dummy).iterator, decay_cute.iterator, scale,
-        h0_cute.iterator, from_dlpack(ht_dummy).iterator,
-        (B, S, H, D), stream,
-    )
-    compile_ms = (time.time() - t0) * 1000
-
     def _run():
-        # Allocate fresh output tensors each iteration (like FLA internally)
-        O = torch.zeros_like(Q)
-        ht = torch.zeros(B, H, D, D, dtype=torch.float32, device=Q.device)
-        o_cute = from_dlpack(O)
-        ht_cute = from_dlpack(ht)
-        compiled(
-            q_cute.iterator, k_cute.iterator, v_cute.iterator,
-            o_cute.iterator, decay_cute.iterator, scale,
-            h0_cute.iterator, ht_cute.iterator,
-            (B, S, H, D), stream,
+        return lightning_attn_fwd(
+            Q, K, V, decay, scale=scale,
+            initial_state=h0.clone() if has_initial_state else None,
+            output_final_state=output_final_state,
+            chunk_size=64,
         )
-        return O, ht
+
+    # First call triggers compilation if not cached
+    t0 = time.time()
+    _run()
+    compile_ms = (time.time() - t0) * 1000
 
     for _ in range(warmup):
         _run()
     torch.cuda.synchronize()
 
-    start = time.perf_counter()
+    # CUDA event timing — measures GPU time only
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
     for _ in range(iterations):
-        O_out, ht_out = _run()
+        O, ht = _run()
+    end_event.record()
     torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
+    elapsed_ms = start_event.elapsed_time(end_event) / iterations
 
-    return O_out, ht_out, elapsed * 1000 / iterations, compile_ms
+    return O, ht, elapsed_ms, compile_ms
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +161,7 @@ def benchmark_config(
         h0 = torch.randn(B, H, D, D, dtype=torch.float32, device=device) * 0.01
         initial_state_fla = h0.clone()
     else:
-        h0 = torch.zeros(B, H, D, D, dtype=torch.float32, device=device)
+        h0 = None
         initial_state_fla = None
 
     result = {
