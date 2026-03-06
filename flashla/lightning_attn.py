@@ -50,6 +50,7 @@ For each head h with decay parameter s_h:
 """
 
 import argparse
+import functools
 import math
 import os
 import sys
@@ -67,7 +68,7 @@ import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.cute.testing as testing
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Int32, Int64, Float32
 
 PRINT_DEBUG=False
@@ -99,12 +100,18 @@ class LinearAttentionChunkwiseDecay:
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         has_initial_state: bool = False,
         output_final_state: bool = False,
+        H: int = 64,
+        D: int = 128,
+        scale: float = 1.0,
     ):
         self.chunk_size = chunk_size
         self.acc_dtype = acc_dtype
         self.io_dtype = io_dtype
         self.has_initial_state = has_initial_state
         self.output_final_state = output_final_state
+        self.H = H
+        self.D = D
+        self.scale = scale
 
         # Warp specialization
         self.num_load_warps = 1
@@ -113,12 +120,9 @@ class LinearAttentionChunkwiseDecay:
         self.threads_per_warp = 32
 
         # MMA tile shapes
-        # C: 64, choose chunk size as 64 for enough spaces to do double buffering
-        # Q: (64, 128)
-        # K: (64, 128)
-        # V: (64, 128)
-        # TODO: READ from input
-        C, D = (64, 128)
+        # C: chunk_size, D: head_dim — both compile-time constants
+        C = chunk_size
+        D = self.D
         # (C, C, D)
         self.qk_mma_tiler = (C, C, D)  # (M, N, K)
         # (D, C, C)
@@ -301,10 +305,9 @@ class LinearAttentionChunkwiseDecay:
         v_in: cute.Tensor,
         o_in: cute.Tensor,
         decay_in: cute.Tensor,
-        scale: Float32,
         initial_state_in: cute.Tensor,
         final_state_in: cute.Tensor,
-        problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B, S, H, D)
+        problem_size: Tuple[Int32, Int32],  # (B, S)
         stream,  # CUstream type annotation removed to avoid import issues
     ):
         """
@@ -314,19 +317,22 @@ class LinearAttentionChunkwiseDecay:
         (zero-copy C-level dlpack). Pass None for initial_state_in / final_state_in
         when has_initial_state / output_final_state is False.
 
+        scale, H, D are compile-time constants stored in self.__init__.
+
         Args:
             q_in: Query tensor [B, S, H, D] (cute.Tensor or torch via TVM-FFI)
             k_in: Key tensor [B, S, H, D]
             v_in: Value tensor [B, S, H, D]
             o_in: Output tensor [B, S, H, D]
             decay_in: Per-head decay tensor [H] (FP32)
-            scale: Scale factor for attention (typically 1/sqrt(D))
             initial_state_in: Initial state [B, H, D, D] (FP32) or None
             final_state_in: Final state [B, H, D, D] (FP32) or None
-            problem_size: (B, S, H, D) problem dimensions
+            problem_size: (B, S) dynamic problem dimensions
             stream: CUDA stream
         """
-        B,S,H,D = problem_size
+        B, S = problem_size
+        H = self.H
+        D = self.D
 
         # Setup attributes
         self._setup_attributes()
@@ -687,7 +693,6 @@ class LinearAttentionChunkwiseDecay:
             tma_atom_o,
             tma_tensor_o,
             decay_in.iterator,
-            scale,
             initial_state,
             final_state,
             q_smem_layout_staged,
@@ -723,7 +728,6 @@ class LinearAttentionChunkwiseDecay:
         tma_atom_o: cute.CopyAtom,
         tma_tensor_o: cute.Tensor,
         decay: cute.Pointer,
-        scale: Float32,
         initial_state: cute.Tensor,
         final_state: cute.Tensor,
         q_smem_layout_staged: cute.ComposedLayout,
@@ -734,7 +738,7 @@ class LinearAttentionChunkwiseDecay:
         o_smem_layout_staged: cute.ComposedLayout,
         p_smem_layout_staged: cute.ComposedLayout,
         state_tmem_layout_staged: cute.ComposedLayout,
-        problem_size: Tuple[Int32, Int32, Int32, Int32],  # (B, S, H, D)
+        problem_size: Tuple[Int32, Int32],  # (B, S)
     ):
         """Kernel for chunkwise linear attention with per-position decay."""
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -934,8 +938,11 @@ class LinearAttentionChunkwiseDecay:
         self.num_regs_cuda = 256
 
         (_, hidx, bidx) = cute.arch.block_idx()
-        B, S, H, D = problem_size
+        B, S = problem_size
+        H = self.H
+        D = self.D
         C = self.chunk_size
+        scale = cutlass.Float32(self.scale)
 
         # Load per-head decay parameter (s_h > 0) to register
         # λ_h = exp(-s_h) is the decay factor
@@ -2393,7 +2400,104 @@ def make_thread_cooperative_group(size: int):
 # ---------------------------------------------------------------------------
 # Compile cache + TVM-FFI API
 # ---------------------------------------------------------------------------
-_compiled_kernels = {}
+
+# Internal cache: maps (has_initial_state, output_final_state, H, D, scale, chunk_size) → compiled_fn
+_kernel_cache: dict = {}
+
+
+def _compile_single_variant(has_initial_state, output_final_state, H, D, scale, chunk_size):
+    """Compile one kernel variant. Returns the compiled TVM-FFI callable.
+
+    Uses make_fake_compact_tensor and make_fake_stream for compilation with
+    TVM-FFI.  At runtime, torch tensors are passed directly (zero-copy).
+    Uses sym_int() for dynamic B and S dimensions so one compiled kernel
+    handles all batch-size / sequence-length combinations.
+    """
+    kernel_obj = LinearAttentionChunkwiseDecay(
+        chunk_size=chunk_size,
+        acc_dtype=cutlass.Float32,
+        io_dtype=cutlass.BFloat16,
+        has_initial_state=has_initial_state,
+        output_final_state=output_final_state,
+        H=H,
+        D=D,
+        scale=scale,
+    )
+
+    sym_b = cute.sym_int()
+    sym_s = cute.sym_int()
+
+    # Q, K, V, O: (B, S, H, D) row-major bf16
+    q_fake = make_fake_compact_tensor(
+        cutlass.BFloat16, (sym_b, sym_s, H, D),
+        stride_order=(3, 2, 1, 0), assumed_align=128,
+    )
+    k_fake = make_fake_compact_tensor(
+        cutlass.BFloat16, (sym_b, sym_s, H, D),
+        stride_order=(3, 2, 1, 0), assumed_align=128,
+    )
+    v_fake = make_fake_compact_tensor(
+        cutlass.BFloat16, (sym_b, sym_s, H, D),
+        stride_order=(3, 2, 1, 0), assumed_align=128,
+    )
+    o_fake = make_fake_compact_tensor(
+        cutlass.BFloat16, (sym_b, sym_s, H, D),
+        stride_order=(3, 2, 1, 0), assumed_align=128,
+    )
+
+    # decay: (H,) float32
+    decay_fake = make_fake_compact_tensor(
+        cutlass.Float32, (H,), assumed_align=128,
+    )
+
+    # initial_state / final_state: (B, H, D, D) float32 or None
+    h0_fake = (
+        make_fake_compact_tensor(
+            cutlass.Float32, (sym_b, H, D, D),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
+        )
+        if has_initial_state
+        else None
+    )
+    ht_fake = (
+        make_fake_compact_tensor(
+            cutlass.Float32, (sym_b, H, D, D),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
+        )
+        if output_final_state
+        else None
+    )
+
+    stream_fake = make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    compiled_fn = cute.compile(
+        kernel_obj,
+        q_fake, k_fake, v_fake, o_fake, decay_fake,
+        h0_fake, ht_fake,
+        (Int32(1), Int32(1)),  # dummy (B, S)
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+    return compiled_fn
+
+
+def _get_compiled_kernel(has_initial_state, output_final_state, H, D, scale, chunk_size):
+    """Get a compiled kernel with on-demand (lazy) compilation.
+
+    Each variant is compiled exactly once and cached.  Compilation is deferred
+    until the variant is actually needed so that cute.compile is always
+    immediately followed by execution — this avoids a CuTe DSL runtime issue
+    where a subsequent cute.compile can invalidate previously compiled but
+    not-yet-executed functions.
+
+    Cache key: (has_initial_state, output_final_state, H, D, scale, chunk_size)
+    """
+    key = (has_initial_state, output_final_state, H, D, scale, chunk_size)
+    if key not in _kernel_cache:
+        _kernel_cache[key] = _compile_single_variant(
+            has_initial_state, output_final_state, H, D, scale, chunk_size,
+        )
+    return _kernel_cache[key]
 
 
 def lightning_attn_fwd(
@@ -2409,11 +2513,12 @@ def lightning_attn_fwd(
     """
     Lightning Attention forward pass with compile cache and TVM-FFI.
 
-    First call for each (has_initial_state, output_final_state, B, S, H, D,
-    chunk_size) compiles the kernel with real input tensors.  Subsequent calls
-    with the same cache key reuse the compiled kernel.  Torch tensors are
-    wrapped via ``from_dlpack(..., enable_tvm_ffi=True)`` and passed to the
-    compiled kernel at zero-copy C-level dlpack cost.
+    Uses make_fake_compact_tensor for compilation (no GC issues).
+    At runtime, torch tensors are passed directly via TVM-FFI.
+    sym_int() is used for B and S so a single compilation handles all
+    batch-size / sequence-length combinations.
+
+    Cache key: (has_initial_state, output_final_state, H, D, scale, chunk_size)
 
     Args:
         Q: (B, S, H, D) bf16 query
@@ -2428,59 +2533,26 @@ def lightning_attn_fwd(
     Returns:
         (O, ht): output tensor (B,S,H,D) bf16, final state (B,H,D,D) f32 or None
     """
-    import cuda.bindings.driver as cuda_drv
-
     B, S, H, D = Q.shape
     O = torch.zeros_like(Q)
 
     has_initial_state = initial_state is not None
 
-    # Wrap real tensors for TVM-FFI (zero-copy)
-    q_ = from_dlpack(Q, assumed_align=128, enable_tvm_ffi=True)
-    k_ = from_dlpack(K, assumed_align=128, enable_tvm_ffi=True)
-    v_ = from_dlpack(V, assumed_align=128, enable_tvm_ffi=True)
-    o_ = from_dlpack(O, assumed_align=128, enable_tvm_ffi=True)
-    decay_ = from_dlpack(decay, assumed_align=128, enable_tvm_ffi=True)
+    compiled_fn = _get_compiled_kernel(
+        has_initial_state, output_final_state, H, D, scale, chunk_size,
+    )
 
-    # h0/ht: from_dlpack when provided, None when absent
-    h0_ = from_dlpack(initial_state, assumed_align=128, enable_tvm_ffi=True) if has_initial_state else None
     if output_final_state:
         ht = torch.zeros(B, H, D, D, dtype=torch.float32, device=Q.device)
-        ht_ = from_dlpack(ht, assumed_align=128, enable_tvm_ffi=True)
     else:
         ht = None
-        ht_ = None
 
-    scale_f32 = Float32(scale)
-    shape_info = (Int32(B), Int32(S), Int32(H), Int32(D))
-    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    cache_key = (has_initial_state, output_final_state, B, S, H, D, chunk_size)
-    if cache_key not in _compiled_kernels:
-        kernel_obj = LinearAttentionChunkwiseDecay(
-            chunk_size=chunk_size,
-            acc_dtype=cutlass.Float32,
-            io_dtype=cutlass.BFloat16,
-            has_initial_state=has_initial_state,
-            output_final_state=output_final_state,
-        )
-        _compiled_kernels[cache_key] = cute.compile(
-            kernel_obj,
-            q_, k_, v_, o_, decay_,
-            scale_f32,
-            h0_, ht_,
-            shape_info,
-            stream,
-            options="--enable-tvm-ffi",
-        )
-
-    # Execute
-    _compiled_kernels[cache_key](
-        q_, k_, v_, o_, decay_,
-        scale_f32,
-        h0_, ht_,
-        shape_info,
-        stream,
+    # TVM-FFI: pass torch tensors directly; stream is auto-provided
+    # by make_fake_stream(use_tvm_ffi_env_stream=True).
+    compiled_fn(
+        Q, K, V, O, decay,
+        initial_state, ht,
+        (Int32(B), Int32(S)),
     )
 
     return O, ht

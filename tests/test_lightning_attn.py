@@ -220,6 +220,43 @@ def test_against_reference(B=1, S=128, H=4, D=128, C=64, decay_val=0.1,
     return passed
 
 
+def test_initial_and_final_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1,
+                                 atol=5e-3, rtol=5e-2, verbose=True):
+    """Test h0/ht against PyTorch reference.
+
+    NOTE: This test is placed BEFORE FLA tests so that the (has_initial_state=True,
+    output_final_state=True) kernel variant is compiled before any Triton/FLA code
+    runs.  Running Triton corrupts state needed by cute.compile.
+    """
+    if verbose:
+        print(f"\nh0/ht: B={B}, S={S}, H={H}, D={D}, C={C}, decay={decay_val}")
+
+    torch.manual_seed(42)
+    Q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
+    h0 = torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
+
+    O_ref, ht_ref = pytorch_reference(
+        Q, K, V, decay, chunk_size=C, initial_state=h0.clone(), output_final_state=True,
+    )
+    O_ref_bf16 = O_ref.to(torch.bfloat16)
+
+    O_cute, ht_cute = run_cute_kernel(
+        Q, K, V, decay, chunk_size=C, initial_state=h0.clone(), output_final_state=True,
+    )
+
+    p1 = _compare("output", O_cute, O_ref_bf16, atol=atol, rtol=rtol, verbose=verbose)
+    p2 = True
+    if ht_ref is not None and ht_cute is not None:
+        p2 = _compare("state", ht_cute, ht_ref, atol=atol, rtol=rtol, verbose=verbose)
+
+    passed = p1 and p2
+    print(f"  {'✓ PASSED' if passed else '✗ FAILED'}")
+    return passed
+
+
 def test_against_fla(B=1, S=128, H=4, D=128, C=64, decay_val=0.1,
                      atol=5e-3, rtol=5e-2, verbose=True):
     """Compare against FLA chunk_simple_gla using g_gamma = -s.
@@ -295,38 +332,6 @@ def test_against_fla_with_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1,
     p2 = True
     if ht_fla is not None and ht_cute is not None:
         p2 = _compare("state", ht_cute, ht_fla, atol=atol, rtol=rtol, verbose=verbose)
-
-    passed = p1 and p2
-    print(f"  {'✓ PASSED' if passed else '✗ FAILED'}")
-    return passed
-
-
-def test_initial_and_final_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1,
-                                 atol=5e-3, rtol=5e-2, verbose=True):
-    """Test h0/ht against PyTorch reference."""
-    if verbose:
-        print(f"\nh0/ht: B={B}, S={S}, H={H}, D={D}, C={C}, decay={decay_val}")
-
-    torch.manual_seed(42)
-    Q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
-    h0 = torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
-
-    O_ref, ht_ref = pytorch_reference(
-        Q, K, V, decay, chunk_size=C, initial_state=h0.clone(), output_final_state=True,
-    )
-    O_ref_bf16 = O_ref.to(torch.bfloat16)
-
-    O_cute, ht_cute = run_cute_kernel(
-        Q, K, V, decay, chunk_size=C, initial_state=h0.clone(), output_final_state=True,
-    )
-
-    p1 = _compare("output", O_cute, O_ref_bf16, atol=atol, rtol=rtol, verbose=verbose)
-    p2 = True
-    if ht_ref is not None and ht_cute is not None:
-        p2 = _compare("state", ht_cute, ht_ref, atol=atol, rtol=rtol, verbose=verbose)
 
     passed = p1 and p2
     print(f"  {'✓ PASSED' if passed else '✗ FAILED'}")

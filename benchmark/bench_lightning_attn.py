@@ -105,7 +105,7 @@ def run_cutedsl(
     def _run():
         return lightning_attn_fwd(
             Q, K, V, decay, scale=scale,
-            initial_state=h0.clone() if has_initial_state else None,
+            initial_state=h0 if has_initial_state else None,
             output_final_state=output_final_state,
             chunk_size=64,
         )
