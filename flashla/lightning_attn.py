@@ -919,7 +919,7 @@ class LinearAttentionChunkwiseDecay:
             print(f"sQK: {cute.pretty_str(sQK)}")
 
         self.num_regs_other = 32
-        self.num_regs_cuda = 208
+        self.num_regs_cuda = 256
 
         (_, hidx, bidx) = cute.arch.block_idx()
         B, S, H, D = problem_size
@@ -1634,7 +1634,7 @@ class LinearAttentionChunkwiseDecay:
                 s0_handle.release()
                 p_handle.commit()
 
-                # Wait for O_INTRA
+                # Wait for O_INTRA (PV result)
                 o_intra_handle = o_intra_consumer.wait_and_advance()
                 
                 # Load O_INTRA from TMEM to RMEM
@@ -1643,7 +1643,7 @@ class LinearAttentionChunkwiseDecay:
                 cute.arch.fence_view_async_tmem_load()
                 o_intra_handle.release()
 
-                # Wait for O_INTER
+                # Wait for O_INTER (SQ result)
                 if idx != 0 or cutlass.const_expr(self.has_initial_state):
                     o_inter_handle = o_inter_consumer.wait_and_advance()
                     tTR_tAcc_sq_i = tTR_tAcc_base_sq[(None, None, None, 0, 0, o_inter_handle.index)]
@@ -1652,11 +1652,11 @@ class LinearAttentionChunkwiseDecay:
                     cute.arch.fence_view_async_tmem_load()
                     o_inter_handle.release()
 
-                # Perform addition with per-position inter-chunk decay
+                # Combine: O = (O_INTRA + O_INTER_decayed) * scale
                 acc_vec = tTR_rAcc_pv.load()
                 if idx != 0 or cutlass.const_expr(self.has_initial_state):
                     # Apply per-position inter-chunk decay: exp(-s*(pos+1))
-                    # Uses LUT: exp(-s*(pos+1)) = sDecayLUT[pos] * sDecayLUT[1]
+                    # Uses sDecayLUT[pos] * sDecayLUT[1] = exp(-s*pos)*exp(-s)
                     self.apply_inter_chunk_decay(tTR_rAcc_sq, tTR_cSQ, sDecayLUT)
                     acc_vec = acc_vec + tTR_rAcc_sq.load()
                 # Apply attention scale factor
@@ -2179,21 +2179,19 @@ class LinearAttentionChunkwiseDecay:
         """Apply per-position inter-chunk decay to SQ MMA output.
         
         For position t within the chunk, multiply by exp(-s*(t+1)).
-        Uses LUT: exp(-s*(t+1)) = decay_lut[t] * decay_lut[1]
+        Uses decay_lut[pos] * decay_lut[1] = exp(-s*pos) * exp(-s) = exp(-s*(pos+1))
         
         Args:
             acc_sq: SQ MMA output register tensor (FP32)
             index_sq: Position identity partition giving (d_idx, pos_idx) per element
-            decay_lut: Precomputed decay LUT where decay_lut[k] = exp(-s*k)
+            decay_lut: Precomputed decay LUT where decay_lut[k] = exp(-s*k), k=0..C-1
         """
         size = cute.size(acc_sq)
-        # decay_lut[1] = exp(-s) -- use for the +1 offset
-        decay_one = decay_lut[1]
+        decay_one = decay_lut[1]  # exp(-s)
         
         for i in cutlass.range_constexpr(0, size - 1, 2):
             # Element i: get position within chunk (column index of SQ output)
             pos0 = index_sq[i][1]
-            # exp(-s*(pos+1)) = decay_lut[pos] * decay_lut[1]
             acc_sq[i] = cutlass.Float32(acc_sq[i]) * decay_lut[pos0] * decay_one
             
             # Element i+1 (unrolled for ILP)
