@@ -17,4 +17,8 @@ source /ossfs/workspace/venv/bin/activate
 
 如果创建临时辅助脚本，请放在 /ossfs/workspace/flashla/tmp 下面
 
+### 单测和性能benchmark存放规则
+
+单测放在 tests 下面
+性能 benchmark 放在 benchmark 文件夹下面
 
