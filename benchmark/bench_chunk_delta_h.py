@@ -38,6 +38,7 @@ chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
 
 # ─── FLA baseline imports ───
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as fla_fwd_h
+from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
 
 
 # ============================================================
@@ -207,6 +208,11 @@ def bench_varlen(configs):
         cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
         cu_seqlens_long = cu_seqlens.long()
 
+        # Pre-compute chunk_indices (for FLA) and chunk_offsets (for CuTe DSL)
+        # so the timing loop measures only kernel execution time.
+        chunk_indices = prepare_chunk_indices(cu_seqlens_long, BT)
+        chunk_offsets_cute = prepare_chunk_offsets(cu_seqlens_long, BT).int()
+
         torch.manual_seed(42)
         torch.cuda.empty_cache()
 
@@ -232,7 +238,7 @@ def bench_varlen(configs):
             k=k, w=w, u=u, g=None, gk=gk,
             initial_state=h0, output_final_state=store_ht,
             chunk_size=BT, save_new_value=save_vnew,
-            cu_seqlens=cu_seqlens_long,
+            cu_seqlens=cu_seqlens_long, chunk_indices=chunk_indices,
         )
         h_fla = fla_result[0]
 
@@ -241,7 +247,7 @@ def bench_varlen(configs):
             k=k, w=w, u=u, g=None, gk=gk,
             initial_state=h0, output_final_state=store_ht,
             chunk_size=BT, save_new_value=save_vnew,
-            cu_seqlens=cu_seqlens_long,
+            cu_seqlens=cu_seqlens_long, chunk_offsets=chunk_offsets_cute,
         )
         h_out = cute_result[0]
         torch.cuda.synchronize()
@@ -249,20 +255,20 @@ def bench_varlen(configs):
         max_diff, mean_diff = accuracy_stats(h_fla, h_out)
 
         # ---- Performance timing ----
-        def run_fla(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens_long):
+        def run_fla(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens_long, ci=chunk_indices):
             fla_fwd_h(
                 k=k, w=w, u=u, g=None, gk=gk,
                 initial_state=h0, output_final_state=store_ht,
                 chunk_size=BT, save_new_value=save_vnew,
-                cu_seqlens=cu,
+                cu_seqlens=cu, chunk_indices=ci,
             )
 
-        def run_cute(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens_long):
+        def run_cute(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens_long, co=chunk_offsets_cute):
             chunk_gated_delta_rule_fwd_h(
                 k=k, w=w, u=u, g=None, gk=gk,
                 initial_state=h0, output_final_state=store_ht,
                 chunk_size=BT, save_new_value=save_vnew,
-                cu_seqlens=cu,
+                cu_seqlens=cu, chunk_offsets=co,
             )
 
         ms_fla = time_kernel(run_fla)

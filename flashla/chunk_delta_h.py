@@ -1477,6 +1477,7 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_size: int = 64,
     save_new_value: bool = True,
     cu_seqlens: torch.Tensor | None = None,
+    chunk_offsets: torch.Tensor | None = None,
     persistent: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
@@ -1496,6 +1497,8 @@ def chunk_gated_delta_rule_fwd_h(
         chunk_size: chunk size (default 64)
         save_new_value: whether to return v_new
         cu_seqlens: cumulative sequence lengths [N+1] int64/int32 for varlen, or None
+        chunk_offsets: pre-computed chunk offsets [N+1] int32 for varlen, or None
+                       If provided, skips internal computation from cu_seqlens.
         persistent: whether to use persistent kernel (default True)
 
     Returns:
@@ -1521,12 +1524,13 @@ def chunk_gated_delta_rule_fwd_h(
         num_seqs = cu_seqlens.shape[0] - 1
         N = num_seqs
 
-        # Compute chunk_offsets from cu_seqlens on GPU (same as FLA)
+        # Compute chunk_offsets from cu_seqlens on GPU if not pre-computed
         cu_seqlens_i32 = cu_seqlens.int() if cu_seqlens.dtype != torch.int32 else cu_seqlens
-        lens = cu_seqlens_i32[1:] - cu_seqlens_i32[:-1]
-        nts = (lens + BT - 1) // BT
-        chunk_offsets = torch.zeros(num_seqs + 1, dtype=torch.int32, device=k.device)
-        chunk_offsets[1:] = nts.cumsum(0)
+        if chunk_offsets is None:
+            lens = cu_seqlens_i32[1:] - cu_seqlens_i32[:-1]
+            nts = (lens + BT - 1) // BT
+            chunk_offsets = torch.zeros(num_seqs + 1, dtype=torch.int32, device=k.device)
+            chunk_offsets[1:] = nts.cumsum(0)
         total_NT = int(chunk_offsets[-1].item())
 
         # Squeeze to 3D for kernel: [1, T, H, K] -> [T, H, K]
