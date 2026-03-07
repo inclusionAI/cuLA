@@ -35,7 +35,7 @@ import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.cute.testing as testing
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Int32, Int64, Float32
 
 PRINT_DEBUG = False
@@ -164,18 +164,18 @@ class ChunkDeltaRuleFwdH:
     @cute.jit
     def __call__(
         self,
-        k_ptr: cute.Pointer,
-        w_ptr: cute.Pointer,
-        u_ptr: cute.Pointer,
-        g_ptr: cute.Pointer,
-        gk_ptr: cute.Pointer,
-        h_out_ptr: cute.Pointer,
-        v_new_ptr: cute.Pointer,
-        h0_ptr: cute.Pointer,
-        ht_ptr: cute.Pointer,
-        cu_seqlens_ptr: cute.Pointer,
-        chunk_offsets_ptr: cute.Pointer,
-        workspace_ptr: cute.Pointer,
+        k_in: cute.Tensor,             # [B, T, H, K] or [T_total, H, K]
+        w_in: cute.Tensor,             # [B, T, H, K] or [T_total, H, K]
+        u_in: cute.Tensor,             # [B, T, H, V] or [T_total, H, V]
+        g_in: cute.Tensor,             # [B, T, H] or [T_total, H] (fp32, unused currently)
+        gk_in: cute.Tensor,            # [B, T, H, K] or [T_total, H, K] (fp32)
+        h_out_in: cute.Tensor,         # [B, NT, H, K, V] or [NT_total, H, K, V]
+        v_new_in: cute.Tensor,         # [B, T, H, V] or [T_total, H, V]
+        h0_in: cute.Tensor,            # [B, H, K, V] (fp32)
+        ht_in: cute.Tensor,            # [B, H, K, V]
+        cu_seqlens_in: cute.Tensor,    # [N+1] int32
+        chunk_offsets_in: cute.Tensor,  # [N+1] int32
+        workspace_in: cute.Tensor,     # workspace buffer
         problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],
         total_nt: Int32,
         use_g: Int32,
@@ -185,6 +185,20 @@ class ChunkDeltaRuleFwdH:
         save_v_new: Int32,
         stream,
     ):
+        # Extract pointers from tensor args (TVM-FFI compatible)
+        k_ptr = k_in.iterator
+        w_ptr = w_in.iterator
+        u_ptr = u_in.iterator
+        g_ptr = g_in.iterator
+        gk_ptr = gk_in.iterator
+        h_out_ptr = h_out_in.iterator
+        v_new_ptr = v_new_in.iterator
+        h0_ptr = h0_in.iterator
+        ht_ptr = ht_in.iterator
+        cu_seqlens_ptr = cu_seqlens_in.iterator
+        chunk_offsets_ptr = chunk_offsets_in.iterator
+        workspace_ptr = workspace_in.iterator
+
         B, T, H, K, V = problem_size
 
         # For varlen: B=num_seqs, T=total_tokens, data tensors use data_B=1.
@@ -1296,6 +1310,260 @@ def reference_bf16_roundtrip(k, w, u, g=None, gk=None, h0=None, chunk_size=64):
     return v_new_out, h_after
 
 
+# ---------------------------------------------------------------------------
+# Compile cache + TVM-FFI API
+# ---------------------------------------------------------------------------
+
+# Internal cache: maps (is_varlen, persistent, H, K, V, chunk_size) → compiled_fn
+_delta_h_kernel_cache: dict = {}
+
+
+def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size):
+    """Compile one ChunkDeltaRuleFwdH kernel variant. Returns the compiled TVM-FFI callable.
+
+    Uses make_fake_compact_tensor and make_fake_stream for compilation with
+    TVM-FFI.  At runtime, torch tensors are passed directly (zero-copy).
+    Uses sym_int() for dynamic B, T, NT dimensions so one compiled kernel
+    handles all batch-size / sequence-length combinations.
+
+    Note: use_g, use_gk, use_initial_state, store_final_state, save_v_new
+    are runtime Int32 flags (NOT const_expr), so they don't need separate
+    compilations — a single kernel handles all flag combinations.
+    """
+    kernel_obj = ChunkDeltaRuleFwdH(
+        chunk_size=chunk_size,
+        head_dim_k=K,
+        head_dim_v=V,
+        is_varlen=is_varlen,
+        persistent=persistent,
+    )
+
+    sym_a = cute.sym_int()   # B (non-varlen) or T_total (varlen)
+    sym_b = cute.sym_int()   # T (non-varlen) or unused
+    sym_nt = cute.sym_int()  # NT or NT_total
+    sym_n = cute.sym_int()   # metadata size (cu_seqlens, chunk_offsets)
+    sym_ws = cute.sym_int()  # workspace size (separate from metadata)
+
+    BT = chunk_size
+
+    if is_varlen:
+        # varlen: data tensors are [T_total, H, ...] (3D)
+        k_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, H, K),
+            stride_order=(2, 1, 0), assumed_align=128,
+        )
+        w_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, H, K),
+            stride_order=(2, 1, 0), assumed_align=128,
+        )
+        u_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, H, V),
+            stride_order=(2, 1, 0), assumed_align=128,
+        )
+        g_fake = make_fake_compact_tensor(
+            cutlass.Float32, (sym_a, H),
+            stride_order=(1, 0), assumed_align=128,
+        )
+        gk_fake = make_fake_compact_tensor(
+            cutlass.Float32, (sym_a, H, K),
+            stride_order=(2, 1, 0), assumed_align=128,
+        )
+        v_new_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, H, V),
+            stride_order=(2, 1, 0), assumed_align=128,
+        )
+        h_out_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_nt, H, K, V),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
+        )
+    else:
+        # non-varlen: data tensors are [B, T, H, ...] (4D)
+        k_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_b, H, K),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
+        )
+        w_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_b, H, K),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
+        )
+        u_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_b, H, V),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
+        )
+        g_fake = make_fake_compact_tensor(
+            cutlass.Float32, (sym_a, sym_b, H),
+            stride_order=(2, 1, 0), assumed_align=128,
+        )
+        gk_fake = make_fake_compact_tensor(
+            cutlass.Float32, (sym_a, sym_b, H, K),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
+        )
+        v_new_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_b, H, V),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
+        )
+        h_out_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_nt, H, K, V),
+            stride_order=(4, 3, 2, 1, 0), assumed_align=128,
+        )
+
+    # h0/ht always use [B, H, K, V] regardless of varlen
+    h0_fake = make_fake_compact_tensor(
+        cutlass.Float32, (sym_a, H, K, V),
+        stride_order=(3, 2, 1, 0), assumed_align=128,
+    )
+    ht_fake = make_fake_compact_tensor(
+        cutlass.Float32, (sym_a, H, K, V),
+        stride_order=(3, 2, 1, 0), assumed_align=128,
+    )
+    cu_fake = make_fake_compact_tensor(
+        cutlass.Int32, (sym_n,), assumed_align=128,
+    )
+    co_fake = make_fake_compact_tensor(
+        cutlass.Int32, (sym_n,), assumed_align=128,
+    )
+    ws_fake = make_fake_compact_tensor(
+        cutlass.Uint8, (sym_ws,), assumed_align=128,
+    )
+    stream_fake = make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    compiled_fn = cute.compile(
+        kernel_obj,
+        k_fake, w_fake, u_fake, g_fake, gk_fake,
+        h_out_fake, v_new_fake, h0_fake, ht_fake,
+        cu_fake, co_fake, ws_fake,
+        (Int32(1), Int32(1), Int32(H), Int32(K), Int32(V)),
+        Int32(1),    # total_nt dummy
+        Int32(0),    # use_g
+        Int32(0),    # use_gk
+        Int32(0),    # use_initial_state
+        Int32(0),    # store_final_state
+        Int32(0),    # save_v_new
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+    return compiled_fn
+
+
+def _get_compiled_delta_h(is_varlen, persistent, H, K, V, chunk_size):
+    """Get a compiled ChunkDeltaRuleFwdH kernel with on-demand (lazy) compilation.
+
+    Each variant is compiled exactly once and cached.  Compilation is deferred
+    until the variant is actually needed so that cute.compile is always
+    immediately followed by execution — this avoids a CuTe DSL runtime issue
+    where a subsequent cute.compile can invalidate previously compiled but
+    not-yet-executed functions.
+
+    Cache key: (is_varlen, persistent, H, K, V, chunk_size)
+    """
+    key = (is_varlen, persistent, H, K, V, chunk_size)
+    if key not in _delta_h_kernel_cache:
+        _delta_h_kernel_cache[key] = _compile_delta_h_variant(
+            is_varlen, persistent, H, K, V, chunk_size,
+        )
+    return _delta_h_kernel_cache[key]
+
+
+def chunk_delta_rule_fwd_h(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor,
+    gk: torch.Tensor,
+    h_out: torch.Tensor,
+    v_new: torch.Tensor,
+    h0: torch.Tensor,
+    ht: torch.Tensor,
+    use_g: int = 0,
+    use_gk: int = 0,
+    use_initial_state: int = 0,
+    store_final_state: int = 0,
+    save_v_new: int = 0,
+    chunk_size: int = 64,
+    cu_seqlens: torch.Tensor = None,
+    chunk_offsets: torch.Tensor = None,
+    workspace: torch.Tensor = None,
+    is_varlen: bool = False,
+    persistent: bool = True,
+) -> None:
+    """
+    ChunkDeltaRuleFwdH forward pass with compile cache and TVM-FFI.
+
+    Computes inter-chunk recurrent state h and optionally v_new for delta rule.
+
+    Uses make_fake_compact_tensor for compilation (no GC issues).
+    At runtime, torch tensors are passed directly via TVM-FFI.
+    sym_int() is used for B, T, NT so a single compilation handles all
+    batch-size / sequence-length combinations.
+
+    Cache key: (is_varlen, persistent, H, K, V, chunk_size)
+    Runtime flags (use_g, use_gk, etc.) are NOT part of the cache key since
+    they are runtime Int32 checks, not const_expr.
+
+    Args:
+        k: key — [B, T, H, K] bf16 or [T_total, H, K]
+        w: decay weight — [B, T, H, K] bf16 or [T_total, H, K]
+        u: value — [B, T, H, V] bf16 or [T_total, H, V]
+        g: scalar gate — [B, T, H] fp32 or [T_total, H]
+        gk: key gate — [B, T, H, K] fp32 or [T_total, H, K]
+        h_out: output state — [B, NT, H, K, V] bf16 or [NT_total, H, K, V]
+        v_new: output v_new — [B, T, H, V] bf16 or [T_total, H, V]
+        h0: initial state — [B, H, K, V] fp32
+        ht: final state output — [B, H, K, V] bf16
+        use_g: whether to use scalar gate g
+        use_gk: whether to use key gate gk
+        use_initial_state: whether to use h0
+        store_final_state: whether to store ht
+        save_v_new: whether to save v_new output
+        chunk_size: chunk size (default: 64)
+        cu_seqlens: cumulative sequence lengths [N+1] int32 (varlen only)
+        chunk_offsets: chunk offsets [N+1] int32 (varlen only)
+        workspace: workspace buffer (uint8)
+        is_varlen: whether to use varlen mode
+        persistent: whether to use persistent kernel (default: True)
+    """
+    if is_varlen:
+        T_total = k.shape[0]
+        H = k.shape[1]
+        K = k.shape[2]
+        V = u.shape[2]
+        num_seqs = cu_seqlens.shape[0] - 1
+        BT = chunk_size
+        total_nt_val = sum((cu_seqlens[i+1].item() - cu_seqlens[i].item() + BT - 1) // BT
+                           for i in range(num_seqs))
+        ps = (Int32(num_seqs), Int32(T_total), Int32(H), Int32(K), Int32(V))
+    else:
+        B, T, H, K = k.shape
+        V = u.shape[3]
+        BT = chunk_size
+        NT = (T + BT - 1) // BT
+        total_nt_val = NT
+        ps = (Int32(B), Int32(T), Int32(H), Int32(K), Int32(V))
+        if cu_seqlens is None:
+            cu_seqlens = torch.zeros(2, dtype=torch.int32, device=k.device)
+        if chunk_offsets is None:
+            chunk_offsets = torch.zeros(2, dtype=torch.int32, device=k.device)
+
+    if workspace is None:
+        workspace = torch.zeros(128, dtype=torch.uint8, device=k.device)
+
+    compiled_fn = _get_compiled_delta_h(
+        is_varlen, persistent, H, K, V, chunk_size,
+    )
+
+    # TVM-FFI: pass torch tensors directly; stream is auto-provided
+    # by make_fake_stream(use_tvm_ffi_env_stream=True).
+    compiled_fn(
+        k, w, u, g, gk,
+        h_out, v_new, h0, ht,
+        cu_seqlens, chunk_offsets, workspace,
+        ps, Int32(total_nt_val),
+        Int32(int(use_g)), Int32(int(use_gk)),
+        Int32(int(use_initial_state)), Int32(int(store_final_state)),
+        Int32(int(save_v_new)),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch_size", type=int, default=1)
@@ -1317,48 +1585,19 @@ def main():
     w = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16) * 0.1
     u = torch.randn(B, T, H, V, device="cuda", dtype=torch.bfloat16) * 0.1
 
-    kernel = ChunkDeltaRuleFwdH(chunk_size=BT, head_dim_k=K, head_dim_v=V)
-    stream = cutlass_torch.default_stream()
-
-    compiled_kernel = None
-
-    # Dummy cu_seqlens/chunk_offsets/workspace for non-varlen mode
-    cu_seqlens_dummy = torch.zeros(2, dtype=torch.int32, device="cuda")
-    chunk_offsets_dummy = torch.zeros(2, dtype=torch.int32, device="cuda")
-    workspace_dummy = torch.zeros(128, dtype=torch.uint8, device="cuda")
-    cu_seqlens_c = from_dlpack(cu_seqlens_dummy)
-    chunk_offsets_c = from_dlpack(chunk_offsets_dummy)
-    workspace_c = from_dlpack(workspace_dummy)
-
     def run_kernel(k_t, w_t, u_t, g_t, gk_t, h0_t, use_g_val, use_gk_val, use_h0, store_ht, do_save_vnew=0):
-        nonlocal compiled_kernel
         h_out = torch.zeros(B, NT, H, K, V, device="cuda", dtype=torch.bfloat16)
         v_new = torch.zeros(B, T, H, V, device="cuda", dtype=torch.bfloat16)
-        ht = torch.zeros(B, H, K, V, device="cuda", dtype=torch.bfloat16)
+        ht = torch.zeros(B, H, K, V, device="cuda", dtype=torch.float32)
 
-        kc, wc, uc = from_dlpack(k_t), from_dlpack(w_t), from_dlpack(u_t)
-        gc, gkc = from_dlpack(g_t), from_dlpack(gk_t)
-        h0c = from_dlpack(h0_t)
-        hc, vnc, htc = from_dlpack(h_out), from_dlpack(v_new), from_dlpack(ht)
-
-        args_tuple = (
-            kc.iterator, wc.iterator, uc.iterator,
-            gc.iterator, gkc.iterator,
-            hc.iterator, vnc.iterator, h0c.iterator, htc.iterator,
-            cu_seqlens_c.iterator, chunk_offsets_c.iterator,
-            workspace_c.iterator,
-            (B, T, H, K, V), NT,
-            int(use_g_val), int(use_gk_val), int(use_h0), int(store_ht), int(do_save_vnew),
-            stream,
+        chunk_delta_rule_fwd_h(
+            k=k_t, w=w_t, u=u_t, g=g_t, gk=gk_t,
+            h_out=h_out, v_new=v_new, h0=h0_t, ht=ht,
+            use_g=use_g_val, use_gk=use_gk_val,
+            use_initial_state=use_h0, store_final_state=store_ht,
+            save_v_new=do_save_vnew,
+            chunk_size=BT, is_varlen=False,
         )
-
-        if compiled_kernel is None:
-            print("Compiling...")
-            t0 = time.time()
-            compiled_kernel = cute.compile(kernel, *args_tuple)
-            print(f"Compiled in {time.time()-t0:.2f}s")
-
-        compiled_kernel(*args_tuple)
         torch.cuda.synchronize()
         return h_out, v_new, ht
 
@@ -1391,7 +1630,6 @@ def main():
     gk_val = gk_val.cumsum(dim=1)
     h0_val = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) * 0.01
 
-    compiled_kernel = None  # recompile since use_gk changes
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_val, h0_val, 0, 1, 1, 0)
     _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, gk=gk_val, h0=h0_val, chunk_size=BT)
 
@@ -1411,7 +1649,6 @@ def main():
     gk_val = -torch.abs(gk_val)
     gk_val = gk_val.cumsum(dim=1)
 
-    compiled_kernel = None  # recompile
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_val, h0_z, 0, 1, 0, 0)
     _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, gk=gk_val, h0=None, chunk_size=BT)
 
@@ -1429,7 +1666,6 @@ def main():
     print("Test 4: With h0 initial state")
     h0_val = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) * 0.01
 
-    compiled_kernel = None  # recompile
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_z, h0_val, 0, 0, 1, 0)
     _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, h0=h0_val, chunk_size=BT)
 
@@ -1451,7 +1687,6 @@ def main():
     print("\n" + "="*60)
     print("Test 5: store_final_state")
 
-    compiled_kernel = None  # recompile
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_z, h0_z, 0, 0, 0, 1)
     _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, h0=None, chunk_size=BT)
 
@@ -1469,7 +1704,6 @@ def main():
     print("\n" + "="*60)
     print("Test 6: gk + h0 + ht (all features)")
 
-    compiled_kernel = None
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_val, h0_val, 0, 1, 1, 1)
     _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, gk=gk_val, h0=h0_val, chunk_size=BT)
 
@@ -1497,37 +1731,15 @@ def main():
     gk_z2 = torch.zeros(B2, T2, H2, K, device="cuda", dtype=torch.float32)
     h0_z2 = torch.zeros(B2, H2, K, V, device="cuda", dtype=torch.float32)
 
-    # Need new kernel instance for different B/T/H
-    kernel2 = ChunkDeltaRuleFwdH(chunk_size=BT, head_dim_k=K, head_dim_v=V)
     h_out2 = torch.zeros(B2, NT2, H2, K, V, device="cuda", dtype=torch.bfloat16)
     v_new2 = torch.zeros(B2, T2, H2, V, device="cuda", dtype=torch.bfloat16)
-    ht2 = torch.zeros(B2, H2, K, V, device="cuda", dtype=torch.bfloat16)
+    ht2 = torch.zeros(B2, H2, K, V, device="cuda", dtype=torch.float32)
 
-    kc2, wc2, uc2 = from_dlpack(k2), from_dlpack(w2), from_dlpack(u2)
-    gc2, gkc2 = from_dlpack(g_z2), from_dlpack(gk_z2)
-    h0c2 = from_dlpack(h0_z2)
-    hc2, vnc2, htc2 = from_dlpack(h_out2), from_dlpack(v_new2), from_dlpack(ht2)
-    cu_seqlens_d2 = torch.zeros(2, dtype=torch.int32, device="cuda")
-    chunk_offsets_d2 = torch.zeros(2, dtype=torch.int32, device="cuda")
-    workspace_d2 = torch.zeros(128, dtype=torch.uint8, device="cuda")
-    csd2 = from_dlpack(cu_seqlens_d2)
-    cod2 = from_dlpack(chunk_offsets_d2)
-    wsd2 = from_dlpack(workspace_d2)
-
-    compiled2 = cute.compile(
-        kernel2,
-        kc2.iterator, wc2.iterator, uc2.iterator,
-        gc2.iterator, gkc2.iterator,
-        hc2.iterator, vnc2.iterator, h0c2.iterator, htc2.iterator,
-        csd2.iterator, cod2.iterator, wsd2.iterator,
-        (B2, T2, H2, K, V), NT2, 0, 0, 0, 0, 0, stream,
-    )
-    compiled2(
-        kc2.iterator, wc2.iterator, uc2.iterator,
-        gc2.iterator, gkc2.iterator,
-        hc2.iterator, vnc2.iterator, h0c2.iterator, htc2.iterator,
-        csd2.iterator, cod2.iterator, wsd2.iterator,
-        (B2, T2, H2, K, V), NT2, 0, 0, 0, 0, 0, stream,
+    chunk_delta_rule_fwd_h(
+        k=k2, w=w2, u=u2, g=g_z2, gk=gk_z2,
+        h_out=h_out2, v_new=v_new2, h0=h0_z2, ht=ht2,
+        use_g=0, use_gk=0, use_initial_state=0, store_final_state=0,
+        save_v_new=0, chunk_size=BT, is_varlen=False,
     )
     torch.cuda.synchronize()
 
@@ -1546,7 +1758,6 @@ def main():
     print("\n" + "="*60)
     print("Test 8: v_new output (no gating)")
 
-    compiled_kernel = None  # recompile
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_z, h0_z, 0, 0, 0, 0, do_save_vnew=1)
     vnew_ref, _ = reference_bf16_roundtrip(k, w, u, h0=None, chunk_size=BT)
 
@@ -1560,7 +1771,6 @@ def main():
     print("\n" + "="*60)
     print("Test 9: v_new output (with gk gating)")
 
-    compiled_kernel = None  # recompile
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_val, h0_z, 0, 1, 0, 0, do_save_vnew=1)
     vnew_ref, _ = reference_bf16_roundtrip(k, w, u, gk=gk_val, h0=None, chunk_size=BT)
 
@@ -1594,33 +1804,20 @@ def main():
     h0b = torch.zeros(Bb, Hb, K, V, device="cuda", dtype=torch.float32)
     h_outb = torch.zeros(Bb, NTb, Hb, K, V, device="cuda", dtype=torch.bfloat16)
     v_newb = torch.zeros(Bb, Tb, Hb, V, device="cuda", dtype=torch.bfloat16)
-    htb = torch.zeros(Bb, Hb, K, V, device="cuda", dtype=torch.bfloat16)
+    htb = torch.zeros(Bb, Hb, K, V, device="cuda", dtype=torch.float32)
 
-    kernelb = ChunkDeltaRuleFwdH(chunk_size=BT, head_dim_k=K, head_dim_v=V)
+    def run_bench():
+        chunk_delta_rule_fwd_h(
+            k=kb, w=wb, u=ub, g=gb, gk=gkb,
+            h_out=h_outb, v_new=v_newb, h0=h0b, ht=htb,
+            use_g=0, use_gk=0, use_initial_state=0,
+            store_final_state=0, save_v_new=0,
+            chunk_size=BT, is_varlen=False,
+        )
 
-    kcb, wcb, ucb = from_dlpack(kb), from_dlpack(wb), from_dlpack(ub)
-    gcb, gkcb = from_dlpack(gb), from_dlpack(gkb)
-    h0cb = from_dlpack(h0b)
-    hcb, vncb, htcb = from_dlpack(h_outb), from_dlpack(v_newb), from_dlpack(htb)
-    cu_seqlens_db = torch.zeros(2, dtype=torch.int32, device="cuda")
-    chunk_offsets_db = torch.zeros(2, dtype=torch.int32, device="cuda")
-    workspace_db = torch.zeros(128, dtype=torch.uint8, device="cuda")
-    csdb = from_dlpack(cu_seqlens_db)
-    codb = from_dlpack(chunk_offsets_db)
-    wsdb = from_dlpack(workspace_db)
-
-    bench_args = (
-        kcb.iterator, wcb.iterator, ucb.iterator,
-        gcb.iterator, gkcb.iterator,
-        hcb.iterator, vncb.iterator, h0cb.iterator, htcb.iterator,
-        csdb.iterator, codb.iterator, wsdb.iterator,
-        (Bb, Tb, Hb, K, V), NTb, 0, 0, 0, 0, 0, stream,
-    )
-    compiled_b = cute.compile(kernelb, *bench_args)
-
-    # Warmup
+    # Warmup (also triggers lazy compilation)
     for _ in range(3):
-        compiled_b(*bench_args)
+        run_bench()
     torch.cuda.synchronize()
 
     # Benchmark
@@ -1629,7 +1826,7 @@ def main():
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
     for _ in range(n_iter):
-        compiled_b(*bench_args)
+        run_bench()
     end_event.record()
     torch.cuda.synchronize()
     elapsed_ms = start_event.elapsed_time(end_event) / n_iter

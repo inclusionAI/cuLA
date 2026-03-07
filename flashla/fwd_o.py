@@ -77,7 +77,7 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Int32, Int64, Float32
 
 PRINT_DEBUG = False
@@ -243,18 +243,28 @@ class ChunkGlaFwdO:
     @cute.jit
     def __call__(
         self,
-        q_ptr: cute.Pointer,           # [B, T, H, K]
-        v_ptr: cute.Pointer,           # [B, T, H, V]
-        g_ptr: cute.Pointer,           # [B, T, H, K]
-        h_ptr: cute.Pointer,           # [NT_total, H, K, V]
-        o_ptr: cute.Pointer,           # [B, T, H, V]
-        A_ptr: cute.Pointer,           # [B, T, H, BT]
-        cu_seqlens_ptr: cute.Pointer,  # [N+1] int32
-        chunk_indices_ptr: cute.Pointer, # [NT*2] int32 — (batch_idx, chunk_seq_idx) pairs
+        q_in: cute.Tensor,             # [B, T, H, K] or [T_total, H, K]
+        v_in: cute.Tensor,             # [B, T, H, V] or [T_total, H, V]
+        g_in: cute.Tensor,             # [B, T, H, K] or [T_total, H, K] (fp32)
+        h_in: cute.Tensor,             # [NT_total, H, K, V]
+        o_in: cute.Tensor,             # [B, T, H, V] or [T_total, H, V]
+        A_in: cute.Tensor,             # [B, T, H, BT] or [T_total, H, BT]
+        cu_seqlens_in: cute.Tensor,    # [N+1] int32
+        chunk_indices_in: cute.Tensor, # [NT*2] int32
         problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],
         total_nt: Int32,               # total chunks across all seqs (varlen)
         stream,
     ):
+        # Extract pointers from tensor args (TVM-FFI compatible)
+        q_ptr = q_in.iterator
+        v_ptr = v_in.iterator
+        g_ptr = g_in.iterator
+        h_ptr = h_in.iterator
+        o_ptr = o_in.iterator
+        A_ptr = A_in.iterator
+        cu_seqlens_ptr = cu_seqlens_in.iterator
+        chunk_indices_ptr = chunk_indices_in.iterator
+
         B, T, H, K, V = problem_size
         BT = self.BT
 
@@ -1414,6 +1424,201 @@ def reference_chunk_gla_fwd_o(q, v, g, h, A, scale, chunk_size=64):
     return o
 
 
+# ---------------------------------------------------------------------------
+# Compile cache + TVM-FFI API
+# ---------------------------------------------------------------------------
+
+# Internal cache: maps (is_varlen, persistent, H, K, V, scale, chunk_size) → compiled_fn
+_fwd_o_kernel_cache: dict = {}
+
+
+def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size):
+    """Compile one ChunkGlaFwdO kernel variant. Returns the compiled TVM-FFI callable.
+
+    Uses make_fake_compact_tensor and make_fake_stream for compilation with
+    TVM-FFI.  At runtime, torch tensors are passed directly (zero-copy).
+    Uses sym_int() for dynamic B, T, NT dimensions so one compiled kernel
+    handles all batch-size / sequence-length combinations.
+    """
+    kernel_obj = ChunkGlaFwdO(
+        chunk_size=chunk_size,
+        head_dim_k=K,
+        head_dim_v=V,
+        scale=scale,
+        is_varlen=is_varlen,
+        persistent=persistent,
+    )
+
+    sym_a = cute.sym_int()   # B (non-varlen) or T_total (varlen)
+    sym_b = cute.sym_int()   # T (non-varlen) or unused
+    sym_nt = cute.sym_int()  # NT_total
+    sym_cu = cute.sym_int()  # cu_seqlens size
+    sym_ci = cute.sym_int()  # chunk_indices size
+
+    BT = chunk_size
+
+    if is_varlen:
+        # varlen: tensors are [T_total, H, ...] (3D)
+        q_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, H, K),
+            stride_order=(2, 1, 0), assumed_align=128,
+        )
+        v_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, H, V),
+            stride_order=(2, 1, 0), assumed_align=128,
+        )
+        g_fake = make_fake_compact_tensor(
+            cutlass.Float32, (sym_a, H, K),
+            stride_order=(2, 1, 0), assumed_align=128,
+        )
+        o_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, H, V),
+            stride_order=(2, 1, 0), assumed_align=128,
+        )
+        A_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, H, BT),
+            stride_order=(2, 1, 0), assumed_align=128,
+        )
+    else:
+        # non-varlen: tensors are [B, T, H, ...] (4D)
+        q_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_b, H, K),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
+        )
+        v_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_b, H, V),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
+        )
+        g_fake = make_fake_compact_tensor(
+            cutlass.Float32, (sym_a, sym_b, H, K),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
+        )
+        o_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_b, H, V),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
+        )
+        A_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_b, H, BT),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
+        )
+
+    h_fake = make_fake_compact_tensor(
+        cutlass.BFloat16, (sym_nt, H, K, V),
+        stride_order=(3, 2, 1, 0), assumed_align=128,
+    )
+    cu_fake = make_fake_compact_tensor(
+        cutlass.Int32, (sym_cu,), assumed_align=128,
+    )
+    ci_fake = make_fake_compact_tensor(
+        cutlass.Int32, (sym_ci,), assumed_align=128,
+    )
+    stream_fake = make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    compiled_fn = cute.compile(
+        kernel_obj,
+        q_fake, v_fake, g_fake, h_fake, o_fake, A_fake,
+        cu_fake, ci_fake,
+        (Int32(1), Int32(1), Int32(H), Int32(K), Int32(V)),
+        Int32(1),
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+    return compiled_fn
+
+
+def _get_compiled_fwd_o(is_varlen, persistent, H, K, V, scale, chunk_size):
+    """Get a compiled ChunkGlaFwdO kernel with on-demand (lazy) compilation.
+
+    Each variant is compiled exactly once and cached.  Compilation is deferred
+    until the variant is actually needed so that cute.compile is always
+    immediately followed by execution — this avoids a CuTe DSL runtime issue
+    where a subsequent cute.compile can invalidate previously compiled but
+    not-yet-executed functions.
+
+    Cache key: (is_varlen, persistent, H, K, V, scale, chunk_size)
+    """
+    key = (is_varlen, persistent, H, K, V, scale, chunk_size)
+    if key not in _fwd_o_kernel_cache:
+        _fwd_o_kernel_cache[key] = _compile_fwd_o_variant(
+            is_varlen, persistent, H, K, V, scale, chunk_size,
+        )
+    return _fwd_o_kernel_cache[key]
+
+
+def chunk_gla_fwd_o(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    h: torch.Tensor,
+    o: torch.Tensor,
+    A: torch.Tensor,
+    scale: float,
+    chunk_size: int = 64,
+    cu_seqlens: torch.Tensor = None,
+    chunk_indices: torch.Tensor = None,
+    is_varlen: bool = False,
+    persistent: bool = True,
+) -> None:
+    """
+    ChunkGlaFwdO forward pass with compile cache and TVM-FFI.
+
+    Computes:  o = scale * (q ⊙ 2^g) @ h  +  tril(Aqk) @ v_new
+
+    Uses make_fake_compact_tensor for compilation (no GC issues).
+    At runtime, torch tensors are passed directly via TVM-FFI.
+    sym_int() is used for B, T, NT so a single compilation handles all
+    batch-size / sequence-length combinations.
+
+    Cache key: (is_varlen, persistent, H, K, V, scale, chunk_size)
+
+    Args:
+        q: query tensor — [B, T, H, K] bf16 (non-varlen) or [T_total, H, K] (varlen)
+        v: value tensor — [B, T, H, V] bf16 (non-varlen) or [T_total, H, V] (varlen)
+        g: gate tensor — [B, T, H, K] fp32 (non-varlen) or [T_total, H, K] (varlen)
+        h: state tensor — [NT_total, H, K, V] bf16
+        o: output tensor (pre-allocated) — same shape as q but with V dim
+        A: attention matrix — [B, T, H, BT] bf16 or [T_total, H, BT]
+        scale: attention scale factor
+        chunk_size: chunk size (default: 64)
+        cu_seqlens: cumulative sequence lengths [N+1] int32 (varlen only)
+        chunk_indices: chunk index pairs [NT*2] int32 (varlen only)
+        is_varlen: whether to use varlen mode
+        persistent: whether to use persistent kernel (default: True)
+    """
+    if is_varlen:
+        assert cu_seqlens is not None and chunk_indices is not None, \
+            "cu_seqlens and chunk_indices are required for varlen mode"
+        T_total = q.shape[0]
+        H = q.shape[1]
+        K = q.shape[2]
+        V = v.shape[2]
+        num_seqs = cu_seqlens.shape[0] - 1
+        total_nt_val = chunk_indices.shape[0] // 2
+        ps = (Int32(num_seqs), Int32(T_total), Int32(H), Int32(K), Int32(V))
+    else:
+        B, T, H, K = q.shape
+        V = v.shape[3]
+        NT = (T + chunk_size - 1) // chunk_size
+        total_nt_val = B * NT
+        ps = (Int32(B), Int32(T), Int32(H), Int32(K), Int32(V))
+        if cu_seqlens is None:
+            cu_seqlens = torch.zeros(2, dtype=torch.int32, device=q.device)
+        if chunk_indices is None:
+            chunk_indices = torch.zeros(2, dtype=torch.int32, device=q.device)
+
+    compiled_fn = _get_compiled_fwd_o(
+        is_varlen, persistent, H, K, V, scale, chunk_size,
+    )
+
+    # TVM-FFI: pass torch tensors directly; stream is auto-provided
+    # by make_fake_stream(use_tvm_ffi_env_stream=True).
+    compiled_fn(
+        q, v, g, h, o, A,
+        cu_seqlens, chunk_indices,
+        ps, Int32(total_nt_val),
+    )
+
+
 # =====================================================================
 # Main
 # =====================================================================
@@ -1433,7 +1638,6 @@ def main():
 
     if args.scale is None:
         args.scale = args.K ** -0.5
-
     B, T, H, K, V = args.B, args.T, args.H, args.K, args.V
     BT = args.chunk_size
     scale = args.scale
@@ -1444,480 +1648,44 @@ def main():
     print(f"  Chunks per seq: {NT}, Total chunks: {B*NT}")
 
     if args.test in ("correctness", "both"):
-        print("\n=== Correctness Test (skipped, testing varlen directly) ===")
+        all_pass = True
+
+        # ----- Non-varlen correctness test -----
+        print("\n=== Non-Varlen Correctness Test ===")
+        torch.manual_seed(42)
+        q_nv = torch.randn(B, T, H, K, dtype=dtype, device=device)
+        v_nv = torch.randn(B, T, H, V, dtype=dtype, device=device)
+        g_nv = torch.randn(B, T, H, K, dtype=torch.float32, device=device) * 0.1
+        h_nv = torch.randn(B * NT, H, K, V, dtype=dtype, device=device) * 0.01
+        A_nv = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
+
+        o_ref_nv = reference_chunk_gla_fwd_o(q_nv, v_nv, g_nv, h_nv, A_nv, scale, BT)
+        o_nv = torch.zeros(B, T, H, V, dtype=dtype, device=device)
+
+        chunk_gla_fwd_o(
+            q=q_nv, v=v_nv, g=g_nv, h=h_nv, o=o_nv, A=A_nv,
+            scale=scale, chunk_size=BT, is_varlen=False,
+        )
+        torch.cuda.synchronize()
+
+        max_diff = (o_ref_nv.float() - o_nv.float()).abs().max().item()
+        status = "PASS" if max_diff < 0.02 else "FAIL"
+        print(f"  Non-varlen: max_diff={max_diff:.6f} [{status}]")
+        all_pass = all_pass and (max_diff < 0.02)
 
         # ----- Varlen correctness test -----
         print("\n=== Varlen Correctness Test ===")
-
-        # Diagnostic: Step-function A to prove wrong T-position load
-        print("\n  --- TMA address verification test ---")
-        try:
-            seq_lens_d = [100, 128]
-            T_d = 228
-            cu_d = [0, 100, 228]
-            total_nt_d = 4
-            cu_t = torch.tensor(cu_d, dtype=torch.int32, device=device)
-            ci_t = build_chunk_indices(seq_lens_d, BT=BT, device=device)
-            cu_c = from_dlpack(cu_t.detach())
-            ci_c = from_dlpack(ci_t.detach())
-            ch_offsets_d = build_chunk_offsets(seq_lens_d, BT=BT)
-            stream = cutlass_torch.default_stream()
-            H_test = 1  # Use H=1 to reduce SMEM debug output
-            ps_d = (2, T_d, H_test, K, V)
-
-            # Use q[t, h, k] = float(t) so SMEM values reveal the actual global token loaded
-            q_tma_test = torch.zeros(T_d, H_test, K, dtype=dtype, device=device)
-            for t in range(T_d):
-                q_tma_test[t, :, :] = float(t)
-            # g[t, h, k] = float(t) * 0.001 (distinctive but small)
-            g_tma_test = torch.zeros(T_d, H_test, K, dtype=torch.float32, device=device)
-            for t in range(T_d):
-                g_tma_test[t, :, :] = float(t) * 0.001
-            # A[t, h, j] = float(t) + j*0.01
-            A_tma_test = torch.zeros(T_d, H_test, BT, dtype=dtype, device=device)
-            for t in range(T_d):
-                for j in range(BT):
-                    A_tma_test[t, :, j] = float(t) + j * 0.01
-            v_tma_test = torch.zeros(T_d, H_test, V, dtype=dtype, device=device)
-            for t in range(T_d):
-                v_tma_test[t, :, :] = float(t)
-            h_tma_test = torch.zeros(total_nt_d, H_test, K, V, dtype=dtype, device=device)
-            o_tma_test = torch.zeros(T_d, H_test, V, dtype=dtype, device=device)
-
-            # Print expected values for comparison
-            print("  Expected SMEM values (q[t]=t, g[t]=t*0.001, A[t,j]=t+j*0.01):")
-            for si, sl in enumerate(seq_lens_d):
-                s = cu_d[si]
-                nt = (sl + BT - 1) // BT
-                for c in range(nt):
-                    tok = s + c * BT
-                    rem = min(BT, sl - c * BT)
-                    print(f"    Seq{si} c{c}: tok_offset={s} local_chunk={c} global_tok={tok} remaining={rem}")
-                    print(f"      Expected q[0..3,0] = {tok:.0f} {tok+1:.0f} {tok+2:.0f} {tok+3:.0f}")
-                    print(f"      Expected g[0..3,0] = {tok*0.001:.4f} {(tok+1)*0.001:.4f} {(tok+2)*0.001:.4f} {(tok+3)*0.001:.4f}")
-                    print(f"      Expected A[0..3,0] = {tok:.2f} {tok+1:.2f} {tok+2:.2f} {tok+3:.2f}")
-                    if rem < BT:
-                        print(f"      Expected q[rem-1={rem-1},0] = {tok+rem-1:.0f}")
-                        print(f"      Expected q[rem={rem},0] = 0.0 (TMA zero-fill)")
-
-            k_tma = ChunkGlaFwdO(chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale, is_varlen=True)
-            c_tma = cute.compile(
-                k_tma,
-                from_dlpack(q_tma_test.detach()).iterator, from_dlpack(v_tma_test.detach()).iterator,
-                from_dlpack(g_tma_test.detach()).iterator, from_dlpack(h_tma_test.detach()).iterator,
-                from_dlpack(o_tma_test.detach()).iterator, from_dlpack(A_tma_test.detach()).iterator,
-                cu_c.iterator, ci_c.iterator,
-                ps_d, total_nt_d, stream,
-            )
-            c_tma(
-                from_dlpack(q_tma_test.detach()).iterator, from_dlpack(v_tma_test.detach()).iterator,
-                from_dlpack(g_tma_test.detach()).iterator, from_dlpack(h_tma_test.detach()).iterator,
-                from_dlpack(o_tma_test.detach()).iterator, from_dlpack(A_tma_test.detach()).iterator,
-                cu_c.iterator, ci_c.iterator,
-                ps_d, total_nt_d, stream,
-            )
-            torch.cuda.synchronize()
-            print("  (Check SMEM debug prints above for actual loaded values)")
-        except Exception as e:
-            import traceback
-            print(f"  TMA verification test failed: {e}")
-            traceback.print_exc()
-
-        print("\n  TMA verification test done.")
-
-        print("\n  --- Step-function A test (prove T-position bug) ---")
-        try:
-            seq_lens_d = [100, 128]
-            T_d = 228
-            cu_d = [0, 100, 228]
-            total_nt_d = 4
-            cu_t = torch.tensor(cu_d, dtype=torch.int32, device=device)
-            ci_t = build_chunk_indices(seq_lens_d, BT=BT, device=device)
-            cu_c = from_dlpack(cu_t.detach())
-            ci_c = from_dlpack(ci_t.detach())
-            ch_offsets_d = build_chunk_offsets(seq_lens_d, BT=BT)
-            stream = cutlass_torch.default_stream()
-            ps_d = (2, T_d, H, K, V)
-
-            # A step: A=1 for t < 100, A=0 for t >= 100
-            # For Seq1 (t >= 100): all A=0 → tril(0) @ v = 0. Any non-zero output = wrong T position.
-            A_step = torch.ones(T_d, H, BT, dtype=dtype, device=device)
-            A_step[100:, :, :] = 0.0
-            v_step = torch.ones(T_d, H, V, dtype=dtype, device=device)
-            q_step = torch.zeros(T_d, H, K, dtype=dtype, device=device)
-            g_step = torch.zeros(T_d, H, K, dtype=torch.float32, device=device)
-            h_step = torch.zeros(total_nt_d, H, K, V, dtype=dtype, device=device)
-
-            o_step = torch.zeros(T_d, H, V, dtype=dtype, device=device)
-            k_step = ChunkGlaFwdO(chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale, is_varlen=True)
-            c_step = cute.compile(
-                k_step,
-                from_dlpack(q_step.detach()).iterator, from_dlpack(v_step.detach()).iterator,
-                from_dlpack(g_step.detach()).iterator, from_dlpack(h_step.detach()).iterator,
-                from_dlpack(o_step.detach()).iterator, from_dlpack(A_step.detach()).iterator,
-                cu_c.iterator, ci_c.iterator,
-                ps_d, total_nt_d, stream,
-            )
-            c_step(
-                from_dlpack(q_step.detach()).iterator, from_dlpack(v_step.detach()).iterator,
-                from_dlpack(g_step.detach()).iterator, from_dlpack(h_step.detach()).iterator,
-                from_dlpack(o_step.detach()).iterator, from_dlpack(A_step.detach()).iterator,
-                cu_c.iterator, ci_c.iterator,
-                ps_d, total_nt_d, stream,
-            )
-            torch.cuda.synchronize()
-
-            print("    A-step test: A=1 for t<100, A=0 for t>=100")
-            for seq_idx, sl in enumerate(seq_lens_d):
-                s = cu_d[seq_idx]
-                nt = (sl + BT - 1) // BT
-                for c_idx in range(nt):
-                    cs = s + c_idx * BT
-                    ce = min(cs + BT, cu_d[seq_idx + 1])
-                    cl = ce - cs
-                    o_chunk = o_step[cs:ce, 0, 0]
-                    mx = o_chunk.abs().max().item()
-                    first_nonzero = -1
-                    for r in range(cl):
-                        if abs(o_chunk[r].item()) > 0.01:
-                            first_nonzero = r
-                            break
-                    nz_str = f" first_nonzero_row={first_nonzero}" if first_nonzero >= 0 else ""
-                    # Show a few values
-                    vals = [f"r{r}:{o_chunk[r].item():.2f}" for r in [0, 1, 2, min(cl-1, 63)]]
-                    print(f"    Seq{seq_idx} c{c_idx} cs={cs}: max={mx:.4f} {' '.join(vals)}{nz_str}")
-                    # For Seq1: any non-zero means wrong T position
-                    if seq_idx == 1 and mx > 0.01:
-                        print(f"      → PROOF: kernel loaded A from T<100 for Seq1 c{c_idx}!")
-
-            # V step: v=1 for t < 100, v=0 for t >= 100, A=ones
-            # For Seq1: v=0 → tril(A)@0 = 0. Any non-zero = wrong v T position.
-            print("    V-step test: v=1 for t<100, v=0 for t>=100, A=ones")
-            v_step2 = torch.ones(T_d, H, V, dtype=dtype, device=device)
-            v_step2[100:, :, :] = 0.0
-            A_step2 = torch.ones(T_d, H, BT, dtype=dtype, device=device)
-
-            o_step2 = torch.zeros(T_d, H, V, dtype=dtype, device=device)
-            k_step2 = ChunkGlaFwdO(chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale, is_varlen=True)
-            c_step2 = cute.compile(
-                k_step2,
-                from_dlpack(q_step.detach()).iterator, from_dlpack(v_step2.detach()).iterator,
-                from_dlpack(g_step.detach()).iterator, from_dlpack(h_step.detach()).iterator,
-                from_dlpack(o_step2.detach()).iterator, from_dlpack(A_step2.detach()).iterator,
-                cu_c.iterator, ci_c.iterator,
-                ps_d, total_nt_d, stream,
-            )
-            c_step2(
-                from_dlpack(q_step.detach()).iterator, from_dlpack(v_step2.detach()).iterator,
-                from_dlpack(g_step.detach()).iterator, from_dlpack(h_step.detach()).iterator,
-                from_dlpack(o_step2.detach()).iterator, from_dlpack(A_step2.detach()).iterator,
-                cu_c.iterator, ci_c.iterator,
-                ps_d, total_nt_d, stream,
-            )
-            torch.cuda.synchronize()
-
-            for seq_idx, sl in enumerate(seq_lens_d):
-                s = cu_d[seq_idx]
-                nt = (sl + BT - 1) // BT
-                for c_idx in range(nt):
-                    cs = s + c_idx * BT
-                    ce = min(cs + BT, cu_d[seq_idx + 1])
-                    cl = ce - cs
-                    o_chunk = o_step2[cs:ce, 0, 0]
-                    mx = o_chunk.abs().max().item()
-                    first_nonzero = -1
-                    for r in range(cl):
-                        if abs(o_chunk[r].item()) > 0.01:
-                            first_nonzero = r
-                            break
-                    nz_str = f" first_nonzero_row={first_nonzero}" if first_nonzero >= 0 else ""
-                    vals = [f"r{r}:{o_chunk[r].item():.2f}" for r in [0, 1, 2, min(cl-1, 63)]]
-                    print(f"    Seq{seq_idx} c{c_idx} cs={cs}: max={mx:.4f} {' '.join(vals)}{nz_str}")
-                    if seq_idx == 1 and mx > 0.01:
-                        print(f"      → PROOF: kernel loaded v from T<100 for Seq1 c{c_idx}!")
-
-        except Exception as e:
-            import traceback
-            print(f"  Step test failed: {e}")
-            traceback.print_exc()
-
-        # Test: Random data with occ=1 to check multi-CTA interference
-        print("\n  --- [100,128] random data with occ=1 ---")
-        try:
-            seq_lens_o1 = [100, 128]
-            T_o1 = 228
-            cu_o1 = [0, 100, 228]
-            ch_offsets_o1 = build_chunk_offsets(seq_lens_o1, BT=BT)
-            nt_o1 = 4
-            cu_t = torch.tensor(cu_o1, dtype=torch.int32, device=device)
-            ci_t = build_chunk_indices(seq_lens_o1, BT=BT, device=device)
-            cu_c = from_dlpack(cu_t.detach())
-            ci_c = from_dlpack(ci_t.detach())
-            stream = cutlass_torch.default_stream()
-            ps_o1 = (2, T_o1, H, K, V)
-
-            torch.manual_seed(42)
-            q_o1 = torch.randn(T_o1, H, K, dtype=dtype, device=device)
-            v_o1 = torch.randn(T_o1, H, V, dtype=dtype, device=device)
-            g_o1 = torch.randn(T_o1, H, K, dtype=torch.float32, device=device) * 0.1
-            h_o1 = torch.randn(nt_o1, H, K, V, dtype=dtype, device=device) * 0.01
-            A_o1 = torch.randn(T_o1, H, BT, dtype=dtype, device=device) * 0.1
-
-            o_ref_o1 = torch.zeros(T_o1, H, V, dtype=dtype, device=device)
-            for si, sl in enumerate(seq_lens_o1):
-                s, e = cu_o1[si], cu_o1[si + 1]
-                co = ch_offsets_o1[si]
-                nt_s = (sl + BT - 1) // BT
-                o_s = reference_chunk_gla_fwd_o(
-                    q_o1[s:e].unsqueeze(0), v_o1[s:e].unsqueeze(0),
-                    g_o1[s:e].unsqueeze(0), h_o1[co:co+nt_s],
-                    A_o1[s:e].unsqueeze(0), scale, BT)
-                o_ref_o1[s:e] = o_s[0]
-
-            o_out1 = torch.zeros(T_o1, H, V, dtype=dtype, device=device)
-            k_occ1 = ChunkGlaFwdO(chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale, is_varlen=True, min_occupancy=1)
-            c_occ1 = cute.compile(
-                k_occ1,
-                from_dlpack(q_o1.detach()).iterator, from_dlpack(v_o1.detach()).iterator,
-                from_dlpack(g_o1.detach()).iterator, from_dlpack(h_o1.detach()).iterator,
-                from_dlpack(o_out1.detach()).iterator, from_dlpack(A_o1.detach()).iterator,
-                cu_c.iterator, ci_c.iterator,
-                ps_o1, nt_o1, stream,
-            )
-            c_occ1(
-                from_dlpack(q_o1.detach()).iterator, from_dlpack(v_o1.detach()).iterator,
-                from_dlpack(g_o1.detach()).iterator, from_dlpack(h_o1.detach()).iterator,
-                from_dlpack(o_out1.detach()).iterator, from_dlpack(A_o1.detach()).iterator,
-                cu_c.iterator, ci_c.iterator,
-                ps_o1, nt_o1, stream,
-            )
-            torch.cuda.synchronize()
-            for si, sl in enumerate(seq_lens_o1):
-                s = cu_o1[si]
-                nt_s = (sl + BT - 1) // BT
-                for ci in range(nt_s):
-                    cs = s + ci * BT
-                    ce = min(cs + BT, cu_o1[si + 1])
-                    cd = (o_ref_o1[cs:ce].float() - o_out1[cs:ce].float()).abs().max().item()
-                    status = "PASS" if cd < 0.02 else "FAIL"
-                    print(f"    occ=1 Seq{si} c{ci} (tok={cs}) max_diff={cd:.4f} [{status}]")
-        except Exception as e:
-            import traceback
-            print(f"  occ=1 test failed: {e}")
-            traceback.print_exc()
-
-        # Test: compile once, run with [100, 128] isolating inter vs intra
-        print("\n  --- Isolate inter vs intra for [100, 128] ---")
-        try:
-            seq_lens = [100, 128]
-            num_seqs = 2
-            T_total = 228
-            cu_seqlens_list = [0, 100, 228]
-            chunk_offsets_list = build_chunk_offsets(seq_lens, BT=BT)
-            total_nt_val = chunk_offsets_list[-1]
-            cu_seqlens_t = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
-            ci_t = build_chunk_indices(seq_lens, BT=BT, device=device)
-            cu_cute = from_dlpack(cu_seqlens_t.detach())
-            ci_cute = from_dlpack(ci_t.detach())
-            ps = (num_seqs, T_total, H, K, V)
-            stream = cutlass_torch.default_stream()
-
-            torch.manual_seed(42)
-            q_flat = torch.randn(T_total, H, K, dtype=dtype, device=device)
-            v_flat = torch.randn(T_total, H, V, dtype=dtype, device=device)
-            g_flat = torch.randn(T_total, H, K, dtype=torch.float32, device=device) * 0.1
-            h_flat = torch.randn(total_nt_val, H, K, V, dtype=dtype, device=device) * 0.01
-            A_flat = torch.randn(T_total, H, BT, dtype=dtype, device=device) * 0.1
-
-            def run_and_check(label, q, v, g, h, A):
-                o_ref = torch.zeros(T_total, H, V, dtype=dtype, device=device)
-                for seq_idx, sl in enumerate(seq_lens):
-                    s, e = cu_seqlens_list[seq_idx], cu_seqlens_list[seq_idx + 1]
-                    co = chunk_offsets_list[seq_idx]
-                    nt_seq = (sl + BT - 1) // BT
-                    o_seq = reference_chunk_gla_fwd_o(
-                        q[s:e].unsqueeze(0), v[s:e].unsqueeze(0),
-                        g[s:e].unsqueeze(0), h[co:co+nt_seq],
-                        A[s:e].unsqueeze(0), scale, BT)
-                    o_ref[s:e] = o_seq[0]
-
-                o_flat = torch.zeros(T_total, H, V, dtype=dtype, device=device)
-                kernel_vl = ChunkGlaFwdO(chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale, is_varlen=True)
-                compiled_vl = cute.compile(
-                    kernel_vl,
-                    from_dlpack(q.detach()).iterator, from_dlpack(v.detach()).iterator,
-                    from_dlpack(g.detach()).iterator, from_dlpack(h.detach()).iterator,
-                    from_dlpack(o_flat.detach()).iterator, from_dlpack(A.detach()).iterator,
-                    cu_cute.iterator, ci_cute.iterator,
-                    ps, total_nt_val, stream,
-                )
-                compiled_vl(
-                    from_dlpack(q.detach()).iterator, from_dlpack(v.detach()).iterator,
-                    from_dlpack(g.detach()).iterator, from_dlpack(h.detach()).iterator,
-                    from_dlpack(o_flat.detach()).iterator, from_dlpack(A.detach()).iterator,
-                    cu_cute.iterator, ci_cute.iterator,
-                    ps, total_nt_val, stream,
-                )
-                torch.cuda.synchronize()
-                # Per chunk
-                for seq_idx, sl in enumerate(seq_lens):
-                    s = cu_seqlens_list[seq_idx]
-                    co = chunk_offsets_list[seq_idx]
-                    nt_seq = (sl + BT - 1) // BT
-                    for c in range(nt_seq):
-                        cs = s + c * BT
-                        ce = min(cs + BT, cu_seqlens_list[seq_idx + 1])
-                        cd = (o_ref[cs:ce].float() - o_flat[cs:ce].float()).abs().max().item()
-                        if cd > 0.02:
-                            print(f"    {label}: Seq{seq_idx} c{c} (tok={cs}) max_diff={cd:.4f} FAIL")
-                md = (o_ref.float() - o_flat.float()).abs().max().item()
-                status = "PASS" if md < 0.02 else "FAIL"
-                print(f"    {label}: max_diff={md:.6f} [{status}]")
-
-            # Full test
-            run_and_check("FULL", q_flat, v_flat, g_flat, h_flat, A_flat)
-
-            # INTRA only: q=0, h=0 → only tril(A) @ v
-            q_zero = torch.zeros_like(q_flat)
-            h_zero = torch.zeros_like(h_flat)
-            run_and_check("INTRA(q=0,h=0)", q_zero, v_flat, g_flat, h_zero, A_flat)
-
-            # INTER only: A=0 → only scale * qg @ h
-            A_zero = torch.zeros_like(A_flat)
-            run_and_check("INTER(A=0)", q_flat, v_flat, g_flat, h_flat, A_zero)
-
-            # V-only: q=0, h=0, A=identity-like (first column = 1, rest=0)
-            # This tests purely the v load
-            A_ones = torch.zeros_like(A_flat)
-            A_ones[:, :, 0] = 1.0  # tril row 0 col 0 = 1
-            run_and_check("V-LOAD(A=diag)", q_zero, v_flat, g_flat, h_zero, A_ones)
-
-        except Exception as e:
-            import traceback
-            print(f"  Test failed: {e}")
-            traceback.print_exc()
-
-        # Diagnostic: Fresh-compile A-column test (no TMA descriptor reuse)
-        print("\n  --- Fresh A-column diagnostic ---")
-        try:
-            seq_lens_diag = [100, 128]
-            T_diag = 228
-            cu_diag = [0, 100, 228]
-            total_nt_diag = 4
-            cu_t = torch.tensor(cu_diag, dtype=torch.int32, device=device)
-            ci_t = build_chunk_indices(seq_lens_diag, BT=BT, device=device)
-            cu_c = from_dlpack(cu_t.detach())
-            ci_c = from_dlpack(ci_t.detach())
-            stream = cutlass_torch.default_stream()
-
-            # v = ones, q=0, g=0, h=0
-            v_diag = torch.ones(T_diag, H, V, dtype=dtype, device=device)
-            q_diag = torch.zeros(T_diag, H, K, dtype=dtype, device=device)
-            g_diag = torch.zeros(T_diag, H, K, dtype=torch.float32, device=device)
-            h_diag = torch.zeros(total_nt_diag, H, K, V, dtype=dtype, device=device)
-            # A[t, h, j] = (j+1) * 0.01
-            A_diag = torch.zeros(T_diag, H, BT, dtype=dtype, device=device)
-            for j in range(BT):
-                A_diag[:, :, j] = (j + 1) * 0.01
-
-            o_diag = torch.zeros(T_diag, H, V, dtype=dtype, device=device)
-            ps_diag = (2, T_diag, H, K, V)
-
-            # FRESH compile with these exact tensors
-            kvl = ChunkGlaFwdO(chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale, is_varlen=True)
-            compiled_d = cute.compile(
-                kvl,
-                from_dlpack(q_diag.detach()).iterator, from_dlpack(v_diag.detach()).iterator,
-                from_dlpack(g_diag.detach()).iterator, from_dlpack(h_diag.detach()).iterator,
-                from_dlpack(o_diag.detach()).iterator, from_dlpack(A_diag.detach()).iterator,
-                cu_c.iterator, ci_c.iterator,
-                ps_diag, total_nt_diag, stream,
-            )
-            compiled_d(
-                from_dlpack(q_diag.detach()).iterator, from_dlpack(v_diag.detach()).iterator,
-                from_dlpack(g_diag.detach()).iterator, from_dlpack(h_diag.detach()).iterator,
-                from_dlpack(o_diag.detach()).iterator, from_dlpack(A_diag.detach()).iterator,
-                cu_c.iterator, ci_c.iterator,
-                ps_diag, total_nt_diag, stream,
-            )
-            torch.cuda.synchronize()
-
-            # Expected: o[cs+i, h, v] = sum_{j=0}^{i} (j+1)*0.01 * 1 = 0.01*(i+1)*(i+2)/2
-            for seq_idx, sl in enumerate(seq_lens_diag):
-                s = cu_diag[seq_idx]
-                nt = (sl + BT - 1) // BT
-                for c in range(nt):
-                    cs = s + c * BT
-                    ce = min(cs + BT, cu_diag[seq_idx + 1])
-                    cl = ce - cs
-                    vals = []
-                    first_bad = -1
-                    for row in range(cl):
-                        ex = 0.01 * (row + 1) * (row + 2) / 2.0
-                        ac = o_diag[cs + row, 0, 0].item()
-                        d = abs(ac - ex)
-                        if row < 4 or row >= cl - 2:
-                            vals.append(f"r{row}:{ac:.4f}/{ex:.4f}")
-                        if d > max(0.1, abs(ex) * 0.05) and first_bad < 0:
-                            first_bad = row
-                    bad_str = f" first_bad={first_bad}" if first_bad >= 0 else " ALL_OK"
-                    print(f"    Seq{seq_idx} c{c} cs={cs}: {' '.join(vals)}{bad_str}")
-                    if first_bad >= 0:
-                        for row in range(max(0, first_bad-1), min(cl, first_bad+5)):
-                            ex = 0.01 * (row + 1) * (row + 2) / 2.0
-                            ac = o_diag[cs + row, 0, 0].item()
-                            print(f"      r{row}: act={ac:.6f} exp={ex:.6f} diff={ac-ex:.6f}")
-
-            # Also fresh A-ones test for sanity
-            print("    --- Fresh A-ones test ---")
-            A_ones = torch.ones(T_diag, H, BT, dtype=dtype, device=device)
-            o_ones = torch.zeros(T_diag, H, V, dtype=dtype, device=device)
-            kvl2 = ChunkGlaFwdO(chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale, is_varlen=True)
-            compiled_d2 = cute.compile(
-                kvl2,
-                from_dlpack(q_diag.detach()).iterator, from_dlpack(v_diag.detach()).iterator,
-                from_dlpack(g_diag.detach()).iterator, from_dlpack(h_diag.detach()).iterator,
-                from_dlpack(o_ones.detach()).iterator, from_dlpack(A_ones.detach()).iterator,
-                cu_c.iterator, ci_c.iterator,
-                ps_diag, total_nt_diag, stream,
-            )
-            compiled_d2(
-                from_dlpack(q_diag.detach()).iterator, from_dlpack(v_diag.detach()).iterator,
-                from_dlpack(g_diag.detach()).iterator, from_dlpack(h_diag.detach()).iterator,
-                from_dlpack(o_ones.detach()).iterator, from_dlpack(A_ones.detach()).iterator,
-                cu_c.iterator, ci_c.iterator,
-                ps_diag, total_nt_diag, stream,
-            )
-            torch.cuda.synchronize()
-            # Expected: o[cs+i] = sum_{j=0}^{i} 1*1 = i+1
-            for seq_idx, sl in enumerate(seq_lens_diag):
-                s = cu_diag[seq_idx]
-                nt = (sl + BT - 1) // BT
-                for c in range(nt):
-                    cs = s + c * BT
-                    ce = min(cs + BT, cu_diag[seq_idx + 1])
-                    cl = ce - cs
-                    md = max(abs(o_ones[cs + row, 0, 0].item() - float(row + 1)) for row in range(cl))
-                    status = "OK" if md < 0.5 else "FAIL"
-                    print(f"    Seq{seq_idx} c{c} cs={cs}: max_diff={md:.2f} [{status}]")
-
-        except Exception as e:
-            import traceback
-            print(f"  Fresh A-col test failed: {e}")
-            traceback.print_exc()
-
-        # Original varlen tests
         test_configs = [
-            [64],               # perfect single chunk
-            [128],              # 2 chunks aligned
-            [100],              # single seq, tail chunk
-            [100, 128],         # non-aligned (was failing)
-            [128, 100],         # different non-aligned
-            [192, 100, 256, 50],  # mixed
-            [228],              # single seq
-            [128, 128],         # aligned control
+            [64],
+            [128],
+            [100],
+            [100, 128],
+            [128, 100],
+            [192, 100, 256, 50],
+            [228],
+            [128, 128],
         ]
-        for run_id, seq_lens in enumerate(test_configs):
+        for seq_lens in test_configs:
             try:
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
@@ -1932,11 +1700,7 @@ def main():
 
                 cu_seqlens_t = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
                 ci_t = build_chunk_indices(seq_lens, BT=BT, device=device)
-                cu_cute = from_dlpack(cu_seqlens_t.detach())
-                ci_cute = from_dlpack(ci_t.detach())
-                ps = (num_seqs, T_total, H, K, V)
 
-                # Random token-indexed inputs (used for reference)
                 q_flat = torch.randn(T_total, H, K, dtype=dtype, device=device)
                 v_flat = torch.randn(T_total, H, V, dtype=dtype, device=device)
                 g_flat = torch.randn(T_total, H, K, dtype=torch.float32, device=device) * 0.1
@@ -1944,7 +1708,7 @@ def main():
                 A_flat = torch.randn(T_total, H, BT, dtype=dtype, device=device) * 0.1
                 o_flat = torch.zeros(T_total, H, V, dtype=dtype, device=device)
 
-                # Reference per-sequence (uses original token-indexed data)
+                # Reference per-sequence
                 o_ref_flat = torch.zeros_like(o_flat)
                 for seq_idx, sl in enumerate(seq_lens):
                     s = cu_seqlens_list[seq_idx]
@@ -1957,94 +1721,102 @@ def main():
                         A_flat[s:e].unsqueeze(0), scale, BT)
                     o_ref_flat[s:e] = o_seq[0]
 
-                # === Test 1: varlen kernel (token-indexed inputs + domain_offset) ===
-                stream = cutlass_torch.default_stream()
-                kernel_vl = ChunkGlaFwdO(
-                    chunk_size=BT, head_dim_k=K, head_dim_v=V, scale=scale,
+                chunk_gla_fwd_o(
+                    q=q_flat, v=v_flat, g=g_flat, h=h_flat, o=o_flat, A=A_flat,
+                    scale=scale, chunk_size=BT,
+                    cu_seqlens=cu_seqlens_t, chunk_indices=ci_t,
                     is_varlen=True,
-                )
-                compiled_vl = cute.compile(
-                    kernel_vl,
-                    from_dlpack(q_flat.detach()).iterator,
-                    from_dlpack(v_flat.detach()).iterator,
-                    from_dlpack(g_flat.detach()).iterator,
-                    from_dlpack(h_flat.detach()).iterator,
-                    from_dlpack(o_flat.detach()).iterator,
-                    from_dlpack(A_flat.detach()).iterator,
-                    cu_cute.iterator, ci_cute.iterator,
-                    ps, total_nt_val, stream,
-                )
-                compiled_vl(
-                    from_dlpack(q_flat.detach()).iterator,
-                    from_dlpack(v_flat.detach()).iterator,
-                    from_dlpack(g_flat.detach()).iterator,
-                    from_dlpack(h_flat.detach()).iterator,
-                    from_dlpack(o_flat.detach()).iterator,
-                    from_dlpack(A_flat.detach()).iterator,
-                    cu_cute.iterator, ci_cute.iterator,
-                    ps, total_nt_val, stream,
                 )
                 torch.cuda.synchronize()
 
                 max_diff = (o_ref_flat.float() - o_flat.float()).abs().max().item()
                 status = "PASS" if max_diff < 0.02 else "FAIL"
-                # Show tok offsets
                 tok_offs = [cu_seqlens_list[i] for i in range(num_seqs)]
                 aligned = all(t % BT == 0 for t in tok_offs)
-                print(f"  seq_lens={seq_lens} T={T_total} tok_offs={tok_offs} aligned={aligned}: max_diff={max_diff:.6f} [{status}]")
-
-                if max_diff >= 0.02:
-                    # Per-chunk, per-head breakdown
-                    for seq_idx, sl in enumerate(seq_lens):
-                        s = cu_seqlens_list[seq_idx]
-                        co = chunk_offsets_list[seq_idx]
-                        nt_seq = (sl + BT - 1) // BT
-                        for c in range(nt_seq):
-                            cs = s + c * BT
-                            ce = min(cs + BT, cu_seqlens_list[seq_idx + 1])
-                            gc = co + c
-                            diffs = [
-                                (o_ref_flat[cs:ce, hh, :].float() - o_flat[cs:ce, hh, :].float()).abs().max().item()
-                                for hh in range(H)
-                            ]
-                            if max(diffs) > 0.02:
-                                dstr = " ".join(f"h{i}={d:.4f}" for i, d in enumerate(diffs))
-                                print(f"    Seq{seq_idx} c{c} gc={gc} tok={cs} rem={sl-c*BT}: {dstr}")
+                print(f"  seq_lens={seq_lens} T={T_total} aligned={aligned}: "
+                      f"max_diff={max_diff:.6f} [{status}]")
+                all_pass = all_pass and (max_diff < 0.02)
 
             except Exception as e:
                 import traceback
                 print(f"  seq_lens={seq_lens}: ERROR - {e}")
                 traceback.print_exc()
+                all_pass = False
+
+        # ----- Cache reuse test (same variant, different data) -----
+        print("\n=== Cache Reuse Test ===")
+        for i in range(3):
+            torch.manual_seed(i * 100)
+            q_cr = torch.randn(B, T, H, K, dtype=dtype, device=device)
+            v_cr = torch.randn(B, T, H, V, dtype=dtype, device=device)
+            g_cr = torch.randn(B, T, H, K, dtype=torch.float32, device=device) * 0.1
+            h_cr = torch.randn(B * NT, H, K, V, dtype=dtype, device=device) * 0.01
+            A_cr = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
+            o_cr = torch.zeros(B, T, H, V, dtype=dtype, device=device)
+            o_ref_cr = reference_chunk_gla_fwd_o(q_cr, v_cr, g_cr, h_cr, A_cr, scale, BT)
+
+            chunk_gla_fwd_o(
+                q=q_cr, v=v_cr, g=g_cr, h=h_cr, o=o_cr, A=A_cr,
+                scale=scale, chunk_size=BT, is_varlen=False,
+            )
+            torch.cuda.synchronize()
+            md = (o_ref_cr.float() - o_cr.float()).abs().max().item()
+            status = "PASS" if md < 0.02 else "FAIL"
+            print(f"  Run {i+1}/3: max_diff={md:.6f} [{status}]")
+            all_pass = all_pass and (md < 0.02)
+
+        print(f"\n{'ALL PASS' if all_pass else 'SOME FAILED'}")
 
     if args.test in ("benchmark", "both"):
         print("\n=== Benchmark ===")
         torch.manual_seed(42)
         for bench_T in [1024, 2048, 4096]:
             bench_NT = (bench_T + BT - 1) // BT
-            q = torch.randn(B, bench_T, H, K, dtype=dtype, device=device)
-            v = torch.randn(B, bench_T, H, V, dtype=dtype, device=device)
-            g = torch.randn(B, bench_T, H, K, dtype=dtype, device=device) * 0.1
-            h = torch.randn(B * bench_NT, H, K, V, dtype=dtype, device=device) * 0.01
-            A = torch.randn(B, bench_T, H, BT, dtype=dtype, device=device) * 0.1
+            q_b = torch.randn(B, bench_T, H, K, dtype=dtype, device=device)
+            v_b = torch.randn(B, bench_T, H, V, dtype=dtype, device=device)
+            g_b = torch.randn(B, bench_T, H, K, dtype=torch.float32, device=device) * 0.1
+            h_b = torch.randn(B * bench_NT, H, K, V, dtype=dtype, device=device) * 0.01
+            A_b = torch.randn(B, bench_T, H, BT, dtype=dtype, device=device) * 0.1
+            o_b = torch.zeros(B, bench_T, H, V, dtype=dtype, device=device)
+
+            # Warmup (also triggers lazy compilation if needed)
+            for _ in range(3):
+                chunk_gla_fwd_o(
+                    q=q_b, v=v_b, g=g_b, h=h_b, o=o_b, A=A_b,
+                    scale=scale, chunk_size=BT, is_varlen=False,
+                )
+            torch.cuda.synchronize()
+
+            # Benchmark
+            N_iters = 100
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(N_iters):
+                chunk_gla_fwd_o(
+                    q=q_b, v=v_b, g=g_b, h=h_b, o=o_b, A=A_b,
+                    scale=scale, chunk_size=BT, is_varlen=False,
+                )
+            end.record()
+            torch.cuda.synchronize()
+            ms = start.elapsed_time(end) / N_iters
+            print(f"  CuTe DSL T={bench_T}: {ms:.3f} ms")
 
             try:
                 sys.path.insert(0, "/ossfs/workspace/flash-linear-attention")
                 from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
                 for _ in range(10):
-                    chunk_gla_fwd_o_gk(q=q, v=v, g=g, A=A, h=h,
+                    chunk_gla_fwd_o_gk(q=q_b, v=v_b, g=g_b, A=A_b, h=h_b,
                                        scale=scale, chunk_size=BT, use_exp2=True)
                 torch.cuda.synchronize()
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                N_iters = 100
                 start.record()
                 for _ in range(N_iters):
-                    chunk_gla_fwd_o_gk(q=q, v=v, g=g, A=A, h=h,
+                    chunk_gla_fwd_o_gk(q=q_b, v=v_b, g=g_b, A=A_b, h=h_b,
                                        scale=scale, chunk_size=BT, use_exp2=True)
                 end.record()
                 torch.cuda.synchronize()
-                ms = start.elapsed_time(end) / N_iters
-                print(f"  Triton T={bench_T}: {ms:.3f} ms")
+                ms_fla = start.elapsed_time(end) / N_iters
+                print(f"  Triton T={bench_T}: {ms_fla:.3f} ms  speedup={ms_fla/ms:.2f}x")
             except Exception as e:
                 print(f"  Triton benchmark failed: {e}")
 
