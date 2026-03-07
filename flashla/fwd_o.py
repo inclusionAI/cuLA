@@ -1431,6 +1431,10 @@ def reference_chunk_gla_fwd_o(q, v, g, h, A, scale, chunk_size=64):
 # Internal cache: maps (is_varlen, persistent, H, K, V, scale, chunk_size) → compiled_fn
 _fwd_o_kernel_cache: dict = {}
 
+# Pre-allocated dummy tensors for non-varlen path (avoid per-call torch.zeros)
+_fwd_o_dummy_cu_seqlens: torch.Tensor = None
+_fwd_o_dummy_chunk_indices: torch.Tensor = None
+
 
 def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size):
     """Compile one ChunkGlaFwdO kernel variant. Returns the compiled TVM-FFI callable.
@@ -1602,9 +1606,15 @@ def chunk_gla_fwd_o(
         total_nt_val = B * NT
         ps = (Int32(B), Int32(T), Int32(H), Int32(K), Int32(V))
         if cu_seqlens is None:
-            cu_seqlens = torch.zeros(2, dtype=torch.int32, device=q.device)
+            global _fwd_o_dummy_cu_seqlens
+            if _fwd_o_dummy_cu_seqlens is None or _fwd_o_dummy_cu_seqlens.device != q.device:
+                _fwd_o_dummy_cu_seqlens = torch.zeros(2, dtype=torch.int32, device=q.device)
+            cu_seqlens = _fwd_o_dummy_cu_seqlens
         if chunk_indices is None:
-            chunk_indices = torch.zeros(2, dtype=torch.int32, device=q.device)
+            global _fwd_o_dummy_chunk_indices
+            if _fwd_o_dummy_chunk_indices is None or _fwd_o_dummy_chunk_indices.device != q.device:
+                _fwd_o_dummy_chunk_indices = torch.zeros(2, dtype=torch.int32, device=q.device)
+            chunk_indices = _fwd_o_dummy_chunk_indices
 
     compiled_fn = _get_compiled_fwd_o(
         is_varlen, persistent, H, K, V, scale, chunk_size,

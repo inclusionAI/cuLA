@@ -1317,6 +1317,11 @@ def reference_bf16_roundtrip(k, w, u, g=None, gk=None, h0=None, chunk_size=64):
 # Internal cache: maps (is_varlen, persistent, H, K, V, chunk_size) → compiled_fn
 _delta_h_kernel_cache: dict = {}
 
+# Pre-allocated dummy tensors for non-varlen path (avoid per-call torch.zeros)
+_dummy_cu_seqlens: torch.Tensor = None
+_dummy_chunk_offsets: torch.Tensor = None
+_dummy_workspace: torch.Tensor = None
+
 
 def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size):
     """Compile one ChunkDeltaRuleFwdH kernel variant. Returns the compiled TVM-FFI callable.
@@ -1531,8 +1536,10 @@ def chunk_delta_rule_fwd_h(
         V = u.shape[2]
         num_seqs = cu_seqlens.shape[0] - 1
         BT = chunk_size
-        total_nt_val = sum((cu_seqlens[i+1].item() - cu_seqlens[i].item() + BT - 1) // BT
-                           for i in range(num_seqs))
+        # h_out is [NT_total, H, K, V] in varlen — read shape (no CUDA sync).
+        # Avoids the old loop that called .item() on each cu_seqlens element,
+        # which caused ~0.6ms of device-host sync overhead per call.
+        total_nt_val = h_out.shape[0]
         ps = (Int32(num_seqs), Int32(T_total), Int32(H), Int32(K), Int32(V))
     else:
         B, T, H, K = k.shape
@@ -1542,12 +1549,21 @@ def chunk_delta_rule_fwd_h(
         total_nt_val = NT
         ps = (Int32(B), Int32(T), Int32(H), Int32(K), Int32(V))
         if cu_seqlens is None:
-            cu_seqlens = torch.zeros(2, dtype=torch.int32, device=k.device)
+            global _dummy_cu_seqlens
+            if _dummy_cu_seqlens is None or _dummy_cu_seqlens.device != k.device:
+                _dummy_cu_seqlens = torch.zeros(2, dtype=torch.int32, device=k.device)
+            cu_seqlens = _dummy_cu_seqlens
         if chunk_offsets is None:
-            chunk_offsets = torch.zeros(2, dtype=torch.int32, device=k.device)
+            global _dummy_chunk_offsets
+            if _dummy_chunk_offsets is None or _dummy_chunk_offsets.device != k.device:
+                _dummy_chunk_offsets = torch.zeros(2, dtype=torch.int32, device=k.device)
+            chunk_offsets = _dummy_chunk_offsets
 
     if workspace is None:
-        workspace = torch.zeros(128, dtype=torch.uint8, device=k.device)
+        global _dummy_workspace
+        if _dummy_workspace is None or _dummy_workspace.device != k.device:
+            _dummy_workspace = torch.zeros(128, dtype=torch.uint8, device=k.device)
+        workspace = _dummy_workspace
 
     compiled_fn = _get_compiled_delta_h(
         is_varlen, persistent, H, K, V, chunk_size,
