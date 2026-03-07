@@ -91,7 +91,7 @@ def benchmark_chunk_intra_uniform(T, provider):
     chunk_size = BT
 
     seq_lens = [T] * B
-    cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64, device=device)
+    cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
     q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(
         B, T, H, D, device, cu_seqlens=cu_seqlens
@@ -154,7 +154,7 @@ def benchmark_chunk_intra_varlen(total_len, provider):
         65536: [0, 652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236, 5543, 6255, 6480, 6947, 7616, 8192],
     }
     T = 8192
-    cu_seqlens = torch.tensor(varlen_traces[total_len], dtype=torch.int64, device=device)
+    cu_seqlens = torch.tensor(varlen_traces[total_len], dtype=torch.int32, device=device)
 
     q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(
         B, T, H, D, device, cu_seqlens=cu_seqlens

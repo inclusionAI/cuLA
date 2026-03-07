@@ -21,7 +21,7 @@ struct KDA_fwd_intra_params {
     void *__restrict__ cu_seqlens_ptr;    //[b + 1]
     void *__restrict__ chunk_indices_ptr; //[(b * t) / chunk_size, 2]
 
-    NaiveTileScheduler::Params tile_scheduler_params;
+    StaticPersistentTileScheduler::Params tile_scheduler_params;
 
     int num_sm;
 };

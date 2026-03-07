@@ -757,15 +757,16 @@ def chunk_kda_fwd_intra(
     BC = 16
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+
     assert cu_seqlens is not None and chunk_indices is not None, "cu_seqlens and chunk_indices must be provided for cuda impl"
+    # NOTE: inside kernel we use int32 for cu_seqlens
+    assert cu_seqlens.dtype == torch.int32 and chunk_indices.dtype == torch.int32, "cu_seqlens and chunk_indices must be int32 for cuda impl"
+
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     NC = triton.cdiv(BT, BC)
 
     Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
-    # Akk must be zero-initialized - kernel only writes lower triangular
-    Akk = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
-    # Separate fp32 buffer for diagonal 16x16 blocks (for precision in solve_tril)
-    Akkd = torch.empty(B, T, H, BC, device=k.device, dtype=torch.float32)
+    Akk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
 
     tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
     flashla_cuda.chunk_kda_fwd_intra_cuda(

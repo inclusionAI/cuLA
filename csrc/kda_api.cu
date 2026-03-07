@@ -38,7 +38,7 @@ void ChunkKDAFwdIntra(
     // printf("tile_num: %d, b: %d, h: %d\n", tile_num, params.b, params.h);
     auto device_prop = at::cuda::getCurrentDeviceProperties();
     params.num_sm = device_prop->multiProcessorCount;
-    params.tile_scheduler_params = NaiveTileScheduler::Params{tile_num, params.h, 4, params.num_sm, (int*)tile_counter.data_ptr()};
+    params.tile_scheduler_params = StaticPersistentTileScheduler::Params{tile_num, params.h, 4, params.num_sm, (int*)tile_counter.data_ptr()};
 
     sm100::run_kda_fwd_intra_sm100(params, at::cuda::getCurrentCUDAStream());
 }
