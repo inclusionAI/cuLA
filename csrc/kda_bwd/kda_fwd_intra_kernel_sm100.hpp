@@ -52,11 +52,9 @@ struct KdaChunkFwdIntraKernelSm100 {
     using PipelineK              = typename Mainloop::PipelineK;
     using PipelineG              = typename Mainloop::PipelineG;
     using PipelineBeta           = typename Mainloop::PipelineBeta;
-    using PipelineQKGAllReady    = typename Mainloop::PipelineQKGAllReady;
-    using PipelineKTGInterReady  = typename Mainloop::PipelineKTGInterReady;
-    using PipelineKTGIntraReady  = typename Mainloop::PipelineKTGIntraReady;
+    using PipelineQKGInterReady    = typename Mainloop::PipelineQKGInterReady;
+    using PipelineQKGIntraReady  = typename Mainloop::PipelineQKGIntraReady;
     using PipelineQKDone         = typename Mainloop::PipelineQKDone;
-    using PipelineKKDone         = typename Mainloop::PipelineKKDone;
     using PipelineKKInvReady     = typename Mainloop::PipelineKKInvReady;
 
     // Pipeline state types
@@ -64,11 +62,9 @@ struct KdaChunkFwdIntraKernelSm100 {
     using PipelineStateK         = typename Mainloop::PipelineStateK;
     using PipelineStateG         = typename Mainloop::PipelineStateG;
     using PipelineStateBeta      = typename Mainloop::PipelineStateBeta;
-    using PipelineStateQKGAll    = typename Mainloop::PipelineStateQKGAll;
-    using PipelineStateKTGInter  = typename Mainloop::PipelineStateKTGInter;
-    using PipelineStateKTGIntra  = typename Mainloop::PipelineStateKTGIntra;
+    using PipelineStateQKGInter  = typename Mainloop::PipelineStateQKGInter;
+    using PipelineStateQKGIntra  = typename Mainloop::PipelineStateQKGIntra;
     using PipelineStateQKDone    = typename Mainloop::PipelineStateQKDone;
-    using PipelineStateKKDone    = typename Mainloop::PipelineStateKKDone;
     using PipelineStateKKInv     = typename Mainloop::PipelineStateKKInv;
 
     // Constants forwarded from Mainloop
@@ -177,26 +173,20 @@ struct KdaChunkFwdIntraKernelSm100 {
         }
 
         // === CE -> MMA pipelines ===
-        typename PipelineQKGAllReady::Params qkg_all_pipe_params;
-        qkg_all_pipe_params.producer_arv_count = NUM_CE_THREADS;
-        qkg_all_pipe_params.consumer_arv_count = NUM_MMA_THREADS;
+        typename PipelineQKGInterReady::Params qkg_inter_pipe_params;
+        qkg_inter_pipe_params.producer_arv_count = NUM_CE_THREADS;
+        qkg_inter_pipe_params.consumer_arv_count = NUM_MMA_THREADS;
 
-        typename PipelineKTGInterReady::Params ktg_inter_pipe_params;
-        ktg_inter_pipe_params.producer_arv_count = NUM_CE_THREADS;
-        ktg_inter_pipe_params.consumer_arv_count = NUM_MMA_THREADS;
-
-        typename PipelineKTGIntraReady::Params ktg_intra_pipe_params;
-        ktg_intra_pipe_params.producer_arv_count = NUM_CE_THREADS;
-        ktg_intra_pipe_params.consumer_arv_count = NUM_MMA_THREADS;
+        typename PipelineQKGIntraReady::Params qkg_intra_pipe_params;
+        qkg_intra_pipe_params.producer_arv_count = NUM_CE_THREADS;
+        qkg_intra_pipe_params.consumer_arv_count = NUM_MMA_THREADS;
 
         if (role == WarpRole::ComputeEpilogue) {
-            qkg_all_pipe_params.role   = PipelineQKGAllReady::ThreadCategory::Producer;
-            ktg_inter_pipe_params.role = PipelineKTGInterReady::ThreadCategory::Producer;
-            ktg_intra_pipe_params.role = PipelineKTGIntraReady::ThreadCategory::Producer;
+            qkg_inter_pipe_params.role   = PipelineQKGInterReady::ThreadCategory::Producer;
+            qkg_intra_pipe_params.role = PipelineQKGIntraReady::ThreadCategory::Producer;
         } else if (role == WarpRole::Mma) {
-            qkg_all_pipe_params.role   = PipelineQKGAllReady::ThreadCategory::Consumer;
-            ktg_inter_pipe_params.role = PipelineKTGInterReady::ThreadCategory::Consumer;
-            ktg_intra_pipe_params.role = PipelineKTGIntraReady::ThreadCategory::Consumer;
+            qkg_inter_pipe_params.role   = PipelineQKGInterReady::ThreadCategory::Consumer;
+            qkg_intra_pipe_params.role = PipelineQKGIntraReady::ThreadCategory::Consumer;
         }
 
         // === MMA -> CE pipelines (UMMA) ===
@@ -204,16 +194,10 @@ struct KdaChunkFwdIntraKernelSm100 {
         qk_done_pipe_params.producer_arv_count = NUM_MMA_THREADS;
         qk_done_pipe_params.consumer_arv_count = NUM_CE_THREADS;
 
-        typename PipelineKKDone::Params kk_done_pipe_params;
-        kk_done_pipe_params.producer_arv_count = NUM_MMA_THREADS;
-        kk_done_pipe_params.consumer_arv_count = NUM_CE_THREADS;
-
         if (role == WarpRole::Mma) {
             qk_done_pipe_params.role = PipelineQKDone::ThreadCategory::Producer;
-            kk_done_pipe_params.role = PipelineKKDone::ThreadCategory::Producer;
         } else if (role == WarpRole::ComputeEpilogue) {
             qk_done_pipe_params.role = PipelineQKDone::ThreadCategory::Consumer;
-            kk_done_pipe_params.role = PipelineKKDone::ThreadCategory::Consumer;
         }
 
         // === CE -> Inverse pipeline ===
@@ -233,16 +217,14 @@ struct KdaChunkFwdIntraKernelSm100 {
         PipelineK   k_pipeline(shared_plan->pipe_k_storage, k_pipe_params, ClusterShape{});
         PipelineG   g_pipeline(shared_plan->pipe_g_storage, g_pipe_params, ClusterShape{});
 
-        PipelineBeta beta_pipeline(shared_plan->pipe_beta_storage, beta_pipe_params, cute::true_type{});
+        PipelineBeta beta_pipeline(shared_plan->pipe_beta_storage, beta_pipe_params, /*InitBarriers*/cute::true_type{});
 
-        PipelineQKGAllReady   qkg_all_pipeline(shared_plan->pipe_qkg_all_storage, qkg_all_pipe_params, cute::true_type{});
-        PipelineKTGInterReady ktg_inter_pipeline(shared_plan->pipe_ktg_inter_storage, ktg_inter_pipe_params, cute::true_type{});
-        PipelineKTGIntraReady ktg_intra_pipeline(shared_plan->pipe_ktg_intra_storage, ktg_intra_pipe_params, cute::true_type{});
+        PipelineQKGInterReady   qkg_inter_pipeline(shared_plan->pipe_qkg_inter_storage, qkg_inter_pipe_params, /*InitBarriers*/cute::true_type{});
+        PipelineQKGIntraReady qkg_intra_pipeline(shared_plan->pipe_qkg_intra_storage, qkg_intra_pipe_params, /*InitBarriers*/cute::true_type{});
 
-        PipelineQKDone qk_done_pipeline(shared_plan->pipe_qk_done_storage, qk_done_pipe_params, ClusterShape{});
-        PipelineKKDone kk_done_pipeline(shared_plan->pipe_kk_done_storage, kk_done_pipe_params, ClusterShape{});
+        PipelineQKDone qk_done_pipeline(shared_plan->pipe_qk_done_storage, qk_done_pipe_params, /*InitBarriers*/cute::true_type{});
 
-        PipelineKKInvReady kk_inv_pipeline(shared_plan->pipe_kk_inv_storage, kk_inv_pipe_params, cute::true_type{});
+        PipelineKKInvReady kk_inv_pipeline(shared_plan->pipe_kk_inv_storage, kk_inv_pipe_params, /*InitBarriers*/cute::true_type{});
 
         // ---------------------------------------------------------------
         // Initialize pipeline states
@@ -257,17 +239,13 @@ struct KdaChunkFwdIntraKernelSm100 {
         PipelineStateBeta beta_pipe_state_read;
         PipelineStateBeta beta_pipe_state_write = cutlass::make_producer_start_state<PipelineBeta>();
 
-        PipelineStateQKGAll   qkg_all_pipe_state_read;
-        PipelineStateQKGAll   qkg_all_pipe_state_write = cutlass::make_producer_start_state<PipelineQKGAllReady>();
-        PipelineStateKTGInter ktg_inter_pipe_state_read;
-        PipelineStateKTGInter ktg_inter_pipe_state_write = cutlass::make_producer_start_state<PipelineKTGInterReady>();
-        PipelineStateKTGIntra ktg_intra_pipe_state_read;
-        PipelineStateKTGIntra ktg_intra_pipe_state_write = cutlass::make_producer_start_state<PipelineKTGIntraReady>();
+        PipelineStateQKGInter   qkg_inter_pipe_state_read;
+        PipelineStateQKGInter   qkg_inter_pipe_state_write = cutlass::make_producer_start_state<PipelineQKGInterReady>();
+        PipelineStateQKGIntra qkg_intra_pipe_state_read;
+        PipelineStateQKGIntra qkg_intra_pipe_state_write = cutlass::make_producer_start_state<PipelineQKGIntraReady>();
 
         PipelineStateQKDone qk_done_pipe_state_read;
         PipelineStateQKDone qk_done_pipe_state_write = cutlass::make_producer_start_state<PipelineQKDone>();
-        PipelineStateKKDone kk_done_pipe_state_read;
-        PipelineStateKKDone kk_done_pipe_state_write = cutlass::make_producer_start_state<PipelineKKDone>();
 
         PipelineStateKKInv kk_inv_pipe_state_read;
         PipelineStateKKInv kk_inv_pipe_state_write = cutlass::make_producer_start_state<PipelineKKInvReady>();
@@ -291,11 +269,9 @@ struct KdaChunkFwdIntraKernelSm100 {
                 q_pipeline, q_pipe_state_read,
                 k_pipeline, k_pipe_state_read,
                 g_pipeline, g_pipe_state_read,
-                qkg_all_pipeline, qkg_all_pipe_state_write,
-                ktg_inter_pipeline, ktg_inter_pipe_state_write,
-                ktg_intra_pipeline, ktg_intra_pipe_state_write,
+                qkg_inter_pipeline, qkg_inter_pipe_state_write,
+                qkg_intra_pipeline, qkg_intra_pipe_state_write,
                 qk_done_pipeline, qk_done_pipe_state_read,
-                kk_done_pipeline, kk_done_pipe_state_read,
                 beta_pipeline, beta_pipe_state_read,
                 kk_inv_pipeline, kk_inv_pipe_state_write,
                 chunk_indices_ptr, cu_len_ptr, total_tiles
@@ -305,11 +281,9 @@ struct KdaChunkFwdIntraKernelSm100 {
             cutlass::arch::warpgroup_reg_dealloc<REG_LOAD>();
             mainloop.mma_loop(
                 params, tma_params, shared_plan, tile_scheduler,
-                qkg_all_pipeline, qkg_all_pipe_state_read,
-                ktg_inter_pipeline, ktg_inter_pipe_state_read,
-                ktg_intra_pipeline, ktg_intra_pipe_state_read,
+                qkg_inter_pipeline, qkg_inter_pipe_state_read,
+                qkg_intra_pipeline, qkg_intra_pipe_state_read,
                 qk_done_pipeline, qk_done_pipe_state_write,
-                kk_done_pipeline, kk_done_pipe_state_write,
                 chunk_indices_ptr, cu_len_ptr, total_tiles
             );
 

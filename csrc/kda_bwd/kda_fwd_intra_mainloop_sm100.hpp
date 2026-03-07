@@ -47,6 +47,11 @@ struct KdaChunkFwdIntraMainloopSm100 {
     static constexpr int NUM_EMPTY_THREADS   = 64;  // warp 14-15
     // static constexpr int NUM_TILE_CONSUMERS  = NUM_CE_THREADS + NUM_INVERSE_THREADS + NUM_MMA_THREADS + NUM_EMPTY_THREADS;
 
+    // TODO: allocate TMEM
+    enum class TmemAllocation : uint32_t {
+        Q = 0
+    };
+
     using ClusterShape = Shape<_1, _1, _1>;
     using TileScheduler = StaticPersistentTileScheduler;
 
@@ -98,12 +103,11 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
     using PipelineBeta = cutlass::PipelineAsync<2>;
 
-    using PipelineQKGAllReady   = cutlass::PipelineAsync<1>;
-    using PipelineKTGInterReady = cutlass::PipelineAsync<1>;
-    using PipelineKTGIntraReady = cutlass::PipelineAsync<1>;
+    // TODO: update to PipelineUmmaConsumerAsync after finishing umma
+    using PipelineQKGInterReady = cutlass::PipelineAsync<1>;
+    using PipelineQKGIntraReady = cutlass::PipelineAsync<1>;
 
-    using PipelineQKDone = cutlass::PipelineUmmaAsync<1>;
-    using PipelineKKDone = cutlass::PipelineUmmaAsync<1>;
+    using PipelineQKDone = cutlass::PipelineAsync<1>;
 
     using PipelineKKInvReady = cutlass::PipelineAsync<1>;
 
@@ -130,12 +134,10 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
         alignas(16) typename PipelineBeta::SharedStorage pipe_beta_storage;
 
-        alignas(16) typename PipelineQKGAllReady::SharedStorage pipe_qkg_all_storage;
-        alignas(16) typename PipelineKTGInterReady::SharedStorage pipe_ktg_inter_storage;
-        alignas(16) typename PipelineKTGIntraReady::SharedStorage pipe_ktg_intra_storage;
+        alignas(16) typename PipelineQKGInterReady::SharedStorage pipe_qkg_inter_storage;
+        alignas(16) typename PipelineQKGIntraReady::SharedStorage pipe_qkg_intra_storage;
 
         alignas(16) typename PipelineQKDone::SharedStorage pipe_qk_done_storage;
-        alignas(16) typename PipelineKKDone::SharedStorage pipe_kk_done_storage;
 
         alignas(16) typename PipelineKKInvReady::SharedStorage pipe_kk_inv_storage;
 
@@ -161,11 +163,9 @@ struct KdaChunkFwdIntraMainloopSm100 {
     using PipelineStateK        = cutlass::PipelineState<PipelineK::Stages>;
     using PipelineStateG        = cutlass::PipelineState<PipelineG::Stages>;
     using PipelineStateBeta     = cutlass::PipelineState<PipelineBeta::Stages>;
-    using PipelineStateQKGAll   = cutlass::PipelineState<PipelineQKGAllReady::Stages>;
-    using PipelineStateKTGInter = cutlass::PipelineState<PipelineKTGInterReady::Stages>;
-    using PipelineStateKTGIntra = cutlass::PipelineState<PipelineKTGIntraReady::Stages>;
+    using PipelineStateQKGInter = cutlass::PipelineState<PipelineQKGInterReady::Stages>;
+    using PipelineStateQKGIntra = cutlass::PipelineState<PipelineQKGIntraReady::Stages>;
     using PipelineStateQKDone   = cutlass::PipelineState<PipelineQKDone::Stages>;
-    using PipelineStateKKDone   = cutlass::PipelineState<PipelineKKDone::Stages>;
     using PipelineStateKKInv    = cutlass::PipelineState<PipelineKKInvReady::Stages>;
 
     // ===================================================================
@@ -182,12 +182,10 @@ struct KdaChunkFwdIntraMainloopSm100 {
         PipelineK &k_pipeline, PipelineStateK &k_pipe_state_read,
         PipelineG &g_pipeline, PipelineStateG &g_pipe_state_read,
         // CE -> MMA pipelines (producer)
-        PipelineQKGAllReady   &qkg_all_pipeline,   PipelineStateQKGAll   &qkg_all_pipe_state_write,
-        PipelineKTGInterReady &ktg_inter_pipeline,  PipelineStateKTGInter &ktg_inter_pipe_state_write,
-        PipelineKTGIntraReady &ktg_intra_pipeline,  PipelineStateKTGIntra &ktg_intra_pipe_state_write,
+        PipelineQKGInterReady   &qkg_inter_pipeline,   PipelineStateQKGInter   &qkg_inter_pipe_state_write,
+        PipelineQKGIntraReady &qkg_intra_pipeline,  PipelineStateQKGIntra &qkg_intra_pipe_state_write,
         // MMA -> CE pipelines (consumer)
         PipelineQKDone &qk_done_pipeline, PipelineStateQKDone &qk_done_pipe_state_read,
-        PipelineKKDone &kk_done_pipeline, PipelineStateKKDone &kk_done_pipe_state_read,
         // Beta pipeline (consumer)
         PipelineBeta &beta_pipeline, PipelineStateBeta &beta_pipe_state_read,
         // CE -> Inverse pipeline (producer)
@@ -210,9 +208,31 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 g_pipeline.consumer_wait(g_pipe_state_read);
                 k_pipeline.consumer_wait(k_pipe_state_read);
                 q_pipeline.consumer_wait(q_pipe_state_read);
-
+                
+                // TODO: use the same gn for inter/intra, avoid recompute
                 // TODO: compute prologue
+                // compute qg_inter, kg_inter, kg_inter fused
+                
+                qkg_inter_pipeline.producer_acquire(qkg_inter_pipe_state_write);
+                // R2T qg_inter, kg_inter, tmem store fence
 
+                // R2S kg_inter
+                // notify MMA qkg and kg_inter ready
+                fence_view_async_shared();
+                qkg_inter_pipeline.producer_commit(qkg_inter_pipe_state_write);
+                ++qkg_inter_pipe_state_write;
+
+                // compute qg_intra, kg_intra, ktg_intra fused
+                qkg_intra_pipeline.producer_acquire(qkg_intra_pipe_state_write);
+                // R2T qg_intra, kg_intra
+
+                // R2S kg_intra
+                // notify MMA kg_intra ready
+                fence_view_async_shared();
+                qkg_intra_pipeline.producer_commit(qkg_intra_pipe_state_write);
+                ++qkg_intra_pipe_state_write;
+
+                // release q,k,g smem, notify TMA load
                 g_pipeline.consumer_release(g_pipe_state_read);
                 ++g_pipe_state_read;
                 k_pipeline.consumer_release(k_pipe_state_read);
@@ -220,7 +240,10 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 q_pipeline.consumer_release(q_pipe_state_read);
                 ++q_pipe_state_read;
             }
-            // TODO: wait for MMA ready
+            // TODO: wait for MMA ready, fence tmem load
+            qk_done_pipeline.consumer_wait(qk_done_pipe_state_read);
+
+            // T2R kk
 
             // TODO: kk epilogue and notify KK inverse
             beta_pipeline.consumer_wait(beta_pipe_state_read);
@@ -235,7 +258,12 @@ struct KdaChunkFwdIntraMainloopSm100 {
             beta_pipeline.consumer_release(beta_pipe_state_read);
             ++beta_pipe_state_read;
 
+            // T2R qk and notify tmem read finished
+            qk_done_pipeline.consumer_release(qk_done_pipe_state_read);
+            ++qk_done_pipe_state_read;
+
             // TODO: qk epilogue and R2G qk
+
         }
     }
 
@@ -249,12 +277,10 @@ struct KdaChunkFwdIntraMainloopSm100 {
         SharedMemoryPlan *shared_plan,
         TileScheduler &tile_scheduler,
         // CE -> MMA pipelines (consumer)
-        PipelineQKGAllReady   &qkg_all_pipeline,   PipelineStateQKGAll   &qkg_all_pipe_state_read,
-        PipelineKTGInterReady &ktg_inter_pipeline,  PipelineStateKTGInter &ktg_inter_pipe_state_read,
-        PipelineKTGIntraReady &ktg_intra_pipeline,  PipelineStateKTGIntra &ktg_intra_pipe_state_read,
+        PipelineQKGInterReady &qkg_inter_pipeline,  PipelineStateQKGInter &qkg_inter_pipe_state_read,
+        PipelineQKGIntraReady &qkg_intra_pipeline,  PipelineStateQKGIntra &qkg_intra_pipe_state_read,
         // MMA -> CE pipelines (producer)
         PipelineQKDone &qk_done_pipeline, PipelineStateQKDone &qk_done_pipe_state_write,
-        PipelineKKDone &kk_done_pipeline, PipelineStateKKDone &kk_done_pipe_state_write,
         // Tile decode helpers
         int *chunk_indices_ptr, int *cu_len_ptr, int total_tiles)
     {
@@ -271,8 +297,26 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
                 // TODO: MMA computation body
                 for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
+                    qkg_inter_pipeline.consumer_wait(qkg_inter_pipe_state_read);
+                    
+                    // TODO: qkg inter MMA
 
+                    qkg_inter_pipeline.consumer_release(qkg_inter_pipe_state_read);
+                    ++qkg_inter_pipe_state_read;
+
+                    // TODO: tcgen05 thread sync
+
+                    qkg_intra_pipeline.consumer_wait(qkg_intra_pipe_state_read);
+
+                    // TODO: qkg intra MMA
+
+                    qkg_intra_pipeline.consumer_release(qkg_intra_pipe_state_read);
+                    ++qkg_intra_pipe_state_read;
                 }
+                // notify MMA finished to CE
+                qk_done_pipeline.producer_acquire(qk_done_pipe_state_write);
+                qk_done_pipeline.producer_commit(qk_done_pipe_state_write);
+                ++qk_done_pipe_state_write;
             }
         }
     }
