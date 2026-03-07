@@ -254,7 +254,7 @@ constexpr int NUM_LOAD_THREADS    = 1;   // elect_one in warp 13
 constexpr int NUM_EMPTY_THREADS   = 64;  // warp 14-15
 
 // Total consumer threads for tile pipeline = CE + Inverse + MMA + Empty
-constexpr int NUM_TILE_CONSUMERS  = NUM_CE_THREADS + NUM_INVERSE_THREADS + NUM_MMA_THREADS + NUM_EMPTY_THREADS;
+// constexpr int NUM_TILE_CONSUMERS  = NUM_CE_THREADS + NUM_INVERSE_THREADS + NUM_MMA_THREADS + NUM_EMPTY_THREADS;
 
 using ClusterShape = Shape<_1, _1, _1>;
 

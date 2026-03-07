@@ -45,7 +45,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
     static constexpr int NUM_MMA_THREADS     = 1;   // elect_one in warp 12
     static constexpr int NUM_LOAD_THREADS    = 1;   // elect_one in warp 13
     static constexpr int NUM_EMPTY_THREADS   = 64;  // warp 14-15
-    static constexpr int NUM_TILE_CONSUMERS  = NUM_CE_THREADS + NUM_INVERSE_THREADS + NUM_MMA_THREADS + NUM_EMPTY_THREADS;
+    // static constexpr int NUM_TILE_CONSUMERS  = NUM_CE_THREADS + NUM_INVERSE_THREADS + NUM_MMA_THREADS + NUM_EMPTY_THREADS;
 
     using ClusterShape = Shape<_1, _1, _1>;
     using TileScheduler = StaticPersistentTileScheduler;
@@ -91,6 +91,22 @@ struct KdaChunkFwdIntraMainloopSm100 {
         Shape<Int<T_TILE>, Int<T_TILE>>{}
     ));
 
+    // ===================== Pipeline Types =====================
+    using PipelineQ = cutlass::PipelineTmaAsync<NUM_BUF_VALUE>;
+    using PipelineK = cutlass::PipelineTmaAsync<NUM_BUF_VALUE>;
+    using PipelineG = cutlass::PipelineTmaAsync<NUM_BUF_VALUE>;
+
+    using PipelineBeta = cutlass::PipelineAsync<2>;
+
+    using PipelineQKGAllReady   = cutlass::PipelineAsync<1>;
+    using PipelineKTGInterReady = cutlass::PipelineAsync<1>;
+    using PipelineKTGIntraReady = cutlass::PipelineAsync<1>;
+
+    using PipelineQKDone = cutlass::PipelineUmmaAsync<1>;
+    using PipelineKKDone = cutlass::PipelineUmmaAsync<1>;
+
+    using PipelineKKInvReady = cutlass::PipelineAsync<1>;
+
     // ===================== Shared Memory Plan =====================
     struct SharedMemoryPlan {
         // Q, K, G double buffer
@@ -108,20 +124,20 @@ struct KdaChunkFwdIntraMainloopSm100 {
         array_aligned<fp16, cosize_v<SmemLayoutOutputFP16>> kk[NUM_BUF_A];
 
         // ---- Pipeline shared storage ----
-        alignas(16) typename cutlass::PipelineTmaAsync<NUM_BUF_VALUE>::SharedStorage pipe_q_storage;
-        alignas(16) typename cutlass::PipelineTmaAsync<NUM_BUF_VALUE>::SharedStorage pipe_k_storage;
-        alignas(16) typename cutlass::PipelineTmaAsync<NUM_BUF_VALUE>::SharedStorage pipe_g_storage;
+        alignas(16) typename PipelineQ::SharedStorage pipe_q_storage;
+        alignas(16) typename PipelineK::SharedStorage pipe_k_storage;
+        alignas(16) typename PipelineG::SharedStorage pipe_g_storage;
 
-        alignas(16) typename cutlass::PipelineAsync<2>::SharedStorage          pipe_beta_storage;
+        alignas(16) typename PipelineBeta::SharedStorage pipe_beta_storage;
 
-        alignas(16) typename cutlass::PipelineAsync<1>::SharedStorage pipe_qkg_all_storage;
-        alignas(16) typename cutlass::PipelineAsync<1>::SharedStorage pipe_ktg_inter_storage;
-        alignas(16) typename cutlass::PipelineAsync<1>::SharedStorage pipe_ktg_intra_storage;
+        alignas(16) typename PipelineQKGAllReady::SharedStorage pipe_qkg_all_storage;
+        alignas(16) typename PipelineKTGInterReady::SharedStorage pipe_ktg_inter_storage;
+        alignas(16) typename PipelineKTGIntraReady::SharedStorage pipe_ktg_intra_storage;
 
-        alignas(16) typename cutlass::PipelineAsync<1>::SharedStorage pipe_qk_done_storage;
-        alignas(16) typename cutlass::PipelineAsync<1>::SharedStorage pipe_kk_done_storage;
+        alignas(16) typename PipelineQKDone::SharedStorage pipe_qk_done_storage;
+        alignas(16) typename PipelineKKDone::SharedStorage pipe_kk_done_storage;
 
-        alignas(16) typename cutlass::PipelineAsync<1>::SharedStorage pipe_kk_inv_storage;
+        alignas(16) typename PipelineKKInvReady::SharedStorage pipe_kk_inv_storage;
 
         alignas(16) float beta_smem[2][T_TILE];
         array_aligned<uint32_t, 1> tmem_start_addr;
@@ -139,22 +155,6 @@ struct KdaChunkFwdIntraMainloopSm100 {
         TMA_K tma_k;
         TMA_G tma_g;
     };
-
-    // ===================== Pipeline Types =====================
-    using PipelineQ = cutlass::PipelineTmaAsync<NUM_BUF_VALUE>;
-    using PipelineK = cutlass::PipelineTmaAsync<NUM_BUF_VALUE>;
-    using PipelineG = cutlass::PipelineTmaAsync<NUM_BUF_VALUE>;
-
-    using PipelineBeta = cutlass::PipelineAsync<2>;
-
-    using PipelineQKGAllReady   = cutlass::PipelineAsync<1>;
-    using PipelineKTGInterReady = cutlass::PipelineAsync<1>;
-    using PipelineKTGIntraReady = cutlass::PipelineAsync<1>;
-
-    using PipelineQKDone = cutlass::PipelineUmmaAsync<1>;
-    using PipelineKKDone = cutlass::PipelineUmmaAsync<1>;
-
-    using PipelineKKInvReady = cutlass::PipelineAsync<1>;
 
     // ===================== Pipeline State Types =====================
     using PipelineStateQ        = cutlass::PipelineState<PipelineQ::Stages>;
@@ -206,10 +206,36 @@ struct KdaChunkFwdIntraMainloopSm100 {
             int tile_idx  = get<2>(blk_coord);
 
             // TODO: CE computation body
+            for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
+                g_pipeline.consumer_wait(g_pipe_state_read);
+                k_pipeline.consumer_wait(k_pipe_state_read);
+                q_pipeline.consumer_wait(q_pipe_state_read);
+
+                // TODO: compute prologue
+
+                g_pipeline.consumer_release(g_pipe_state_read);
+                ++g_pipe_state_read;
+                k_pipeline.consumer_release(k_pipe_state_read);
+                ++k_pipe_state_read;
+                q_pipeline.consumer_release(q_pipe_state_read);
+                ++q_pipe_state_read;
+            }
+            // TODO: wait for MMA ready
+
+            // TODO: kk epilogue and notify KK inverse
             beta_pipeline.consumer_wait(beta_pipe_state_read);
+            fence_view_async_shared();
+
+            kk_inv_pipeline.producer_acquire(kk_inv_pipe_state_write);
+
+            fence_view_async_shared();
+            kk_inv_pipeline.producer_commit(kk_inv_pipe_state_write);
+            ++kk_inv_pipe_state_write;
 
             beta_pipeline.consumer_release(beta_pipe_state_read);
             ++beta_pipe_state_read;
+
+            // TODO: qk epilogue and R2G qk
         }
     }
 
@@ -244,6 +270,9 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 int tile_idx  = get<2>(blk_coord);
 
                 // TODO: MMA computation body
+                for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
+
+                }
             }
         }
     }
@@ -275,8 +304,41 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 int batch_idx    = get<0>(blk_coord);
                 int head_idx     = get<1>(blk_coord);
                 int tile_idx     = get<2>(blk_coord);
+                int token_offset = cu_len_ptr[batch_idx];
+                int seq_len = cu_len_ptr[batch_idx + 1] - cu_len_ptr[batch_idx];
+                int sub_seq_len = min(T_TILE, seq_len - tile_idx * T_TILE);
 
-                // TODO: TMA load body (Q, K, G)
+                // TMA load body (Q, K, G)
+                for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
+                    Tensor sQ = make_tensor(make_smem_ptr(
+                        shared_plan->q[q_pipe_state_write.index()].data()
+                    ), SmemLayoutInputBF16{});
+                    Tensor sK = make_tensor(make_smem_ptr(
+                        shared_plan->k[k_pipe_state_write.index()].data()
+                    ), SmemLayoutInputBF16{});
+                    Tensor sG = make_tensor(make_smem_ptr(
+                        shared_plan->g[g_pipe_state_write.index()].data()
+                    ), SmemLayoutInputFP32{});
+
+                    Tensor mQ = domain_offset(make_coord(token_offset, _0{}, _0{}), tma_params.tma_q.get_tma_tensor(tma_params.shape_qkg));
+                    Tensor mK = domain_offset(make_coord(token_offset, _0{}, _0{}), tma_params.tma_k.get_tma_tensor(tma_params.shape_qkg));
+                    Tensor mG = domain_offset(make_coord(token_offset, _0{}, _0{}), tma_params.tma_g.get_tma_tensor(tma_params.shape_qkg));
+
+                    Tensor gK = local_tile(mK(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
+                    Tensor gG = local_tile(mG(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
+                    Tensor gQ = local_tile(mQ(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
+                    
+                    g_pipeline.producer_acquire(g_pipe_state_write);
+                    launch_tma_copy(tma_params.tma_g, gG, sG, *g_pipeline.producer_get_barrier(g_pipe_state_write));
+                    ++g_pipe_state_write;
+                    k_pipeline.producer_acquire(k_pipe_state_write);
+                    launch_tma_copy(tma_params.tma_k, gK, sK, *k_pipeline.producer_get_barrier(k_pipe_state_write));
+                    ++k_pipe_state_write;
+                    q_pipeline.producer_acquire(q_pipe_state_write);
+                    launch_tma_copy(tma_params.tma_q, gQ, sQ, *q_pipeline.producer_get_barrier(q_pipe_state_write));
+                    ++q_pipe_state_write;
+
+                }
             }
         }
     }
@@ -307,6 +369,11 @@ struct KdaChunkFwdIntraMainloopSm100 {
             int tile_idx  = get<2>(blk_coord);
 
             // TODO: Inverse computation body
+            kk_inv_pipeline.consumer_wait(kk_inv_pipe_state_read);
+            fence_view_async_shared();
+
+            kk_inv_pipeline.consumer_release(kk_inv_pipe_state_read);
+            ++kk_inv_pipe_state_read;
         }
     }
 
@@ -339,7 +406,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
             int seq_len = cu_len_ptr[batch_idx + 1] - cu_len_ptr[batch_idx];
             int sub_seq_len = min(T_TILE, seq_len - tile_idx * T_TILE);
 
-            // TODO: Beta loading body
+            // Beta loading body
             beta_pipeline.producer_acquire(beta_pipe_state_write);
             if (empty_idx < T_TILE) {
                 shared_plan->beta_smem[beta_pipe_state_write.index()][empty_idx] = (empty_idx < sub_seq_len)
