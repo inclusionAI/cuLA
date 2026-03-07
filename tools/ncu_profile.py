@@ -8,12 +8,17 @@ Usage:
   # Profile both ours + FLA:
   ncu -o kda_report --set full --launch-count 2 python ncu_profile.py
 """
+import sys
+import pathlib
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
 import torch
 import numpy as np
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
-from chunk_delta_h import ChunkDeltaRuleFwdH
+from flashla.chunk_delta_h import ChunkDeltaRuleFwdH
 
 # ---------- Config ----------
 # Varlen scenario: 20 seqs, total 8192 tokens

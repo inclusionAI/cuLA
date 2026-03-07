@@ -11,12 +11,17 @@ import time
 import numpy as np
 import torch
 
+import sys
+import pathlib
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
-from chunk_delta_h import ChunkDeltaRuleFwdH
+from flashla.chunk_delta_h import ChunkDeltaRuleFwdH
 
 
 def generate_seq_lens(num_seqs, total_T, ratio, seed=42):

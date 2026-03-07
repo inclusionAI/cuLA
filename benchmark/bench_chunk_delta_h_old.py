@@ -15,12 +15,17 @@ import time
 import torch
 import triton
 
+import sys
+import pathlib
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
-from chunk_delta_h import ChunkDeltaRuleFwdH
+from flashla.chunk_delta_h import ChunkDeltaRuleFwdH
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as fla_fwd_h
 
 

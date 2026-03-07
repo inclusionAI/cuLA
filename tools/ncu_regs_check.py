@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Quick NCU check: does changing num_regs_cuda actually affect launch register count?"""
 
+import sys
+import pathlib
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
 import numpy as np
 import torch
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
-from chunk_delta_h import ChunkDeltaRuleFwdH
+from flashla.chunk_delta_h import ChunkDeltaRuleFwdH
 
 num_seqs, total_T, H, K, V, BT = 20, 8192, 64, 128, 128, 64
 device, dtype = "cuda", torch.bfloat16

@@ -4,12 +4,13 @@
 import os
 import sys
 import time
+import pathlib
 
 # Avoid torch import issues
 os.environ['LD_LIBRARY_PATH'] = '/usr/local/lib:/usr/lib/x86_64-linux-gnu'
 
 import torch
-sys.path.insert(0, '/ossfs/workspace/flashla')
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from flashla.kda import KDAChunkwise
 from fla.modules.l2norm import l2norm_fwd

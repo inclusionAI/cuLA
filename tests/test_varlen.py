@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Test varlen support for ChunkDeltaRuleFwdH."""
 
+import sys
+import pathlib
 import torch
 import time
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
-from chunk_delta_h import ChunkDeltaRuleFwdH, reference_bf16_roundtrip
+from flashla.chunk_delta_h import ChunkDeltaRuleFwdH, reference_bf16_roundtrip
 
 
 def make_varlen_data(seq_lens, H, K, V, BT, device="cuda", dtype=torch.bfloat16):
