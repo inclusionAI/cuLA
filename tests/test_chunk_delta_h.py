@@ -24,7 +24,7 @@ _spec = importlib.util.spec_from_file_location(
     "chunk_delta_h", os.path.join(os.path.dirname(__file__), "..", "flashla", "chunk_delta_h.py"))
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
-chunk_delta_rule_fwd_h = _mod.chunk_delta_rule_fwd_h
+chunk_gated_delta_rule_fwd_h = _mod.chunk_gated_delta_rule_fwd_h
 
 
 BT = 64
@@ -46,45 +46,14 @@ def run_fla_ref(k, w, u, g=None, gk=None, initial_state=None,
 
 def run_cute_dsl(k, w, u, g=None, gk=None, initial_state=None,
                  output_final_state=False, save_new_value=True):
-    """Call CuTe DSL kernel wrapper and return (h_out, v_new, ht)."""
-    B, T, H, K = k.shape
-    V = u.shape[3]
-    NT = (T + BT - 1) // BT
-
-    h_out = torch.zeros(B, NT, H, K, V, device=device, dtype=torch.bfloat16)
-    v_new = torch.zeros(B, T, H, V, device=device, dtype=torch.bfloat16)
-    ht = torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
-
-    use_g_val = 1 if g is not None else 0
-    use_gk_val = 1 if gk is not None else 0
-    use_h0 = 1 if initial_state is not None else 0
-    store_ht = 1 if output_final_state else 0
-    save_vnew = 1 if save_new_value else 0
-
-    # Prepare dummy tensors for unused optional inputs
-    if g is None:
-        g = torch.zeros(B, T, H, device=device, dtype=torch.float32)
-    if gk is None:
-        gk = torch.zeros(B, T, H, K, device=device, dtype=torch.float32)
-    if initial_state is None:
-        h0 = torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
-    else:
-        h0 = initial_state
-
-    chunk_delta_rule_fwd_h(
-        k=k, w=w, u=u, g=g, gk=gk,
-        h_out=h_out, v_new=v_new, h0=h0, ht=ht,
-        use_g=use_g_val, use_gk=use_gk_val,
-        use_initial_state=use_h0, store_final_state=store_ht,
-        save_v_new=save_vnew,
-        chunk_size=BT, is_varlen=False,
-    )
-    torch.cuda.synchronize()
-
-    return (
-        h_out,
-        v_new if save_new_value else None,
-        ht if output_final_state else None,
+    """Call CuTe DSL kernel wrapper (FLA-compatible API) and return (h_out, v_new, ht)."""
+    return chunk_gated_delta_rule_fwd_h(
+        k=k, w=w, u=u,
+        g=g, gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=BT,
+        save_new_value=save_new_value,
     )
 
 
@@ -248,23 +217,18 @@ def run_benchmark(B=4, T=4096, H=64, K=128, V=128, num_iters=20):
     h_out = torch.zeros(B, NT, H, K, V, device=device, dtype=torch.bfloat16)
     v_new = torch.zeros(B, T, H, V, device=device, dtype=torch.bfloat16)
     ht = torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
-    g_dummy = torch.zeros(B, T, H, device=device, dtype=torch.float32)
 
     # Warmup (triggers compilation)
-    chunk_delta_rule_fwd_h(
-        k=k, w=w, u=u, g=g_dummy, gk=gk,
-        h_out=h_out, v_new=v_new, h0=h0, ht=ht,
-        use_g=0, use_gk=1, use_initial_state=1, store_final_state=1, save_v_new=1,
-        chunk_size=BT, is_varlen=False,
+    chunk_gated_delta_rule_fwd_h(
+        k=k, w=w, u=u, gk=gk, initial_state=h0,
+        output_final_state=True, chunk_size=BT, save_new_value=True,
     )
     torch.cuda.synchronize()
 
     for _ in range(5):
-        chunk_delta_rule_fwd_h(
-            k=k, w=w, u=u, g=g_dummy, gk=gk,
-            h_out=h_out, v_new=v_new, h0=h0, ht=ht,
-            use_g=0, use_gk=1, use_initial_state=1, store_final_state=1, save_v_new=1,
-            chunk_size=BT, is_varlen=False,
+        chunk_gated_delta_rule_fwd_h(
+            k=k, w=w, u=u, gk=gk, initial_state=h0,
+            output_final_state=True, chunk_size=BT, save_new_value=True,
         )
     torch.cuda.synchronize()
 
@@ -272,11 +236,9 @@ def run_benchmark(B=4, T=4096, H=64, K=128, V=128, num_iters=20):
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(num_iters):
-        chunk_delta_rule_fwd_h(
-            k=k, w=w, u=u, g=g_dummy, gk=gk,
-            h_out=h_out, v_new=v_new, h0=h0, ht=ht,
-            use_g=0, use_gk=1, use_initial_state=1, store_final_state=1, save_v_new=1,
-            chunk_size=BT, is_varlen=False,
+        chunk_gated_delta_rule_fwd_h(
+            k=k, w=w, u=u, gk=gk, initial_state=h0,
+            output_final_state=True, chunk_size=BT, save_new_value=True,
         )
     end.record()
     torch.cuda.synchronize()

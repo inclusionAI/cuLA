@@ -1317,11 +1317,6 @@ def reference_bf16_roundtrip(k, w, u, g=None, gk=None, h0=None, chunk_size=64):
 # Internal cache: maps (is_varlen, persistent, H, K, V, chunk_size) → compiled_fn
 _delta_h_kernel_cache: dict = {}
 
-# Pre-allocated dummy tensors for non-varlen path (avoid per-call torch.zeros)
-_dummy_cu_seqlens: torch.Tensor = None
-_dummy_chunk_offsets: torch.Tensor = None
-_dummy_workspace: torch.Tensor = None
-
 
 def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size):
     """Compile one ChunkDeltaRuleFwdH kernel variant. Returns the compiled TVM-FFI callable.
@@ -1471,115 +1466,145 @@ def _get_compiled_delta_h(is_varlen, persistent, H, K, V, chunk_size):
     return _delta_h_kernel_cache[key]
 
 
-def chunk_delta_rule_fwd_h(
+def chunk_gated_delta_rule_fwd_h(
     k: torch.Tensor,
     w: torch.Tensor,
     u: torch.Tensor,
-    g: torch.Tensor,
-    gk: torch.Tensor,
-    h_out: torch.Tensor,
-    v_new: torch.Tensor,
-    h0: torch.Tensor,
-    ht: torch.Tensor,
-    use_g: int = 0,
-    use_gk: int = 0,
-    use_initial_state: int = 0,
-    store_final_state: int = 0,
-    save_v_new: int = 0,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
     chunk_size: int = 64,
-    cu_seqlens: torch.Tensor = None,
-    chunk_offsets: torch.Tensor = None,
-    workspace: torch.Tensor = None,
-    is_varlen: bool = False,
+    save_new_value: bool = True,
+    cu_seqlens: torch.Tensor | None = None,
     persistent: bool = True,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
-    ChunkDeltaRuleFwdH forward pass with compile cache and TVM-FFI.
+    ChunkDeltaRuleFwdH forward pass — FLA-compatible API.
 
-    Computes inter-chunk recurrent state h and optionally v_new for delta rule.
-
-    Uses make_fake_compact_tensor for compilation (no GC issues).
-    At runtime, torch tensors are passed directly via TVM-FFI.
-    sym_int() is used for B, T, NT so a single compilation handles all
-    batch-size / sequence-length combinations.
-
-    Cache key: (is_varlen, persistent, H, K, V, chunk_size)
-    Runtime flags (use_g, use_gk, etc.) are NOT part of the cache key since
-    they are runtime Int32 checks, not const_expr.
+    Interface aligned with FLA's chunk_gated_delta_rule_fwd_h for fair benchmarking.
+    Allocates output tensors internally and returns (h, v_new, final_state).
 
     Args:
-        k: key — [B, T, H, K] bf16 or [T_total, H, K]
-        w: decay weight — [B, T, H, K] bf16 or [T_total, H, K]
-        u: value — [B, T, H, V] bf16 or [T_total, H, V]
-        g: scalar gate — [B, T, H] fp32 or [T_total, H]
-        gk: key gate — [B, T, H, K] fp32 or [T_total, H, K]
-        h_out: output state — [B, NT, H, K, V] bf16 or [NT_total, H, K, V]
-        v_new: output v_new — [B, T, H, V] bf16 or [T_total, H, V]
-        h0: initial state — [B, H, K, V] fp32
-        ht: final state output — [B, H, K, V] bf16
-        use_g: whether to use scalar gate g
-        use_gk: whether to use key gate gk
-        use_initial_state: whether to use h0
-        store_final_state: whether to store ht
-        save_v_new: whether to save v_new output
-        chunk_size: chunk size (default: 64)
-        cu_seqlens: cumulative sequence lengths [N+1] int32 (varlen only)
-        chunk_offsets: chunk offsets [N+1] int32 (varlen only)
-        workspace: workspace buffer (uint8)
-        is_varlen: whether to use varlen mode
-        persistent: whether to use persistent kernel (default: True)
+        k:  key tensor           [B, T, H, K]  bf16
+        w:  decay weight tensor  [B, T, H, K]  bf16
+        u:  value tensor         [B, T, H, V]  bf16
+        g:  scalar gate          [B, T, H]     fp32, or None
+        gk: key gate             [B, T, H, K]  fp32, or None
+        initial_state: h0        [N, H, K, V]  fp32, or None
+        output_final_state: whether to return final_state
+        chunk_size: chunk size (default 64)
+        save_new_value: whether to return v_new
+        cu_seqlens: cumulative sequence lengths [N+1] int64/int32 for varlen, or None
+        persistent: whether to use persistent kernel (default True)
+
+    Returns:
+        (h, v_new, final_state) — same as FLA
+        h:           [B, NT, H, K, V] bf16  (or [1, NT_total, H, K, V] for varlen)
+        v_new:       [B, T, H, V] bf16      (or None if save_new_value=False)
+        final_state: [N, H, K, V] fp32      (or None if output_final_state=False)
     """
+    B, T, H, K_dim = k.shape
+    V_dim = u.shape[3]
+    BT = chunk_size
+    is_varlen = cu_seqlens is not None
+
+    use_g_flag = 1 if g is not None else 0
+    use_gk_flag = 1 if gk is not None else 0
+    use_h0_flag = 1 if initial_state is not None else 0
+    store_ht_flag = 1 if output_final_state else 0
+    save_vnew_flag = 1 if save_new_value else 0
+
     if is_varlen:
-        T_total = k.shape[0]
-        H = k.shape[1]
-        K = k.shape[2]
-        V = u.shape[2]
+        # Varlen mode: B must be 1 (FLA convention), cu_seqlens is [N+1]
+        assert B == 1, "varlen mode requires B=1 (data packed in T dimension)"
         num_seqs = cu_seqlens.shape[0] - 1
-        BT = chunk_size
-        # h_out is [NT_total, H, K, V] in varlen — read shape (no CUDA sync).
-        # Avoids the old loop that called .item() on each cu_seqlens element,
-        # which caused ~0.6ms of device-host sync overhead per call.
-        total_nt_val = h_out.shape[0]
-        ps = (Int32(num_seqs), Int32(T_total), Int32(H), Int32(K), Int32(V))
+        N = num_seqs
+
+        # Compute chunk_offsets from cu_seqlens on GPU (same as FLA)
+        cu_seqlens_i32 = cu_seqlens.int() if cu_seqlens.dtype != torch.int32 else cu_seqlens
+        lens = cu_seqlens_i32[1:] - cu_seqlens_i32[:-1]
+        nts = (lens + BT - 1) // BT
+        chunk_offsets = torch.zeros(num_seqs + 1, dtype=torch.int32, device=k.device)
+        chunk_offsets[1:] = nts.cumsum(0)
+        total_NT = int(chunk_offsets[-1].item())
+
+        # Squeeze to 3D for kernel: [1, T, H, K] -> [T, H, K]
+        k_kern = k.squeeze(0)
+        w_kern = w.squeeze(0)
+        u_kern = u.squeeze(0)
+        # Use torch.empty for dummies the kernel won't read (flag-gated)
+        g_kern = g.squeeze(0) if g is not None else torch.empty(T, H, device=k.device, dtype=torch.float32)
+        gk_kern = gk.squeeze(0) if gk is not None else torch.empty(T, H, K_dim, device=k.device, dtype=torch.float32)
+
+        # Allocate outputs (3D for kernel)
+        h_out_kern = k.new_empty(total_NT, H, K_dim, V_dim)  # bf16
+        v_new_kern = torch.empty_like(u_kern)  # always allocate; kernel checks save_v_new flag
+        h0_kern = initial_state if initial_state is not None else torch.empty(num_seqs, H, K_dim, V_dim, device=k.device, dtype=torch.float32)
+        # ht must share sym_ns (first dim) with h0, so always use num_seqs
+        ht_kern = k.new_zeros(num_seqs, H, K_dim, V_dim, dtype=torch.float32)
+
+        workspace = torch.empty(num_seqs * 128, dtype=torch.uint8, device=k.device)
+
+        ps = (Int32(num_seqs), Int32(T), Int32(H), Int32(K_dim), Int32(V_dim))
+        total_nt_val = total_NT
+
+        compiled_fn = _get_compiled_delta_h(True, persistent, H, K_dim, V_dim, chunk_size)
+        compiled_fn(
+            k_kern, w_kern, u_kern, g_kern, gk_kern,
+            h_out_kern, v_new_kern, h0_kern, ht_kern,
+            cu_seqlens_i32, chunk_offsets, workspace,
+            ps, Int32(total_nt_val),
+            Int32(use_g_flag), Int32(use_gk_flag),
+            Int32(use_h0_flag), Int32(store_ht_flag),
+            Int32(save_vnew_flag),
+        )
+
+        # Wrap outputs to 4D to match FLA's return shapes:
+        # FLA returns h as [1, NT_total, H, K, V]
+        h = h_out_kern.unsqueeze(0)
+        v_new = v_new_kern.unsqueeze(0) if save_new_value else None
+        final_state = ht_kern if output_final_state else None
     else:
-        B, T, H, K = k.shape
-        V = u.shape[3]
-        BT = chunk_size
+        # Non-varlen mode
         NT = (T + BT - 1) // BT
+        N = B
+
+        # Allocate outputs
+        h = k.new_empty(B, NT, H, K_dim, V_dim)  # bf16
+        v_new_out = torch.empty_like(u)  # always allocate; kernel checks save_v_new flag
+        # Use torch.empty for dummies the kernel won't read (flag-gated)
+        h0 = initial_state if initial_state is not None else torch.empty(B, H, K_dim, V_dim, device=k.device, dtype=torch.float32)
+        # ht must share sym_ns (first dim) with h0, so always use B
+        ht = k.new_zeros(B, H, K_dim, V_dim, dtype=torch.float32)
+
+        # Dummy tensors for unused optional gate inputs (kernel checks flags)
+        g_kern = g if g is not None else torch.empty(B, T, H, device=k.device, dtype=torch.float32)
+        gk_kern = gk if gk is not None else torch.empty(B, T, H, K_dim, device=k.device, dtype=torch.float32)
+
+        # Dummy cu_seqlens / chunk_offsets / workspace (kernel requires them)
+        cu_dummy = torch.empty(2, dtype=torch.int32, device=k.device)
+        co_dummy = torch.empty(2, dtype=torch.int32, device=k.device)
+        ws_dummy = torch.empty(128, dtype=torch.uint8, device=k.device)
+
+        ps = (Int32(B), Int32(T), Int32(H), Int32(K_dim), Int32(V_dim))
         total_nt_val = NT
-        ps = (Int32(B), Int32(T), Int32(H), Int32(K), Int32(V))
-        if cu_seqlens is None:
-            global _dummy_cu_seqlens
-            if _dummy_cu_seqlens is None or _dummy_cu_seqlens.device != k.device:
-                _dummy_cu_seqlens = torch.zeros(2, dtype=torch.int32, device=k.device)
-            cu_seqlens = _dummy_cu_seqlens
-        if chunk_offsets is None:
-            global _dummy_chunk_offsets
-            if _dummy_chunk_offsets is None or _dummy_chunk_offsets.device != k.device:
-                _dummy_chunk_offsets = torch.zeros(2, dtype=torch.int32, device=k.device)
-            chunk_offsets = _dummy_chunk_offsets
 
-    if workspace is None:
-        global _dummy_workspace
-        if _dummy_workspace is None or _dummy_workspace.device != k.device:
-            _dummy_workspace = torch.zeros(128, dtype=torch.uint8, device=k.device)
-        workspace = _dummy_workspace
+        compiled_fn = _get_compiled_delta_h(False, persistent, H, K_dim, V_dim, chunk_size)
+        compiled_fn(
+            k, w, u, g_kern, gk_kern,
+            h, v_new_out, h0, ht,
+            cu_dummy, co_dummy, ws_dummy,
+            ps, Int32(total_nt_val),
+            Int32(use_g_flag), Int32(use_gk_flag),
+            Int32(use_h0_flag), Int32(store_ht_flag),
+            Int32(save_vnew_flag),
+        )
 
-    compiled_fn = _get_compiled_delta_h(
-        is_varlen, persistent, H, K, V, chunk_size,
-    )
+        v_new = v_new_out if save_new_value else None
+        final_state = ht if output_final_state else None
 
-    # TVM-FFI: pass torch tensors directly; stream is auto-provided
-    # by make_fake_stream(use_tvm_ffi_env_stream=True).
-    compiled_fn(
-        k, w, u, g, gk,
-        h_out, v_new, h0, ht,
-        cu_seqlens, chunk_offsets, workspace,
-        ps, Int32(total_nt_val),
-        Int32(int(use_g)), Int32(int(use_gk)),
-        Int32(int(use_initial_state)), Int32(int(store_final_state)),
-        Int32(int(save_v_new)),
-    )
+    return h, v_new, final_state
 
 
 def main():
@@ -1604,19 +1629,23 @@ def main():
     u = torch.randn(B, T, H, V, device="cuda", dtype=torch.bfloat16) * 0.1
 
     def run_kernel(k_t, w_t, u_t, g_t, gk_t, h0_t, use_g_val, use_gk_val, use_h0, store_ht, do_save_vnew=0):
-        h_out = torch.zeros(B, NT, H, K, V, device="cuda", dtype=torch.bfloat16)
-        v_new = torch.zeros(B, T, H, V, device="cuda", dtype=torch.bfloat16)
-        ht = torch.zeros(B, H, K, V, device="cuda", dtype=torch.float32)
-
-        chunk_delta_rule_fwd_h(
-            k=k_t, w=w_t, u=u_t, g=g_t, gk=gk_t,
-            h_out=h_out, v_new=v_new, h0=h0_t, ht=ht,
-            use_g=use_g_val, use_gk=use_gk_val,
-            use_initial_state=use_h0, store_final_state=store_ht,
-            save_v_new=do_save_vnew,
-            chunk_size=BT, is_varlen=False,
+        h_out, v_new, ht = chunk_gated_delta_rule_fwd_h(
+            k=k_t, w=w_t, u=u_t,
+            g=g_t if use_g_val else None,
+            gk=gk_t if use_gk_val else None,
+            initial_state=h0_t if use_h0 else None,
+            output_final_state=bool(store_ht),
+            chunk_size=BT,
+            save_new_value=bool(do_save_vnew),
         )
         torch.cuda.synchronize()
+        # Ensure consistent return shapes for backward compat with manual tests
+        if h_out is None:
+            h_out = torch.zeros(B, NT, H, K, V, device="cuda", dtype=torch.bfloat16)
+        if v_new is None:
+            v_new = torch.zeros(B, T, H, V, device="cuda", dtype=torch.bfloat16)
+        if ht is None:
+            ht = torch.zeros(B, H, K, V, device="cuda", dtype=torch.float32)
         return h_out, v_new, ht
 
     all_pass = True
@@ -1745,19 +1774,10 @@ def main():
     k2 = torch.randn(B2, T2, H2, K, device="cuda", dtype=torch.bfloat16) * 0.1
     w2 = torch.randn(B2, T2, H2, K, device="cuda", dtype=torch.bfloat16) * 0.1
     u2 = torch.randn(B2, T2, H2, V, device="cuda", dtype=torch.bfloat16) * 0.1
-    g_z2 = torch.zeros(B2, T2, H2, device="cuda", dtype=torch.float32)
-    gk_z2 = torch.zeros(B2, T2, H2, K, device="cuda", dtype=torch.float32)
-    h0_z2 = torch.zeros(B2, H2, K, V, device="cuda", dtype=torch.float32)
 
-    h_out2 = torch.zeros(B2, NT2, H2, K, V, device="cuda", dtype=torch.bfloat16)
-    v_new2 = torch.zeros(B2, T2, H2, V, device="cuda", dtype=torch.bfloat16)
-    ht2 = torch.zeros(B2, H2, K, V, device="cuda", dtype=torch.float32)
-
-    chunk_delta_rule_fwd_h(
-        k=k2, w=w2, u=u2, g=g_z2, gk=gk_z2,
-        h_out=h_out2, v_new=v_new2, h0=h0_z2, ht=ht2,
-        use_g=0, use_gk=0, use_initial_state=0, store_final_state=0,
-        save_v_new=0, chunk_size=BT, is_varlen=False,
+    h_out2, v_new2, ht2 = chunk_gated_delta_rule_fwd_h(
+        k=k2, w=w2, u=u2,
+        chunk_size=BT, save_new_value=False,
     )
     torch.cuda.synchronize()
 
@@ -1817,20 +1837,11 @@ def main():
     kb = torch.randn(Bb, Tb, Hb, K, device="cuda", dtype=torch.bfloat16) * 0.1
     wb = torch.randn(Bb, Tb, Hb, K, device="cuda", dtype=torch.bfloat16) * 0.1
     ub = torch.randn(Bb, Tb, Hb, V, device="cuda", dtype=torch.bfloat16) * 0.1
-    gb = torch.zeros(Bb, Tb, Hb, device="cuda", dtype=torch.float32)
-    gkb = torch.zeros(Bb, Tb, Hb, K, device="cuda", dtype=torch.float32)
-    h0b = torch.zeros(Bb, Hb, K, V, device="cuda", dtype=torch.float32)
-    h_outb = torch.zeros(Bb, NTb, Hb, K, V, device="cuda", dtype=torch.bfloat16)
-    v_newb = torch.zeros(Bb, Tb, Hb, V, device="cuda", dtype=torch.bfloat16)
-    htb = torch.zeros(Bb, Hb, K, V, device="cuda", dtype=torch.float32)
 
     def run_bench():
-        chunk_delta_rule_fwd_h(
-            k=kb, w=wb, u=ub, g=gb, gk=gkb,
-            h_out=h_outb, v_new=v_newb, h0=h0b, ht=htb,
-            use_g=0, use_gk=0, use_initial_state=0,
-            store_final_state=0, save_v_new=0,
-            chunk_size=BT, is_varlen=False,
+        chunk_gated_delta_rule_fwd_h(
+            k=kb, w=wb, u=ub,
+            chunk_size=BT, save_new_value=False,
         )
 
     # Warmup (also triggers lazy compilation)

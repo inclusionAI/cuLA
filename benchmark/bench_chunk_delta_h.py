@@ -34,7 +34,7 @@ import importlib
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
 _delta_h_mod = importlib.import_module("flashla.chunk_delta_h")
-chunk_delta_rule_fwd_h = _delta_h_mod.chunk_delta_rule_fwd_h
+chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
 
 # ─── FLA baseline imports ───
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as fla_fwd_h
@@ -80,15 +80,6 @@ def accuracy_stats(ref, out):
     return diff.max().item(), diff.mean().item()
 
 
-def make_chunk_offsets(seq_lens, BT, device="cuda"):
-    """Create chunk_offsets from sequence lengths."""
-    NTs = [(int(l) + BT - 1) // BT for l in seq_lens]
-    co = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
-    for i, nt in enumerate(NTs):
-        co[i + 1] = co[i] + nt
-    return co, int(sum(NTs))
-
-
 # ============================================================
 # Non-varlen benchmark
 # ============================================================
@@ -126,21 +117,15 @@ def bench_non_varlen(configs):
         h_fla = fla_result[0]  # h_out
 
         # ---- CuTe DSL ----
-        g_tensor = torch.zeros(B, T, H, device=device, dtype=torch.float32)
-        gk_tensor = gk if gk is not None else torch.zeros(B, T, H, K, device=device, dtype=torch.float32)
-        h0_tensor = h0 if h0 is not None else torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
-
-        h_out = torch.zeros(B, NT, H, K, V, device=device, dtype=dtype)
-        v_new_out = torch.zeros(B, T, H, V, device=device, dtype=dtype)
-        ht_out = torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
-
-        chunk_delta_rule_fwd_h(
-            k=k, w=w, u=u, g=g_tensor, gk=gk_tensor,
-            h_out=h_out, v_new=v_new_out, h0=h0_tensor, ht=ht_out,
-            use_g=0, use_gk=int(use_gk), use_initial_state=int(use_h0),
-            store_final_state=int(store_ht), save_v_new=int(save_vnew),
-            chunk_size=BT, is_varlen=False,
+        cute_result = chunk_gated_delta_rule_fwd_h(
+            k=k, w=w, u=u,
+            g=None, gk=gk,
+            initial_state=h0,
+            output_final_state=store_ht,
+            chunk_size=BT,
+            save_new_value=save_vnew,
         )
+        h_out = cute_result[0]
         torch.cuda.synchronize()
 
         max_diff, mean_diff = accuracy_stats(h_fla, h_out)
@@ -153,15 +138,11 @@ def bench_non_varlen(configs):
                 chunk_size=BT, save_new_value=save_vnew,
             )
 
-        def run_cute(k=k, w=w, u=u, g_tensor=g_tensor, gk_tensor=gk_tensor,
-                     h_out=h_out, v_new_out=v_new_out, h0_tensor=h0_tensor,
-                     ht_out=ht_out):
-            chunk_delta_rule_fwd_h(
-                k=k, w=w, u=u, g=g_tensor, gk=gk_tensor,
-                h_out=h_out, v_new=v_new_out, h0=h0_tensor, ht=ht_out,
-                use_g=0, use_gk=int(use_gk), use_initial_state=int(use_h0),
-                store_final_state=int(store_ht), save_v_new=int(save_vnew),
-                chunk_size=BT, is_varlen=False,
+        def run_cute(k=k, w=w, u=u, gk=gk, h0=h0):
+            chunk_gated_delta_rule_fwd_h(
+                k=k, w=w, u=u, g=None, gk=gk,
+                initial_state=h0, output_final_state=store_ht,
+                chunk_size=BT, save_new_value=save_vnew,
             )
 
         ms_fla = time_kernel(run_fla)
@@ -224,70 +205,51 @@ def bench_varlen(configs):
         for sl in seq_lens:
             cu_seqlens_list.append(cu_seqlens_list[-1] + sl)
         cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
-        chunk_offsets, total_NT = make_chunk_offsets(seq_lens, BT, device)
+        cu_seqlens_long = cu_seqlens.long()
 
         torch.manual_seed(42)
         torch.cuda.empty_cache()
 
-        # FLA uses [1, total_T, H, ...] (4D with B=1)
-        k_4d = torch.randn(1, total_T, H, K, device=device, dtype=dtype) * 0.1
-        w_4d = torch.randn(1, total_T, H, K, device=device, dtype=dtype) * 0.1
-        u_4d = torch.randn(1, total_T, H, V, device=device, dtype=dtype) * 0.1
+        # Both FLA and CuTe DSL use [1, total_T, H, ...] (4D with B=1)
+        k = torch.randn(1, total_T, H, K, device=device, dtype=dtype) * 0.1
+        w = torch.randn(1, total_T, H, K, device=device, dtype=dtype) * 0.1
+        u = torch.randn(1, total_T, H, V, device=device, dtype=dtype) * 0.1
 
         gk = None
-        gk_4d = None
         h0 = None
         if use_gk:
             gk_raw = torch.randn(1, total_T, H, K, device=device, dtype=torch.float32) * 0.1
-            gk_4d = torch.zeros_like(gk_raw)
+            gk = torch.zeros_like(gk_raw)
             for i in range(num_seqs):
                 bos = cu_seqlens[i].item()
                 eos = cu_seqlens[i + 1].item()
-                gk_4d[:, bos:eos] = -torch.abs(gk_raw[:, bos:eos]).cumsum(dim=1)
-            gk = gk_4d
+                gk[:, bos:eos] = -torch.abs(gk_raw[:, bos:eos]).cumsum(dim=1)
         if use_h0:
             h0 = torch.randn(num_seqs, H, K, V, device=device, dtype=torch.float32) * 0.01
 
-        # CuTe DSL uses [T_total, H, ...] (3D, flat)
-        k_3d = k_4d.squeeze(0)
-        w_3d = w_4d.squeeze(0)
-        u_3d = u_4d.squeeze(0)
-
         # ---- FLA baseline ----
-        cu_seqlens_long = cu_seqlens.long()
         fla_result = fla_fwd_h(
-            k=k_4d, w=w_4d, u=u_4d, g=None, gk=gk_4d,
+            k=k, w=w, u=u, g=None, gk=gk,
             initial_state=h0, output_final_state=store_ht,
             chunk_size=BT, save_new_value=save_vnew,
             cu_seqlens=cu_seqlens_long,
         )
         h_fla = fla_result[0]
 
-        # ---- CuTe DSL varlen ----
-        g_tensor = torch.zeros(total_T, H, device=device, dtype=torch.float32)
-        gk_3d = gk_4d.squeeze(0) if gk_4d is not None else torch.zeros(total_T, H, K, device=device, dtype=torch.float32)
-        h0_tensor = h0 if h0 is not None else torch.zeros(num_seqs, H, K, V, device=device, dtype=torch.float32)
-
-        h_out = torch.zeros(total_NT, H, K, V, device=device, dtype=dtype)
-        v_new_out = torch.zeros(total_T, H, V, device=device, dtype=dtype)
-        ht_out = torch.zeros(num_seqs, H, K, V, device=device, dtype=torch.float32)
-        workspace = torch.zeros(num_seqs * 128, dtype=torch.uint8, device=device)
-
-        chunk_delta_rule_fwd_h(
-            k=k_3d, w=w_3d, u=u_3d, g=g_tensor, gk=gk_3d,
-            h_out=h_out, v_new=v_new_out, h0=h0_tensor, ht=ht_out,
-            use_g=0, use_gk=int(use_gk), use_initial_state=int(use_h0),
-            store_final_state=int(store_ht), save_v_new=int(save_vnew),
-            chunk_size=BT, cu_seqlens=cu_seqlens, chunk_offsets=chunk_offsets,
-            workspace=workspace, is_varlen=True, persistent=True,
+        # ---- CuTe DSL varlen (same API as FLA) ----
+        cute_result = chunk_gated_delta_rule_fwd_h(
+            k=k, w=w, u=u, g=None, gk=gk,
+            initial_state=h0, output_final_state=store_ht,
+            chunk_size=BT, save_new_value=save_vnew,
+            cu_seqlens=cu_seqlens_long,
         )
+        h_out = cute_result[0]
         torch.cuda.synchronize()
 
-        # FLA returns [1, NT_total, H, K, V], CuTe DSL returns [NT_total, H, K, V]
-        max_diff, mean_diff = accuracy_stats(h_fla.squeeze(0), h_out)
+        max_diff, mean_diff = accuracy_stats(h_fla, h_out)
 
         # ---- Performance timing ----
-        def run_fla(k=k_4d, w=w_4d, u=u_4d, gk=gk_4d, h0=h0, cu=cu_seqlens_long):
+        def run_fla(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens_long):
             fla_fwd_h(
                 k=k, w=w, u=u, g=None, gk=gk,
                 initial_state=h0, output_final_state=store_ht,
@@ -295,17 +257,12 @@ def bench_varlen(configs):
                 cu_seqlens=cu,
             )
 
-        def run_cute(k=k_3d, w=w_3d, u=u_3d, g_tensor=g_tensor, gk_3d=gk_3d,
-                     h_out=h_out, v_new_out=v_new_out, h0_tensor=h0_tensor,
-                     ht_out=ht_out, cu_seqlens=cu_seqlens,
-                     chunk_offsets=chunk_offsets, workspace=workspace):
-            chunk_delta_rule_fwd_h(
-                k=k, w=w, u=u, g=g_tensor, gk=gk_3d,
-                h_out=h_out, v_new=v_new_out, h0=h0_tensor, ht=ht_out,
-                use_g=0, use_gk=int(use_gk), use_initial_state=int(use_h0),
-                store_final_state=int(store_ht), save_v_new=int(save_vnew),
-                chunk_size=BT, cu_seqlens=cu_seqlens, chunk_offsets=chunk_offsets,
-                workspace=workspace, is_varlen=True, persistent=True,
+        def run_cute(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens_long):
+            chunk_gated_delta_rule_fwd_h(
+                k=k, w=w, u=u, g=None, gk=gk,
+                initial_state=h0, output_final_state=store_ht,
+                chunk_size=BT, save_new_value=save_vnew,
+                cu_seqlens=cu,
             )
 
         ms_fla = time_kernel(run_fla)
