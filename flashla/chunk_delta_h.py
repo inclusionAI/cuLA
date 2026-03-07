@@ -1343,6 +1343,7 @@ def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size):
     sym_nt = cute.sym_int()  # NT or NT_total
     sym_n = cute.sym_int()   # metadata size (cu_seqlens, chunk_offsets)
     sym_ws = cute.sym_int()  # workspace size (separate from metadata)
+    sym_ns = cute.sym_int()  # num_seqs (varlen h0/ht) or B (non-varlen, == sym_a)
 
     BT = chunk_size
 
@@ -1407,13 +1408,14 @@ def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size):
             stride_order=(4, 3, 2, 1, 0), assumed_align=128,
         )
 
-    # h0/ht always use [B, H, K, V] regardless of varlen
+    # h0/ht use [B, H, K, V] (non-varlen) or [num_seqs, H, K, V] (varlen)
+    # In varlen mode, num_seqs != T_total, so use a separate sym_ns
     h0_fake = make_fake_compact_tensor(
-        cutlass.Float32, (sym_a, H, K, V),
+        cutlass.Float32, (sym_ns, H, K, V),
         stride_order=(3, 2, 1, 0), assumed_align=128,
     )
     ht_fake = make_fake_compact_tensor(
-        cutlass.Float32, (sym_a, H, K, V),
+        cutlass.Float32, (sym_ns, H, K, V),
         stride_order=(3, 2, 1, 0), assumed_align=128,
     )
     cu_fake = make_fake_compact_tensor(
