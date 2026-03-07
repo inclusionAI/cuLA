@@ -1478,7 +1478,9 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
+    total_nt: int | None = None,
     persistent: bool = True,
+    head_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     ChunkDeltaRuleFwdH forward pass — FLA-compatible API.
@@ -1499,7 +1501,11 @@ def chunk_gated_delta_rule_fwd_h(
         cu_seqlens: cumulative sequence lengths [N+1] int64/int32 for varlen, or None
         chunk_offsets: pre-computed chunk offsets [N+1] int32 for varlen, or None
                        If provided, skips internal computation from cu_seqlens.
+        total_nt: total number of chunks across all sequences (Python int).
+                  If provided (varlen mode), avoids a GPU→CPU sync (.item()).
+                  Typically pre-computed as sum(ceil(seq_len_i / chunk_size)).
         persistent: whether to use persistent kernel (default True)
+        head_first: unused, for API compatibility only
 
     Returns:
         (h, v_new, final_state) — same as FLA
@@ -1524,41 +1530,48 @@ def chunk_gated_delta_rule_fwd_h(
         num_seqs = cu_seqlens.shape[0] - 1
         N = num_seqs
 
-        # Compute chunk_offsets from cu_seqlens on GPU if not pre-computed
+        # Ensure cu_seqlens is int32 for the kernel
         cu_seqlens_i32 = cu_seqlens.int() if cu_seqlens.dtype != torch.int32 else cu_seqlens
+
+        # Compute chunk_offsets from cu_seqlens on GPU if not pre-computed
         if chunk_offsets is None:
             lens = cu_seqlens_i32[1:] - cu_seqlens_i32[:-1]
             nts = (lens + BT - 1) // BT
             chunk_offsets = torch.zeros(num_seqs + 1, dtype=torch.int32, device=k.device)
             chunk_offsets[1:] = nts.cumsum(0)
-        total_NT = int(chunk_offsets[-1].item())
 
-        # Squeeze to 3D for kernel: [1, T, H, K] -> [T, H, K]
-        k_kern = k.squeeze(0)
-        w_kern = w.squeeze(0)
-        u_kern = u.squeeze(0)
+        # Determine total_NT: prefer caller-provided value to avoid GPU sync
+        if total_nt is not None:
+            total_NT = total_nt
+        else:
+            total_NT = int(chunk_offsets[-1].item())
+
+        # View as 3D for kernel: [1, T, H, K] -> [T, H, K] (zero-copy)
+        k_kern = k[0]
+        w_kern = w[0]
+        u_kern = u[0]
         # Use torch.empty for dummies the kernel won't read (flag-gated)
-        g_kern = g.squeeze(0) if g is not None else torch.empty(T, H, device=k.device, dtype=torch.float32)
-        gk_kern = gk.squeeze(0) if gk is not None else torch.empty(T, H, K_dim, device=k.device, dtype=torch.float32)
+        g_kern = g[0] if g is not None else torch.empty(T, H, device=k.device, dtype=torch.float32)
+        gk_kern = gk[0] if gk is not None else torch.empty(T, H, K_dim, device=k.device, dtype=torch.float32)
 
         # Allocate outputs (3D for kernel)
         h_out_kern = k.new_empty(total_NT, H, K_dim, V_dim)  # bf16
         v_new_kern = torch.empty_like(u_kern)  # always allocate; kernel checks save_v_new flag
         h0_kern = initial_state if initial_state is not None else torch.empty(num_seqs, H, K_dim, V_dim, device=k.device, dtype=torch.float32)
-        # ht must share sym_ns (first dim) with h0, so always use num_seqs
-        ht_kern = k.new_zeros(num_seqs, H, K_dim, V_dim, dtype=torch.float32)
+        # ht is purely an output (kernel writes all elements when store_final_state=1);
+        # use empty instead of zeros to skip the zero-fill kernel launch.
+        ht_kern = torch.empty(num_seqs, H, K_dim, V_dim, device=k.device, dtype=torch.float32)
 
         workspace = torch.empty(num_seqs * 128, dtype=torch.uint8, device=k.device)
 
         ps = (Int32(num_seqs), Int32(T), Int32(H), Int32(K_dim), Int32(V_dim))
-        total_nt_val = total_NT
 
         compiled_fn = _get_compiled_delta_h(True, persistent, H, K_dim, V_dim, chunk_size)
         compiled_fn(
             k_kern, w_kern, u_kern, g_kern, gk_kern,
             h_out_kern, v_new_kern, h0_kern, ht_kern,
             cu_seqlens_i32, chunk_offsets, workspace,
-            ps, Int32(total_nt_val),
+            ps, Int32(total_NT),
             Int32(use_g_flag), Int32(use_gk_flag),
             Int32(use_h0_flag), Int32(store_ht_flag),
             Int32(save_vnew_flag),
@@ -1592,14 +1605,13 @@ def chunk_gated_delta_rule_fwd_h(
         ws_dummy = torch.empty(128, dtype=torch.uint8, device=k.device)
 
         ps = (Int32(B), Int32(T), Int32(H), Int32(K_dim), Int32(V_dim))
-        total_nt_val = NT
 
         compiled_fn = _get_compiled_delta_h(False, persistent, H, K_dim, V_dim, chunk_size)
         compiled_fn(
             k, w, u, g_kern, gk_kern,
             h, v_new_out, h0, ht,
             cu_dummy, co_dummy, ws_dummy,
-            ps, Int32(total_nt_val),
+            ps, Int32(NT),
             Int32(use_g_flag), Int32(use_gk_flag),
             Int32(use_h0_flag), Int32(store_ht_flag),
             Int32(save_vnew_flag),

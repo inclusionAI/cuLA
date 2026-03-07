@@ -212,6 +212,8 @@ def bench_varlen(configs):
         # so the timing loop measures only kernel execution time.
         chunk_indices = prepare_chunk_indices(cu_seqlens_long, BT)
         chunk_offsets_cute = prepare_chunk_offsets(cu_seqlens_long, BT).int()
+        # Pre-compute total_nt as Python int (avoids GPU→CPU sync in CuTe DSL wrapper)
+        total_nt = int(chunk_offsets_cute[-1].item())
 
         torch.manual_seed(42)
         torch.cuda.empty_cache()
@@ -247,7 +249,8 @@ def bench_varlen(configs):
             k=k, w=w, u=u, g=None, gk=gk,
             initial_state=h0, output_final_state=store_ht,
             chunk_size=BT, save_new_value=save_vnew,
-            cu_seqlens=cu_seqlens_long, chunk_offsets=chunk_offsets_cute,
+            cu_seqlens=cu_seqlens, chunk_offsets=chunk_offsets_cute,
+            total_nt=total_nt,
         )
         h_out = cute_result[0]
         torch.cuda.synchronize()
@@ -263,12 +266,13 @@ def bench_varlen(configs):
                 cu_seqlens=cu, chunk_indices=ci,
             )
 
-        def run_cute(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens_long, co=chunk_offsets_cute):
+        def run_cute(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens, co=chunk_offsets_cute, tnt=total_nt):
             chunk_gated_delta_rule_fwd_h(
                 k=k, w=w, u=u, g=None, gk=gk,
                 initial_state=h0, output_final_state=store_ht,
                 chunk_size=BT, save_new_value=save_vnew,
                 cu_seqlens=cu, chunk_offsets=co,
+                total_nt=tnt,
             )
 
         ms_fla = time_kernel(run_fla)
