@@ -37,6 +37,24 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.cute.testing as testing
 from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Int32, Int64, Float32
+from cutlass._mlir.dialects import llvm as _llvm
+from cutlass.cutlass_dsl import T as _T
+
+
+@cutlass.dsl_user_op
+def _atomic_add_global_i32(ptr_i64, addend_i32, *, loc=None, ip=None):
+    """Atomic add on global memory int32. Returns old value."""
+    result = _llvm.inline_asm(
+        _T.i32(),
+        [ptr_i64, addend_i32],
+        "atom.global.add.s32 $0, [$1], $2;",
+        "=r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip,
+    )
+    return Int32(result)
 
 PRINT_DEBUG = False
 
@@ -118,6 +136,9 @@ class ChunkDeltaRuleFwdH:
             barrier_id=3,
             num_threads=self.threads_per_warp * len(self.cuda_warp_ids),  # 128
         )
+        # No CTA-wide barrier needed for WU scheduling:
+        # Load warp elect_one arrives on a lightweight mbarrier (count=1),
+        # other warps just wait on mbarrier phase (no arrive needed).
         self.buffer_align_bytes = 1024
 
     @staticmethod
@@ -468,6 +489,10 @@ class ChunkDeltaRuleFwdH:
                 cute.struct.MemRange[cutlass.Float32, self.BK * self.BV],
                 self.buffer_align_bytes,
             ]
+            # Double-buffered work index for dynamic scheduling
+            sWorkIdx: cute.struct.MemRange[Int32, 2]
+            # Double-buffered scheduling mbarriers (count=1 each, Load warp elect_one arrives)
+            sched_mbar: cute.struct.MemRange[Int64, 2]
 
         self.shared_storage = SharedStorage
         self.grid = self._compute_grid(B, H, V)
@@ -652,6 +677,16 @@ class ChunkDeltaRuleFwdH:
             barrier_storage=storage.h0_load_mbar.data_ptr(),
         ).make_participants()
 
+        # ===================== Scheduling mbarrier init (persistent varlen) =====================
+        if cutlass.const_expr(self.is_varlen and self.persistent):
+            sched_mbar_base = storage.sched_mbar.data_ptr()
+            # Init 2 mbarriers with count=1: only Load warp elect_one arrives
+            if warp_idx == 0:
+                cute.arch.mbarrier_init(sched_mbar_base, 1)
+                cute.arch.mbarrier_init(sched_mbar_base + 1, 1)
+            cute.arch.mbarrier_init_fence()
+            cute.arch.barrier(barrier_id=0, number_of_threads=self.threads_per_cta)
+
         # ===================== TMEM =====================
         tmem_alloc_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=self.threads_per_cta)
         tmem = utils.TmemAllocator(
@@ -719,7 +754,11 @@ class ChunkDeltaRuleFwdH:
             grid_dim_x = cute.arch.grid_dim()[0]
             num_v_tiles = (V + self.BV - 1) // self.BV
             total_work_units = num_v_tiles * H * B
-            num_iters = (total_work_units - block_idx_x + grid_dim_x - 1) // grid_dim_x
+            if cutlass.const_expr(self.persistent):
+                # Dynamic scheduling: while loop uses work_idx < total_work_units
+                num_iters = Int32(0)  # not used, while loop controls iteration
+            else:
+                num_iters = (total_work_units - block_idx_x + grid_dim_x - 1) // grid_dim_x
             # Pre-initialize variables reassigned inside persistent loop (CuTe DSL requirement)
             v_tile_idx = Int32(0)
             hidx = Int32(0)
@@ -739,6 +778,25 @@ class ChunkDeltaRuleFwdH:
             num_iters = Int32(1)
 
         # =========================================================================
+        # DYNAMIC SCHEDULING: initial work_idx fetch (persistent varlen only)
+        # Load warp elect_one does atomicAdd → sWorkIdx[buf] → fence → arrive mbar[buf].
+        # Other warps wait on mbar[buf] at the correct phase, then read sWorkIdx[buf].
+        # Double-buffered to avoid phase racing.
+        # =========================================================================
+        if cutlass.const_expr(self.is_varlen and self.persistent):
+            sWorkIdx = storage.sWorkIdx.get_tensor(cute.make_layout((2,)))
+            if warp_idx == self.load_warp_id:
+                with cute.arch.elect_one():
+                    first_work_idx = _atomic_add_global_i32(
+                        workspace_iter.toint().ir_value(), Int32(1).ir_value())
+                    sWorkIdx[(0,)] = first_work_idx
+                    cute.arch.fence_acq_rel_cta()
+                    cute.arch.mbarrier_arrive(sched_mbar_base)
+            else:
+                # All other warps: wait for Load warp's signal on mbar[0], phase=0
+                cute.arch.mbarrier_wait(sched_mbar_base, Int32(0))
+
+        # =========================================================================
         # LOAD WARP
         # =========================================================================
         if warp_idx == self.load_warp_id:
@@ -746,10 +804,21 @@ class ChunkDeltaRuleFwdH:
 
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_h0)
 
-            for wu_iter in cutlass.range(0, num_iters, unroll=0):
-                # --- Persistent work decode ---
+            wu_iter = Int32(0)
+            if cutlass.const_expr(self.is_varlen and self.persistent):
+                # Load warp wrote sWorkIdx[0], read it back (sync_warp ensures visibility)
+                cute.arch.sync_warp()
+                work_idx = sWorkIdx[(0,)]
+                sched_buf = Int32(1)  # next buffer to write (0 was just written at init)
+                should_continue = work_idx < total_work_units
+            else:
+                should_continue = wu_iter < num_iters
+
+            while should_continue:
+                # --- Work decode ---
                 if cutlass.const_expr(self.is_varlen):
-                    work_idx = block_idx_x + wu_iter * grid_dim_x
+                    if cutlass.const_expr(not self.persistent):
+                        work_idx = block_idx_x + wu_iter * grid_dim_x
                     v_tile_idx = work_idx % num_v_tiles
                     temp_work = work_idx // num_v_tiles
                     hidx = temp_work % H
@@ -834,16 +903,43 @@ class ChunkDeltaRuleFwdH:
                                   dst=bSG_sGK[None, gk_h.index],
                                   tma_bar_ptr=gk_h.barrier)
 
+                # --- End-of-WU: Load warp fetches next work_idx and signals ---
+                if cutlass.const_expr(self.is_varlen and self.persistent):
+                    with cute.arch.elect_one():
+                        next_idx = _atomic_add_global_i32(
+                            workspace_iter.toint().ir_value(), Int32(1).ir_value())
+                        sWorkIdx[(sched_buf,)] = next_idx
+                        cute.arch.fence_acq_rel_cta()
+                        cute.arch.mbarrier_arrive(sched_mbar_base + sched_buf)
+                    cute.arch.sync_warp()
+                    work_idx = sWorkIdx[(sched_buf,)]
+                    sched_buf = Int32(1) - sched_buf
+                    should_continue = work_idx < total_work_units
+                else:
+                    wu_iter = wu_iter + 1
+                    should_continue = wu_iter < num_iters
+
         # =========================================================================
         # MMA WARP
         # =========================================================================
         elif warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_others)
 
-            for wu_iter in cutlass.range(0, num_iters, unroll=0):
-                # --- Persistent work decode (MMA only needs NT) ---
+            wu_iter = Int32(0)
+            if cutlass.const_expr(self.is_varlen and self.persistent):
+                work_idx = sWorkIdx[(0,)]
+                sched_buf = Int32(1)  # next buffer to wait on
+                sched_phase0 = Int32(1)  # mbar[0]: init consumed phase=0, next=1
+                sched_phase1 = Int32(0)  # mbar[1]: not yet used, next=0
+                should_continue = work_idx < total_work_units
+            else:
+                should_continue = wu_iter < num_iters
+
+            while should_continue:
+                # --- Work decode (MMA only needs NT) ---
                 if cutlass.const_expr(self.is_varlen):
-                    work_idx = block_idx_x + wu_iter * grid_dim_x
+                    if cutlass.const_expr(not self.persistent):
+                        work_idx = block_idx_x + wu_iter * grid_dim_x
                     bidx_mma = (work_idx // num_v_tiles) // H
                     tok_off_mma = cu_seqlens[bidx_mma]
                     NT = (cu_seqlens[bidx_mma + 1] - tok_off_mma + BT - 1) // BT
@@ -881,6 +977,22 @@ class ChunkDeltaRuleFwdH:
                     kv_h.commit()
                     kt_h.release()
                     vnew_h.release()
+
+                # --- End-of-WU: wait for Load warp's scheduling signal ---
+                if cutlass.const_expr(self.is_varlen and self.persistent):
+                    # Wait on mbar[sched_buf] at the right phase
+                    if sched_buf == 0:
+                        cute.arch.mbarrier_wait(sched_mbar_base, sched_phase0)
+                        sched_phase0 = Int32(1) - sched_phase0
+                    else:
+                        cute.arch.mbarrier_wait(sched_mbar_base + 1, sched_phase1)
+                        sched_phase1 = Int32(1) - sched_phase1
+                    work_idx = sWorkIdx[(sched_buf,)]
+                    sched_buf = Int32(1) - sched_buf
+                    should_continue = work_idx < total_work_units
+                else:
+                    wu_iter = wu_iter + 1
+                    should_continue = wu_iter < num_iters
 
         # =========================================================================
         # CUDA CORE WARPS
@@ -974,10 +1086,21 @@ class ChunkDeltaRuleFwdH:
             tTR_cM_h = thr_t2r_kv.partition_D(cM_h)
 
             # ===== Persistent outer loop =====
-            for wu_iter in cutlass.range(0, num_iters, unroll=0):
-                # --- Persistent work decode ---
+            wu_iter = Int32(0)
+            if cutlass.const_expr(self.is_varlen and self.persistent):
+                work_idx = sWorkIdx[(0,)]
+                sched_buf = Int32(1)
+                sched_phase0 = Int32(1)
+                sched_phase1 = Int32(0)
+                should_continue = work_idx < total_work_units
+            else:
+                should_continue = wu_iter < num_iters
+
+            while should_continue:
+                # --- Work decode ---
                 if cutlass.const_expr(self.is_varlen):
-                    work_idx = block_idx_x + wu_iter * grid_dim_x
+                    if cutlass.const_expr(not self.persistent):
+                        work_idx = block_idx_x + wu_iter * grid_dim_x
                     v_tile_idx = work_idx % num_v_tiles
                     temp_work = work_idx // num_v_tiles
                     hidx = temp_work % H
@@ -1127,6 +1250,21 @@ class ChunkDeltaRuleFwdH:
                         v_coord, k_coord = tTR_cM_h[ei]
                         gHt[v_coord + v_tile_idx * self.BV, k_coord] = tTR_rKV[ei]
 
+                # --- End-of-WU: wait for Load warp's scheduling signal ---
+                if cutlass.const_expr(self.is_varlen and self.persistent):
+                    if sched_buf == 0:
+                        cute.arch.mbarrier_wait(sched_mbar_base, sched_phase0)
+                        sched_phase0 = Int32(1) - sched_phase0
+                    else:
+                        cute.arch.mbarrier_wait(sched_mbar_base + 1, sched_phase1)
+                        sched_phase1 = Int32(1) - sched_phase1
+                    work_idx = sWorkIdx[(sched_buf,)]
+                    sched_buf = Int32(1) - sched_buf
+                    should_continue = work_idx < total_work_units
+                else:
+                    wu_iter = wu_iter + 1
+                    should_continue = wu_iter < num_iters
+
         # =========================================================================
         # STORE WARP
         # =========================================================================
@@ -1140,10 +1278,21 @@ class ChunkDeltaRuleFwdH:
             # Store warp local thread index (0..31)
             store_local_tidx = tidx - self.store_warp_id * self.threads_per_warp
 
-            for wu_iter in cutlass.range(0, num_iters, unroll=0):
-                # --- Persistent work decode ---
+            wu_iter = Int32(0)
+            if cutlass.const_expr(self.is_varlen and self.persistent):
+                work_idx = sWorkIdx[(0,)]
+                sched_buf = Int32(1)
+                sched_phase0 = Int32(1)
+                sched_phase1 = Int32(0)
+                should_continue = work_idx < total_work_units
+            else:
+                should_continue = wu_iter < num_iters
+
+            while should_continue:
+                # --- Work decode ---
                 if cutlass.const_expr(self.is_varlen):
-                    work_idx = block_idx_x + wu_iter * grid_dim_x
+                    if cutlass.const_expr(not self.persistent):
+                        work_idx = block_idx_x + wu_iter * grid_dim_x
                     v_tile_idx = work_idx % num_v_tiles
                     temp_work = work_idx // num_v_tiles
                     hidx = temp_work % H
@@ -1259,11 +1408,41 @@ class ChunkDeltaRuleFwdH:
                             cute.arch.cp_async_bulk_wait_group(0, read=True)
                         vnew_handle.release()
 
+                # --- End-of-WU: wait for Load warp's scheduling signal ---
+                if cutlass.const_expr(self.is_varlen and self.persistent):
+                    if sched_buf == 0:
+                        cute.arch.mbarrier_wait(sched_mbar_base, sched_phase0)
+                        sched_phase0 = Int32(1) - sched_phase0
+                    else:
+                        cute.arch.mbarrier_wait(sched_mbar_base + 1, sched_phase1)
+                        sched_phase1 = Int32(1) - sched_phase1
+                    work_idx = sWorkIdx[(sched_buf,)]
+                    sched_buf = Int32(1) - sched_buf
+                    should_continue = work_idx < total_work_units
+                else:
+                    wu_iter = wu_iter + 1
+                    should_continue = wu_iter < num_iters
+
         # =========================================================================
         # EMPTY WARP
         # =========================================================================
         elif warp_idx == self.empty_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_others)
+            # Dynamic scheduling: wait on double-buffered mbarriers for each WU
+            if cutlass.const_expr(self.is_varlen and self.persistent):
+                work_idx = sWorkIdx[(0,)]
+                sched_buf = Int32(1)
+                sched_phase0 = Int32(1)
+                sched_phase1 = Int32(0)
+                while work_idx < total_work_units:
+                    if sched_buf == 0:
+                        cute.arch.mbarrier_wait(sched_mbar_base, sched_phase0)
+                        sched_phase0 = Int32(1) - sched_phase0
+                    else:
+                        cute.arch.mbarrier_wait(sched_mbar_base + 1, sched_phase1)
+                        sched_phase1 = Int32(1) - sched_phase1
+                    work_idx = sWorkIdx[(sched_buf,)]
+                    sched_buf = Int32(1) - sched_buf
 
         tmem.relinquish_alloc_permit()
         self.tmem_dealloc_sync_barrier.arrive_and_wait()
@@ -1622,7 +1801,8 @@ def chunk_gated_delta_rule_fwd_h(
         # use empty instead of zeros to skip the zero-fill kernel launch.
         ht_kern = torch.empty(num_seqs, H, K_dim, V_dim, device=k.device, dtype=torch.float32)
 
-        workspace = torch.empty(num_seqs * 128, dtype=torch.uint8, device=k.device)
+        # Workspace: first 4 bytes used as atomic counter for dynamic scheduling
+        workspace = torch.zeros(max(num_seqs * 128, 4), dtype=torch.uint8, device=k.device)
 
         ps = (Int32(num_seqs), Int32(T), Int32(H), Int32(K_dim), Int32(V_dim))
 

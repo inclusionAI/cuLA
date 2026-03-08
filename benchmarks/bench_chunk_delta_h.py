@@ -385,13 +385,9 @@ def main():
     non_varlen_configs = [
         # Sweep B × H with all features (gk, h0, ht, vnew)
         (1,  8192,  64, True, True, True, True),
-        (1,  8192, 128, True, True, True, True),
         (2,  8192,  64, True, True, True, True),
-        (2,  8192, 128, True, True, True, True),
         (4,  8192,  64, True, True, True, True),
-        (4,  8192, 128, True, True, True, True),
         (8,  8192,  64, True, True, True, True),
-        (8,  8192, 128, True, True, True, True),
     ]
 
     # (num_seqs, total_T, H, ratio, use_gk, use_h0, store_ht, save_vnew)
