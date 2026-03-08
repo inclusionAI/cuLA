@@ -742,7 +742,7 @@ class ChunkDeltaRuleFwdH:
         # LOAD WARP
         # =========================================================================
         if warp_idx == self.load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
+            cute.arch.setmaxregister_decrease(self.num_regs_others)
 
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_h0)
 
@@ -838,7 +838,7 @@ class ChunkDeltaRuleFwdH:
         # MMA WARP
         # =========================================================================
         elif warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
+            cute.arch.setmaxregister_decrease(self.num_regs_others)
 
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 # --- Persistent work decode (MMA only needs NT) ---
@@ -886,7 +886,7 @@ class ChunkDeltaRuleFwdH:
         # CUDA CORE WARPS
         # =========================================================================
         elif warp_idx in self.cuda_warp_ids:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_cuda)
+            cute.arch.setmaxregister_increase(self.num_regs_cuda)
 
             local_tidx = tidx % (self.threads_per_warp * len(self.cuda_warp_ids))
 
@@ -1131,7 +1131,7 @@ class ChunkDeltaRuleFwdH:
         # STORE WARP
         # =========================================================================
         elif warp_idx == self.store_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
+            cute.arch.setmaxregister_decrease(self.num_regs_others)
 
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_h_out)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_vnew_st)
@@ -1263,7 +1263,7 @@ class ChunkDeltaRuleFwdH:
         # EMPTY WARP
         # =========================================================================
         elif warp_idx == self.empty_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
+            cute.arch.setmaxregister_decrease(self.num_regs_others)
 
         tmem.relinquish_alloc_permit()
         self.tmem_dealloc_sync_barrier.arrive_and_wait()
