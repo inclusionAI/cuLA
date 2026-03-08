@@ -100,11 +100,11 @@ class ChunkDeltaRuleFwdH:
         self.store_warp_id = 6
         self.empty_warp_id = 7
         # Register allocation (occ=1 only):
-        # - 208 regs (varlen) / 232 regs (non-varlen) for CUDA warps
-        #   208 is the minimum to eliminate all register spilling in varlen mode
+        # - 232 regs for CUDA warps (both varlen and non-varlen)
+        #   Extra headroom reduces register spilling and improves ILP
         self.min_occupancy = 1
         self.persistent = persistent if is_varlen else False  # only meaningful for varlen
-        self.num_regs_cuda = 208 if is_varlen else 232
+        self.num_regs_cuda = 232
         self.num_regs_others = 40
         self.threads_per_cta = self.threads_per_warp * 8
 
