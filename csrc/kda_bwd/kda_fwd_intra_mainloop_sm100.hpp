@@ -6,6 +6,7 @@
 #include "kda_bwd/helpers.h"
 #include "kda_bwd/gemm.h"
 #include "kda_bwd/utils.h"
+#include "kda_bwd/fwd_util_func.h"
 
 #include <cutlass/barrier.h>
 #include <cutlass/arch/barrier.h>
@@ -70,7 +71,14 @@ struct KdaChunkFwdIntraMainloopSm100 {
         Step<_1, _2>{}
     ), Shape<_1, _1>{}));
 
-    // Gated MMA K^T (tf32)
+    // Gated MMA B-matrix (tf32) — non-transposed, K-major layout
+    // Forward computes Q/K @ K^T, Backward computes dAqk/dAkk @ K.
+    // Forward MMA:  64 × X × 32 (M×N×K), reduces head dim (K=32), B = K^T
+    //   B-matrix shape = (N × K) = (SUB_T_TILE × K_TILE), K-major
+    //   Store pattern: sKG(x_local, y), where x_local = row within sub_tile, y = col group
+    // Backward MMA: 64 × 32 × X (M×N×K), reduces chunk dim (K=SUB_T_TILE), B = K
+    //   B-matrix shape = (K × N) = (SUB_T_TILE × K_TILE), MN-major
+    //   Uses SmemLayoutMatBTF32Tranposed (Layout_MN_SW128_32B_Atom), stored as sKG(y, x_local)
     template<int NUM_TILES>
     using SmemLayoutMatBTF32 = decltype(coalesce(tile_to_shape(
         UMMA::Layout_K_SW128_Atom<tf32>{},
@@ -194,6 +202,48 @@ struct KdaChunkFwdIntraMainloopSm100 {
         int *chunk_indices_ptr, int *cu_len_ptr, int total_tiles)
     {
         // === PERSISTENT CE LOOP (static scheduling, no tile pipeline) ===
+        //
+        // CE warpgroups: WG0 = thread [0,128), WG1 = thread [128,256)
+        // idx_in_warpgroup: 0..127 within each WG
+        //
+        // B-matrix (R2S) thread mapping:
+        //   128 threads per WG cover 16 rows × 8 col-groups = one sub_tile per call
+        //   x_local = idx_in_warpgroup / 8  (row 0..15 within sub_tile)
+        //   y       = idx_in_warpgroup % 8 * 4  (col group 0..28 step 4)
+        //
+        // Lower-triangular 4×4 subchunk matrix (10 total, i=row, j=col):
+        //          j=0         j=1         j=2         j=3
+        //   i=0  intra[0]
+        //   i=1  inter[0]   intra[1]
+        //   i=2  inter[1]   inter[2]   intra[2]
+        //   i=3  inter[3]   inter[4]   inter[5]   intra[3]
+        //
+        // B-matrix formula for block (i, j) with i >= j:
+        //   if i > j (inter): B = exp2(g_first_i - g_j[x]) * K_j[x]  (g_first_i = g[i*16])
+        //   if i == j (intra): B = exp2(g_half_i - g_i[x]) * K_i[x]  (g_half_i = g[i*16+8])
+        //
+        // Column-based processing with fused helpers (load K_j + G once per column):
+        //   col0_4out: intra(0,0) + inter(1,0) + inter(2,0) + inter(3,0)  (4 outputs)
+        //   col1_3out: intra(1,1) + inter(2,1) + inter(3,1)               (3 outputs)
+        //   col2_2out: intra(2,2) + inter(3,2)                            (2 outputs)
+        //   col3_1out: intra(3,3)                                         (1 output)
+        //
+        // Work distribution across 2 WGs (balanced at 5 outputs each):
+        //   WG0: col0 (4 outputs) + col3 (1 output) = 5 outputs
+        //         via fwd_setup_kg_col0_4out + fwd_setup_kg_col3_1out
+        //   WG1: col1 (3 outputs) + col2 (2 outputs) = 5 outputs
+        //         via fwd_setup_kg_col1_3out + fwd_setup_kg_col2_2out
+        //
+        // Benefits over old column-split approach:
+        //   - Each column's K_j + G data loaded exactly ONCE (was 2× for col0-2)
+        //   - No WG idle time (old design: WG1 idle on col3)
+        //   - Perfect 5:5 output balance
+        //
+        // Result: kg_all.inter[0..5] and kg_all.intra[0..3] in SMEM (tf32).
+        //
+        const int idx_in_warpgroup = threadIdx.x % 128;
+        const int wg_idx = threadIdx.x / 128;  // 0 or 1 within CE
+
         CUTE_NO_UNROLL
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
@@ -202,37 +252,101 @@ struct KdaChunkFwdIntraMainloopSm100 {
             int batch_idx = get<0>(blk_coord);
             int head_idx  = get<1>(blk_coord);
             int tile_idx  = get<2>(blk_coord);
+            int start_offset = cu_len_ptr[batch_idx];
+            int seq_len = cu_len_ptr[batch_idx + 1] - cu_len_ptr[batch_idx];
+            int sub_seq_len = min(T_TILE, seq_len - tile_idx * T_TILE);
 
-            // TODO: CE computation body
             for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
+                // ============================================================
+                // Step 1: Wait for K, G data from TMA Load warp
+                // ============================================================
                 g_pipeline.consumer_wait(g_pipe_state_read);
                 k_pipeline.consumer_wait(k_pipe_state_read);
                 q_pipeline.consumer_wait(q_pipe_state_read);
-                
-                // TODO: use the same gn for inter/intra, avoid recompute
-                // TODO: compute prologue
-                // compute qg_inter, kg_inter, kg_inter fused
-                
-                qkg_inter_pipeline.producer_acquire(qkg_inter_pipe_state_write);
-                // R2T qg_inter, kg_inter, tmem store fence
 
-                // R2S kg_inter
-                // notify MMA qkg and kg_inter ready
+                // ============================================================
+                // Step 2: Create SMEM tensor views for this buffer slot
+                // ============================================================
+                Tensor sK = make_tensor(make_smem_ptr(shared_plan->k[k_pipe_state_read.index()].data()), SmemLayoutInputBF16{});
+                Tensor sG = make_tensor(make_smem_ptr(shared_plan->g[g_pipe_state_read.index()].data()), SmemLayoutInputFP32{});
+
+                // B-matrix SMEM views (single-buffered kg_all)
+                // Each sub_tile occupies one SmemLayoutMatBTF32<1> = (16 × 32)
+                // inter[i] and intra[i] are indexed by KG_OFFSET * index inside the helper
+                Tensor sKG_inter = make_tensor(make_smem_ptr(shared_plan->kg_all.inter[0].data()), SmemLayoutMatBTF32<1>{});
+                Tensor sKG_intra = make_tensor(make_smem_ptr(shared_plan->kg_all.intra[0].data()), SmemLayoutMatBTF32<1>{});
+
+                constexpr int kg_offset = SUB_T_TILE * K_TILE;  // stride between sub_tile buffers
+
+                // All 6 inter + 4 intra B-matrices are ready → signal both pipelines
+                qkg_inter_pipeline.producer_acquire(qkg_inter_pipe_state_write);
+                qkg_intra_pipeline.producer_acquire(qkg_intra_pipe_state_write);
+                // ============================================================
+                // Step 3: Compute all 10 B-matrix subchunks (R2S)
+                // ============================================================
+                // Lower-triangular 4×4 pattern, column-by-column processing.
+                // Each fused helper loads K_j + G data ONCE and produces ALL outputs for column j.
+                //
+                // Buffer mapping:
+                //   inter[0]=(1,0), inter[1]=(2,0), inter[2]=(2,1),
+                //   inter[3]=(3,0), inter[4]=(3,1), inter[5]=(3,2)
+                //   intra[0]=(0,0), intra[1]=(1,1), intra[2]=(2,2), intra[3]=(3,3)
+                //
+                // Work distribution (balanced, 5 outputs each):
+                //   WG0: col0 (4 outputs) + col3 (1 output) = 5 outputs
+                //   WG1: col1 (3 outputs) + col2 (2 outputs) = 5 outputs
+                {
+                    if (wg_idx == 0) {
+                        // ---- WG0: Column j=0 (4 outputs) ----
+                        // intra(0,0) + inter(1,0) + inter(2,0) + inter(3,0)
+                        float4 g_half_0, g_first_1, g_first_2, g_first_3;
+                        fwd_setup_kg_col0_4out<decltype(sG), decltype(sK), decltype(sKG_inter), kg_offset>(
+                            sG, sK, sKG_inter, sKG_intra,
+                            idx_in_warpgroup, sub_seq_len,
+                            g_half_0, g_first_1, g_first_2, g_first_3);
+
+                        // ---- WG0: Column j=3 (1 output) ----
+                        // intra(3,3)
+                        float4 g_half_3;
+                        fwd_setup_kg_col3_1out<decltype(sG), decltype(sK), decltype(sKG_intra), kg_offset>(
+                            sG, sK, sKG_intra,
+                            idx_in_warpgroup, sub_seq_len,
+                            g_half_3);
+                    } else {
+                        // ---- WG1: Column j=1 (3 outputs) ----
+                        // intra(1,1) + inter(2,1) + inter(3,1)
+                        float4 g_half_1, g_first_2, g_first_3;
+                        fwd_setup_kg_col1_3out<decltype(sG), decltype(sK), decltype(sKG_inter), kg_offset>(
+                            sG, sK, sKG_inter, sKG_intra,
+                            idx_in_warpgroup, sub_seq_len,
+                            g_half_1, g_first_2, g_first_3);
+
+                        // ---- WG1: Column j=2 (2 outputs) ----
+                        // intra(2,2) + inter(3,2)
+                        float4 g_half_2, g_first_3_2;
+                        fwd_setup_kg_col2_2out<decltype(sG), decltype(sK), decltype(sKG_inter), kg_offset>(
+                            sG, sK, sKG_inter, sKG_intra,
+                            idx_in_warpgroup, sub_seq_len,
+                            g_half_2, g_first_3_2);
+                    }
+                }
+
+                // TODO: debug
+
+                // ============================================================
+                // Step 4: Fence SMEM writes and signal MMA
+                // ============================================================
                 fence_view_async_shared();
                 qkg_inter_pipeline.producer_commit(qkg_inter_pipe_state_write);
                 ++qkg_inter_pipe_state_write;
 
-                // compute qg_intra, kg_intra, ktg_intra fused
-                qkg_intra_pipeline.producer_acquire(qkg_intra_pipe_state_write);
-                // R2T qg_intra, kg_intra
-
-                // R2S kg_intra
-                // notify MMA kg_intra ready
                 fence_view_async_shared();
                 qkg_intra_pipeline.producer_commit(qkg_intra_pipe_state_write);
                 ++qkg_intra_pipe_state_write;
 
-                // release q,k,g smem, notify TMA load
+                // ============================================================
+                // Step 5: Release Q, K, G smem buffers back to TMA Load warp
+                // ============================================================
                 g_pipeline.consumer_release(g_pipe_state_read);
                 ++g_pipe_state_read;
                 k_pipeline.consumer_release(k_pipe_state_read);
@@ -240,10 +354,15 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 q_pipeline.consumer_release(q_pipe_state_read);
                 ++q_pipe_state_read;
             }
+
+            // ============================================================
+            // Post-loop: wait for MMA results, epilogue, signal downstream
+            // ============================================================
+            // TODO: A-matrix (R2T) prologue — will be added after B-matrix validation
             // TODO: wait for MMA ready, fence tmem load
             qk_done_pipeline.consumer_wait(qk_done_pipe_state_read);
 
-            // T2R kk
+            // TODO: T2R kk
 
             // TODO: kk epilogue and notify KK inverse
             beta_pipeline.consumer_wait(beta_pipe_state_read);
@@ -258,7 +377,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
             beta_pipeline.consumer_release(beta_pipe_state_read);
             ++beta_pipe_state_read;
 
-            // T2R qk and notify tmem read finished
+            // TODO: T2R qk and notify tmem read finished
             qk_done_pipeline.consumer_release(qk_done_pipe_state_read);
             ++qk_done_pipe_state_read;
 
