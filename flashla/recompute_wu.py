@@ -14,16 +14,15 @@ MMA layout (tcgen05):
   Result = output^T[BN, BT] → transpose in epilogue writes.
   MMA tiler = (64, 64, 64).
 
-Optimization: cooperative SMEM loading.
-  All 128 CUDA threads cooperatively load k/v/gk tiles from GMEM→SMEM
-  using coalesced 128-bit copies, then read from SMEM for element-wise compute.
-  This eliminates scattered GMEM loads (stride H*K between rows) and reduces
-  register spilling from long GMEM latency.
+Optimization: TMA loads for ALL input data (k, v, gk, A_mat).
+  The load warp handles all TMA copy issuance. CUDA warps simply
+  consume data from SMEM after pipeline waits.  Beta is cooperatively
+  loaded (too small for TMA — only BT bf16 values with stride H).
 
 Warp assignment:
-  0-3: CUDA core warps (cooperative load, element-wise compute, GMEM store)
+  0-3: CUDA core warps (element-wise compute, GMEM store)
   4:   MMA warp (tcgen05 GEMM)
-  5:   Load warp (TMA for A_mat)
+  5:   Load warp (TMA for A_mat, k, v, gk)
   6:   Store warp (idle)
   7:   Empty warp (idle)
 """
@@ -77,6 +76,7 @@ class KDARecomputeWU:
         self.empty_warp_id = 7
         self.threads_per_cta = self.threads_per_warp * 8  # 256
         self.num_cuda_warps = len(self.cuda_warp_ids)
+        self.num_cuda_threads = self.threads_per_warp * self.num_cuda_warps  # 128
 
         self.num_regs_cuda = 208
         self.num_regs_others = 40
@@ -91,12 +91,8 @@ class KDARecomputeWU:
 
         self.bproc_stage = 1
         self.acc_stage = 1
-
-        # Cooperative copy parameters
-        self.num_cuda_threads = self.threads_per_warp * self.num_cuda_warps  # 128
-        # For 128-bit vectorized copies:
-        self.vec_bf16 = 8   # 8 bf16 = 128 bits
-        self.vec_fp32 = 4   # 4 fp32 = 128 bits
+        self.kgk_stage = 2
+        self.v_tma_stage = 2
 
     @staticmethod
     def _plan_tmem_offsets(tiled_mma, mma_tiler, tmem_a_layout, acc_stages, io_dtype, acc_dtype):
@@ -128,6 +124,18 @@ class KDARecomputeWU:
             cute.group_modes(smem, 0, 3), cute.group_modes(tCgX, 0, 3),
         )
         return tXsX, tXgX
+
+    @cute.jit
+    def _data_tma_partition(self, atom, tma_tensor_3d, tile_shape, smem, head_idx, batch_idx):
+        """Partition for non-MMA TMA load (epilog-style). Follows fwd_o pattern."""
+        gmem_2d = tma_tensor_3d[None, None, (head_idx, batch_idx)]
+        gC_tiled = cute.local_tile(gmem_2d, tile_shape, (None, None))
+        sC_g = cute.group_modes(smem, 0, 2)
+        gC_g = cute.group_modes(gC_tiled, 0, 2)
+        bSG_sC, bSG_gC = cpasync.tma_partition(
+            atom, 0, cute.make_layout(1), sC_g, gC_g,
+        )
+        return bSG_sC, bSG_gC
 
     @cute.jit
     def __call__(
@@ -175,9 +183,10 @@ class KDARecomputeWU:
             self.acc_stage, self.io_dtype, self.acc_dtype,
         )
 
-        # ---------- SMEM layouts for MMA B operand (A_mat) ----------
+        # ---------- TMA load op ----------
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
 
+        # ---------- SMEM layout: A_mat (MMA B operand) ----------
         a_smem_staged = sm100_utils.make_smem_layout_b(
             tiled_mma, self.mma_tiler, self.io_dtype, 1,
         )
@@ -187,14 +196,47 @@ class KDARecomputeWU:
             (tiled_mma.thr_id.shape,),
         )
 
-        # ---------- GMEM tensor for A_mat ----------
+        # ---------- SMEM layouts: k/v (bf16) and gk (fp32) ----------
+        kv_epi_staged = sm100_utils.make_smem_layout_epi(
+            self.io_dtype, utils.LayoutEnum.ROW_MAJOR,
+            (self.BT, self.BK), self.kgk_stage,
+        )
+        gk_epi_staged = sm100_utils.make_smem_layout_epi(
+            self.acc_dtype, utils.LayoutEnum.ROW_MAJOR,
+            (self.BT, self.BK), self.kgk_stage,
+        )
+
+        # ---------- GMEM tensors ----------
+        # A_mat: (T, BT, (H, B))
         A_layout = cute.make_layout(
             (T, BT, (H, B)),
             stride=(H * BT, 1, (BT, T * H * BT)),
         )
         A_gmem = cute.make_tensor(A_ptr, A_layout)
 
-        # ---------- TMA descriptor for A_mat ----------
+        # k: [B, T, H, K] → (T, K, (H, B))
+        k_layout = cute.make_layout(
+            (T, K, (H, B)),
+            stride=(H * K, 1, (K, T * H * K)),
+        )
+        k_gmem = cute.make_tensor(k_ptr, k_layout)
+
+        # v: [B, T, H, V] → (T, V, (H, B))
+        v_layout = cute.make_layout(
+            (T, V, (H, B)),
+            stride=(H * V, 1, (V, T * H * V)),
+        )
+        v_gmem = cute.make_tensor(v_ptr, v_layout)
+
+        # gk: [B, T, H, K] fp32 → (T, K, (H, B))
+        gk_layout = cute.make_layout(
+            (T, K, (H, B)),
+            stride=(H * K, 1, (K, T * H * K)),
+        )
+        gk_gmem = cute.make_tensor(gk_ptr, gk_layout)
+
+        # ---------- TMA descriptors ----------
+        # A_mat: MMA B operand
         a_smem_one = cute.select(a_smem_staged, mode=[0, 1, 2])
         tma_atom_A, tma_tensor_A = cute.nvgpu.make_tiled_tma_atom_B(
             tma_load_op, A_gmem, a_smem_one, self.mma_tiler, tiled_mma,
@@ -202,40 +244,35 @@ class KDARecomputeWU:
         )
         self.tma_A_bytes = cute.size_in_bytes(self.io_dtype, a_smem_one)
 
-        # ---------- Cooperative copy atoms for CUDA warps (128 threads) ----------
-        copy_atom_bf16 = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            self.io_dtype,
-            num_bits_per_copy=128,
-        )
-        copy_atom_fp32 = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            self.acc_dtype,
-            num_bits_per_copy=128,
-        )
-        # Thread layout: 128 threads across (16 rows, 8 col_groups)
-        # order=(1,0): col_groups vary fastest → threads 0-7 cover same row → coalesced
-        coop_thr_layout = cute.make_ordered_layout((16, 8), order=(1, 0))
-        coop_val_bf16 = cute.make_layout((1, self.vec_bf16))   # (1, 8) → 128 bits
-        coop_val_fp32 = cute.make_layout((1, self.vec_fp32))   # (1, 4) → 128 bits
-
-        coop_copy_bf16 = cute.make_tiled_copy_tv(
-            copy_atom_bf16, coop_thr_layout, coop_val_bf16,
-        )
-        coop_copy_fp32 = cute.make_tiled_copy_tv(
-            copy_atom_fp32, coop_thr_layout, coop_val_fp32,
+        # k: non-MMA epilog TMA
+        kv_epi_smem = cute.select(kv_epi_staged, mode=[0, 1])
+        tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
+            tma_load_op, k_gmem, kv_epi_smem, (self.BT, self.BK),
         )
 
-        # Padded SMEM strides to avoid bank conflicts during T2R-mapped reads:
-        # bf16: stride(BN+2, 1) → bank = (row + col/2) % 32 → no conflict
-        # fp32: stride(BK+1, 1) → bank = (row + col) % 32 → no conflict
-        self.smem_bf16_stride = self.BN + 2   # 66
-        self.smem_fp32_stride = self.BK + 1   # 65
+        # v: non-MMA epilog TMA (same SMEM layout as k, different GMEM)
+        tma_atom_v, tma_tensor_v = cpasync.make_tiled_tma_atom(
+            tma_load_op, v_gmem, kv_epi_smem, (self.BT, self.BV),
+        )
+
+        # gk: non-MMA epilog TMA (fp32)
+        gk_epi_smem = cute.select(gk_epi_staged, mode=[0, 1])
+        tma_atom_gk, tma_tensor_gk = cpasync.make_tiled_tma_atom(
+            tma_load_op, gk_gmem, gk_epi_smem, (self.BT, self.BK),
+        )
+
+        # ---------- TMA byte counts ----------
+        self.tma_bytes_kv = cute.size_in_bytes(self.io_dtype, kv_epi_smem)
+        self.tma_bytes_gk = cute.size_in_bytes(self.acc_dtype, gk_epi_smem)
+        # Combined count for k+gk loads sharing a single barrier
+        self.tma_bytes_kgk = self.tma_bytes_kv + self.tma_bytes_gk
 
         # ---------- SharedStorage ----------
         @cute.struct
         class SharedStorage:
             load_A_mbar: cute.struct.MemRange[Int64, 1 * 2]
+            load_kgk_mbar: cute.struct.MemRange[Int64, self.kgk_stage * 2]
+            load_v_mbar: cute.struct.MemRange[Int64, self.v_tma_stage * 2]
             bproc_mbar: cute.struct.MemRange[Int64, self.bproc_stage * 2]
             acc_mbar: cute.struct.MemRange[Int64, self.acc_stage * 2]
             tmem_holding_buf: Int32
@@ -243,16 +280,17 @@ class KDARecomputeWU:
                 cute.struct.MemRange[self.io_dtype, cute.cosize(a_smem_staged)],
                 self.buffer_align_bytes,
             ]
-            # Cooperative loading buffers (padded for bank conflict avoidance)
-            sDataBF16: cute.struct.Align[
-                cute.struct.MemRange[self.io_dtype, self.BT * self.smem_bf16_stride],
+            # TMA targets for k/v data (shared buffer, swizzled)
+            sKV: cute.struct.Align[
+                cute.struct.MemRange[self.io_dtype, cute.cosize(kv_epi_staged)],
                 self.buffer_align_bytes,
             ]
-            sDataFP32: cute.struct.Align[
-                cute.struct.MemRange[self.acc_dtype, self.BT * self.smem_fp32_stride],
+            # TMA target for gk data (fp32, swizzled)
+            sGK: cute.struct.Align[
+                cute.struct.MemRange[self.acc_dtype, cute.cosize(gk_epi_staged)],
                 self.buffer_align_bytes,
             ]
-            # Beta buffer (64 bf16 with 2-element padding for alignment)
+            # Beta buffer (cooperative load)
             sBeta: cute.struct.Align[
                 cute.struct.MemRange[self.io_dtype, self.BT + 2],
                 128,
@@ -265,11 +303,14 @@ class KDARecomputeWU:
         self.kernel(
             tiled_mma,
             tma_atom_A, tma_tensor_A,
+            tma_atom_k, tma_tensor_k,
+            tma_atom_v, tma_tensor_v,
+            tma_atom_gk, tma_tensor_gk,
             tmem_a_layout,
             a_smem_staged,
-            coop_copy_bf16,
-            coop_copy_fp32,
-            k_ptr, v_ptr, beta_ptr, gk_ptr,
+            kv_epi_staged,
+            gk_epi_staged,
+            beta_ptr,
             w_ptr, u_ptr, kg_ptr,
             problem_size,
         ).launch(
@@ -286,14 +327,17 @@ class KDARecomputeWU:
         tiled_mma: cute.TiledMma,
         tma_atom_A: cute.CopyAtom,
         tma_tensor_A: cute.Tensor,
+        tma_atom_k: cute.CopyAtom,
+        tma_tensor_k: cute.Tensor,
+        tma_atom_v: cute.CopyAtom,
+        tma_tensor_v: cute.Tensor,
+        tma_atom_gk: cute.CopyAtom,
+        tma_tensor_gk: cute.Tensor,
         tmem_a_layout: cute.ComposedLayout,
         a_smem_staged: cute.ComposedLayout,
-        coop_copy_bf16: cute.TiledCopy,
-        coop_copy_fp32: cute.TiledCopy,
-        k_ptr: cute.Pointer,
-        v_ptr: cute.Pointer,
+        kv_epi_staged: cute.ComposedLayout,
+        gk_epi_staged: cute.ComposedLayout,
         beta_ptr: cute.Pointer,
-        gk_ptr: cute.Pointer,
         w_ptr: cute.Pointer,
         u_ptr: cute.Pointer,
         kg_ptr: cute.Pointer,
@@ -304,25 +348,16 @@ class KDARecomputeWU:
 
         if warp_idx == self.load_warp_id:
             cpasync.prefetch_descriptor(tma_atom_A)
+            cpasync.prefetch_descriptor(tma_atom_k)
+            cpasync.prefetch_descriptor(tma_atom_v)
+            cpasync.prefetch_descriptor(tma_atom_gk)
 
         # ---------- SMEM ----------
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sA = storage.sA.get_tensor(a_smem_staged.outer, swizzle=a_smem_staged.inner)
-
-        # Cooperative loading SMEM with padded strides (no swizzle)
-        sDataBF16 = cute.make_tensor(
-            cute.make_ptr(self.io_dtype, storage.sDataBF16.data_ptr().toint(),
-                          cute.AddressSpace.smem),
-            cute.make_layout((self.BT, self.BN),
-                             stride=(self.smem_bf16_stride, 1)),
-        )
-        sDataFP32 = cute.make_tensor(
-            cute.make_ptr(self.acc_dtype, storage.sDataFP32.data_ptr().toint(),
-                          cute.AddressSpace.smem),
-            cute.make_layout((self.BT, self.BK),
-                             stride=(self.smem_fp32_stride, 1)),
-        )
+        sKV = storage.sKV.get_tensor(kv_epi_staged.outer, swizzle=kv_epi_staged.inner)
+        sGK = storage.sGK.get_tensor(gk_epi_staged.outer, swizzle=gk_epi_staged.inner)
         sBeta = cute.make_tensor(
             cute.make_ptr(self.io_dtype, storage.sBeta.data_ptr().toint(),
                           cute.AddressSpace.smem),
@@ -330,6 +365,7 @@ class KDARecomputeWU:
         )
 
         # ---------- Pipelines ----------
+        # A_mat: Load→MMA+CUDA
         load_A_P, load_A_C = pipeline.PipelineTmaAsync.create(
             num_stages=1,
             producer_group=_make_coop_group(1),
@@ -338,19 +374,37 @@ class KDARecomputeWU:
             barrier_storage=storage.load_A_mbar.data_ptr(),
         ).make_participants()
 
+        # k+gk combined TMA: Load→CUDA (both copies share one barrier)
+        load_kgk_P, load_kgk_C = pipeline.PipelineTmaAsync.create(
+            num_stages=self.kgk_stage,
+            producer_group=_make_coop_group(1),
+            consumer_group=_make_coop_group(self.num_cuda_warps),
+            tx_count=self.tma_bytes_kgk,
+            barrier_storage=storage.load_kgk_mbar.data_ptr(),
+        ).make_participants()
+
+        # v TMA: Load→CUDA
+        load_v_P, load_v_C = pipeline.PipelineTmaAsync.create(
+            num_stages=self.v_tma_stage,
+            producer_group=_make_coop_group(1),
+            consumer_group=_make_coop_group(self.num_cuda_warps),
+            tx_count=self.tma_bytes_kv,
+            barrier_storage=storage.load_v_mbar.data_ptr(),
+        ).make_participants()
+
+        # CUDA→MMA: B_proc ready
         bproc_P, bproc_C = pipeline.PipelineAsyncUmma.create(
             num_stages=self.bproc_stage,
-            producer_group=_make_coop_group(
-                self.threads_per_warp * self.num_cuda_warps),
+            producer_group=_make_coop_group(self.num_cuda_threads),
             consumer_group=_make_coop_group(1),
             barrier_storage=storage.bproc_mbar.data_ptr(),
         ).make_participants()
 
+        # MMA→CUDA: accumulator ready
         acc_done_P, acc_done_C = pipeline.PipelineUmmaAsync.create(
             num_stages=self.acc_stage,
             producer_group=_make_coop_group(1),
-            consumer_group=_make_coop_group(
-                self.threads_per_warp * self.num_cuda_warps),
+            consumer_group=_make_coop_group(self.num_cuda_threads),
             barrier_storage=storage.acc_mbar.data_ptr(),
         ).make_participants()
 
@@ -386,19 +440,39 @@ class KDARecomputeWU:
         NV = self.NV
 
         i_t, i_h, i_b = cute.arch.block_idx()
-        bos = i_b * T
 
-        # ---------- TMA partition for A_mat ----------
+        # ---------- TMA partitions (before warp dispatch) ----------
+        # A_mat (MMA B operand)
         tAsA, tAgA = self._tma_partition_B(
             tma_atom_A, tma_tensor_A, sA,
             self.mma_tiler, tiled_mma, i_b, i_h,
         )
 
+        # k: non-MMA → (BT, BK) tiles
+        bSG_sK, bSG_gK = self._data_tma_partition(
+            tma_atom_k, tma_tensor_k, (self.BT, self.BK), sKV, i_h, i_b,
+        )
+
+        # v: non-MMA → (BT, BV) tiles (same SMEM as k)
+        bSG_sV, bSG_gV = self._data_tma_partition(
+            tma_atom_v, tma_tensor_v, (self.BT, self.BV), sKV, i_h, i_b,
+        )
+
+        # gk: non-MMA → (BT, BK) tiles
+        bSG_sGK, bSG_gGK = self._data_tma_partition(
+            tma_atom_gk, tma_tensor_gk, (self.BT, self.BK), sGK, i_h, i_b,
+        )
+
         # =================================================================
-        # LOAD WARP
+        # LOAD WARP — TMA for A_mat, k, v, gk
         # =================================================================
         if warp_idx == self.load_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
+
+            num_k_tiles = Int32(NK)
+            num_v_tiles = Int32(NV)
+
+            # TMA load A_mat (once)
             h_a = load_A_P.acquire_and_advance()
             cute.copy(
                 tma_atom_A,
@@ -406,6 +480,32 @@ class KDARecomputeWU:
                 tAsA[(None, 0)],
                 tma_bar_ptr=h_a.barrier,
             )
+
+            # K-tile loop: load k + gk (combined barrier)
+            for i_k in cutlass.range(0, num_k_tiles, unroll=0):
+                kgk_h = load_kgk_P.acquire_and_advance()
+                cute.copy(
+                    tma_atom_k,
+                    bSG_gK[(None, i_t, i_k)],
+                    bSG_sK[None, kgk_h.index],
+                    tma_bar_ptr=kgk_h.barrier,
+                )
+                cute.copy(
+                    tma_atom_gk,
+                    bSG_gGK[(None, i_t, i_k)],
+                    bSG_sGK[None, kgk_h.index],
+                    tma_bar_ptr=kgk_h.barrier,
+                )
+
+            # V-tile loop: load v
+            for i_v in cutlass.range(0, num_v_tiles, unroll=0):
+                v_h = load_v_P.acquire_and_advance()
+                cute.copy(
+                    tma_atom_v,
+                    bSG_gV[(None, i_t, i_v)],
+                    bSG_sV[None, v_h.index],
+                    tma_bar_ptr=v_h.barrier,
+                )
 
         # =================================================================
         # STORE WARP — idle
@@ -491,15 +591,7 @@ class KDARecomputeWU:
             tTR_rBproc = cute.make_rmem_tensor(tTR_sOut.shape, self.io_dtype)
             tRT_rBproc = cute.make_rmem_tensor(r2t_src_shape, self.io_dtype)
 
-            # ---- Cooperative copy thread views ----
-            thr_bf16 = coop_copy_bf16.get_slice(local_tidx)
-            thr_fp32 = coop_copy_fp32.get_slice(local_tidx)
-
-            # SMEM destination partitions (constant across tiles)
-            tCsDataBF16 = thr_bf16.partition_D(sDataBF16)
-            tCsDataFP32 = thr_fp32.partition_D(sDataFP32)
-
-            # ---- NamedBarrier for CUDA warp sync ----
+            # ---- NamedBarrier for CUDA warp sync (beta loading) ----
             cuda_sync = pipeline.NamedBarrier(
                 barrier_id=2, num_threads=self.num_cuda_threads)
 
@@ -507,26 +599,23 @@ class KDARecomputeWU:
             a_h = load_A_C.wait_and_advance()
             a_h.release()
 
-            # GMEM strides
+            # GMEM strides for output writes
             stride_k = cute.assume(H * K, divby=1)
             stride_v = cute.assume(H * V, divby=1)
             stride_beta = cute.assume(H, divby=1)
 
+            bos = i_b * T
             time_base = (bos + i_t * BT) * H + i_h
-            last_t = cutlass.min(i_t * BT + BT, T) - Int32(1)
 
             num_k_tiles = Int32(NK)
             num_v_tiles = Int32(NV)
 
-            # -- Load beta into SMEM once (shared across all K/V tiles) --
-            # (sBeta tensor created before warp dispatch to avoid DSLTreeFlattenError)
-            # Cooperative load: first BT threads each load 1 beta element
+            # -- Load beta into SMEM once (cooperative across CUDA warps) --
             beta_gmem_p = cute.make_ptr(self.io_dtype, (beta_ptr + time_base).toint(),
                                         cute.AddressSpace.gmem, assumed_align=2)
             beta_gmem = cute.make_tensor(beta_gmem_p,
                 cute.make_layout((self.BT,), stride=(stride_beta,)))
-            # Use threads 0..BT-1 to load beta; others get redundant copy
-            beta_load_idx = local_tidx % self.BT  # constexpr divisor
+            beta_load_idx = local_tidx % self.BT
             sBeta[beta_load_idx] = beta_gmem[beta_load_idx]
             cuda_sync.arrive_and_wait()
 
@@ -534,34 +623,14 @@ class KDARecomputeWU:
             # K-tile loop: compute w and kg
             # ==============================================================
             for i_k in cutlass.range(0, num_k_tiles, unroll=0):
-                k_off = time_base * K + i_k * BK
+                # Wait for TMA: k + gk data ready in sKV and sGK
+                kgk_h = load_kgk_C.wait_and_advance()
 
-                # -- GMEM tensors for cooperative load --
-                k_tile_p = cute.make_ptr(self.io_dtype, (k_ptr + k_off).toint(),
-                                         cute.AddressSpace.gmem, assumed_align=2)
-                gmem_k = cute.make_tensor(k_tile_p,
-                    cute.make_layout((self.BT, self.BK), stride=(stride_k, 1)))
-
-                gk_tile_p = cute.make_ptr(self.acc_dtype, (gk_ptr + k_off).toint(),
-                                          cute.AddressSpace.gmem, assumed_align=4)
-                gmem_gk = cute.make_tensor(gk_tile_p,
-                    cute.make_layout((self.BT, self.BK), stride=(stride_k, 1)))
-
-                # -- Cooperative load: GMEM → SMEM (coalesced) --
-                tCgK = thr_bf16.partition_S(gmem_k)
-                cute.autovec_copy(tCgK, tCsDataBF16)
-
-                tCgGK = thr_fp32.partition_S(gmem_gk)
-                cute.autovec_copy(tCgGK, tCsDataFP32)
-
-                # Sync: ensure all SMEM writes complete before reads
-                cuda_sync.arrive_and_wait()
-
-                # -- Compute B_proc from SMEM (k, gk, beta all from SMEM) --
+                # -- Compute B_proc from SMEM: k * beta * exp2(gk) --
                 for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                     m_coord, k_coord = tTR_cM[ei]
-                    k_val = sDataBF16[(k_coord, m_coord)].to(self.acc_dtype)
-                    gk_val = sDataFP32[(k_coord, m_coord)]
+                    k_val = sKV[(k_coord, m_coord, kgk_h.index)].to(self.acc_dtype)
+                    gk_val = sGK[(k_coord, m_coord, kgk_h.index)]
                     beta_val = sBeta[k_coord].to(self.acc_dtype)
                     tTR_rBproc[ei] = (k_val * beta_val * cute.exp2(gk_val)).to(self.io_dtype)
 
@@ -573,12 +642,8 @@ class KDARecomputeWU:
                 bproc_h.commit()
 
                 # -- Compute kg from SMEM (overlaps with MMA) --
-                gn_off = (bos + last_t) * H * K + i_h * K + i_k * BK
-                gn_p = cute.make_ptr(self.acc_dtype, (gk_ptr + gn_off).toint(),
-                                     cute.AddressSpace.gmem, assumed_align=4)
-                gn_row = cute.make_tensor(gn_p,
-                    cute.make_layout((self.BK,), stride=(1,)))
-
+                # gn = gk[last_row] read directly from SMEM
+                k_off = time_base * K + i_k * BK
                 kg_tile_p = cute.make_ptr(self.io_dtype, (kg_ptr + k_off).toint(),
                                           cute.AddressSpace.gmem, assumed_align=2)
                 kg_tile = cute.make_tensor(kg_tile_p,
@@ -586,13 +651,13 @@ class KDARecomputeWU:
 
                 for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                     m_coord, k_coord = tTR_cM[ei]
-                    k_val2 = sDataBF16[(k_coord, m_coord)].to(self.acc_dtype)
-                    gk_val2 = sDataFP32[(k_coord, m_coord)]
-                    gn_val = gn_row[m_coord]
+                    k_val2 = sKV[(k_coord, m_coord, kgk_h.index)].to(self.acc_dtype)
+                    gk_val2 = sGK[(k_coord, m_coord, kgk_h.index)]
+                    gn_val = sGK[(self.BT - 1, m_coord, kgk_h.index)]
                     kg_tile[(k_coord, m_coord)] = (k_val2 * cute.exp2(gn_val - gk_val2)).to(self.io_dtype)
 
-                # Sync: ensure all SMEM reads done before next cooperative load
-                cuda_sync.arrive_and_wait()
+                # Release SMEM for next TMA load
+                kgk_h.release()
 
                 # -- Wait for MMA, T2R → w --
                 acc_h = acc_done_C.wait_and_advance()
@@ -613,23 +678,13 @@ class KDARecomputeWU:
             # V-tile loop: compute u
             # ==============================================================
             for i_v in cutlass.range(0, num_v_tiles, unroll=0):
-                v_off = time_base * V + i_v * BV
-
-                # -- Cooperative load v → SMEM --
-                v_tile_p = cute.make_ptr(self.io_dtype, (v_ptr + v_off).toint(),
-                                         cute.AddressSpace.gmem, assumed_align=2)
-                gmem_v = cute.make_tensor(v_tile_p,
-                    cute.make_layout((self.BT, self.BV), stride=(stride_v, 1)))
-
-                tCgV = thr_bf16.partition_S(gmem_v)
-                cute.autovec_copy(tCgV, tCsDataBF16)
-
-                cuda_sync.arrive_and_wait()
+                # Wait for TMA: v data ready in sKV
+                v_h = load_v_C.wait_and_advance()
 
                 # -- Compute B_proc = v * beta from SMEM --
                 for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                     m_coord, k_coord = tTR_cM[ei]
-                    v_val = sDataBF16[(k_coord, m_coord)].to(self.acc_dtype)
+                    v_val = sKV[(k_coord, m_coord, v_h.index)].to(self.acc_dtype)
                     beta_val = sBeta[k_coord].to(self.acc_dtype)
                     tTR_rBproc[ei] = (v_val * beta_val).to(self.io_dtype)
 
@@ -639,8 +694,8 @@ class KDARecomputeWU:
                 cute.arch.fence_view_async_tmem_store()
                 bproc_h2.commit()
 
-                # Sync: ensure all SMEM reads done
-                cuda_sync.arrive_and_wait()
+                # Release SMEM for next TMA load
+                v_h.release()
 
                 # -- Wait for MMA, T2R → u --
                 acc_h2 = acc_done_C.wait_and_advance()
@@ -648,6 +703,7 @@ class KDARecomputeWU:
                 cute.arch.fence_view_async_tmem_load()
                 acc_h2.release()
 
+                v_off = time_base * V + i_v * BV
                 u_tile_p = cute.make_ptr(self.io_dtype, (u_ptr + v_off).toint(),
                                          cute.AddressSpace.gmem, assumed_align=2)
                 u_tile = cute.make_tensor(u_tile_p,
