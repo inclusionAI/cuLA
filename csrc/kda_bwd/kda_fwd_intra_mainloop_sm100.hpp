@@ -21,6 +21,10 @@ namespace sm100 {
 using cutlass::arch::fence_view_async_shared;
 using namespace cute;
 
+struct KdaChunkFwdIntraSm100NamedBarriers {
+    static constexpr int ComputePrologue = 0;
+};
+
 // ===================================================================
 // Mainloop struct: KdaChunkFwdIntraMainloopSm100
 // Self-contained: owns all pipeline types, SMEM layouts, SharedMemoryPlan,
@@ -330,6 +334,17 @@ struct KdaChunkFwdIntraMainloopSm100 {
                             g_half_2, g_first_3_2);
                     }
                 }
+
+                // =====DEBUG=====
+                // wait for smem write finished
+                // cutlass::arch::NamedBarrier::arrive_and_wait(128 * 2, KdaChunkFwdIntraSm100NamedBarriers::ComputePrologue);
+                // if (threadIdx.x == 0) {
+                //     printf("Iter=%d\n", k_idx);
+                //     printf("sKG_inter (0, 0)");
+                //     cute::print_tensor(sKG_inter);
+                //     printf("sKG_intra (0, 0)");
+                //     cute::print_tensor(sKG_intra);
+                // }
 
                 // TODO: debug
 
