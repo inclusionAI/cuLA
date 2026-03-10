@@ -606,6 +606,7 @@ __forceinline__ __device__ void fwd_epilogue_t2r_qk(
 
     // R2G: convert to bf16 and write to global memory
     // Only write if this row is valid (row < sub_seq_len)
+    // NOTE: we do not need write zeros here because this is a direct R2G copy, writing zero causes oob write
     if (row < sub_seq_len) {
         #pragma unroll
         for (int i = 0; i < T_TILE / 16; ++i) {
@@ -655,7 +656,7 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
         if (j > mask_limit) {
             res[j] = 0.0f;
         } else {
-            res[j] *= beta_row;
+            res[j] *= float(beta_row);
         }
     }
 
@@ -670,6 +671,13 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
             __half2 h23 = __float22half2_rn(f23);
             *reinterpret_cast<__half2*>(&sKK(row, i * 4))     = h01;
             *reinterpret_cast<__half2*>(&sKK(row, i * 4 + 2)) = h23;
+        }
+    } else {
+        // NOTE: must write zeros to SMEM of invalid token postitions in the current chunk
+        // R2S zero
+        #pragma unroll
+        for (int i = 0; i < T_TILE; ++i) {
+            sKK(row, i) = half_t(0.0f);
         }
     }
 }

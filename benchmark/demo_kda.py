@@ -89,12 +89,11 @@ def test_chunk_kda():
 def test_chunk_kda_varlen():
     device = torch.device("cuda")
     cu_seqlens = [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192]
-    B = len(cu_seqlens) - 1
     T = cu_seqlens[-1]
     cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
     # NOTE: cu_seqlens must be int32 for FlashLA CUDA Impl
     cu_seqlens = cu_seqlens.to(torch.int32)
-    q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens)
+    q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens)
 
     set_seed(SEED)
     w, u, qg, kg, Aqk, Akk = flat_chunk_kda_fwd_intra(
@@ -118,6 +117,6 @@ def test_chunk_kda_varlen():
     assert_close("kg: fla vs. flashla", kg_fla, kg, 0.005)
 
 if __name__ == "__main__":
-    test_kda_chunk_intra()
+    # test_kda_chunk_intra()
     # test_chunk_kda()
     test_chunk_kda_varlen()

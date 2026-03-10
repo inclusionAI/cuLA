@@ -149,9 +149,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
     using PipelineBeta = cutlass::PipelineAsync<2>;
 
-    // TODO: update to PipelineUmmaConsumerAsync after finishing umma
     using PipelineQKGInterReady = cutlass::PipelineUmmaConsumerAsync<1>;
-    using PipelineQKGIntraReady = cutlass::PipelineAsync<1>;
 
     using PipelineQKDone = cutlass::PipelineAsync<1>;
 
@@ -204,7 +202,6 @@ struct KdaChunkFwdIntraMainloopSm100 {
         alignas(16) typename PipelineBeta::SharedStorage pipe_beta_storage;
 
         alignas(16) typename PipelineQKGInterReady::SharedStorage pipe_qkg_inter_storage;
-        alignas(16) typename PipelineQKGIntraReady::SharedStorage pipe_qkg_intra_storage;
 
         alignas(16) typename PipelineQKDone::SharedStorage pipe_qk_done_storage;
 
@@ -233,7 +230,6 @@ struct KdaChunkFwdIntraMainloopSm100 {
     using PipelineStateG        = cutlass::PipelineState<PipelineG::Stages>;
     using PipelineStateBeta     = cutlass::PipelineState<PipelineBeta::Stages>;
     using PipelineStateQKGInter = cutlass::PipelineState<PipelineQKGInterReady::Stages>;
-    using PipelineStateQKGIntra = cutlass::PipelineState<PipelineQKGIntraReady::Stages>;
     using PipelineStateQKDone   = cutlass::PipelineState<PipelineQKDone::Stages>;
     using PipelineStateKKInv    = cutlass::PipelineState<PipelineKKInvReady::Stages>;
 
@@ -252,7 +248,6 @@ struct KdaChunkFwdIntraMainloopSm100 {
         PipelineG &g_pipeline, PipelineStateG &g_pipe_state_read,
         // CE -> MMA pipelines (producer)
         PipelineQKGInterReady   &qkg_inter_pipeline,   PipelineStateQKGInter   &qkg_inter_pipe_state_write,
-        PipelineQKGIntraReady &qkg_intra_pipeline,  PipelineStateQKGIntra &qkg_intra_pipe_state_write,
         // MMA -> CE pipelines (consumer)
         PipelineQKDone &qk_done_pipeline, PipelineStateQKDone &qk_done_pipe_state_read,
         // Beta pipeline (consumer)
@@ -540,12 +535,12 @@ struct KdaChunkFwdIntraMainloopSm100 {
         TileScheduler &tile_scheduler,
         // CE -> MMA pipelines (consumer)
         PipelineQKGInterReady &qkg_inter_pipeline,  PipelineStateQKGInter &qkg_inter_pipe_state_read,
-        PipelineQKGIntraReady &qkg_intra_pipeline,  PipelineStateQKGIntra &qkg_intra_pipe_state_read,
         // MMA -> CE pipelines (producer)
         PipelineQKDone &qk_done_pipeline, PipelineStateQKDone &qk_done_pipe_state_write,
         // Tile decode helpers
         int *chunk_indices_ptr, int *cu_len_ptr, int total_tiles)
     {
+        // FIXME: elect one sync only during MMA
         if (cute::elect_one_sync()) {
             // === PERSISTENT MMA LOOP (static scheduling, no tile pipeline) ===
             CUTE_NO_UNROLL

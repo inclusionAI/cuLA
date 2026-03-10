@@ -755,7 +755,6 @@ def chunk_kda_fwd_intra(
     safe_gate: bool = False,
     disable_recompute: bool = False,
 ):
-    batch_size, seq_len, num_heads, head_dim = q.shape
     assert safe_gate, "Only safe_gate=True is supported in chunk_kda_fwd_intra for now"
     B, T, H, K = k.shape
     BT = chunk_size
@@ -764,7 +763,7 @@ def chunk_kda_fwd_intra(
     reset_cu_seqlens = False
     if cu_seqlens is None:
         reset_cu_seqlens = True
-        cu_seqlens = prepare_uniform_cu_seqlens(batch_size, seq_len, q.device, torch.int32)
+        cu_seqlens = prepare_uniform_cu_seqlens(B, T, q.device, torch.int32)
         warnings.warn(
             "cu_seqlens is not provided and created on-the-fly, will face performance degradation!"
         )
@@ -783,17 +782,19 @@ def chunk_kda_fwd_intra(
     Akk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
 
     # set batch dimension to 1
-    q, k, gk, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, gk, beta))
+    if B != 1:
+        q, k, gk, beta, Aqk, Akk = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, gk, beta, Aqk, Akk))
     tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
     flashla_cuda.chunk_kda_fwd_intra_cuda(
         q, k, gk, beta, cu_seqlens, chunk_indices,
         Aqk, Akk, tile_counter, scale, chunk_size
     )
     # rearrange back
-    q, k, gk, beta, Aqk, Akk = map(
-        lambda x: rearrange(x, "1 (b t) ... -> b t ...", b=batch_size),
-        (q, k, gk, beta, Aqk, Akk),
-    )
+    if B != 1:
+        q, k, gk, beta, Aqk, Akk = map(
+            lambda x: rearrange(x, "1 (b t) ... -> b t ...", b=B),
+            (q, k, gk, beta, Aqk, Akk),
+        )
     if reset_cu_seqlens:
         cu_seqlens = None
 
