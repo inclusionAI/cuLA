@@ -21,7 +21,7 @@ from cutlass.cute.runtime import from_dlpack, make_ptr
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 sys.path.insert(0, "/ossfs/workspace/flashla")
-from flashla.lightning_attn import LinearAttentionChunkwiseDecay, lightning_attn_fwd
+from flashla.lightning_attn import LinearAttentionChunkwiseDecay, lightning_attn_fwd, lightning_attn_fwd_varlen
 
 try:
     from fla.ops.simple_gla import chunk_simple_gla
@@ -65,6 +65,34 @@ def run_cute_kernel(
     )
     torch.cuda.synchronize()
     return O, ht
+
+
+def run_cute_kernel_varlen(
+    Q, K, V, decay, cu_seqlens, scale=1.0, chunk_size=64,
+    state_pool=None, initial_state_indices=None,
+):
+    """Run the CuTeDSL varlen kernel.
+
+    Args:
+        Q, K, V: (1, T, H, D) bfloat16 — packed sequences
+        decay: (H,) float32
+        cu_seqlens: (N+1,) int32
+        state_pool: (pool_size, H, D, D) float32 or None
+        initial_state_indices: (N,) int32 or None
+
+    Returns:
+        O: (1, T, H, D) bfloat16
+        state_pool: (pool_size, H, D, D) float32
+    """
+    O, sp = lightning_attn_fwd_varlen(
+        Q, K, V, decay, cu_seqlens,
+        scale=scale,
+        state_pool=state_pool,
+        initial_state_indices=initial_state_indices,
+        chunk_size=chunk_size,
+    )
+    torch.cuda.synchronize()
+    return O, sp
 
 
 # ---------------------------------------------------------------------------
@@ -339,12 +367,188 @@ def test_against_fla_with_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1,
 
 
 # ===========================================================================
+# Varlen tests
+# ===========================================================================
+
+def test_varlen_single_seq(H=4, S=128, D=128, C=64, decay_val=0.1,
+                           atol=5e-3, rtol=5e-2, verbose=True) -> bool:
+    """Varlen with a single sequence vs non-varlen reference."""
+    if verbose:
+        print(f"\nVarlen single: S={S}, H={H}, D={D}, C={C}, decay={decay_val}")
+
+    torch.manual_seed(42)
+    Q = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    K = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    V = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
+
+    # Non-varlen reference
+    O_ref, ht_ref = run_cute_kernel(Q, K, V, decay, chunk_size=C, output_final_state=True)
+
+    # Varlen
+    cu_seqlens = torch.tensor([0, S], dtype=torch.int32, device="cuda")
+    O_var, sp = run_cute_kernel_varlen(Q, K, V, decay, cu_seqlens, chunk_size=C)
+
+    p1 = _compare("output", O_var, O_ref, atol=atol, rtol=rtol, verbose=verbose)
+    p2 = _compare("state", sp[0], ht_ref, atol=atol, rtol=rtol, verbose=verbose)
+    passed = p1 and p2
+    print(f"  {'✓ PASSED' if passed else '✗ FAILED'}")
+    return passed
+
+
+def test_varlen_multi_seq(seq_lens=None, H=4, D=128, C=64, decay_val=0.1,
+                          atol=5e-3, rtol=5e-2, verbose=True) -> bool:
+    """Varlen with multiple packed sequences vs per-sequence non-varlen reference."""
+    if seq_lens is None:
+        seq_lens = [128, 64, 192]  # all multiples of C
+    if verbose:
+        print(f"\nVarlen multi: seqs={seq_lens}, H={H}, D={D}, C={C}, decay={decay_val}")
+
+    torch.manual_seed(42)
+    T = sum(seq_lens)
+    N = len(seq_lens)
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seq_lens), 0).tolist()),
+        dtype=torch.int32, device="cuda",
+    )
+
+    Q = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    K = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    V = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
+
+    O_var, sp = run_cute_kernel_varlen(Q, K, V, decay, cu_seqlens, chunk_size=C)
+
+    all_pass = True
+    for i, slen in enumerate(seq_lens):
+        bos = cu_seqlens[i].item()
+        eos = cu_seqlens[i + 1].item()
+        Qi = Q[:, bos:eos].contiguous()
+        Ki = K[:, bos:eos].contiguous()
+        Vi = V[:, bos:eos].contiguous()
+        O_ref_i, ht_ref_i = run_cute_kernel(Qi, Ki, Vi, decay, chunk_size=C, output_final_state=True)
+
+        po = _compare(f"O[{i}]", O_var[:, bos:eos], O_ref_i, atol=atol, rtol=rtol, verbose=verbose)
+        ps = _compare(f"ht[{i}]", sp[i], ht_ref_i, atol=atol, rtol=rtol, verbose=verbose)
+        all_pass = all_pass and po and ps
+
+    print(f"  {'✓ PASSED' if all_pass else '✗ FAILED'}")
+    return all_pass
+
+
+def test_varlen_with_initial_state(seq_lens=None, H=4, D=128, C=64, decay_val=0.1,
+                                   atol=5e-3, rtol=5e-2, verbose=True) -> bool:
+    """Varlen with initial state from state pool (non-contiguous indices)."""
+    if seq_lens is None:
+        seq_lens = [128, 64]
+    if verbose:
+        print(f"\nVarlen h0: seqs={seq_lens}, H={H}, D={D}, C={C}, decay={decay_val}")
+
+    torch.manual_seed(42)
+    T = sum(seq_lens)
+    N = len(seq_lens)
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seq_lens), 0).tolist()),
+        dtype=torch.int32, device="cuda",
+    )
+
+    Q = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    K = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    V = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
+
+    # State pool with 3 slots, use indices [2, 0]
+    pool_size = 3
+    state_pool = torch.randn(pool_size, H, D, D, dtype=torch.float32, device="cuda") * 0.01
+    indices = torch.tensor([2, 0], dtype=torch.int32, device="cuda")
+
+    O_var, sp = run_cute_kernel_varlen(
+        Q, K, V, decay, cu_seqlens,
+        chunk_size=C, state_pool=state_pool.clone(),
+        initial_state_indices=indices,
+    )
+
+    all_pass = True
+    for i, slen in enumerate(seq_lens):
+        bos = cu_seqlens[i].item()
+        eos = cu_seqlens[i + 1].item()
+        idx = indices[i].item()
+        Qi = Q[:, bos:eos].contiguous()
+        Ki = K[:, bos:eos].contiguous()
+        Vi = V[:, bos:eos].contiguous()
+        h0_i = state_pool[idx:idx + 1].clone()
+
+        O_ref_i, ht_ref_i = run_cute_kernel(
+            Qi, Ki, Vi, decay, chunk_size=C,
+            initial_state=h0_i, output_final_state=True,
+        )
+
+        po = _compare(f"O[{i}]", O_var[:, bos:eos], O_ref_i, atol=atol, rtol=rtol, verbose=verbose)
+        ps = _compare(f"ht[{i}]", sp[idx], ht_ref_i, atol=atol, rtol=rtol, verbose=verbose)
+        all_pass = all_pass and po and ps
+
+    print(f"  {'✓ PASSED' if all_pass else '✗ FAILED'}")
+    return all_pass
+
+
+def test_varlen_against_pytorch_ref(seq_lens=None, H=4, D=128, C=64, decay_val=0.1,
+                                    atol=5e-3, rtol=5e-2, verbose=True) -> bool:
+    """Varlen against the PyTorch reference with initial state."""
+    if seq_lens is None:
+        seq_lens = [128, 192]
+    if verbose:
+        print(f"\nVarlen vs ref: seqs={seq_lens}, H={H}, D={D}, C={C}, decay={decay_val}")
+
+    torch.manual_seed(42)
+    T = sum(seq_lens)
+    N = len(seq_lens)
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seq_lens), 0).tolist()),
+        dtype=torch.int32, device="cuda",
+    )
+
+    Q = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    K = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    V = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
+
+    state_pool = torch.randn(N, H, D, D, dtype=torch.float32, device="cuda") * 0.01
+
+    O_var, sp = run_cute_kernel_varlen(
+        Q, K, V, decay, cu_seqlens,
+        chunk_size=C, state_pool=state_pool.clone(),
+    )
+
+    all_pass = True
+    for i, slen in enumerate(seq_lens):
+        bos = cu_seqlens[i].item()
+        eos = cu_seqlens[i + 1].item()
+        Qi = Q[:, bos:eos].contiguous()
+        Ki = K[:, bos:eos].contiguous()
+        Vi = V[:, bos:eos].contiguous()
+        h0_i = state_pool[i:i + 1].clone()
+
+        O_ref_i, ht_ref_i = pytorch_reference(
+            Qi, Ki, Vi, decay, chunk_size=C, scale=1.0,
+            initial_state=h0_i, output_final_state=True,
+        )
+        O_ref_bf16 = O_ref_i.to(torch.bfloat16)
+
+        po = _compare(f"O[{i}]", O_var[:, bos:eos], O_ref_bf16, atol=atol, rtol=rtol, verbose=verbose)
+        ps = _compare(f"ht[{i}]", sp[i], ht_ref_i, atol=atol, rtol=rtol, verbose=verbose)
+        all_pass = all_pass and po and ps
+
+    print(f"  {'✓ PASSED' if all_pass else '✗ FAILED'}")
+    return all_pass
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Lightning Attention test suite")
-    parser.add_argument("--test", choices=["basic", "ref", "fla", "h0ht", "all"], default="all")
+    parser.add_argument("--test", choices=["basic", "ref", "fla", "h0ht", "varlen", "all"], default="all")
     parser.add_argument("--verbose", action="store_true", default=True)
     args = parser.parse_args()
 
@@ -425,6 +629,40 @@ def main():
                 ("Batch",       dict(B=2, S=128, H=4, D=128, C=64, decay_val=0.2)),
             ]:
                 results.append((f"FLA h0/ht {tag}", test_against_fla_with_state(**kw, verbose=args.verbose)))
+
+    # ---- Varlen tests ----
+    if args.test in ("varlen", "all"):
+        print("\n" + "=" * 60)
+        print("VARLEN TESTS")
+        print("=" * 60)
+        for tag, kw in [
+            ("Single seq",      dict(H=4, S=128, D=128, C=64, decay_val=0.1)),
+            ("Single long",     dict(H=4, S=256, D=128, C=64, decay_val=0.1)),
+            ("Decay 0.5",       dict(H=4, S=128, D=128, C=64, decay_val=0.5)),
+        ]:
+            results.append((f"Varlen {tag}", test_varlen_single_seq(**kw, verbose=args.verbose)))
+
+        for tag, kw in [
+            ("Multi 3-seq",     dict(seq_lens=[128, 64, 192], H=4, D=128, C=64, decay_val=0.1)),
+            ("Multi 2-seq",     dict(seq_lens=[256, 128],     H=4, D=128, C=64, decay_val=0.1)),
+            ("Multi decay",     dict(seq_lens=[128, 128],     H=4, D=128, C=64, decay_val=0.5)),
+        ]:
+            results.append((f"Varlen {tag}", test_varlen_multi_seq(**kw, verbose=args.verbose)))
+
+        for tag, kw in [
+            ("h0 indirect",     dict(seq_lens=[128, 64], H=4, D=128, C=64, decay_val=0.1)),
+            ("h0 decay 0.2",    dict(seq_lens=[128, 64], H=4, D=128, C=64, decay_val=0.2)),
+        ]:
+            results.append((f"Varlen {tag}", test_varlen_with_initial_state(**kw, verbose=args.verbose)))
+
+        print("\n" + "=" * 60)
+        print("VARLEN TESTS (vs PyTorch ref)")
+        print("=" * 60)
+        for tag, kw in [
+            ("vs ref 2-seq",    dict(seq_lens=[128, 192], H=4, D=128, C=64, decay_val=0.1)),
+            ("vs ref decay",    dict(seq_lens=[64, 128],  H=4, D=128, C=64, decay_val=0.5)),
+        ]:
+            results.append((f"Varlen {tag}", test_varlen_against_pytorch_ref(**kw, verbose=args.verbose)))
 
     # ---- Summary ----
     print("\n" + "=" * 60)
