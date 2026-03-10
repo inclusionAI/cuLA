@@ -76,8 +76,8 @@ struct KdaChunkFwdIntraKernelSm100 {
     static constexpr int NUM_BUF_VALUE       = Mainloop::NUM_BUF_VALUE;
 
     // ===================== Kernel-only Constants =====================
-    static constexpr int REG_COMPUTE  = 168;
-    static constexpr int REG_LOAD     = 64;
+    static constexpr int REG_COMPUTE  = 160;
+    static constexpr int REG_LOAD     = 80;
     static constexpr int REG_INVERSE  = 104;
 
     // ===================== Warp Roles =====================
