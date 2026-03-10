@@ -173,24 +173,18 @@ def run_cutedsl_varlen(Q, K, V, decay, cu_seqlens, persistent, warmup, iters):
     return ms, O, sp, compile_ms
 
 
-def run_fla_perseq(Q, K, V, decay, cu_seqlens, N, warmup, iters):
-    """Run FLA per-sequence (loop over packed sequences)."""
+def run_fla_varlen(Q, K, V, decay, cu_seqlens, warmup, iters):
+    """Run FLA native varlen (single launch via cu_seqlens). FAIR baseline."""
     g_gamma = -decay
+    cu_long = cu_seqlens.to(torch.long)
 
     def fn():
-        for i in range(N):
-            bos = cu_seqlens[i].item()
-            eos = cu_seqlens[i + 1].item()
-            chunk_simple_gla_fwd(
-                q=Q[:, bos:eos].contiguous(),
-                k=K[:, bos:eos].contiguous(),
-                v=V[:, bos:eos].contiguous(),
-                g_gamma=g_gamma,
-                scale=1.0,
-                initial_state=None,
-                output_final_state=True,
-                chunk_size=C,
-            )
+        return chunk_simple_gla_fwd(
+            q=Q, k=K, v=V,
+            g_gamma=g_gamma, scale=1.0,
+            initial_state=None, output_final_state=True,
+            cu_seqlens=cu_long, chunk_size=C,
+        )
 
     fn()  # compile
     ms = time_fn(fn, warmup, iters)
@@ -268,7 +262,7 @@ def benchmark_standard_config(B, T, H, D, layer_idx, num_layers, mode, warmup, i
 # Varlen benchmark
 # =============================================================================
 def benchmark_varlen_config(N, seq_lens, H, D, warmup, iters, dist=""):
-    """Benchmark a varlen config: persistent vs non-persistent vs FLA per-seq."""
+    """Benchmark a varlen config: persistent vs non-persistent vs FLA varlen."""
     T = sum(seq_lens)
     torch.manual_seed(42)
     Q = torch.randn(1, T, H, D, dtype=DTYPE, device=DEVICE)
@@ -302,12 +296,12 @@ def benchmark_varlen_config(N, seq_lens, H, D, warmup, iters, dist=""):
         O_np = None
         reset_cuda_error()
 
-    # --- FLA per-seq ---
+    # --- FLA native varlen (fair: single launch) ---
     try:
-        fla_ms = run_fla_perseq(Q, K, V, decay, cu, N, warmup, iters)
-        result["fla_ms"] = fla_ms
+        fla_vl_ms = run_fla_varlen(Q, K, V, decay, cu, warmup, iters)
+        result["fla_varlen_ms"] = fla_vl_ms
     except Exception as e:
-        result["fla_ms"] = float("nan")
+        result["fla_varlen_ms"] = float("nan")
         reset_cuda_error()
 
     # --- Accuracy: persistent vs non-persistent ---
@@ -321,14 +315,12 @@ def benchmark_varlen_config(N, seq_lens, H, D, warmup, iters, dist=""):
     # --- Speedups ---
     p_ms = result["persistent_ms"]
     np_ms = result["nonpersistent_ms"]
-    fla_ms = result.get("fla_ms", float("nan"))
-
+    fla_vl_ms = result.get("fla_varlen_ms", float("nan"))
     result["p_vs_np_speedup"] = np_ms / p_ms if _valid(p_ms) and _valid(np_ms) else float("nan")
-    result["p_vs_fla_speedup"] = fla_ms / p_ms if _valid(p_ms) and _valid(fla_ms) else float("nan")
-    result["np_vs_fla_speedup"] = fla_ms / np_ms if _valid(np_ms) and _valid(fla_ms) else float("nan")
+    result["p_vs_fla_vl_speedup"] = fla_vl_ms / p_ms if _valid(p_ms) and _valid(fla_vl_ms) else float("nan")
     # For unified summary
     result["cutedsl_ms"] = p_ms
-    result["speedup"] = result["p_vs_fla_speedup"]
+    result["speedup"] = result["p_vs_fla_vl_speedup"]  # use fair comparison
 
     return result
 
@@ -369,8 +361,8 @@ def print_standard_result(r):
 def print_varlen_header():
     hdr = (
         f"{'Config':<24} {'Dist':<8} "
-        f"{'Persist(ms)':>12} {'NonPer(ms)':>11} {'FLA(ms)':>9} "
-        f"{'P/NP':>6} {'P/FLA':>7} {'NP/FLA':>7} "
+        f"{'Persist(ms)':>12} {'NonPer(ms)':>11} {'FLA_vl(ms)':>11} "
+        f"{'P/NP':>6} {'P/FLAvl':>8} "
         f"{'O diff':>10} {'ht diff':>10}"
     )
     print(hdr)
@@ -383,19 +375,18 @@ def print_varlen_result(r):
 
     p_ms = f"{r['persistent_ms']:.3f}" if _valid(r.get("persistent_ms", float("nan"))) else "ERR"
     np_ms = f"{r['nonpersistent_ms']:.3f}" if _valid(r.get("nonpersistent_ms", float("nan"))) else "ERR"
-    fla = f"{r['fla_ms']:.3f}" if _valid(r.get("fla_ms", float("nan"))) else "ERR"
+    fla_vl = f"{r['fla_varlen_ms']:.3f}" if _valid(r.get("fla_varlen_ms", float("nan"))) else "ERR"
 
     pvnp = f"{r['p_vs_np_speedup']:.2f}x" if _valid(r.get("p_vs_np_speedup", float("nan"))) else "-"
-    pvfla = f"{r['p_vs_fla_speedup']:.2f}x" if _valid(r.get("p_vs_fla_speedup", float("nan"))) else "-"
-    npvfla = f"{r['np_vs_fla_speedup']:.2f}x" if _valid(r.get("np_vs_fla_speedup", float("nan"))) else "-"
+    pvfla_vl = f"{r['p_vs_fla_vl_speedup']:.2f}x" if _valid(r.get("p_vs_fla_vl_speedup", float("nan"))) else "-"
 
     od = f"{r['p_vs_np_O_diff']:.1e}" if not np.isnan(r.get("p_vs_np_O_diff", float("nan"))) else "-"
     hd = f"{r['p_vs_np_ht_diff']:.1e}" if not np.isnan(r.get("p_vs_np_ht_diff", float("nan"))) else "-"
 
     print(
         f"{cfg:<24} {dist:<8} "
-        f"{p_ms:>12} {np_ms:>11} {fla:>9} "
-        f"{pvnp:>6} {pvfla:>7} {npvfla:>7} "
+        f"{p_ms:>12} {np_ms:>11} {fla_vl:>11} "
+        f"{pvnp:>6} {pvfla_vl:>8} "
         f"{od:>10} {hd:>10}"
     )
 
@@ -446,29 +437,19 @@ def run_benchmark_suite(args):
     # ===================== Varlen mode =====================
     if "varlen" in modes:
         print(f"\n{'=' * 100}")
-        print(" Varlen Mode: Persistent vs Non-Persistent vs FLA per-seq")
+        print(" Varlen Mode: Persistent vs Non-Persistent vs FLA varlen")
         print(f"{'=' * 100}")
 
         # Build varlen workloads
         workloads = []
 
-        # Small batch decode-like
-        for N in [1, 2, 4, 8]:
-            for T_total in [256, 1024, 4096]:
+        # Focus on N=5..25 range (realistic serving batch sizes)
+        for N in [5, 8, 10, 12, 16, 20, 25]:
+            for T_total in [1024, 2048, 4096, 8192, 16384, 32768]:
                 if T_total // N < 1:
                     continue
                 workloads.append((N, T_total, "uniform"))
-
-        # Medium batch prefill
-        for N in [8, 16, 32]:
-            for T_total in [4096, 8192, 16384]:
-                workloads.append((N, T_total, "uniform"))
                 workloads.append((N, T_total, "skewed"))
-
-        # Large batch: many short seqs
-        for N in [32, 64, 128]:
-            for T_total in [8192, 32768]:
-                workloads.append((N, T_total, "uniform"))
                 workloads.append((N, T_total, "random"))
 
         # Deduplicate
@@ -514,17 +495,14 @@ def run_benchmark_suite(args):
             # persistent vs non-persistent
             pvnp = [r["p_vs_np_speedup"] for r in mode_r if _valid(r.get("p_vs_np_speedup", float("nan")))]
             if pvnp:
-                print(f"    Persist vs NonPer:  avg={np.mean(pvnp):.2f}x  min={np.min(pvnp):.2f}x  max={np.max(pvnp):.2f}x")
-            pvfla = [r["p_vs_fla_speedup"] for r in mode_r if _valid(r.get("p_vs_fla_speedup", float("nan")))]
-            if pvfla:
-                print(f"    Persist vs FLA:     avg={np.mean(pvfla):.2f}x  min={np.min(pvfla):.2f}x  max={np.max(pvfla):.2f}x")
-            npvfla = [r["np_vs_fla_speedup"] for r in mode_r if _valid(r.get("np_vs_fla_speedup", float("nan")))]
-            if npvfla:
-                print(f"    NonPer  vs FLA:     avg={np.mean(npvfla):.2f}x  min={np.min(npvfla):.2f}x  max={np.max(npvfla):.2f}x")
+                print(f"    Persist vs NonPer:      avg={np.mean(pvnp):.2f}x  min={np.min(pvnp):.2f}x  max={np.max(pvnp):.2f}x")
+            pvfla_vl = [r["p_vs_fla_vl_speedup"] for r in mode_r if _valid(r.get("p_vs_fla_vl_speedup", float("nan")))]
+            if pvfla_vl:
+                print(f"    Persist vs FLA varlen:   avg={np.mean(pvfla_vl):.2f}x  min={np.min(pvfla_vl):.2f}x  max={np.max(pvfla_vl):.2f}x  (FAIR)")
             # accuracy
             od = [r["p_vs_np_O_diff"] for r in mode_r if not np.isnan(r.get("p_vs_np_O_diff", float("nan")))]
             if od:
-                print(f"    P vs NP O diff:     max={max(od):.2e}  (bit-exact={all(x==0 for x in od)})")
+                print(f"    P vs NP O diff:         max={max(od):.2e}  (bit-exact={all(x==0 for x in od)})")
         else:
             speedups = [r["speedup"] for r in mode_r]
             print(f"\n  [{mode}]  ({len(mode_r)} configs)")
@@ -573,7 +551,7 @@ def plot_results(all_results, modes):
             labels = [f"N{r['B']}T{r['T']}\n{r.get('dist','')[:3]}" for r in hr]
             p_ms = [r["persistent_ms"] for r in hr]
             np_ms = [r["nonpersistent_ms"] for r in hr]
-            fla_ms = [r["fla_ms"] if _valid(r.get("fla_ms", float("nan"))) else 0 for r in hr]
+            fla_ms = [r["fla_varlen_ms"] if _valid(r.get("fla_varlen_ms", float("nan"))) else 0 for r in hr]
             x = np.arange(len(labels))
             w = 0.25
             ax.bar(x - w, p_ms, w, label="Persistent", color="tab:green")
@@ -630,18 +608,17 @@ def generate_report(all_results, modes, args):
             f.write(f"## Mode: {mode}\n\n")
 
             if mode == "varlen":
-                f.write("| N | T | Dist | Persist(ms) | NonPer(ms) | FLA(ms) | P/NP | P/FLA | NP/FLA | O diff | ht diff |\n")
-                f.write("|---|---|------|-------------|------------|---------|------|-------|--------|--------|--------|\n")
+                f.write("| N | T | Dist | Persist(ms) | NonPer(ms) | FLA_vl(ms) | P/NP | P/FLAvl | O diff | ht diff |\n")
+                f.write("|---|---|------|-------------|------------|------------|------|---------|--------|--------|\n")
                 for r in mr:
                     p = f"{r['persistent_ms']:.3f}" if _valid(r.get("persistent_ms", float("nan"))) else "-"
                     np_ = f"{r['nonpersistent_ms']:.3f}" if _valid(r.get("nonpersistent_ms", float("nan"))) else "-"
-                    fla = f"{r['fla_ms']:.3f}" if _valid(r.get("fla_ms", float("nan"))) else "-"
+                    fla_vl = f"{r['fla_varlen_ms']:.3f}" if _valid(r.get("fla_varlen_ms", float("nan"))) else "-"
                     pvnp = f"{r['p_vs_np_speedup']:.2f}x" if _valid(r.get("p_vs_np_speedup", float("nan"))) else "-"
-                    pvfla = f"{r['p_vs_fla_speedup']:.2f}x" if _valid(r.get("p_vs_fla_speedup", float("nan"))) else "-"
-                    npvfla = f"{r['np_vs_fla_speedup']:.2f}x" if _valid(r.get("np_vs_fla_speedup", float("nan"))) else "-"
+                    pvfla_vl = f"{r['p_vs_fla_vl_speedup']:.2f}x" if _valid(r.get("p_vs_fla_vl_speedup", float("nan"))) else "-"
                     od = f"{r['p_vs_np_O_diff']:.1e}" if not np.isnan(r.get("p_vs_np_O_diff", float("nan"))) else "-"
                     hd = f"{r['p_vs_np_ht_diff']:.1e}" if not np.isnan(r.get("p_vs_np_ht_diff", float("nan"))) else "-"
-                    f.write(f"| {r['B']} | {r['T']} | {r.get('dist','')} | {p} | {np_} | {fla} | {pvnp} | {pvfla} | {npvfla} | {od} | {hd} |\n")
+                    f.write(f"| {r['B']} | {r['T']} | {r.get('dist','')} | {p} | {np_} | {fla_vl} | {pvnp} | {pvfla_vl} | {od} | {hd} |\n")
             else:
                 has_ht = mode == "h0_ht"
                 if has_ht:
@@ -672,10 +649,10 @@ def generate_report(all_results, modes, args):
             if not mr:
                 continue
             if mode == "varlen":
-                pvfla = [r["p_vs_fla_speedup"] for r in mr if _valid(r.get("p_vs_fla_speedup", float("nan")))]
-                if pvfla:
-                    f.write(f"- **varlen Persist vs FLA**: avg {np.mean(pvfla):.2f}x, "
-                            f"min {np.min(pvfla):.2f}x, max {np.max(pvfla):.2f}x ({len(pvfla)} configs)\n")
+                pvfla_vl = [r["p_vs_fla_vl_speedup"] for r in mr if _valid(r.get("p_vs_fla_vl_speedup", float("nan")))]
+                if pvfla_vl:
+                    f.write(f"- **varlen Persist vs FLA varlen (fair)**: avg {np.mean(pvfla_vl):.2f}x, "
+                            f"min {np.min(pvfla_vl):.2f}x, max {np.max(pvfla_vl):.2f}x ({len(pvfla_vl)} configs)\n")
             else:
                 speedups = [r["speedup"] for r in mr]
                 f.write(f"- **{mode}**: avg {np.mean(speedups):.2f}x, "
