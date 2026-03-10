@@ -279,6 +279,10 @@ struct KdaChunkFwdIntraMainloopSm100 {
         //
         const int idx_in_warpgroup = threadIdx.x % 128;
         const int wg_idx = threadIdx.x / 128;  // 0 or 1 within CE
+        constexpr int HALF_K = K_TILE / 2;
+        constexpr int HALF_T = T_TILE / 2;
+        const int k_offset = wg_idx * HALF_K;
+        const int t_offset = wg_idx * HALF_T;
 
         CUTE_NO_UNROLL
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
@@ -435,17 +439,23 @@ struct KdaChunkFwdIntraMainloopSm100 {
             // ============================================================
             // Post-loop: wait for MMA results, epilogue, signal downstream
             // ============================================================
-            // TODO: wait for MMA ready, fence tmem load
             qk_done_pipeline.consumer_wait(qk_done_pipe_state_read);
 
-            // TODO: T2R kk
+            // ============================================================
+            // KK epilogue: T2R + causal mask → SMEM for inverse warpgroup
+            // ============================================================
+            // Upper 64 threads (idx_in_warpgroup >= 64) read KK from TMEM,
+            // apply causal mask, write fp16 to SMEM kk[] for inverse WG.
+            // Lower 64 threads idle here (they will handle QK below).
+            // TODO: T2R kk — fwd_epilogue_t2r_kk
 
-            // TODO: kk epilogue and notify KK inverse
+            // Wait for beta data and notify KK inverse
             beta_pipeline.consumer_wait(beta_pipe_state_read);
             fence_view_async_shared();
 
             kk_inv_pipeline.producer_acquire(kk_inv_pipe_state_write);
 
+            // TODO: kk epilogue (beta scaling, etc.) before commit
             fence_view_async_shared();
             kk_inv_pipeline.producer_commit(kk_inv_pipe_state_write);
             ++kk_inv_pipe_state_write;
@@ -453,12 +463,50 @@ struct KdaChunkFwdIntraMainloopSm100 {
             beta_pipeline.consumer_release(beta_pipe_state_read);
             ++beta_pipe_state_read;
 
-            // TODO: T2R qk and notify tmem read finished
+            // FIXME: use two WGs for epilogue, each process HALF_T elements in T_TILE
+            // ============================================================
+            // QK epilogue: T2R + scale + causal mask → global memory
+            // ============================================================
+            // Lower 64 threads in WG0 read QK from TMEM, multiply by scale,
+            // apply causal mask, and write bf16 to Aqk_out_ptr.
+            //
+            // TMEM address: QK = 0 (the MMA wrote QK results at QK_02/QK_13,
+            // which are the same TMEM rows 0-63 with different dp-lane bank
+            // encoding; tmem_ld_32dp32bNx reads all 64 rows correctly from
+            // the base address QK = 0 for 64 threads across 2 warps).
+            //
+            // Output addressing (Aqk layout: [total_tokens, H, BT]):
+            //   base = Aqk_out_ptr + (token_offset + tile_idx * T_TILE + row) * H * BT
+            //                      + head_idx * BT
+            //   where token_offset = cu_len_ptr[batch_idx], row = idx_in_warpgroup % 64
+            //
+            // Only WG0 does this since both WGs share the same TMEM and would
+            // produce identical results; one WG is sufficient.
+            {
+                int token_offset = cu_len_ptr[batch_idx];
+                int row = idx_in_warpgroup % 64;
+                int BT = T_TILE;  // chunk size = T_TILE for the column dimension
+                int H = params.h;
+                __nv_bfloat16 *Aqk_base = reinterpret_cast<__nv_bfloat16 *>(params.Aqk_out_ptr);
+                __nv_bfloat16 *qk_out_row = Aqk_base
+                    + static_cast<int64_t>(token_offset + tile_idx * T_TILE + row) * H * BT
+                    + head_idx * BT;
+
+                if (wg_idx == 0) {
+                    // Only lower 64 threads handle QK output
+                    if (idx_in_warpgroup < 64) {
+                        fwd_epilogue_t2r_qk<T_TILE>(
+                            static_cast<int>(TmemAllocation::QK),
+                            idx_in_warpgroup,
+                            sub_seq_len,
+                            params.scale,
+                            qk_out_row);
+                    }
+                }
+            }
 
             qk_done_pipeline.consumer_release(qk_done_pipe_state_read);
             ++qk_done_pipe_state_read;
-
-            // TODO: qk epilogue and R2G qk
 
         }
     }
@@ -516,27 +564,29 @@ struct KdaChunkFwdIntraMainloopSm100 {
                     tQK_row3.data() = uint32_t(TmemAllocation::QK_13);
 
                     // kg_inter: 3 MMA calls
+                    // clear_accum only on first k_idx iteration; accumulate across K_ITERATION
                     {
+                        bool first_iter = (k_idx == 0);
                         Tensor tQ_1 = tile_mma_qk_n16_mask02.get_slice(_0{}).make_fragment_A(
                             partition_shape_A(tile_mma_qk_n16_mask02, Shape<Int<CHUNK_SIZE>, Int<K_TILE>>{})
                         );
                         tQ_1.data() = uint32_t(TmemAllocation::QG_INTER_13);
                         Tensor sKG_1 = make_tensor(make_smem_ptr(sp->kg_all.inter[0].data()), SmemLayoutMatBTF32<1>{});
-                        utcmma_ts(tile_mma_qk_n16_mask02, tQ_1, sKG_1, tQK_row1, true);
+                        utcmma_ts(tile_mma_qk_n16_mask02, tQ_1, sKG_1, tQK_row1, first_iter);
 
                         Tensor tQ_2 = tile_mma_qk_n32_mask13.get_slice(_0{}).make_fragment_A(
                             partition_shape_A(tile_mma_qk_n32_mask13, Shape<Int<CHUNK_SIZE>, Int<K_TILE>>{})
                         );
                         tQ_2.data() = uint32_t(TmemAllocation::QG_INTER_02);
                         Tensor sKG_2 = make_tensor(make_smem_ptr(sp->kg_all.inter[1].data()), SmemLayoutMatBTF32<2>{});
-                        utcmma_ts(tile_mma_qk_n32_mask13, tQ_2, sKG_2, tQK_row2, true);
+                        utcmma_ts(tile_mma_qk_n32_mask13, tQ_2, sKG_2, tQK_row2, first_iter);
 
                         Tensor tQ_3 = tile_mma_qk_n48_mask13.get_slice(_0{}).make_fragment_A(
                             partition_shape_A(tile_mma_qk_n48_mask13, Shape<Int<CHUNK_SIZE>, Int<K_TILE>>{})
                         );
                         tQ_3.data() = uint32_t(TmemAllocation::QG_INTER_13);
                         Tensor sKG_3 = make_tensor(make_smem_ptr(sp->kg_all.inter[3].data()), SmemLayoutMatBTF32<3>{});
-                        utcmma_ts(tile_mma_qk_n48_mask13, tQ_3, sKG_3, tQK_row3, true);
+                        utcmma_ts(tile_mma_qk_n48_mask13, tQ_3, sKG_3, tQK_row3, first_iter);
                     }
 
                     tcgen05_after_thread_sync();
@@ -560,33 +610,34 @@ struct KdaChunkFwdIntraMainloopSm100 {
                     tQK_33.data() = uint32_t(TmemAllocation::QK_13) + 48;
 
                     {
+                        bool first_iter = (k_idx == 0);
                         Tensor tQ_0 = tile_mma_qk_n16_mask02.get_slice(_0{}).make_fragment_A(
                             partition_shape_A(tile_mma_qk_n16_mask02, Shape<Int<CHUNK_SIZE>, Int<K_TILE>>{})
                         );
                         tQ_0.data() = uint32_t(TmemAllocation::QG_INTRA_02);
                         Tensor sKG_0 = make_tensor(make_smem_ptr(sp->kg_all.intra[0].data()), SmemLayoutMatBTF32<1>{});
-                        utcmma_ts(tile_mma_qk_n16_mask02, tQ_0, sKG_0, tQK_00, true);
+                        utcmma_ts(tile_mma_qk_n16_mask02, tQ_0, sKG_0, tQK_00, first_iter);
 
                         Tensor tQ_1 = tile_mma_qk_n16_mask02.get_slice(_0{}).make_fragment_A(
                             partition_shape_A(tile_mma_qk_n16_mask02, Shape<Int<CHUNK_SIZE>, Int<K_TILE>>{})
                         );
                         tQ_1.data() = uint32_t(TmemAllocation::QG_INTRA_13);
                         Tensor sKG_1 = make_tensor(make_smem_ptr(sp->kg_all.intra[1].data()), SmemLayoutMatBTF32<1>{});
-                        utcmma_ts(tile_mma_qk_n16_mask02, tQ_1, sKG_1, tQK_11, true);
+                        utcmma_ts(tile_mma_qk_n16_mask02, tQ_1, sKG_1, tQK_11, first_iter);
 
                         Tensor tQ_2 = tile_mma_qk_n16_mask02.get_slice(_0{}).make_fragment_A(
                             partition_shape_A(tile_mma_qk_n16_mask02, Shape<Int<CHUNK_SIZE>, Int<K_TILE>>{})
                         );
                         tQ_2.data() = uint32_t(TmemAllocation::QG_INTRA_02);
                         Tensor sKG_2 = make_tensor(make_smem_ptr(sp->kg_all.intra[2].data()), SmemLayoutMatBTF32<1>{});
-                        utcmma_ts(tile_mma_qk_n16_mask13, tQ_2, sKG_2, tQK_22, true);
+                        utcmma_ts(tile_mma_qk_n16_mask13, tQ_2, sKG_2, tQK_22, first_iter);
 
                         Tensor tQ_3 = tile_mma_qk_n16_mask02.get_slice(_0{}).make_fragment_A(
                             partition_shape_A(tile_mma_qk_n16_mask02, Shape<Int<CHUNK_SIZE>, Int<K_TILE>>{})
                         );
                         tQ_3.data() = uint32_t(TmemAllocation::QG_INTRA_13);
                         Tensor sKG_3 = make_tensor(make_smem_ptr(sp->kg_all.intra[3].data()), SmemLayoutMatBTF32<1>{});
-                        utcmma_ts(tile_mma_qk_n16_mask13, tQ_3, sKG_3, tQK_33, true);
+                        utcmma_ts(tile_mma_qk_n16_mask13, tQ_3, sKG_3, tQK_33, first_iter);
 
                     }
 
