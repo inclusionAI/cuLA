@@ -78,8 +78,8 @@ class KDARecomputeWU:
         self.num_cuda_warps = len(self.cuda_warp_ids)
         self.num_cuda_threads = self.threads_per_warp * self.num_cuda_warps  # 128
 
-        self.num_regs_cuda = 208
-        self.num_regs_others = 40
+        self.num_regs_cuda = 232
+        self.num_regs_others = 24
         self.min_occupancy = 2
 
         self.BN = max(self.BK, self.BV)  # 64
@@ -590,6 +590,7 @@ class KDARecomputeWU:
             tTR_rAcc = cute.make_rmem_tensor(tTR_sOut.shape, self.acc_dtype)
             tTR_rBproc = cute.make_rmem_tensor(tTR_sOut.shape, self.io_dtype)
             tRT_rBproc = cute.make_rmem_tensor(r2t_src_shape, self.io_dtype)
+            tTR_rKg = cute.make_rmem_tensor(tTR_sOut.shape, self.io_dtype)  # deferred kg output
 
             # ---- NamedBarrier for CUDA warp sync (beta loading) ----
             cuda_sync = pipeline.NamedBarrier(
@@ -626,13 +627,18 @@ class KDARecomputeWU:
                 # Wait for TMA: k + gk data ready in sKV and sGK
                 kgk_h = load_kgk_C.wait_and_advance()
 
-                # -- Compute B_proc from SMEM: k * beta * exp2(gk) --
+                # -- Fused: compute B_proc AND kg in single SMEM pass --
                 for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                     m_coord, k_coord = tTR_cM[ei]
                     k_val = sKV[(k_coord, m_coord, kgk_h.index)].to(self.acc_dtype)
                     gk_val = sGK[(k_coord, m_coord, kgk_h.index)]
+                    gn_val = sGK[(self.BT - 1, m_coord, kgk_h.index)]
                     beta_val = sBeta[k_coord].to(self.acc_dtype)
                     tTR_rBproc[ei] = (k_val * beta_val * cute.exp2(gk_val)).to(self.io_dtype)
+                    tTR_rKg[ei] = (k_val * cute.exp2(gn_val - gk_val)).to(self.io_dtype)
+
+                # Release SMEM immediately — done reading sKV/sGK
+                kgk_h.release()
 
                 # -- R2T: B_proc → TMEM --
                 tRT_rBproc.store(tTR_rBproc.load())
@@ -641,23 +647,15 @@ class KDARecomputeWU:
                 cute.arch.fence_view_async_tmem_store()
                 bproc_h.commit()
 
-                # -- Compute kg from SMEM (overlaps with MMA) --
-                # gn = gk[last_row] read directly from SMEM
+                # -- Write kg to GMEM from register (overlaps with MMA) --
                 k_off = time_base * K + i_k * BK
                 kg_tile_p = cute.make_ptr(self.io_dtype, (kg_ptr + k_off).toint(),
                                           cute.AddressSpace.gmem, assumed_align=2)
                 kg_tile = cute.make_tensor(kg_tile_p,
                     cute.make_layout((self.BT, self.BK), stride=(stride_k, 1)))
-
                 for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                     m_coord, k_coord = tTR_cM[ei]
-                    k_val2 = sKV[(k_coord, m_coord, kgk_h.index)].to(self.acc_dtype)
-                    gk_val2 = sGK[(k_coord, m_coord, kgk_h.index)]
-                    gn_val = sGK[(self.BT - 1, m_coord, kgk_h.index)]
-                    kg_tile[(k_coord, m_coord)] = (k_val2 * cute.exp2(gn_val - gk_val2)).to(self.io_dtype)
-
-                # Release SMEM for next TMA load
-                kgk_h.release()
+                    kg_tile[(k_coord, m_coord)] = tTR_rKg[ei]
 
                 # -- Wait for MMA, T2R → w --
                 acc_h = acc_done_C.wait_and_advance()
