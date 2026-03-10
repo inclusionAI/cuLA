@@ -1,14 +1,18 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import warnings
 import torch
 import triton
 import triton.language as tl
 
+from einops import rearrange
 from fla.ops.kda.chunk_intra_token_parallel import chunk_kda_fwd_intra_token_parallel
 from fla.ops.kda.wy_fast import recompute_w_u_fwd
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2, gather
 from fla.utils import IS_GATHER_SUPPORTED, IS_TF32_SUPPORTED, autotune_cache_kwargs
+
+from flashla.utils import prepare_uniform_cu_seqlens
 
 import flashla.cudac as flashla_cuda
 
@@ -751,14 +755,24 @@ def chunk_kda_fwd_intra(
     safe_gate: bool = False,
     disable_recompute: bool = False,
 ):
+    batch_size, seq_len, num_heads, head_dim = q.shape
     assert safe_gate, "Only safe_gate=True is supported in chunk_kda_fwd_intra for now"
     B, T, H, K = k.shape
     BT = chunk_size
     BC = 16
+
+    reset_cu_seqlens = False
+    if cu_seqlens is None:
+        reset_cu_seqlens = True
+        cu_seqlens = prepare_uniform_cu_seqlens(batch_size, seq_len, q.device, torch.int32)
+        warnings.warn(
+            "cu_seqlens is not provided and created on-the-fly, will face performance degradation!"
+        )
+
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
 
-    assert cu_seqlens is not None and chunk_indices is not None, "cu_seqlens and chunk_indices must be provided for cuda impl"
+    # assert cu_seqlens is not None and chunk_indices is not None, "cu_seqlens and chunk_indices must be provided for cuda impl"
     # NOTE: inside kernel we use int32 for cu_seqlens
     assert cu_seqlens.dtype == torch.int32 and chunk_indices.dtype == torch.int32, "cu_seqlens and chunk_indices must be int32 for cuda impl"
 
@@ -768,11 +782,20 @@ def chunk_kda_fwd_intra(
     Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
     Akk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
 
+    # set batch dimension to 1
+    q, k, gk, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, gk, beta))
     tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
     flashla_cuda.chunk_kda_fwd_intra_cuda(
         q, k, gk, beta, cu_seqlens, chunk_indices,
         Aqk, Akk, tile_counter, scale, chunk_size
     )
+    # rearrange back
+    q, k, gk, beta, Aqk, Akk = map(
+        lambda x: rearrange(x, "1 (b t) ... -> b t ...", b=batch_size),
+        (q, k, gk, beta, Aqk, Akk),
+    )
+    if reset_cu_seqlens:
+        cu_seqlens = None
 
     w, u, qg, kg = recompute_w_u_fwd(
         k=k,

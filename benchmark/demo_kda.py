@@ -18,8 +18,8 @@ from flashla.kda.chunk_intra import chunk_kda_fwd_intra as flat_chunk_kda_fwd_in
 from flashla.kda_wrapper import flash_kda_prefill as flashla_fully_fused_kda
 
 # Constant params
-B, H, D = 1, 64, 128
-T = 8192
+B, H, D = 2, 64, 128
+T = 500
 BT = 64  # chunk size
 
 def test_kda_chunk_intra():
@@ -86,6 +86,38 @@ def test_chunk_kda():
     assert_close("O: fla vs. flashla", o_fla, o, 0.05)
     assert_close("ht: fla vs. flashla", final_state_fla, final_state, 0.005)
 
+def test_chunk_kda_varlen():
+    device = torch.device("cuda")
+    cu_seqlens = [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192]
+    B = len(cu_seqlens) - 1
+    T = cu_seqlens[-1]
+    cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
+    # NOTE: cu_seqlens must be int32 for FlashLA CUDA Impl
+    cu_seqlens = cu_seqlens.to(torch.int32)
+    q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens)
+
+    set_seed(SEED)
+    w, u, qg, kg, Aqk, Akk = flat_chunk_kda_fwd_intra(
+                q=q, k=k, v=v, gk=g, beta=beta,
+                scale=scale, cu_seqlens=cu_seqlens,
+                chunk_size=BT, chunk_indices=chunk_indices,
+                safe_gate=True,)
+
+    set_seed(SEED)
+    w_fla, u_fla, qg_fla, kg_fla, Aqk_fla, Akk_fla = fla_chunk_kda_fwd_intra(
+        q=q, k=k, v=v, gk=g, beta=beta,
+        scale=scale, cu_seqlens=cu_seqlens,
+        chunk_size=BT, chunk_indices=chunk_indices,
+        safe_gate=True,
+    )
+
+    assert_close("Aqk: fla vs. flashla", Aqk_fla, Aqk, 0.005)
+    assert_close("Akk: fla vs. flashla", Akk_fla, Akk, 0.005)
+    assert_close("w: fla vs. flashla", w_fla, w, 0.005)
+    assert_close("u: fla vs. flashla", u_fla, u, 0.005)
+    assert_close("kg: fla vs. flashla", kg_fla, kg, 0.005)
+
 if __name__ == "__main__":
-    # test_kda_chunk_intra()
-    test_chunk_kda()
+    test_kda_chunk_intra()
+    # test_chunk_kda()
+    test_chunk_kda_varlen()

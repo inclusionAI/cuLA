@@ -4,10 +4,12 @@
 """
 Utility functions for FlashLA debugging and development.
 """
+import torch
 
 import cutlass
 from cutlass import cute
 
+from fla.utils import tensor_cache
 
 @cute.jit
 def print_tensor_2d(tensor: cute.Tensor):
@@ -110,3 +112,8 @@ def print_tensor_partial(tensor: cute.Tensor, max_rows: int, max_cols: int):
         cute.printf("... (%d more rows)\n", rows - print_rows)
     
     cute.printf("----------------------------------\n")
+
+@tensor_cache
+def prepare_uniform_cu_seqlens(batch_size: int, seqlen: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, device=device, dtype=dtype)
+    return cu_seqlens

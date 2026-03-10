@@ -620,18 +620,21 @@ __forceinline__ __device__ void fwd_epilogue_t2r_qk(
     }
 }
 
-// fwd_epilogue_t2r_kk: T2R for KK result, apply causal mask, R2S
+// fwd_epilogue_t2r_kk: T2R for KK result, apply beta scaling + causal mask, R2S
 // Called by upper 64 threads (idx_in_warpgroup >= 64) of each CE warpgroup.
 // Each thread reads its row of the 64×64 KK matrix from TMEM,
-// applies lower-triangular causal mask, and writes fp16 to SMEM
-// for the inverse warpgroup.  (beta scaling is done separately.)
+// applies beta scaling (row i *= beta[i]), lower-triangular causal mask,
+// converts to fp16, and writes to SMEM for the inverse warpgroup.
 //
 // tmem_kk_addr: TMEM base address for this thread's KK data
+// idx_in_warpgroup: 0..127 within this WG (only threads 64..127 should call this)
 // sub_seq_len: actual sequence length within this tile
+// beta_row: beta scaling factor for this thread's row (from beta_smem)
 // sKK: SMEM tensor for inverse warpgroup (fp16)
 template <int T_TILE, typename KK_SMEM_TENSOR>
 __forceinline__ __device__ void fwd_epilogue_t2r_kk(
     int tmem_kk_addr, int idx_in_warpgroup, int sub_seq_len,
+    float beta_row,
     KK_SMEM_TENSOR &sKK) {
     // T2R: read full row (T_TILE floats) from TMEM
     float res[T_TILE];
@@ -642,13 +645,17 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
 
     int row = idx_in_warpgroup % 64;
 
-    // Apply causal mask: zero out j > row (strictly upper triangle)
-    // Also zero out j >= sub_seq_len (out-of-bounds columns)
+    // Apply beta scaling and causal mask:
+    //   - Multiply valid elements (j <= row && j < sub_seq_len) by beta_row
+    //   - Zero out elements in the strictly upper triangle (j > row)
+    //   - Zero out out-of-bounds columns (j >= sub_seq_len)
     int mask_limit = min(row, sub_seq_len - 1);
     #pragma unroll
     for (int j = 0; j < T_TILE; ++j) {
         if (j > mask_limit) {
             res[j] = 0.0f;
+        } else {
+            res[j] *= beta_row;
         }
     }
 
@@ -669,24 +676,26 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
 
 // fwd_epilogue_qk_kk: combined T2R + causal mask + output for both QK and KK
 // Called by all 128 threads in each CE warpgroup.
-// Lower 64 threads handle QK (scale + mask + R2G), upper 64 threads handle KK (mask + R2S).
+// Lower 64 threads handle QK (scale + mask + R2G), upper 64 threads handle KK (beta + mask + R2S).
 //
 // tmem_qk_addr: TMEM base address for QK / KK data (same region, different dp-lane banks)
 // idx_in_warpgroup: 0..127
 // sub_seq_len: actual sequence length within this tile
 // scale: per-element scaling factor for QK (params.scale)
+// beta_row: beta scaling factor for this thread's row (from beta_smem)
 // qk_out_base: global memory pointer for QK row output (bf16, lower threads only)
 // sKK: SMEM tensor for KK inverse (fp16, upper threads only)
 template <int T_TILE, typename KK_SMEM_TENSOR>
 __forceinline__ __device__ void fwd_epilogue_qk_kk(
     int tmem_qk_addr, int idx_in_warpgroup, int sub_seq_len,
-    float scale, __nv_bfloat16 *qk_out_base,
+    float scale, float beta_row, __nv_bfloat16 *qk_out_base,
     KK_SMEM_TENSOR &sKK) {
     if (idx_in_warpgroup < 64) {
         fwd_epilogue_t2r_qk<T_TILE>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, scale, qk_out_base);
     } else {
-        fwd_epilogue_t2r_kk<T_TILE>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, sKK);
+        fwd_epilogue_t2r_kk<T_TILE>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, beta_row, sKK);
     }
 }
+
 
 } // namespace sm100

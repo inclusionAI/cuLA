@@ -7,6 +7,7 @@
 #include "kda_bwd/gemm.h"
 #include "kda_bwd/utils.h"
 #include "kda_bwd/fwd_util_func.h"
+#include "kda_bwd/collective_inverse.hpp"
 
 #include <cutlass/barrier.h>
 #include <cutlass/arch/barrier.h>
@@ -23,6 +24,7 @@ using namespace cute;
 
 struct KdaChunkFwdIntraSm100NamedBarriers {
     static constexpr int ComputePrologue = 0;
+    static constexpr int InverseMath = 1;
 };
 
 // ===================================================================
@@ -154,6 +156,29 @@ struct KdaChunkFwdIntraMainloopSm100 {
     using PipelineQKDone = cutlass::PipelineAsync<1>;
 
     using PipelineKKInvReady = cutlass::PipelineAsync<1>;
+
+    // ===================== Matrix Inverse =====================
+    using InverseType       = cutlass::half_t;
+    using CollectiveInverse = sm100::CollectiveInverse<InverseType, true, false>;
+
+    // ===================== GMEM Store ===========
+    // Akk: R2G store bf16
+    using TileShapeKK = decltype(make_shape(_64{}, _64{}, _128{}));
+    using Element = cutlass::bfloat16_t;
+    // Adapted from https://github.com/Dao-AILab/flash-attention/blob/9b6dbaceb658f576ea81e2b0189f4b5707a39aae/hopper/epilogue_fwd.hpp#L51
+    static constexpr int kGmemElemsPerStore = sizeof(cute::uint128_t) / sizeof(Element); // 16/2=8
+    static_assert(T_TILE % kGmemElemsPerStore == 0, "Chunk size must be a multiple of kGmemElemsPerStore for Aqk/Akk");
+    static constexpr int kBytePerRow = T_TILE * sizeof(Element); // 64x2=128
+    static constexpr int kBlockKGmem = (kBytePerRow % 128 == 0 ? 128 : (kBytePerRow % 64 == 0 ? 64 : 32)) / sizeof(Element); // 128/2=64
+    // Number of threads required to collaboratively read/write one (128-byte, 64-byte, or 32-byte) block
+    static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerStore; // 8
+    static constexpr int NumEpilogueThreads = cutlass::NumThreadsPerWarpGroup;
+    static_assert(NumEpilogueThreads % kGmemThreadsPerRow == 0, "NumEpilogueThreads must be a multiple of kGmemThreadsPerRow");
+    // Layout of Epilogue threads, named GmemLayoutAtom
+    using GmemLayoutAtom = Layout<Shape<Int<NumEpilogueThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>, Stride<Int<kGmemThreadsPerRow>, _1>>;
+    using GmemTileCopyAtomO = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    using GmemTiledCopyO =
+        decltype(make_tiled_copy(GmemTileCopyAtomO{}, GmemLayoutAtom{}, Layout<Shape<_1, Int<kGmemElemsPerStore>>>{})); // Val layout, 8 or 16 vals per store
 
     // ===================== Shared Memory Plan =====================
     struct SharedMemoryPlan {
@@ -441,69 +466,62 @@ struct KdaChunkFwdIntraMainloopSm100 {
             // ============================================================
             qk_done_pipeline.consumer_wait(qk_done_pipe_state_read);
 
-            // ============================================================
-            // KK epilogue: T2R + causal mask → SMEM for inverse warpgroup
-            // ============================================================
-            // Upper 64 threads (idx_in_warpgroup >= 64) read KK from TMEM,
-            // apply causal mask, write fp16 to SMEM kk[] for inverse WG.
-            // Lower 64 threads idle here (they will handle QK below).
-            // TODO: T2R kk — fwd_epilogue_t2r_kk
-
-            // Wait for beta data and notify KK inverse
+            // Wait for beta data from empty warp
             beta_pipeline.consumer_wait(beta_pipe_state_read);
             fence_view_async_shared();
 
             kk_inv_pipeline.producer_acquire(kk_inv_pipe_state_write);
 
-            // TODO: kk epilogue (beta scaling, etc.) before commit
-            fence_view_async_shared();
-            kk_inv_pipeline.producer_commit(kk_inv_pipe_state_write);
-            ++kk_inv_pipe_state_write;
-
-            beta_pipeline.consumer_release(beta_pipe_state_read);
-            ++beta_pipe_state_read;
-
-            // FIXME: use two WGs for epilogue, each process HALF_T elements in T_TILE
+            // FIXME: use two WGs to do QK/KK epilogue, each process half of T_TILE
             // ============================================================
-            // QK epilogue: T2R + scale + causal mask → global memory
+            // QK + KK epilogue: T2R + mask + scale/beta → global / SMEM
             // ============================================================
-            // Lower 64 threads in WG0 read QK from TMEM, multiply by scale,
-            // apply causal mask, and write bf16 to Aqk_out_ptr.
+            // Lower 64 threads in WG0: QK epilogue (scale + causal mask → global bf16)
+            // Upper 64 threads in WG0: KK epilogue (beta + causal mask → SMEM fp16)
             //
-            // TMEM address: QK = 0 (the MMA wrote QK results at QK_02/QK_13,
-            // which are the same TMEM rows 0-63 with different dp-lane bank
-            // encoding; tmem_ld_32dp32bNx reads all 64 rows correctly from
-            // the base address QK = 0 for 64 threads across 2 warps).
+            // TMEM address: QK = 0 (the MMA wrote QK/KK results at QK_02/QK_13;
+            // tmem_ld_32dp32bNx reads all 64 rows correctly from the base
+            // address QK = 0 for lower 64 threads, and KK occupies the
+            // upper 64 TMEM lanes accessed by upper 64 threads).
             //
-            // Output addressing (Aqk layout: [total_tokens, H, BT]):
-            //   base = Aqk_out_ptr + (token_offset + tile_idx * T_TILE + row) * H * BT
-            //                      + head_idx * BT
-            //   where token_offset = cu_len_ptr[batch_idx], row = idx_in_warpgroup % 64
+            // KK epilogue applies per-row beta scaling: KK[i, :] *= beta[i]
+            // Beta is loaded from beta_smem[pipe_index][row] (Tx1 vector).
             //
-            // Only WG0 does this since both WGs share the same TMEM and would
-            // produce identical results; one WG is sufficient.
+            // Only WG0 does this since both WGs share the same TMEM.
             {
                 int token_offset = cu_len_ptr[batch_idx];
                 int row = idx_in_warpgroup % 64;
-                int BT = T_TILE;  // chunk size = T_TILE for the column dimension
+                int BT = T_TILE;
                 int H = params.h;
                 __nv_bfloat16 *Aqk_base = reinterpret_cast<__nv_bfloat16 *>(params.Aqk_out_ptr);
                 __nv_bfloat16 *qk_out_row = Aqk_base
                     + static_cast<int64_t>(token_offset + tile_idx * T_TILE + row) * H * BT
                     + head_idx * BT;
 
+                // Read per-row beta for KK scaling
+                float beta_row = shared_plan->beta_smem[beta_pipe_state_read.index()][row];
+
+                // Create SMEM tensor view for KK output (fp16)
+                Tensor sKK = make_tensor(make_smem_ptr(shared_plan->kk[0].data()), SmemLayoutOutputFP16{});
+
                 if (wg_idx == 0) {
-                    // Only lower 64 threads handle QK output
-                    if (idx_in_warpgroup < 64) {
-                        fwd_epilogue_t2r_qk<T_TILE>(
-                            static_cast<int>(TmemAllocation::QK),
-                            idx_in_warpgroup,
-                            sub_seq_len,
-                            params.scale,
-                            qk_out_row);
-                    }
+                    fwd_epilogue_qk_kk<T_TILE>(
+                        static_cast<int>(TmemAllocation::QK),
+                        idx_in_warpgroup,
+                        sub_seq_len,
+                        params.scale,
+                        beta_row,
+                        qk_out_row,
+                        sKK);
                 }
             }
+
+            fence_view_async_shared();
+            kk_inv_pipeline.producer_commit(kk_inv_pipe_state_write);
+            ++kk_inv_pipe_state_write;
+
+            beta_pipeline.consumer_release(beta_pipe_state_read);
+            ++beta_pipe_state_read;
 
             qk_done_pipeline.consumer_release(qk_done_pipe_state_read);
             ++qk_done_pipe_state_read;
@@ -739,6 +757,16 @@ struct KdaChunkFwdIntraMainloopSm100 {
         int *chunk_indices_ptr, int *cu_len_ptr, int total_tiles)
     {
         // === PERSISTENT INVERSE LOOP (static scheduling, no tile pipeline) ===
+        int thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
+        // TODO: tf32 inverse
+        static_assert(sizeof(InverseType) == sizeof(Element));
+        // Create SMEM tensor view for KK output (fp16)
+        Tensor sKK_inv = make_tensor(make_smem_ptr(shared_plan->kk[0].data()), SmemLayoutOutputFP16{});
+
+        // TODO: move to host-side params
+        auto shape_Akk = make_shape(params.total_q_len, params.chunk_size, params.h);
+        auto stride_Akk = make_stride(params.chunk_size * params.h, _1{}, params.chunk_size);
+
         CUTE_NO_UNROLL
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
@@ -747,10 +775,63 @@ struct KdaChunkFwdIntraMainloopSm100 {
             int batch_idx = get<0>(blk_coord);
             int head_idx  = get<1>(blk_coord);
             int tile_idx  = get<2>(blk_coord);
+            int token_offset = cu_len_ptr[batch_idx];
+            int seq_len = cu_len_ptr[batch_idx + 1] - cu_len_ptr[batch_idx];
+            int sub_seq_len = min(T_TILE, seq_len - tile_idx * T_TILE);
+            int token_offset_cur = token_offset + tile_idx * T_TILE; 
 
-            // TODO: Inverse computation body
+            // KK R2G Store
+            Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.Akk_out_ptr)), make_layout(shape_Akk, stride_Akk))(_, _, head_idx);
+            // NOTE: currently hardcode to _0{} chunk because each CTA only processes one chunk
+            Tensor gO = local_tile(cute::domain_offset(make_coord(token_offset_cur, _0{}), mO), select<0, 1>(TileShapeKK{}), make_coord(_0{}, _0{}));
+
+            // Inverse computation body
             kk_inv_pipeline.consumer_wait(kk_inv_pipe_state_read);
             fence_view_async_shared();
+
+            auto sKK_inv_pipe_slice = sKK_inv(_, _);
+            auto collective_inverse = CollectiveInverse(KdaChunkFwdIntraSm100NamedBarriers::InverseMath);
+            collective_inverse.compute(sKK_inv_pipe_slice);
+
+            // cast to Element in registers, then R2G directly — no extra R2S + S2R round-trip
+            using GmemTileCopyAtomInv = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, InverseType>;
+            using GmemTiledCopyInv =
+            decltype(make_tiled_copy(GmemTileCopyAtomInv{}, GmemLayoutAtom{}, Layout<Shape<_1, Int<kGmemElemsPerStore>>>{}));
+
+            GmemTiledCopyInv gmem_tiled_copy_inv;
+            auto gmem_thr_copy_inv = gmem_tiled_copy_inv.get_thread_slice(thread_idx);
+
+            GmemTiledCopyO gmem_tiled_copy_O;
+            auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
+
+            // Initialize tOcO and tOpO to predict OOB access
+            Tensor tOcO = gmem_thr_copy_O.partition_D(make_identity_tensor(select<0, 1>(TileShapeKK{})));
+            Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOcO)));
+    #pragma unroll
+            for (int k = 0; k < size(tOpO); ++k) {
+                tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(shape_Akk);
+            }
+            // Initialize tOgO to store O to gmem
+            Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+
+            // wait for inverse done
+            cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, KdaChunkFwdIntraSm100NamedBarriers::InverseMath);
+
+            // S2R with GmemTiledCopy layout, reading InverseType from smem
+            Tensor tOsInv = gmem_thr_copy_inv.partition_S(sKK_inv_pipe_slice);
+            Tensor tOrInv = make_fragment_like(tOsInv);
+            cute::copy(gmem_tiled_copy_inv, tOsInv, tOrInv);
+
+            // Cast InverseType -> Element in registers, then R2G directly
+            Tensor tOrFinalO = make_fragment_like<Element>(tOrInv);
+    #pragma unroll
+            for (int i = 0; i < size(tOrInv); ++i) {
+                tOrFinalO(i) = Element(tOrInv(i));
+            }
+
+            // R2G directly
+            copy_pred</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                gmem_tiled_copy_O, tOrFinalO, tOgO, tOcO, tOpO, sub_seq_len);
 
             kk_inv_pipeline.consumer_release(kk_inv_pipe_state_read);
             ++kk_inv_pipe_state_read;
