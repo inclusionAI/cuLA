@@ -758,10 +758,6 @@ struct KdaChunkFwdIntraMainloopSm100 {
         // Create SMEM tensor view for KK output (fp16)
         Tensor sKK_inv = make_tensor(make_smem_ptr(shared_plan->kk[0].data()), SmemLayoutOutputFP16{});
 
-        // TODO: move to host-side params
-        auto shape_Akk = make_shape(params.total_q_len, params.chunk_size, params.h);
-        auto stride_Akk = make_stride(params.chunk_size * params.h, _1{}, params.chunk_size);
-
         CUTE_NO_UNROLL
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
@@ -776,7 +772,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
             int token_offset_cur = token_offset + tile_idx * T_TILE; 
 
             // KK R2G Store
-            Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.Akk_out_ptr)), make_layout(shape_Akk, stride_Akk))(_, _, head_idx);
+            Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.Akk_out_ptr)), make_layout(params.shape_Akk, params.stride_Akk))(_, _, head_idx);
             // NOTE: currently hardcode to _0{} chunk because each CTA only processes one chunk
             Tensor gO = local_tile(cute::domain_offset(make_coord(token_offset_cur, _0{}), mO), select<0, 1>(TileShapeKK{}), make_coord(_0{}, _0{}));
 
@@ -804,7 +800,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
             Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOcO)));
     #pragma unroll
             for (int k = 0; k < size(tOpO); ++k) {
-                tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(shape_Akk);
+                tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(params.shape_Akk);
             }
             // Initialize tOgO to store O to gmem
             Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
