@@ -219,7 +219,8 @@ struct KdaChunkFwdIntraKernelSm100 {
 
         PipelineBeta beta_pipeline(shared_plan->pipe_beta_storage, beta_pipe_params, /*InitBarriers*/cute::true_type{});
 
-        PipelineQKGInterReady   qkg_inter_pipeline(shared_plan->pipe_qkg_inter_storage, qkg_inter_pipe_params, /*InitBarriers*/cute::true_type{});
+        // PipelineQKGInterReady   qkg_inter_pipeline(shared_plan->pipe_qkg_inter_storage, qkg_inter_pipe_params, /*InitBarriers*/cute::true_type{});
+        PipelineQKGInterReady   qkg_inter_pipeline(shared_plan->pipe_qkg_inter_storage, qkg_inter_pipe_params, ClusterShape{});
         PipelineQKGIntraReady qkg_intra_pipeline(shared_plan->pipe_qkg_intra_storage, qkg_intra_pipe_params, /*InitBarriers*/cute::true_type{});
 
         PipelineQKDone qk_done_pipeline(shared_plan->pipe_qk_done_storage, qk_done_pipe_params, /*InitBarriers*/cute::true_type{});

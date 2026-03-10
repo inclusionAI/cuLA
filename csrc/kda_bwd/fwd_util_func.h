@@ -408,4 +408,266 @@ __forceinline__ __device__ void fwd_setup_A_intra_QK(
     }
 }
 
+// ============================================================
+// Forward Prologue: Combined A-matrix helpers (all 4 subchunks → 1 TMEM store)
+// ============================================================
+//
+// These helpers compute the gated A-matrix for ALL 4 sub_tiles in a single pass.
+// Each thread owns one row (row = idx_in_warpgroup % 64) and determines its
+// sub_tile_i = row / 16. The appropriate g_ref is selected per sub_tile:
+//   inter: g_first = g[sub_tile_i * 16]      (first row of the sub_tile)
+//   intra: g_half  = g[sub_tile_i * 16 + 8]  (middle row of the sub_tile)
+//
+// Result: exp2(g[row] - g_ref) * Vec[row], stored to TMEM via a single
+// tmem_st_32dp32bNx<K_TILE> call.
+//
+// TMEM lane mapping (128 threads = 4 warps in one WG):
+//   Warp 0 (threads 0-31):   Q rows 0-31   → TMEM lanes 0-31
+//   Warp 1 (threads 32-63):  Q rows 32-63  → TMEM lanes 32-63  (lane16 offset)
+//   Warp 2 (threads 64-95):  K rows 0-31   → TMEM lanes 64-95
+//   Warp 3 (threads 96-127): K rows 32-63  → TMEM lanes 96-127 (lane16 offset)
+// All 128 TMEM lanes are covered by one WG (128 threads).
+//
+// FIXME: redundant write
+// When 2 WGs call this function, both write the same data → idempotent / redundant.
+
+// fwd_setup_A_inter_all: all 4 sub_tiles, inter gating, single Vec (Q or K)
+template <int K_TILE, typename G_TENSOR, typename VEC_TENSOR>
+__forceinline__ __device__ void fwd_setup_A_inter_all(
+    G_TENSOR &sG, VEC_TENSOR &sVec,
+    int idx_in_warpgroup, int sub_seq_len,
+    int tmem_addr) {
+    int row = idx_in_warpgroup % 64;
+    int sub_tile_i = row / 16;  // 0, 1, 2, or 3
+    float res[K_TILE];
+    if (row < sub_seq_len) {
+        int g_first_row = min(sub_tile_i * 16, sub_seq_len - 1);
+        #pragma unroll
+        for (int i = 0; i < K_TILE / 4; ++i) {
+            int y = i * 4;
+            float4 g     = *reinterpret_cast<float4*>(&sG(row, y));
+            float4 g_ref = *reinterpret_cast<float4*>(&sG(g_first_row, y));
+            nvbf16x4 v   = *reinterpret_cast<nvbf16x4*>(&sVec(row, y));
+            float2 s1 = float2_sub(reinterpret_cast<float2*>(&g)[0], reinterpret_cast<float2*>(&g_ref)[0]);
+            float2 s2 = float2_sub(reinterpret_cast<float2*>(&g)[1], reinterpret_cast<float2*>(&g_ref)[1]);
+            s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
+            s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+            reinterpret_cast<float2*>(&res[i * 4])[0] = float2_mul(s1, __bfloat1622float2(v.a));
+            reinterpret_cast<float2*>(&res[i * 4])[1] = float2_mul(s2, __bfloat1622float2(v.b));
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < K_TILE; ++i) res[i] = 0.0f;
+    }
+    tmem_st_32dp32bNx<K_TILE>(tmem_addr, res);
+}
+
+// fwd_setup_A_intra_all: all 4 sub_tiles, intra gating, single Vec (Q or K)
+template <int K_TILE, typename G_TENSOR, typename VEC_TENSOR>
+__forceinline__ __device__ void fwd_setup_A_intra_all(
+    G_TENSOR &sG, VEC_TENSOR &sVec,
+    int idx_in_warpgroup, int sub_seq_len,
+    int tmem_addr) {
+    int row = idx_in_warpgroup % 64;
+    int sub_tile_i = row / 16;  // 0, 1, 2, or 3
+    float res[K_TILE];
+    if (row < sub_seq_len) {
+        int g_half_row = min(sub_tile_i * 16 + 8, sub_seq_len - 1);
+        #pragma unroll
+        for (int i = 0; i < K_TILE / 4; ++i) {
+            int y = i * 4;
+            float4 g     = *reinterpret_cast<float4*>(&sG(row, y));
+            float4 g_ref = *reinterpret_cast<float4*>(&sG(g_half_row, y));
+            nvbf16x4 v   = *reinterpret_cast<nvbf16x4*>(&sVec(row, y));
+            float2 s1 = float2_sub(reinterpret_cast<float2*>(&g)[0], reinterpret_cast<float2*>(&g_ref)[0]);
+            float2 s2 = float2_sub(reinterpret_cast<float2*>(&g)[1], reinterpret_cast<float2*>(&g_ref)[1]);
+            s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
+            s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+            reinterpret_cast<float2*>(&res[i * 4])[0] = float2_mul(s1, __bfloat1622float2(v.a));
+            reinterpret_cast<float2*>(&res[i * 4])[1] = float2_mul(s2, __bfloat1622float2(v.b));
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < K_TILE; ++i) res[i] = 0.0f;
+    }
+    tmem_st_32dp32bNx<K_TILE>(tmem_addr, res);
+}
+
+// fwd_setup_A_inter_all_QK: combined Q + K, inter gating, all 4 sub_tiles
+// Threads 0-63 → gated Q → tmem_addr_q
+// Threads 64-127 → gated K → tmem_addr_k
+template <int K_TILE, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
+__forceinline__ __device__ void fwd_setup_A_inter_all_QK(
+    G_TENSOR &sG, Q_TENSOR &sQ, K_TENSOR &sK,
+    int idx_in_warpgroup, int sub_seq_len,
+    int tmem_addr_q, int tmem_addr_k) {
+    if (idx_in_warpgroup < 64) {
+        fwd_setup_A_inter_all<K_TILE>(sG, sQ, idx_in_warpgroup, sub_seq_len, tmem_addr_q);
+    } else {
+        fwd_setup_A_inter_all<K_TILE>(sG, sK, idx_in_warpgroup, sub_seq_len, tmem_addr_k);
+    }
+}
+
+// fwd_setup_A_intra_all_QK: combined Q + K, intra gating, all 4 sub_tiles
+// Threads 0-63 → gated Q → tmem_addr_q
+// Threads 64-127 → gated K → tmem_addr_k
+template <int K_TILE, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
+__forceinline__ __device__ void fwd_setup_A_intra_all_QK(
+    G_TENSOR &sG, Q_TENSOR &sQ, K_TENSOR &sK,
+    int idx_in_warpgroup, int sub_seq_len,
+    int tmem_addr_q, int tmem_addr_k) {
+    if (idx_in_warpgroup < 64) {
+        fwd_setup_A_intra_all<K_TILE>(sG, sQ, idx_in_warpgroup, sub_seq_len, tmem_addr_q);
+    } else {
+        fwd_setup_A_intra_all<K_TILE>(sG, sK, idx_in_warpgroup, sub_seq_len, tmem_addr_k);
+    }
+}
+
+// ============================================================
+// Forward Epilogue: T2R + Causal Mask + R2G / R2S helper functions
+// ============================================================
+//
+// After MMA finishes K_ITERATION accumulations, the full 64×64 QK and KK
+// matrices reside in TMEM. The CE warpgroups perform:
+//   1. T2R: read TMEM → registers (tmem_ld_32dp32bNx<T_TILE>)
+//   2. Causal mask: apply lower-triangular mask in registers (zero j > i)
+//   3. R2G: convert float → bf16 and store to global memory (store_256B)
+//   4. R2S (KK only): write masked KK to SMEM for inverse warpgroup
+//
+// Thread mapping for T2R (128 threads per WG, 2 WGs):
+//   row = idx_in_warpgroup % 64     (each thread owns one row of 64×64)
+//   Lower 64 threads (idx < 64):    QK[row, 0..63] from TMEM QK lanes
+//   Upper 64 threads (idx >= 64):   KK[row, 0..63] from TMEM QK lanes (offset by 64 TMEM lanes)
+//
+// TMEM lane mapping:
+//   QK_02 = lanes 0,2 → threads with (warp_in_wg % 2 == 0), i.e. row 0-15 and 32-47
+//   QK_13 = lanes 1,3 → threads with (warp_in_wg % 2 == 1), i.e. row 16-31 and 48-63
+//
+// Causal mask (lower-triangular):
+//   QK[i, j] = 0 when j > i (only keep j <= i)
+//   KK[i, j] = 0 when j > i (only keep j <= i)
+//   Applied element-wise in registers after T2R.
+//
+// The 64 columns in TMEM map to the 64 sequence positions within the chunk.
+// Column layout mirrors the MMA accumulation pattern:
+//   col 0-15:  sub_tile 0 (positions 0-15)
+//   col 16-31: sub_tile 1 (positions 16-31)
+//   col 32-47: sub_tile 2 (positions 32-47)
+//   col 48-63: sub_tile 3 (positions 48-63)
+
+// fwd_epilogue_t2r_qk: T2R for QK result, apply causal mask, R2G to global memory
+// Called by lower 64 threads (idx_in_warpgroup < 64) of each CE warpgroup.
+// Each thread reads its row of the 64×64 QK matrix from TMEM,
+// applies lower-triangular causal mask, and writes bf16 to global memory.
+//
+// tmem_qk_addr: TMEM base address for this thread's QK data
+// sub_seq_len: actual sequence length within this tile (for bounds checking)
+// qk_out_base: global memory pointer for this thread's row output
+template <int T_TILE>
+__forceinline__ __device__ void fwd_epilogue_t2r_qk(
+    int tmem_qk_addr, int idx_in_warpgroup, int sub_seq_len,
+    __nv_bfloat16 *qk_out_base) {
+    // T2R: read full row (T_TILE floats) from TMEM
+    float res[T_TILE];
+    tcgen05_after_thread_sync();
+    tmem_ld_32dp32bNx<T_TILE>(tmem_qk_addr, res);
+    cutlass::arch::fence_view_async_tmem_load();
+    tcgen05_before_thread_sync();
+
+    int row = idx_in_warpgroup % 64;
+
+    // Apply causal mask: zero out j > row (strictly upper triangle)
+    // Also zero out j >= sub_seq_len (out-of-bounds columns)
+    int mask_limit = min(row, sub_seq_len - 1);  // last valid column
+    #pragma unroll
+    for (int j = 0; j < T_TILE; ++j) {
+        if (j > mask_limit) {
+            res[j] = 0.0f;
+        }
+    }
+
+    // R2G: convert to bf16 and write to global memory
+    // Only write if this row is valid
+    if (row < sub_seq_len) {
+        #pragma unroll
+        for (int i = 0; i < T_TILE / 16; ++i) {
+            bf16x16 out;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                reinterpret_cast<__nv_bfloat162*>(&out)[j] =
+                    __float22bfloat162_rn(reinterpret_cast<float2*>(&res[i * 16])[j]);
+            }
+            store_256B(&out, qk_out_base + i * 16);
+        }
+    }
+}
+
+// fwd_epilogue_t2r_kk: T2R for KK result, apply causal mask, R2G + R2S
+// Called by upper 64 threads (idx_in_warpgroup >= 64) of each CE warpgroup.
+// Each thread reads its row of the 64×64 KK matrix from TMEM,
+// applies lower-triangular causal mask, writes bf16 to global memory,
+// and writes fp16 to SMEM for the inverse warpgroup.
+//
+// tmem_kk_addr: TMEM base address for this thread's KK data
+// sub_seq_len: actual sequence length within this tile
+// kk_out_base: global memory pointer for this thread's row output (bf16)
+// sKK: SMEM tensor for inverse warpgroup (fp16)
+template <int T_TILE, typename KK_SMEM_TENSOR>
+__forceinline__ __device__ void fwd_epilogue_t2r_kk(
+    int tmem_kk_addr, int idx_in_warpgroup, int sub_seq_len,
+    KK_SMEM_TENSOR &sKK) {
+    // T2R: read full row (T_TILE floats) from TMEM
+    float res[T_TILE];
+    tcgen05_after_thread_sync();
+    tmem_ld_32dp32bNx<T_TILE>(tmem_kk_addr, res);
+    cutlass::arch::fence_view_async_tmem_load();
+    tcgen05_before_thread_sync();
+
+    int row = idx_in_warpgroup % 64;
+
+    // Apply causal mask: zero out j > row (strictly upper triangle)
+    // Also zero out j >= sub_seq_len (out-of-bounds columns)
+    int mask_limit = min(row, sub_seq_len - 1);
+    #pragma unroll
+    for (int j = 0; j < T_TILE; ++j) {
+        if (j > mask_limit) {
+            res[j] = 0.0f;
+        }
+    }
+
+    if (row < sub_seq_len) {
+        // R2S: convert to fp16 and write to SMEM for inverse warpgroup
+        #pragma unroll
+        for (int i = 0; i < T_TILE / 4; ++i) {
+            // Convert 4 floats → 4 fp16 values, store as 2×half2
+            float2 f01 = reinterpret_cast<float2*>(res)[i * 2];
+            float2 f23 = reinterpret_cast<float2*>(res)[i * 2 + 1];
+            __half2 h01 = __float22half2_rn(f01);
+            __half2 h23 = __float22half2_rn(f23);
+            *reinterpret_cast<__half2*>(&sKK(row, i * 4))     = h01;
+            *reinterpret_cast<__half2*>(&sKK(row, i * 4 + 2)) = h23;
+        }
+    }
+}
+
+// fwd_epilogue_qk_kk: combined T2R + causal mask + output for both QK and KK
+// Called by all 128 threads in each CE warpgroup.
+// Lower 64 threads handle QK, upper 64 threads handle KK.
+//
+// tmem_qk_addr: TMEM address for QK (lower threads) / KK (upper threads)
+// sub_seq_len: actual sequence length within this tile
+// out_base: global memory pointer for bf16 output (QK or KK row)
+// sKK: SMEM tensor for KK inverse (only written by upper threads)
+template <int T_TILE, typename KK_SMEM_TENSOR>
+__forceinline__ __device__ void fwd_epilogue_qk_kk(
+    int tmem_qk_addr, int idx_in_warpgroup, int sub_seq_len,
+    __nv_bfloat16 *qk_out_base, __nv_bfloat16 *kk_out_base,
+    KK_SMEM_TENSOR &sKK) {
+    if (idx_in_warpgroup < 64) {
+        fwd_epilogue_t2r_qk<T_TILE>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, qk_out_base);
+    } else {
+        fwd_epilogue_t2r_kk<T_TILE>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, kk_out_base, sKK);
+    }
+}
+
 } // namespace sm100
