@@ -1,7 +1,7 @@
 """Sweep register allocation for warp groups."""
 import sys, pathlib, torch, torch.nn.functional as F, triton
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-from benchmark.utils import set_seed, exclusive_cumsum
+from benchmarks.utils import set_seed, exclusive_cumsum
 
 torch.backends.cuda.matmul.allow_tf32 = True
 D = 128; DTYPE = torch.bfloat16; DEV = torch.device("cuda")

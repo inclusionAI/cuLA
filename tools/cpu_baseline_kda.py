@@ -16,7 +16,7 @@ from einops import rearrange
 from fla.modules.l2norm import l2norm_fwd
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
-from benchmark.utils import set_seed
+from benchmarks.utils import set_seed
 
 # Constants - must match bench_kda.py
 B, H, D = 1, 1, 128

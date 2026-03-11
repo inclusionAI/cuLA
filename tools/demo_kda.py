@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from fla.ops.kda import chunk_kda as fla_chunk_kda
 from fla.ops.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from fla.utils import assert_close
-from benchmark.utils import set_seed, exclusive_cumsum, prepare_intra_inputs, prepare_safe_gate_inputs, SEED
+from benchmarks.utils import set_seed, exclusive_cumsum, prepare_intra_inputs, prepare_safe_gate_inputs, SEED
 from torch.profiler import profile, record_function, ProfilerActivity
 
 from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_intra

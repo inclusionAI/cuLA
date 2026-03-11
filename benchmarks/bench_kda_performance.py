@@ -4,7 +4,7 @@ from fla.ops.kda import chunk_kda
 from fla.modules.l2norm import l2norm_fwd
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
-from benchmark.utils import set_seed
+from benchmarks.utils import set_seed
 import time
 import cutlass
 import cutlass.cute as cute

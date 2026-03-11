@@ -10,7 +10,7 @@ from fla.ops.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from fla.ops.kda.gate import fused_kda_gate, naive_kda_gate
 from fla.modules.l2norm import l2norm_fwd
 from fla.utils import assert_close
-from benchmark.utils import set_seed
+from benchmarks.utils import set_seed
 from torch.profiler import profile, record_function, ProfilerActivity
 
 from flashla.kda_wrapper import flash_kda_prefill
