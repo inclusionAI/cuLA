@@ -1578,54 +1578,50 @@ class LinearAttentionChunkwiseDecay:
             cM = cute.make_identity_tensor(self.qk_mma_tiler[:2])
             
             # With ACC_STAGE
-            # O1
+            # O combine: Use a SINGLE register fragment for both PV and SQ loads.
+            # Since both have mma_tiler[:2] = (128, 128), the copy layout is identical.
+            # Reduces peak regs: instead of 128(PV) + 128(SQ) = 256 FP32 simultaneously,
+            # we have 128(shared) + 64(BF16 output) = 192 FP32-equiv.
             (
                 tiled_copy_t2r_pv,
                 tTR_tAcc_base_pv,
-                tTR_rAcc_pv,
+                tTR_rAcc,  # Shared 128 FP32 fragment — reused for PV and SQ
             ) = self.epilog_tmem_copy_and_partition(
                 tidx, tCtAccPV, self.vp_mma_tiler, use_2cta_instrs=False
             )
 
             # ((ATOM_V, REST_V), EPI_M, EPI_N)
-            tTR_rO = cute.make_rmem_tensor(tTR_rAcc_pv.shape, self.io_dtype)
+            tTR_rO = cute.make_rmem_tensor(tTR_rAcc.shape, self.io_dtype)
             tiled_copy_r2s_o, tRS_rO, tRS_sO = self.epilog_smem_copy_and_partition_o(
                 tiled_copy_t2r_pv, tTR_rO, tidx, sO
             )
 
-            thr_copy_r2s_o = tiled_copy_r2s_o.get_slice(tidx)
-
             if cutlass.const_expr(PRINT_DEBUG):
-                print(f"thr_copy_r2s_o: {cute.pretty_str(thr_copy_r2s_o)}")
                 print(f"sO: {cute.pretty_str(sO)}")
                 print(f"tTR_rO: {cute.pretty_str(tTR_rO)}")
                 print(f"tRS_rO: {cute.pretty_str(tRS_rO)}")
                 print(f"tRS_sO: {cute.pretty_str(tRS_sO)}")
 
-            # O2, i.e. O_INTER
-            # SQ: (128, 64), (D, C)
-            (
-                tiled_copy_t2r_sq,
-                tTR_tAcc_base_sq,
-                tTR_rAcc_sq,
-            ) = self.epilog_tmem_copy_and_partition(
-                tidx, tCtAccSQ, self.sq_mma_tiler, use_2cta_instrs=False
+            # SQ TMEM source partition using the SAME tiled copy
+            thr_t2r = tiled_copy_t2r_pv.get_slice(tidx)
+            sq_epitile = self.sq_mma_tiler[:2]
+            tAcc_sq_epi = cute.flat_divide(
+                tCtAccSQ[((None, None), 0, 0, None)], sq_epitile
             )
+            tTR_tAcc_base_sq = thr_t2r.partition_S(tAcc_sq_epi)
 
             # Position identity tensor for SQ output (D, C)
             # Used to apply per-position inter-chunk decay: exp(-s*(pos+1))
             cM_sq = cute.make_identity_tensor(self.sq_mma_tiler[:2])
-            thr_copy_t2r_sq_thread = tiled_copy_t2r_sq.get_slice(tidx)
-            tTR_cSQ = thr_copy_t2r_sq_thread.partition_D(cM_sq)
+            tTR_cSQ = thr_t2r.partition_D(cM_sq)
 
 
             if cutlass.const_expr(PRINT_DEBUG):
                 print(f"tiled_copy_t2r_pv: {tiled_copy_t2r_pv}")
                 print(f"tTR_tAcc_base_pv: {tTR_tAcc_base_pv}")
-                print(f"tTR_rAcc_pv: {tTR_rAcc_pv}")
-                print(f"tiled_copy_t2r_sq: {tiled_copy_t2r_sq}")
+                print(f"tTR_rAcc: {tTR_rAcc}")
                 print(f"tTR_tAcc_base_sq: {tTR_tAcc_base_sq}")
-                print(f"tTR_rAcc_sq: {tTR_rAcc_sq}")
+                print(f"tTR_cSQ: {tTR_cSQ}")
 
                 print(f"tCtAccQK: {tCtAccQK}")
                 print(f"tCtAccSQ: {tCtAccSQ}")
@@ -1936,28 +1932,36 @@ class LinearAttentionChunkwiseDecay:
                     )
                     p_handle.commit()
 
-                    # Wait for O_INTRA (PV result)
+                    # ========== O Combine (single shared fragment) ==========
+                    # Use ONE 128-FP32 register fragment (tTR_rAcc) for both PV and SQ loads.
+                    # Convert O_intra to BF16 early to free FP32 regs before loading O_inter.
+                    # Peak: 128 FP32 + 64 BF16 = 192 FP32-equiv.
+
+                    # Step 1: Load O_INTRA into shared fragment (128 FP32)
                     o_intra_handle = o_intra_consumer.wait_and_advance()
                     tTR_tAcc_pv_i = tTR_tAcc_base_pv[(None, None, None, 0, 0, o_intra_handle.index)]
-                    cute.copy(tiled_copy_t2r_pv, tTR_tAcc_pv_i, tTR_rAcc_pv)
+                    cute.copy(tiled_copy_t2r_pv, tTR_tAcc_pv_i, tTR_rAcc)
                     cute.arch.fence_view_async_tmem_load()
                     o_intra_handle.release()
 
-                    # Wait for O_INTER (SQ result)
                     if chunk_start != 0 or cutlass.const_expr(self.has_initial_state):
+                        # Step 2a: Save O_intra × scale as BF16 in tTR_rO, freeing tTR_rAcc
+                        tTR_rO.store((tTR_rAcc.load() * scale).to(self.io_dtype))
+
+                        # Step 2b: Load O_INTER into SAME shared fragment (128 FP32)
                         o_inter_handle = o_inter_consumer.wait_and_advance()
                         tTR_tAcc_sq_i = tTR_tAcc_base_sq[(None, None, None, 0, 0, o_inter_handle.index)]
-                        cute.copy(tiled_copy_t2r_sq, tTR_tAcc_sq_i, tTR_rAcc_sq)
+                        cute.copy(tiled_copy_t2r_pv, tTR_tAcc_sq_i, tTR_rAcc)
                         cute.arch.fence_view_async_tmem_load()
                         o_inter_handle.release()
 
-                    # Combine: O = (O_INTRA + O_INTER_decayed) * scale
-                    acc_vec = tTR_rAcc_pv.load()
-                    if chunk_start != 0 or cutlass.const_expr(self.has_initial_state):
-                        self.apply_inter_chunk_decay(tTR_rAcc_sq, tTR_cSQ, sDecayLUT)
-                        acc_vec = acc_vec + tTR_rAcc_sq.load()
-                    acc_vec = acc_vec * scale
-                    tTR_rO.store(acc_vec.to(self.io_dtype))
+                        # Step 3: Apply decay to O_inter, then add scaled O_inter to O_intra
+                        self.apply_inter_chunk_decay(tTR_rAcc, tTR_cSQ, sDecayLUT)
+                        for i in cutlass.range_constexpr(cute.size(tTR_rO)):
+                            tTR_rO[i] = (cutlass.Float32(tTR_rO[i]) + tTR_rAcc[i] * scale).to(self.io_dtype)
+                    else:
+                        # No O_inter: just O_intra × scale
+                        tTR_rO.store((tTR_rAcc.load() * scale).to(self.io_dtype))
 
                     # Zero O at invalid positions for tail chunk (varlen)
                     if cutlass.const_expr(self.is_varlen):
@@ -2279,7 +2283,7 @@ class LinearAttentionChunkwiseDecay:
         )
         return tma_atom_c, bSG_sC, bSG_gC
             
-    def tmem_load_partition_kv(self, mma_tiler, tState, local_tidx):
+    def tmem_load_partition_kv(self, mma_tiler, tState, local_tidx, existing_regs=None):
         # Make tiledCopy for tensor memory load
         # D,D
         # KV: V^T*K, K-Major
@@ -2297,12 +2301,14 @@ class LinearAttentionChunkwiseDecay:
             cute.dice(self.kv_mma_tiler, (1,1,None)),
         )
         return self.make_tmem_load_and_partition(
-            copy_atom_t2r, tState, (None, None, 0), local_tidx, fake_sState
+            copy_atom_t2r, tState, (None, None, 0), local_tidx, fake_sState,
+            existing_regs=existing_regs
         )
 
     
     def make_tmem_load_and_partition(
-        self, copy_atom_t2r, tmem_tensor, tmem_tile_coord, local_tidx, smem_tensor
+        self, copy_atom_t2r, tmem_tensor, tmem_tile_coord, local_tidx, smem_tensor,
+        existing_regs=None
     ):
         dtype = tmem_tensor.element_type
         # TMEM: (EPITILE_M, EPITILE_N, STAGES)
@@ -2313,12 +2319,16 @@ class LinearAttentionChunkwiseDecay:
         tTR_t = thr_t2r.partition_S(tmem_tensor)
         # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
         tTR_s = thr_t2r.partition_D(smem_tensor)
-        # Make register fragments for tmem load INTER1_ACC
-        # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
-        tTR_r = cute.make_rmem_tensor(
-            tTR_s.shape,
-            dtype,
-        )
+        # Reuse existing register storage if provided (register aliasing)
+        if existing_regs is not None:
+            tTR_r = cute.make_tensor(existing_regs.iterator, layout=tTR_s.layout)
+        else:
+            # Make register fragments for tmem load INTER1_ACC
+            # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
+            tTR_r = cute.make_rmem_tensor(
+                tTR_s.shape,
+                dtype,
+            )
         return tiled_t2r, thr_t2r, tTR_t, tTR_r
 
     def tmem_store_and_partition_kv(self, local_tidx, tCtState):
