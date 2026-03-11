@@ -60,6 +60,8 @@ class KDARecomputeWU:
         K: int = 128,
         V: int = 128,
         chunk_size: int = 64,
+        block_k: int = None,
+        block_v: int = None,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         is_varlen: bool = False,
@@ -68,8 +70,8 @@ class KDARecomputeWU:
         self.K = K
         self.V = V
         self.BT = chunk_size
-        self.BK = K
-        self.BV = V
+        self.BK = block_k if block_k is not None else K
+        self.BV = block_v if block_v is not None else V
         self.NK = (K + self.BK - 1) // self.BK
         self.NV = (V + self.BV - 1) // self.BV
         self.io_dtype = io_dtype
@@ -311,14 +313,13 @@ class KDARecomputeWU:
         self.tma_bytes_k = cute.size_in_bytes(self.io_dtype, k_epi_smem)
         self.tma_bytes_v = cute.size_in_bytes(self.io_dtype, v_epi_smem)
         self.tma_bytes_gk = cute.size_in_bytes(self.acc_dtype, gk_epi_smem)
-        self.tma_bytes_kgk = self.tma_bytes_k + self.tma_bytes_gk
+        self.tma_bytes_kgkv = self.tma_bytes_k + self.tma_bytes_gk + self.tma_bytes_v
 
         # ---------- SharedStorage ----------
         @cute.struct
         class SharedStorage:
             load_A_mbar: cute.struct.MemRange[Int64, self.a_stage * 2]
-            load_kgk_mbar: cute.struct.MemRange[Int64, self.kgk_stage * 2]
-            load_v_mbar: cute.struct.MemRange[Int64, self.v_tma_stage * 2]
+            load_kgkv_mbar: cute.struct.MemRange[Int64, self.kgk_stage * 2]
             bproc_mbar: cute.struct.MemRange[Int64, self.bproc_stage * 2]
             acc_mbar: cute.struct.MemRange[Int64, self.acc_stage * 2]
             tmem_holding_buf: Int32
@@ -489,7 +490,7 @@ class KDARecomputeWU:
         load_A_P, load_A_C = pipeline.PipelineTmaAsync.create(
             num_stages=self.a_stage,
             producer_group=_make_coop_group(1),
-            consumer_group=_make_coop_group(self.num_cuda_warps + 1),
+            consumer_group=_make_coop_group(1),
             tx_count=self.tma_A_bytes,
             barrier_storage=storage.load_A_mbar.data_ptr(),
         ).make_participants()
@@ -498,16 +499,8 @@ class KDARecomputeWU:
             num_stages=self.kgk_stage,
             producer_group=_make_coop_group(1),
             consumer_group=_make_coop_group(self.num_cuda_warps),
-            tx_count=self.tma_bytes_kgk,
-            barrier_storage=storage.load_kgk_mbar.data_ptr(),
-        ).make_participants()
-
-        load_v_P, load_v_C = pipeline.PipelineTmaAsync.create(
-            num_stages=self.v_tma_stage,
-            producer_group=_make_coop_group(1),
-            consumer_group=_make_coop_group(self.num_cuda_warps),
-            tx_count=self.tma_bytes_v,
-            barrier_storage=storage.load_v_mbar.data_ptr(),
+            tx_count=self.tma_bytes_kgkv,
+            barrier_storage=storage.load_kgkv_mbar.data_ptr(),
         ).make_participants()
 
         bproc_P, bproc_C = pipeline.PipelineAsyncUmma.create(
@@ -619,27 +612,26 @@ class KDARecomputeWU:
                     tma_bar_ptr=h_a.barrier,
                 )
 
-                kgk_h = load_kgk_P.acquire_and_advance()
-                cute.copy(
-                    tma_atom_k,
-                    bSG_gK[(None, i_t, 0)],
-                    bSG_sK[None, kgk_h.index],
-                    tma_bar_ptr=kgk_h.barrier,
-                )
-                cute.copy(
-                    tma_atom_gk,
-                    bSG_gGK[(None, i_t, 0)],
-                    bSG_sGK[None, kgk_h.index],
-                    tma_bar_ptr=kgk_h.barrier,
-                )
-
-                v_h = load_v_P.acquire_and_advance()
-                cute.copy(
-                    tma_atom_v,
-                    bSG_gV[(None, i_t, 0)],
-                    bSG_sV[None, v_h.index],
-                    tma_bar_ptr=v_h.barrier,
-                )
+                for i_kv in cutlass.range(0, self.NK):
+                    kgk_h = load_kgk_P.acquire_and_advance()
+                    cute.copy(
+                        tma_atom_k,
+                        bSG_gK[(None, i_t, i_kv)],
+                        bSG_sK[None, kgk_h.index],
+                        tma_bar_ptr=kgk_h.barrier,
+                    )
+                    cute.copy(
+                        tma_atom_gk,
+                        bSG_gGK[(None, i_t, i_kv)],
+                        bSG_sGK[None, kgk_h.index],
+                        tma_bar_ptr=kgk_h.barrier,
+                    )
+                    cute.copy(
+                        tma_atom_v,
+                        bSG_gV[(None, i_t, i_kv)],
+                        bSG_sV[None, kgk_h.index],
+                        tma_bar_ptr=kgk_h.barrier,
+                    )
 
         # =====================================================================
         # STORE WARP -- idle
@@ -666,35 +658,36 @@ class KDARecomputeWU:
                 a_h = load_A_C.wait_and_advance()
                 a_h.release()
 
-                # K pass: w = A_mat @ B_proc(k)
-                bp_h = bproc_C.wait_and_advance()
-                acc_h = acc_done_P.acquire_and_advance()
-                for kblk in cutlass.range(num_kblks, unroll_full=True):
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kblk != 0))
-                    cute.gemm(
-                        tiled_mma,
-                        tCtAcc[(None, None, None, acc_h.index)],
-                        tCrA[(None, None, kblk, 0)],
-                        tCrB[(None, None, kblk, 0)],
-                        tCtAcc[(None, None, None, acc_h.index)],
-                    )
-                acc_h.commit()
-                bp_h.release()
+                for i_kv in cutlass.range(0, self.NK):
+                    # K pass: w = A_mat @ B_proc(k)
+                    bp_h = bproc_C.wait_and_advance()
+                    acc_h = acc_done_P.acquire_and_advance()
+                    for kblk in cutlass.range(num_kblks, unroll_full=True):
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kblk != 0))
+                        cute.gemm(
+                            tiled_mma,
+                            tCtAcc[(None, None, None, acc_h.index)],
+                            tCrA[(None, None, kblk, 0)],
+                            tCrB[(None, None, kblk, 0)],
+                            tCtAcc[(None, None, None, acc_h.index)],
+                        )
+                    acc_h.commit()
+                    bp_h.release()
 
-                # V pass: u = A_mat @ B_proc(v)
-                bp_h2 = bproc_C.wait_and_advance()
-                acc_h2 = acc_done_P.acquire_and_advance()
-                for kblk in cutlass.range(num_kblks, unroll_full=True):
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kblk != 0))
-                    cute.gemm(
-                        tiled_mma,
-                        tCtAcc[(None, None, None, acc_h2.index)],
-                        tCrA[(None, None, kblk, 0)],
-                        tCrB[(None, None, kblk, 0)],
-                        tCtAcc[(None, None, None, acc_h2.index)],
-                    )
-                acc_h2.commit()
-                bp_h2.release()
+                    # V pass: u = A_mat @ B_proc(v)
+                    bp_h2 = bproc_C.wait_and_advance()
+                    acc_h2 = acc_done_P.acquire_and_advance()
+                    for kblk in cutlass.range(num_kblks, unroll_full=True):
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kblk != 0))
+                        cute.gemm(
+                            tiled_mma,
+                            tCtAcc[(None, None, None, acc_h2.index)],
+                            tCrA[(None, None, kblk, 0)],
+                            tCrB[(None, None, kblk, 0)],
+                            tCtAcc[(None, None, None, acc_h2.index)],
+                        )
+                    acc_h2.commit()
+                    bp_h2.release()
 
         # =====================================================================
         # CUDA CORE WARPS
@@ -765,10 +758,7 @@ class KDARecomputeWU:
 
                 time_base = (tok_offset + i_t * BT) * H + i_h
 
-                # Wait for A_mat, then load beta cooperatively
-                a_h = load_A_C.wait_and_advance()
-                a_h.release()
-
+                # Load beta cooperatively (no A wait needed: CUDA warps don't read sA)
                 beta_gmem_p = cute.make_ptr(
                     self.io_dtype, (beta_ptr + time_base).toint(),
                     cute.AddressSpace.gmem, assumed_align=2,
@@ -781,92 +771,92 @@ class KDARecomputeWU:
                 sBeta[beta_load_idx] = beta_gmem[beta_load_idx]
                 cuda_sync.arrive_and_wait()
 
-                # ==== K pass: w + kg ====
-                kgk_h = load_kgk_C.wait_and_advance()
+                for i_kv in cutlass.range(0, self.NK):
+                    # ==== K pass: compute k*beta*exp2(gk) + kg ====
+                    kgk_h = load_kgk_C.wait_and_advance()
 
-                for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
-                    m_coord, k_coord = tTR_cM[ei]
-                    k_val    = sK[(k_coord,  m_coord, kgk_h.index)].to(self.acc_dtype)
-                    gk_val   = sGK[(k_coord, m_coord, kgk_h.index)]
-                    gn_val   = sGK[(self.BT - 1, m_coord, kgk_h.index)]
-                    beta_val = sBeta[k_coord].to(self.acc_dtype)
-                    tTR_rBproc[ei] = (k_val * beta_val * cute.exp2(gk_val)).to(self.io_dtype)
-                    tTR_rKg[ei]    = (k_val * cute.exp2(gn_val - gk_val)).to(self.io_dtype)
+                    for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
+                        m_coord, k_coord = tTR_cM[ei]
+                        k_val    = sK[(k_coord,  m_coord, kgk_h.index)].to(self.acc_dtype)
+                        gk_val   = sGK[(k_coord, m_coord, kgk_h.index)]
+                        gn_val   = sGK[(self.BT - 1, m_coord, kgk_h.index)]
+                        beta_val = sBeta[k_coord].to(self.acc_dtype)
+                        tTR_rBproc[ei] = (k_val * beta_val * cute.exp2(gk_val)).to(self.io_dtype)
+                        tTR_rKg[ei]    = (k_val * cute.exp2(gn_val - gk_val)).to(self.io_dtype)
 
-                kgk_h.release()
+                    # R2T K bproc -> TMEM -> signal MMA K start
+                    tRT_rBproc.store(tTR_rBproc.load())
+                    bproc_h = bproc_P.acquire_and_advance()
+                    cute.copy(tiled_r2t, tRT_rBproc, tRT_tA[(None, None, None, None, 0)])
+                    cute.arch.fence_view_async_tmem_store()
+                    bproc_h.commit()
 
-                tRT_rBproc.store(tTR_rBproc.load())
-                bproc_h = bproc_P.acquire_and_advance()
-                cute.copy(tiled_r2t, tRT_rBproc, tRT_tA[(None, None, None, None, 0)])
-                cute.arch.fence_view_async_tmem_store()
-                bproc_h.commit()
+                    # === Overlap with MMA K: write kg + precompute V ===
+                    k_off = time_base * K + i_kv * self.BK
+                    kg_tile_p = cute.make_ptr(
+                        self.io_dtype, (kg_ptr + k_off).toint(),
+                        cute.AddressSpace.gmem, assumed_align=2,
+                    )
+                    kg_tile = cute.make_tensor(
+                        kg_tile_p,
+                        cute.make_layout((self.BT, self.BK), stride=(stride_k, 1)),
+                    )
+                    for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
+                        m_coord, k_coord = tTR_cM[ei]
+                        kg_tile[(k_coord, m_coord)] = tTR_rKg[ei]
 
-                # Write kg (overlaps MMA)
-                k_off = time_base * K
-                kg_tile_p = cute.make_ptr(
-                    self.io_dtype, (kg_ptr + k_off).toint(),
-                    cute.AddressSpace.gmem, assumed_align=2,
-                )
-                kg_tile = cute.make_tensor(
-                    kg_tile_p,
-                    cute.make_layout((self.BT, self.BK), stride=(stride_k, 1)),
-                )
-                for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
-                    m_coord, k_coord = tTR_cM[ei]
-                    kg_tile[(k_coord, m_coord)] = tTR_rKg[ei]
+                    # Precompute v*beta during MMA K (all data on same barrier)
+                    for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
+                        m_coord, k_coord = tTR_cM[ei]
+                        v_val    = sV[(k_coord, m_coord, kgk_h.index)].to(self.acc_dtype)
+                        beta_val = sBeta[k_coord].to(self.acc_dtype)
+                        tTR_rBproc[ei] = (v_val * beta_val).to(self.io_dtype)
+                    kgk_h.release()
+                    tRT_rBproc.store(tTR_rBproc.load())
 
-                # Wait MMA done -> T2R -> write w
-                acc_h = acc_done_C.wait_and_advance()
-                cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, acc_h.index)], tTR_rAcc)
-                cute.arch.fence_view_async_tmem_load()
-                acc_h.release()
+                    # === K MMA done: T2R result, immediately R2T V -> MMA V ===
+                    acc_h = acc_done_C.wait_and_advance()
+                    cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, acc_h.index)], tTR_rAcc)
+                    cute.arch.fence_view_async_tmem_load()
+                    acc_h.release()
 
-                w_tile_p = cute.make_ptr(
-                    self.io_dtype, (w_ptr + k_off).toint(),
-                    cute.AddressSpace.gmem, assumed_align=2,
-                )
-                w_tile = cute.make_tensor(
-                    w_tile_p,
-                    cute.make_layout((self.BT, self.BK), stride=(stride_k, 1)),
-                )
-                for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
-                    m_coord, n_coord = tTR_cM[ei]
-                    w_tile[(n_coord, m_coord)] = tTR_rAcc[ei].to(self.io_dtype)
+                    # R2T V bproc -> TMEM -> signal MMA V start
+                    bproc_h2 = bproc_P.acquire_and_advance()
+                    cute.copy(tiled_r2t, tRT_rBproc, tRT_tA[(None, None, None, None, 0)])
+                    cute.arch.fence_view_async_tmem_store()
+                    bproc_h2.commit()
 
-                # ==== V pass: u ====
-                v_h = load_v_C.wait_and_advance()
+                    # Write w to GMEM (overlaps with MMA V)
+                    w_tile_p = cute.make_ptr(
+                        self.io_dtype, (w_ptr + k_off).toint(),
+                        cute.AddressSpace.gmem, assumed_align=2,
+                    )
+                    w_tile = cute.make_tensor(
+                        w_tile_p,
+                        cute.make_layout((self.BT, self.BK), stride=(stride_k, 1)),
+                    )
+                    for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
+                        m_coord, n_coord = tTR_cM[ei]
+                        w_tile[(n_coord, m_coord)] = tTR_rAcc[ei].to(self.io_dtype)
 
-                for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
-                    m_coord, k_coord = tTR_cM[ei]
-                    v_val    = sV[(k_coord, m_coord, v_h.index)].to(self.acc_dtype)
-                    beta_val = sBeta[k_coord].to(self.acc_dtype)
-                    tTR_rBproc[ei] = (v_val * beta_val).to(self.io_dtype)
+                    # === V MMA done ===
+                    acc_h2 = acc_done_C.wait_and_advance()
+                    cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, acc_h2.index)], tTR_rAcc)
+                    cute.arch.fence_view_async_tmem_load()
+                    acc_h2.release()
 
-                tRT_rBproc.store(tTR_rBproc.load())
-                bproc_h2 = bproc_P.acquire_and_advance()
-                cute.copy(tiled_r2t, tRT_rBproc, tRT_tA[(None, None, None, None, 0)])
-                cute.arch.fence_view_async_tmem_store()
-                bproc_h2.commit()
-
-                v_h.release()
-
-                acc_h2 = acc_done_C.wait_and_advance()
-                cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, acc_h2.index)], tTR_rAcc)
-                cute.arch.fence_view_async_tmem_load()
-                acc_h2.release()
-
-                v_off = time_base * V
-                u_tile_p = cute.make_ptr(
-                    self.io_dtype, (u_ptr + v_off).toint(),
-                    cute.AddressSpace.gmem, assumed_align=2,
-                )
-                u_tile = cute.make_tensor(
-                    u_tile_p,
-                    cute.make_layout((self.BT, self.BV), stride=(stride_v, 1)),
-                )
-                for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
-                    m_coord, n_coord = tTR_cM[ei]
-                    u_tile[(n_coord, m_coord)] = tTR_rAcc[ei].to(self.io_dtype)
+                    v_off = time_base * V + i_kv * self.BV
+                    u_tile_p = cute.make_ptr(
+                        self.io_dtype, (u_ptr + v_off).toint(),
+                        cute.AddressSpace.gmem, assumed_align=2,
+                    )
+                    u_tile = cute.make_tensor(
+                        u_tile_p,
+                        cute.make_layout((self.BT, self.BV), stride=(stride_v, 1)),
+                    )
+                    for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
+                        m_coord, n_coord = tTR_cM[ei]
+                        u_tile[(n_coord, m_coord)] = tTR_rAcc[ei].to(self.io_dtype)
 
         # ---------- TMEM cleanup ----------
         tmem.relinquish_alloc_permit()
@@ -883,13 +873,14 @@ _dummy_cu_seqlens = None
 _dummy_chunk_indices = None
 
 
-def _compile_recompute_wu(H, K, V, chunk_size=64, persistent=False, is_varlen=False):
-    key = (H, K, V, chunk_size, persistent, is_varlen)
+def _compile_recompute_wu(H, K, V, chunk_size=64, block_k=None, block_v=None, persistent=False, is_varlen=False):
+    key = (H, K, V, chunk_size, block_k, block_v, persistent, is_varlen)
     if key in _recompute_wu_cache:
         return _recompute_wu_cache[key]
 
     kernel_obj = KDARecomputeWU(
         K=K, V=V, chunk_size=chunk_size,
+        block_k=block_k, block_v=block_v,
         persistent=persistent, is_varlen=is_varlen,
     )
 
@@ -943,7 +934,7 @@ def _compile_recompute_wu(H, K, V, chunk_size=64, persistent=False, is_varlen=Fa
 
 def recompute_w_u_fwd(k, v, beta, A, gk,
                       cu_seqlens=None, chunk_indices=None,
-                      persistent=False):
+                      persistent=False, block_k=None, block_v=None):
     is_varlen = cu_seqlens is not None
 
     if is_varlen:
@@ -977,7 +968,8 @@ def recompute_w_u_fwd(k, v, beta, A, gk,
     kg = torch.empty_like(k)
 
     compiled_fn = _compile_recompute_wu(
-        H, K, V, chunk_size=BT, persistent=persistent, is_varlen=is_varlen,
+        H, K, V, chunk_size=BT, block_k=block_k, block_v=block_v,
+        persistent=persistent, is_varlen=is_varlen,
     )
     compiled_fn(k, v, beta, A, gk, w, u, kg, cu_s, ci_s, ps, Int32(total_nt))
     return w, u, None, kg

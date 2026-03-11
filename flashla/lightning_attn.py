@@ -109,7 +109,11 @@ class LinearAttentionChunkwiseDecay:
     Args:
         chunk_size: Size of each attention chunk (default: 64)
         acc_dtype: Accumulator data type for all MMA computations (default: Float32)
-        io_dtype: Input/output data type (default: Float16)
+        io_dtype: Input/output data type (default: BFloat16)
+        H: Number of attention heads
+        K: Key head dimension (must be 128)
+        V: Value head dimension (must be 128)
+        scale: Scaling factor for queries
     """
 
     def __init__(
@@ -120,11 +124,15 @@ class LinearAttentionChunkwiseDecay:
         has_initial_state: bool = False,
         output_final_state: bool = False,
         H: int = 64,
-        D: int = 128,
+        K: int = 128,
+        V: int = 128,
         scale: float = 1.0,
         is_varlen: bool = False,
         persistent: bool = True,
     ):
+        assert K == 128 and V == 128, (
+            f"K and V must both be 128, got K={K}, V={V}"
+        )
         self.chunk_size = chunk_size
         self.acc_dtype = acc_dtype
         self.io_dtype = io_dtype
@@ -139,7 +147,9 @@ class LinearAttentionChunkwiseDecay:
             self.has_initial_state = has_initial_state
             self.output_final_state = output_final_state
         self.H = H
-        self.D = D
+        self.K = K
+        self.V = V
+        self.D = K  # Internal shorthand: K == V == D
         self.scale = scale
 
         # Warp specialization
@@ -2818,7 +2828,8 @@ def _compile_single_variant(has_initial_state, output_final_state, H, D, scale, 
         has_initial_state=has_initial_state,
         output_final_state=output_final_state,
         H=H,
-        D=D,
+        K=D,
+        V=D,
         scale=scale,
     )
 
@@ -3000,7 +3011,8 @@ def _compile_single_variant_varlen(H, D, scale, chunk_size, persistent=True):
         has_initial_state=True,
         output_final_state=True,
         H=H,
-        D=D,
+        K=D,
+        V=D,
         scale=scale,
         is_varlen=True,
         persistent=persistent,

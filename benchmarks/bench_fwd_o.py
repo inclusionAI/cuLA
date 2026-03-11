@@ -26,11 +26,9 @@ import os
 import sys
 import argparse
 
-os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
-os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
-
 import torch
 import importlib
+import pathlib
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
 _fwd_o_mod = importlib.import_module("flashla.fwd_o")
@@ -38,7 +36,7 @@ chunk_gla_fwd_o = _fwd_o_mod.chunk_gla_fwd_o
 build_chunk_indices = _fwd_o_mod.build_chunk_indices
 
 # ─── FLA baseline imports ───
-sys.path.insert(0, "/ossfs/workspace/flash-linear-attention")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
 
 
@@ -77,9 +75,14 @@ def time_kernel(fn, warmup=None, n_iters=None):
 
 
 def accuracy_stats(ref, out):
-    """Compute max and mean absolute difference."""
-    diff = (ref.float() - out.float()).abs()
-    return diff.max().item(), diff.mean().item()
+    """Compute max, relative max, and mean absolute difference."""
+    ref_f = ref.float()
+    diff = (ref_f - out.float()).abs()
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+    denom = ref_f.abs().max().item()
+    rel_max_diff = max_diff / denom if denom > 0 else 0.0
+    return max_diff, rel_max_diff, mean_diff
 
 
 # ============================================================
@@ -120,7 +123,7 @@ def bench_non_varlen(configs):
         )
         torch.cuda.synchronize()
 
-        max_diff, mean_diff = accuracy_stats(o_fla, o_cute_t)
+        max_diff, rel_max_diff, mean_diff = accuracy_stats(o_fla, o_cute_t)
 
         # ---- Performance timing ----
         def run_fla(q=q, v=v, g=g, A=A, h=h, scale=scale):
@@ -142,12 +145,12 @@ def bench_non_varlen(configs):
 
         r = {
             'B': B, 'T': T, 'H': H,
-            'max_diff': max_diff, 'mean_diff': mean_diff,
+            'max_diff': max_diff, 'rel_max_diff': rel_max_diff, 'mean_diff': mean_diff,
             'ms_fla': ms_fla, 'ms_cute': ms_cute, 'speedup': speedup,
         }
         results.append(r)
         print(f"  B={B:2d} T={T:5d} H={H:2d} | "
-              f"max_diff={max_diff:.6f} mean_diff={mean_diff:.8f} | "
+              f"max_diff={max_diff:.6f} rel_max={rel_max_diff:.6f} mean_diff={mean_diff:.8f} | "
               f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms | "
               f"speedup={speedup:.2f}x")
 
@@ -227,7 +230,7 @@ def bench_varlen(configs):
         torch.cuda.synchronize()
 
         # FLA output [1, T_total, H, V] → squeeze to [T_total, H, V]
-        max_diff, mean_diff = accuracy_stats(o_fla.squeeze(0), o_cute_flat)
+        max_diff, rel_max_diff, mean_diff = accuracy_stats(o_fla.squeeze(0), o_cute_flat)
 
         # ---- Performance timing ----
         def run_fla(q_fla=q_fla, v_fla=v_fla, g_fla=g_fla, A_fla=A_fla,
@@ -258,12 +261,12 @@ def bench_varlen(configs):
         tag = f"{n_seqs}seqs T={T_total} [{min_l}..{max_l}] avg={avg_l}"
         r = {
             'tag': tag, 'T_total': T_total, 'H': H, 'n_seqs': n_seqs,
-            'max_diff': max_diff, 'mean_diff': mean_diff,
+            'max_diff': max_diff, 'rel_max_diff': rel_max_diff, 'mean_diff': mean_diff,
             'ms_fla': ms_fla, 'ms_cute': ms_cute, 'speedup': speedup,
         }
         results.append(r)
         print(f"  {tag:45s} H={H:2d} | "
-              f"max_diff={max_diff:.6f} mean_diff={mean_diff:.8f} | "
+              f"max_diff={max_diff:.6f} rel_max={rel_max_diff:.6f} mean_diff={mean_diff:.8f} | "
               f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms | "
               f"speedup={speedup:.2f}x")
 
@@ -287,29 +290,29 @@ def print_report(nv_results, vl_results):
 
     if nv_results:
         print("\n  [Non-Varlen]")
-        hdr = (f"  {'B':>3s}  {'T':>5s}  {'H':>3s}  │  {'max_diff':>10s}  {'mean_diff':>12s}"
+        hdr = (f"  {'B':>3s}  {'T':>5s}  {'H':>3s}  │  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
                f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}")
-        print(f"  {'─' * 78}")
+        print(f"  {'─' * 90}")
         print(hdr)
-        print(f"  {'─' * 78}")
+        print(f"  {'─' * 90}")
         for r in nv_results:
             print(f"  {r['B']:3d}  {r['T']:5d}  {r['H']:3d}  │  "
-                  f"{r['max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                  f"{r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
                   f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x")
-        print(f"  {'─' * 78}")
+        print(f"  {'─' * 90}")
 
     if vl_results:
         print("\n  [Varlen]")
-        hdr = (f"  {'Config':>45s}  {'H':>3s}  │  {'max_diff':>10s}  {'mean_diff':>12s}"
+        hdr = (f"  {'Config':>45s}  {'H':>3s}  │  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
                f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}")
-        print(f"  {'─' * 105}")
+        print(f"  {'─' * 117}")
         print(hdr)
-        print(f"  {'─' * 105}")
+        print(f"  {'─' * 117}")
         for r in vl_results:
             print(f"  {r['tag']:>45s}  {r['H']:3d}  │  "
-                  f"{r['max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                  f"{r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
                   f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x")
-        print(f"  {'─' * 105}")
+        print(f"  {'─' * 117}")
 
     print(f"\n{sep}\n")
 
