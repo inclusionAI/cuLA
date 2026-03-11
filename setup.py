@@ -67,11 +67,8 @@ ext_modules.append(
         name="flashla.cudac",
         sources=[
             "csrc/pybind.cu",
-            "csrc/lightning/sm100/prefill_fwd.cu",
             "csrc/kda_api.cu",
-            "csrc/kda_bwd/kda_bwd_intra_sm100.cu",
-            "csrc/kda_bwd/kda_bwd_wy_dqkg_fused_sm100.cu",
-            "csrc/kda_bwd/kda_fwd_intra_sm100.cu",
+            "csrc/kda/kda_fwd_intra_sm100.cu",
         ],
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),

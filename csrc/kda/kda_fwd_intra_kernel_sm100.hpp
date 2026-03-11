@@ -3,9 +3,8 @@
 // NOTE: This header is included from .cu files in csrc/ (parent directory).
 // All includes use csrc/ as the root include path.
 #include "kda_fwd_common.cuh"
-#include "kda_bwd/helpers.h"
-#include "kda_bwd/gemm.h"
-#include "kda_bwd/utils.h"
+#include "helpers.h"
+#include "gemm.h"
 
 #include <cutlass/barrier.h>
 #include <cutlass/arch/barrier.h>
@@ -15,7 +14,7 @@
 #include <cute/tensor.hpp>
 #include <cute/arch/tmem_allocator_sm100.hpp>
 
-#include "kda_bwd/kda_fwd_intra_mainloop_sm100.hpp"
+#include "kda_fwd_intra_mainloop_sm100.hpp"
 
 namespace sm100 {
 
@@ -336,7 +335,6 @@ kda_fwd_intra_sm100_kernel_entry(
 // ===================================================================
 inline void run_kda_fwd_intra_sm100_v2(KDA_fwd_intra_params &params, cudaStream_t stream) {
     using Kernel = KdaChunkFwdIntraKernelSm100Default;
-    KDA_ASSERT(params.d % 32 == 0);
 
     auto shape_QKG  = make_shape(params.total_q_len, params.d, params.h);
     auto stride_QKG = make_stride(params.h * params.d, _1{}, params.d);

@@ -3,11 +3,10 @@
 // NOTE: This header is included from .cu files in csrc/ (parent directory).
 // All includes use csrc/ as the root include path.
 #include "kda_fwd_common.cuh"
-#include "kda_bwd/helpers.h"
-#include "kda_bwd/gemm.h"
-#include "kda_bwd/utils.h"
-#include "kda_bwd/fwd_util_func.h"
-#include "kda_bwd/collective_inverse.hpp"
+#include "helpers.h"
+#include "gemm.h"
+#include "fwd_util_func.h"
+#include "collective_inverse.hpp"
 
 #include <cutlass/barrier.h>
 #include <cutlass/arch/barrier.h>

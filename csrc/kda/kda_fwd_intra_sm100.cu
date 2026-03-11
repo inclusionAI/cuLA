@@ -1,8 +1,7 @@
 #include "kda_fwd_common.cuh"
-#include "kda_bwd/helpers.h"
-#include "kda_bwd/gemm.h"
-#include "kda_bwd/utils.h"
-#include "kda_bwd/kda_fwd_intra_kernel_sm100.hpp"
+#include "helpers.h"
+#include "gemm.h"
+#include "kda_fwd_intra_kernel_sm100.hpp"
 
 #include <cutlass/barrier.h>
 #include <cutlass/arch/barrier.h>
