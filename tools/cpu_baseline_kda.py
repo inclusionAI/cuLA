@@ -5,6 +5,11 @@ This script computes step-by-step intermediate values for debugging.
 Uses the same seed and initialization order as bench_kda.py.
 """
 
+import sys
+import pathlib
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
 import torch
 import torch.nn.functional as F
 from einops import rearrange

@@ -11,7 +11,7 @@ from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 from fla.ops.kda import chunk_kda
-from benchmark.utils import set_seed, exclusive_cumsum
+from benchmarks.utils import set_seed, exclusive_cumsum
 
 from flashla.kda_wrapper import flash_kda_prefill
 

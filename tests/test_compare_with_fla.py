@@ -5,9 +5,12 @@ Compare our Blackwell SM100 kernel with FLA's reference implementation.
 
 import sys
 import os
+import pathlib
 import argparse
 import torch
 import torch.nn.functional as F
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import cutlass
 import cutlass.cute as cute
@@ -15,7 +18,7 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
 # Our implementation
-from chunk_delta_h import ChunkDeltaRuleFwdH, reference_chunk_delta_rule_fwd_h
+from flashla.chunk_delta_h import ChunkDeltaRuleFwdH, reference_chunk_delta_rule_fwd_h
 
 
 def fla_reference_chunk_fwd_h(

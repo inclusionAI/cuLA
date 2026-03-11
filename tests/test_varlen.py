@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Test varlen support for ChunkDeltaRuleFwdH."""
 
+import sys
+import pathlib
 import torch
 import time
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
-from chunk_delta_h import ChunkDeltaRuleFwdH, reference_bf16_roundtrip
+from flashla.chunk_delta_h import ChunkDeltaRuleFwdH, reference_bf16_roundtrip
 
 
 def make_varlen_data(seq_lens, H, K, V, BT, device="cuda", dtype=torch.bfloat16):
@@ -49,7 +54,7 @@ def run_varlen_kernel(k, w, u, gk, h0, cu_seqlens, chunk_offsets,
 
     h_out = torch.zeros(1, total_NT, H, K, V, device=device, dtype=dtype)
     v_new = torch.zeros(1, total_T, H, V, device=device, dtype=dtype)
-    ht = torch.zeros(num_seqs, H, K, V, device=device, dtype=dtype)
+    ht = torch.zeros(num_seqs, H, K, V, device=device, dtype=torch.float32)
 
     g = torch.zeros(1, total_T, H, device=device, dtype=torch.float32)
     gk_t = gk if gk is not None else torch.zeros(1, total_T, H, K, device=device, dtype=torch.float32)
@@ -331,7 +336,7 @@ def test_varlen_vs_nonvarlen():
     h0_z = torch.zeros(B, H, K, V, device="cuda", dtype=torch.float32)
     h_out_nv = torch.zeros(B, NT, H, K, V, device="cuda", dtype=torch.bfloat16)
     v_new_nv = torch.zeros(B, T, H, V, device="cuda", dtype=torch.bfloat16)
-    ht_nv = torch.zeros(B, H, K, V, device="cuda", dtype=torch.bfloat16)
+    ht_nv = torch.zeros(B, H, K, V, device="cuda", dtype=torch.float32)
 
     kernel_nv = ChunkDeltaRuleFwdH(chunk_size=BT, head_dim_k=K, head_dim_v=V, is_varlen=False)
     stream = cutlass_torch.default_stream()
@@ -366,7 +371,7 @@ def test_varlen_vs_nonvarlen():
     chunk_offsets_v = torch.tensor([0, NT], dtype=torch.int32, device="cuda")
     h_out_v = torch.zeros(1, NT, H, K, V, device="cuda", dtype=torch.bfloat16)
     v_new_v = torch.zeros(1, T, H, V, device="cuda", dtype=torch.bfloat16)
-    ht_v = torch.zeros(1, H, K, V, device="cuda", dtype=torch.bfloat16)
+    ht_v = torch.zeros(1, H, K, V, device="cuda", dtype=torch.float32)
 
     kernel_v = ChunkDeltaRuleFwdH(chunk_size=BT, head_dim_k=K, head_dim_v=V, is_varlen=True)
 

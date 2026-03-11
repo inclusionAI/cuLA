@@ -10,7 +10,7 @@ from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_intra
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.constant import RCP_LN2
-from benchmark.utils import set_seed, exclusive_cumsum, generate_random_seq_lens, SEED
+from benchmarks.utils import set_seed, exclusive_cumsum, generate_random_seq_lens, SEED
 
 from flashla.kda.chunk_intra import chunk_kda_fwd_intra as flat_chunk_kda_fwd_intra
 

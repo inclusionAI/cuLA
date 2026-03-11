@@ -10,9 +10,13 @@ Tests: h_out, v_new, ht (final state) at various:
   - num_stages: 2, 3
 """
 import sys
+import pathlib
 import torch
 import numpy as np
-from chunk_delta_h import ChunkDeltaRuleFwdH
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from flashla.chunk_delta_h import ChunkDeltaRuleFwdH
 from cutlass.cute.runtime import from_dlpack
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
@@ -82,7 +86,7 @@ def run_test(
 
     h_out = torch.zeros(1, total_NT, H, K, V, device=device, dtype=dtype)
     v_new_out = torch.zeros(1, total_T, H, V, device=device, dtype=dtype)
-    ht_out = torch.zeros(num_seqs, H, K, V, device=device, dtype=dtype)
+    ht_out = torch.zeros(num_seqs, H, K, V, device=device, dtype=torch.float32)
     workspace = torch.zeros(128, dtype=torch.uint8, device=device)
     stream = cutlass_torch.default_stream()
 
