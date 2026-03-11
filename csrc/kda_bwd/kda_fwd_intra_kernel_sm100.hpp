@@ -173,7 +173,8 @@ struct KdaChunkFwdIntraKernelSm100 {
         // === CE -> MMA pipelines ===
         typename PipelineQKGInterReady::Params qkg_inter_pipe_params;
         qkg_inter_pipe_params.producer_arv_count = NUM_CE_THREADS;
-        qkg_inter_pipe_params.consumer_arv_count = NUM_MMA_THREADS;
+        // NOTE: only one threads calls consumer_release (umma_arrive)
+        qkg_inter_pipe_params.consumer_arv_count = 1;
 
         if (role == WarpRole::ComputeEpilogue) {
             qkg_inter_pipe_params.role   = PipelineQKGInterReady::ThreadCategory::Producer;
