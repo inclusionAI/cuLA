@@ -312,10 +312,18 @@ struct KdaChunkFwdIntraMainloopSm100 {
             int batch_idx = get<0>(blk_coord);
             int head_idx  = get<1>(blk_coord);
             int tile_idx  = get<2>(blk_coord);
-            int start_offset = cu_len_ptr[batch_idx];
             int seq_len = cu_len_ptr[batch_idx + 1] - cu_len_ptr[batch_idx];
             int sub_seq_len = min(T_TILE, seq_len - tile_idx * T_TILE);
 
+            // B-matrix SMEM views (single-buffered kg_all)
+            // Each sub_tile occupies one SmemLayoutMatBTF32<1> = (16 × 32)
+            // inter[i] and intra[i] are indexed by KG_OFFSET * index inside the helper
+            Tensor sKG_inter = make_tensor(make_smem_ptr(shared_plan->kg_all.inter[0].data()), SmemLayoutMatBTF32<1>{});
+            Tensor sKG_intra = make_tensor(make_smem_ptr(shared_plan->kg_all.intra[0].data()), SmemLayoutMatBTF32<1>{});
+
+            constexpr int kg_offset = SUB_T_TILE * K_TILE;  // stride between sub_tile buffers
+
+            CUTE_NO_UNROLL
             for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
                 // ============================================================
                 // Step 1: Wait for K, G data from TMA Load warp
@@ -329,14 +337,6 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 // ============================================================
                 Tensor sK = make_tensor(make_smem_ptr(shared_plan->k[k_pipe_state_read.index()].data()), SmemLayoutInputBF16{});
                 Tensor sG = make_tensor(make_smem_ptr(shared_plan->g[g_pipe_state_read.index()].data()), SmemLayoutInputFP32{});
-
-                // B-matrix SMEM views (single-buffered kg_all)
-                // Each sub_tile occupies one SmemLayoutMatBTF32<1> = (16 × 32)
-                // inter[i] and intra[i] are indexed by KG_OFFSET * index inside the helper
-                Tensor sKG_inter = make_tensor(make_smem_ptr(shared_plan->kg_all.inter[0].data()), SmemLayoutMatBTF32<1>{});
-                Tensor sKG_intra = make_tensor(make_smem_ptr(shared_plan->kg_all.intra[0].data()), SmemLayoutMatBTF32<1>{});
-
-                constexpr int kg_offset = SUB_T_TILE * K_TILE;  // stride between sub_tile buffers
 
                 qkg_inter_pipeline.producer_acquire(qkg_inter_pipe_state_write);
 
@@ -541,6 +541,13 @@ struct KdaChunkFwdIntraMainloopSm100 {
         int *chunk_indices_ptr, int *cu_len_ptr, int total_tiles)
     {
         // === PERSISTENT MMA LOOP (static scheduling, no tile pipeline) ===
+        TiledMMA tile_mma_qk_n16_mask02 = TiledMMA_KDAqk_N16_MASK02{};
+        TiledMMA tile_mma_qk_n16_mask13 = TiledMMA_KDAqk_N16_MASK13{};
+        TiledMMA tile_mma_qk_n32_mask02 = TiledMMA_KDAqk_N32_MASK02{};
+        TiledMMA tile_mma_qk_n32_mask13 = TiledMMA_KDAqk_N32_MASK13{};
+        TiledMMA tile_mma_qk_n48_mask02 = TiledMMA_KDAqk_N48_MASK02{};
+        TiledMMA tile_mma_qk_n48_mask13 = TiledMMA_KDAqk_N48_MASK13{};
+
         CUTE_NO_UNROLL
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
@@ -552,18 +559,13 @@ struct KdaChunkFwdIntraMainloopSm100 {
             int lane_predicate = cute::elect_one_sync();
 
             // MMA computation body
+            CUTE_NO_UNROLL
             for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
                 // launder shared plan pointer, Why?
                 SharedMemoryPlan *sp = shared_plan;
                 asm volatile("" : "+l"(sp) :: "memory");
                 qkg_inter_pipeline.consumer_wait(qkg_inter_pipe_state_read);
                     
-                TiledMMA tile_mma_qk_n16_mask02 = TiledMMA_KDAqk_N16_MASK02{};
-                TiledMMA tile_mma_qk_n16_mask13 = TiledMMA_KDAqk_N16_MASK13{};
-                TiledMMA tile_mma_qk_n32_mask02 = TiledMMA_KDAqk_N32_MASK02{};
-                TiledMMA tile_mma_qk_n32_mask13 = TiledMMA_KDAqk_N32_MASK13{};
-                TiledMMA tile_mma_qk_n48_mask02 = TiledMMA_KDAqk_N48_MASK02{};
-                TiledMMA tile_mma_qk_n48_mask13 = TiledMMA_KDAqk_N48_MASK13{};
                 // inter-chunk: (1,0), (2,0), (2,1), (3,0), (3,1), (3,2)
                 Tensor tQK_row1 = partition_fragment_C(tile_mma_qk_n16_mask02, make_shape(Int<T_TILE>{}, Int<SUB_T_TILE>{}));
                 Tensor tQK_row2 = partition_fragment_C(tile_mma_qk_n32_mask02, make_shape(Int<T_TILE>{}, Int<SUB_T_TILE*2>{}));
@@ -575,6 +577,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 // row3, (3,0) (3,1) (3,2), qk[1, 3]-kk[1, 3], mask13
                 tQK_row3.data() = uint32_t(TmemAllocation::QK_13);
 
+                tcgen05_after_thread_sync();
                 // kg_inter: 3 MMA calls
                 // clear_accum only on first k_idx iteration; accumulate across K_ITERATION
                 {
@@ -669,14 +672,9 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
                 qkg_inter_pipeline.consumer_release(qkg_inter_pipe_state_read);
                 ++qkg_inter_pipe_state_read;
-                    
-                // TODO: should sync?
-                tcgen05_after_thread_sync();
             }
             // notify MMA finished to CE
             qk_done_pipeline.producer_acquire(qk_done_pipe_state_write);
-            // T2R util function has this sync
-            // tcgen05_after_thread_sync();
             qk_done_pipeline.producer_commit(qk_done_pipe_state_write);
             ++qk_done_pipe_state_write;
         }
@@ -713,7 +711,12 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 int seq_len = cu_len_ptr[batch_idx + 1] - cu_len_ptr[batch_idx];
                 int sub_seq_len = min(T_TILE, seq_len - tile_idx * T_TILE);
 
+                Tensor mQ = domain_offset(make_coord(token_offset, _0{}, _0{}), tma_params.tma_q.get_tma_tensor(tma_params.shape_qkg));
+                Tensor mK = domain_offset(make_coord(token_offset, _0{}, _0{}), tma_params.tma_k.get_tma_tensor(tma_params.shape_qkg));
+                Tensor mG = domain_offset(make_coord(token_offset, _0{}, _0{}), tma_params.tma_g.get_tma_tensor(tma_params.shape_qkg));
+
                 // TMA load body (Q, K, G)
+                CUTE_NO_UNROLL
                 for (int k_idx = 0; k_idx < K_ITERATION; ++k_idx) {
                     Tensor sQ = make_tensor(make_smem_ptr(
                         shared_plan->q[q_pipe_state_write.index()].data()
@@ -724,10 +727,6 @@ struct KdaChunkFwdIntraMainloopSm100 {
                     Tensor sG = make_tensor(make_smem_ptr(
                         shared_plan->g[g_pipe_state_write.index()].data()
                     ), SmemLayoutInputFP32{});
-
-                    Tensor mQ = domain_offset(make_coord(token_offset, _0{}, _0{}), tma_params.tma_q.get_tma_tensor(tma_params.shape_qkg));
-                    Tensor mK = domain_offset(make_coord(token_offset, _0{}, _0{}), tma_params.tma_k.get_tma_tensor(tma_params.shape_qkg));
-                    Tensor mG = domain_offset(make_coord(token_offset, _0{}, _0{}), tma_params.tma_g.get_tma_tensor(tma_params.shape_qkg));
 
                     Tensor gK = local_tile(mK(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
                     Tensor gG = local_tile(mG(_, _, head_idx), make_shape(Int<T_TILE>{}, Int<K_TILE>{}), make_coord(tile_idx, k_idx));
