@@ -19,7 +19,8 @@ Output:
   o:  [B, T, H, V]           bf16
 
 For KDA: K=V=128, BT=64, use_exp2=True always.
-Scale is folded into the gating: qg = q * 2^g * scale.
+Scale is deferred to post-accumulation for better bf16 precision:
+  qg = q * 2^g (no scale), AM = tril(A) / scale, output = scale * acc.
 
 Kernel design (TMEM A-operand approach):
   Grid: (ceil(V/BV), NT, B*H)
@@ -27,13 +28,16 @@ Kernel design (TMEM A-operand approach):
 
   Warp specialization:
     Warps 0-3 (CUDA):
-        - Read q, g from epilog SMEM, compute qg = q * exp2(g) * scale
+        - Read q, g from epilog SMEM, compute qg = q * exp2(g)
         - R2T write qg to TMEM (QG A-operand)
         - Read A from epilog SMEM, apply causal mask
         - R2T write A_masked to TMEM (AM A-operand)
+        - After QH MMA: T2R read acc, multiply by scale, save to regs
+        - After AV MMA: T2R read acc, add scaled QH, convert bf16
     Warp 4 (MMA):
         - QH MMA: qg(TMEM) × h(SMEM) → acc(TMEM)
-        - AV MMA: am(TMEM) × v(SMEM) → acc(TMEM, ACCUMULATE)
+        - Signal QH done, wait for CUDA read
+        - AV MMA: am(TMEM) × v(SMEM) → acc(TMEM, fresh)
     Warp 5 (Load):
         - TMA G2S: q, g, A → epilog SMEM
         - TMA G2S: h, v → MMA B-operand SMEM
@@ -42,22 +46,24 @@ Kernel design (TMEM A-operand approach):
     Warp 7 (Empty):
         - Required for warp group register redistribution
 
-  TMEM layout:
-    ACC:   (BT, BV) fp32 — shared accumulator for QH and AV
-    QG_A:  (BT, BK) bf16 — A-operand for QH MMA
-    AM_A:  (BT, BT) bf16 — A-operand for AV MMA
+  TMEM layout (dual-ACC):
+    ACC_QH: (BT, BV) fp32 — accumulator for QH MMA (qg@h)
+    ACC_AV: (BT, BV) fp32 — accumulator for AV MMA (am@v)
+    QG_A:   (BT, BK) bf16 — A-operand for QH MMA
+    AM_A:   (BT, BT) bf16 — A-operand for AV MMA
 
   Pipeline:
-    Load→CUDA: q, g, A  (PipelineTmaAsync, 1-stage)
-    Load→MMA:  h, v      (PipelineTmaUmma, 1-stage)
-    CUDA→MMA:  qg_ready  (PipelineAsyncUmma, 1-stage)
-    CUDA→MMA:  am_ready  (PipelineAsyncUmma, 1-stage)
-    MMA→CUDA:  acc_done  (PipelineUmmaAsync, 1-stage)
-    CUDA→Store: o_ready  (PipelineAsync, 1-stage)
+    Load→CUDA: q, g, A   (PipelineTmaAsync, 1-stage)
+    Load→MMA:  h, v       (PipelineTmaUmma, 1-stage)
+    CUDA→MMA:  qg_ready   (PipelineAsyncUmma, 1-stage)
+    CUDA→MMA:  am_ready   (PipelineAsyncUmma, 1-stage)
+    MMA→CUDA:  acc_done   (PipelineUmmaAsync, 1-stage)
+    CUDA→Store: o_ready   (PipelineAsync, 1-stage)
 
-  Output epilog:
-    CUDA warps: T2R (ACC TMEM → FP32 regs) → FP32→BF16 → R2S (regs → sO)
-    Load warp:  TMA store sO → GMEM
+  Output epilog (dual-ACC approach):
+    MMA: QH→acc_qh, AV→acc_av back-to-back, signal acc_done
+    CUDA: T2R(acc_qh) + T2R(acc_av), o = scale*qh + av → BF16 → R2S
+    Load warp: TMA store sO → GMEM
 """
 
 import argparse
@@ -209,7 +215,11 @@ class ChunkGlaFwdO:
         qg_tmem_layout, am_tmem_layout,
         acc_stages,
     ):
-        """Plan TMEM offsets for ACC, QG A-operand, AM A-operand."""
+        """Plan TMEM offsets for dual-ACC, QG A-operand, AM A-operand.
+
+        Dual-ACC layout: two separate ACC regions (one for QH MMA, one for AV MMA)
+        so MMA can run QH→AV back-to-back without blocking on CUDA warp reads.
+        """
         SM100_TMEM_CAPACITY_COLS = 512
 
         # ACC: (BT, BV) FP32
@@ -221,24 +231,20 @@ class ChunkGlaFwdO:
         tCrQG_fake = qh_tiled_mma.make_fragment_A(qg_tmem_layout.outer.shape)
         num_qg = tcgen05.find_tmem_tensor_col_offset(tCrQG_fake)
 
-        # AM A-operand: (BT, BT) BF16
-        # Use av_tiled_mma for this — passed in via am_tmem_layout
-
-        acc_off = 0
-        qg_off = acc_off + num_acc
+        # Dual-ACC: acc_qh for QH MMA, acc_av for AV MMA
+        acc_qh_off = 0
+        acc_av_off = acc_qh_off + num_acc
+        qg_off = acc_av_off + num_acc
         am_off = qg_off + num_qg
 
-        # For AM, we need to find its column count from the layout
-        # We'll compute it at the call site and pass it in
-        # For now, estimate as num_qg // 2 (BT=64 vs BK=128)
         total_tmp = am_off + num_qg  # conservative estimate
         total = 1
         while total < total_tmp:
             total *= 2
         assert total <= SM100_TMEM_CAPACITY_COLS, f"TMEM overflow: {total} > {SM100_TMEM_CAPACITY_COLS}"
         if cutlass.const_expr(PRINT_DEBUG):
-            print(f"  TMEM: ACC={num_acc}@{acc_off}, QG={num_qg}@{qg_off}, AM@{am_off}, total={total}")
-        return acc_off, qg_off, am_off, total
+            print(f"  TMEM: ACC_QH={num_acc}@{acc_qh_off}, ACC_AV={num_acc}@{acc_av_off}, QG={num_qg}@{qg_off}, AM@{am_off}, total={total}")
+        return acc_qh_off, acc_av_off, qg_off, am_off, total
 
     @cute.jit
     def __call__(
@@ -369,7 +375,7 @@ class ChunkGlaFwdO:
         )
 
         # ===================== TMEM offsets =====================
-        (self.tmem_acc_off, self.tmem_qg_off, self.tmem_am_off, self.tmem_total) = \
+        (self.tmem_acc_qh_off, self.tmem_acc_av_off, self.tmem_qg_off, self.tmem_am_off, self.tmem_total) = \
             self._plan_tmem_offsets(
                 qh_tiled_mma, self.qh_mma_tiler,
                 qg_tmem_layout, am_tmem_layout,
@@ -467,7 +473,7 @@ class ChunkGlaFwdO:
             load_a_mbar: cute.struct.MemRange[Int64, self.a_stage * 2]
             qg_mbar: cute.struct.MemRange[Int64, self.acc_stage * 2]   # CUDA→MMA: qg ready
             am_mbar: cute.struct.MemRange[Int64, self.acc_stage * 2]   # CUDA→MMA: am ready
-            acc_done_mbar: cute.struct.MemRange[Int64, self.acc_stage * 2]  # MMA→CUDA: acc done
+            acc_done_mbar: cute.struct.MemRange[Int64, self.acc_stage * 2]  # MMA→CUDA: both ACC done
             o_ready_mbar: cute.struct.MemRange[Int64, self.o_stage * 2]   # CUDA→Load: o ready
 
             sQ_epi: cute.struct.Align[
@@ -665,15 +671,16 @@ class ChunkGlaFwdO:
         tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
         # ---- TMEM tensors ----
-        # ACC: (BT, BV) fp32
+        # Dual ACC: separate regions for QH MMA and AV MMA results
         acc_shape = qh_tiled_mma.partition_shape_C(self.qh_mma_tiler[:2])
         tCtAcc_fake = qh_tiled_mma.make_fragment_C(cute.append(acc_shape, self.acc_stage))
-        tCtAcc = cute.make_tensor(tmem_ptr + self.tmem_acc_off, tCtAcc_fake.layout)
+        tCtAcc_qh = cute.make_tensor(tmem_ptr + self.tmem_acc_qh_off, tCtAcc_fake.layout)
+        tCtAcc_av = cute.make_tensor(tmem_ptr + self.tmem_acc_av_off, tCtAcc_fake.layout)
 
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"acc_shape: {acc_shape}")
-            print(f"tCtAcc: {tCtAcc}")
-            print(f"tCtAcc_fake: {tCtAcc_fake}")
+            print(f"tCtAcc_qh: {tCtAcc_qh}")
+            print(f"tCtAcc_av: {tCtAcc_av}")
 
         # QG A-operand: TMEM fragment (BF16) - use FP32 ptr + offset, then recast
         tCrQG = qh_tiled_mma.make_fragment_A(qg_tmem_layout.outer.shape)
@@ -964,9 +971,8 @@ class ChunkGlaFwdO:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
-                # Phase 1: QH MMA — qg(TMEM) × h(SMEM) → acc(TMEM)
+                # Phase 1: QH MMA — qg(TMEM) × h(SMEM) → acc_qh(TMEM)
                 qg_h = qg_C.wait_and_advance()
-                acc_h = acc_done_P.acquire_and_advance()
 
                 for i_k in cutlass.range(self.num_k_tiles, unroll_full=True):
                     h_h = load_h_C.wait_and_advance()
@@ -978,37 +984,39 @@ class ChunkGlaFwdO:
                         )
                         cute.gemm(
                             qh_tiled_mma,
-                            tCtAcc[None, None, None, 0],
+                            tCtAcc_qh[None, None, None, 0],
                             tCrQG_tmem[None, None, kp, 0],
                             tCrH_B[None, None, kp, h_h.index],
-                            tCtAcc[None, None, None, 0],
+                            tCtAcc_qh[None, None, None, 0],
                         )
 
                     h_h.release()
 
                 qg_h.release()
 
-                # Phase 2: AV MMA — am(TMEM) × v(SMEM) → acc(TMEM, ACCUMULATE)
+                # Phase 2: AV MMA — am(TMEM) × v(SMEM) → acc_av(TMEM)
+                # No barrier needed: QH writes to acc_qh, AV writes to acc_av (separate TMEM regions)
                 am_h = am_C.wait_and_advance()
+                acc_h = acc_done_P.acquire_and_advance()
                 v_h = load_v_C.wait_and_advance()
 
                 for kp in cutlass.range(cute.size(tCrV_B, mode=[2]), unroll_full=True):
                     av_tiled_mma.set(
                         tcgen05.Field.ACCUMULATE,
-                        cutlass.Boolean(True),
+                        cutlass.Boolean(kp != 0),
                     )
                     cute.gemm(
                         av_tiled_mma,
-                        tCtAcc[None, None, None, 0],
+                        tCtAcc_av[None, None, None, 0],
                         tCrAM_tmem[None, None, kp, 0],
                         tCrV_B[None, None, kp, v_h.index],
-                        tCtAcc[None, None, None, 0],
+                        tCtAcc_av[None, None, None, 0],
                     )
 
                 am_h.release()
                 v_h.release()
 
-                # Phase 3: Signal ACC done to CUDA warps
+                # Signal both ACCs done to CUDA warps
                 acc_h.commit()
 
         # =====================================================================
@@ -1030,12 +1038,13 @@ class ChunkGlaFwdO:
                 tcgen05.Ld16x256bOp(tcgen05.Repetition(16), tcgen05.Pack.NONE),
                 self.acc_dtype,
             )
-            tCtAcc_flat = tCtAcc[((None, None), 0, 0, None)]
+            tCtAcc_qh_flat = tCtAcc_qh[((None, None), 0, 0, None)]
+            tCtAcc_av_flat = tCtAcc_av[((None, None), 0, 0, None)]
             fake_sQG = cute.make_tensor(
                 cute.make_ptr(self.io_dtype, 0, cute.AddressSpace.smem),
                 cute.dice(self.qh_mma_tiler, (1, 1, None)),
             )
-            tiled_t2r_acc = tcgen05.make_tmem_copy(t2r_atom_acc, tCtAcc_flat[(None, None, 0)])
+            tiled_t2r_acc = tcgen05.make_tmem_copy(t2r_atom_acc, tCtAcc_qh_flat[(None, None, 0)])
             thr_t2r_acc = tiled_t2r_acc.get_slice(local_tidx)
 
             # QG identity tensor: (BT, BK) coords
@@ -1056,6 +1065,9 @@ class ChunkGlaFwdO:
             # Register tensors for QG computation
             tTR_rQG_fp32 = cute.make_rmem_tensor(thr_t2r_acc.partition_D(fake_sQG).shape, self.acc_dtype)
             tRT_rQG_bf16 = cute.make_rmem_tensor(r2t_qg_shape, self.io_dtype)
+
+            # Register buffer for AV acc result
+            tTR_rAV_fp32 = cute.make_rmem_tensor(tTR_rQG_fp32.shape, self.acc_dtype)
 
             # AM R2T: bf16 registers → AM TMEM
             r2t_atom_am = cute.make_copy_atom(
@@ -1081,8 +1093,9 @@ class ChunkGlaFwdO:
             thr_r2s_o = tiled_r2s_o.get_slice(local_tidx)
             tRS_sO = thr_r2s_o.partition_D(sO)
 
-            # Output epilog setup
-            tTR_tAcc = thr_t2r_acc.partition_S(tCtAcc_flat)
+            # Output epilog setup — dual T2R sources for QH and AV accumulators
+            tTR_tAcc_qh = thr_t2r_acc.partition_S(tCtAcc_qh_flat)
+            tTR_tAcc_av = thr_t2r_acc.partition_S(tCtAcc_av_flat)
 
             # ====== Persistent computation loop ======
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
@@ -1100,8 +1113,8 @@ class ChunkGlaFwdO:
                     remaining = seq_len - i_t * BT
                     remaining = cutlass.select_(remaining > BT, Int32(BT), remaining)
 
-                # ============ Compute QG: (q * scale) * exp2(g) ============
-                # Reorder: q*scale (FMA pipe) can overlap with exp2(g) (XU pipe).
+                # ============ Compute QG: q * exp2(g) ============
+                # Scale is deferred to post-accumulation for better bf16 precision.
                 # Varlen: unconditional SMEM loads + branchless select.
                 for i_k in cutlass.range(self.num_k_tiles, unroll_full=True):
                     q_h = load_q_C.wait_and_advance()
@@ -1115,14 +1128,12 @@ class ChunkGlaFwdO:
                             # Branchless select zeros out-of-bounds results.
                             q_val = sQ_epi[(bt_coord, bk_coord, q_h.index)].to(self.acc_dtype)
                             g_val = sG_epi[(bt_coord, bk_coord, g_h.index)]
-                            qs_val = q_val * scale_f32
-                            result = qs_val * cute.exp2(g_val)
+                            result = q_val * cute.exp2(g_val)
                             tTR_rQG_fp32[ei] = cutlass.select_(bt_coord < remaining, result, Float32(0.0))
                         else:
                             q_val = sQ_epi[(bt_coord, bk_coord, q_h.index)].to(self.acc_dtype)
                             g_val = sG_epi[(bt_coord, bk_coord, g_h.index)]
-                            qs_val = q_val * scale_f32
-                            tTR_rQG_fp32[ei] = qs_val * cute.exp2(g_val)
+                            tTR_rQG_fp32[ei] = q_val * cute.exp2(g_val)
 
                     q_h.release()
                     g_h.release()
@@ -1164,13 +1175,18 @@ class ChunkGlaFwdO:
                 cute.arch.fence_view_async_tmem_store()
                 am_h.commit()
 
-                # ============ Output Epilog: ACC → T2R → R2S → sO ============
+                # ============ Dual-ACC Epilog: read both accumulators, combine ============
                 acc_h = acc_done_C.wait_and_advance()
 
-                # Reuse tTR_rQG_fp32 as ACC readback buffer (same shape, no overlap)
-                cute.copy(tiled_t2r_acc, tTR_tAcc[(None, None, None, 0)], tTR_rQG_fp32)
+                # Read QH accumulator (qg@h) from TMEM → fp32 registers
+                cute.copy(tiled_t2r_acc, tTR_tAcc_qh[(None, None, None, 0)], tTR_rQG_fp32)
+                # Read AV accumulator (am@v) from TMEM → fp32 registers
+                cute.copy(tiled_t2r_acc, tTR_tAcc_av[(None, None, None, 0)], tTR_rAV_fp32)
                 cute.arch.fence_view_async_tmem_load()
                 acc_h.release()
+
+                # o = scale*(qg@h) + am@v
+                tTR_rQG_fp32.store(tTR_rQG_fp32.load() * Float32(scale_f32) + tTR_rAV_fp32.load())
 
                 tTR_rAcc_bf16 = cute.make_rmem_tensor(tTR_rQG_fp32.shape, self.io_dtype)
                 tTR_rAcc_bf16.store(tTR_rQG_fp32.load().to(self.io_dtype))
