@@ -10,7 +10,7 @@ from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_intra
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.constant import RCP_LN2
-from benchmark.utils import set_seed, exclusive_cumsum, generate_random_seq_lens
+from benchmark.utils import set_seed, exclusive_cumsum, generate_random_seq_lens, SEED
 
 from flashla.kda.chunk_intra import chunk_kda_fwd_intra as flat_chunk_kda_fwd_intra
 
@@ -34,7 +34,7 @@ def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None):
     chunk_size = BT
     scale = D ** (-0.5)
 
-    set_seed(42)
+    set_seed(SEED)
 
     q = torch.randn(batch_size, T, H, D, dtype=dtype, device=device)
     k = torch.randn(batch_size, T, H, D, dtype=dtype, device=device)
@@ -143,18 +143,18 @@ def benchmark_chunk_intra_varlen(total_len, provider):
     device = torch.device("cuda")
     chunk_size = BT
 
-    # seq_lens = generate_random_seq_lens(num_seqs, total_len, min_seq_len, variance, seed)
-    # T = total_len
-    # cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64, device=device)
+    seq_lens = generate_random_seq_lens(NUM_SEQS, total_len, MIN_SEQ_LEN, VARIANCE, SEED)
+    T = total_len
+    cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
     # hardcoded real-world training traces
-    varlen_traces = {
-        8192:  [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192],
-        16384: [0, 315, 973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459, 6318, 6669, 6979, 7583, 8192],
-        32768: [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
-        65536: [0, 652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236, 5543, 6255, 6480, 6947, 7616, 8192],
-    }
-    T = 8192
-    cu_seqlens = torch.tensor(varlen_traces[total_len], dtype=torch.int32, device=device)
+    # varlen_traces = {
+    #     8192:  [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192],
+    #     16384: [0, 315, 973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459, 6318, 6669, 6979, 7583, 8192],
+    #     32768: [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
+    #     65536: [0, 652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236, 5543, 6255, 6480, 6947, 7616, 8192],
+    # }
+    # T = 8192
+    # cu_seqlens = torch.tensor(varlen_traces[total_len], dtype=torch.int32, device=device)
 
     q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(
         B, T, H, D, device, cu_seqlens=cu_seqlens
