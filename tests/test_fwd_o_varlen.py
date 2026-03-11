@@ -181,10 +181,15 @@ def run_cute_non_varlen_per_seq(d):
 
 
 def check_accuracy(name, ref, out, atol=0.02, rtol_max=0.01):
-    """Check accuracy: abs max diff, rel max diff, mean diff.
+    """Check accuracy: max diff, rel max diff, RMSE ratio (FLA-style).
 
-    Asserts max_diff < atol and rel_max < rtol_max.
-    Returns (max_diff, rel_max, mean_diff).
+    Metrics:
+      - max_diff: max |ref - out|
+      - rel_max:  max_diff / max(|ref|)
+      - rmse_ratio: RMSE(ref - out) / RMS(ref)  (same as FLA get_err_ratio)
+
+    Asserts max_diff < atol.
+    Returns (max_diff, rel_max, rmse_ratio).
     """
     ref_f = ref.float()
     out_f = out.float()
@@ -193,18 +198,23 @@ def check_accuracy(name, ref, out, atol=0.02, rtol_max=0.01):
     mean_diff = diff.mean().item()
     denom = ref_f.abs().max().item()
     rel_max = max_diff / denom if denom > 0 else 0.0
+    # FLA-style RMSE ratio: RMSE(diff) / RMS(ref)
+    rmse = diff.flatten().square().mean().sqrt().item()
+    rms_ref = ref_f.flatten().square().mean().sqrt().item()
+    rmse_ratio = rmse / (rms_ref + 1e-8)
 
     passed = max_diff < atol
     status = "PASS" if passed else "FAIL"
-    print(f"  [{status}] {name}: max_diff={max_diff:.6f} rel_max={rel_max:.6f} "
-          f"mean_diff={mean_diff:.8f}")
+    print(f"  [{status}] {name}: "
+          f"max_diff={max_diff:.6f} rel_max={rel_max:.6f} "
+          f"rmse_ratio={rmse_ratio:.6f}")
     if not passed:
         flat_idx = diff.view(-1).argmax().item()
         print(f"    Worst at flat_idx={flat_idx}: "
               f"ref={ref_f.view(-1)[flat_idx].item():.6f}, "
               f"out={out_f.view(-1)[flat_idx].item():.6f}")
     assert passed, f"{name}: max_diff={max_diff:.6f} exceeds atol={atol}"
-    return max_diff, rel_max, mean_diff
+    return max_diff, rel_max, rmse_ratio
 
 
 def check_per_seq(name, ref, out, d, atol=0.02):
@@ -262,36 +272,62 @@ def check_per_seq(name, ref, out, d, atol=0.02):
     ([256, 512, 128, 64, 256], 64),
     ([1024, 2048], 64),
 ], ids=lambda x: str(x))
-def test_cute_varlen_vs_pytorch_ref(seq_lens, H):
-    """CuTe DSL varlen must match per-sequence PyTorch reference."""
+def test_cute_varlen_vs_torch_baseline(seq_lens, H):
+    """CuTe DSL varlen must match per-sequence PyTorch baseline."""
     d = gen_varlen_data(seq_lens, H)
-    o_cute = run_cute_varlen(d)
     o_ref = run_pytorch_ref_per_seq(d)
-    check_accuracy(f"CuTe_varlen vs ref seqs={seq_lens} H={H}", o_ref, o_cute)
-    check_per_seq("per_seq", o_ref, o_cute, d)
+    o_cute = run_cute_varlen(d)
+    check_accuracy(f"CuTe vs torch seqs={seq_lens} H={H}", o_ref, o_cute)
+    check_per_seq("CuTe_per_seq", o_ref, o_cute, d)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test: CuTe varlen vs FLA Triton varlen
+# Test: FLA Triton varlen vs PyTorch baseline
 # ═══════════════════════════════════════════════════════════════════════
 
 @pytest.mark.parametrize("seq_lens,H", [
+    # Single sequence
     ([64], 4),
+    ([128], 4),
+    ([192], 4),
+    ([100], 4),
+    ([1], 4),
+    ([63], 4),
+    ([65], 4),
+
+    # Two sequences
+    ([64, 64], 4),
     ([128, 64], 4),
     ([100, 200], 4),
-    ([256, 128, 64], 4),
+    ([256, 1], 4),
+
+    # Multiple sequences
+    ([64, 64, 64], 4),
+    ([128, 64, 192], 4),
+    ([256, 128, 64, 64], 4),
+    ([100, 150, 200, 250, 300], 4),
+
+    # Same-length / many short
     ([64, 64, 64, 64], 4),
-    ([100, 150, 200, 250], 4),
-    ([1024, 2048], 32),
+    ([128, 128, 128], 4),
+    ([2] * 20, 4),
+
+    # Mixed extreme
+    ([1, 1024], 4),
+    ([1024, 1], 4),
+    ([1, 64, 1, 128, 1], 4),
+
+    # Larger scale
     ([256, 512, 128, 64, 256], 64),
+    ([1024, 2048], 64),
 ], ids=lambda x: str(x))
-def test_cute_varlen_vs_fla_triton(seq_lens, H):
-    """CuTe DSL varlen must match FLA Triton varlen."""
+def test_fla_varlen_vs_torch_baseline(seq_lens, H):
+    """FLA Triton varlen must match per-sequence PyTorch baseline."""
     d = gen_varlen_data(seq_lens, H)
-    o_cute = run_cute_varlen(d)
+    o_ref = run_pytorch_ref_per_seq(d)
     o_fla = run_fla_varlen(d)
-    check_accuracy(f"CuTe_varlen vs FLA seqs={seq_lens} H={H}", o_fla, o_cute)
-    check_per_seq("per_seq_vs_fla", o_fla, o_cute, d)
+    check_accuracy(f"FLA vs torch seqs={seq_lens} H={H}", o_ref, o_fla)
+    check_per_seq("FLA_per_seq", o_ref, o_fla, d)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -324,36 +360,42 @@ def test_cute_varlen_vs_non_varlen(seq_lens, H):
     [64, 128], [100, 200, 64], [256, 512],
 ])
 def test_pure_inter_chunk(seq_lens):
-    """With A=0, output is purely from inter-chunk (q*g @ h). Must match ref."""
+    """With A=0, output is purely from inter-chunk (q*g @ h). Must match torch baseline."""
     H = 4
     d = gen_varlen_data(seq_lens, H, zero_A=True)
-    o_cute = run_cute_varlen(d)
     o_ref = run_pytorch_ref_per_seq(d)
-    check_accuracy(f"pure_inter (A=0) seqs={seq_lens}", o_ref, o_cute)
+    o_cute = run_cute_varlen(d)
+    o_fla = run_fla_varlen(d)
+    check_accuracy(f"pure_inter (A=0) FLA vs torch seqs={seq_lens}", o_ref, o_fla)
+    check_accuracy(f"pure_inter (A=0) CuTe vs torch seqs={seq_lens}", o_ref, o_cute)
 
 
 @pytest.mark.parametrize("seq_lens", [
     [64, 128], [100, 200, 64], [256, 512],
 ])
 def test_pure_intra_chunk(seq_lens):
-    """With h=0, output is purely from intra-chunk (A @ v). Must match ref."""
+    """With h=0, output is purely from intra-chunk (A @ v). Must match torch baseline."""
     H = 4
     d = gen_varlen_data(seq_lens, H, zero_h=True)
-    o_cute = run_cute_varlen(d)
     o_ref = run_pytorch_ref_per_seq(d)
-    check_accuracy(f"pure_intra (h=0) seqs={seq_lens}", o_ref, o_cute)
+    o_cute = run_cute_varlen(d)
+    o_fla = run_fla_varlen(d)
+    check_accuracy(f"pure_intra (h=0) FLA vs torch seqs={seq_lens}", o_ref, o_fla)
+    check_accuracy(f"pure_intra (h=0) CuTe vs torch seqs={seq_lens}", o_ref, o_cute)
 
 
 @pytest.mark.parametrize("seq_lens", [
     [64, 128], [100, 200, 64],
 ])
 def test_zero_gate(seq_lens):
-    """With g=0, exp2(g)=1 so qg=q. Must match ref."""
+    """With g=0, exp2(g)=1 so qg=q. Must match torch baseline."""
     H = 4
     d = gen_varlen_data(seq_lens, H, zero_g=True)
-    o_cute = run_cute_varlen(d)
     o_ref = run_pytorch_ref_per_seq(d)
-    check_accuracy(f"zero_gate (g=0) seqs={seq_lens}", o_ref, o_cute)
+    o_cute = run_cute_varlen(d)
+    o_fla = run_fla_varlen(d)
+    check_accuracy(f"zero_gate (g=0) FLA vs torch seqs={seq_lens}", o_ref, o_fla)
+    check_accuracy(f"zero_gate (g=0) CuTe vs torch seqs={seq_lens}", o_ref, o_cute)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -362,12 +404,14 @@ def test_zero_gate(seq_lens):
 
 @pytest.mark.parametrize("H", [1, 2, 4, 8, 16, 32, 64])
 def test_head_counts(H):
-    """Test varlen across different head counts."""
+    """Test varlen across different head counts, both FLA and CuTe vs torch baseline."""
     seq_lens = [128, 64, 192]
     d = gen_varlen_data(seq_lens, H)
-    o_cute = run_cute_varlen(d)
     o_ref = run_pytorch_ref_per_seq(d)
-    check_accuracy(f"H={H} seqs={seq_lens}", o_ref, o_cute)
+    o_cute = run_cute_varlen(d)
+    o_fla = run_fla_varlen(d)
+    check_accuracy(f"H={H} FLA vs torch", o_ref, o_fla)
+    check_accuracy(f"H={H} CuTe vs torch", o_ref, o_cute)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -397,7 +441,8 @@ def test_determinism():
 
 @pytest.mark.parametrize("seed", list(range(10)))
 def test_random_varlen_configs(seed):
-    """Random seq count (2-15), random lengths (1-500), random H in {4,16,32,64}."""
+    """Random seq count (2-15), random lengths (1-500), random H in {4,16,32,64}.
+    Both FLA and CuTe compared against torch baseline."""
     rng = random.Random(seed + 1000)
     n_seqs = rng.randint(2, 15)
     seq_lens = [rng.randint(1, 500) for _ in range(n_seqs)]
@@ -405,9 +450,11 @@ def test_random_varlen_configs(seed):
     print(f"  seed={seed}: n_seqs={n_seqs} H={H} lens={seq_lens}")
 
     d = gen_varlen_data(seq_lens, H, seed=seed)
-    o_cute = run_cute_varlen(d)
     o_ref = run_pytorch_ref_per_seq(d)
-    check_accuracy(f"random seed={seed}", o_ref, o_cute, atol=0.02)
+    o_cute = run_cute_varlen(d)
+    o_fla = run_fla_varlen(d)
+    check_accuracy(f"random seed={seed} FLA vs torch", o_ref, o_fla, atol=0.02)
+    check_accuracy(f"random seed={seed} CuTe vs torch", o_ref, o_cute, atol=0.02)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -416,15 +463,18 @@ def test_random_varlen_configs(seed):
 
 @pytest.mark.parametrize("g_scale", [0.01, 0.1, 0.5, 1.0])
 def test_gate_magnitude(g_scale):
-    """Various gate magnitudes to test numerical stability."""
+    """Various gate magnitudes to test numerical stability.
+    Both FLA and CuTe compared against torch baseline."""
     seq_lens = [128, 64, 100]
     H = 4
     d = gen_varlen_data(seq_lens, H, g_scale=g_scale)
-    o_cute = run_cute_varlen(d)
     o_ref = run_pytorch_ref_per_seq(d)
+    o_cute = run_cute_varlen(d)
+    o_fla = run_fla_varlen(d)
     # Larger gates → larger values → relax atol proportionally
     atol = 0.02 * max(1.0, 2 ** g_scale)
-    check_accuracy(f"g_scale={g_scale}", o_ref, o_cute, atol=atol)
+    check_accuracy(f"g_scale={g_scale} FLA vs torch", o_ref, o_fla, atol=atol)
+    check_accuracy(f"g_scale={g_scale} CuTe vs torch", o_ref, o_cute, atol=atol)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -493,14 +543,17 @@ def test_sequence_boundary_isolation():
     ([64, 64, 64, 64, 64], 64),
 ])
 def test_three_way_cross_validation(seq_lens, H):
-    """All three implementations must agree within tolerance."""
+    """All three implementations must agree with torch baseline."""
     d = gen_varlen_data(seq_lens, H)
     o_ref = run_pytorch_ref_per_seq(d)
     o_fla = run_fla_varlen(d)
     o_cute = run_cute_varlen(d)
 
-    check_accuracy(f"ref vs FLA seqs={seq_lens}", o_ref, o_fla, atol=0.02)
-    check_accuracy(f"ref vs CuTe seqs={seq_lens}", o_ref, o_cute, atol=0.02)
+    print(f"  --- Torch baseline vs FLA ---")
+    check_accuracy(f"torch vs FLA seqs={seq_lens}", o_ref, o_fla, atol=0.02)
+    print(f"  --- Torch baseline vs CuTe ---")
+    check_accuracy(f"torch vs CuTe seqs={seq_lens}", o_ref, o_cute, atol=0.02)
+    print(f"  --- FLA vs CuTe (cross-check) ---")
     check_accuracy(f"FLA vs CuTe seqs={seq_lens}", o_fla, o_cute, atol=0.02)
 
 
