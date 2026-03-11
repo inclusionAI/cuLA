@@ -811,6 +811,7 @@ struct SM100_MMA_TF32_TS_MASK3_NOELECT
     }
 };
 
+// TODO: refactor to cutlass-style code
 template <class a_type, class b_type, class c_type,
           int M, int N, UMMA::Major a_major, UMMA::Major b_major,
           UMMA::ScaleIn a_neg = UMMA::ScaleIn::One, UMMA::ScaleIn b_neg = UMMA::ScaleIn::One>

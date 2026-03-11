@@ -9,7 +9,7 @@ struct KDA_fwd_intra_params {
     int total_q_len;
     int b;
     int h;
-    int d, d_v;
+    int d;
     int chunk_size;
     float scale;
 

@@ -333,7 +333,7 @@ kda_fwd_intra_sm100_kernel_entry(
 // ===================================================================
 // Host-side launcher: constructs TMA descriptors and launches kernel
 // ===================================================================
-inline void run_kda_fwd_intra_sm100_v2(KDA_fwd_intra_params &params, cudaStream_t stream) {
+inline void run_kda_fwd_intra_sm100_impl(KDA_fwd_intra_params &params, cudaStream_t stream) {
     using Kernel = KdaChunkFwdIntraKernelSm100Default;
 
     auto shape_QKG  = make_shape(params.total_q_len, params.d, params.h);

@@ -24,7 +24,7 @@ using namespace cute;
     template <class Type>
     using Layout_K_SW128_32B_Atom = decltype(upcast<sizeof_bits<Type>::value>(Layout_K_SW128_32B_Atom_Bits{}));
 
-
+// TODO: wrap into sm100_utils.hpp
 CUTE_DEVICE
 void tcgen05_before_thread_sync() {
     asm volatile("tcgen05.fence::before_thread_sync;");
