@@ -3,6 +3,7 @@ import random
 
 import torch
 import torch.distributions as dist
+import torch.nn.functional as F
 
 from einops import rearrange
 from fla.modules.l2norm import l2norm_fwd
@@ -185,6 +186,64 @@ def prepare_safe_gate_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk
         A_log=A_log, dt_bias=dt_bias,
         scale=scale, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         init_state=None, lower_bound=-5.0,
+    )
+
+def prepare_no_gate_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED):
+    """Prepare inputs for use_gate_in_kernel=False benchmarks.
+
+    All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
+    """
+    dtype = torch.bfloat16
+    scale = D ** (-0.5)
+
+    set_seed(seed)
+
+    q = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
+    k = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
+    v = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
+    g = F.logsigmoid(torch.randn(batch_size, T, H, D, dtype=torch.float, device=device)).requires_grad_(False)
+    beta = torch.randn(batch_size, T, H, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
+
+    # flatten to batch_size=1 for cu_seqlens compatibility
+    if batch_size != 1:
+        q, k, v, g, beta = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, g, beta))
+
+    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
+
+    return dict(
+        q=q, k=k, v=v, g=g, beta=beta,
+        scale=scale, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+    )
+
+
+def prepare_kernel_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED):
+    """Prepare inputs for kernel-level benchmarks (l2norm pre-applied).
+
+    All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
+    """
+    dtype = torch.bfloat16
+    scale = D ** (-0.5)
+
+    set_seed(seed)
+
+    q = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
+    k = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
+    v = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
+    g = F.logsigmoid(torch.randn(batch_size, T, H, D, dtype=dtype, device=device)).requires_grad_(False)
+    beta = torch.randn(batch_size, T, H, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
+
+    q, _ = l2norm_fwd(q)
+    k, _ = l2norm_fwd(k)
+
+    # flatten to batch_size=1 for cu_seqlens compatibility
+    if batch_size != 1:
+        q, k, v, g, beta = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, g, beta))
+
+    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
+
+    return dict(
+        q=q, k=k, v=v, g=g, beta=beta,
+        scale=scale, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
     )
 
 def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED):

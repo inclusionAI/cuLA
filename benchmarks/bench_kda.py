@@ -1,323 +1,233 @@
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
 import torch
 import triton
-import sys, pathlib
 
-sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-
-import torch.nn.functional as F
-from einops import rearrange
-
-from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
-from fla.ops.kda import chunk_kda
-from benchmarks.utils import set_seed, exclusive_cumsum
+from fla.ops.kda import chunk_kda as fla_chunk_kda
+from benchmarks.utils import (
+    set_seed, exclusive_cumsum, generate_random_seq_lens,
+    prepare_safe_gate_inputs, prepare_no_gate_inputs,
+    SEED, CHUNK_SIZE,
+)
 
 from flashla.kda_wrapper import flash_kda_prefill
+from flashla.kda.chunk import chunk_kda as flashla_chunk_kda
 
 # Constant params
 B, H, D = 2, 64, 128
 
+# Varlen benchmark params
+NUM_SEQS = 8 # 序列个数
+TOTAL_LEN = 8192  # 总长度
+MIN_SEQ_LEN = 63  # 最小序列长度
+VARIANCE = 1.0  # 方差控制: 0.0=均衡, 1.0=正常随机, >1.0=更不均衡
+
+# hardcoded real-world training traces
+VARLEN_TRACES = {
+    8192:  [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192],
+    16384: [0, 315, 973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459, 6318, 6669, 6979, 7583, 8192],
+    32768: [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
+    65536: [0, 652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236, 5543, 6255, 6480, 6947, 7616, 8192],
+}
+
+
+# ==============================================================================
+# Benchmark 1: safe_gate (use_gate_in_kernel=True, safe_gate=True), uniform seqlen
+# ==============================================================================
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        # argument names to use as an x-axis for the plot
         x_names=['T'],
-        # different possible values for `x_name`
-        x_vals=[128, 256, 512, 1024, 2048, 4096, 8192, 16384],
-        # argument name whose value corresponds to a different line in the plot
+        x_vals=[128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
         line_arg='provider',
-        # possible values for `line_arg``
-        line_vals=['flashla_cutedsl', 'fla'],
-        # label name for the lines
-        line_names=['flashla_cutedsl', 'fla'],
-        # line styles
-        styles=[('blue', '-'), ('red', '-.'), ('green', '-'), ('orange', '-.'),
-                ('purple', '-'), ('brown', '-.'), ('pink', '-'), ('gray', '-.')],
-        ylabel="Execution Time (ms)",  # label name for the y-axis
-        # name for the plot. Used also as a file name for saving the plot.
-        plot_name=f"Performance_B{B}_H{H}_kda_safe_gate",
+        line_vals=['flashla_fully_fused', 'flashla', 'fla'],
+        line_names=['flashla_fully_fused', 'flashla', 'fla'],
+        styles=[('blue', '-'), ('green', '-'), ('red', '-.'),
+                ('orange', '-.'), ('purple', '-'), ('brown', '-.'), ('pink', '-'), ('gray', '-.')],
+        ylabel="Execution Time (ms)",
+        plot_name=f"Performance_B{B}_H{H}",
         args={},
     ),
 )
 def benchmark_safe_gate(T, provider):
-    dtype = torch.bfloat16
     device = torch.device("cuda")
 
     seq_lens = [T] * B
-    num_seqs = len(seq_lens) # TODO: support varlen
-    assert num_seqs == B
-    scale = D ** (-0.5)
+    cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-    use_gate_in_kernel = True
-    safe_gate = True
-    has_init_state = False
-    # normalize for gate to test numerical stablity
-    gate_logit_normalizer = 1
+    inputs = prepare_safe_gate_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens)
+    q, k, v, g, beta = inputs['q'], inputs['k'], inputs['v'], inputs['g'], inputs['beta']
+    A_log, dt_bias = inputs['A_log'], inputs['dt_bias']
+    scale, init_state, lower_bound = inputs['scale'], inputs['init_state'], inputs['lower_bound']
 
     quantiles = [0.5, 0.2, 0.8]
-    results = 0, 0, 0
 
-    set_seed(42)
-
-    q = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    k = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    v = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    g = torch.randn(B, T, H, D, dtype=torch.float, device=device).requires_grad_(False)
-    beta = torch.randn(B, T, H, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
-    if use_gate_in_kernel:
-      A_log = torch.randn(H, dtype=torch.float)
-      dt_bias = torch.randn(H * D, dtype=torch.float)
-      A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(False), (A_log, dt_bias))
-    else:
-      g = F.logsigmoid(g)
-      g = g / gate_logit_normalizer
-
-    if safe_gate:
-        lower_bound = -5.0
-        if not use_gate_in_kernel:
-            g = g.clamp(-5, 0)
-    else:
-        lower_bound = None
-
-    if has_init_state:
-      init_state = torch.randn(B, H, D, D, dtype=torch.float, device=device).requires_grad_(False)
-    else:
-       init_state = None
-
-    if provider == 'flashla_cutedsl':
+    if provider == 'flashla_fully_fused':
         results = triton.testing.do_bench(
-          lambda: flash_kda_prefill(
-              q=q,
-              k=k,
-              v=v,
-              g=g,
-              beta=beta,
-              scale=scale,
-              A_log=(A_log.clone() if use_gate_in_kernel else None),
-              dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-              initial_state=init_state,
-              output_final_state=True,
-              use_qk_l2norm_in_kernel=True,
-              use_gate_in_kernel=use_gate_in_kernel,
-              safe_gate=safe_gate,
-              lower_bound=lower_bound
-          ),
-          quantiles=quantiles,
+            lambda: flash_kda_prefill(
+                q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                A_log=A_log, dt_bias=dt_bias,
+                initial_state=init_state, output_final_state=True,
+                use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
+                use_gate_in_kernel=True, safe_gate=True, lower_bound=lower_bound,
+            ),
+            quantiles=quantiles,
+        )
+    elif provider == 'flashla':
+        results = triton.testing.do_bench(
+            lambda: flashla_chunk_kda(
+                q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                A_log=A_log, dt_bias=dt_bias,
+                initial_state=init_state, output_final_state=True,
+                use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
+                use_gate_in_kernel=True, safe_gate=True, lower_bound=lower_bound,
+            ),
+            quantiles=quantiles,
         )
     elif provider == 'fla':
-      results = triton.testing.do_bench(
-          lambda: chunk_kda(
-              q=q,
-              k=k,
-              v=v,
-              g=g,
-              beta=beta,
-              A_log=(A_log.clone() if use_gate_in_kernel else None),
-              dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-              scale=scale,
-              initial_state=init_state,
-              output_final_state=True,
-              use_qk_l2norm_in_kernel=True,
-              use_gate_in_kernel=use_gate_in_kernel,
-              safe_gate=safe_gate,
-              lower_bound=lower_bound
-          ),
-          quantiles=quantiles,
-      )
+        results = triton.testing.do_bench(
+            lambda: fla_chunk_kda(
+                q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                A_log=A_log, dt_bias=dt_bias,
+                initial_state=init_state, output_final_state=True,
+                use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
+                use_gate_in_kernel=True, safe_gate=True, lower_bound=lower_bound,
+            ),
+            quantiles=quantiles,
+        )
 
     return results
 
 
+# ==============================================================================
+# Benchmark 2: use_gate_in_kernel=False, uniform seqlen
+# ==============================================================================
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        # argument names to use as an x-axis for the plot
         x_names=['T'],
-        # different possible values for `x_name`
         x_vals=[2048, 4096, 8192, 16384, 32768, 65536],
-        # argument name whose value corresponds to a different line in the plot
         line_arg='provider',
-        # possible values for `line_arg``
-        line_vals=['flat_ops', 'fla'],
-        # label name for the lines
-        line_names=['flat_ops', 'fla'],
-        # line styles
+        line_vals=['flashla_fully_fused', 'fla'],
+        line_names=['flashla_fully_fused', 'fla'],
         styles=[('blue', '-'), ('red', '-.'), ('green', '-'), ('orange', '-.'),
                 ('purple', '-'), ('brown', '-.'), ('pink', '-'), ('gray', '-.')],
-        ylabel="Execution Time (ms)",  # label name for the y-axis
-        # name for the plot. Used also as a file name for saving the plot.
+        ylabel="Execution Time (ms)",
         plot_name=f"Performance_B{B}_H{H}_kda_use_gate_false",
         args={},
     ),
 )
 def benchmark(T, provider):
-    dtype = torch.bfloat16
     device = torch.device("cuda")
 
     seq_lens = [T] * B
-    num_seqs = len(seq_lens) # TODO: support varlen
-    assert num_seqs == B
-    scale = D ** (-0.5)
+    cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64, device=device)
 
-    use_gate_in_kernel = False
+    inputs = prepare_no_gate_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens)
+    q, k, v, g, beta = inputs['q'], inputs['k'], inputs['v'], inputs['g'], inputs['beta']
+    scale = inputs['scale']
 
     quantiles = [0.5, 0.2, 0.8]
-    results = 0, 0, 0
 
-    set_seed(42)
-
-    use_gate_in_kernel = False
-
-    q = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    k = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    v = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    g = torch.randn(B, T, H, D, dtype=torch.float, device=device).requires_grad_(False)
-    beta = torch.randn(B, T, H, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
-    if use_gate_in_kernel:
-      A_log = torch.randn(H, dtype=torch.float)
-      dt_bias = torch.randn(H * D, dtype=torch.float)
-      A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(False), (A_log, dt_bias))
-    else:
-      g = F.logsigmoid(g)
-
-    if provider == 'flat_ops':
-        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64, device=device)
-        # set batch size to 1 for compatibility with the preprocessing kernel
-        if B != 1:
-          q, k, v, g, beta = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, g, beta))
+    if provider == 'flashla_fully_fused':
         results = triton.testing.do_bench(
-          lambda: flash_kda_prefill(
-              q=q,
-              k=k,
-              v=v,
-              g=g,
-              beta=beta,
-              scale=scale,
-              A_log=(A_log.clone() if use_gate_in_kernel else None),
-              dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-              initial_state=None,
-              output_final_state=True,
-              use_qk_l2norm_in_kernel=True,
-              cu_seqlens=cu_seqlens,
-              use_gate_in_kernel=use_gate_in_kernel,
-              safe_gate=False
-          ),
-          quantiles=quantiles,
+            lambda: flash_kda_prefill(
+                q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                A_log=None, dt_bias=None,
+                initial_state=None, output_final_state=True,
+                use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
+                use_gate_in_kernel=False, safe_gate=False,
+            ),
+            quantiles=quantiles,
         )
     elif provider == 'fla':
-      results = triton.testing.do_bench(
-          lambda: chunk_kda(
-              q=q,
-              k=k,
-              v=v,
-              g=g,
-              beta=beta,
-              A_log=(A_log.clone() if use_gate_in_kernel else None),
-              dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-              scale=scale,
-              initial_state=None,
-              output_final_state=True,
-              use_qk_l2norm_in_kernel=True,
-              use_gate_in_kernel=use_gate_in_kernel,
-          ),
-          quantiles=quantiles,
-      )
+        results = triton.testing.do_bench(
+            lambda: fla_chunk_kda(
+                q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                A_log=None, dt_bias=None,
+                initial_state=None, output_final_state=True,
+                use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
+                use_gate_in_kernel=False,
+            ),
+            quantiles=quantiles,
+        )
 
     return results
 
+
+# ==============================================================================
+# Benchmark 3: varlen safe_gate
+# ==============================================================================
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        # argument names to use as an x-axis for the plot
-        x_names=['T'],
-        # different possible values for `x_name`
-        x_vals=[2048, 4096, 8192, 16384, 32768, 65536],
-        # argument name whose value corresponds to a different line in the plot
+        x_names=['total_len'],
+        x_vals=[8192, 16384, 32768, 65536],
         line_arg='provider',
-        # possible values for `line_arg``
-        line_vals=['flat_ops', 'fla'],
-        # label name for the lines
-        line_names=['flat_ops', 'fla'],
-        # line styles
-        styles=[('blue', '-'), ('red', '-.'), ('green', '-'), ('orange', '-.'),
-                ('purple', '-'), ('brown', '-.'), ('pink', '-'), ('gray', '-.')],
-        ylabel="Execution Time (ms)",  # label name for the y-axis
-        # name for the plot. Used also as a file name for saving the plot.
-        plot_name=f"Performance_B{B}_H{H}_kda_use_gate_in_kernel",
+        line_vals=['flashla_fully_fused', 'flashla', 'fla'],
+        line_names=['flashla_fully_fused', 'flashla', 'fla'],
+        styles=[('blue', '-'), ('green', '-'), ('red', '-.')],
+        ylabel="Execution Time (ms)",
+        plot_name=f"Performance_varlen_NSEQ{NUM_SEQS}_H{H}_VAR{VARIANCE}",
         args={},
     ),
 )
-def benchmark_kernel(T, provider):
-    try:
-        from fla.ops.kda import chunk_kda_fwd
-    except ImportError:
-        raise ImportError("Please modify the fla/ops/kda/__init__.py to export chunk_kda_fwd.")
-
-    dtype = torch.bfloat16
+def benchmark_varlen_safe_gate(total_len, provider):
+    """
+    Varlen 版本的 benchmark，支持配置：
+    - NUM_SEQS: 序列个数 (使用全局变量)
+    - total_len: 总长度 (x轴)
+    - MIN_SEQ_LEN: 最小序列长度 (使用全局变量)
+    - VARIANCE: 方差控制 (使用全局变量)
+    """
     device = torch.device("cuda")
 
-    seq_lens = [T] * B
-    num_seqs = len(seq_lens) # TODO: support varlen
-    assert num_seqs == B
+    # seq_lens = generate_random_seq_lens(NUM_SEQS, total_len, MIN_SEQ_LEN, VARIANCE, 42)
+    # T = total_len
+    # cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
+    # hardcoded real-world training traces
+    T = 8192
+    cu_seqlens = torch.tensor(VARLEN_TRACES[total_len], dtype=torch.int32, device=device)
 
-    scale = D ** (-0.5)
-    use_qk_l2norm_in_kernel = True
-    output_final_state = True
+    inputs = prepare_safe_gate_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens)
+    q, k, v, g, beta = inputs['q'], inputs['k'], inputs['v'], inputs['g'], inputs['beta']
+    A_log, dt_bias = inputs['A_log'], inputs['dt_bias']
+    scale, init_state, lower_bound = inputs['scale'], inputs['init_state'], inputs['lower_bound']
 
     quantiles = [0.5, 0.2, 0.8]
-    results = 0, 0, 0
 
-    set_seed(42)
-
-    q = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    k = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    v = torch.randn(B, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    g = F.logsigmoid(torch.randn(B, T, H, D, dtype=dtype, device=device)).requires_grad_(False)
-    beta = torch.randn(B, T, H, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
-    chunk_indices = None
-    q_rstd, k_rstd = None, None
-    if use_qk_l2norm_in_kernel:
-        q, q_rstd = l2norm_fwd(q)
-        k, k_rstd = l2norm_fwd(k)
-
-    chunk_size = 64
-
-    if provider == 'flat_ops':
-        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64, device=device)
-        # set batch size to 1 for compatibility with the preprocessing kernel
-        if B != 1:
-          q, k, v, g, beta = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, g, beta))
-        g = chunk_local_cumsum(
-            g=g,
-            chunk_size=chunk_size,
-            scale=RCP_LN2,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices
-        )
-        workspace_buffer = torch.zeros(132 * 1024, dtype=torch.uint8, device=q.device)
-
+    if provider == 'flashla_fully_fused':
         results = triton.testing.do_bench(
-          lambda: ops.kda_fwd_prefill(
-            None, None, q, k, v, None, g, beta, cu_seqlens, workspace_buffer, scale
-          ),
-          quantiles=quantiles,
+            lambda: flash_kda_prefill(
+                q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                A_log=A_log, dt_bias=dt_bias,
+                initial_state=init_state, output_final_state=True,
+                use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
+                use_gate_in_kernel=True, safe_gate=True, lower_bound=lower_bound,
+            ),
+            quantiles=quantiles,
+        )
+    elif provider == 'flashla':
+        results = triton.testing.do_bench(
+            lambda: flashla_chunk_kda(
+                q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                A_log=A_log, dt_bias=dt_bias,
+                initial_state=init_state, output_final_state=True,
+                use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
+                use_gate_in_kernel=True, safe_gate=True, lower_bound=lower_bound,
+            ),
+            quantiles=quantiles,
         )
     elif provider == 'fla':
-        g = chunk_local_cumsum(
-            g=g,
-            chunk_size=chunk_size,
-            scale=RCP_LN2,
-        )
         results = triton.testing.do_bench(
-          lambda: chunk_kda_fwd(
-              q=q,
-              k=k,
-              v=v,
-              g=g,
-              beta=beta,
-              scale=scale,
-              initial_state=None,
-              output_final_state=output_final_state,
-          ),
-          quantiles=quantiles,
+            lambda: fla_chunk_kda(
+                q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                A_log=A_log, dt_bias=dt_bias,
+                initial_state=init_state, output_final_state=True,
+                use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
+                use_gate_in_kernel=True, safe_gate=True, lower_bound=lower_bound,
+            ),
+            quantiles=quantiles,
         )
 
     return results
@@ -337,7 +247,7 @@ def run_safe_gate_sweep(B_list=[1, 2], H=64, D=128,
 
     for B in B_list:
         for T in T_list:
-            set_seed(42)
+            set_seed(SEED)
             q = torch.randn(B, T, H, D, dtype=dtype, device=device)
             k = torch.randn(B, T, H, D, dtype=dtype, device=device)
             v = torch.randn(B, T, H, D, dtype=dtype, device=device)
@@ -429,7 +339,7 @@ def run_state_combo_sweep(B=2, H=64, D=128,
     # Warmup: compile all kernel variants before timing
     print("Warming up all kernel variants...")
     for has_init, out_final in combos:
-        set_seed(42)
+        set_seed(SEED)
         T_warmup = T_list[0]
         q = torch.randn(B, T_warmup, H, D, dtype=dtype, device=device)
         k = torch.randn(B, T_warmup, H, D, dtype=dtype, device=device)
@@ -463,7 +373,7 @@ def run_state_combo_sweep(B=2, H=64, D=128,
         tag = f"init={'Y' if has_init else 'N'}, out={'Y' if out_final else 'N'}"
         print(f"\n--- {tag} ---")
         for T in T_list:
-            set_seed(42)
+            set_seed(SEED)
             q = torch.randn(B, T, H, D, dtype=dtype, device=device)
             k = torch.randn(B, T, H, D, dtype=dtype, device=device)
             v = torch.randn(B, T, H, D, dtype=dtype, device=device)
@@ -548,8 +458,9 @@ def run_state_combo_sweep(B=2, H=64, D=128,
 
 
 if __name__ == "__main__":
-  run_state_combo_sweep(B=2)
-  # run_safe_gate_sweep(B_list=[1, 2, 4])
-  # benchmark_safe_gate.run(print_data=True, save_path='./benchmarks_safe_gate')
-  # benchmark.run(print_data=True, save_path='./benchmarks')
-  # benchmark_kernel.run(print_data=True, save_path='./benchmark_kernel')
+    # run_state_combo_sweep(B=2)
+    # run_safe_gate_sweep(B_list=[1, 2, 4])
+    # Fixed-length benchmarks
+    benchmark_safe_gate.run(print_data=True, save_path='./bench_safe_gate')
+    # Varlen benchmarks
+    benchmark_varlen_safe_gate.run(print_data=True, save_path='./bench_varlen_safe_gate')

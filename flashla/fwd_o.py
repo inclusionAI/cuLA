@@ -76,6 +76,8 @@ from typing import Type, Tuple, List, Union
 import torch
 import torch.nn.functional as F
 
+from fla.ops.utils import prepare_chunk_indices
+
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -1605,6 +1607,11 @@ def chunk_gla_fwd_o(
         is_varlen: whether to use varlen mode
         persistent: whether to use persistent kernel (default: True)
     """
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    if chunk_indices is not None:
+        chunk_indices = torch.flatten(chunk_indices) # ensure 1D
+
     if is_varlen:
         assert cu_seqlens is not None and chunk_indices is not None, \
             "cu_seqlens and chunk_indices are required for varlen mode"
