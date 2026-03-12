@@ -902,12 +902,11 @@ class ChunkDeltaRuleFwdH:
 
                     # TMA load gk for this chunk (BK Float32 values)
                     if use_gk:
-                        # For tail chunk in varlen, use last valid position
+                        # For tail chunk (T not divisible by BT), clamp to last valid position
                         gk_t_idx = chunk_idx * self.BT + self.BT - 1
-                        if cutlass.const_expr(self.is_varlen):
-                            remaining = seq_len - chunk_idx * self.BT
-                            if remaining < self.BT:
-                                gk_t_idx = seq_len - 1
+                        remaining = seq_len - chunk_idx * self.BT
+                        if remaining < self.BT:
+                            gk_t_idx = seq_len - 1
                         gk_h = load_gk_P.acquire_and_advance()
                         cute.copy(atom=tma_atom_gk,
                                   src=bSG_gGK[(None, 0, gk_t_idx)],
