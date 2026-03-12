@@ -16,15 +16,6 @@ using namespace cute;
 //   inter: exp2(g_first - g[x]) * K[x]     (g_first = g[sub_tile_i * 16])
 //   intra: exp2(g_half  - g[x]) * K[x]     (g_half  = g[sub_tile_i * 16 + 8])
 //
-// Backward vs Forward B-matrix layout difference:
-//   Forward computes Q/K @ K^T, Backward computes dAqk/dAkk @ K.
-//   Forward MMA:  64 × X × 32 (M×N×K), reduces head dim (K=32), B = K^T
-//     B-matrix shape = (N × K) = (SubTileT × TileK), K-major
-//     uses SmemLayoutMatBTF32 = Layout_K_SW128_Atom, stored as sKG(x_local, y)
-//   Backward MMA: 64 × 32 × X (M×N×K), reduces chunk dim (K=SubTileT), B = K
-//     B-matrix shape = (K × N) = (SubTileT × TileK), MN-major
-//     uses SmemLayoutMatBTF32Tranposed = Layout_MN_SW128_32B_Atom, stored as sKG(y, x_local)
-//
 // SmemLayoutMatBTF32<1> = (SubTileT, TileK) = (16, 32), K-major layout
 //
 // Thread mapping (128 threads per WG, 16 rows per sub_tile):

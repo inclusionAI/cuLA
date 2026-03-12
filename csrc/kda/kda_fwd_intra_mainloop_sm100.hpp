@@ -82,14 +82,6 @@ struct KdaChunkFwdIntraMainloopSm100 {
         Step<_1, _2>{}
     ), Shape<_1, _1>{}));
 
-    // Gated MMA B-matrix (tf32) — non-transposed, K-major layout
-    // Forward computes Q/K @ K^T, Backward computes dAqk/dAkk @ K.
-    // Forward MMA:  64 × X × 32 (M×N×K), reduces head dim (K=32), B = K^T
-    //   B-matrix shape = (N × K) = (SubTileT × TileK), K-major
-    //   Store pattern: sKG(x_local, y), where x_local = row within sub_tile, y = col group
-    // Backward MMA: 64 × 32 × X (M×N×K), reduces chunk dim (K=SubTileT), B = K
-    //   B-matrix shape = (K × N) = (SubTileT × TileK), MN-major
-    //   Uses SmemLayoutMatBTF32Tranposed (Layout_MN_SW128_32B_Atom), stored as sKG(y, x_local)
     template<int NUM_TILES>
     using SmemLayoutMatBTF32 = decltype(coalesce(tile_to_shape(
         UMMA::Layout_K_SW128_Atom<tf32>{},
@@ -234,7 +226,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
     // ComputeCudaCore warp persistent loop (warp 0-7, 2 warpgroups)
     // ===================================================================
     template <typename TmaParamsT>
-    CUTLASS_DEVICE void compute_epilogue_loop(
+    CUTLASS_DEVICE void compute_cudacore_loop(
         const KDA_fwd_intra_params &params,
         const TmaParamsT &tma_params,
         SharedMemoryPlan *shared_plan,
@@ -250,9 +242,8 @@ struct KdaChunkFwdIntraMainloopSm100 {
         // Beta pipeline (consumer)
         PipelineBeta &beta_pipeline, PipelineStateBeta &beta_pipe_state_read,
         // CudaCore -> Inverse pipeline (producer)
-        PipelineKKInvReady &kk_inv_pipeline, PipelineStateKKInv &kk_inv_pipe_state_write,
-        // Tile decode helpers
-        int *chunk_indices_ptr, int *cu_len_ptr, int total_tiles)
+        PipelineKKInvReady &kk_inv_pipeline, PipelineStateKKInv &kk_inv_pipe_state_write
+    )
     {
         // === PERSISTENT CudaCore LOOP (static scheduling, no tile pipeline) ===
         //
@@ -296,20 +287,18 @@ struct KdaChunkFwdIntraMainloopSm100 {
         //
         const int idx_in_warpgroup = threadIdx.x % 128;
         const int wg_idx = threadIdx.x / 128;  // 0 or 1 within CudaCore
-        constexpr int HalfK = TileK / 2;
-        constexpr int HalfT = TileT / 2;
-        const int k_offset = wg_idx * HalfK;
-        const int t_offset = wg_idx * HalfT;
+        int *chunk_indices_ptr = (int*)params.chunk_indices_ptr;
+        int *cu_seqlens_ptr = (int*)params.cu_seqlens_ptr;
 
         CUTE_NO_UNROLL
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
 
-            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_len_ptr);
+            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
             int batch_idx = get<0>(blk_coord);
             int head_idx  = get<1>(blk_coord);
             int tile_idx  = get<2>(blk_coord);
-            int seq_len = cu_len_ptr[batch_idx + 1] - cu_len_ptr[batch_idx];
+            int seq_len = cu_seqlens_ptr[batch_idx + 1] - cu_seqlens_ptr[batch_idx];
             int sub_seq_len = min(TileT, seq_len - tile_idx * TileT);
 
             // B-matrix SMEM views (single-buffered kg_all)
@@ -481,7 +470,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
             //
             // Only WG0 does this since both WGs share the same TMEM.
             {
-                int token_offset = cu_len_ptr[batch_idx];
+                int token_offset = cu_seqlens_ptr[batch_idx];
                 int row = idx_in_warpgroup % 64;
                 int BT = TileT;
                 int H = params.h;
@@ -533,11 +522,13 @@ struct KdaChunkFwdIntraMainloopSm100 {
         // CudaCore -> MMA pipelines (consumer)
         PipelineQKGInterReady &qkg_inter_pipeline,  PipelineStateQKGInter &qkg_inter_pipe_state_read,
         // MMA -> CudaCore pipelines (producer)
-        PipelineQKDone &qk_done_pipeline, PipelineStateQKDone &qk_done_pipe_state_write,
-        // Tile decode helpers
-        int *chunk_indices_ptr, int *cu_len_ptr, int total_tiles)
+        PipelineQKDone &qk_done_pipeline, PipelineStateQKDone &qk_done_pipe_state_write
+    )
     {
         // === PERSISTENT MMA LOOP (static scheduling, no tile pipeline) ===
+        int *chunk_indices_ptr = (int*)params.chunk_indices_ptr;
+        int *cu_seqlens_ptr = (int*)params.cu_seqlens_ptr;
+
         TiledMMA tile_mma_qk_n16_mask02 = TiledMMA_KDAqk_N16_MASK02{};
         TiledMMA tile_mma_qk_n16_mask13 = TiledMMA_KDAqk_N16_MASK13{};
         TiledMMA tile_mma_qk_n32_mask02 = TiledMMA_KDAqk_N32_MASK02{};
@@ -549,7 +540,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
 
-            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_len_ptr);
+            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
             int batch_idx = get<0>(blk_coord);
             int head_idx  = get<1>(blk_coord);
             int tile_idx  = get<2>(blk_coord);
@@ -674,23 +665,24 @@ struct KdaChunkFwdIntraMainloopSm100 {
         // TMA pipelines (producer)
         PipelineQ &q_pipeline, PipelineStateQ &q_pipe_state_write,
         PipelineK &k_pipeline, PipelineStateK &k_pipe_state_write,
-        PipelineG &g_pipeline, PipelineStateG &g_pipe_state_write,
-        // Tile decode helpers
-        int *chunk_indices_ptr, int *cu_len_ptr, int total_tiles)
+        PipelineG &g_pipeline, PipelineStateG &g_pipe_state_write
+    )
     {
         if (cute::elect_one_sync()) {
+            int *chunk_indices_ptr = (int*)params.chunk_indices_ptr;
+            int *cu_seqlens_ptr = (int*)params.cu_seqlens_ptr;
             // === PERSISTENT LOAD LOOP (static scheduling, no tile pipeline) ===
             CUTE_NO_UNROLL
             for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
                 int tid = tile_scheduler.get_current_tile_id();
 
                 // Decode tile coordinates
-                auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_len_ptr);
+                auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
                 int batch_idx    = get<0>(blk_coord);
                 int head_idx     = get<1>(blk_coord);
                 int tile_idx     = get<2>(blk_coord);
-                int token_offset = cu_len_ptr[batch_idx];
-                int seq_len = cu_len_ptr[batch_idx + 1] - cu_len_ptr[batch_idx];
+                int token_offset = cu_seqlens_ptr[batch_idx];
+                int seq_len = cu_seqlens_ptr[batch_idx + 1] - cu_seqlens_ptr[batch_idx];
                 int sub_seq_len = min(TileT, seq_len - tile_idx * TileT);
 
                 Tensor mQ = domain_offset(make_coord(token_offset, _0{}, _0{}), tma_params.tma_q.get_tma_tensor(tma_params.shape_qkg));
@@ -740,12 +732,13 @@ struct KdaChunkFwdIntraMainloopSm100 {
         TileScheduler &tile_scheduler,
         // CudaCore -> Inverse pipeline (consumer)
         PipelineKKInvReady &kk_inv_pipeline,
-        PipelineStateKKInv &kk_inv_pipe_state_read,
-        // Tile decode helpers
-        int *chunk_indices_ptr, int *cu_len_ptr, int total_tiles)
+        PipelineStateKKInv &kk_inv_pipe_state_read
+    )
     {
         // === PERSISTENT INVERSE LOOP (static scheduling, no tile pipeline) ===
         int thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
+        int *chunk_indices_ptr = (int*)params.chunk_indices_ptr;
+        int *cu_seqlens_ptr = (int*)params.cu_seqlens_ptr;
         // TODO: tf32 inverse
         static_assert(sizeof(InverseType) == sizeof(Element));
         // Create SMEM tensor view for KK output (fp16)
@@ -755,12 +748,12 @@ struct KdaChunkFwdIntraMainloopSm100 {
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
 
-            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_len_ptr);
+            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
             int batch_idx = get<0>(blk_coord);
             int head_idx  = get<1>(blk_coord);
             int tile_idx  = get<2>(blk_coord);
-            int token_offset = cu_len_ptr[batch_idx];
-            int seq_len = cu_len_ptr[batch_idx + 1] - cu_len_ptr[batch_idx];
+            int token_offset = cu_seqlens_ptr[batch_idx];
+            int seq_len = cu_seqlens_ptr[batch_idx + 1] - cu_seqlens_ptr[batch_idx];
             int sub_seq_len = min(TileT, seq_len - tile_idx * TileT);
             int token_offset_cur = token_offset + tile_idx * TileT; 
 
@@ -823,7 +816,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
     }
 
     // ===================================================================
-    // Empty warp persistent loop (warp 14-15, beta loading)
+    // Load beta warp persistent loop (warp 14-15, beta loading)
     // ===================================================================
     template <typename TmaParamsT>
     CUTLASS_DEVICE void load_beta_loop(
@@ -833,22 +826,24 @@ struct KdaChunkFwdIntraMainloopSm100 {
         TileScheduler &tile_scheduler,
         // Beta pipeline (producer)
         PipelineBeta &beta_pipeline,
-        PipelineStateBeta &beta_pipe_state_write,
-        // Tile decode helpers
-        int *chunk_indices_ptr, int *cu_len_ptr, int total_tiles)
+        PipelineStateBeta &beta_pipe_state_write
+        )
     {
         // === PERSISTENT LOAD BETA WARP LOOP (static scheduling, no tile pipeline) ===
         int thread_idx = threadIdx.x - (NumTotalThreads - 64); // 0..63
+        int *chunk_indices_ptr = (int*)params.chunk_indices_ptr;
+        int *cu_seqlens_ptr = (int*)params.cu_seqlens_ptr;
+
         CUTE_NO_UNROLL
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
 
-            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_len_ptr);
+            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
             int batch_idx    = get<0>(blk_coord);
             int head_idx     = get<1>(blk_coord);
             int tile_idx     = get<2>(blk_coord);
-            int token_offset = cu_len_ptr[batch_idx];
-            int seq_len = cu_len_ptr[batch_idx + 1] - cu_len_ptr[batch_idx];
+            int token_offset = cu_seqlens_ptr[batch_idx];
+            int seq_len = cu_seqlens_ptr[batch_idx + 1] - cu_seqlens_ptr[batch_idx];
             int sub_seq_len = min(TileT, seq_len - tile_idx * TileT);
 
             // Beta loading body

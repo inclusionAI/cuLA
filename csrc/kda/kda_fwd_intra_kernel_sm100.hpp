@@ -78,21 +78,28 @@ struct KdaChunkFwdIntraKernelSm100 {
 
     // ===================== Warp Roles =====================
     enum class WarpRole {
-        Empty = 0x0, Load = 0x1, Mma = 0x2, Compute = 0x3, Epilogue = 0x4,
-        ComputeCudaCore = 0x5, Inverse = 0x6
+        ComputeCudaCore,
+        Inverse,
+        Mma,
+        Load,
+        LoadBeta,
+        Empty
     };
 
-    // TODO: add other ways for warp role selection
     // Warp layout (16 warps, 512 threads):
-    //   warp  0- 7  (thread   0-255): ComputeCudaCore  — WG0+WG1
+    //   warp  0- 7  (thread   0-255): ComputeCudaCore   — WG0+WG1
     //   warp  8-11  (thread 256-383): Inverse           — 1 warpgroup for inv(KK)
-    //   warp  12    (thread 384-415): Mma               — 1 warp, elect_one
+    //   warp  12    (thread 384-415): Mma               — 1 warp
     //   warp  13    (thread 416-447): Load              — 1 warp, elect_one
-    //   warp 14-15  (thread 448-511): Empty             — 2 warps for beta loading
-    static constexpr unsigned long long kWarpAssignment = 0x12'6666'5555'5555ull;
-
+    //   warp 14-15  (thread 448-511): LoadBeta          — 2 warps for beta loading
     CUTLASS_DEVICE static WarpRole warp_idx_to_role(int warp_idx) {
-        return static_cast<WarpRole>((kWarpAssignment >> (4 * warp_idx)) & 0xF);
+        int wg_idx = warp_idx / 4;
+        if (wg_idx == 0 || wg_idx == 1) return WarpRole::ComputeCudaCore;
+        if (wg_idx == 2) return WarpRole::Inverse;
+        if (warp_idx == 12) return WarpRole::Mma;
+        if (warp_idx == 13) return WarpRole::Load;
+        if (warp_idx == 14 || warp_idx == 15) return WarpRole::LoadBeta;
+        return WarpRole::Empty; // not used
     }
 
     // ===================================================================
@@ -104,9 +111,7 @@ struct KdaChunkFwdIntraKernelSm100 {
         const TmaParamsT &tma_params) {
 
         const int warpgroup_idx    = cutlass::canonical_warp_group_idx();
-        const int idx_in_warpgroup = threadIdx.x % 128;
         const int warp_idx         = cutlass::canonical_warp_idx_sync();
-        const int idx_in_warp      = threadIdx.x % 32;
         auto role = warp_idx_to_role(warp_idx);
         int lane_predicate = cute::elect_one_sync();
         TileScheduler tile_scheduler(params.tile_scheduler_params);
@@ -161,7 +166,7 @@ struct KdaChunkFwdIntraKernelSm100 {
         typename PipelineBeta::Params beta_pipe_params;
         beta_pipe_params.producer_arv_count = NumLoadBetaThreads;
         beta_pipe_params.consumer_arv_count = NumCudaCoreThreads;
-        if (role == WarpRole::Empty) {
+        if (role == WarpRole::LoadBeta) {
             beta_pipe_params.role = PipelineBeta::ThreadCategory::Producer;
         } else if (role == WarpRole::ComputeCudaCore) {
             beta_pipe_params.role = PipelineBeta::ThreadCategory::Consumer;
@@ -241,10 +246,6 @@ struct KdaChunkFwdIntraKernelSm100 {
         // Barrier sync after pipeline construction
         __syncthreads();
 
-        int *chunk_indices_ptr = (int*)params.chunk_indices_ptr;
-        int *cu_len_ptr = (int*)params.cu_seqlens_ptr;
-        int total_tiles = tile_scheduler.total_tiles();
-
         // =======================================================================
         // Dispatch to warp-specialized persistent loops (Mainloop)
         // =======================================================================
@@ -252,7 +253,7 @@ struct KdaChunkFwdIntraKernelSm100 {
 
         if (role == WarpRole::ComputeCudaCore) {
             cutlass::arch::warpgroup_reg_alloc<NumCudaCoreRegs>();
-            mainloop.compute_epilogue_loop(
+            mainloop.compute_cudacore_loop(
                 params, tma_params, shared_plan, tile_scheduler,
                 q_pipeline, q_pipe_state_read,
                 k_pipeline, k_pipe_state_read,
@@ -260,8 +261,7 @@ struct KdaChunkFwdIntraKernelSm100 {
                 qkg_inter_pipeline, qkg_inter_pipe_state_write,
                 qk_done_pipeline, qk_done_pipe_state_read,
                 beta_pipeline, beta_pipe_state_read,
-                kk_inv_pipeline, kk_inv_pipe_state_write,
-                chunk_indices_ptr, cu_len_ptr, total_tiles
+                kk_inv_pipeline, kk_inv_pipe_state_write
             );
 
         } else if (role == WarpRole::Mma) {
@@ -269,8 +269,7 @@ struct KdaChunkFwdIntraKernelSm100 {
             mainloop.mma_loop(
                 params, tma_params, shared_plan, tile_scheduler,
                 qkg_inter_pipeline, qkg_inter_pipe_state_read,
-                qk_done_pipeline, qk_done_pipe_state_write,
-                chunk_indices_ptr, cu_len_ptr, total_tiles
+                qk_done_pipeline, qk_done_pipe_state_write
             );
 
         } else if (role == WarpRole::Load) {
@@ -279,25 +278,21 @@ struct KdaChunkFwdIntraKernelSm100 {
                 params, tma_params, shared_plan, tile_scheduler,
                 q_pipeline, q_pipe_state_write,
                 k_pipeline, k_pipe_state_write,
-                g_pipeline, g_pipe_state_write,
-                chunk_indices_ptr, cu_len_ptr, total_tiles
+                g_pipeline, g_pipe_state_write
             );
 
         } else if (role == WarpRole::Inverse) {
             cutlass::arch::warpgroup_reg_dealloc<NumInverseRegs>();
             mainloop.inverse_loop(
                 params, tma_params, shared_plan, tile_scheduler,
-                kk_inv_pipeline, kk_inv_pipe_state_read,
-                chunk_indices_ptr, cu_len_ptr, total_tiles
+                kk_inv_pipeline, kk_inv_pipe_state_read
             );
 
         } else {
-            // WarpRole::Empty — beta loading
             cutlass::arch::warpgroup_reg_dealloc<NumLoadRegs>();
             mainloop.load_beta_loop(
                 params, tma_params, shared_plan, tile_scheduler,
-                beta_pipeline, beta_pipe_state_write,
-                chunk_indices_ptr, cu_len_ptr, total_tiles
+                beta_pipeline, beta_pipe_state_write
             );
         }
 
