@@ -240,7 +240,7 @@ def bench_varlen(configs):
             k=k, w=w, u=u, g=None, gk=gk,
             initial_state=h0, output_final_state=store_ht,
             chunk_size=BT, save_new_value=save_vnew,
-            cu_seqlens=cu_seqlens_long, chunk_indices=chunk_indices,
+            cu_seqlens=cu_seqlens_long,
         )
         h_fla = fla_result[0]
 
@@ -249,8 +249,7 @@ def bench_varlen(configs):
             k=k, w=w, u=u, g=None, gk=gk,
             initial_state=h0, output_final_state=store_ht,
             chunk_size=BT, save_new_value=save_vnew,
-            cu_seqlens=cu_seqlens, chunk_offsets=chunk_offsets_cute,
-            total_nt=total_nt,
+            cu_seqlens=cu_seqlens,
         )
         h_out = cute_result[0]
         torch.cuda.synchronize()
@@ -258,21 +257,20 @@ def bench_varlen(configs):
         max_diff, mean_diff = accuracy_stats(h_fla, h_out)
 
         # ---- Performance timing ----
-        def run_fla(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens_long, ci=chunk_indices):
+        def run_fla(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens_long):
             fla_fwd_h(
                 k=k, w=w, u=u, g=None, gk=gk,
                 initial_state=h0, output_final_state=store_ht,
                 chunk_size=BT, save_new_value=save_vnew,
-                cu_seqlens=cu, chunk_indices=ci,
+                cu_seqlens=cu,
             )
 
-        def run_cute(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens, co=chunk_offsets_cute, tnt=total_nt):
+        def run_cute(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens):
             chunk_gated_delta_rule_fwd_h(
                 k=k, w=w, u=u, g=None, gk=gk,
                 initial_state=h0, output_final_state=store_ht,
                 chunk_size=BT, save_new_value=save_vnew,
-                cu_seqlens=cu, chunk_offsets=co,
-                total_nt=tnt,
+                cu_seqlens=cu,
             )
 
         ms_fla = time_kernel(run_fla)

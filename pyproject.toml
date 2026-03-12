@@ -10,7 +10,10 @@ description = "FlashLA CUDA extension"
 readme = "README.md"
 authors = [ { name = "flashla contributors" } ]
 requires-python = ">=3.8"
-dependencies = []
+dependencies = [
+    "nvidia-cutlass-dsl==4.4.1",
+    "apache-tvm-ffi==0.1.9"
+]
 license = { text = "MIT" }
 
 [tool.setuptools.packages.find]

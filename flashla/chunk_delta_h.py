@@ -26,6 +26,7 @@ from typing import Type, Tuple, List, Union
 
 import torch
 import torch.nn.functional as F
+import triton
 
 import cutlass
 import cutlass.cute as cute
@@ -40,6 +41,16 @@ from cutlass.cute.typing import Int32, Int64, Float32
 from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cutlass_dsl import T as _T
 
+from fla.ops.utils import prepare_chunk_indices, prepare_lens
+from fla.utils import tensor_cache
+
+# in FLA, cumsum returns int64 tensor by default
+@tensor_cache
+def prepare_chunk_offsets_i32(
+    cu_seqlens: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    return F.pad(triton.cdiv(prepare_lens(cu_seqlens), chunk_size), (1, 0), value=0).cumsum(-1).int()
 
 @cutlass.dsl_user_op
 def _atomic_add_global_i32(ptr_i64, addend_i32, *, loc=None, ip=None):
@@ -1220,8 +1231,11 @@ class ChunkDeltaRuleFwdH:
                     if use_gk:
                         gk_h = load_gk_C.wait_and_advance()
                         # Step 1: Each CUDA thread (tidx 0-127) computes one exp2 and overwrites sGK in-place
+                        # NOTE: gk values are already pre-scaled by RCP_LN2 (= 1/ln2) in
+                        # chunk_local_cumsum preprocessing, so they are in base-2 form. We apply exp2()
+                        # directly — do NOT multiply by INV_LN2 again (that would double-scale).
                         gk_raw = sGK_smem[(tidx, gk_h.index)]
-                        sGK_smem[(tidx, gk_h.index)] = cute.exp2(gk_raw * INV_LN2)
+                        sGK_smem[(tidx, gk_h.index)] = cute.exp2(gk_raw)
                         # Step 2: Sync all 4 CUDA warps so all 128 scales are visible
                         self.gk_precompute_bar.arrive_and_wait()
                         # Step 3: Apply precomputed scales (SMEM read only, no exp2)
@@ -1478,6 +1492,9 @@ class ChunkDeltaRuleFwdH:
 # ===================== Reference implementations =====================
 
 def reference_chunk_delta_rule_fwd_h(k, w, u, g=None, gk=None, h0=None, chunk_size=64):
+    """Reference implementation.  Gate values (g, gk) are assumed to be
+    pre-scaled by RCP_LN2 (= 1/ln2), matching the convention used by
+    chunk_local_cumsum in KDA.  The kernel applies exp2() directly."""
     B, T, H, K = k.shape
     V = u.shape[-1]
     BT = chunk_size
@@ -1499,21 +1516,23 @@ def reference_chunk_delta_rule_fwd_h(k, w, u, g=None, gk=None, h0=None, chunk_si
         if g is not None:
             gc = g[:, s:e].permute(0, 2, 1).float()
             gl = gc[:, :, -1:].float()
-            vnc = vnc * torch.exp(gl - gc).unsqueeze(-1)
+            vnc = vnc * torch.exp2(gl - gc).unsqueeze(-1)
         v_new_out[:, s:e] = vnc.permute(0, 2, 1, 3).to(torch.bfloat16)
         if g is not None:
             gls = gc[:, :, -1].float()
-            h = h * torch.exp(gls).unsqueeze(-1).unsqueeze(-1)
+            h = h * torch.exp2(gls).unsqueeze(-1).unsqueeze(-1)
         if gk is not None:
             gkc = gk[:, s:e].permute(0, 2, 1, 3).float()
             gkl = gkc[:, :, -1, :].float()
-            h = h * torch.exp(gkl).unsqueeze(-1)
+            h = h * torch.exp2(gkl).unsqueeze(-1)
         h = h + torch.matmul(kc.transpose(-2, -1), vnc)
         h_after.append(h[0, 0].to(torch.bfloat16).clone())
     return h_out, v_new_out, h_after
 
 
 def reference_bf16_roundtrip(k, w, u, g=None, gk=None, h0=None, chunk_size=64):
+    """Reference with bf16 roundtrip.  Gate values (g, gk) are assumed to be
+    pre-scaled by RCP_LN2 (= 1/ln2).  Uses exp2() to match kernel."""
     B, T, H, K = k.shape
     V = u.shape[-1]
     BT = chunk_size
@@ -1534,15 +1553,15 @@ def reference_bf16_roundtrip(k, w, u, g=None, gk=None, h0=None, chunk_size=64):
         if g is not None:
             gc = g[:, s:e].permute(0, 2, 1).float()
             gl = gc[:, :, -1:].float()
-            vnc = vnc * torch.exp(gl - gc).unsqueeze(-1)
+            vnc = vnc * torch.exp2(gl - gc).unsqueeze(-1)
         v_new_out[:, s:e] = vnc.permute(0, 2, 1, 3).to(torch.bfloat16)
         if g is not None:
             gls = gc[:, :, -1].float()
-            h = h * torch.exp(gls).unsqueeze(-1).unsqueeze(-1)
+            h = h * torch.exp2(gls).unsqueeze(-1).unsqueeze(-1)
         if gk is not None:
             gkc = gk[:, s:e].permute(0, 2, 1, 3).float()
             gkl = gkc[:, :, -1, :].float()
-            h = h * torch.exp(gkl).unsqueeze(-1)
+            h = h * torch.exp2(gkl).unsqueeze(-1)
         vn_bf16 = vnc.to(torch.bfloat16).float()
         h = h + torch.matmul(kc.transpose(-2, -1), vn_bf16)
         h_after.append(h[0, 0].to(torch.bfloat16).clone())
@@ -1716,10 +1735,8 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_size: int = 64,
     save_new_value: bool = True,
     cu_seqlens: torch.Tensor | None = None,
-    chunk_offsets: torch.Tensor | None = None,
-    total_nt: int | None = None,
+    chunk_indices: torch.Tensor | None = None,
     persistent: bool = True,
-    head_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     ChunkDeltaRuleFwdH forward pass — FLA-compatible API.
@@ -1738,13 +1755,8 @@ def chunk_gated_delta_rule_fwd_h(
         chunk_size: chunk size (default 64)
         save_new_value: whether to return v_new
         cu_seqlens: cumulative sequence lengths [N+1] int64/int32 for varlen, or None
-        chunk_offsets: pre-computed chunk offsets [N+1] int32 for varlen, or None
-                       If provided, skips internal computation from cu_seqlens.
-        total_nt: total number of chunks across all sequences (Python int).
-                  If provided (varlen mode), avoids a GPU→CPU sync (.item()).
-                  Typically pre-computed as sum(ceil(seq_len_i / chunk_size)).
+        chunk_indices: chunk index pairs [NT, 2] int32 (varlen only)
         persistent: whether to use persistent kernel (default True)
-        head_first: unused, for API compatibility only
 
     Returns:
         (h, v_new, final_state) — same as FLA
@@ -1757,6 +1769,16 @@ def chunk_gated_delta_rule_fwd_h(
     BT = chunk_size
     is_varlen = cu_seqlens is not None
 
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    # N: the actual number of sequences in the batch with either equal or variable lengths
+    if cu_seqlens is None:
+        N, NT, chunk_offsets = B, (T + BT - 1) // BT, None
+    else:
+        N, NT, chunk_offsets = len(cu_seqlens) - 1, len(chunk_indices), prepare_chunk_offsets_i32(cu_seqlens, BT)
+    assert K_dim == 128, "current kernel only supports 128."
+    total_nt = B * NT
+
     use_g_flag = 1 if g is not None else 0
     use_gk_flag = 1 if gk is not None else 0
     use_h0_flag = 1 if initial_state is not None else 0
@@ -1766,24 +1788,9 @@ def chunk_gated_delta_rule_fwd_h(
     if is_varlen:
         # Varlen mode: B must be 1 (FLA convention), cu_seqlens is [N+1]
         assert B == 1, "varlen mode requires B=1 (data packed in T dimension)"
-        num_seqs = cu_seqlens.shape[0] - 1
-        N = num_seqs
 
         # Ensure cu_seqlens is int32 for the kernel
         cu_seqlens_i32 = cu_seqlens.int() if cu_seqlens.dtype != torch.int32 else cu_seqlens
-
-        # Compute chunk_offsets from cu_seqlens on GPU if not pre-computed
-        if chunk_offsets is None:
-            lens = cu_seqlens_i32[1:] - cu_seqlens_i32[:-1]
-            nts = (lens + BT - 1) // BT
-            chunk_offsets = torch.zeros(num_seqs + 1, dtype=torch.int32, device=k.device)
-            chunk_offsets[1:] = nts.cumsum(0)
-
-        # Determine total_NT: prefer caller-provided value to avoid GPU sync
-        if total_nt is not None:
-            total_NT = total_nt
-        else:
-            total_NT = int(chunk_offsets[-1].item())
 
         # View as 3D for kernel: [1, T, H, K] -> [T, H, K] (zero-copy)
         k_kern = k[0]
@@ -1794,24 +1801,26 @@ def chunk_gated_delta_rule_fwd_h(
         gk_kern = gk[0] if gk is not None else torch.empty(T, H, K_dim, device=k.device, dtype=torch.float32)
 
         # Allocate outputs (3D for kernel)
-        h_out_kern = k.new_empty(total_NT, H, K_dim, V_dim)  # bf16
+        h_out_kern = k.new_empty(total_nt, H, K_dim, V_dim)  # bf16
         v_new_kern = torch.empty_like(u_kern)  # always allocate; kernel checks save_v_new flag
-        h0_kern = initial_state if initial_state is not None else torch.empty(num_seqs, H, K_dim, V_dim, device=k.device, dtype=torch.float32)
+        h0_kern = initial_state if initial_state is not None else torch.empty(N, H, K_dim, V_dim, device=k.device, dtype=torch.float32)
         # ht is purely an output (kernel writes all elements when store_final_state=1);
         # use empty instead of zeros to skip the zero-fill kernel launch.
-        ht_kern = torch.empty(num_seqs, H, K_dim, V_dim, device=k.device, dtype=torch.float32)
+        # NOTE: Ensure final output is zeros
+        # vLLM will use padding for CUDA Graph
+        ht_kern = torch.zeros(N, H, K_dim, V_dim, device=k.device, dtype=torch.float32)
 
         # Workspace: first 4 bytes used as atomic counter for dynamic scheduling
-        workspace = torch.zeros(max(num_seqs * 128, 4), dtype=torch.uint8, device=k.device)
+        workspace = torch.zeros(max(N * 128, 4), dtype=torch.uint8, device=k.device)
 
-        ps = (Int32(num_seqs), Int32(T), Int32(H), Int32(K_dim), Int32(V_dim))
+        ps = (Int32(N), Int32(T), Int32(H), Int32(K_dim), Int32(V_dim))
 
         compiled_fn = _get_compiled_delta_h(True, persistent, H, K_dim, V_dim, chunk_size)
         compiled_fn(
             k_kern, w_kern, u_kern, g_kern, gk_kern,
             h_out_kern, v_new_kern, h0_kern, ht_kern,
             cu_seqlens_i32, chunk_offsets, workspace,
-            ps, Int32(total_NT),
+            ps, Int32(total_nt),
             Int32(use_g_flag), Int32(use_gk_flag),
             Int32(use_h0_flag), Int32(store_ht_flag),
             Int32(save_vnew_flag),
@@ -1931,6 +1940,8 @@ def main():
     gk_val = torch.randn(B, T, H, K, device="cuda", dtype=torch.float32) * 0.1
     gk_val = -torch.abs(gk_val)
     gk_val = gk_val.cumsum(dim=1)
+    # Pre-scale by RCP_LN2 to match KDA convention (kernel does exp2 directly)
+    gk_val = gk_val * INV_LN2
     h0_val = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) * 0.01
 
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_val, h0_val, 0, 1, 1, 0)
@@ -1951,6 +1962,8 @@ def main():
     gk_val = torch.randn(B, T, H, K, device="cuda", dtype=torch.float32) * 0.1
     gk_val = -torch.abs(gk_val)
     gk_val = gk_val.cumsum(dim=1)
+    # Pre-scale by RCP_LN2 to match KDA convention (kernel does exp2 directly)
+    gk_val = gk_val * INV_LN2
 
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_val, h0_z, 0, 1, 0, 0)
     _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, gk=gk_val, h0=None, chunk_size=BT)
