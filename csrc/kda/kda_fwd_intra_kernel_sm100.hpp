@@ -64,27 +64,27 @@ struct KdaChunkFwdIntraKernelSm100 {
     using PipelineStateKKInv     = typename Mainloop::PipelineStateKKInv;
 
     // Constants forwarded from Mainloop
-    static constexpr int NUM_THREADS         = Mainloop::NUM_THREADS;
-    static constexpr int NUM_CE_THREADS      = Mainloop::NUM_CE_THREADS;
-    static constexpr int NUM_INVERSE_THREADS = Mainloop::NUM_INVERSE_THREADS;
-    static constexpr int NUM_MMA_THREADS     = Mainloop::NUM_MMA_THREADS;
-    static constexpr int NUM_LOAD_THREADS    = Mainloop::NUM_LOAD_THREADS;
-    static constexpr int NUM_EMPTY_THREADS   = Mainloop::NUM_EMPTY_THREADS;
+    static constexpr int NumTotalThreads         = Mainloop::NumTotalThreads;
+    static constexpr int NumCudaCoreThreads      = Mainloop::NumCudaCoreThreads;
+    static constexpr int NumInverseThreads = Mainloop::NumInverseThreads;
+    static constexpr int NumMmaThreads     = Mainloop::NumMmaThreads;
+    static constexpr int NumLoadTmaThreads    = Mainloop::NumLoadTmaThreads;
+    static constexpr int NumLoadBetaThreads   = Mainloop::NumLoadBetaThreads;
 
     // ===================== Kernel-only Constants =====================
-    static constexpr int REG_COMPUTE  = 160;
-    static constexpr int REG_LOAD     = 80;
-    static constexpr int REG_INVERSE  = 104;
+    static constexpr int NumCudaCoreRegs  = 160;
+    static constexpr int NumLoadRegs     = 80;
+    static constexpr int NumInverseRegs  = 104;
 
     // ===================== Warp Roles =====================
     enum class WarpRole {
         Empty = 0x0, Load = 0x1, Mma = 0x2, Compute = 0x3, Epilogue = 0x4,
-        ComputeEpilogue = 0x5, Inverse = 0x6
+        ComputeCudaCore = 0x5, Inverse = 0x6
     };
 
     // TODO: add other ways for warp role selection
     // Warp layout (16 warps, 512 threads):
-    //   warp  0- 7  (thread   0-255): ComputeEpilogue  — WG0+WG1
+    //   warp  0- 7  (thread   0-255): ComputeCudaCore  — WG0+WG1
     //   warp  8-11  (thread 256-383): Inverse           — 1 warpgroup for inv(KK)
     //   warp  12    (thread 384-415): Mma               — 1 warp, elect_one
     //   warp  13    (thread 416-447): Load              — 1 warp, elect_one
@@ -135,23 +135,23 @@ struct KdaChunkFwdIntraKernelSm100 {
         typename PipelineQ::Params q_pipe_params;
         q_pipe_params.transaction_bytes = sizeof(bf16) * cosize_v<SmemLayoutInputBF16>;
         q_pipe_params.is_leader    = lane_predicate && (role == WarpRole::Load);
-        q_pipe_params.num_consumers = NUM_CE_THREADS;
+        q_pipe_params.num_consumers = NumCudaCoreThreads;
 
         typename PipelineK::Params k_pipe_params;
         k_pipe_params.transaction_bytes = sizeof(bf16) * cosize_v<SmemLayoutInputBF16>;
         k_pipe_params.is_leader    = lane_predicate && (role == WarpRole::Load);
-        k_pipe_params.num_consumers = NUM_CE_THREADS;
+        k_pipe_params.num_consumers = NumCudaCoreThreads;
 
         typename PipelineG::Params g_pipe_params;
         g_pipe_params.transaction_bytes = sizeof(float) * cosize_v<SmemLayoutInputFP32>;
         g_pipe_params.is_leader    = lane_predicate && (role == WarpRole::Load);
-        g_pipe_params.num_consumers = NUM_CE_THREADS;
+        g_pipe_params.num_consumers = NumCudaCoreThreads;
 
         if (role == WarpRole::Load) {
             q_pipe_params.role = PipelineQ::ThreadCategory::Producer;
             k_pipe_params.role = PipelineK::ThreadCategory::Producer;
             g_pipe_params.role = PipelineG::ThreadCategory::Producer;
-        } else if (role == WarpRole::ComputeEpilogue) {
+        } else if (role == WarpRole::ComputeCudaCore) {
             q_pipe_params.role = PipelineQ::ThreadCategory::Consumer;
             k_pipe_params.role = PipelineK::ThreadCategory::Consumer;
             g_pipe_params.role = PipelineG::ThreadCategory::Consumer;
@@ -159,42 +159,42 @@ struct KdaChunkFwdIntraKernelSm100 {
 
         // === Beta pipeline ===
         typename PipelineBeta::Params beta_pipe_params;
-        beta_pipe_params.producer_arv_count = NUM_EMPTY_THREADS;
-        beta_pipe_params.consumer_arv_count = NUM_CE_THREADS;
+        beta_pipe_params.producer_arv_count = NumLoadBetaThreads;
+        beta_pipe_params.consumer_arv_count = NumCudaCoreThreads;
         if (role == WarpRole::Empty) {
             beta_pipe_params.role = PipelineBeta::ThreadCategory::Producer;
-        } else if (role == WarpRole::ComputeEpilogue) {
+        } else if (role == WarpRole::ComputeCudaCore) {
             beta_pipe_params.role = PipelineBeta::ThreadCategory::Consumer;
         }
 
-        // === CE -> MMA pipelines ===
+        // === CudaCore -> MMA pipelines ===
         typename PipelineQKGInterReady::Params qkg_inter_pipe_params;
-        qkg_inter_pipe_params.producer_arv_count = NUM_CE_THREADS;
+        qkg_inter_pipe_params.producer_arv_count = NumCudaCoreThreads;
         // NOTE: only one threads calls consumer_release (umma_arrive)
         qkg_inter_pipe_params.consumer_arv_count = 1;
 
-        if (role == WarpRole::ComputeEpilogue) {
+        if (role == WarpRole::ComputeCudaCore) {
             qkg_inter_pipe_params.role   = PipelineQKGInterReady::ThreadCategory::Producer;
         } else if (role == WarpRole::Mma) {
             qkg_inter_pipe_params.role   = PipelineQKGInterReady::ThreadCategory::Consumer;
         }
 
-        // === MMA -> CE pipelines (UMMA) ===
+        // === MMA -> CudaCore pipelines (UMMA) ===
         typename PipelineQKDone::Params qk_done_pipe_params;
-        qk_done_pipe_params.producer_arv_count = NUM_MMA_THREADS;
-        qk_done_pipe_params.consumer_arv_count = NUM_CE_THREADS;
+        qk_done_pipe_params.producer_arv_count = NumMmaThreads;
+        qk_done_pipe_params.consumer_arv_count = NumCudaCoreThreads;
 
         if (role == WarpRole::Mma) {
             qk_done_pipe_params.role = PipelineQKDone::ThreadCategory::Producer;
-        } else if (role == WarpRole::ComputeEpilogue) {
+        } else if (role == WarpRole::ComputeCudaCore) {
             qk_done_pipe_params.role = PipelineQKDone::ThreadCategory::Consumer;
         }
 
-        // === CE -> Inverse pipeline ===
+        // === CudaCore -> Inverse pipeline ===
         typename PipelineKKInvReady::Params kk_inv_pipe_params;
-        kk_inv_pipe_params.producer_arv_count = NUM_CE_THREADS;
-        kk_inv_pipe_params.consumer_arv_count = NUM_INVERSE_THREADS;
-        if (role == WarpRole::ComputeEpilogue) {
+        kk_inv_pipe_params.producer_arv_count = NumCudaCoreThreads;
+        kk_inv_pipe_params.consumer_arv_count = NumInverseThreads;
+        if (role == WarpRole::ComputeCudaCore) {
             kk_inv_pipe_params.role = PipelineKKInvReady::ThreadCategory::Producer;
         } else if (role == WarpRole::Inverse) {
             kk_inv_pipe_params.role = PipelineKKInvReady::ThreadCategory::Consumer;
@@ -250,8 +250,8 @@ struct KdaChunkFwdIntraKernelSm100 {
         // =======================================================================
         Mainloop mainloop;
 
-        if (role == WarpRole::ComputeEpilogue) {
-            cutlass::arch::warpgroup_reg_alloc<REG_COMPUTE>();
+        if (role == WarpRole::ComputeCudaCore) {
+            cutlass::arch::warpgroup_reg_alloc<NumCudaCoreRegs>();
             mainloop.compute_epilogue_loop(
                 params, tma_params, shared_plan, tile_scheduler,
                 q_pipeline, q_pipe_state_read,
@@ -265,7 +265,7 @@ struct KdaChunkFwdIntraKernelSm100 {
             );
 
         } else if (role == WarpRole::Mma) {
-            cutlass::arch::warpgroup_reg_dealloc<REG_LOAD>();
+            cutlass::arch::warpgroup_reg_dealloc<NumLoadRegs>();
             mainloop.mma_loop(
                 params, tma_params, shared_plan, tile_scheduler,
                 qkg_inter_pipeline, qkg_inter_pipe_state_read,
@@ -274,7 +274,7 @@ struct KdaChunkFwdIntraKernelSm100 {
             );
 
         } else if (role == WarpRole::Load) {
-            cutlass::arch::warpgroup_reg_dealloc<REG_LOAD>();
+            cutlass::arch::warpgroup_reg_dealloc<NumLoadRegs>();
             mainloop.load_loop(
                 params, tma_params, shared_plan, tile_scheduler,
                 q_pipeline, q_pipe_state_write,
@@ -284,7 +284,7 @@ struct KdaChunkFwdIntraKernelSm100 {
             );
 
         } else if (role == WarpRole::Inverse) {
-            cutlass::arch::warpgroup_reg_dealloc<REG_INVERSE>();
+            cutlass::arch::warpgroup_reg_dealloc<NumInverseRegs>();
             mainloop.inverse_loop(
                 params, tma_params, shared_plan, tile_scheduler,
                 kk_inv_pipeline, kk_inv_pipe_state_read,
@@ -293,8 +293,8 @@ struct KdaChunkFwdIntraKernelSm100 {
 
         } else {
             // WarpRole::Empty — beta loading
-            cutlass::arch::warpgroup_reg_dealloc<REG_LOAD>();
-            mainloop.empty_loop(
+            cutlass::arch::warpgroup_reg_dealloc<NumLoadRegs>();
+            mainloop.load_beta_loop(
                 params, tma_params, shared_plan, tile_scheduler,
                 beta_pipeline, beta_pipe_state_write,
                 chunk_indices_ptr, cu_len_ptr, total_tiles
@@ -383,7 +383,7 @@ inline void run_kda_fwd_intra_sm100_impl(KDA_fwd_intra_params &params, cudaStrea
         kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     dim3 grid_dim(Kernel::TileScheduler::get_grid_shape(params.tile_scheduler_params));
-    dim3 block_dim(Kernel::NUM_THREADS, 1, 1);
+    dim3 block_dim(Kernel::NumTotalThreads, 1, 1);
     kernel_fn<<<grid_dim, block_dim, smem_size, stream>>>(params, tma_params);
 }
 

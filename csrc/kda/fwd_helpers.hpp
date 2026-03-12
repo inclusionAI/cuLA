@@ -19,13 +19,13 @@ using namespace cute;
 // Backward vs Forward B-matrix layout difference:
 //   Forward computes Q/K @ K^T, Backward computes dAqk/dAkk @ K.
 //   Forward MMA:  64 × X × 32 (M×N×K), reduces head dim (K=32), B = K^T
-//     B-matrix shape = (N × K) = (SUB_T_TILE × K_TILE), K-major
+//     B-matrix shape = (N × K) = (SubTileT × TileK), K-major
 //     uses SmemLayoutMatBTF32 = Layout_K_SW128_Atom, stored as sKG(x_local, y)
-//   Backward MMA: 64 × 32 × X (M×N×K), reduces chunk dim (K=SUB_T_TILE), B = K
-//     B-matrix shape = (K × N) = (SUB_T_TILE × K_TILE), MN-major
+//   Backward MMA: 64 × 32 × X (M×N×K), reduces chunk dim (K=SubTileT), B = K
+//     B-matrix shape = (K × N) = (SubTileT × TileK), MN-major
 //     uses SmemLayoutMatBTF32Tranposed = Layout_MN_SW128_32B_Atom, stored as sKG(y, x_local)
 //
-// SmemLayoutMatBTF32<1> = (SUB_T_TILE, K_TILE) = (16, 32), K-major layout
+// SmemLayoutMatBTF32<1> = (SubTileT, TileK) = (16, 32), K-major layout
 //
 // Thread mapping (128 threads per WG, 16 rows per sub_tile):
 //   x_local = idx_in_warpgroup / 8           (row within sub_tile, 0..15)
@@ -33,7 +33,7 @@ using namespace cute;
 //   Each thread writes 4 consecutive tf32 values (128 bits) to SMEM.
 //
 // Store pattern: sKG(x_local, y) + KG_OFFSET * index
-//   where KG_OFFSET = SUB_T_TILE * K_TILE (stride between sub_tile buffers)
+//   where KG_OFFSET = SubTileT * TileK (stride between sub_tile buffers)
 
 // ============================================================
 // Column-based fused B-matrix helpers (1 load → N outputs per column)
@@ -308,8 +308,8 @@ __forceinline__ __device__ void fwd_setup_kg_col3_1out(
 //   Lower 64 threads (idx < 64): write gated Q → TMEM for QK MMA
 //   Upper 64 threads (idx >= 64): write gated K → TMEM for KK MMA
 //
-// Each thread computes K_TILE float values for its row, then does a single
-// tmem_st_32dp32bNx<K_TILE> store.
+// Each thread computes TileK float values for its row, then does a single
+// tmem_st_32dp32bNx<TileK> store.
 //
 // The tmem_addr parameter specifies the TMEM base address for this A-matrix.
 // Different sub_tiles write to different TMEM address offsets.
@@ -317,17 +317,17 @@ __forceinline__ __device__ void fwd_setup_kg_col3_1out(
 // fwd_setup_A_inter: compute exp2(g[row] - g_first) * Vec[row] → TMEM
 // Covers all 64 rows; only rows in [sub_tile_i*16, sub_tile_i*16+16) get real data.
 // Other rows are zeroed. Vec is Q or K (bf16 from SMEM).
-template <int K_TILE, typename G_TENSOR, typename VEC_TENSOR>
+template <int TileK, typename G_TENSOR, typename VEC_TENSOR>
 __forceinline__ __device__ void fwd_setup_A_inter(
     G_TENSOR &sG, VEC_TENSOR &sVec,
     int sub_tile_i, int idx_in_warpgroup, int sub_seq_len,
     int tmem_addr) {
     int row = idx_in_warpgroup % 64;
-    float res[K_TILE];
+    float res[TileK];
     if (row >= sub_tile_i * 16 && row < sub_tile_i * 16 + 16 && row < sub_seq_len) {
         int g_first_row = min(sub_tile_i * 16, sub_seq_len - 1);
         #pragma unroll
-        for (int i = 0; i < K_TILE / 4; ++i) {
+        for (int i = 0; i < TileK / 4; ++i) {
             int y = i * 4;
             float4 g     = *reinterpret_cast<float4*>(&sG(row, y));
             float4 g_ref = *reinterpret_cast<float4*>(&sG(g_first_row, y));
@@ -342,23 +342,23 @@ __forceinline__ __device__ void fwd_setup_A_inter(
         }
     } else {
         #pragma unroll
-        for (int i = 0; i < K_TILE; ++i) res[i] = 0.0f;
+        for (int i = 0; i < TileK; ++i) res[i] = 0.0f;
     }
-    tmem_st_32dp32bNx<K_TILE>(tmem_addr, res);
+    tmem_st_32dp32bNx<TileK>(tmem_addr, res);
 }
 
 // fwd_setup_A_intra: compute exp2(g[row] - g_half) * Vec[row] → TMEM
-template <int K_TILE, typename G_TENSOR, typename VEC_TENSOR>
+template <int TileK, typename G_TENSOR, typename VEC_TENSOR>
 __forceinline__ __device__ void fwd_setup_A_intra(
     G_TENSOR &sG, VEC_TENSOR &sVec,
     int sub_tile_i, int idx_in_warpgroup, int sub_seq_len,
     int tmem_addr) {
     int row = idx_in_warpgroup % 64;
-    float res[K_TILE];
+    float res[TileK];
     if (row >= sub_tile_i * 16 && row < sub_tile_i * 16 + 16 && row < sub_seq_len) {
         int g_half_row = min(sub_tile_i * 16 + 8, sub_seq_len - 1);
         #pragma unroll
-        for (int i = 0; i < K_TILE / 4; ++i) {
+        for (int i = 0; i < TileK / 4; ++i) {
             int y = i * 4;
             float4 g     = *reinterpret_cast<float4*>(&sG(row, y));
             float4 g_ref = *reinterpret_cast<float4*>(&sG(g_half_row, y));
@@ -373,15 +373,15 @@ __forceinline__ __device__ void fwd_setup_A_intra(
         }
     } else {
         #pragma unroll
-        for (int i = 0; i < K_TILE; ++i) res[i] = 0.0f;
+        for (int i = 0; i < TileK; ++i) res[i] = 0.0f;
     }
-    tmem_st_32dp32bNx<K_TILE>(tmem_addr, res);
+    tmem_st_32dp32bNx<TileK>(tmem_addr, res);
 }
 
 // fwd_setup_A_inter_QK: compute both gated Q and gated K for inter A-matrices
 // Lower 64 threads handle Q (for QK MMA), upper 64 handle K (for KK MMA)
 // Both use the same exponent: exp2(g[row] - g_first)
-template <int K_TILE, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
+template <int TileK, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
 __forceinline__ __device__ void fwd_setup_A_inter_QK(
     G_TENSOR &sG, Q_TENSOR &sQ, K_TENSOR &sK,
     int sub_tile_i, int idx_in_warpgroup, int sub_seq_len,
@@ -389,22 +389,22 @@ __forceinline__ __device__ void fwd_setup_A_inter_QK(
     // Lower 64 threads → gated Q → tmem_addr_q
     // Upper 64 threads → gated K → tmem_addr_k
     if (idx_in_warpgroup < 64) {
-        fwd_setup_A_inter<K_TILE>(sG, sQ, sub_tile_i, idx_in_warpgroup, sub_seq_len, tmem_addr_q);
+        fwd_setup_A_inter<TileK>(sG, sQ, sub_tile_i, idx_in_warpgroup, sub_seq_len, tmem_addr_q);
     } else {
-        fwd_setup_A_inter<K_TILE>(sG, sK, sub_tile_i, idx_in_warpgroup, sub_seq_len, tmem_addr_k);
+        fwd_setup_A_inter<TileK>(sG, sK, sub_tile_i, idx_in_warpgroup, sub_seq_len, tmem_addr_k);
     }
 }
 
 // fwd_setup_A_intra_QK: compute both gated Q and gated K for intra A-matrices
-template <int K_TILE, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
+template <int TileK, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
 __forceinline__ __device__ void fwd_setup_A_intra_QK(
     G_TENSOR &sG, Q_TENSOR &sQ, K_TENSOR &sK,
     int sub_tile_i, int idx_in_warpgroup, int sub_seq_len,
     int tmem_addr_q, int tmem_addr_k) {
     if (idx_in_warpgroup < 64) {
-        fwd_setup_A_intra<K_TILE>(sG, sQ, sub_tile_i, idx_in_warpgroup, sub_seq_len, tmem_addr_q);
+        fwd_setup_A_intra<TileK>(sG, sQ, sub_tile_i, idx_in_warpgroup, sub_seq_len, tmem_addr_q);
     } else {
-        fwd_setup_A_intra<K_TILE>(sG, sK, sub_tile_i, idx_in_warpgroup, sub_seq_len, tmem_addr_k);
+        fwd_setup_A_intra<TileK>(sG, sK, sub_tile_i, idx_in_warpgroup, sub_seq_len, tmem_addr_k);
     }
 }
 
@@ -419,7 +419,7 @@ __forceinline__ __device__ void fwd_setup_A_intra_QK(
 //   intra: g_half  = g[sub_tile_i * 16 + 8]  (middle row of the sub_tile)
 //
 // Result: exp2(g[row] - g_ref) * Vec[row], stored to TMEM via a single
-// tmem_st_32dp32bNx<K_TILE> call.
+// tmem_st_32dp32bNx<TileK> call.
 //
 // TMEM lane mapping (128 threads = 4 warps in one WG):
 //   Warp 0 (threads 0-31):   Q rows 0-31   → TMEM lanes 0-31
@@ -432,18 +432,18 @@ __forceinline__ __device__ void fwd_setup_A_intra_QK(
 // When 2 WGs call this function, both write the same data → idempotent / redundant.
 
 // fwd_setup_A_inter_all: all 4 sub_tiles, inter gating, single Vec (Q or K)
-template <int K_TILE, typename G_TENSOR, typename VEC_TENSOR>
+template <int TileK, typename G_TENSOR, typename VEC_TENSOR>
 __forceinline__ __device__ void fwd_setup_A_inter_all(
     G_TENSOR &sG, VEC_TENSOR &sVec,
     int idx_in_warpgroup, int sub_seq_len,
     int tmem_addr) {
     int row = idx_in_warpgroup % 64;
     int sub_tile_i = row / 16;  // 0, 1, 2, or 3
-    float res[K_TILE];
+    float res[TileK];
     if (row < sub_seq_len) {
         int g_first_row = min(sub_tile_i * 16, sub_seq_len - 1);
         #pragma unroll
-        for (int i = 0; i < K_TILE / 4; ++i) {
+        for (int i = 0; i < TileK / 4; ++i) {
             int y = i * 4;
             float4 g     = *reinterpret_cast<float4*>(&sG(row, y));
             float4 g_ref = *reinterpret_cast<float4*>(&sG(g_first_row, y));
@@ -457,24 +457,24 @@ __forceinline__ __device__ void fwd_setup_A_inter_all(
         }
     } else {
         #pragma unroll
-        for (int i = 0; i < K_TILE; ++i) res[i] = 0.0f;
+        for (int i = 0; i < TileK; ++i) res[i] = 0.0f;
     }
-    tmem_st_32dp32bNx<K_TILE>(tmem_addr, res);
+    tmem_st_32dp32bNx<TileK>(tmem_addr, res);
 }
 
 // fwd_setup_A_intra_all: all 4 sub_tiles, intra gating, single Vec (Q or K)
-template <int K_TILE, typename G_TENSOR, typename VEC_TENSOR>
+template <int TileK, typename G_TENSOR, typename VEC_TENSOR>
 __forceinline__ __device__ void fwd_setup_A_intra_all(
     G_TENSOR &sG, VEC_TENSOR &sVec,
     int idx_in_warpgroup, int sub_seq_len,
     int tmem_addr) {
     int row = idx_in_warpgroup % 64;
     int sub_tile_i = row / 16;  // 0, 1, 2, or 3
-    float res[K_TILE];
+    float res[TileK];
     if (row < sub_seq_len) {
         int g_half_row = min(sub_tile_i * 16 + 8, sub_seq_len - 1);
         #pragma unroll
-        for (int i = 0; i < K_TILE / 4; ++i) {
+        for (int i = 0; i < TileK / 4; ++i) {
             int y = i * 4;
             float4 g     = *reinterpret_cast<float4*>(&sG(row, y));
             float4 g_ref = *reinterpret_cast<float4*>(&sG(g_half_row, y));
@@ -488,38 +488,38 @@ __forceinline__ __device__ void fwd_setup_A_intra_all(
         }
     } else {
         #pragma unroll
-        for (int i = 0; i < K_TILE; ++i) res[i] = 0.0f;
+        for (int i = 0; i < TileK; ++i) res[i] = 0.0f;
     }
-    tmem_st_32dp32bNx<K_TILE>(tmem_addr, res);
+    tmem_st_32dp32bNx<TileK>(tmem_addr, res);
 }
 
 // fwd_setup_A_inter_all_QK: combined Q + K, inter gating, all 4 sub_tiles
 // Threads 0-63 → gated Q → tmem_addr_q
 // Threads 64-127 → gated K → tmem_addr_k
-template <int K_TILE, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
+template <int TileK, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
 __forceinline__ __device__ void fwd_setup_A_inter_all_QK(
     G_TENSOR &sG, Q_TENSOR &sQ, K_TENSOR &sK,
     int idx_in_warpgroup, int sub_seq_len,
     int tmem_addr_q, int tmem_addr_k) {
     if (idx_in_warpgroup < 64) {
-        fwd_setup_A_inter_all<K_TILE>(sG, sQ, idx_in_warpgroup, sub_seq_len, tmem_addr_q);
+        fwd_setup_A_inter_all<TileK>(sG, sQ, idx_in_warpgroup, sub_seq_len, tmem_addr_q);
     } else {
-        fwd_setup_A_inter_all<K_TILE>(sG, sK, idx_in_warpgroup, sub_seq_len, tmem_addr_k);
+        fwd_setup_A_inter_all<TileK>(sG, sK, idx_in_warpgroup, sub_seq_len, tmem_addr_k);
     }
 }
 
 // fwd_setup_A_intra_all_QK: combined Q + K, intra gating, all 4 sub_tiles
 // Threads 0-63 → gated Q → tmem_addr_q
 // Threads 64-127 → gated K → tmem_addr_k
-template <int K_TILE, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
+template <int TileK, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
 __forceinline__ __device__ void fwd_setup_A_intra_all_QK(
     G_TENSOR &sG, Q_TENSOR &sQ, K_TENSOR &sK,
     int idx_in_warpgroup, int sub_seq_len,
     int tmem_addr_q, int tmem_addr_k) {
     if (idx_in_warpgroup < 64) {
-        fwd_setup_A_intra_all<K_TILE>(sG, sQ, idx_in_warpgroup, sub_seq_len, tmem_addr_q);
+        fwd_setup_A_intra_all<TileK>(sG, sQ, idx_in_warpgroup, sub_seq_len, tmem_addr_q);
     } else {
-        fwd_setup_A_intra_all<K_TILE>(sG, sK, idx_in_warpgroup, sub_seq_len, tmem_addr_k);
+        fwd_setup_A_intra_all<TileK>(sG, sK, idx_in_warpgroup, sub_seq_len, tmem_addr_k);
     }
 }
 
@@ -527,9 +527,9 @@ __forceinline__ __device__ void fwd_setup_A_intra_all_QK(
 // Forward Epilogue: T2R + Causal Mask + R2G / R2S helper functions
 // ============================================================
 //
-// After MMA finishes K_ITERATION accumulations, the full 64×64 QK and KK
-// matrices reside in TMEM. The CE warpgroups perform:
-//   1. T2R: read TMEM → registers (tmem_ld_32dp32bNx<T_TILE>)
+// After MMA finishes NumKIters accumulations, the full 64×64 QK and KK
+// matrices reside in TMEM. The CudaCore warpgroups perform:
+//   1. T2R: read TMEM → registers (tmem_ld_32dp32bNx<TileT>)
 //   2. Causal mask: apply lower-triangular mask in registers (zero j > i)
 //   3. R2G: convert float → bf16 and store to global memory (store_256B)
 //   4. R2S (KK only): write masked KK to SMEM for inverse warpgroup
@@ -556,7 +556,7 @@ __forceinline__ __device__ void fwd_setup_A_intra_all_QK(
 //   col 48-63: sub_tile 3 (positions 48-63)
 
 // fwd_epilogue_t2r_qk: T2R for QK result, apply scale + causal mask, R2G to global memory
-// Called by threads responsible for QK output in each CE warpgroup.
+// Called by threads responsible for QK output in each CudaCore warpgroup.
 // Each thread reads its row of the 64×64 QK matrix from TMEM,
 // multiplies every element by `scale`, applies lower-triangular causal mask,
 // and writes bf16 to global memory.
@@ -564,27 +564,27 @@ __forceinline__ __device__ void fwd_setup_A_intra_all_QK(
 // TMEM row mapping (64 threads → 64 rows):
 //   Warp 0 (threads  0-31): dp-lanes 0-31  → rows 0-31
 //   Warp 1 (threads 32-63): dp-lanes 0-31  → rows 32-63  (lane16 bank offset)
-//   A single tmem_ld_32dp32bNx<T_TILE> call per thread reads all T_TILE columns
+//   A single tmem_ld_32dp32bNx<TileT> call per thread reads all TileT columns
 //   for that thread's row.
 //
 // Output addressing (Aqk_out_ptr layout: [total_tokens, H, BT]):
-//   qk_out_row_base = Aqk_out_ptr + (token_offset + tile_idx * T_TILE + row) * H * BT
+//   qk_out_row_base = Aqk_out_ptr + (token_offset + tile_idx * TileT + row) * H * BT
 //                                  + head_idx * BT
-//   Each thread writes its full row (T_TILE bf16 values) via store_256B.
+//   Each thread writes its full row (TileT bf16 values) via store_256B.
 //
 // tmem_qk_addr: TMEM base address for QK data (= TmemAllocation::QK)
 // idx_in_warpgroup: 0..127 within this WG (only threads 0..63 should call this)
 // sub_seq_len: actual sequence length within this tile (for bounds checking)
 // scale: per-element scaling factor (params.scale)
 // qk_out_base: global memory pointer for this thread's row output
-template <int T_TILE>
+template <int TileT>
 __forceinline__ __device__ void fwd_epilogue_t2r_qk(
     int tmem_qk_addr, int idx_in_warpgroup, int sub_seq_len,
     float scale, __nv_bfloat16 *qk_out_base) {
-    // T2R: read full row (T_TILE floats) from TMEM
-    float res[T_TILE];
+    // T2R: read full row (TileT floats) from TMEM
+    float res[TileT];
     tcgen05_after_thread_sync();
-    tmem_ld_32dp32bNx<T_TILE>(tmem_qk_addr, res);
+    tmem_ld_32dp32bNx<TileT>(tmem_qk_addr, res);
     cutlass::arch::fence_view_async_tmem_load();
     tcgen05_before_thread_sync();
 
@@ -596,7 +596,7 @@ __forceinline__ __device__ void fwd_epilogue_t2r_qk(
     //   - Zero out out-of-bounds columns (j >= sub_seq_len)
     int mask_limit = min(row, sub_seq_len - 1);  // last valid column
     #pragma unroll
-    for (int j = 0; j < T_TILE; ++j) {
+    for (int j = 0; j < TileT; ++j) {
         if (j > mask_limit) {
             res[j] = 0.0f;
         } else {
@@ -609,7 +609,7 @@ __forceinline__ __device__ void fwd_epilogue_t2r_qk(
     // NOTE: we do not need write zeros here because this is a direct R2G copy, writing zero causes oob write
     if (row < sub_seq_len) {
         #pragma unroll
-        for (int i = 0; i < T_TILE / 16; ++i) {
+        for (int i = 0; i < TileT / 16; ++i) {
             bf16x16 out;
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
@@ -622,7 +622,7 @@ __forceinline__ __device__ void fwd_epilogue_t2r_qk(
 }
 
 // fwd_epilogue_t2r_kk: T2R for KK result, apply beta scaling + causal mask, R2S
-// Called by upper 64 threads (idx_in_warpgroup >= 64) of each CE warpgroup.
+// Called by upper 64 threads (idx_in_warpgroup >= 64) of each CudaCore warpgroup.
 // Each thread reads its row of the 64×64 KK matrix from TMEM,
 // applies beta scaling (row i *= beta[i]), lower-triangular causal mask,
 // converts to fp16, and writes to SMEM for the inverse warpgroup.
@@ -632,15 +632,15 @@ __forceinline__ __device__ void fwd_epilogue_t2r_qk(
 // sub_seq_len: actual sequence length within this tile
 // beta_row: beta scaling factor for this thread's row (from beta_smem)
 // sKK: SMEM tensor for inverse warpgroup (fp16)
-template <int T_TILE, typename KK_SMEM_TENSOR>
+template <int TileT, typename KK_SMEM_TENSOR>
 __forceinline__ __device__ void fwd_epilogue_t2r_kk(
     int tmem_kk_addr, int idx_in_warpgroup, int sub_seq_len,
     float beta_row,
     KK_SMEM_TENSOR &sKK) {
-    // T2R: read full row (T_TILE floats) from TMEM
-    float res[T_TILE];
+    // T2R: read full row (TileT floats) from TMEM
+    float res[TileT];
     tcgen05_after_thread_sync();
-    tmem_ld_32dp32bNx<T_TILE>(tmem_kk_addr, res);
+    tmem_ld_32dp32bNx<TileT>(tmem_kk_addr, res);
     cutlass::arch::fence_view_async_tmem_load();
     tcgen05_before_thread_sync();
 
@@ -652,7 +652,7 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
     //   - Zero out out-of-bounds columns (j >= sub_seq_len)
     int mask_limit = min(row, sub_seq_len - 1);
     #pragma unroll
-    for (int j = 0; j < T_TILE; ++j) {
+    for (int j = 0; j < TileT; ++j) {
         if (j > mask_limit) {
             res[j] = 0.0f;
         } else {
@@ -663,7 +663,7 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
     if (row < sub_seq_len) {
         // R2S: convert to fp16 and write to SMEM for inverse warpgroup
         #pragma unroll
-        for (int i = 0; i < T_TILE / 4; ++i) {
+        for (int i = 0; i < TileT / 4; ++i) {
             // Convert 4 floats → 4 fp16 values, store as 2×half2
             float2 f01 = reinterpret_cast<float2*>(res)[i * 2];
             float2 f23 = reinterpret_cast<float2*>(res)[i * 2 + 1];
@@ -676,14 +676,14 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
         // NOTE: must write zeros to SMEM of invalid token postitions in the current chunk
         // R2S zero
         #pragma unroll
-        for (int i = 0; i < T_TILE; ++i) {
+        for (int i = 0; i < TileT; ++i) {
             sKK(row, i) = half_t(0.0f);
         }
     }
 }
 
 // fwd_epilogue_qk_kk: combined T2R + causal mask + output for both QK and KK
-// Called by all 128 threads in each CE warpgroup.
+// Called by all 128 threads in each CudaCore warpgroup.
 // Lower 64 threads handle QK (scale + mask + R2G), upper 64 threads handle KK (beta + mask + R2S).
 //
 // tmem_qk_addr: TMEM base address for QK / KK data (same region, different dp-lane banks)
@@ -693,15 +693,15 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
 // beta_row: beta scaling factor for this thread's row (from beta_smem)
 // qk_out_base: global memory pointer for QK row output (bf16, lower threads only)
 // sKK: SMEM tensor for KK inverse (fp16, upper threads only)
-template <int T_TILE, typename KK_SMEM_TENSOR>
+template <int TileT, typename KK_SMEM_TENSOR>
 __forceinline__ __device__ void fwd_epilogue_qk_kk(
     int tmem_qk_addr, int idx_in_warpgroup, int sub_seq_len,
     float scale, float beta_row, __nv_bfloat16 *qk_out_base,
     KK_SMEM_TENSOR &sKK) {
     if (idx_in_warpgroup < 64) {
-        fwd_epilogue_t2r_qk<T_TILE>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, scale, qk_out_base);
+        fwd_epilogue_t2r_qk<TileT>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, scale, qk_out_base);
     } else {
-        fwd_epilogue_t2r_kk<T_TILE>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, beta_row, sKK);
+        fwd_epilogue_t2r_kk<TileT>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, beta_row, sKK);
     }
 }
 
