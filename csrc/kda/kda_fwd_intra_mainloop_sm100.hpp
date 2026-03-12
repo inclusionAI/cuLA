@@ -35,36 +35,27 @@ struct KdaChunkFwdIntraSm100NamedBarriers {
 struct KdaChunkFwdIntraMainloopSm100 {
 
     // ===================== Tile / Buffer Constants =====================
-    static constexpr int SubTileT   = 16;
+    static constexpr int SubTileT    = 16;
     static constexpr int TileT       = 64;
-    static constexpr int HeadDim       = 128;
+    static constexpr int HeadDim     = 128;
     static constexpr int TileK       = 32;
-    static constexpr int NumKIters  = HeadDim / TileK;
-    static constexpr int StagesLoad = 2;
+    static constexpr int NumKIters   = HeadDim / TileK;
     static constexpr int ChunkSize   = 64;
-    static constexpr int NumTotalThreads  = 128 * 4;  // 512
-
-    // ===================== Thread Count Constants =====================
-    static constexpr int NumCudaCoreThreads      = 256; // warp 0-7 (2 warpgroups)
-    static constexpr int NumInverseThreads = 128; // warp 8-11 (1 warpgroup)
-    static constexpr int NumMmaThreads     = 32;  // warp 12
-    static constexpr int NumLoadTmaThreads    = 1;   // elect_one in warp 13
-    static constexpr int NumLoadBetaThreads   = 64;  // warp 14-15
+    static constexpr int StagesLoad  = 2;
 
     // TODO: double buffer in TMEM, overlap prologue A matrix with MMA
     enum class TmemAllocation : uint32_t {
         QK = 0, // [0, 64]
         QK_02 = QK, // [0, 64]
-        QK_13 = QK_02 + 16 * 65536, // [0, 64] (+lane16 offset)
+        QK_13 = QK_02 + 16 * 65536, // [0, 64] +lane16
         QG_INTER = QK + TileT, // [64, 96]
         QG_INTER_02 = QG_INTER, // [64, 96]
-        QG_INTER_13 = QG_INTER_02 + 16 * 65536, // [64, 96] (+lane16 offset)
+        QG_INTER_13 = QG_INTER_02 + 16 * 65536, // [64, 96] +lane16
         QG_INTRA = QG_INTER + TileK, // [96, 128]
         QG_INTRA_02 = QG_INTRA, // [96, 128]
-        QG_INTRA_13 = QG_INTRA_02 + 16 * 65536, // [96, 128] (+lane16 offset)
+        QG_INTRA_13 = QG_INTRA_02 + 16 * 65536, // [96, 128] +lane16
     };
 
-    using ClusterShape = Shape<_1, _1, _1>;
     using TileScheduler = StaticPersistentTileScheduler;
 
     // ===================== SMEM Layouts =====================
@@ -830,7 +821,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
         )
     {
         // === PERSISTENT LOAD BETA WARP LOOP (static scheduling, no tile pipeline) ===
-        int thread_idx = threadIdx.x - (NumTotalThreads - 64); // 0..63
+        int thread_idx = threadIdx.x % 64; // 0..63
         int *chunk_indices_ptr = (int*)params.chunk_indices_ptr;
         int *cu_seqlens_ptr = (int*)params.cu_seqlens_ptr;
 

@@ -35,7 +35,6 @@ struct KdaChunkFwdIntraKernelSm100 {
     // ===================== Import types from Mainloop =====================
     using SharedMemoryPlan       = typename Mainloop::SharedMemoryPlan;
     using TileScheduler          = typename Mainloop::TileScheduler;
-    using ClusterShape           = typename Mainloop::ClusterShape;
 
     // SMEM layouts (for TMA descriptor construction in host launcher)
     using SmemLayoutInputBF16    = typename Mainloop::SmemLayoutInputBF16;
@@ -63,18 +62,20 @@ struct KdaChunkFwdIntraKernelSm100 {
     using PipelineStateQKDone    = typename Mainloop::PipelineStateQKDone;
     using PipelineStateKKInv     = typename Mainloop::PipelineStateKKInv;
 
-    // Constants forwarded from Mainloop
-    static constexpr int NumTotalThreads         = Mainloop::NumTotalThreads;
-    static constexpr int NumCudaCoreThreads      = Mainloop::NumCudaCoreThreads;
-    static constexpr int NumInverseThreads = Mainloop::NumInverseThreads;
-    static constexpr int NumMmaThreads     = Mainloop::NumMmaThreads;
-    static constexpr int NumLoadTmaThreads    = Mainloop::NumLoadTmaThreads;
-    static constexpr int NumLoadBetaThreads   = Mainloop::NumLoadBetaThreads;
+    using ClusterShape = Shape<_1, _1, _1>;
+
+    // ===================== Thread Count Constants =====================
+    static constexpr int NumTotalThreads  = 128 * 4;  // 512
+    static constexpr int NumCudaCoreThreads = 256; // warp 0-7 (2 warpgroups)
+    static constexpr int NumInverseThreads = 128; // warp 8-11 (1 warpgroup)
+    static constexpr int NumMmaThreads = 32;  // warp 12
+    static constexpr int NumLoadTmaThreads = 1;   // elect_one in warp 13
+    static constexpr int NumLoadBetaThreads = 64;  // warp 14-15
 
     // ===================== Kernel-only Constants =====================
-    static constexpr int NumCudaCoreRegs  = 160;
-    static constexpr int NumLoadRegs     = 80;
-    static constexpr int NumInverseRegs  = 104;
+    static constexpr int NumCudaCoreRegs = 160;
+    static constexpr int NumLoadRegs = 80;
+    static constexpr int NumInverseRegs = 104;
 
     // ===================== Warp Roles =====================
     enum class WarpRole {
