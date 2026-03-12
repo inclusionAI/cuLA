@@ -1,8 +1,8 @@
 #pragma once
 
 #include <cute/tensor.hpp>
-#include "basic.h"
-#include "helpers.h"
+#include "common_utils.hpp"
+#include "sm100_utils.hpp"
 
 namespace sm100 {
 

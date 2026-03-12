@@ -5,7 +5,7 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/arch/barrier.h>
 
-#include "fwd_util_func.h"
+#include "common_utils.hpp"
 
 namespace sm100 {
 

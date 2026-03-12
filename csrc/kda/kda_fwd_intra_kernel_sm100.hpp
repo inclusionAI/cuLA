@@ -1,10 +1,9 @@
 #pragma once
 
-// NOTE: This header is included from .cu files in csrc/ (parent directory).
-// All includes use csrc/ as the root include path.
 #include "kda_fwd_common.cuh"
-#include "helpers.h"
-#include "gemm.h"
+#include "common_utils.hpp"
+#include "sm100_utils.hpp"
+#include "sm100_umma_ext.hpp"
 
 #include <cutlass/barrier.h>
 #include <cutlass/arch/barrier.h>
@@ -85,6 +84,7 @@ struct KdaChunkFwdIntraKernelSm100 {
         ComputeEpilogue = 0x5, Inverse = 0x6
     };
 
+    // TODO: add other ways for warp role selection
     // Warp layout (16 warps, 512 threads):
     //   warp  0- 7  (thread   0-255): ComputeEpilogue  — WG0+WG1
     //   warp  8-11  (thread 256-383): Inverse           — 1 warpgroup for inv(KK)

@@ -1,11 +1,11 @@
 #pragma once
 
-// NOTE: This header is included from .cu files in csrc/ (parent directory).
-// All includes use csrc/ as the root include path.
 #include "kda_fwd_common.cuh"
-#include "helpers.h"
-#include "gemm.h"
-#include "fwd_util_func.h"
+#include "common_utils.hpp"
+#include "sm90_utils.hpp"
+#include "sm100_utils.hpp"
+#include "sm100_umma_ext.hpp"
+#include "fwd_helpers.hpp"
 #include "collective_inverse.hpp"
 
 #include <cutlass/barrier.h>
