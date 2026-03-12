@@ -73,10 +73,10 @@ struct KdaChunkFwdIntraMainloopSm100 {
         Step<_1, _2>{}
     ), Shape<_1, _1>{}));
 
-    template<int NUM_TILES>
+    template<int NumTiles>
     using SmemLayoutMatBTF32 = decltype(coalesce(tile_to_shape(
         UMMA::Layout_K_SW128_Atom<tf32>{},
-        Shape<Int<SubTileT * NUM_TILES>, Int<TileK>>{},
+        Shape<Int<SubTileT * NumTiles>, Int<TileK>>{},
         Step<_1, _2>{}
     ), Shape<_1, _1>{}));
 
@@ -280,6 +280,8 @@ struct KdaChunkFwdIntraMainloopSm100 {
         const int wg_idx = threadIdx.x / 128;  // 0 or 1 within CudaCore
         int *chunk_indices_ptr = (int*)params.chunk_indices_ptr;
         int *cu_seqlens_ptr = (int*)params.cu_seqlens_ptr;
+        constexpr int HalfK = TileK / 2;
+        int k_offset = wg_idx * HalfK;
 
         CUTE_NO_UNROLL
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
@@ -327,27 +329,22 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 //
                 // Inter-chunk: qg/kg_i = q/k_i * exp2(g_i - g_first_i), g_first_i = g[sub_tile_i * 16]
                 // Intra-chunk: qg/kg_i = q/k_i * exp2(g_i - g_half_i),  g_half_i  = g[sub_tile_i * 16 + 8]
-                //
-                // Both WGs compute the same result (idempotent R2T writes).
-                // FIXME: use 2 WGs to do A-matrix prologue
                 {
                     Tensor sQ = make_tensor(make_smem_ptr(shared_plan->q[q_pipe_state_read.index()].data()), SmemLayoutInputBF16{});
                     
-                    if (wg_idx == 0) {
-                        // Inter A-matrix: all 4 subchunks → QG_INTER in TMEM
-                        fwd_setup_A_inter_all_QK<TileK>(
-                            sG, sQ, sK,
-                            idx_in_warpgroup, sub_seq_len,
-                            static_cast<int>(TmemAllocation::QG_INTER),
-                            static_cast<int>(TmemAllocation::QG_INTER));
+                    // Inter A-matrix: all 4 subchunks → QG_INTER in TMEM
+                    fwd_setup_A_inter_all_QK<HalfK>(
+                        sG, sQ, sK,
+                        idx_in_warpgroup, sub_seq_len, k_offset,
+                        static_cast<int>(TmemAllocation::QG_INTER),
+                        static_cast<int>(TmemAllocation::QG_INTER));
 
-                        // Intra A-matrix: all 4 subchunks → QG_INTRA in TMEM
-                        fwd_setup_A_intra_all_QK<TileK>(
-                            sG, sQ, sK,
-                            idx_in_warpgroup, sub_seq_len,
-                            static_cast<int>(TmemAllocation::QG_INTRA),
-                            static_cast<int>(TmemAllocation::QG_INTRA));
-                    }
+                    // Intra A-matrix: all 4 subchunks → QG_INTRA in TMEM
+                    fwd_setup_A_intra_all_QK<HalfK>(
+                        sG, sQ, sK,
+                        idx_in_warpgroup, sub_seq_len, k_offset,
+                        static_cast<int>(TmemAllocation::QG_INTRA),
+                        static_cast<int>(TmemAllocation::QG_INTRA));
 
                     cutlass::arch::fence_view_async_tmem_store();
                     tcgen05_before_thread_sync();

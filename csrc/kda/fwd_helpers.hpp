@@ -426,7 +426,7 @@ __forceinline__ __device__ void fwd_setup_A_intra_QK(
 template <int TileK, typename G_TENSOR, typename VEC_TENSOR>
 __forceinline__ __device__ void fwd_setup_A_inter_all(
     G_TENSOR &sG, VEC_TENSOR &sVec,
-    int idx_in_warpgroup, int sub_seq_len,
+    int idx_in_warpgroup, int sub_seq_len, int k_offset,
     int tmem_addr) {
     int row = idx_in_warpgroup % 64;
     int sub_tile_i = row / 16;  // 0, 1, 2, or 3
@@ -435,7 +435,7 @@ __forceinline__ __device__ void fwd_setup_A_inter_all(
         int g_first_row = min(sub_tile_i * 16, sub_seq_len - 1);
         #pragma unroll
         for (int i = 0; i < TileK / 4; ++i) {
-            int y = i * 4;
+            int y = i * 4 + k_offset;
             float4 g     = *reinterpret_cast<float4*>(&sG(row, y));
             float4 g_ref = *reinterpret_cast<float4*>(&sG(g_first_row, y));
             nvbf16x4 v   = *reinterpret_cast<nvbf16x4*>(&sVec(row, y));
@@ -457,7 +457,7 @@ __forceinline__ __device__ void fwd_setup_A_inter_all(
 template <int TileK, typename G_TENSOR, typename VEC_TENSOR>
 __forceinline__ __device__ void fwd_setup_A_intra_all(
     G_TENSOR &sG, VEC_TENSOR &sVec,
-    int idx_in_warpgroup, int sub_seq_len,
+    int idx_in_warpgroup, int sub_seq_len, int k_offset,
     int tmem_addr) {
     int row = idx_in_warpgroup % 64;
     int sub_tile_i = row / 16;  // 0, 1, 2, or 3
@@ -466,7 +466,7 @@ __forceinline__ __device__ void fwd_setup_A_intra_all(
         int g_half_row = min(sub_tile_i * 16 + 8, sub_seq_len - 1);
         #pragma unroll
         for (int i = 0; i < TileK / 4; ++i) {
-            int y = i * 4;
+            int y = i * 4 + k_offset;
             float4 g     = *reinterpret_cast<float4*>(&sG(row, y));
             float4 g_ref = *reinterpret_cast<float4*>(&sG(g_half_row, y));
             nvbf16x4 v   = *reinterpret_cast<nvbf16x4*>(&sVec(row, y));
@@ -490,12 +490,12 @@ __forceinline__ __device__ void fwd_setup_A_intra_all(
 template <int TileK, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
 __forceinline__ __device__ void fwd_setup_A_inter_all_QK(
     G_TENSOR &sG, Q_TENSOR &sQ, K_TENSOR &sK,
-    int idx_in_warpgroup, int sub_seq_len,
+    int idx_in_warpgroup, int sub_seq_len, int k_offset,
     int tmem_addr_q, int tmem_addr_k) {
     if (idx_in_warpgroup < 64) {
-        fwd_setup_A_inter_all<TileK>(sG, sQ, idx_in_warpgroup, sub_seq_len, tmem_addr_q);
+        fwd_setup_A_inter_all<TileK>(sG, sQ, idx_in_warpgroup, sub_seq_len, k_offset, tmem_addr_q + k_offset);
     } else {
-        fwd_setup_A_inter_all<TileK>(sG, sK, idx_in_warpgroup, sub_seq_len, tmem_addr_k);
+        fwd_setup_A_inter_all<TileK>(sG, sK, idx_in_warpgroup, sub_seq_len, k_offset, tmem_addr_k + k_offset);
     }
 }
 
@@ -505,12 +505,12 @@ __forceinline__ __device__ void fwd_setup_A_inter_all_QK(
 template <int TileK, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
 __forceinline__ __device__ void fwd_setup_A_intra_all_QK(
     G_TENSOR &sG, Q_TENSOR &sQ, K_TENSOR &sK,
-    int idx_in_warpgroup, int sub_seq_len,
+    int idx_in_warpgroup, int sub_seq_len, int k_offset,
     int tmem_addr_q, int tmem_addr_k) {
     if (idx_in_warpgroup < 64) {
-        fwd_setup_A_intra_all<TileK>(sG, sQ, idx_in_warpgroup, sub_seq_len, tmem_addr_q);
+        fwd_setup_A_intra_all<TileK>(sG, sQ, idx_in_warpgroup, sub_seq_len, k_offset, tmem_addr_q + k_offset);
     } else {
-        fwd_setup_A_intra_all<TileK>(sG, sK, idx_in_warpgroup, sub_seq_len, tmem_addr_k);
+        fwd_setup_A_intra_all<TileK>(sG, sK, idx_in_warpgroup, sub_seq_len, k_offset, tmem_addr_k + k_offset);
     }
 }
 
