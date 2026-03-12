@@ -70,8 +70,6 @@ struct KdaChunkFwdIntraKernelSm100 {
     static constexpr int NUM_MMA_THREADS     = Mainloop::NUM_MMA_THREADS;
     static constexpr int NUM_LOAD_THREADS    = Mainloop::NUM_LOAD_THREADS;
     static constexpr int NUM_EMPTY_THREADS   = Mainloop::NUM_EMPTY_THREADS;
-    static constexpr int NUM_TILE_CONSUMERS  = Mainloop::NUM_TILE_CONSUMERS;
-    static constexpr int NUM_BUF_VALUE       = Mainloop::NUM_BUF_VALUE;
 
     // ===================== Kernel-only Constants =====================
     static constexpr int REG_COMPUTE  = 160;
