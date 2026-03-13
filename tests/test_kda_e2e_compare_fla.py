@@ -86,6 +86,9 @@ def test_safe_gate_chunk(
         lambda x: x.to(device).requires_grad_(True), (q, k, v, g, beta, h0)
     )
 
+    do = torch.randn_like(v)
+    dht = torch.randn_like(h0)
+
     ref, ref_ht = fla_chunk_kda(
         q=(
             F.normalize(q.clone(), p=2, dim=-1)
@@ -110,6 +113,12 @@ def test_safe_gate_chunk(
         safe_gate=safe_gate,
         lower_bound=lower_bound,
     )
+    ((ref * do).sum() + (ref_ht * dht).sum()).backward(retain_graph=True)
+    if use_gate_in_kernel:
+        ref_dA, A_log.grad = A_log.grad, None
+        ref_dbias, dt_bias.grad = dt_bias.grad, None
+    ref_dq, ref_dk, ref_dv, ref_dg, ref_db, ref_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
+    q.grad = k.grad = v.grad = g.grad = beta.grad = h0.grad = None
 
     tri, tri_ht = flashla_chunk_kda(
         q=(
@@ -135,9 +144,24 @@ def test_safe_gate_chunk(
         safe_gate=safe_gate,
         lower_bound=lower_bound,
     )
+    ((tri * do).sum() + (tri_ht * dht).sum()).backward(retain_graph=True)
+    if use_gate_in_kernel:
+        tri_dA, A_log.grad = A_log.grad, None
+        tri_dbias, dt_bias.grad = dt_bias.grad, None
+    tri_dq, tri_dk, tri_dv, tri_dg, tri_db, tri_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
+    q.grad = k.grad = v.grad = g.grad = beta.grad = h0.grad = None
 
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+    assert_close("dq", ref_dq, tri_dq, 0.008)
+    assert_close("dk", ref_dk, tri_dk, 0.008)
+    assert_close("dv", ref_dv, tri_dv, 0.008)
+    assert_close("dg", ref_dg, tri_dg, 0.02)
+    assert_close("db", ref_db, tri_db, 0.02)
+    if use_gate_in_kernel:
+        assert_close("dA", ref_dA, tri_dA, 0.003, warning=True)
+        assert_close("dbias", ref_dbias, tri_dbias, 0.008)
+    assert_close("dh0", ref_dh0, tri_dh0, 0.008)
 
 
 @pytest.mark.parametrize(
@@ -293,6 +317,8 @@ def test_safe_gate_chunk_varlen(
     q, k, v, g, beta, h0 = map(
         lambda x: x.to(device).requires_grad_(), (q, k, v, g, beta, h0)
     )
+    do = torch.randn_like(v)
+    dht = torch.rand_like(h0)
 
     tri, tri_ht = flashla_chunk_kda(
         q=F.normalize(q.clone(), p=2, dim=-1),
@@ -307,6 +333,9 @@ def test_safe_gate_chunk_varlen(
         safe_gate=safe_gate,
         lower_bound=-5.0 if safe_gate else None,
     )
+    ((tri * do).sum() + (tri_ht * dht).sum()).backward(retain_graph=True)
+    tri_dq, tri_dk, tri_dv, tri_dg, tri_db, tri_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
+    q.grad = k.grad = v.grad = g.grad = beta.grad = h0.grad = None
 
     ref, ref_ht = fla_chunk_kda(
         q=F.normalize(q.clone(), p=2, dim=-1),
@@ -321,6 +350,14 @@ def test_safe_gate_chunk_varlen(
         safe_gate=safe_gate,
         lower_bound=-5.0 if safe_gate else None,
     )
+    ((ref * do).sum() + (ref_ht * dht).sum()).backward(retain_graph=True)
+    ref_dq, ref_dk, ref_dv, ref_dg, ref_db, ref_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
 
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+    assert_close("dq", ref_dq, tri_dq, 0.007)
+    assert_close("dk", ref_dk, tri_dk, 0.008)
+    assert_close("dv", ref_dv, tri_dv, 0.007)
+    assert_close("dg", ref_dg, tri_dg, 0.015)
+    assert_close("db", ref_db, tri_db, 0.015)
+    assert_close("dh0", ref_dh0, tri_dh0, 0.007)

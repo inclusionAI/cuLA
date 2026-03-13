@@ -8,71 +8,85 @@ FlashLA is a lightweight, high-performance linear attention library inspired by 
 - Supports causal (autoregressive) and non-causal modes.
 - Numerical-stability controls (normalization, log-space ops, safe modes).
 
+## Environment
+
+We test and benchmark FlashLA on GB200 GPUs with Python 3.12, CUDA 12.9, PyTorch 2.9.1, Triton 3.5.1, and a specific commit of [flash-linear-attention](https://github.com/fla-org/flash-linear-attention/tree/5da31d199456ee4004f70186f3391d309e26ca98).
+
 ## Installation
 
-- From PyPI (if published):
+- Install from source
+
+```bash
+git clone git@code.alipay.com:ling/flashla.git -b rel/v0.1-rc1
+git submodule update --init --recursive
+# install torch first
+pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu129
+# if network error, try the following command
+# pip install --trusted-host pypi.nvidia.cn --trusted-host pypi.nvidia.com --trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host download.pytorch.org torch==2.9.1 --index-url https://download.pytorch.org/whl/cu129
+# install flash-linear-attention
+cd third_party/flash-linear-attention
+pip install -e .
+# install flashla
+pip install -e . --no-build-isolation
+```
+
+- [TODO] From PyPI (if published)
 
 ```bash
 pip install flashla
 ```
 
-- From a prebuilt local wheel (recommended if available):
-
-```bash
-# create and activate a virtual environment (example)
-python -m venv /path/to/venv
-. /path/to/venv/bin/activate
-
-# install the wheel produced in the project's `dist/` directory
-pip install dist/*.whl
-```
-
-- Build and install from source (requires CUDA toolchain + matching PyTorch):
-
-```bash
-# create and activate a virtual environment (example)
-python -m venv /path/to/venv
-. /path/to/venv/bin/activate
-
-# ensure build tooling and setuptools_scm are available in the build environment
-pip install -U build wheel setuptools setuptools_scm
-
-# build using non-isolated mode so the local `torch` and CUDA toolchain are used
-python -m build --no-isolation
-
-# install the produced wheel
-pip install dist/*.whl
-```
-
-Notes:
-- Building the native CUDA extension requires a working CUDA toolkit (nvcc) and a compatible `torch` installed in the build environment. Use a non-isolated build (`--no-isolation`) if you rely on a locally installed `torch`/CUDA.
-- Editable installs (`pip install -e .`) are useful for development, but you may still need to compile the extension manually after changes.
-- Ensure git submodules are initialized before building from source:
-
-```bash
-git submodule update --init --recursive
-```
-
-For CI or isolated builds, `setuptools_scm` is declared in `pyproject.toml` and will provide dynamic versions; if Git metadata is unavailable a fallback version will be used.
+- [TODO] From a prebuilt local wheel (recommended if available)
 
 ## Quick start
 
-WIP
+We maintain a user-friendly interface that is compatible with flash-linear-attention (FLA), so adopting FlashLA only requires a one-line change.
+
+### KDA
+
+```python
+# One-line import change
+from flashla.kda.chunk import chunk_kda
+
+# Same interface as FLA
+o, ht = chunk_kda(
+    q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+    A_log=A_log, 
+    dt_bias=dt_bias,
+    initial_state=init_state, 
+    output_final_state=True,
+    use_qk_l2norm_in_kernel=True, 
+    cu_seqlens=cu_seqlens,
+    use_gate_in_kernel=True, 
+    safe_gate=True, 
+    lower_bound=lower_bound,
+)
+o.backward(do)
+```
+
+**Notes:**
+- We currently only support `safe_gate=True` due to algorithm advancements and its superior performance.
+- It is highly recommended to compute `cu_seqlens` outside and pass it in for optimal performance.
+
+### Lightning [TODO]
+
 
 ## Performance and benchmarks
 
 Benchmarks for KDA (Kimi Delta Attention)
 
 ```bash
-python benchmark/bench_kda.py
+python benchmarks/bench_kda.py
 ```
+
 
 ## Tests
 
-[WIP] Tests for KDA (Kimi Delta Attention)
+Tests for KDA (Kimi Delta Attention)
 
 ```bash
-pytest tests/test_kda.py::test_safe_gate_chunk
+# e2e test for both forward and backward
+python -m pytest tests/test_kda_e2e_compare_fla.py
 ```
 
 ## Mathematical background (brief)

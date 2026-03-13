@@ -12,7 +12,10 @@ authors = [ { name = "flashla contributors" } ]
 requires-python = ">=3.8"
 dependencies = [
     "nvidia-cutlass-dsl==4.4.1",
-    "apache-tvm-ffi==0.1.9"
+    "apache-tvm-ffi==0.1.9",
+    "pytest",
+    "matplotlib",
+    "pandas",
 ]
 license = { text = "MIT" }
 
