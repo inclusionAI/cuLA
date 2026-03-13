@@ -66,6 +66,7 @@ o.backward(do)
 
 **Notes:**
 - We currently only support `safe_gate=True` due to algorithm advancements and its superior performance.
+- We currently only support `beta` input as `float32` data type.
 - It is highly recommended to compute `cu_seqlens` outside and pass it in for optimal performance.
 
 ### Lightning [TODO]
