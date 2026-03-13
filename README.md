@@ -67,19 +67,45 @@ o.backward(do)
 **Notes:**
 - We currently only support `safe_gate=True` due to algorithm advancements and its superior performance.
 - We currently only support `beta` input as `float32` data type.
-- It is highly recommended to compute `cu_seqlens` outside and pass it in for optimal performance.
+- It is highly recommended to compute `cu_seqlens` outside with `int32` data type and pass it in for optimal performance.
+- We currently use FP16 precision for matrix inversion.
 
 ### Lightning [TODO]
 
 
 ## Performance and benchmarks
 
-Benchmarks for KDA (Kimi Delta Attention)
+### KDA
 
+Benchmarks for KDA (Kimi Delta Attention) run on a single NVIDIA GB200 GPU. The following tables show the execution time (in milliseconds) and the speedup of FlashLA compared to the baseline `flash-linear-attention`.
+
+- Uniform Sequence Length (B=2, H=64, D=128)
+
+| T | flash-linear-attention (ms) | flashla (ms) | Speedup |
+|---|---------------------------|--------------|---------|
+| 128 | 0.573 | 0.534 | **1.074x** |
+| 256 | 0.548 | 0.521 | **1.052x** |
+| 512 | 0.557 | 0.534 | **1.043x** |
+| 1024 | 0.555 | 0.528 | **1.052x** |
+| 2048 | 1.022 | 0.595 | **1.718x** |
+| 4096 | 1.965 | 1.121 | **1.753x** |
+| 8192 | 3.856 | 2.176 | **1.772x** |
+| 16384 | 7.657 | 4.250 | **1.802x** |
+| 32768 | 15.488 | 8.565 | **1.808x** |
+
+- Varlen Sequence Length (NUM_SEQS=8, H=64, D=128)
+
+| Total Length | flash-linear-attention (ms) | flashla (ms) | Speedup |
+|--------------|---------------------------|--------------|---------|
+| 4096 | 1.070 | 0.621 | **1.722x** |
+| 8192 | 2.026 | 1.146 | **1.768x** |
+| 16384 | 3.953 | 2.187 | **1.808x** |
+| 32768 | 7.858 | 4.273 | **1.839x** |
+
+To reproduce the benchmarks:
 ```bash
 python benchmarks/bench_kda.py
 ```
-
 
 ## Tests
 

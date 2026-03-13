@@ -182,12 +182,12 @@ def benchmark_varlen_safe_gate(total_len, provider):
     """
     device = torch.device("cuda")
 
-    # seq_lens = generate_random_seq_lens(NUM_SEQS, total_len, MIN_SEQ_LEN, VARIANCE, 42)
-    # T = total_len
-    # cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
+    seq_lens = generate_random_seq_lens(NUM_SEQS, total_len, MIN_SEQ_LEN, VARIANCE, 42)
+    T = total_len
+    cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
     # hardcoded real-world training traces
-    T = 8192
-    cu_seqlens = torch.tensor(VARLEN_TRACES[total_len], dtype=torch.int32, device=device)
+    # T = 8192
+    # cu_seqlens = torch.tensor(VARLEN_TRACES[total_len], dtype=torch.int32, device=device)
 
     inputs = prepare_safe_gate_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens)
     q, k, v, g, beta = inputs['q'], inputs['k'], inputs['v'], inputs['g'], inputs['beta']
