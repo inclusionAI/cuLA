@@ -5,6 +5,8 @@
 #include "cutlass/kernel_hardware_info.h"
 #include "cute/tensor.hpp"
 
+// TODO: implement DynamicPersistentTileScheduler with atomic added tile_counter
+
 // ===================================================================
 // StaticPersistentTileScheduler
 // No smem synchronization needed — every CTA processes tiles starting
@@ -15,10 +17,9 @@ struct StaticPersistentTileScheduler {
     struct Params {
       int num_blocks;   // number of sequence chunks (from chunk_indices)
       int num_heads;
-      int num_k;        // unused, kept for compatibility
 
       int num_sm;
-      int *tile_counter; // unused, kept for compatibility (can be nullptr)
+      int *tile_counter; // unused
     };
 
     int current_tile_id;

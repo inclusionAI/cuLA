@@ -7,7 +7,7 @@
 
 #include "common_utils.hpp"
 
-namespace sm100 {
+namespace flashla {
 
 using namespace cute;
 

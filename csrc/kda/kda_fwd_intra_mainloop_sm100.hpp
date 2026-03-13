@@ -16,7 +16,7 @@
 #include <cute/tensor.hpp>
 #include <cute/arch/tmem_allocator_sm100.hpp>
 
-namespace sm100 {
+namespace flashla {
 
 using cutlass::arch::fence_view_async_shared;
 using namespace cute;
@@ -137,7 +137,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
     // ===================== Matrix Inverse =====================
     using InverseType       = cutlass::half_t;
-    using CollectiveInverse = sm100::CollectiveInverse<InverseType, true, false>;
+    using CollectiveInverse = flashla::CollectiveInverse<InverseType, true, false>;
 
     // ===================== GMEM Store ===========
     // Akk: R2G store bf16
@@ -848,4 +848,4 @@ struct KdaChunkFwdIntraMainloopSm100 {
     }
 };
 
-} // namespace sm100
+} // namespace flashla

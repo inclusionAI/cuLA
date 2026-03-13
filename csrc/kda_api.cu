@@ -41,5 +41,5 @@ void ChunkKDAFwdIntra(
     params.num_sm = device_prop->multiProcessorCount;
     params.tile_scheduler_params = StaticPersistentTileScheduler::Params{tile_num, params.h, 4, params.num_sm, (int*)tile_counter.data_ptr()};
 
-    sm100::run_kda_fwd_intra_sm100(params, at::cuda::getCurrentCUDAStream());
+    flashla::run_kda_fwd_intra_sm100(params, at::cuda::getCurrentCUDAStream());
 }

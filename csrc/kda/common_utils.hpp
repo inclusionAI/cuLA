@@ -16,7 +16,7 @@
 
 #define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())
 
-namespace sm100 {
+namespace flashla {
 
 using namespace cute;
 
@@ -241,4 +241,4 @@ CUTLASS_DEVICE void copy_pred(TiledCopy<CopyAtom, TV, Tiler> const &tiled_copy, 
     }
 }
 
-} // namespace sm100
+} // namespace flashla

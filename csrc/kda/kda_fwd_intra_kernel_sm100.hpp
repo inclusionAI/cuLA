@@ -15,7 +15,7 @@
 
 #include "kda_fwd_intra_mainloop_sm100.hpp"
 
-namespace sm100 {
+namespace flashla {
 
 using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
@@ -383,4 +383,4 @@ inline void run_kda_fwd_intra_sm100_impl(KDA_fwd_intra_params &params, cudaStrea
     kernel_fn<<<grid_dim, block_dim, smem_size, stream>>>(params, tma_params);
 }
 
-} // namespace sm100
+} // namespace flashla

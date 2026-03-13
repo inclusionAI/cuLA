@@ -3,7 +3,7 @@
 #include <cute/tensor.hpp>
 #include <cutlass/detail/layout.hpp>
 
-namespace sm100 {
+namespace flashla {
 
 using namespace cute;
 
