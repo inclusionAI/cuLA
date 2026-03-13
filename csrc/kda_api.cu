@@ -34,12 +34,10 @@ void ChunkKDAFwdIntra(
     params.Akk_out_ptr = Akk_out.data_ptr();
     params.shape_Akk = cute::make_shape(params.total_q_len, params.chunk_size, params.h);
     params.stride_Akk = cute::make_stride(params.chunk_size * params.h, cute::_1{}, params.chunk_size);
-    // printf("ChunkKDAFwdIntra, total_q_len: %d, b: %d, h: %d, d: %d, chunk_size: %d\n", params.total_q_len, params.b, params.h, params.d, chunk_size);
     int tile_num = chunk_indices.size(0);
-    // printf("tile_num: %d, b: %d, h: %d\n", tile_num, params.b, params.h);
     auto device_prop = at::cuda::getCurrentDeviceProperties();
     params.num_sm = device_prop->multiProcessorCount;
-    params.tile_scheduler_params = StaticPersistentTileScheduler::Params{tile_num, params.h, 4, params.num_sm, (int*)tile_counter.data_ptr()};
+    params.tile_scheduler_params = StaticPersistentTileScheduler::Params{tile_num, params.h, params.num_sm, (int*)tile_counter.data_ptr()};
 
     flashla::run_kda_fwd_intra_sm100(params, at::cuda::getCurrentCUDAStream());
 }
