@@ -3,8 +3,8 @@ import pathlib
 
 def calculate_speedups():
     # Paths
-    uniform_path = "/ossfs/workspace/kevinzeng/flashla/bench_safe_gate/Performance_B2_H64.csv"
-    varlen_path = "/ossfs/workspace/kevinzeng/flashla/bench_varlen_safe_gate/Performance_varlen_NSEQ8_H64_VAR1.0.csv"
+    uniform_path = "./bench_safe_gate/Performance_B2_H64.csv"
+    varlen_path = "./bench_varlen_safe_gate/Performance_varlen_NSEQ8_H64_VAR1.0.csv"
     
     # Process uniform
     df_uniform = pd.read_csv(uniform_path)
