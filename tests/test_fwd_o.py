@@ -34,10 +34,10 @@ build_chunk_offsets = _mod.build_chunk_offsets
 
 
 def triton_chunk_gla_fwd_o(q, v, g, h, A, scale, chunk_size=64):
-    """Call the Triton reference kernel."""
+    """Call the Triton reference kernel. FLA expects h as [B*NT, H, K, V]."""
     from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
     return chunk_gla_fwd_o_gk(
-        q=q, v=v, g=g, A=A, h=h,
+        q=q, v=v, g=g, A=A, h=h.flatten(0, 1),
         scale=scale, chunk_size=chunk_size,
         use_exp2=True,
     )
@@ -79,7 +79,7 @@ def test_reference_vs_triton(B, T, H, K, V):
     q = torch.randn(B, T, H, K, dtype=dtype, device=device)
     v = torch.randn(B, T, H, V, dtype=dtype, device=device)
     g = torch.randn(B, T, H, K, dtype=dtype, device=device) * 0.1
-    h = torch.randn(B * NT, H, K, V, dtype=dtype, device=device) * 0.01
+    h = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
     A = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
 
     o_ref = reference_chunk_gla_fwd_o(q, v, g, h, A, scale, BT)
@@ -109,7 +109,7 @@ def test_cute_dsl_vs_reference(B, T, H, K, V):
     q = torch.randn(B, T, H, K, dtype=dtype, device=device)
     v = torch.randn(B, T, H, V, dtype=dtype, device=device)
     g = torch.randn(B, T, H, K, dtype=torch.float32, device=device) * 0.1
-    h = torch.randn(B * NT, H, K, V, dtype=dtype, device=device) * 0.01
+    h = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
     A = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
 
     o_ref = reference_chunk_gla_fwd_o(q, v, g, h, A, scale, BT)
@@ -144,15 +144,15 @@ def test_cute_dsl_varlen_vs_reference(seq_lens):
 
     chunk_indices = build_chunk_indices(seq_lens_t, BT=BT, device=device)
 
-    q = torch.randn(T_total, H, K, dtype=dtype, device=device)
-    v = torch.randn(T_total, H, V, dtype=dtype, device=device)
-    g = torch.randn(T_total, H, K, dtype=torch.float32, device=device) * 0.1
+    q = torch.randn(1, T_total, H, K, dtype=dtype, device=device)
+    v = torch.randn(1, T_total, H, V, dtype=dtype, device=device)
+    g = torch.randn(1, T_total, H, K, dtype=torch.float32, device=device) * 0.1
 
     total_nt = sum((s + BT - 1) // BT for s in seq_lens)
-    h = torch.randn(total_nt, H, K, V, dtype=dtype, device=device) * 0.01
-    A = torch.randn(T_total, H, BT, dtype=dtype, device=device) * 0.1
+    h = torch.randn(1, total_nt, H, K, V, dtype=dtype, device=device) * 0.01
+    A = torch.randn(1, T_total, H, BT, dtype=dtype, device=device) * 0.1
 
-    o_cute = torch.zeros(T_total, H, V, dtype=dtype, device=device)
+    o_cute = torch.zeros(1, T_total, H, V, dtype=dtype, device=device)
     chunk_gla_fwd_o(q, v, g, h, o_cute, A, scale, chunk_size=BT,
                     cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
                     is_varlen=True, persistent=True)
@@ -164,13 +164,13 @@ def test_cute_dsl_varlen_vs_reference(seq_lens):
         start = cu_seqlens[i].item()
         end = cu_seqlens[i + 1].item()
         nt_i = (slen + BT - 1) // BT
-        qi = q[start:end].unsqueeze(0)
-        vi = v[start:end].unsqueeze(0)
-        gi = g[start:end].unsqueeze(0)
-        hi = h[nt_offset:nt_offset + nt_i]
-        Ai = A[start:end].unsqueeze(0)
+        qi = q[:, start:end]
+        vi = v[:, start:end]
+        gi = g[:, start:end]
+        hi = h[:, nt_offset:nt_offset + nt_i]
+        Ai = A[:, start:end]
         oi_ref = reference_chunk_gla_fwd_o(qi, vi, gi, hi, Ai, scale, BT)
-        oi_cute = o_cute[start:end].unsqueeze(0)
+        oi_cute = o_cute[:, start:end]
         assert assert_close(f"varlen_seq{i} slen={slen}", oi_ref, oi_cute, atol=0.02)
         nt_offset += nt_i
 
@@ -203,7 +203,7 @@ def run_correctness_tests():
         q = torch.randn(B, T, H, K, dtype=dtype, device=device)
         v = torch.randn(B, T, H, V, dtype=dtype, device=device)
         g = torch.randn(B, T, H, K, dtype=torch.float32, device=device) * 0.1
-        h = torch.randn(B * NT, H, K, V, dtype=dtype, device=device) * 0.01
+        h = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
         A = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
 
         # PyTorch reference
@@ -249,7 +249,7 @@ def run_benchmark(B=4, T=4096, H=4, K=128, V=128, num_iters=100):
     q = torch.randn(B, T, H, K, dtype=dtype, device=device)
     v = torch.randn(B, T, H, V, dtype=dtype, device=device)
     g = torch.randn(B, T, H, K, dtype=torch.float32, device=device) * 0.1
-    h = torch.randn(B * NT, H, K, V, dtype=dtype, device=device) * 0.01
+    h = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
     A = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
     o = torch.zeros(B, T, H, V, dtype=dtype, device=device)
 

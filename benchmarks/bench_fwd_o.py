@@ -103,12 +103,12 @@ def bench_non_varlen(configs):
         q = torch.randn(B, T, H, K, dtype=dtype, device=device)
         v = torch.randn(B, T, H, V, dtype=dtype, device=device)
         g = torch.randn(B, T, H, K, dtype=torch.float32, device=device) * 0.1
-        h = torch.randn(B * NT, H, K, V, dtype=dtype, device=device) * 0.01
+        h = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
         A = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
 
         # ---- FLA baseline (accuracy) ----
         o_fla = chunk_gla_fwd_o_gk(
-            q=q, v=v, g=g, A=A, h=h,
+            q=q, v=v, g=g, A=A, h=h.flatten(0, 1),
             scale=scale, chunk_size=BT, use_exp2=True,
         )
 
@@ -128,7 +128,7 @@ def bench_non_varlen(configs):
         # ---- Performance timing ----
         def run_fla(q=q, v=v, g=g, A=A, h=h, scale=scale):
             chunk_gla_fwd_o_gk(
-                q=q, v=v, g=g, A=A, h=h,
+                q=q, v=v, g=g, A=A, h=h.flatten(0, 1),
                 scale=scale, chunk_size=BT, use_exp2=True,
             )
 
@@ -196,27 +196,24 @@ def bench_varlen(configs):
         torch.cuda.empty_cache()
 
         # Flat token-indexed tensors (shared data for both kernels)
-        q_flat = torch.randn(T_total, H, K, dtype=dtype, device=device)
-        v_flat = torch.randn(T_total, H, V, dtype=dtype, device=device)
-        g_flat = torch.randn(T_total, H, K, dtype=torch.float32, device=device) * 0.1
-        h_flat = torch.randn(total_nt_val, H, K, V, dtype=dtype, device=device) * 0.01
-        A_flat = torch.randn(T_total, H, BT, dtype=dtype, device=device) * 0.1
+        # 4D with B=1: [1, T_total, H, *]
+        q_flat = torch.randn(1, T_total, H, K, dtype=dtype, device=device)
+        v_flat = torch.randn(1, T_total, H, V, dtype=dtype, device=device)
+        g_flat = torch.randn(1, T_total, H, K, dtype=torch.float32, device=device) * 0.1
+        h_flat = torch.randn(1, total_nt_val, H, K, V, dtype=dtype, device=device) * 0.01
+        A_flat = torch.randn(1, T_total, H, BT, dtype=dtype, device=device) * 0.1
 
         # ---- FLA baseline (needs [1, T_total, H, *] + cu_seqlens int64) ----
-        q_fla = q_flat.unsqueeze(0)          # [1, T_total, H, K]
-        v_fla = v_flat.unsqueeze(0)          # [1, T_total, H, V]
-        g_fla = g_flat.unsqueeze(0)          # [1, T_total, H, K]
-        A_fla = A_flat.unsqueeze(0)          # [1, T_total, H, BT]
         cu_fla = torch.tensor(cu_seqlens_list, dtype=torch.long, device=device)
 
         o_fla = chunk_gla_fwd_o_gk(
-            q=q_fla, v=v_fla, g=g_fla, A=A_fla, h=h_flat,
+            q=q_flat, v=v_flat, g=g_flat, A=A_flat, h=h_flat.flatten(0, 1),
             scale=scale, cu_seqlens=cu_fla,
             chunk_size=BT, use_exp2=True,
         )
 
         # ---- CuTe DSL varlen ----
-        o_cute_flat = torch.zeros(T_total, H, V, dtype=dtype, device=device)
+        o_cute_flat = torch.zeros(1, T_total, H, V, dtype=dtype, device=device)
         cu_cute = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
         ci_cute = build_chunk_indices(seq_lens, BT=BT, device=device)
 
@@ -229,14 +226,14 @@ def bench_varlen(configs):
         )
         torch.cuda.synchronize()
 
-        # FLA output [1, T_total, H, V] → squeeze to [T_total, H, V]
-        max_diff, rel_max_diff, mean_diff = accuracy_stats(o_fla.squeeze(0), o_cute_flat)
+        # Both outputs are [1, T_total, H, V]; squeeze to [T_total, H, V] for comparison
+        max_diff, rel_max_diff, mean_diff = accuracy_stats(o_fla.squeeze(0), o_cute_flat.squeeze(0))
 
         # ---- Performance timing ----
-        def run_fla(q_fla=q_fla, v_fla=v_fla, g_fla=g_fla, A_fla=A_fla,
+        def run_fla(q_flat=q_flat, v_flat=v_flat, g_flat=g_flat, A_flat=A_flat,
                     h_flat=h_flat, cu_fla=cu_fla, scale=scale):
             chunk_gla_fwd_o_gk(
-                q=q_fla, v=v_fla, g=g_fla, A=A_fla, h=h_flat,
+                q=q_flat, v=v_flat, g=g_flat, A=A_flat, h=h_flat.flatten(0, 1),
                 scale=scale, cu_seqlens=cu_fla,
                 chunk_size=BT, use_exp2=True,
             )

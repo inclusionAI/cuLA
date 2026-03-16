@@ -27,6 +27,7 @@ pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu129
 cd third_party/flash-linear-attention
 pip install -e .
 # install flashla
+cd ../..
 pip install -e . --no-build-isolation
 ```
 

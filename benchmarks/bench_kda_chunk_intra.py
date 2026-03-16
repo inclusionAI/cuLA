@@ -12,7 +12,7 @@ from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.constant import RCP_LN2
 from benchmarks.utils import set_seed, exclusive_cumsum, generate_random_seq_lens, SEED
 
-from flashla.kda.chunk_intra import chunk_kda_fwd_intra as flat_chunk_kda_fwd_intra
+from flashla.kda.chunk_intra import chunk_kda_fwd_intra as flashla_chunk_kda_fwd_intra
 
 # Constant params
 B, H, D = 2, 64, 128
@@ -101,7 +101,7 @@ def benchmark_chunk_intra_uniform(T, provider):
 
     if provider == 'flat_ops':
         results = triton.testing.do_bench(
-            lambda: flat_chunk_kda_fwd_intra(
+            lambda: flashla_chunk_kda_fwd_intra(
                 q=q, k=k, v=v, gk=g, beta=beta,
                 scale=scale, cu_seqlens=cu_seqlens,
                 chunk_size=chunk_size, chunk_indices=chunk_indices,
@@ -164,7 +164,7 @@ def benchmark_chunk_intra_varlen(total_len, provider):
 
     if provider == 'flat_ops':
         results = triton.testing.do_bench(
-            lambda: flat_chunk_kda_fwd_intra(
+            lambda: flashla_chunk_kda_fwd_intra(
                 q=q, k=k, v=v, gk=g, beta=beta,
                 scale=scale, cu_seqlens=cu_seqlens,
                 chunk_size=chunk_size, chunk_indices=chunk_indices,

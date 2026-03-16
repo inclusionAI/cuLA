@@ -12,7 +12,7 @@ Inputs:
   q:  [B, T, H, K]           bf16  — query
   v:  [B, T, H, V]           bf16  — value (v_new from delta-rule)
   g:  [B, T, H, K]           fp32  — cumulative gate (log2 domain)
-  h:  [NT_total, H, K, V]    bf16  — inter-chunk recurrent state
+  h:  [B, NT, H, K, V]       bf16  — inter-chunk recurrent state
   A:  [B, T, H, BT]          bf16  — intra-chunk attention matrix (Aqk)
 
 Output:
@@ -251,14 +251,14 @@ class ChunkGlaFwdO:
     @cute.jit
     def __call__(
         self,
-        q_in: cute.Tensor,             # [B, T, H, K] or [T_total, H, K]
-        v_in: cute.Tensor,             # [B, T, H, V] or [T_total, H, V]
-        g_in: cute.Tensor,             # [B, T, H, K] or [T_total, H, K] (fp32)
-        h_in: cute.Tensor,             # [NT_total, H, K, V]
-        o_in: cute.Tensor,             # [B, T, H, V] or [T_total, H, V]
-        A_in: cute.Tensor,             # [B, T, H, BT] or [T_total, H, BT]
+        q_in: cute.Tensor,             # [B, T, H, K] (B=1 for varlen)
+        v_in: cute.Tensor,             # [B, T, H, V] (B=1 for varlen)
+        g_in: cute.Tensor,             # [B, T, H, K] fp32 (B=1 for varlen)
+        h_in: cute.Tensor,             # [B, NT, H, K, V] (B=1 for varlen)
+        o_in: cute.Tensor,             # [B, T, H, V] (B=1 for varlen)
+        A_in: cute.Tensor,             # [B, T, H, BT] (B=1 for varlen)
         cu_seqlens_in: cute.Tensor,    # [N+1] int32
-        chunk_indices_in: cute.Tensor, # [NT*2] int32
+        chunk_indices_in: cute.Tensor, # [NT, 2] int32
         problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],
         total_nt: Int32,               # total chunks across all seqs (varlen)
         stream,
@@ -320,9 +320,9 @@ class ChunkGlaFwdO:
         )
         v_T = cute.make_tensor(v_ptr, v_T_layout)
 
-        # h: stored as [NT_total, H, K, V] — V contiguous
-        # Transposed view for MMA B TMA: (V, K, (H, NT_total)) — V contiguous
-        # non-varlen: NT_total = B * NT;  varlen: NT_total = total_nt (already flat)
+        # h: stored as [B, NT, H, K, V] — V contiguous
+        # Transposed view for MMA B TMA: (V, K, (h_nt_total, H)) — V contiguous
+        # non-varlen: h_nt_total = B * NT;  varlen: h_nt_total = total_nt (B=1)
         if cutlass.const_expr(self.is_varlen):
             h_nt_total = NT  # = total_nt
         else:
@@ -523,7 +523,7 @@ class ChunkGlaFwdO:
 
         # ===================== cu_seqlens / chunk_indices tensors =====================
         cu_seqlens = cute.make_tensor(cu_seqlens_ptr, cute.make_layout((B + 1,)))
-        chunk_indices = cute.make_tensor(chunk_indices_ptr, cute.make_layout((total_nt * 2,)))
+        chunk_indices = cute.make_tensor(chunk_indices_ptr, cute.make_layout((total_nt, 2), stride=(2, 1)))
 
         # ===================== Direct GMEM write for varlen O store =====================
         # For varlen tail chunks, TMA store would write beyond sequence boundary.
@@ -801,8 +801,8 @@ class ChunkGlaFwdO:
                     chunk_flat = temp_work % total_nt
                     i_h = temp_work // total_nt
                     if cutlass.const_expr(self.is_varlen):
-                        i_b = chunk_indices[chunk_flat * 2]
-                        i_t = chunk_indices[chunk_flat * 2 + 1]
+                        i_b = chunk_indices[(chunk_flat, 0)]
+                        i_t = chunk_indices[(chunk_flat, 1)]
                         tok_offset = cu_seqlens[i_b]
                         data_bidx = Int32(0)
                     else:
@@ -890,8 +890,8 @@ class ChunkGlaFwdO:
                     temp_work = work_idx // num_v_tiles
                     chunk_global_idx = temp_work % total_nt
                     i_h = temp_work // total_nt
-                    i_b = chunk_indices[chunk_global_idx * 2]
-                    i_t = chunk_indices[chunk_global_idx * 2 + 1]
+                    i_b = chunk_indices[(chunk_global_idx, 0)]
+                    i_t = chunk_indices[(chunk_global_idx, 1)]
                     tok_offset = cu_seqlens[i_b]
                     seq_len = cu_seqlens[i_b + 1] - tok_offset
                     remaining = seq_len - i_t * BT
@@ -1108,8 +1108,8 @@ class ChunkGlaFwdO:
                     temp_work = work_idx // num_v_tiles
                     chunk_global_idx = temp_work % total_nt
                     i_h = temp_work // total_nt
-                    i_b = chunk_indices[chunk_global_idx * 2]
-                    i_t = chunk_indices[chunk_global_idx * 2 + 1]
+                    i_b = chunk_indices[(chunk_global_idx, 0)]
+                    i_t = chunk_indices[(chunk_global_idx, 1)]
                     tok_offset = cu_seqlens[i_b]
                     seq_len = cu_seqlens[i_b + 1] - tok_offset
                     remaining = seq_len - i_t * BT
@@ -1358,9 +1358,9 @@ def build_chunk_indices(seq_lens, BT=64, device='cuda'):
     """
     Build chunk_indices tensor in the same format as FLA's prepare_chunk_indices.
 
-    Returns a flat int32 tensor of shape [NT*2], where each pair is
+    Returns an int32 tensor of shape [NT, 2], where each row is
     (batch_idx, chunk_seq_idx).  This matches the kda_bwd decode_tile_coord
-    scheme: chunk_indices[i*2] = batch_idx, chunk_indices[i*2+1] = chunk_in_seq.
+    scheme: chunk_indices[i, 0] = batch_idx, chunk_indices[i, 1] = chunk_in_seq.
 
     Args:
         seq_lens: list of sequence lengths
@@ -1368,15 +1368,15 @@ def build_chunk_indices(seq_lens, BT=64, device='cuda'):
         device: torch device
 
     Returns:
-        chunk_indices: [NT*2] int32 tensor
+        chunk_indices: [NT, 2] int32 tensor
     """
     import torch
     pairs = []
     for seq_idx, sl in enumerate(seq_lens):
         nt = (sl + BT - 1) // BT
         for c in range(nt):
-            pairs.extend([seq_idx, c])
-    return torch.tensor(pairs, dtype=torch.int32, device=device)
+            pairs.append([seq_idx, c])
+    return torch.tensor(pairs, dtype=torch.int32, device=device).reshape(-1, 2)
 
 
 def build_chunk_offsets(seq_lens, BT=64):
@@ -1399,7 +1399,7 @@ def reference_chunk_gla_fwd_o(q, v, g, h, A, scale, chunk_size=64):
         q: [B, T, H, K]
         v: [B, T, H, V] (v_new)
         g: [B, T, H, K] cumulative gate (log2 domain)
-        h: [NT_total, H, K, V] recurrent state
+        h: [B, NT, H, K, V] recurrent state
         A: [B, T, H, BT] intra-chunk attention matrix (Aqk)
         scale: float
         chunk_size: int
@@ -1425,8 +1425,7 @@ def reference_chunk_gla_fwd_o(q, v, g, h, A, scale, chunk_size=64):
                 g_chunk = g[b, t_start:t_end, i_h, :].float()
                 qg = (q_chunk.float() * (2.0 ** g_chunk)).to(q.dtype)
 
-                i_tg = b * NT + i_t
-                h_state = h[i_tg, i_h, :, :]
+                h_state = h[b, i_t, i_h, :, :]
 
                 o_inter = scale * (qg.float() @ h_state.float())
 
@@ -1471,8 +1470,8 @@ def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size):
         persistent=persistent,
     )
 
-    sym_a = cute.sym_int()   # B (non-varlen) or T_total (varlen)
-    sym_b = cute.sym_int()   # T (non-varlen) or unused
+    sym_a = cute.sym_int()   # B (non-varlen: dynamic B; varlen: fixed 1)
+    sym_b = cute.sym_int()   # T (non-varlen) or T_total (varlen)
     sym_nt = cute.sym_int()  # NT_total
     sym_cu = cute.sym_int()  # cu_seqlens size
     sym_ci = cute.sym_int()  # chunk_indices size
@@ -1480,26 +1479,27 @@ def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size):
     BT = chunk_size
 
     if is_varlen:
-        # varlen: tensors are [T_total, H, ...] (3D)
+        # varlen: tensors are [1, T_total, H, ...] (4D with B=1)
+        # This avoids squeeze(0) CPU overhead at the call site.
         q_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (sym_a, H, K),
-            stride_order=(2, 1, 0), assumed_align=128,
+            cutlass.BFloat16, (1, sym_b, H, K),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
         )
         v_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (sym_a, H, V),
-            stride_order=(2, 1, 0), assumed_align=128,
+            cutlass.BFloat16, (1, sym_b, H, V),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
         )
         g_fake = make_fake_compact_tensor(
-            cutlass.Float32, (sym_a, H, K),
-            stride_order=(2, 1, 0), assumed_align=128,
+            cutlass.Float32, (1, sym_b, H, K),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
         )
         o_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (sym_a, H, V),
-            stride_order=(2, 1, 0), assumed_align=128,
+            cutlass.BFloat16, (1, sym_b, H, V),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
         )
         A_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (sym_a, H, BT),
-            stride_order=(2, 1, 0), assumed_align=128,
+            cutlass.BFloat16, (1, sym_b, H, BT),
+            stride_order=(3, 2, 1, 0), assumed_align=128,
         )
     else:
         # non-varlen: tensors are [B, T, H, ...] (4D)
@@ -1524,15 +1524,25 @@ def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size):
             stride_order=(3, 2, 1, 0), assumed_align=128,
         )
 
-    h_fake = make_fake_compact_tensor(
-        cutlass.BFloat16, (sym_nt, H, K, V),
-        stride_order=(3, 2, 1, 0), assumed_align=128,
+    if is_varlen:
+        # varlen: h is [1, NT_total, H, K, V] (5D with B=1)
+        h_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (1, sym_nt, H, K, V),
+            stride_order=(4, 3, 2, 1, 0), assumed_align=128,
+        )
+    else:
+        # non-varlen: h is [B, NT, H, K, V] (5D)
+        h_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_nt, H, K, V),
+            stride_order=(4, 3, 2, 1, 0), assumed_align=128,
+        )
+    # chunk_indices is [NT, 2]
+    ci_fake = make_fake_compact_tensor(
+        cutlass.Int32, (sym_ci, 2),
+        stride_order=(1, 0), assumed_align=128,
     )
     cu_fake = make_fake_compact_tensor(
         cutlass.Int32, (sym_cu,), assumed_align=128,
-    )
-    ci_fake = make_fake_compact_tensor(
-        cutlass.Int32, (sym_ci,), assumed_align=128,
     )
     stream_fake = make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -1594,33 +1604,35 @@ def chunk_gla_fwd_o(
     Cache key: (is_varlen, persistent, H, K, V, scale, chunk_size)
 
     Args:
-        q: query tensor — [B, T, H, K] bf16 (non-varlen) or [T_total, H, K] (varlen)
-        v: value tensor — [B, T, H, V] bf16 (non-varlen) or [T_total, H, V] (varlen)
-        g: gate tensor — [B, T, H, K] fp32 (non-varlen) or [T_total, H, K] (varlen)
-        h: state tensor — [NT_total, H, K, V] bf16
+        q: query tensor — [B, T, H, K] bf16 (both non-varlen and varlen with B=1)
+        v: value tensor — [B, T, H, V] bf16 (both non-varlen and varlen with B=1)
+        g: gate tensor — [B, T, H, K] fp32 (both non-varlen and varlen with B=1)
+        h: state tensor — [B, NT, H, K, V] bf16 (B=1 for varlen)
         o: output tensor (pre-allocated) — same shape as q but with V dim
-        A: attention matrix — [B, T, H, BT] bf16 or [T_total, H, BT]
+        A: attention matrix — [B, T, H, BT] bf16 (both non-varlen and varlen with B=1)
         scale: attention scale factor
         chunk_size: chunk size (default: 64)
         cu_seqlens: cumulative sequence lengths [N+1] int32 (varlen only)
-        chunk_indices: chunk index pairs [NT*2] int32 (varlen only)
+        chunk_indices: chunk index pairs [NT, 2] int32
         is_varlen: whether to use varlen mode
         persistent: whether to use persistent kernel (default: True)
     """
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-    if chunk_indices is not None:
-        chunk_indices = torch.flatten(chunk_indices) # ensure 1D
 
     if is_varlen:
         assert cu_seqlens is not None and chunk_indices is not None, \
             "cu_seqlens and chunk_indices are required for varlen mode"
-        T_total = q.shape[0]
-        H = q.shape[1]
-        K = q.shape[2]
-        V = v.shape[2]
+        assert q.dim() == 4 and q.shape[0] == 1, \
+            f"varlen mode expects [1, T_total, H, K] input, got shape {q.shape}"
+        assert h.dim() == 5 and h.shape[0] == 1, \
+            f"varlen mode expects [1, NT_total, H, K, V] for h, got shape {h.shape}"
+        T_total = q.shape[1]
+        H = q.shape[2]
+        K = q.shape[3]
+        V = v.shape[3]
         num_seqs = cu_seqlens.shape[0] - 1
-        total_nt_val = chunk_indices.shape[0] // 2
+        total_nt_val = chunk_indices.shape[0]
         ps = (Int32(num_seqs), Int32(T_total), Int32(H), Int32(K), Int32(V))
     else:
         B, T, H, K = q.shape
@@ -1636,7 +1648,7 @@ def chunk_gla_fwd_o(
         if chunk_indices is None:
             global _fwd_o_dummy_chunk_indices
             if _fwd_o_dummy_chunk_indices is None or _fwd_o_dummy_chunk_indices.device != q.device:
-                _fwd_o_dummy_chunk_indices = torch.zeros(2, dtype=torch.int32, device=q.device)
+                _fwd_o_dummy_chunk_indices = torch.zeros((1, 2), dtype=torch.int32, device=q.device)
             chunk_indices = _fwd_o_dummy_chunk_indices
 
     compiled_fn = _get_compiled_fwd_o(
@@ -1689,7 +1701,7 @@ def main():
         q_nv = torch.randn(B, T, H, K, dtype=dtype, device=device)
         v_nv = torch.randn(B, T, H, V, dtype=dtype, device=device)
         g_nv = torch.randn(B, T, H, K, dtype=torch.float32, device=device) * 0.1
-        h_nv = torch.randn(B * NT, H, K, V, dtype=dtype, device=device) * 0.01
+        h_nv = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
         A_nv = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
 
         o_ref_nv = reference_chunk_gla_fwd_o(q_nv, v_nv, g_nv, h_nv, A_nv, scale, BT)
@@ -1734,12 +1746,12 @@ def main():
                 cu_seqlens_t = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
                 ci_t = build_chunk_indices(seq_lens, BT=BT, device=device)
 
-                q_flat = torch.randn(T_total, H, K, dtype=dtype, device=device)
-                v_flat = torch.randn(T_total, H, V, dtype=dtype, device=device)
-                g_flat = torch.randn(T_total, H, K, dtype=torch.float32, device=device) * 0.1
-                h_flat = torch.randn(total_nt_val, H, K, V, dtype=dtype, device=device) * 0.01
-                A_flat = torch.randn(T_total, H, BT, dtype=dtype, device=device) * 0.1
-                o_flat = torch.zeros(T_total, H, V, dtype=dtype, device=device)
+                q_flat = torch.randn(1, T_total, H, K, dtype=dtype, device=device)
+                v_flat = torch.randn(1, T_total, H, V, dtype=dtype, device=device)
+                g_flat = torch.randn(1, T_total, H, K, dtype=torch.float32, device=device) * 0.1
+                h_flat = torch.randn(1, total_nt_val, H, K, V, dtype=dtype, device=device) * 0.01
+                A_flat = torch.randn(1, T_total, H, BT, dtype=dtype, device=device) * 0.1
+                o_flat = torch.zeros(1, T_total, H, V, dtype=dtype, device=device)
 
                 # Reference per-sequence
                 o_ref_flat = torch.zeros_like(o_flat)
@@ -1749,10 +1761,10 @@ def main():
                     co = chunk_offsets_list[seq_idx]
                     nt_seq = (sl + BT - 1) // BT
                     o_seq = reference_chunk_gla_fwd_o(
-                        q_flat[s:e].unsqueeze(0), v_flat[s:e].unsqueeze(0),
-                        g_flat[s:e].unsqueeze(0), h_flat[co:co+nt_seq],
-                        A_flat[s:e].unsqueeze(0), scale, BT)
-                    o_ref_flat[s:e] = o_seq[0]
+                        q_flat[:, s:e], v_flat[:, s:e],
+                        g_flat[:, s:e], h_flat[:, co:co+nt_seq],
+                        A_flat[:, s:e], scale, BT)
+                    o_ref_flat[:, s:e] = o_seq
 
                 chunk_gla_fwd_o(
                     q=q_flat, v=v_flat, g=g_flat, h=h_flat, o=o_flat, A=A_flat,
@@ -1783,7 +1795,7 @@ def main():
             q_cr = torch.randn(B, T, H, K, dtype=dtype, device=device)
             v_cr = torch.randn(B, T, H, V, dtype=dtype, device=device)
             g_cr = torch.randn(B, T, H, K, dtype=torch.float32, device=device) * 0.1
-            h_cr = torch.randn(B * NT, H, K, V, dtype=dtype, device=device) * 0.01
+            h_cr = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
             A_cr = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
             o_cr = torch.zeros(B, T, H, V, dtype=dtype, device=device)
             o_ref_cr = reference_chunk_gla_fwd_o(q_cr, v_cr, g_cr, h_cr, A_cr, scale, BT)
@@ -1808,7 +1820,7 @@ def main():
             q_b = torch.randn(B, bench_T, H, K, dtype=dtype, device=device)
             v_b = torch.randn(B, bench_T, H, V, dtype=dtype, device=device)
             g_b = torch.randn(B, bench_T, H, K, dtype=torch.float32, device=device) * 0.1
-            h_b = torch.randn(B * bench_NT, H, K, V, dtype=dtype, device=device) * 0.01
+            h_b = torch.randn(B, bench_NT, H, K, V, dtype=dtype, device=device) * 0.01
             A_b = torch.randn(B, bench_T, H, BT, dtype=dtype, device=device) * 0.1
             o_b = torch.zeros(B, bench_T, H, V, dtype=dtype, device=device)
 
@@ -1839,12 +1851,12 @@ def main():
                 sys.path.insert(0, "/ossfs/workspace/flash-linear-attention")
                 from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
                 for _ in range(10):
-                    chunk_gla_fwd_o_gk(q=q_b, v=v_b, g=g_b, A=A_b, h=h_b,
+                    chunk_gla_fwd_o_gk(q=q_b, v=v_b, g=g_b, A=A_b, h=h_b.flatten(0, 1),
                                        scale=scale, chunk_size=BT, use_exp2=True)
                 torch.cuda.synchronize()
                 start.record()
                 for _ in range(N_iters):
-                    chunk_gla_fwd_o_gk(q=q_b, v=v_b, g=g_b, A=A_b, h=h_b,
+                    chunk_gla_fwd_o_gk(q=q_b, v=v_b, g=g_b, A=A_b, h=h_b.flatten(0, 1),
                                        scale=scale, chunk_size=BT, use_exp2=True)
                 end.record()
                 torch.cuda.synchronize()

@@ -14,7 +14,7 @@ from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_int
 from fla.ops.kda import chunk_kda as fla_chunk_kda
 
 from flashla.kda.chunk import chunk_kda as flashla_chunk_kda
-from flashla.kda.chunk_intra import chunk_kda_fwd_intra as flat_chunk_kda_fwd_intra
+from flashla.kda.chunk_intra import chunk_kda_fwd_intra as flashla_chunk_kda_fwd_intra
 from flashla.kda_wrapper import flash_kda_prefill as flashla_fully_fused_kda
 
 # Constant params
@@ -29,7 +29,7 @@ def test_kda_chunk_intra():
     q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens)
 
     set_seed(SEED)
-    w, u, qg, kg, Aqk, Akk = flat_chunk_kda_fwd_intra(
+    w, u, qg, kg, Aqk, Akk = flashla_chunk_kda_fwd_intra(
                 q=q, k=k, v=v, gk=g, beta=beta,
                 scale=scale, cu_seqlens=cu_seqlens,
                 chunk_size=BT, chunk_indices=chunk_indices,
@@ -97,7 +97,7 @@ def test_chunk_kda_varlen():
     q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens)
 
     set_seed(SEED)
-    w, u, qg, kg, Aqk, Akk = flat_chunk_kda_fwd_intra(
+    w, u, qg, kg, Aqk, Akk = flashla_chunk_kda_fwd_intra(
                 q=q, k=k, v=v, gk=g, beta=beta,
                 scale=scale, cu_seqlens=cu_seqlens,
                 chunk_size=BT, chunk_indices=chunk_indices,
@@ -118,7 +118,48 @@ def test_chunk_kda_varlen():
     assert_close("u: fla vs. flashla", u_fla, u, 0.005)
     assert_close("kg: fla vs. flashla", kg_fla, kg, 0.005)
 
+def profile_chunk_kda_varlen():
+    device = torch.device("cuda")
+    cu_seqlens = [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192]
+    T = cu_seqlens[-1]
+    cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
+    # NOTE: cu_seqlens must be int32 for FlashLA CUDA Impl
+    cu_seqlens = cu_seqlens.to(torch.int32)
+    inputs = prepare_safe_gate_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens)
+    q, k, v, g, beta = inputs['q'], inputs['k'], inputs['v'], inputs['g'], inputs['beta']
+    A_log, dt_bias = inputs['A_log'], inputs['dt_bias']
+    scale, init_state, lower_bound = inputs['scale'], inputs['init_state'], inputs['lower_bound']
+    
+    steps = 5
+
+    set_seed(SEED)
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(wait=0, warmup=2, active=steps),
+        with_stack=False,
+        record_shapes=False,
+        profile_memory=False,
+    ) as prof:
+        for step in range(steps):
+            with torch.profiler.record_function("chunk_kda_fwd"):
+                o, final_states = flashla_chunk_kda(
+                    q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                    A_log=A_log, dt_bias=dt_bias,
+                    initial_state=init_state, output_final_state=True,
+                    use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
+                    use_gate_in_kernel=True, safe_gate=True, lower_bound=lower_bound,
+                )
+            prof.step()
+    torch.cuda.synchronize()
+    
+    prof.export_chrome_trace(f"chunk_kda_varlen_profile_T{T}_H{H}.json")
+
+
 if __name__ == "__main__":
     # test_kda_chunk_intra()
     # test_chunk_kda()
-    test_chunk_kda_varlen()
+    # test_chunk_kda_varlen()
+    profile_chunk_kda_varlen()

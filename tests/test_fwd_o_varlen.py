@@ -60,31 +60,32 @@ def gen_varlen_data(seq_lens, H, seed=42, g_scale=0.1, h_scale=0.01,
 
     Returns dict with q, v, g, h, A, o, cu_seqlens, chunk_indices, scale,
     seq_lens, T_total, total_nt, H.
+    All token-indexed tensors are 4D: [1, T_total, H, *] (B=1 for varlen).
     """
     torch.manual_seed(seed)
     T_total = sum(seq_lens)
     total_nt = sum((s + BT - 1) // BT for s in seq_lens)
     scale = K ** -0.5
 
-    q = torch.randn(T_total, H, K, dtype=DTYPE, device=DEVICE)
-    v = torch.randn(T_total, H, V, dtype=DTYPE, device=DEVICE)
+    q = torch.randn(1, T_total, H, K, dtype=DTYPE, device=DEVICE)
+    v = torch.randn(1, T_total, H, V, dtype=DTYPE, device=DEVICE)
 
     if zero_g:
-        g = torch.zeros(T_total, H, K, dtype=torch.float32, device=DEVICE)
+        g = torch.zeros(1, T_total, H, K, dtype=torch.float32, device=DEVICE)
     else:
-        g = torch.randn(T_total, H, K, dtype=torch.float32, device=DEVICE) * g_scale
+        g = torch.randn(1, T_total, H, K, dtype=torch.float32, device=DEVICE) * g_scale
 
     if zero_h:
-        h = torch.zeros(total_nt, H, K, V, dtype=DTYPE, device=DEVICE)
+        h = torch.zeros(1, total_nt, H, K, V, dtype=DTYPE, device=DEVICE)
     else:
-        h = torch.randn(total_nt, H, K, V, dtype=DTYPE, device=DEVICE) * h_scale
+        h = torch.randn(1, total_nt, H, K, V, dtype=DTYPE, device=DEVICE) * h_scale
 
     if zero_A:
-        A = torch.zeros(T_total, H, BT, dtype=DTYPE, device=DEVICE)
+        A = torch.zeros(1, T_total, H, BT, dtype=DTYPE, device=DEVICE)
     else:
-        A = torch.randn(T_total, H, BT, dtype=DTYPE, device=DEVICE) * 0.1
+        A = torch.randn(1, T_total, H, BT, dtype=DTYPE, device=DEVICE) * 0.1
 
-    o = torch.zeros(T_total, H, V, dtype=DTYPE, device=DEVICE)
+    o = torch.zeros(1, T_total, H, V, dtype=DTYPE, device=DEVICE)
     cu_seqlens = make_cu_seqlens(seq_lens)
     chunk_indices = build_chunk_indices(seq_lens, BT=BT, device=DEVICE)
 
@@ -106,7 +107,7 @@ def run_cute_varlen(d):
         is_varlen=True, persistent=True,
     )
     torch.cuda.synchronize()
-    return o
+    return o.squeeze(0)  # [1, T_total, H, V] → [T_total, H, V] for comparison
 
 
 def run_pytorch_ref_per_seq(d):
@@ -119,14 +120,13 @@ def run_pytorch_ref_per_seq(d):
         start = cu[i].item()
         end = cu[i + 1].item()
         nt_i = (slen + BT - 1) // BT
-        # Unsqueeze to [1, slen, H, *] for reference
-        qi = d['q'][start:end].unsqueeze(0)
-        vi = d['v'][start:end].unsqueeze(0)
-        gi = d['g'][start:end].unsqueeze(0)
-        hi = d['h'][nt_offset:nt_offset + nt_i]
-        Ai_raw = d['A'][start:end]  # [slen, H, BT]
-        # Reference expects [B, T, H, BT]
-        Ai = Ai_raw.unsqueeze(0)
+        # Data is [1, T_total, H, *]; slice gives [1, slen, H, *]
+        qi = d['q'][:, start:end]
+        vi = d['v'][:, start:end]
+        gi = d['g'][:, start:end]
+        # h is [1, total_nt, H, K, V]; slice gives [1, nt_i, H, K, V]
+        hi = d['h'][:, nt_offset:nt_offset + nt_i]
+        Ai = d['A'][:, start:end]
         oi = reference_chunk_gla_fwd_o(qi, vi, gi, hi, Ai, d['scale'], BT)
         o_ref[start:end] = oi.squeeze(0)
         nt_offset += nt_i
@@ -135,14 +135,12 @@ def run_pytorch_ref_per_seq(d):
 
 def run_fla_varlen(d):
     """Run FLA Triton varlen kernel, return [T_total, H, V]."""
-    # FLA expects [1, T_total, H, *] + cu_seqlens int64
-    q_fla = d['q'].unsqueeze(0)
-    v_fla = d['v'].unsqueeze(0)
-    g_fla = d['g'].unsqueeze(0)
-    A_fla = d['A'].unsqueeze(0)
+    # FLA expects [1, T_total, H, *] + cu_seqlens int64; data is already 4D.
+    # FLA expects h as [NT_total, H, K, V] (4D flat), so flatten B dim.
     cu_fla = d['cu_seqlens'].to(torch.int64)
+    h_flat = d['h'].flatten(0, 1)  # [1, NT, H, K, V] -> [NT, H, K, V]
     o_fla = triton_chunk_gla_fwd_o_gk(
-        q=q_fla, v=v_fla, g=g_fla, A=A_fla, h=d['h'],
+        q=d['q'], v=d['v'], g=d['g'], A=d['A'], h=h_flat,
         scale=d['scale'], cu_seqlens=cu_fla,
         chunk_size=BT, use_exp2=True,
     )
@@ -163,11 +161,13 @@ def run_cute_non_varlen_per_seq(d):
         start = cu[i].item()
         end = cu[i + 1].item()
         nt_i = (slen + BT - 1) // BT
-        qi = d['q'][start:end].unsqueeze(0)        # [1, slen, H, K]
-        vi = d['v'][start:end].unsqueeze(0)
-        gi = d['g'][start:end].unsqueeze(0)
-        hi = d['h'][nt_offset:nt_offset + nt_i]
-        Ai = d['A'][start:end].unsqueeze(0)        # [1, slen, H, BT]
+        # Data is [1, T_total, H, *]; slice gives [1, slen, H, *]
+        qi = d['q'][:, start:end]
+        vi = d['v'][:, start:end]
+        gi = d['g'][:, start:end]
+        # h is [1, total_nt, H, K, V]; slice gives [1, nt_i, H, K, V]
+        hi = d['h'][:, nt_offset:nt_offset + nt_i]
+        Ai = d['A'][:, start:end]
         oi = torch.zeros(1, slen, d['H'], V, dtype=DTYPE, device=DEVICE)
         chunk_gla_fwd_o(
             q=qi, v=vi, g=gi, h=hi, o=oi, A=Ai,
@@ -514,8 +514,8 @@ def test_sequence_boundary_isolation():
     cu = d['cu_seqlens']
     s1_start = cu[1].item()
     s1_end = cu[2].item()
-    d['q'][s1_start:s1_end] = torch.randn_like(d['q'][s1_start:s1_end]) * 10
-    d['v'][s1_start:s1_end] = torch.randn_like(d['v'][s1_start:s1_end]) * 10
+    d['q'][:, s1_start:s1_end] = torch.randn_like(d['q'][:, s1_start:s1_end]) * 10
+    d['v'][:, s1_start:s1_end] = torch.randn_like(d['v'][:, s1_start:s1_end]) * 10
 
     o2 = run_cute_varlen(d).clone()
 
