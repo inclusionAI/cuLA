@@ -83,6 +83,9 @@ def test_safe_gate_chunk(
         A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(True), (A_log, dt_bias))
     q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(True), (q, k, v, g, beta, h0))
 
+    do = torch.randn_like(v)
+    dht = torch.randn_like(h0)
+
     ref, ref_ht = naive_recurrent_kda(
         q=F.normalize(q.clone(), p=2, dim=-1),
         k=F.normalize(k.clone(), p=2, dim=-1),
@@ -93,6 +96,12 @@ def test_safe_gate_chunk(
         initial_state=h0.clone(),
         output_final_state=True,
     )
+    ((ref * do).sum() + (ref_ht * dht).sum()).backward(retain_graph=True)
+    if use_gate_in_kernel:
+        ref_dA, A_log.grad = A_log.grad, None
+        ref_dbias, dt_bias.grad = dt_bias.grad, None
+    ref_dq, ref_dk, ref_dv, ref_dg, ref_db, ref_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
+    q.grad = k.grad = v.grad = g.grad = beta.grad = h0.grad = None
 
     tri, tri_ht = chunk_kda(
         q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
@@ -110,9 +119,24 @@ def test_safe_gate_chunk(
         safe_gate=safe_gate,
         lower_bound=lower_bound,
     )
+    ((tri * do).sum() + (tri_ht * dht).sum()).backward(retain_graph=True)
+    if use_gate_in_kernel:
+        tri_dA, A_log.grad = A_log.grad, None
+        tri_dbias, dt_bias.grad = dt_bias.grad, None
+    tri_dq, tri_dk, tri_dv, tri_dg, tri_db, tri_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
+    q.grad = k.grad = v.grad = g.grad = beta.grad = h0.grad = None
 
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+    assert_close("dq", ref_dq, tri_dq, 0.008)
+    assert_close("dk", ref_dk, tri_dk, 0.008)
+    assert_close("dv", ref_dv, tri_dv, 0.008)
+    assert_close("dg", ref_dg, tri_dg, 0.02)
+    assert_close("db", ref_db, tri_db, 0.02)
+    if use_gate_in_kernel:
+        assert_close("dA", ref_dA, tri_dA, 0.003, warning=True)
+        assert_close("dbias", ref_dbias, tri_dbias, 0.008)
+    assert_close("dh0", ref_dh0, tri_dh0, 0.008)
 
 
 @pytest.mark.parametrize(
@@ -153,6 +177,8 @@ def test_safe_gate_chunk_varlen(
 
     torch.manual_seed(42)
     cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
+    # NOTE: cu_seqlens must be int32 for FlashLA CUDA Impl
+    cu_seqlens = cu_seqlens.to(torch.int32)
     cu_seqlens_cpu = cu_seqlens.cpu()
     T = cu_seqlens[-1]
     N = len(cu_seqlens) - 1
@@ -170,6 +196,8 @@ def test_safe_gate_chunk_varlen(
     h0 = torch.randn((N, H, D, D), dtype=torch.float32)
 
     q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(), (q, k, v, g, beta, h0))
+    do = torch.randn_like(v)
+    dht = torch.rand_like(h0)
 
     tri, tri_ht = chunk_kda(
         q=F.normalize(q.clone(), p=2, dim=-1),
@@ -184,6 +212,9 @@ def test_safe_gate_chunk_varlen(
         safe_gate=safe_gate,
         lower_bound=-5.0 if safe_gate else None,
     )
+    ((tri * do).sum() + (tri_ht * dht).sum()).backward(retain_graph=True)
+    tri_dq, tri_dk, tri_dv, tri_dg, tri_db, tri_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
+    q.grad = k.grad = v.grad = g.grad = beta.grad = h0.grad = None
 
     ref = []
     ref_ht = []
@@ -202,5 +233,14 @@ def test_safe_gate_chunk_varlen(
     ref = torch.cat(ref, 1)
     ref_ht = torch.cat(ref_ht, 0)
 
+    ((ref * do).sum() + (ref_ht * dht).sum()).backward(retain_graph=True)
+    ref_dq, ref_dk, ref_dv, ref_dg, ref_db, ref_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
+
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+    assert_close("dq", ref_dq, tri_dq, 0.007)
+    assert_close("dk", ref_dk, tri_dk, 0.008)
+    assert_close("dv", ref_dv, tri_dv, 0.007)
+    assert_close("dg", ref_dg, tri_dg, 0.015)
+    assert_close("db", ref_db, tri_db, 0.015)
+    assert_close("dh0", ref_dh0, tri_dh0, 0.007)

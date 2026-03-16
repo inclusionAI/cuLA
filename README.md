@@ -112,8 +112,11 @@ python benchmarks/bench_kda.py
 Tests for KDA (Kimi Delta Attention)
 
 ```bash
-# e2e test for both forward and backward
+# e2e test for both forward and backward compared with FLA implementation
 python -m pytest tests/test_kda_e2e_compare_fla.py
+
+# e2e test compared with Naive KDA implementation
+python -m pytest tests/test_kda.py 
 ```
 
 ## Mathematical background (brief)
