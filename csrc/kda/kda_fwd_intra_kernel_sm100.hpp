@@ -45,18 +45,14 @@ struct KdaChunkFwdIntraKernelSm100 {
     using TmaParams = typename Mainloop::template TmaParams<ShapeQKG, TMA_Q, TMA_K, TMA_G>;
 
     // Pipeline types (for construction in operator())
-    using PipelineQ              = typename Mainloop::PipelineQ;
-    using PipelineK              = typename Mainloop::PipelineK;
-    using PipelineG              = typename Mainloop::PipelineG;
+    using PipelineQKG            = typename Mainloop::PipelineQKG;
     using PipelineBeta           = typename Mainloop::PipelineBeta;
     using PipelineQKGInterReady    = typename Mainloop::PipelineQKGInterReady;
     using PipelineQKDone         = typename Mainloop::PipelineQKDone;
     using PipelineKKInvReady     = typename Mainloop::PipelineKKInvReady;
 
     // Pipeline state types
-    using PipelineStateQ         = typename Mainloop::PipelineStateQ;
-    using PipelineStateK         = typename Mainloop::PipelineStateK;
-    using PipelineStateG         = typename Mainloop::PipelineStateG;
+    using PipelineStateQKG       = typename Mainloop::PipelineStateQKG;
     using PipelineStateBeta      = typename Mainloop::PipelineStateBeta;
     using PipelineStateQKGInter  = typename Mainloop::PipelineStateQKGInter;
     using PipelineStateQKDone    = typename Mainloop::PipelineStateQKDone;
@@ -137,30 +133,19 @@ struct KdaChunkFwdIntraKernelSm100 {
         // Configure pipeline params per role
         // ---------------------------------------------------------------
 
-        // === TMA load pipelines: Q, K, G ===
-        typename PipelineQ::Params q_pipe_params;
-        q_pipe_params.transaction_bytes = sizeof(bf16) * cosize_v<SmemLayoutInputBF16>;
-        q_pipe_params.is_leader    = lane_predicate && (role == WarpRole::Load);
-        q_pipe_params.num_consumers = NumCudaCoreThreads;
-
-        typename PipelineK::Params k_pipe_params;
-        k_pipe_params.transaction_bytes = sizeof(bf16) * cosize_v<SmemLayoutInputBF16>;
-        k_pipe_params.is_leader    = lane_predicate && (role == WarpRole::Load);
-        k_pipe_params.num_consumers = NumCudaCoreThreads;
-
-        typename PipelineG::Params g_pipe_params;
-        g_pipe_params.transaction_bytes = sizeof(float) * cosize_v<SmemLayoutInputFP32>;
-        g_pipe_params.is_leader    = lane_predicate && (role == WarpRole::Load);
-        g_pipe_params.num_consumers = NumCudaCoreThreads;
+        // === Unified TMA load pipeline: Q + K + G ===
+        typename PipelineQKG::Params qkg_load_pipe_params;
+        qkg_load_pipe_params.transaction_bytes =
+            sizeof(bf16)  * cosize_v<SmemLayoutInputBF16> +   // Q
+            sizeof(bf16)  * cosize_v<SmemLayoutInputBF16> +   // K
+            sizeof(float) * cosize_v<SmemLayoutInputFP32>;    // G
+        qkg_load_pipe_params.is_leader    = lane_predicate && (role == WarpRole::Load);
+        qkg_load_pipe_params.num_consumers = NumCudaCoreThreads;
 
         if (role == WarpRole::Load) {
-            q_pipe_params.role = PipelineQ::ThreadCategory::Producer;
-            k_pipe_params.role = PipelineK::ThreadCategory::Producer;
-            g_pipe_params.role = PipelineG::ThreadCategory::Producer;
+            qkg_load_pipe_params.role = PipelineQKG::ThreadCategory::Producer;
         } else if (role == WarpRole::ComputeCudaCore) {
-            q_pipe_params.role = PipelineQ::ThreadCategory::Consumer;
-            k_pipe_params.role = PipelineK::ThreadCategory::Consumer;
-            g_pipe_params.role = PipelineG::ThreadCategory::Consumer;
+            qkg_load_pipe_params.role = PipelineQKG::ThreadCategory::Consumer;
         }
 
         // === Beta pipeline ===
@@ -209,9 +194,7 @@ struct KdaChunkFwdIntraKernelSm100 {
         // ---------------------------------------------------------------
         // Construct pipeline objects
         // ---------------------------------------------------------------
-        PipelineQ   q_pipeline(shared_plan->pipe_q_storage, q_pipe_params, ClusterShape{});
-        PipelineK   k_pipeline(shared_plan->pipe_k_storage, k_pipe_params, ClusterShape{});
-        PipelineG   g_pipeline(shared_plan->pipe_g_storage, g_pipe_params, ClusterShape{});
+        PipelineQKG qkg_load_pipeline(shared_plan->pipe_qkg_load_storage, qkg_load_pipe_params, ClusterShape{});
 
         PipelineBeta beta_pipeline(shared_plan->pipe_beta_storage, beta_pipe_params, /*InitBarriers*/cute::true_type{});
 
@@ -225,12 +208,8 @@ struct KdaChunkFwdIntraKernelSm100 {
         // ---------------------------------------------------------------
         // Initialize pipeline states
         // ---------------------------------------------------------------
-        PipelineStateQ q_pipe_state_read;
-        PipelineStateQ q_pipe_state_write = cutlass::make_producer_start_state<PipelineQ>();
-        PipelineStateK k_pipe_state_read;
-        PipelineStateK k_pipe_state_write = cutlass::make_producer_start_state<PipelineK>();
-        PipelineStateG g_pipe_state_read;
-        PipelineStateG g_pipe_state_write = cutlass::make_producer_start_state<PipelineG>();
+        PipelineStateQKG qkg_load_pipe_state_read;
+        PipelineStateQKG qkg_load_pipe_state_write = cutlass::make_producer_start_state<PipelineQKG>();
 
         PipelineStateBeta beta_pipe_state_read;
         PipelineStateBeta beta_pipe_state_write = cutlass::make_producer_start_state<PipelineBeta>();
@@ -256,9 +235,7 @@ struct KdaChunkFwdIntraKernelSm100 {
             cutlass::arch::warpgroup_reg_alloc<NumCudaCoreRegs>();
             mainloop.compute_cudacore_loop(
                 params, tma_params, shared_plan, tile_scheduler,
-                q_pipeline, q_pipe_state_read,
-                k_pipeline, k_pipe_state_read,
-                g_pipeline, g_pipe_state_read,
+                qkg_load_pipeline, qkg_load_pipe_state_read,
                 qkg_inter_pipeline, qkg_inter_pipe_state_write,
                 qk_done_pipeline, qk_done_pipe_state_read,
                 beta_pipeline, beta_pipe_state_read,
@@ -277,9 +254,7 @@ struct KdaChunkFwdIntraKernelSm100 {
             cutlass::arch::warpgroup_reg_dealloc<NumLoadRegs>();
             mainloop.load_loop(
                 params, tma_params, shared_plan, tile_scheduler,
-                q_pipeline, q_pipe_state_write,
-                k_pipeline, k_pipe_state_write,
-                g_pipeline, g_pipe_state_write
+                qkg_load_pipeline, qkg_load_pipe_state_write
             );
 
         } else if (role == WarpRole::Inverse) {

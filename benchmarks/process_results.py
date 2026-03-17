@@ -11,13 +11,13 @@ def calculate_speedups():
     df_uniform['T'] = df_uniform['T'].astype(int)
     df_uniform['speedup'] = df_uniform['fla'] / df_uniform['flashla']
     
-    print("### Uniform Sequence Length (B=2, H=64, D=128)")
+    print("- Uniform Sequence Length (B=2, H=64, D=128)\n")
     print("| T | flash-linear-attention (ms) | flashla (ms) | Speedup |")
     print("|---|---------------------------|--------------|---------|")
     for _, row in df_uniform.iterrows():
         print(f"| {int(row['T'])} | {row['fla']:.3f} | {row['flashla']:.3f} | **{row['speedup']:.3f}x** |")
-        
-    print("\n### Varlen Sequence Length (NUM_SEQS=8, H=64, D=128)")
+
+    print("\n- Varlen Sequence Length (NUM_SEQS=8, H=64, D=128)\n")
     print("| Total Length | flash-linear-attention (ms) | flashla (ms) | Speedup |")
     print("|--------------|---------------------------|--------------|---------|")
     

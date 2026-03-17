@@ -10,7 +10,7 @@ FlashLA is a lightweight, high-performance linear attention library inspired by 
 
 ## Environment
 
-We test and benchmark FlashLA on GB200 GPUs with Python 3.12, CUDA 12.9, PyTorch 2.9.1, Triton 3.5.1, and a specific commit of [flash-linear-attention](https://github.com/fla-org/flash-linear-attention/tree/5da31d199456ee4004f70186f3391d309e26ca98).
+We test and benchmark FlashLA on GB200 GPUs with Python 3.12, CUDA 12.9/13.0, PyTorch 2.9.1, Triton 3.5.1, and a specific commit of [flash-linear-attention](https://github.com/fla-org/flash-linear-attention/tree/5da31d199456ee4004f70186f3391d309e26ca98).
 
 ## Installation
 
@@ -19,14 +19,15 @@ We test and benchmark FlashLA on GB200 GPUs with Python 3.12, CUDA 12.9, PyTorch
 ```bash
 git clone git@code.alipay.com:ling/flashla.git -b rel/v0.1-rc1
 git submodule update --init --recursive
-# install torch first
-pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu129
+# install torch first (default to CUDA 13.0)
+pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu130
 # if network error, try the following command
-# pip install --trusted-host pypi.nvidia.cn --trusted-host pypi.nvidia.com --trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host download.pytorch.org torch==2.9.1 --index-url https://download.pytorch.org/whl/cu129
+# pip install --trusted-host pypi.nvidia.cn --trusted-host pypi.nvidia.com --trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host download.pytorch.org torch==2.9.1 --index-url https://download.pytorch.org/whl/cu130
 # install flash-linear-attention
 cd third_party/flash-linear-attention
 pip install -e .
 # install flashla
+cd ../..
 pip install -e . --no-build-isolation
 ```
 
@@ -67,7 +68,7 @@ o.backward(do)
 **Notes:**
 - We currently only support `safe_gate=True` due to algorithm advancements and its superior performance.
 - We currently only support `beta` input as `float32` data type.
-- It is highly recommended to compute `cu_seqlens` outside with `int32` data type and pass it in for optimal performance.
+- We currently only support `cu_seqlens` input as `int32` data type.
 - We currently use FP16 precision for matrix inversion.
 
 ### Lightning [TODO]
@@ -83,24 +84,24 @@ Benchmarks for KDA (Kimi Delta Attention) run on a single NVIDIA GB200 GPU. The 
 
 | T | flash-linear-attention (ms) | flashla (ms) | Speedup |
 |---|---------------------------|--------------|---------|
-| 128 | 0.573 | 0.534 | **1.074x** |
-| 256 | 0.548 | 0.521 | **1.052x** |
-| 512 | 0.557 | 0.534 | **1.043x** |
-| 1024 | 0.555 | 0.528 | **1.052x** |
-| 2048 | 1.022 | 0.595 | **1.718x** |
-| 4096 | 1.965 | 1.121 | **1.753x** |
-| 8192 | 3.856 | 2.176 | **1.772x** |
-| 16384 | 7.657 | 4.250 | **1.802x** |
-| 32768 | 15.488 | 8.565 | **1.808x** |
+| 128 | 0.577 | 0.519 | **1.111x** |
+| 256 | 0.541 | 0.525 | **1.030x** |
+| 512 | 0.551 | 0.513 | **1.074x** |
+| 1024 | 0.552 | 0.525 | **1.051x** |
+| 2048 | 0.848 | 0.607 | **1.397x** |
+| 4096 | 1.614 | 1.137 | **1.420x** |
+| 8192 | 3.136 | 2.198 | **1.427x** |
+| 16384 | 6.206 | 4.324 | **1.435x** |
+| 32768 | 12.531 | 8.699 | **1.440x** |
 
 - Varlen Sequence Length (NUM_SEQS=8, H=64, D=128)
 
 | Total Length | flash-linear-attention (ms) | flashla (ms) | Speedup |
 |--------------|---------------------------|--------------|---------|
-| 4096 | 1.070 | 0.621 | **1.722x** |
-| 8192 | 2.026 | 1.146 | **1.768x** |
-| 16384 | 3.953 | 2.187 | **1.808x** |
-| 32768 | 7.858 | 4.273 | **1.839x** |
+| 4096 | 0.892 | 0.631 | **1.413x** |
+| 8192 | 1.674 | 1.162 | **1.441x** |
+| 16384 | 3.235 | 2.208 | **1.465x** |
+| 32768 | 6.399 | 4.324 | **1.480x** |
 
 To reproduce the benchmarks:
 ```bash

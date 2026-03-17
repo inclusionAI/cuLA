@@ -68,7 +68,7 @@ ext_modules.append(
         sources=[
             "csrc/pybind.cu",
             "csrc/kda_api.cu",
-            "csrc/kda/kda_fwd_intra_sm100.cu",
+            "csrc/kda/kda_fwd_sm100.cu",
         ],
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),

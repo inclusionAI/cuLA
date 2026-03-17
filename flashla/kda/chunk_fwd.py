@@ -112,39 +112,21 @@ def chunk_kda_fwd(
         # only the first state in the tensor is relevant. We compress it to optimize memory for `save_for_backward`.
         initial_state = compress_h0(initial_state, context=cp_context)
 
+    # Please ensure zeros, since vllm will use padding v
     o = torch.zeros_like(v)
-    # chunk_gated_delta_rule_fwd_h returns h of shape [B, NT, H, K, V].
-    # chunk_gla_fwd_o expects h of shape [B*NT, H, K, V] (4D flat).
-    h_4d = h.flatten(0, 1)
-    if cu_seqlens is not None:
-        # varlen: kernel expects 3D tensors [T_total, H, ...]; squeeze batch dim.
-        chunk_gla_fwd_o(
-            q=q.squeeze(0),
-            v=v_new.squeeze(0),
-            g=g.squeeze(0),
-            A=Aqk.squeeze(0),
-            h=h_4d,
-            o=o.squeeze(0),
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size,
-            chunk_indices=chunk_indices,
-            is_varlen=True,
-        )
-    else:
-        chunk_gla_fwd_o(
-            q=q,
-            v=v_new,
-            g=g,
-            A=Aqk,
-            h=h_4d,
-            o=o,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size,
-            chunk_indices=chunk_indices,
-            is_varlen=False,
-        )
+    chunk_gla_fwd_o(
+        q=q,
+        v=v_new,
+        g=g,
+        A=Aqk,
+        h=h,
+        o=o,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+        is_varlen=cu_seqlens is not None,
+    )
     if disable_recompute is False:
         # Delete to save memory
         w, u, qg, kg, v_new = None, None, None, None, None
