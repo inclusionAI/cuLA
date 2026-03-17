@@ -16,12 +16,13 @@ using namespace cute;
 //   inter: exp2(g_first - g[x]) * K[x]     (g_first = g[sub_tile_i * 16])
 //   intra: exp2(g_half  - g[x]) * K[x]     (g_half  = g[sub_tile_i * 16 + 8])
 //
-// SmemLayoutMatBTF32<1> = (SubTileT, TileK) = (16, 32), K-major layout
+// SmemLayoutMatBTF32<1> = (SubTileT, TileK) = (16, TileK), K-major layout
 //
 // Thread mapping (128 threads per WG, 16 rows per sub_tile):
 //   x_local = idx_in_warpgroup / 8           (row within sub_tile, 0..15)
-//   y       = idx_in_warpgroup % 8 * 4       (column group, 0..28 step 4)
+//   y_base  = idx_in_warpgroup % 8 * 4       (column group base, 0..28 step 4)
 //   Each thread writes 4 consecutive tf32 values (128 bits) to SMEM.
+//   When TileK > 32, each thread loops over y_iter in [0, 32, ...] to cover all columns.
 //
 // Store pattern: sKG(x_local, y) + KG_OFFSET * index
 //   where KG_OFFSET = SubTileT * TileK (stride between sub_tile buffers)
@@ -56,79 +57,82 @@ using namespace cute;
 //     inter(1,0): exp2(g_first_1 - g_0[x]) * K_0[x] → sKG_inter index 0
 //     inter(2,0): exp2(g_first_2 - g_0[x]) * K_0[x] → sKG_inter index 1
 //     inter(3,0): exp2(g_first_3 - g_0[x]) * K_0[x] → sKG_inter index 3
-//   Returns g_half_0, g_first_1, g_first_2, g_first_3 for potential A-matrix reuse.
-template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET>
+template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_>
 __forceinline__ __device__ void fwd_setup_kg_col0_4out(
     G_TENSOR &sG, K_TENSOR &sK,
     KG_TENSOR &sKG_inter, KG_TENSOR &sKG_intra,
-    int idx_in_warpgroup, int sub_seq_len,
-    float4 &g_half_0 /*out*/, float4 &g_first_1 /*out*/,
-    float4 &g_first_2 /*out*/, float4 &g_first_3 /*out*/) {
-    int y = idx_in_warpgroup % 8 * 4;
-    // Load 4 g_ref values (3 SMEM reads for g_ref; g_half_0 needs row 8)
-    g_half_0  = *reinterpret_cast<float4*>(&sG(min(0 * 16 + 8, sub_seq_len - 1), y));
-    g_first_1 = *reinterpret_cast<float4*>(&sG(min(1 * 16, sub_seq_len - 1), y));
-    g_first_2 = *reinterpret_cast<float4*>(&sG(min(2 * 16, sub_seq_len - 1), y));
-    g_first_3 = *reinterpret_cast<float4*>(&sG(min(3 * 16, sub_seq_len - 1), y));
+    int idx_in_warpgroup, int sub_seq_len) {
+    int y_base = idx_in_warpgroup % 8 * 4;
     // K data from sub_tile j=0
     int x = idx_in_warpgroup / 8 + 0 * 16;
-    if (x < sub_seq_len) {
-        float4 g = *reinterpret_cast<float4*>(&sG(x, y));
-        nvbf16x4 k = *reinterpret_cast<nvbf16x4*>(&sK(x, y));
-        float2 kf_a = __bfloat1622float2(k.a);
-        float2 kf_b = __bfloat1622float2(k.b);
-        float2 g_a = reinterpret_cast<float2*>(&g)[0];
-        float2 g_b = reinterpret_cast<float2*>(&g)[1];
-        // intra(0,0): exp2(g_half_0 - g[x]) * K[x]
-        {
-            float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_half_0)[0], g_a);
-            float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_half_0)[1], g_b);
-            s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-            s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
-            float4 res;
-            reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
-            reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
-            store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 0, res);
+    // Loop over column chunks to cover full TileK width
+    // When TileK_=32: single iteration (y_iter=0). When TileK_=64: two iterations.
+    #pragma unroll
+    for (int y_iter = 0; y_iter < TileK_; y_iter += 32) {
+        int y = y_base + y_iter;
+        // Load 4 g_ref values for this column chunk
+        float4 g_half_0_local  = *reinterpret_cast<float4*>(&sG(min(0 * 16 + 8, sub_seq_len - 1), y));
+        float4 g_first_1_local = *reinterpret_cast<float4*>(&sG(min(1 * 16, sub_seq_len - 1), y));
+        float4 g_first_2_local = *reinterpret_cast<float4*>(&sG(min(2 * 16, sub_seq_len - 1), y));
+        float4 g_first_3_local = *reinterpret_cast<float4*>(&sG(min(3 * 16, sub_seq_len - 1), y));
+        if (x < sub_seq_len) {
+            float4 g = *reinterpret_cast<float4*>(&sG(x, y));
+            nvbf16x4 k = *reinterpret_cast<nvbf16x4*>(&sK(x, y));
+            float2 kf_a = __bfloat1622float2(k.a);
+            float2 kf_b = __bfloat1622float2(k.b);
+            float2 g_a = reinterpret_cast<float2*>(&g)[0];
+            float2 g_b = reinterpret_cast<float2*>(&g)[1];
+            // intra(0,0): exp2(g_half_0 - g[x]) * K[x]
+            {
+                float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_half_0_local)[0], g_a);
+                float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_half_0_local)[1], g_b);
+                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                float4 res;
+                reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
+                reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
+                store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 0, res);
+            }
+            // inter(1,0): exp2(g_first_1 - g[x]) * K[x]
+            {
+                float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_1_local)[0], g_a);
+                float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_1_local)[1], g_b);
+                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                float4 res;
+                reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
+                reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
+                store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 0, res);
+            }
+            // inter(2,0): exp2(g_first_2 - g[x]) * K[x]
+            {
+                float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[0], g_a);
+                float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[1], g_b);
+                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                float4 res;
+                reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
+                reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
+                store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 1, res);
+            }
+            // inter(3,0): exp2(g_first_3 - g[x]) * K[x]
+            {
+                float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[0], g_a);
+                float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[1], g_b);
+                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                float4 res;
+                reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
+                reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
+                store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 3, res);
+            }
+        } else {
+            float4 z = {0.0f, 0.0f, 0.0f, 0.0f};
+            store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 0, z);
+            store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 0, z);
+            store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 1, z);
+            store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 3, z);
         }
-        // inter(1,0): exp2(g_first_1 - g[x]) * K[x]
-        {
-            float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_1)[0], g_a);
-            float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_1)[1], g_b);
-            s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-            s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
-            float4 res;
-            reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
-            reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
-            store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 0, res);
-        }
-        // inter(2,0): exp2(g_first_2 - g[x]) * K[x]
-        {
-            float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_2)[0], g_a);
-            float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_2)[1], g_b);
-            s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-            s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
-            float4 res;
-            reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
-            reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
-            store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 1, res);
-        }
-        // inter(3,0): exp2(g_first_3 - g[x]) * K[x]
-        {
-            float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_3)[0], g_a);
-            float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_3)[1], g_b);
-            s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-            s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
-            float4 res;
-            reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
-            reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
-            store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 3, res);
-        }
-    } else {
-        float4 z = {0.0f, 0.0f, 0.0f, 0.0f};
-        store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 0, z);
-        store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 0, z);
-        store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 1, z);
-        store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 3, z);
     }
 }
 
@@ -137,66 +141,67 @@ __forceinline__ __device__ void fwd_setup_kg_col0_4out(
 //     intra(1,1): exp2(g_half_1 - g_1[x]) * K_1[x]  → sKG_intra index 1
 //     inter(2,1): exp2(g_first_2 - g_1[x]) * K_1[x] → sKG_inter index 2
 //     inter(3,1): exp2(g_first_3 - g_1[x]) * K_1[x] → sKG_inter index 4
-//   Returns g_half_1, g_first_2, g_first_3 for potential A-matrix reuse.
-template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET>
+template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_>
 __forceinline__ __device__ void fwd_setup_kg_col1_3out(
     G_TENSOR &sG, K_TENSOR &sK,
     KG_TENSOR &sKG_inter, KG_TENSOR &sKG_intra,
-    int idx_in_warpgroup, int sub_seq_len,
-    float4 &g_half_1 /*out*/, float4 &g_first_2 /*out*/,
-    float4 &g_first_3 /*out*/) {
-    int y = idx_in_warpgroup % 8 * 4;
-    // Load 3 g_ref values
-    g_half_1  = *reinterpret_cast<float4*>(&sG(min(1 * 16 + 8, sub_seq_len - 1), y));
-    g_first_2 = *reinterpret_cast<float4*>(&sG(min(2 * 16, sub_seq_len - 1), y));
-    g_first_3 = *reinterpret_cast<float4*>(&sG(min(3 * 16, sub_seq_len - 1), y));
+    int idx_in_warpgroup, int sub_seq_len) {
+    int y_base = idx_in_warpgroup % 8 * 4;
     // K data from sub_tile j=1
     int x = idx_in_warpgroup / 8 + 1 * 16;
-    if (x < sub_seq_len) {
-        float4 g = *reinterpret_cast<float4*>(&sG(x, y));
-        nvbf16x4 k = *reinterpret_cast<nvbf16x4*>(&sK(x, y));
-        float2 kf_a = __bfloat1622float2(k.a);
-        float2 kf_b = __bfloat1622float2(k.b);
-        float2 g_a = reinterpret_cast<float2*>(&g)[0];
-        float2 g_b = reinterpret_cast<float2*>(&g)[1];
-        // intra(1,1): exp2(g_half_1 - g[x]) * K[x]
-        {
-            float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_half_1)[0], g_a);
-            float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_half_1)[1], g_b);
-            s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-            s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
-            float4 res;
-            reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
-            reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
-            store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 1, res);
+    #pragma unroll
+    for (int y_iter = 0; y_iter < TileK_; y_iter += 32) {
+        int y = y_base + y_iter;
+        // Load 3 g_ref values for this column chunk
+        float4 g_half_1_local  = *reinterpret_cast<float4*>(&sG(min(1 * 16 + 8, sub_seq_len - 1), y));
+        float4 g_first_2_local = *reinterpret_cast<float4*>(&sG(min(2 * 16, sub_seq_len - 1), y));
+        float4 g_first_3_local = *reinterpret_cast<float4*>(&sG(min(3 * 16, sub_seq_len - 1), y));
+        if (x < sub_seq_len) {
+            float4 g = *reinterpret_cast<float4*>(&sG(x, y));
+            nvbf16x4 k = *reinterpret_cast<nvbf16x4*>(&sK(x, y));
+            float2 kf_a = __bfloat1622float2(k.a);
+            float2 kf_b = __bfloat1622float2(k.b);
+            float2 g_a = reinterpret_cast<float2*>(&g)[0];
+            float2 g_b = reinterpret_cast<float2*>(&g)[1];
+            // intra(1,1): exp2(g_half_1 - g[x]) * K[x]
+            {
+                float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_half_1_local)[0], g_a);
+                float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_half_1_local)[1], g_b);
+                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                float4 res;
+                reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
+                reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
+                store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 1, res);
+            }
+            // inter(2,1): exp2(g_first_2 - g[x]) * K[x]
+            {
+                float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[0], g_a);
+                float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[1], g_b);
+                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                float4 res;
+                reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
+                reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
+                store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 2, res);
+            }
+            // inter(3,1): exp2(g_first_3 - g[x]) * K[x]
+            {
+                float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[0], g_a);
+                float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[1], g_b);
+                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                float4 res;
+                reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
+                reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
+                store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 4, res);
+            }
+        } else {
+            float4 z = {0.0f, 0.0f, 0.0f, 0.0f};
+            store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 1, z);
+            store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 2, z);
+            store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 4, z);
         }
-        // inter(2,1): exp2(g_first_2 - g[x]) * K[x]
-        {
-            float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_2)[0], g_a);
-            float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_2)[1], g_b);
-            s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-            s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
-            float4 res;
-            reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
-            reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
-            store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 2, res);
-        }
-        // inter(3,1): exp2(g_first_3 - g[x]) * K[x]
-        {
-            float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_3)[0], g_a);
-            float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_3)[1], g_b);
-            s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-            s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
-            float4 res;
-            reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
-            reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
-            store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 4, res);
-        }
-    } else {
-        float4 z = {0.0f, 0.0f, 0.0f, 0.0f};
-        store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 1, z);
-        store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 2, z);
-        store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 4, z);
     }
 }
 
@@ -204,85 +209,89 @@ __forceinline__ __device__ void fwd_setup_kg_col1_3out(
 //   Loads K_2 + G data once, computes:
 //     intra(2,2): exp2(g_half_2 - g_2[x]) * K_2[x]  → sKG_intra index 2
 //     inter(3,2): exp2(g_first_3 - g_2[x]) * K_2[x] → sKG_inter index 5
-//   Returns g_half_2, g_first_3 for potential A-matrix reuse.
-template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET>
+template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_>
 __forceinline__ __device__ void fwd_setup_kg_col2_2out(
     G_TENSOR &sG, K_TENSOR &sK,
     KG_TENSOR &sKG_inter, KG_TENSOR &sKG_intra,
-    int idx_in_warpgroup, int sub_seq_len,
-    float4 &g_half_2 /*out*/, float4 &g_first_3 /*out*/) {
-    int y = idx_in_warpgroup % 8 * 4;
-    // Load 2 g_ref values
-    g_half_2  = *reinterpret_cast<float4*>(&sG(min(2 * 16 + 8, sub_seq_len - 1), y));
-    g_first_3 = *reinterpret_cast<float4*>(&sG(min(3 * 16, sub_seq_len - 1), y));
+    int idx_in_warpgroup, int sub_seq_len) {
+    int y_base = idx_in_warpgroup % 8 * 4;
     // K data from sub_tile j=2
     int x = idx_in_warpgroup / 8 + 2 * 16;
-    if (x < sub_seq_len) {
-        float4 g = *reinterpret_cast<float4*>(&sG(x, y));
-        nvbf16x4 k = *reinterpret_cast<nvbf16x4*>(&sK(x, y));
-        float2 kf_a = __bfloat1622float2(k.a);
-        float2 kf_b = __bfloat1622float2(k.b);
-        float2 g_a = reinterpret_cast<float2*>(&g)[0];
-        float2 g_b = reinterpret_cast<float2*>(&g)[1];
-        // intra(2,2): exp2(g_half_2 - g[x]) * K[x]
-        {
-            float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_half_2)[0], g_a);
-            float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_half_2)[1], g_b);
-            s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-            s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
-            float4 res;
-            reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
-            reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
-            store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 2, res);
+    #pragma unroll
+    for (int y_iter = 0; y_iter < TileK_; y_iter += 32) {
+        int y = y_base + y_iter;
+        // Load 2 g_ref values for this column chunk
+        float4 g_half_2_local  = *reinterpret_cast<float4*>(&sG(min(2 * 16 + 8, sub_seq_len - 1), y));
+        float4 g_first_3_local = *reinterpret_cast<float4*>(&sG(min(3 * 16, sub_seq_len - 1), y));
+        if (x < sub_seq_len) {
+            float4 g = *reinterpret_cast<float4*>(&sG(x, y));
+            nvbf16x4 k = *reinterpret_cast<nvbf16x4*>(&sK(x, y));
+            float2 kf_a = __bfloat1622float2(k.a);
+            float2 kf_b = __bfloat1622float2(k.b);
+            float2 g_a = reinterpret_cast<float2*>(&g)[0];
+            float2 g_b = reinterpret_cast<float2*>(&g)[1];
+            // intra(2,2): exp2(g_half_2 - g[x]) * K[x]
+            {
+                float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_half_2_local)[0], g_a);
+                float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_half_2_local)[1], g_b);
+                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                float4 res;
+                reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
+                reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
+                store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 2, res);
+            }
+            // inter(3,2): exp2(g_first_3 - g[x]) * K[x]
+            {
+                float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[0], g_a);
+                float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[1], g_b);
+                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                float4 res;
+                reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
+                reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
+                store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 5, res);
+            }
+        } else {
+            float4 z = {0.0f, 0.0f, 0.0f, 0.0f};
+            store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 2, z);
+            store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 5, z);
         }
-        // inter(3,2): exp2(g_first_3 - g[x]) * K[x]
-        {
-            float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_3)[0], g_a);
-            float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_3)[1], g_b);
-            s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-            s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
-            float4 res;
-            reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
-            reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
-            store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 5, res);
-        }
-    } else {
-        float4 z = {0.0f, 0.0f, 0.0f, 0.0f};
-        store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 2, z);
-        store_128b(&sKG_inter(idx_in_warpgroup / 8, y) + KG_OFFSET * 5, z);
     }
 }
 
 // fwd_setup_kg_col3_1out: column j=3, 1 output (intra only)
 //   Loads K_3 + G data once, computes:
 //     intra(3,3): exp2(g_half_3 - g_3[x]) * K_3[x]  → sKG_intra index 3
-//   Returns g_half_3 for potential A-matrix reuse.
-template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET>
+template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_>
 __forceinline__ __device__ void fwd_setup_kg_col3_1out(
     G_TENSOR &sG, K_TENSOR &sK,
     KG_TENSOR &sKG_intra,
-    int idx_in_warpgroup, int sub_seq_len,
-    float4 &g_half_3 /*out*/) {
-    int y = idx_in_warpgroup % 8 * 4;
-    // Load 1 g_ref value
-    g_half_3 = *reinterpret_cast<float4*>(&sG(min(3 * 16 + 8, sub_seq_len - 1), y));
+    int idx_in_warpgroup, int sub_seq_len) {
+    int y_base = idx_in_warpgroup % 8 * 4;
     // K data from sub_tile j=3
     int x = idx_in_warpgroup / 8 + 3 * 16;
-    if (x < sub_seq_len) {
-        float4 g = *reinterpret_cast<float4*>(&sG(x, y));
-        nvbf16x4 k = *reinterpret_cast<nvbf16x4*>(&sK(x, y));
-        // intra(3,3): exp2(g_half_3 - g[x]) * K[x]
-        float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_half_3)[0], reinterpret_cast<float2*>(&g)[0]);
-        float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_half_3)[1], reinterpret_cast<float2*>(&g)[1]);
-        s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-        s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
-        float4 res;
-        reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, __bfloat1622float2(k.a));
-        reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, __bfloat1622float2(k.b));
-        store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 3, res);
-    } else {
-        float4 z = {0.0f, 0.0f, 0.0f, 0.0f};
-        store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 3, z);
+    #pragma unroll
+    for (int y_iter = 0; y_iter < TileK_; y_iter += 32) {
+        int y = y_base + y_iter;
+        // Load 1 g_ref value for this column chunk
+        float4 g_half_3_local = *reinterpret_cast<float4*>(&sG(min(3 * 16 + 8, sub_seq_len - 1), y));
+        if (x < sub_seq_len) {
+            float4 g = *reinterpret_cast<float4*>(&sG(x, y));
+            nvbf16x4 k = *reinterpret_cast<nvbf16x4*>(&sK(x, y));
+            // intra(3,3): exp2(g_half_3 - g[x]) * K[x]
+            float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_half_3_local)[0], reinterpret_cast<float2*>(&g)[0]);
+            float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_half_3_local)[1], reinterpret_cast<float2*>(&g)[1]);
+            s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
+            s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+            float4 res;
+            reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, __bfloat1622float2(k.a));
+            reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, __bfloat1622float2(k.b));
+            store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 3, res);
+        } else {
+            float4 z = {0.0f, 0.0f, 0.0f, 0.0f};
+            store_128b(&sKG_intra(idx_in_warpgroup / 8, y) + KG_OFFSET * 3, z);
+        }
     }
 }
 
