@@ -504,6 +504,8 @@ class ChunkDeltaRuleFwdH:
             sWorkIdx: cute.struct.MemRange[Int32, 2]
             # Double-buffered scheduling mbarriers (count=1 each, Load warp elect_one arrives)
             sched_mbar: cute.struct.MemRange[Int64, 2]
+            # Double-buffered consumed mbarriers (count=4, one arrive per consumer warp group)
+            sched_consumed_mbar: cute.struct.MemRange[Int64, 2]
 
         self.shared_storage = SharedStorage
         self.grid = self._compute_grid(B, H, V)
@@ -691,10 +693,15 @@ class ChunkDeltaRuleFwdH:
         # ===================== Scheduling mbarrier init (persistent varlen) =====================
         if cutlass.const_expr(self.is_varlen and self.persistent):
             sched_mbar_base = storage.sched_mbar.data_ptr()
-            # Init 2 mbarriers with count=1: only Load warp elect_one arrives
+            sched_consumed_mbar_base = storage.sched_consumed_mbar.data_ptr()
+            # Init 2 scheduling mbarriers with count=1: only Load warp elect_one arrives
+            # Init 2 consumed mbarriers with count=7: one arrive per non-load warp
+            # (MMA=1, CC=4, Store=1, Empty=1)
             if warp_idx == 0:
                 cute.arch.mbarrier_init(sched_mbar_base, 1)
                 cute.arch.mbarrier_init(sched_mbar_base + 1, 1)
+                cute.arch.mbarrier_init(sched_consumed_mbar_base, 7)
+                cute.arch.mbarrier_init(sched_consumed_mbar_base + 1, 7)
             cute.arch.mbarrier_init_fence()
             cute.arch.barrier(barrier_id=0, number_of_threads=self.threads_per_cta)
 
@@ -806,10 +813,15 @@ class ChunkDeltaRuleFwdH:
             else:
                 # All other warps: wait for Load warp's signal on mbar[0], phase=0
                 cute.arch.mbarrier_wait(sched_mbar_base, Int32(0))
+                # Signal consumed_mbar[0]: buf 0 has been consumed
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(sched_consumed_mbar_base)
 
         # =========================================================================
         # LOAD WARP
         # =========================================================================
+        is_debug_cta = block_idx_x == 0 if cutlass.const_expr(self.is_varlen) else cute.arch.block_idx()[0] == 0
+
         if warp_idx == self.load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_others)
 
@@ -822,6 +834,11 @@ class ChunkDeltaRuleFwdH:
                 work_idx = sWorkIdx[(0,)]
                 sched_buf = Int32(1)  # next buffer to write (0 was just written at init)
                 should_continue = work_idx < total_work_units
+                # Back-pressure: track whether consumers consumed the previous
+                # signal on each scheduling buffer to prevent ABA phase issue
+                first_wu = Int32(1)  # skip consumed wait on first iteration
+                consumed_phase0 = Int32(0)
+                consumed_phase1 = Int32(0)
             else:
                 should_continue = wu_iter < num_iters
 
@@ -838,6 +855,10 @@ class ChunkDeltaRuleFwdH:
                     seq_len = cu_seqlens[bidx + 1] - tok_offset
                     NT = (seq_len + BT - 1) // BT
                     data_bidx = Int32(0)
+                    if cutlass.const_expr(PRINT_DEBUG):
+                        if is_debug_cta:
+                            with cute.arch.elect_one():
+                                cute.printf("[LD] wi=%d bidx=%d NT=%d h0=%d\n", work_idx, bidx, NT, use_initial_state)
 
                 # Apply domain_offset for varlen TMA tensors (shift T dim by tok_offset)
                 if cutlass.const_expr(self.is_varlen):
@@ -879,13 +900,26 @@ class ChunkDeltaRuleFwdH:
 
                 # Issue TMA load for h0 before chunk loop (overlaps with chunk TMA loads)
                 if use_initial_state:
+                    if cutlass.const_expr(PRINT_DEBUG):
+                        if is_debug_cta:
+                            with cute.arch.elect_one():
+                                cute.printf("[LD] wi=%d h0_P.acq\n", work_idx)
                     h0_h = load_h0_P.acquire_and_advance()
                     cute.copy(atom=tma_atom_h0,
                               src=bSG_gH0[(None, 0, v_tile_idx)],
                               dst=bSG_sH0_ld[None, h0_h.index],
                               tma_bar_ptr=h0_h.barrier)
+                else:
+                    if cutlass.const_expr(PRINT_DEBUG):
+                        if is_debug_cta:
+                            with cute.arch.elect_one():
+                                cute.printf("[LD] wi=%d skip_h0\n", work_idx)
 
                 for chunk_idx in cutlass.range(0, NT, unroll=0):
+                    if cutlass.const_expr(PRINT_DEBUG):
+                        if is_debug_cta:
+                            with cute.arch.elect_one():
+                                cute.printf("[LD] wi=%d c=%d w_P.acq\n", work_idx, chunk_idx)
                     w_h = load_w_P.acquire_and_advance()
                     cute.copy(atom=tma_atom_w, src=tWgW[None, chunk_idx, 0],
                               dst=tWsW[None, w_h.index], tma_bar_ptr=w_h.barrier)
@@ -914,7 +948,22 @@ class ChunkDeltaRuleFwdH:
                                   tma_bar_ptr=gk_h.barrier)
 
                 # --- End-of-WU: Load warp fetches next work_idx and signals ---
+                if cutlass.const_expr(PRINT_DEBUG):
+                    if is_debug_cta:
+                        with cute.arch.elect_one():
+                            cute.printf("[LD] wi=%d end_wu\n", work_idx)
                 if cutlass.const_expr(self.is_varlen and self.persistent):
+                    # Back-pressure: wait for consumers to have consumed the
+                    # previous signal on sched_mbar[sched_buf] before re-producing.
+                    # Skip on first iteration (sched_buf=1 first use).
+                    if first_wu == Int32(0):
+                        if sched_buf == 0:
+                            cute.arch.mbarrier_wait(sched_consumed_mbar_base, consumed_phase0)
+                            consumed_phase0 = Int32(1) - consumed_phase0
+                        else:
+                            cute.arch.mbarrier_wait(sched_consumed_mbar_base + 1, consumed_phase1)
+                            consumed_phase1 = Int32(1) - consumed_phase1
+                    first_wu = Int32(0)
                     with cute.arch.elect_one():
                         next_idx = _atomic_add_global_i32(
                             workspace_iter.toint().ir_value(), Int32(1).ir_value())
@@ -953,8 +1002,16 @@ class ChunkDeltaRuleFwdH:
                     bidx_mma = (work_idx // num_v_tiles) // H
                     tok_off_mma = cu_seqlens[bidx_mma]
                     NT = (cu_seqlens[bidx_mma + 1] - tok_off_mma + BT - 1) // BT
+                    if cutlass.const_expr(PRINT_DEBUG):
+                        if is_debug_cta:
+                            with cute.arch.elect_one():
+                                cute.printf("[MMA] wi=%d NT=%d\n", work_idx, NT)
 
                 for chunk_idx in cutlass.range(0, NT, unroll=0):
+                    if cutlass.const_expr(PRINT_DEBUG):
+                        if is_debug_cta:
+                            with cute.arch.elect_one():
+                                cute.printf("[MMA] wi=%d c=%d state_C.wait\n", work_idx, chunk_idx)
                     # --- WH MMA: state(SMEM) × W(SMEM) → acc_wh ---
                     state_h = state_smem_C.wait_and_advance()
                     w_h = load_w_C.wait_and_advance()
@@ -987,8 +1044,16 @@ class ChunkDeltaRuleFwdH:
                     kv_h.commit()
                     kt_h.release()
                     vnew_h.release()
+                    if cutlass.const_expr(PRINT_DEBUG):
+                        if is_debug_cta:
+                            with cute.arch.elect_one():
+                                cute.printf("[MMA] wi=%d c=%d done\n", work_idx, chunk_idx)
 
                 # --- End-of-WU: wait for Load warp's scheduling signal ---
+                if cutlass.const_expr(PRINT_DEBUG):
+                    if is_debug_cta:
+                        with cute.arch.elect_one():
+                            cute.printf("[MMA] wi=%d end_wu, wait_sched\n", work_idx)
                 if cutlass.const_expr(self.is_varlen and self.persistent):
                     # Wait on mbar[sched_buf] at the right phase
                     if sched_buf == 0:
@@ -998,6 +1063,9 @@ class ChunkDeltaRuleFwdH:
                         cute.arch.mbarrier_wait(sched_mbar_base + 1, sched_phase1)
                         sched_phase1 = Int32(1) - sched_phase1
                     work_idx = sWorkIdx[(sched_buf,)]
+                    # Signal consumed: Load warp can reuse this sched buffer
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(sched_consumed_mbar_base + sched_buf)
                     sched_buf = Int32(1) - sched_buf
                     should_continue = work_idx < total_work_units
                 else:
@@ -1120,6 +1188,10 @@ class ChunkDeltaRuleFwdH:
                     NT = (seq_len + BT - 1) // BT
 
                 # ===== Initialize h in registers =====
+                if cutlass.const_expr(PRINT_DEBUG):
+                    if is_debug_cta:
+                        if local_tidx == 0:
+                            cute.printf("[CC] wi=%d NT=%d h0=%d\n", work_idx, NT, use_initial_state)
                 if use_initial_state:
                     # Wait for load warp's TMA h0 load into SMEM, then read from SMEM
                     h0_h = load_h0_C.wait_and_advance()
@@ -1137,6 +1209,10 @@ class ChunkDeltaRuleFwdH:
                 # (R2T/R2S publish h BEFORE gk_decay, so gk can be deferred safely)
 
                 for chunk_idx in cutlass.range(0, NT, unroll=0):
+                    if cutlass.const_expr(PRINT_DEBUG):
+                        if is_debug_cta:
+                            if local_tidx == 0:
+                                cute.printf("[CC] wi=%d c=%d state_P.acq\n", work_idx, chunk_idx)
                     # ========================================
                     # Phase 1: Publish h for WH MMA + h_out store
                     # ========================================
@@ -1255,6 +1331,10 @@ class ChunkDeltaRuleFwdH:
                     h_vec = tTR_rKV.load()
                     update_vec = tTR_rUpdate.load()
                     tTR_rKV.store(h_vec + update_vec)
+                    if cutlass.const_expr(PRINT_DEBUG):
+                        if is_debug_cta:
+                            if local_tidx == 0:
+                                cute.printf("[CC] wi=%d c=%d done\n", work_idx, chunk_idx)
 
                 # ===== After main loop: store final state ht (fp32 reg → fp32 GMEM) =====
                 if store_final_state:
@@ -1264,6 +1344,10 @@ class ChunkDeltaRuleFwdH:
                         gHt[v_coord + v_tile_idx * self.BV, k_coord] = tTR_rKV[ei]
 
                 # --- End-of-WU: wait for Load warp's scheduling signal ---
+                if cutlass.const_expr(PRINT_DEBUG):
+                    if is_debug_cta:
+                        if local_tidx == 0:
+                            cute.printf("[CC] wi=%d end_wu, wait_sched\n", work_idx)
                 if cutlass.const_expr(self.is_varlen and self.persistent):
                     if sched_buf == 0:
                         cute.arch.mbarrier_wait(sched_mbar_base, sched_phase0)
@@ -1272,6 +1356,9 @@ class ChunkDeltaRuleFwdH:
                         cute.arch.mbarrier_wait(sched_mbar_base + 1, sched_phase1)
                         sched_phase1 = Int32(1) - sched_phase1
                     work_idx = sWorkIdx[(sched_buf,)]
+                    # Signal consumed: CC has 4 warps, elect_one per warp → 4 arrives
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(sched_consumed_mbar_base + sched_buf)
                     sched_buf = Int32(1) - sched_buf
                     should_continue = work_idx < total_work_units
                 else:
@@ -1315,6 +1402,10 @@ class ChunkDeltaRuleFwdH:
                     NT = (seq_len + BT - 1) // BT
                     data_bidx = Int32(0)
                     chunk_off = chunk_offsets[bidx]
+                    if cutlass.const_expr(PRINT_DEBUG):
+                        if is_debug_cta:
+                            with cute.arch.elect_one():
+                                cute.printf("[ST] wi=%d NT=%d\n", work_idx, NT)
 
                 # Apply domain_offset for varlen store TMA tensors
                 if cutlass.const_expr(self.is_varlen):
@@ -1340,6 +1431,10 @@ class ChunkDeltaRuleFwdH:
                 )
 
                 for chunk_idx in cutlass.range(0, NT, unroll=0):
+                    if cutlass.const_expr(PRINT_DEBUG):
+                        if is_debug_cta:
+                            with cute.arch.elect_one():
+                                cute.printf("[ST] wi=%d c=%d hout_C.wait\n", work_idx, chunk_idx)
                     h_handle = h_out_C.wait_and_advance()
 
                     cute.copy(tma_h_st, bSG_sH[None, h_handle.index],
@@ -1422,6 +1517,10 @@ class ChunkDeltaRuleFwdH:
                         vnew_handle.release()
 
                 # --- End-of-WU: wait for Load warp's scheduling signal ---
+                if cutlass.const_expr(PRINT_DEBUG):
+                    if is_debug_cta:
+                        with cute.arch.elect_one():
+                            cute.printf("[ST] wi=%d end_wu, wait_sched\n", work_idx)
                 if cutlass.const_expr(self.is_varlen and self.persistent):
                     if sched_buf == 0:
                         cute.arch.mbarrier_wait(sched_mbar_base, sched_phase0)
@@ -1430,6 +1529,9 @@ class ChunkDeltaRuleFwdH:
                         cute.arch.mbarrier_wait(sched_mbar_base + 1, sched_phase1)
                         sched_phase1 = Int32(1) - sched_phase1
                     work_idx = sWorkIdx[(sched_buf,)]
+                    # Signal consumed: Store warp → 1 arrive
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(sched_consumed_mbar_base + sched_buf)
                     sched_buf = Int32(1) - sched_buf
                     should_continue = work_idx < total_work_units
                 else:
@@ -1455,6 +1557,9 @@ class ChunkDeltaRuleFwdH:
                         cute.arch.mbarrier_wait(sched_mbar_base + 1, sched_phase1)
                         sched_phase1 = Int32(1) - sched_phase1
                     work_idx = sWorkIdx[(sched_buf,)]
+                    # Signal consumed: Empty warp → 1 arrive
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(sched_consumed_mbar_base + sched_buf)
                     sched_buf = Int32(1) - sched_buf
 
         tmem.relinquish_alloc_permit()
