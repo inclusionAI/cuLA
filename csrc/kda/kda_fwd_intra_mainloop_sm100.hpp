@@ -42,18 +42,19 @@ struct KdaChunkFwdIntraMainloopSm100 {
     static constexpr int NumKIters   = HeadDim / TileK;
     static constexpr int ChunkSize   = 64;
     static constexpr int StagesLoad  = 2;
+    static constexpr int StagesMma   = 2;
 
-    // TODO: double buffer in TMEM, overlap prologue A matrix with MMA
+    // double buffer in TMEM, overlap prologue A matrix with MMA
     enum class TmemAllocation : uint32_t {
         QK = 0, // [0, 64]
         QK_02 = QK, // [0, 64]
         QK_13 = QK_02 + 16 * 65536, // [0, 64] +lane16
-        QG_INTER = QK + TileT, // [64, 96]
-        QG_INTER_02 = QG_INTER, // [64, 96]
-        QG_INTER_13 = QG_INTER_02 + 16 * 65536, // [64, 96] +lane16
-        QG_INTRA = QG_INTER + TileK, // [96, 128]
-        QG_INTRA_02 = QG_INTRA, // [96, 128]
-        QG_INTRA_13 = QG_INTRA_02 + 16 * 65536, // [96, 128] +lane16
+        QG_INTER = QK + TileT, // [64, 96], [320, 352]
+        QG_INTER_02 = QG_INTER, // [64, 96], [320, 352]
+        QG_INTER_13 = QG_INTER_02 + 16 * 65536, // [64, 96], [320, 352] +lane16
+        QG_INTRA = QG_INTER + TileK, // [96, 128], [352, 384]
+        QG_INTRA_02 = QG_INTRA, // [96, 128], [352, 384]
+        QG_INTRA_13 = QG_INTRA_02 + 16 * 65536, // [96, 128], [352, 384] +lane16
     };
 
     using TileScheduler = StaticPersistentTileScheduler;
@@ -129,7 +130,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
     using PipelineBeta = cutlass::PipelineAsync<2>;
 
-    using PipelineQKGInterReady = cutlass::PipelineUmmaConsumerAsync<1>;
+    using PipelineQKGInterReady = cutlass::PipelineUmmaConsumerAsync<StagesMma>;
 
     using PipelineQKDone = cutlass::PipelineAsync<1>;
 
@@ -169,7 +170,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
         struct {
             array_aligned<tf32, cosize_v<SmemLayoutMatBTF32<1>>> inter[6];
             array_aligned<tf32, cosize_v<SmemLayoutMatBTF32<1>>> intra[4];
-        } kg_all;
+        } kg_all[StagesMma];
 
         // inv(KK), single buffer
         array_aligned<fp16, cosize_v<SmemLayoutOutputFP16>> kk[1];
@@ -294,12 +295,6 @@ struct KdaChunkFwdIntraMainloopSm100 {
             int seq_len = cu_seqlens_ptr[batch_idx + 1] - cu_seqlens_ptr[batch_idx];
             int sub_seq_len = min(TileT, seq_len - tile_idx * TileT);
 
-            // B-matrix SMEM views (single-buffered kg_all)
-            // Each sub_tile occupies one SmemLayoutMatBTF32<1> = (16 × 32)
-            // inter[i] and intra[i] are indexed by KG_OFFSET * index inside the helper
-            Tensor sKG_inter = make_tensor(make_smem_ptr(shared_plan->kg_all.inter[0].data()), SmemLayoutMatBTF32<1>{});
-            Tensor sKG_intra = make_tensor(make_smem_ptr(shared_plan->kg_all.intra[0].data()), SmemLayoutMatBTF32<1>{});
-
             constexpr int kg_offset = SubTileT * TileK;  // stride between sub_tile buffers
 
             CUTE_NO_UNROLL
@@ -318,6 +313,12 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 Tensor sG = make_tensor(make_smem_ptr(shared_plan->g[g_pipe_state_read.index()].data()), SmemLayoutInputFP32{});
 
                 qkg_inter_pipeline.producer_acquire(qkg_inter_pipe_state_write);
+                int buf_idx = qkg_inter_pipe_state_write.index();
+                // B-matrix SMEM views (single-buffered kg_all)
+                // Each sub_tile occupies one SmemLayoutMatBTF32<1> = (16 × 32)
+                // inter[i] and intra[i] are indexed by KG_OFFSET * index inside the helper
+                Tensor sKG_inter = make_tensor(make_smem_ptr(shared_plan->kg_all[buf_idx].inter[0].data()), SmemLayoutMatBTF32<1>{});
+                Tensor sKG_intra = make_tensor(make_smem_ptr(shared_plan->kg_all[buf_idx].intra[0].data()), SmemLayoutMatBTF32<1>{});
 
                 // ============================================================
                 // A-matrix prologue: gated Q/K → TMEM (R2T) for all 4 subchunks
@@ -336,15 +337,15 @@ struct KdaChunkFwdIntraMainloopSm100 {
                     fwd_setup_A_inter_all_QK<HalfK>(
                         sG, sQ, sK,
                         idx_in_warpgroup, sub_seq_len, k_offset,
-                        static_cast<int>(TmemAllocation::QG_INTER),
-                        static_cast<int>(TmemAllocation::QG_INTER));
+                        static_cast<int>(TmemAllocation::QG_INTER) + buf_idx * 256,
+                        static_cast<int>(TmemAllocation::QG_INTER) + buf_idx * 256);
 
                     // Intra A-matrix: all 4 subchunks → QG_INTRA in TMEM
                     fwd_setup_A_intra_all_QK<HalfK>(
                         sG, sQ, sK,
                         idx_in_warpgroup, sub_seq_len, k_offset,
-                        static_cast<int>(TmemAllocation::QG_INTRA),
-                        static_cast<int>(TmemAllocation::QG_INTRA));
+                        static_cast<int>(TmemAllocation::QG_INTRA) + buf_idx * 256,
+                        static_cast<int>(TmemAllocation::QG_INTRA) + buf_idx * 256);
 
                     cutlass::arch::fence_view_async_tmem_store();
                     tcgen05_before_thread_sync();
@@ -540,6 +541,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 SharedMemoryPlan *sp = shared_plan;
                 asm volatile("" : "+l"(sp) :: "memory");
                 qkg_inter_pipeline.consumer_wait(qkg_inter_pipe_state_read);
+                int buf_idx = qkg_inter_pipe_state_read.index();
                     
                 // inter-chunk: (1,0), (2,0), (2,1), (3,0), (3,1), (3,2)
                 Tensor tQK_row1 = partition_fragment_C(tile_mma_qk_n16_mask02, make_shape(Int<TileT>{}, Int<SubTileT>{}));
@@ -560,22 +562,22 @@ struct KdaChunkFwdIntraMainloopSm100 {
                     Tensor tQ_1 = tile_mma_qk_n16_mask02.get_slice(_0{}).make_fragment_A(
                         partition_shape_A(tile_mma_qk_n16_mask02, Shape<Int<ChunkSize>, Int<TileK>>{})
                     );
-                    tQ_1.data() = uint32_t(TmemAllocation::QG_INTER_13);
-                    Tensor sKG_1 = make_tensor(make_smem_ptr(sp->kg_all.inter[0].data()), SmemLayoutMatBTF32<1>{});
+                    tQ_1.data() = uint32_t(TmemAllocation::QG_INTER_13) + buf_idx * 256;
+                    Tensor sKG_1 = make_tensor(make_smem_ptr(sp->kg_all[buf_idx].inter[0].data()), SmemLayoutMatBTF32<1>{});
                     utcmma_ts(tile_mma_qk_n16_mask02, tQ_1, sKG_1, tQK_row1, first_iter);
 
                     Tensor tQ_2 = tile_mma_qk_n32_mask13.get_slice(_0{}).make_fragment_A(
                         partition_shape_A(tile_mma_qk_n32_mask13, Shape<Int<ChunkSize>, Int<TileK>>{})
                     );
-                    tQ_2.data() = uint32_t(TmemAllocation::QG_INTER_02);
-                    Tensor sKG_2 = make_tensor(make_smem_ptr(sp->kg_all.inter[1].data()), SmemLayoutMatBTF32<2>{});
+                    tQ_2.data() = uint32_t(TmemAllocation::QG_INTER_02) + buf_idx * 256;
+                    Tensor sKG_2 = make_tensor(make_smem_ptr(sp->kg_all[buf_idx].inter[1].data()), SmemLayoutMatBTF32<2>{});
                     utcmma_ts(tile_mma_qk_n32_mask13, tQ_2, sKG_2, tQK_row2, first_iter);
 
                     Tensor tQ_3 = tile_mma_qk_n48_mask13.get_slice(_0{}).make_fragment_A(
                         partition_shape_A(tile_mma_qk_n48_mask13, Shape<Int<ChunkSize>, Int<TileK>>{})
                     );
-                    tQ_3.data() = uint32_t(TmemAllocation::QG_INTER_13);
-                    Tensor sKG_3 = make_tensor(make_smem_ptr(sp->kg_all.inter[3].data()), SmemLayoutMatBTF32<3>{});
+                    tQ_3.data() = uint32_t(TmemAllocation::QG_INTER_13) + buf_idx * 256;
+                    Tensor sKG_3 = make_tensor(make_smem_ptr(sp->kg_all[buf_idx].inter[3].data()), SmemLayoutMatBTF32<3>{});
                     utcmma_ts(tile_mma_qk_n48_mask13, tQ_3, sKG_3, tQK_row3, first_iter);
                 }
 
@@ -604,29 +606,29 @@ struct KdaChunkFwdIntraMainloopSm100 {
                     Tensor tQ_0 = tile_mma_qk_n16_mask02.get_slice(_0{}).make_fragment_A(
                         partition_shape_A(tile_mma_qk_n16_mask02, Shape<Int<ChunkSize>, Int<TileK>>{})
                     );
-                    tQ_0.data() = uint32_t(TmemAllocation::QG_INTRA_02);
-                    Tensor sKG_0 = make_tensor(make_smem_ptr(sp->kg_all.intra[0].data()), SmemLayoutMatBTF32<1>{});
+                    tQ_0.data() = uint32_t(TmemAllocation::QG_INTRA_02) + buf_idx * 256;
+                    Tensor sKG_0 = make_tensor(make_smem_ptr(sp->kg_all[buf_idx].intra[0].data()), SmemLayoutMatBTF32<1>{});
                     utcmma_ts(tile_mma_qk_n16_mask02, tQ_0, sKG_0, tQK_00, first_iter);
 
                     Tensor tQ_1 = tile_mma_qk_n16_mask02.get_slice(_0{}).make_fragment_A(
                         partition_shape_A(tile_mma_qk_n16_mask02, Shape<Int<ChunkSize>, Int<TileK>>{})
                     );
-                    tQ_1.data() = uint32_t(TmemAllocation::QG_INTRA_13);
-                    Tensor sKG_1 = make_tensor(make_smem_ptr(sp->kg_all.intra[1].data()), SmemLayoutMatBTF32<1>{});
+                    tQ_1.data() = uint32_t(TmemAllocation::QG_INTRA_13) + buf_idx * 256;
+                    Tensor sKG_1 = make_tensor(make_smem_ptr(sp->kg_all[buf_idx].intra[1].data()), SmemLayoutMatBTF32<1>{});
                     utcmma_ts(tile_mma_qk_n16_mask02, tQ_1, sKG_1, tQK_11, first_iter);
 
                     Tensor tQ_2 = tile_mma_qk_n16_mask02.get_slice(_0{}).make_fragment_A(
                         partition_shape_A(tile_mma_qk_n16_mask02, Shape<Int<ChunkSize>, Int<TileK>>{})
                     );
-                    tQ_2.data() = uint32_t(TmemAllocation::QG_INTRA_02);
-                    Tensor sKG_2 = make_tensor(make_smem_ptr(sp->kg_all.intra[2].data()), SmemLayoutMatBTF32<1>{});
+                    tQ_2.data() = uint32_t(TmemAllocation::QG_INTRA_02) + buf_idx * 256;
+                    Tensor sKG_2 = make_tensor(make_smem_ptr(sp->kg_all[buf_idx].intra[2].data()), SmemLayoutMatBTF32<1>{});
                     utcmma_ts(tile_mma_qk_n16_mask13, tQ_2, sKG_2, tQK_22, first_iter);
 
                     Tensor tQ_3 = tile_mma_qk_n16_mask02.get_slice(_0{}).make_fragment_A(
                         partition_shape_A(tile_mma_qk_n16_mask02, Shape<Int<ChunkSize>, Int<TileK>>{})
                     );
-                    tQ_3.data() = uint32_t(TmemAllocation::QG_INTRA_13);
-                    Tensor sKG_3 = make_tensor(make_smem_ptr(sp->kg_all.intra[3].data()), SmemLayoutMatBTF32<1>{});
+                    tQ_3.data() = uint32_t(TmemAllocation::QG_INTRA_13) + buf_idx * 256;
+                    Tensor sKG_3 = make_tensor(make_smem_ptr(sp->kg_all[buf_idx].intra[3].data()), SmemLayoutMatBTF32<1>{});
                     utcmma_ts(tile_mma_qk_n16_mask13, tQ_3, sKG_3, tQK_33, first_iter);
 
                 }

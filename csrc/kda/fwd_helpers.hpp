@@ -418,9 +418,6 @@ __forceinline__ __device__ void fwd_setup_A_intra_QK(
 //   Warp 2 (threads 64-95):  K rows 0-31   → TMEM lanes 64-95
 //   Warp 3 (threads 96-127): K rows 32-63  → TMEM lanes 96-127 (lane16 offset)
 // All 128 TMEM lanes are covered by one WG (128 threads).
-//
-// FIXME: redundant write
-// When 2 WGs call this function, both write the same data → idempotent / redundant.
 
 // fwd_setup_A_inter_all: all 4 sub_tiles, inter gating, single Vec (Q or K)
 template <int TileK, typename G_TENSOR, typename VEC_TENSOR>
