@@ -1,167 +1,346 @@
-import sys, pathlib
+#!/usr/bin/env python3
+"""
+bench_kda.py — Benchmark: flashla CuTe DSL vs FLA Triton baseline
+               for chunk_kda (KDA forward)
+
+Compares:
+  - Accuracy: RMSE, relative max diff between flashla and FLA outputs
+  - Performance: kernel execution time (ms) with CUDA events
+
+Modes:
+  - Fixed-length: B=1, B=2 with various T
+  - Varlen: ~20 seqs with 2-3x length variation
+
+Usage:
+  python bench_kda.py [--mode fixed|varlen|both] [--ncu]
+
+With --ncu, warmup=1 and iters=1 for ncu profiling:
+  ncu --set full -o report python bench_kda.py --mode varlen --ncu
+"""
+
+import sys
+import pathlib
+import argparse
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-import os
 
 import torch
-import triton
 
 from fla.ops.kda import chunk_kda as fla_chunk_kda
-from benchmarks.utils import (
-    set_seed, exclusive_cumsum, generate_random_seq_lens,
-    prepare_safe_gate_inputs,
-    SEED,
-)
-
 from flashla.kda.chunk import chunk_kda as flashla_chunk_kda
-
-# Constant params
-B, H, D = 2, 64, 128
-
-# Varlen benchmark params
-NUM_SEQS = 8 # 序列个数
-TOTAL_LEN = 8192  # 总长度
-MIN_SEQ_LEN = 63  # 最小序列长度
-VARIANCE = 1.0  # 方差控制: 0.0=均衡, 1.0=正常随机, >1.0=更不均衡
-
-# hardcoded real-world training traces
-VARLEN_TRACES = {
-    4096: [0, 652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236, 5543, 6255, 6480, 6947, 7616, 8192],
-    8192:  [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192],
-    16384: [0, 315, 973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459, 6318, 6669, 6979, 7583, 8192],
-    32768: [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
-}
-
-
-# ==============================================================================
-# Benchmark 1: safe_gate (use_gate_in_kernel=True, safe_gate=True), uniform seqlen
-# ==============================================================================
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=['T'],
-        x_vals=[128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
-        line_arg='provider',
-        line_vals=['flashla', 'fla'],
-        line_names=['flashla', 'fla'],
-        styles=[('blue', '-'), ('green', '-'), ('red', '-.'),
-                ('orange', '-.'), ('purple', '-'), ('brown', '-.'), ('pink', '-'), ('gray', '-.')],
-        ylabel="Execution Time (ms)",
-        plot_name=f"Performance_B{B}_H{H}",
-        args={},
-    ),
+from benchmarks.utils import (
+    set_seed, exclusive_cumsum, prepare_safe_gate_inputs, SEED,
 )
-def benchmark_safe_gate(T, provider):
-    set_seed(SEED)
-    device = torch.device("cuda")
 
-    seq_lens = [T] * B
-    cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
+# ============================================================
+# Constants
+# ============================================================
+H, D = 64, 128
+WARMUP = 10
+N_ITERS = 100
+NCU_MODE = False
+SANITIZER_MODE = False
 
-    inputs = prepare_safe_gate_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens)
-    q, k, v, g, beta = inputs['q'], inputs['k'], inputs['v'], inputs['g'], inputs['beta']
-    A_log, dt_bias = inputs['A_log'], inputs['dt_bias']
-    scale, init_state, lower_bound = inputs['scale'], inputs['init_state'], inputs['lower_bound']
 
-    quantiles = [0.5, 0.2, 0.8]
+# ============================================================
+# Helpers
+# ============================================================
+def time_kernel(fn, warmup=None, n_iters=None):
+    if warmup is None:
+        warmup = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
+    if n_iters is None:
+        n_iters = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt = torch.cuda.Event(enable_timing=True)
+    start_evt.record()
+    for _ in range(n_iters):
+        fn()
+    end_evt.record()
+    torch.cuda.synchronize()
+    return start_evt.elapsed_time(end_evt) / n_iters
 
-    if provider == 'flashla':
-        results = triton.testing.do_bench(
-            lambda: flashla_chunk_kda(
-                q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-                A_log=A_log, dt_bias=dt_bias,
-                initial_state=init_state, output_final_state=True,
-                use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
-                use_gate_in_kernel=True, safe_gate=True, lower_bound=lower_bound,
-            ),
-            quantiles=quantiles,
-        )
-    elif provider == 'fla':
-        results = triton.testing.do_bench(
-            lambda: fla_chunk_kda(
-                q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-                A_log=A_log, dt_bias=dt_bias,
-                initial_state=init_state, output_final_state=True,
-                use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
-                use_gate_in_kernel=True, safe_gate=True, lower_bound=lower_bound,
-            ),
-            quantiles=quantiles,
-        )
+
+def accuracy_stats(ref, out):
+    """Compute RMSE, relative max diff, and mean absolute difference."""
+    ref_f = ref.float()
+    out_f = out.float()
+    diff = (ref_f - out_f).abs()
+    rmse = diff.pow(2).mean().sqrt().item()
+    max_diff = diff.max().item()
+    denom = ref_f.abs().max().item()
+    rel_max = max_diff / denom if denom > 0 else 0.0
+    mean_diff = diff.mean().item()
+    return rmse, rel_max, mean_diff
+
+
+def gen_varlen_seqs(target_total, n_seqs, seed=0):
+    """Generate n_seqs random seq lengths summing to target_total.
+    Lengths vary ~2-3x (log-uniform-ish), each rounded up to multiple of 2."""
+    import random
+    rng = random.Random(seed)
+    raw = [rng.uniform(0.4, 1.0) for _ in range(n_seqs)]
+    s = sum(raw)
+    lens = [max(2, round(r / s * target_total / 2) * 2) for r in raw]
+    diff = target_total - sum(lens)
+    lens[-1] += diff
+    if lens[-1] < 2:
+        lens[-1] = 2
+    return lens
+
+
+def run_kda(q, k, v, g, beta, scale, A_log, dt_bias,
+            init_state, cu_seqlens, lower_bound, fn):
+    return fn(
+        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+        A_log=A_log, dt_bias=dt_bias,
+        initial_state=init_state, output_final_state=True,
+        use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
+        use_gate_in_kernel=True, safe_gate=True, lower_bound=lower_bound,
+    )
+
+
+# ============================================================
+# Fixed-length benchmark
+# ============================================================
+def bench_fixed(configs):
+    print("\n" + "=" * 100)
+    print(" Fixed-Length Benchmark: flashla CuTe DSL vs FLA Triton")
+    print("=" * 100)
+    results = []
+
+    for B, T in configs:
+        set_seed(SEED)
+        device = torch.device("cuda")
+        torch.cuda.empty_cache()
+
+        seq_lens = [T] * B
+        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
+
+        inputs = prepare_safe_gate_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens)
+        q, k, v, g, beta = inputs['q'], inputs['k'], inputs['v'], inputs['g'], inputs['beta']
+        A_log, dt_bias = inputs['A_log'], inputs['dt_bias']
+        scale, init_state, lower_bound = inputs['scale'], inputs['init_state'], inputs['lower_bound']
+
+        common = dict(q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                      A_log=A_log, dt_bias=dt_bias, init_state=init_state,
+                      cu_seqlens=cu_seqlens, lower_bound=lower_bound)
+
+        # Accuracy: compare outputs
+        o_fla, _ = run_kda(**common, fn=fla_chunk_kda)
+        o_flashla, _ = run_kda(**common, fn=flashla_chunk_kda)
+        torch.cuda.synchronize()
+
+        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_flashla)
+
+        # Performance
+        def fn_fla(**common_kw):
+            return lambda: run_kda(**common_kw, fn=fla_chunk_kda)
+
+        def fn_flashla(**common_kw):
+            return lambda: run_kda(**common_kw, fn=flashla_chunk_kda)
+
+        ms_fla = time_kernel(fn_fla(**common))
+        ms_flashla = time_kernel(fn_flashla(**common))
+        speedup = ms_fla / ms_flashla if ms_flashla > 0 else float('inf')
+
+        r = {
+            'B': B, 'T': T,
+            'rmse': rmse, 'rel_max': rel_max, 'mean_diff': mean_diff,
+            'ms_fla': ms_fla, 'ms_flashla': ms_flashla, 'speedup': speedup,
+        }
+        results.append(r)
+        print(f"  B={B:2d} T={T:5d} | "
+              f"RMSE={rmse:.6f} rel_max={rel_max:.6f} mean_diff={mean_diff:.8f} | "
+              f"FLA={ms_fla:.4f}ms flashla={ms_flashla:.4f}ms | "
+              f"speedup={speedup:.2f}x")
+
+        del o_fla, o_flashla, q, k, v, g, beta, A_log, dt_bias, inputs
+        torch.cuda.empty_cache()
 
     return results
 
-# ==============================================================================
-# Benchmark 2: varlen safe_gate
-# ==============================================================================
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=['total_len'],
-        x_vals=[4096, 8192, 16384, 32768],
-        line_arg='provider',
-        line_vals=['flashla', 'fla'],
-        line_names=['flashla', 'fla'],
-        styles=[('blue', '-'), ('green', '-'), ('red', '-.')],
-        ylabel="Execution Time (ms)",
-        plot_name=f"Performance_varlen_NSEQ{NUM_SEQS}_H{H}_VAR{VARIANCE}",
-        args={},
-    ),
-)
-def benchmark_varlen_safe_gate(total_len, provider):
-    """
-    Varlen 版本的 benchmark，支持配置：
-    - NUM_SEQS: 序列个数 (使用全局变量)
-    - total_len: 总长度 (x轴)
-    - MIN_SEQ_LEN: 最小序列长度 (使用全局变量)
-    - VARIANCE: 方差控制 (使用全局变量)
-    """
-    set_seed(SEED)
-    device = torch.device("cuda")
 
-    seq_lens = generate_random_seq_lens(NUM_SEQS, total_len, MIN_SEQ_LEN, VARIANCE, 42)
-    T = total_len
-    cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
-    # hardcoded real-world training traces
-    # T = 8192
-    # cu_seqlens = torch.tensor(VARLEN_TRACES[total_len], dtype=torch.int32, device=device)
+# ============================================================
+# Varlen benchmark
+# ============================================================
+def bench_varlen(configs):
+    print("\n" + "=" * 100)
+    print(" Varlen Benchmark: flashla CuTe DSL vs FLA Triton")
+    print("=" * 100)
+    results = []
 
-    inputs = prepare_safe_gate_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens)
-    q, k, v, g, beta = inputs['q'], inputs['k'], inputs['v'], inputs['g'], inputs['beta']
-    A_log, dt_bias = inputs['A_log'], inputs['dt_bias']
-    scale, init_state, lower_bound = inputs['scale'], inputs['init_state'], inputs['lower_bound']
+    for seq_lens, total_len in configs:
+        set_seed(SEED)
+        device = torch.device("cuda")
+        torch.cuda.empty_cache()
 
-    quantiles = [0.5, 0.2, 0.8]
+        T = total_len
+        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-    if provider == 'flashla':
-        results = triton.testing.do_bench(
-            lambda: flashla_chunk_kda(
-                q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-                A_log=A_log, dt_bias=dt_bias,
-                initial_state=init_state, output_final_state=True,
-                use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
-                use_gate_in_kernel=True, safe_gate=True, lower_bound=lower_bound,
-            ),
-            quantiles=quantiles,
-        )
-    elif provider == 'fla':
-        results = triton.testing.do_bench(
-            lambda: fla_chunk_kda(
-                q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-                A_log=A_log, dt_bias=dt_bias,
-                initial_state=init_state, output_final_state=True,
-                use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
-                use_gate_in_kernel=True, safe_gate=True, lower_bound=lower_bound,
-            ),
-            quantiles=quantiles,
-        )
+        inputs = prepare_safe_gate_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens)
+        q, k, v, g, beta = inputs['q'], inputs['k'], inputs['v'], inputs['g'], inputs['beta']
+        A_log, dt_bias = inputs['A_log'], inputs['dt_bias']
+        scale, init_state, lower_bound = inputs['scale'], inputs['init_state'], inputs['lower_bound']
+
+        common = dict(q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+                      A_log=A_log, dt_bias=dt_bias, init_state=init_state,
+                      cu_seqlens=cu_seqlens, lower_bound=lower_bound)
+
+        # Accuracy
+        o_fla, _ = run_kda(**common, fn=fla_chunk_kda)
+        o_flashla, _ = run_kda(**common, fn=flashla_chunk_kda)
+        torch.cuda.synchronize()
+
+        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_flashla)
+
+        # Performance
+        def fn_fla(**common_kw):
+            return lambda: run_kda(**common_kw, fn=fla_chunk_kda)
+
+        def fn_flashla(**common_kw):
+            return lambda: run_kda(**common_kw, fn=flashla_chunk_kda)
+
+        ms_fla = time_kernel(fn_fla(**common))
+        ms_flashla = time_kernel(fn_flashla(**common))
+        speedup = ms_fla / ms_flashla if ms_flashla > 0 else float('inf')
+
+        n_seqs = len(seq_lens)
+        min_l, max_l = min(seq_lens), max(seq_lens)
+        avg_l = T // n_seqs
+        tag = f"{n_seqs}seqs T={T} [{min_l}..{max_l}] avg={avg_l}"
+
+        r = {
+            'tag': tag, 'T_total': T, 'n_seqs': n_seqs,
+            'rmse': rmse, 'rel_max': rel_max, 'mean_diff': mean_diff,
+            'ms_fla': ms_fla, 'ms_flashla': ms_flashla, 'speedup': speedup,
+        }
+        results.append(r)
+        print(f"  {tag:45s} | "
+              f"RMSE={rmse:.6f} rel_max={rel_max:.6f} mean_diff={mean_diff:.8f} | "
+              f"FLA={ms_fla:.4f}ms flashla={ms_flashla:.4f}ms | "
+              f"speedup={speedup:.2f}x")
+
+        del o_fla, o_flashla, q, k, v, g, beta, A_log, dt_bias, inputs
+        torch.cuda.empty_cache()
 
     return results
+
+
+# ============================================================
+# Report
+# ============================================================
+def print_report(fixed_results, varlen_results):
+    sep = "=" * 110
+    print(f"\n\n{sep}")
+    print("                       BENCHMARK REPORT: chunk_kda")
+    print("                       flashla CuTe DSL vs FLA Triton")
+    print(f"                       H={H}  D={D}  dtype=bf16  safe_gate=True")
+    wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
+    ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
+    mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
+    print(f"                       Warmup={wu}  Iters={ni}{mode_tag}")
+    print(sep)
+
+    if fixed_results:
+        print("\n  [Fixed-Length]")
+        print(f"  {'─' * 100}")
+        print(f"  {'B':>3s}  {'T':>5s}  │  {'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
+              f"  │  {'FLA(ms)':>9s}  {'flashla(ms)':>11s}  {'Speedup':>8s}")
+        print(f"  {'─' * 100}")
+        for r in fixed_results:
+            print(f"  {r['B']:3d}  {r['T']:5d}  │  "
+                  f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                  f"{r['ms_fla']:9.4f}  {r['ms_flashla']:11.4f}  {r['speedup']:7.2f}x")
+        print(f"  {'─' * 100}")
+
+    if varlen_results:
+        print("\n  [Varlen]")
+        print(f"  {'─' * 115}")
+        print(f"  {'Config':>45s}  │  {'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
+              f"  │  {'FLA(ms)':>9s}  {'flashla(ms)':>11s}  {'Speedup':>8s}")
+        print(f"  {'─' * 115}")
+        for r in varlen_results:
+            print(f"  {r['tag']:>45s}  │  "
+                  f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                  f"{r['ms_fla']:9.4f}  {r['ms_flashla']:11.4f}  {r['speedup']:7.2f}x")
+        print(f"  {'─' * 115}")
+
+    print(f"\n{sep}\n")
+
+
+# ============================================================
+# Main
+# ============================================================
+def main():
+    parser = argparse.ArgumentParser(
+        description="bench_kda: flashla CuTe DSL vs FLA Triton baseline"
+    )
+    parser.add_argument(
+        "--mode", type=str, default="both",
+        choices=["fixed", "varlen", "both"],
+        help="Which benchmark mode to run (default: both)",
+    )
+    parser.add_argument(
+        "--ncu", action="store_true",
+        help="NCU profiling mode: warmup=1, iters=1",
+    )
+    parser.add_argument(
+        "--sanitizer", action="store_true",
+        help="Sanitizer mode: warmup=1, iters=1 (avoid Triton memory leak under compute-sanitizer)",
+    )
+    args = parser.parse_args()
+
+    global NCU_MODE, SANITIZER_MODE
+    if args.ncu:
+        NCU_MODE = True
+        print("[NCU mode] warmup=1, iters=1")
+    if args.sanitizer:
+        SANITIZER_MODE = True
+        print("[Sanitizer mode] warmup=1, iters=1")
+
+    fixed_configs = [
+        # (B, T)
+        (1, 128), (1, 256), (1, 512), (1, 1024), (1, 2048),
+        (1, 4096), (1, 8192), (1, 16384),
+        (2, 128), (2, 256), (2, 512), (2, 1024), (2, 2048),
+        (2, 4096), (2, 8192), (2, 16384),
+    ]
+
+    varlen_configs = [
+        # (seq_lens, total_len)
+        # Single sequence
+        ([4096], 4096),
+        ([8192], 8192),
+        ([16384], 16384),
+        # Normal varlen (~20-25 seqs, 2-3x variation)
+        (gen_varlen_seqs(4096, 20, seed=1), 4096),
+        (gen_varlen_seqs(8192, 20, seed=2), 8192),
+        (gen_varlen_seqs(8192, 25, seed=3), 8192),
+        (gen_varlen_seqs(16384, 20, seed=4), 16384),
+        (gen_varlen_seqs(16384, 25, seed=5), 16384),
+        # Extreme varlen: 1 long seq + many short seqs
+        ([4096 - 19 * 64] + [64] * 19, 4096),
+        ([8192 - 19 * 64] + [64] * 19, 8192),
+        ([16384 - 19 * 64] + [64] * 19, 16384),
+        # Extreme varlen: many tiny seqs + 1 huge seq
+        ([64] * 19 + [4096 - 19 * 64], 4096),
+        ([64] * 19 + [8192 - 19 * 64], 8192),
+        ([64] * 19 + [16384 - 19 * 64], 16384),
+    ]
+
+    fixed_res, varlen_res = [], []
+
+    if args.mode in ("fixed", "both"):
+        fixed_res = bench_fixed(fixed_configs)
+
+    if args.mode in ("varlen", "both"):
+        varlen_res = bench_varlen(varlen_configs)
+
+    print_report(fixed_res, varlen_res)
+
 
 if __name__ == "__main__":
-    # run_state_combo_sweep(B=2)
-    # run_safe_gate_sweep(B_list=[1, 2, 4])
-    # Fixed-length benchmarks
-    output_dir = "./bench_safe_gate"
-    os.makedirs(output_dir, exist_ok=True)
-    benchmark_safe_gate.run(print_data=True, save_path=output_dir)
-    # Varlen benchmarks
-    output_dir = "./bench_varlen_safe_gate"
-    os.makedirs(output_dir, exist_ok=True)
-    benchmark_varlen_safe_gate.run(print_data=True, save_path=output_dir)
+    main()

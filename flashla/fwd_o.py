@@ -1122,7 +1122,7 @@ class ChunkGlaFwdO:
                     q_h = load_q_C.wait_and_advance()
                     g_h = load_g_C.wait_and_advance()
 
-                    for ei in cutlass.range_constexpr(cute.size(tTR_rQG_fp32)):
+                    for ei in cutlass.range(cute.size(tTR_rQG_fp32), unroll_full=True):
                         bt_coord, bk_coord = tTR_cM_qg[ei]
                         if cutlass.const_expr(self.is_varlen):
                             # Unconditional loads — safe because SMEM always
@@ -1149,7 +1149,7 @@ class ChunkGlaFwdO:
                 # ============ Compute AM: tril(A) with varlen boundary mask ============
                 a_h = load_a_C.wait_and_advance()
 
-                for ei in cutlass.range_constexpr(cute.size(tRT_rAM)):
+                for ei in cutlass.range(cute.size(tRT_rAM), unroll_full=True):
                     coord_val = tRS_cM_am[ei]
                     m0, m1, m2, m3 = coord_val
                     sub0, sub1 = m0
