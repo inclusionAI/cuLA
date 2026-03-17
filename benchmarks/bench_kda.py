@@ -37,7 +37,7 @@ from benchmarks.utils import (
 # ============================================================
 H, D = 64, 128
 WARMUP = 10
-N_ITERS = 100
+N_ITERS = 30
 NCU_MODE = False
 SANITIZER_MODE = False
 

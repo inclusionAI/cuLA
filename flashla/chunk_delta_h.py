@@ -1200,7 +1200,7 @@ class ChunkDeltaRuleFwdH:
                         tTR_rKV[ei] = sH0[(k_coord, v_coord, 0)]
                     h0_h.release()
                 else:
-                    for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
+                    for ei in cutlass.range(cute.size(tTR_rKV), unroll_full=True):
                         tTR_rKV[ei] = Float32(0.0)
 
                 # ===== Main loop (gk-only optimized pipeline) =====
