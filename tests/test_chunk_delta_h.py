@@ -32,7 +32,8 @@ device = "cuda"
 
 
 def run_fla_ref(k, w, u, g=None, gk=None, initial_state=None,
-                output_final_state=False, save_new_value=True):
+                output_final_state=False, save_new_value=True,
+                cu_seqlens=None):
     """Call FLA's Triton kernel as reference."""
     return fla_fwd_h(
         k=k, w=w, u=u,
@@ -41,11 +42,13 @@ def run_fla_ref(k, w, u, g=None, gk=None, initial_state=None,
         output_final_state=output_final_state,
         chunk_size=BT,
         save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
     )
 
 
 def run_cute_dsl(k, w, u, g=None, gk=None, initial_state=None,
-                 output_final_state=False, save_new_value=True):
+                 output_final_state=False, save_new_value=True,
+                 cu_seqlens=None):
     """Call CuTe DSL kernel wrapper (FLA-compatible API) and return (h_out, v_new, ht)."""
     return chunk_gated_delta_rule_fwd_h(
         k=k, w=w, u=u,
@@ -54,6 +57,7 @@ def run_cute_dsl(k, w, u, g=None, gk=None, initial_state=None,
         output_final_state=output_final_state,
         chunk_size=BT,
         save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
     )
 
 
@@ -138,6 +142,112 @@ def test_vnew_no_gating(B, T, H, K, V):
         our_vnew.float(), ref_vnew.float(),
         atol=1e-2, rtol=1e-2,
         msg=f"v_new no-gating mismatch B={B} T={T} H={H}",
+    )
+
+
+# ===================== Varlen pytest tests =====================
+
+def _make_varlen_inputs(seq_lens, H, K, V, use_gk=False, use_h0=False, seed=42):
+    """Create varlen-packed tensors in FLA convention: [1, T_total, H, D]."""
+    T_total = sum(seq_lens)
+    num_seqs = len(seq_lens)
+    cu_seqlens_list = [0]
+    for sl in seq_lens:
+        cu_seqlens_list.append(cu_seqlens_list[-1] + sl)
+
+    torch.manual_seed(seed)
+    k = torch.randn(1, T_total, H, K, dtype=torch.bfloat16, device=device) * 0.1
+    w = torch.randn(1, T_total, H, K, dtype=torch.bfloat16, device=device) * 0.1
+    u = torch.randn(1, T_total, H, V, dtype=torch.bfloat16, device=device) * 0.1
+
+    gk_val = None
+    if use_gk:
+        # Per-sequence cumsum (reset at sequence boundaries)
+        gk_val = torch.zeros(1, T_total, H, K, dtype=torch.float32, device=device)
+        for i in range(num_seqs):
+            bos, eos = cu_seqlens_list[i], cu_seqlens_list[i + 1]
+            seg = torch.randn(1, eos - bos, H, K, dtype=torch.float32, device=device) * 0.1
+            gk_val[:, bos:eos] = -torch.abs(seg).cumsum(dim=1)
+
+    h0 = None
+    if use_h0:
+        h0 = torch.randn(num_seqs, H, K, V, dtype=torch.float32, device=device) * 0.01
+
+    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.long, device=device)
+    return k, w, u, gk_val, h0, cu_seqlens
+
+
+@pytest.mark.parametrize("seq_lens", [
+    [128, 128],
+    [50, 192, 100],
+    [33, 128, 200, 95],
+])
+@pytest.mark.parametrize("H", [1, 4])
+@pytest.mark.parametrize("use_gk", [False, True])
+@pytest.mark.parametrize("use_h0", [False, True])
+def test_varlen_against_fla(seq_lens, H, use_gk, use_h0):
+    """Test varlen CuTe DSL h_out/v_new/ht matches FLA's Triton kernel."""
+    K, V = 128, 128
+    k, w, u, gk_val, h0, cu_seqlens = _make_varlen_inputs(
+        seq_lens, H, K, V, use_gk=use_gk, use_h0=use_h0,
+    )
+
+    ref_h, ref_vnew, ref_ht = run_fla_ref(
+        k, w, u, gk=gk_val, initial_state=h0,
+        output_final_state=use_h0, save_new_value=True,
+        cu_seqlens=cu_seqlens,
+    )
+    our_h, our_vnew, our_ht = run_cute_dsl(
+        k, w, u, gk=gk_val, initial_state=h0,
+        output_final_state=use_h0, save_new_value=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+    torch.testing.assert_close(
+        our_h.float(), ref_h.float(),
+        atol=1e-2, rtol=1e-2,
+        msg=f"varlen h_out mismatch seqs={seq_lens} H={H} gk={use_gk} h0={use_h0}",
+    )
+    if ref_vnew is not None and our_vnew is not None:
+        torch.testing.assert_close(
+            our_vnew.float(), ref_vnew.float(),
+            atol=1e-2, rtol=1e-2,
+            msg=f"varlen v_new mismatch seqs={seq_lens} H={H} gk={use_gk} h0={use_h0}",
+        )
+    if use_h0 and ref_ht is not None and our_ht is not None:
+        torch.testing.assert_close(
+            our_ht.float(), ref_ht.float(),
+            atol=1e-2, rtol=1e-2,
+            msg=f"varlen ht mismatch seqs={seq_lens} H={H} gk={use_gk} h0={use_h0}",
+        )
+
+
+def test_varlen_vs_nonvarlen():
+    """Test that varlen with a single sequence matches non-varlen output."""
+    H, K, V = 2, 128, 128
+    T = 256
+
+    torch.manual_seed(42)
+    k = torch.randn(1, T, H, K, dtype=torch.bfloat16, device=device) * 0.1
+    w = torch.randn(1, T, H, K, dtype=torch.bfloat16, device=device) * 0.1
+    u = torch.randn(1, T, H, V, dtype=torch.bfloat16, device=device) * 0.1
+
+    # Non-varlen
+    h_nv, vnew_nv, _ = run_cute_dsl(k, w, u, save_new_value=True)
+
+    # Varlen with single sequence (should be identical)
+    cu_seqlens = torch.tensor([0, T], dtype=torch.long, device=device)
+    h_vl, vnew_vl, _ = run_cute_dsl(k, w, u, save_new_value=True, cu_seqlens=cu_seqlens)
+
+    torch.testing.assert_close(
+        h_nv.float(), h_vl.float(),
+        atol=1e-6, rtol=1e-6,
+        msg="varlen vs non-varlen h_out mismatch for single sequence",
+    )
+    torch.testing.assert_close(
+        vnew_nv.float(), vnew_vl.float(),
+        atol=1e-6, rtol=1e-6,
+        msg="varlen vs non-varlen v_new mismatch for single sequence",
     )
 
 
