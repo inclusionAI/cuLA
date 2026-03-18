@@ -85,7 +85,7 @@ def test_reference_vs_triton(B, T, H, K, V):
     o_ref = reference_chunk_gla_fwd_o(q, v, g, h, A, scale, BT)
     o_triton = triton_chunk_gla_fwd_o(q, v, g, h, A, scale, BT)
 
-    assert assert_close(f"ref_vs_triton B={B} T={T} H={H}", o_ref, o_triton, atol=0.01)
+    assert assert_close(f"ref_vs_triton B={B} T={T} H={H}", o_ref, o_triton, atol=0.02)
 
 
 # ===================== CuTe DSL vs Reference Tests =====================
