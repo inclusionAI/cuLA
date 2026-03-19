@@ -45,7 +45,14 @@ struct KdaChunkFwdIntraMainloopSm100 {
     static constexpr int StagesMma   = 2;
     static constexpr int StagesAcc   = 2;
 
+    // matrix inversion config
     static constexpr bool UseTF32Inverse = true;
+    // NOTE: when enbale RoundingTF32=true, do x+=0x1000u for rounding, 
+    // theoretically better precision, but lower performance
+    // otherwise, better performance but theoretically lower precision
+    // default to false, because FLA impl uses tl.dot directly which does not use rounding
+    // ref: https://triton-lang.org/main/python-api/generated/triton.language.dot.html
+    static constexpr bool RoundingTF32   = false;
 
     // double buffer in TMEM, overlap prologue A matrix with MMA
     enum class TmemAllocation : uint32_t {
@@ -148,7 +155,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
     using CollectiveInverse = std::conditional_t<
         !UseTF32Inverse, 
         flashla::CollectiveInverse<InverseType, true, false>,
-        flashla::CollectiveInverseTF32<InverseType, true, false>
+        flashla::CollectiveInverseTF32<InverseType, true, false, RoundingTF32>
     >;
 
     // ===================== GMEM Store ===========
@@ -467,7 +474,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 Tensor sKK = make_tensor(make_smem_ptr(shared_plan->kk[buf_acc_idx].data()), SmemLayoutInvKK{});
 
                 if (wg_idx == 0) {
-                    fwd_epilogue_qk_kk<TileT, UseTF32Inverse>(
+                    fwd_epilogue_qk_kk<TileT, UseTF32Inverse, RoundingTF32>(
                         static_cast<int>(TmemAllocation::QK) + buf_acc_idx * 256,
                         idx_in_warpgroup,
                         sub_seq_len,

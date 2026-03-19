@@ -52,7 +52,7 @@ make_acc_into_op(Accumulator const& acc, TiledMMA const& tiled_mma) {
   return operand;
 }
 
-template <int NumKAtoms = 4, class FragSrc, class FragDst, class TiledMMA>
+template <int NumKAtoms = 4, bool RoundingTF32 = false, class FragSrc, class FragDst, class TiledMMA>
 CUTE_DEVICE void
 convert_fp32_acc_to_tf32_operandA_layout(
   const FragSrc& frag_src, FragDst& frag_dst, 
@@ -61,7 +61,8 @@ convert_fp32_acc_to_tf32_operandA_layout(
   using ElemSrc = typename cute::remove_cvref_t<FragSrc>::value_type;
   using ElemDst = typename cute::remove_cvref_t<FragDst>::value_type;
   static_assert(cute::is_same_v<ElemSrc, float>, "Fragment must be float; tf32 truncation is done by MMA hw");
-  static_assert(cute::is_same_v<ElemDst, cutlass::tfloat32_t>, "Fragment must be float; tf32 truncation is done by MMA hw");
+  static_assert(RoundingTF32 || cute::is_same_v<ElemDst, float>, "Fragment must be float with no rounding; tf32 truncation is done by MMA hw");
+  static_assert(!RoundingTF32 || cute::is_same_v<ElemDst, cutlass::tfloat32_t>, "Fragment must be tfloat32 with rounding inside this function");
 
   // convert acc layout to A layout of the corresponding TiledMMA
   auto frag_src_cvt = make_tensor(frag_src.data(), convert_c_layout_to_a_layout(frag_src.layout(), tiled_mma));
@@ -109,18 +110,27 @@ convert_fp32_acc_to_tf32_operandA_layout(
     }
 
     // Write all 4 output values
-    frag_dst(0 + 4*j) = (ElemDst)out_vals[0];
-    frag_dst(1 + 4*j) = (ElemDst)out_vals[1];
-    frag_dst(2 + 4*j) = (ElemDst)out_vals[2];
-    frag_dst(3 + 4*j) = (ElemDst)out_vals[3];
+    if constexpr (RoundingTF32) {
+      frag_dst(0 + 4*j) = (ElemDst)out_vals[0];
+      frag_dst(1 + 4*j) = (ElemDst)out_vals[1];
+      frag_dst(2 + 4*j) = (ElemDst)out_vals[2];
+      frag_dst(3 + 4*j) = (ElemDst)out_vals[3];
+    } else {
+      frag_dst(0 + 4*j) = out_vals[0];
+      frag_dst(1 + 4*j) = out_vals[1];
+      frag_dst(2 + 4*j) = out_vals[2];
+      frag_dst(3 + 4*j) = out_vals[3];
+    }
   }
 }
 
 }
 
-template <class Element, bool GarbageFilledDiagonal, bool GarbageFilledUpperTriangular>
+template <class Element, bool GarbageFilledDiagonal, bool GarbageFilledUpperTriangular,
+          bool RoundingTF32 = false>
 struct CollectiveInverseTF32 {
   static_assert(std::is_same_v<Element, cutlass::tfloat32_t>);
+  using ElementView = std::conditional_t<RoundingTF32, Element, float>;
 
   CUTE_DEVICE
   CollectiveInverseTF32(int wg_sync_named_barrier_id): wg_sync_named_barrier_id_(wg_sync_named_barrier_id) {}
@@ -135,7 +145,8 @@ struct CollectiveInverseTF32 {
 
     int thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
 
-    auto t8X8sT = flat_divide(sT, Shape<_8, _8>{});
+    auto sT_view = recast<ElementView>(sT);
+    auto t8X8sT = flat_divide(sT_view, Shape<_8, _8>{});
     // if (thread_idx == 1) {
     //   printf("Before diagonal 8x8, mat:\n");
     //   cute::print_tensor(t8X8sT);
@@ -152,7 +163,7 @@ struct CollectiveInverseTF32 {
     // }
     // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
 
-    auto t16X16sT = flat_divide(sT, Shape<_16, _16>{});
+    auto t16X16sT = flat_divide(sT_view, Shape<_16, _16>{});
     // 四个warp做8x8 -> 16x16
     blockwise_diagonal_inversed_8x8_to_16x16(t16X16sT(_, _, thread_idx / 32, thread_idx / 32));
 
@@ -163,7 +174,7 @@ struct CollectiveInverseTF32 {
     // }
     // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
 
-    auto t32X32sT = flat_divide(sT, Shape<_32, _32>{});
+    auto t32X32sT = flat_divide(sT_view, Shape<_32, _32>{});
     if (thread_idx < 64) { // 两个warp做16x16 -> 32x32
       blockwise_diagonal_inversed_16x16_to_32x32(t32X32sT(_, _, thread_idx / 32, thread_idx /32));
     }
@@ -174,7 +185,7 @@ struct CollectiveInverseTF32 {
     // }
     cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
     // 一个warpgroup做32x32 -> 64x64
-    blockwise_diagonal_inversed_32x32_to_64x64(sT);
+    blockwise_diagonal_inversed_32x32_to_64x64(sT_view);
   }
 
 private:
@@ -189,10 +200,10 @@ private:
 
     using ElementCompute = float;
 
-    using CopyOp = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    using CopyOp = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementView>;
 
     auto load_row = [&](int y) {
-      auto row = make_tensor<Element>(Shape<Int<N>>{});
+      auto row = make_tensor<ElementView>(Shape<Int<N>>{});
       copy(CopyOp{}, std::forward<TensorT>(mat)(y, _), row);
 
       auto row_cvt = make_tensor_like<ElementCompute>(row);
@@ -210,7 +221,7 @@ private:
     };
 
     auto store_row = [&](int y, auto row) {
-      auto row_cvt = make_tensor_like<Element>(row);
+      auto row_cvt = make_tensor_like<ElementView>(row);
       copy(row, row_cvt);
       copy(CopyOp{}, row_cvt, std::forward<TensorT>(mat)(y, _));
     };
@@ -274,17 +285,17 @@ private:
 #ifdef CUTE_ARCH_STSM_SM90_ENABLED
     using CopyOpO_R2S = CopyOpTF32;
 #else
-    using CopyOpO_R2S = UniversalCopy<Element, Element>;
+    using CopyOpO_R2S = UniversalCopy<ElementView, ElementView>;
 #endif
 
     int  lane_id   = cutlass::canonical_lane_idx();
     auto tiled_mma = TiledMMA{};
     auto thr_mma   = tiled_mma.get_thread_slice(lane_id);
 
-    auto D_tiled_copy = make_tiled_copy_A(Copy_Atom<CopyOpD_S2R, Element>{}, tiled_mma);
-    auto C_tiled_copy = make_tiled_copy_B(Copy_Atom<CopyOpC_S2R, Element>{}, tiled_mma);
-    auto A_tiled_copy = make_tiled_copy_B(Copy_Atom<CopyOpA_S2R, Element>{}, tiled_mma);
-    auto O_tiled_copy = make_tiled_copy_C(Copy_Atom<CopyOpO_R2S, Element>{}, tiled_mma);
+    auto D_tiled_copy = make_tiled_copy_A(Copy_Atom<CopyOpD_S2R, ElementView>{}, tiled_mma);
+    auto C_tiled_copy = make_tiled_copy_B(Copy_Atom<CopyOpC_S2R, ElementView>{}, tiled_mma);
+    auto A_tiled_copy = make_tiled_copy_B(Copy_Atom<CopyOpA_S2R, ElementView>{}, tiled_mma);
+    auto O_tiled_copy = make_tiled_copy_C(Copy_Atom<CopyOpO_R2S, ElementView>{}, tiled_mma);
 
     auto D_thr_copy = D_tiled_copy.get_thread_slice(lane_id);
     auto C_thr_copy = C_tiled_copy.get_thread_slice(lane_id);
@@ -309,9 +320,11 @@ private:
     Tensor sDinv_m_bcast = make_tensor(sDinv.data(), logical_product(sDinv.layout(), Tile<Layout<_2, _0>>{}));
     Tensor sO_m_bcast    = make_tensor(sO.data(), logical_product(sO.layout(), Tile<Layout<_2, _0>>{}));
 
-    Tensor tOrDinv = make_fragment_like<Element>(partition_shape_A(tiled_mma, Shape<_16, _8>{}));
-    Tensor tOrC    = thr_mma.partition_fragment_B(sC);
-    Tensor tOrAinv = thr_mma.partition_fragment_B(sAinv);
+    Tensor tOrDinv = make_fragment_like<ElementView>(partition_shape_A(tiled_mma, Shape<_16, _8>{}));
+    Tensor tOrC    = make_fragment_like<ElementView>(partition_shape_B(tiled_mma, Shape<_8, _8>{}));
+    // Tensor tOrC    = thr_mma.partition_fragment_B(sC);
+    Tensor tOrAinv    = make_fragment_like<ElementView>(partition_shape_B(tiled_mma, Shape<_8, _8>{}));
+    // Tensor tOrAinv = thr_mma.partition_fragment_B(sAinv);
 
     Tensor tDCrDC = partition_fragment_C(tiled_mma, Shape<_16, _8>{});  // output of -inv(D)C
     Tensor tOrO   = partition_fragment_C(tiled_mma, Shape<_16, _8>{});  // output of -inv(D)C inv(A)
@@ -342,7 +355,21 @@ private:
     // }
 
     clear(tDCrDC);
-    gemm(tiled_mma, tOrDinv, tOrC, tDCrDC);
+    auto tOrDinv_mma = [&]() {
+      if constexpr (!RoundingTF32) {
+        return recast<Element>(tOrDinv);
+      } else {
+        return tOrDinv;
+      }
+    }();
+    auto tOrC_mma = [&]() {
+      if constexpr (!RoundingTF32) {
+        return recast<Element>(tOrC);
+      } else {
+        return tOrC;
+      }
+    }();
+    gemm(tiled_mma, tOrDinv_mma, tOrC_mma, tDCrDC);
     transform(tDCrDC, [](auto v) { return -v; });
 
     // if (thread_idx == 1) {
@@ -352,10 +379,16 @@ private:
 
     /////////////////////////////////////////////////////////////////////////////
     // -inv(D)C inv(A)
-    Tensor tOrDC = make_fragment_like<Element>(partition_shape_A(tiled_mma, Shape<_16, _8>{}));
+    Tensor tOrDC = make_fragment_like<ElementView>(partition_shape_A(tiled_mma, Shape<_16, _8>{}));
     // Tensor tOrDC = detail::SM80::make_acc_into_op<Element>(tDCrDC, tiled_mma);
-    detail::SM80::convert_fp32_acc_to_tf32_operandA_layout<1>(tDCrDC, tOrDC, tiled_mma, lane_id);
-    // Tensor tOrDC = recast<Element>(tOrDC_fp32);
+    detail::SM80::convert_fp32_acc_to_tf32_operandA_layout<1, RoundingTF32>(tDCrDC, tOrDC, tiled_mma, lane_id);
+    auto tOrDC_mma = [&] () {
+      if constexpr (!RoundingTF32) {
+        return recast<Element>(tOrDC);
+      } else {
+        return tOrDC;
+      }
+    }();
 
     copy(A_tiled_copy, tOsAinv, tOrAinv_cv);
 
@@ -367,18 +400,30 @@ private:
     // }
 
     clear(tOrO);
-    gemm(tiled_mma, tOrDC, tOrAinv, tOrO);
+    auto tOrAinv_mma = [&]() {
+      if constexpr (!RoundingTF32) {
+        return recast<Element>(tOrAinv);
+      } else {
+        return tOrAinv;
+      }
+    }();
+    gemm(tiled_mma, tOrDC_mma, tOrAinv_mma, tOrO);
+    
+    if constexpr (!RoundingTF32) {
+      // no need for conversion
+      copy(O_tiled_copy, tOrO_cv, tOsO);
+    } else {
+      auto tOrO_cv_cvt = make_tensor_like<Element>(tOrO_cv);
+      // if (thread_idx == 1) {
+      //   printf("inv(D)C inv(A) Acc: tOrO\n");
+      //   cute::print_tensor(tOrO);
+      //   printf("tOrO_cv\n");
+      //   cute::print_tensor(tOrO_cv);
+      // }
 
-    auto tOrO_cv_cvt = make_tensor_like<Element>(tOrO_cv);
-    // if (thread_idx == 1) {
-    //   printf("inv(D)C inv(A) Acc: tOrO\n");
-    //   cute::print_tensor(tOrO);
-    //   printf("tOrO_cv\n");
-    //   cute::print_tensor(tOrO_cv);
-    // }
-
-    transform(tOrO_cv, tOrO_cv_cvt, [](auto v) { return Element(v); });
-    copy(O_tiled_copy, tOrO_cv_cvt, tOsO);
+      transform(tOrO_cv, tOrO_cv_cvt, [](auto v) { return Element(v); });
+      copy(O_tiled_copy, tOrO_cv_cvt, tOsO);
+    }
 
     // if (thread_idx == 1) {
     //   printf("Final Output sO\n");
@@ -406,23 +451,22 @@ private:
 
     using CopyOpTF32 = AutoVectorizingCopyWithAssumedAlignment<128>;
     using CopyOpD_S2R = CopyOpTF32;
-    // TODO: original is LDSM_T
     using CopyOpC_S2R = CopyOpTF32;
     using CopyOpA_S2R = CopyOpTF32;
 #ifdef CUTE_ARCH_STSM_SM90_ENABLED
     using CopyOpO_R2S = CopyOpTF32;
 #else
-    using CopyOpO_R2S = UniversalCopy<Element, Element>;
+    using CopyOpO_R2S = UniversalCopy<ElementView, ElementView>;
 #endif
 
     int  lane_id   = cutlass::canonical_lane_idx();
     auto tiled_mma = TiledMMA{};
     auto thr_mma   = tiled_mma.get_thread_slice(lane_id);
 
-    auto D_tiled_copy = make_tiled_copy_A(Copy_Atom<CopyOpD_S2R, Element>{}, tiled_mma);
-    auto C_tiled_copy = make_tiled_copy_B(Copy_Atom<CopyOpC_S2R, Element>{}, tiled_mma);
-    auto A_tiled_copy = make_tiled_copy_B(Copy_Atom<CopyOpA_S2R, Element>{}, tiled_mma);
-    auto O_tiled_copy = make_tiled_copy_C(Copy_Atom<CopyOpO_R2S, Element>{}, tiled_mma);
+    auto D_tiled_copy = make_tiled_copy_A(Copy_Atom<CopyOpD_S2R, ElementView>{}, tiled_mma);
+    auto C_tiled_copy = make_tiled_copy_B(Copy_Atom<CopyOpC_S2R, ElementView>{}, tiled_mma);
+    auto A_tiled_copy = make_tiled_copy_B(Copy_Atom<CopyOpA_S2R, ElementView>{}, tiled_mma);
+    auto O_tiled_copy = make_tiled_copy_C(Copy_Atom<CopyOpO_R2S, ElementView>{}, tiled_mma);
 
     auto D_thr_copy = D_tiled_copy.get_thread_slice(lane_id);
     auto C_thr_copy = C_tiled_copy.get_thread_slice(lane_id);
@@ -434,9 +478,9 @@ private:
     Tensor sAinv = select_tensor<1, 0>(mat_16x16_2x2(_, _, _0{}, _0{}));
     Tensor sO    = mat_16x16_2x2(_, _, _1{}, _0{});
 
-    Tensor tOrDinv = thr_mma.partition_fragment_A(sDinv);
-    Tensor tOrC    = thr_mma.partition_fragment_B(sC);
-    Tensor tOrAinv = thr_mma.partition_fragment_B(sAinv);
+    Tensor tOrDinv = make_fragment_like<ElementView>(partition_shape_A(tiled_mma, select<0, 2>(TileShape{})));
+    Tensor tOrC = make_fragment_like<ElementView>(partition_shape_B(tiled_mma, select<1, 2>(TileShape{})));
+    Tensor tOrAinv = make_fragment_like<ElementView>(partition_shape_B(tiled_mma, select<1, 2>(TileShape{})));
 
     Tensor tDCrDC = partition_fragment_C(tiled_mma, select<0,1>(TileShape{}));  // output of -inv(D)C
     Tensor tOrO   = partition_fragment_C(tiled_mma, select<0,1>(TileShape{}));  // output of -inv(D)C inv(A)
@@ -456,23 +500,56 @@ private:
     copy(C_tiled_copy, tOsC, tOrC_cv);
 
     clear(tDCrDC);
-    gemm(tiled_mma, tOrDinv, tOrC, tDCrDC);
+    auto tOrDinv_mma = [&]() {
+      if constexpr (!RoundingTF32) {
+        return recast<Element>(tOrDinv);
+      } else {
+        return tOrDinv;
+      }
+    }();
+    auto tOrC_mma = [&]() {
+      if constexpr (!RoundingTF32) {
+        return recast<Element>(tOrC);
+      } else {
+        return tOrC;
+      }
+    }();
+    gemm(tiled_mma, tOrDinv_mma, tOrC_mma, tDCrDC);
     transform(tDCrDC, [](auto v) { return -v; });
 
     /////////////////////////////////////////////////////////////////////////////
     // -inv(D)C inv(A)
-    Tensor tOrDC = make_fragment_like<Element>(partition_shape_A(tiled_mma, Shape<_16, _16>{}));
+    Tensor tOrDC = make_fragment_like<ElementView>(partition_shape_A(tiled_mma, Shape<_16, _16>{}));
     // Tensor tOrDC = detail::SM80::make_acc_into_op<Element>(tDCrDC, tiled_mma);
-    detail::SM80::convert_fp32_acc_to_tf32_operandA_layout<2>(tDCrDC, tOrDC, tiled_mma, lane_id);
-    // Tensor tOrDC = recast<Element>(tOrDC_fp32);
+    detail::SM80::convert_fp32_acc_to_tf32_operandA_layout<2, RoundingTF32>(tDCrDC, tOrDC, tiled_mma, lane_id);
+    auto tOrDC_mma = [&]() {
+      if constexpr (!RoundingTF32) {
+        return recast<Element>(tOrDC);
+      } else {
+        return tOrDC;
+      }
+    }();
 
     copy(A_tiled_copy, tOsAinv, tOrAinv_cv);
     clear(tOrO);
-    gemm(tiled_mma, tOrDC, tOrAinv, tOrO);
 
-    auto tOrO_cv_cvt = make_tensor_like<Element>(tOrO_cv);
-    transform(tOrO_cv, tOrO_cv_cvt, [](auto v) { return Element(v); });
-    copy(O_tiled_copy, tOrO_cv_cvt, tOsO);
+    auto tOrAinv_mma = [&]() {
+      if constexpr (!RoundingTF32) {
+        return recast<Element>(tOrAinv);
+      } else {
+        return tOrAinv;
+      }
+    }();
+    gemm(tiled_mma, tOrDC_mma, tOrAinv_mma, tOrO);
+
+    if constexpr (!RoundingTF32) {
+      // no need for conversion
+      copy(O_tiled_copy, tOrO_cv, tOsO);
+    } else {
+      auto tOrO_cv_cvt = make_tensor_like<Element>(tOrO_cv);
+      transform(tOrO_cv, tOrO_cv_cvt, [](auto v) { return Element(v); });
+      copy(O_tiled_copy, tOrO_cv_cvt, tOsO);
+    }
   }
 
   template <typename TensorT>
@@ -498,11 +575,10 @@ private:
     using CopyOpC_S2R = CopyOpTF32;
     using CopyOpA_S2R = CopyOpTF32;
     using CopyOpO_S2R = CopyOpTF32;
-    using CopyOpO_S2R = CopyOpTF32;
 #ifdef CUTE_ARCH_STSM_SM90_ENABLED
     using CopyOpO_R2S = CopyOpTF32;
 #else
-    using CopyOpO_R2S = UniversalCopy<Element, Element>;
+    using CopyOpO_R2S = UniversalCopy<ElementView, ElementView>;
 #endif
 
     int warp_id_in_wg = cutlass::canonical_warp_idx() - cutlass::NumWarpsPerWarpGroup * cutlass::canonical_warp_group_idx();
@@ -516,11 +592,11 @@ private:
     auto tiled_mma2 = TiledMMA2{};
     auto thr_mma2   = tiled_mma2.get_thread_slice(lane_id);
 
-    auto D_tiled_copy = make_tiled_copy_A(Copy_Atom<CopyOpD_S2R, Element>{}, tiled_mma1);
-    auto C_tiled_copy = make_tiled_copy_B(Copy_Atom<CopyOpC_S2R, Element>{}, tiled_mma1);
-    auto A_tiled_copy = make_tiled_copy_B(Copy_Atom<CopyOpA_S2R, Element>{}, tiled_mma2);
-    auto O_tiled_s2r  = make_tiled_copy_C(Copy_Atom<CopyOpO_S2R, Element>{}, tiled_mma2);
-    auto O_tiled_r2s  = make_tiled_copy_C(Copy_Atom<CopyOpO_R2S, Element>{}, tiled_mma2);
+    auto D_tiled_copy = make_tiled_copy_A(Copy_Atom<CopyOpD_S2R, ElementView>{}, tiled_mma1);
+    auto C_tiled_copy = make_tiled_copy_B(Copy_Atom<CopyOpC_S2R, ElementView>{}, tiled_mma1);
+    auto A_tiled_copy = make_tiled_copy_B(Copy_Atom<CopyOpA_S2R, ElementView>{}, tiled_mma2);
+    auto O_tiled_s2r  = make_tiled_copy_C(Copy_Atom<CopyOpO_S2R, ElementView>{}, tiled_mma2);
+    auto O_tiled_r2s  = make_tiled_copy_C(Copy_Atom<CopyOpO_R2S, ElementView>{}, tiled_mma2);
 
     auto D_thr_copy = D_tiled_copy.get_thread_slice(lane_id);
     auto C_thr_copy = C_tiled_copy.get_thread_slice(lane_id);
@@ -533,9 +609,12 @@ private:
     Tensor sAinv = select_tensor<1, 0>(mat_16x2X16x2_2x2(make_coord(_, x), _, _0{}, _0{}));  // NOTE: not y!
     Tensor sO    = mat_16x2X16x2_2x2(make_coord(_, y), _, _1{}, _0{});  // needs cross-warp reduction
 
-    Tensor tOrDinv = thr_mma1.partition_fragment_A(sDinv);
-    Tensor tOrC    = thr_mma1.partition_fragment_B(sC);
-    Tensor tOrAinv = thr_mma2.partition_fragment_B(sAinv);
+    // Tensor tOrDinv = thr_mma1.partition_fragment_A(sDinv);
+    // Tensor tOrC    = thr_mma1.partition_fragment_B(sC);
+    // Tensor tOrAinv = thr_mma2.partition_fragment_B(sAinv);
+    Tensor tOrDinv = make_fragment_like<ElementView>(partition_shape_A(tiled_mma1, Shape<_16, _32>{}));
+    Tensor tOrC    = make_fragment_like<ElementView>(partition_shape_B(tiled_mma1, Shape<_16, _32>{}));
+    Tensor tOrAinv = make_fragment_like<ElementView>(partition_shape_B(tiled_mma2, Shape<_32, _16>{}));
 
     Tensor tDCrDC = partition_fragment_C(tiled_mma1, Shape<_16, _16>{});  // output of -inv(D)C
     Tensor tOrO   = partition_fragment_C(tiled_mma2, Shape<_16, _32>{});  // output of -inv(D)C inv(A)
@@ -553,22 +632,57 @@ private:
     copy(C_tiled_copy, tOsC, tOrC_cv);
 
     clear(tDCrDC);
-    gemm(tiled_mma1, tOrDinv, tOrC, tDCrDC);
+    auto tOrDinv_mma = [&]() {
+      if constexpr (!RoundingTF32) {
+        return recast<Element>(tOrDinv);
+      } else {
+        return tOrDinv;
+      }
+    }();
+    auto tOrC_mma = [&]() {
+      if constexpr (!RoundingTF32) {
+        return recast<Element>(tOrC);
+      } else {
+        return tOrC;
+      }
+    }();  
+    gemm(tiled_mma1, tOrDinv_mma, tOrC_mma, tDCrDC);
     transform(tDCrDC, [](auto v) { return -v; });
 
     /////////////////////////////////////////////////////////////////////////////
     // -inv(D)C inv(A)
-    Tensor tOrDC = make_fragment_like<Element>(partition_shape_A(tiled_mma2, Shape<_16, _16>{}));
-    // Tensor tOrDC = detail::SM80::make_acc_into_op<Element>(tDCrDC, tiled_mma2);
-    detail::SM80::convert_fp32_acc_to_tf32_operandA_layout<2>(tDCrDC, tOrDC, tiled_mma2, lane_id);
-    // Tensor tOrDC = recast<Element>(tOrDC_fp32);
+    Tensor tOrDC = make_fragment_like<ElementView>(partition_shape_A(tiled_mma2, Shape<_16, _16>{}));
+    detail::SM80::convert_fp32_acc_to_tf32_operandA_layout<2, RoundingTF32>(tDCrDC, tOrDC, tiled_mma2, lane_id);
+    auto tOrDC_mma = [&]() {
+      if constexpr (!RoundingTF32) {
+        return recast<Element>(tOrDC);
+      } else {
+        return tOrDC;
+      }
+    }();
 
     copy(A_tiled_copy, tOsAinv, tOrAinv_cv);
     clear(tOrO);
-    gemm(tiled_mma2, tOrDC, tOrAinv, tOrO);
-
-    auto tOrO_cvt = make_tensor_like<Element>(tOrO);
-    transform(tOrO, tOrO_cvt, [](auto v) { return Element(v); });
+    
+    auto tOrAinv_mma = [&]() {
+      if constexpr (!RoundingTF32) {
+        return recast<Element>(tOrAinv);
+      } else {
+        return tOrAinv;
+      }
+    }();
+    gemm(tiled_mma2, tOrDC_mma, tOrAinv_mma, tOrO);
+    
+    auto tOrO_cvt = [&]() {
+      if constexpr (!RoundingTF32) {
+        return tOrO;
+      } else {
+        return make_tensor_like<Element>(tOrO);
+      }
+    }();
+    if constexpr (RoundingTF32) {
+      transform(tOrO, tOrO_cvt, [](auto v) { return Element(v); });
+    }
 
     // ensure tOsC consumed, tOsC and tOsO are the same buffer
     cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
