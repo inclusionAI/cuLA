@@ -18,7 +18,6 @@ from flashla.kda.chunk import chunk_kda as flashla_chunk_kda
         "T",
         "H",
         "D",
-        "scale",
         "gate_logit_normalizer",
         "mask_p",
         "use_qk_l2norm_in_kernel",
@@ -29,19 +28,19 @@ from flashla.kda.chunk import chunk_kda as flashla_chunk_kda
     [
         pytest.param(
             *test,
-            id="B{}-T{}-H{}-D{}-scale{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-{}".format(
+            id="B{}-T{}-H{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-{}".format(
                 *test
             ),
         )
         for test in [
-            (1, 63, 1, 128, 1, 1, 0, False, False, True, torch.bfloat16),
-            (2, 500, 3, 128, 1, 1, 0, False, False, True, torch.bfloat16),
-            (2, 1000, 3, 128, 0.1, 1, 0.5, False, False, True, torch.bfloat16),
-            (3, 1024, 4, 128, 1, 0.1, 0, False, False, True, torch.bfloat16),
-            (4, 1024, 4, 128, 0.1, 1, 0, False, False, True, torch.bfloat16),
-            (4, 1024, 4, 128, 0.1, 1, 0, True, False, True, torch.bfloat16),
-            (2, 1500, 4, 128, 0.1, 10, 0, False, True, True, torch.bfloat16),
-            (4, 2048, 8, 128, 0.1, 1, 0, False, True, True, torch.bfloat16),
+            (1, 63, 1, 128, 1, 0, False, False, True, torch.bfloat16),
+            (2, 500, 3, 128, 1, 0, False, False, True, torch.bfloat16),
+            (2, 1000, 3, 128, 1, 0.5, False, False, True, torch.bfloat16),
+            (3, 1024, 4, 128, 0.1, 0, False, False, True, torch.bfloat16),
+            (4, 1024, 4, 128, 1, 0, False, False, True, torch.bfloat16),
+            (4, 1024, 4, 128, 1, 0, True, False, True, torch.bfloat16),
+            (2, 1500, 4, 128, 10, 0, False, True, True, torch.bfloat16),
+            (4, 2048, 8, 128, 1, 0, False, True, True, torch.bfloat16),
         ]
     ],
 )
@@ -50,7 +49,6 @@ def test_safe_gate_chunk(
     T: int,
     H: int,
     D: int,
-    scale: float,
     gate_logit_normalizer: float,
     mask_p: float,
     use_qk_l2norm_in_kernel: bool,
@@ -105,7 +103,6 @@ def test_safe_gate_chunk(
         beta=beta.clone(),
         A_log=(A_log.clone() if use_gate_in_kernel else None),
         dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-        scale=scale,
         initial_state=h0.clone(),
         output_final_state=True,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
@@ -136,7 +133,6 @@ def test_safe_gate_chunk(
         beta=beta.clone(),
         A_log=(A_log.clone() if use_gate_in_kernel else None),
         dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-        scale=scale,
         initial_state=h0.clone(),
         output_final_state=True,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
@@ -208,7 +204,7 @@ def test_safe_gate_chunk(
             (
                 4,
                 128,
-                0.9,
+                0,
                 [
                     0,
                     652,
@@ -235,7 +231,7 @@ def test_safe_gate_chunk(
             (
                 4,
                 128,
-                0.9,
+                0,
                 [
                     0,
                     315,
@@ -261,7 +257,7 @@ def test_safe_gate_chunk(
             (
                 4,
                 128,
-                0.9,
+                0,
                 [
                     0,
                     494,
