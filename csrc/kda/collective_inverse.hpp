@@ -56,17 +56,17 @@ template <int NumKAtoms = 4, class FragSrc, class FragDst, class TiledMMA>
 CUTE_DEVICE void
 convert_fp32_acc_to_tf32_operandA_layout(
   const FragSrc& frag_src, FragDst& frag_dst, 
-  TiledMMA const& tiled_mma, int local_thread_idx) 
+  TiledMMA const& tiled_mma, int lane_id) 
 {
   using ElemSrc = typename cute::remove_cvref_t<FragSrc>::value_type;
   using ElemDst = typename cute::remove_cvref_t<FragDst>::value_type;
   static_assert(cute::is_same_v<ElemSrc, float>, "Fragment must be float; tf32 truncation is done by MMA hw");
-  static_assert(cute::is_same_v<ElemDst, float>, "Fragment must be float; tf32 truncation is done by MMA hw");
+  static_assert(cute::is_same_v<ElemDst, cutlass::tfloat32_t>, "Fragment must be float; tf32 truncation is done by MMA hw");
 
   // convert acc layout to A layout of the corresponding TiledMMA
   auto frag_src_cvt = make_tensor(frag_src.data(), convert_c_layout_to_a_layout(frag_src.layout(), tiled_mma));
 
-  int tid = local_thread_idx % 32;  // lane within warp
+  int tid = lane_id;  // lane within warp
   int t0 = tid % 4;
   bool sel_odd = (t0 & 1);  // t0%2: selects v0_bf16=1 result
 
@@ -109,10 +109,10 @@ convert_fp32_acc_to_tf32_operandA_layout(
     }
 
     // Write all 4 output values
-    frag_dst(0 + 4*j) = out_vals[0];
-    frag_dst(1 + 4*j) = out_vals[1];
-    frag_dst(2 + 4*j) = out_vals[2];
-    frag_dst(3 + 4*j) = out_vals[3];
+    frag_dst(0 + 4*j) = (ElemDst)out_vals[0];
+    frag_dst(1 + 4*j) = (ElemDst)out_vals[1];
+    frag_dst(2 + 4*j) = (ElemDst)out_vals[2];
+    frag_dst(3 + 4*j) = (ElemDst)out_vals[3];
   }
 }
 
@@ -132,7 +132,6 @@ struct CollectiveInverseTF32 {
     static_assert(rank(L) == 2);
     static_assert(size<0>(L) == 64);
     static_assert(size<1>(L) == 64);
-    // TODO:
 
     int thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
 
@@ -353,10 +352,10 @@ private:
 
     /////////////////////////////////////////////////////////////////////////////
     // -inv(D)C inv(A)
-    Tensor tOrDC_fp32 = make_fragment_like<float>(partition_shape_A(tiled_mma, Shape<_16, _8>{}));
+    Tensor tOrDC = make_fragment_like<Element>(partition_shape_A(tiled_mma, Shape<_16, _8>{}));
     // Tensor tOrDC = detail::SM80::make_acc_into_op<Element>(tDCrDC, tiled_mma);
-    detail::SM80::convert_fp32_acc_to_tf32_operandA_layout<1>(tDCrDC, tOrDC_fp32, tiled_mma, lane_id);
-    Tensor tOrDC = recast<Element>(tOrDC_fp32);
+    detail::SM80::convert_fp32_acc_to_tf32_operandA_layout<1>(tDCrDC, tOrDC, tiled_mma, lane_id);
+    // Tensor tOrDC = recast<Element>(tOrDC_fp32);
 
     copy(A_tiled_copy, tOsAinv, tOrAinv_cv);
 
@@ -462,10 +461,10 @@ private:
 
     /////////////////////////////////////////////////////////////////////////////
     // -inv(D)C inv(A)
-    Tensor tOrDC_fp32 = make_fragment_like<float>(partition_shape_A(tiled_mma, Shape<_16, _16>{}));
+    Tensor tOrDC = make_fragment_like<Element>(partition_shape_A(tiled_mma, Shape<_16, _16>{}));
     // Tensor tOrDC = detail::SM80::make_acc_into_op<Element>(tDCrDC, tiled_mma);
-    detail::SM80::convert_fp32_acc_to_tf32_operandA_layout<2>(tDCrDC, tOrDC_fp32, tiled_mma, lane_id);
-    Tensor tOrDC = recast<Element>(tOrDC_fp32);
+    detail::SM80::convert_fp32_acc_to_tf32_operandA_layout<2>(tDCrDC, tOrDC, tiled_mma, lane_id);
+    // Tensor tOrDC = recast<Element>(tOrDC_fp32);
 
     copy(A_tiled_copy, tOsAinv, tOrAinv_cv);
     clear(tOrO);
@@ -559,10 +558,10 @@ private:
 
     /////////////////////////////////////////////////////////////////////////////
     // -inv(D)C inv(A)
-    Tensor tOrDC_fp32 = make_fragment_like<float>(partition_shape_A(tiled_mma2, Shape<_16, _16>{}));
+    Tensor tOrDC = make_fragment_like<Element>(partition_shape_A(tiled_mma2, Shape<_16, _16>{}));
     // Tensor tOrDC = detail::SM80::make_acc_into_op<Element>(tDCrDC, tiled_mma2);
-    detail::SM80::convert_fp32_acc_to_tf32_operandA_layout<2>(tDCrDC, tOrDC_fp32, tiled_mma2, lane_id);
-    Tensor tOrDC = recast<Element>(tOrDC_fp32);
+    detail::SM80::convert_fp32_acc_to_tf32_operandA_layout<2>(tDCrDC, tOrDC, tiled_mma2, lane_id);
+    // Tensor tOrDC = recast<Element>(tOrDC_fp32);
 
     copy(A_tiled_copy, tOsAinv, tOrAinv_cv);
     clear(tOrO);

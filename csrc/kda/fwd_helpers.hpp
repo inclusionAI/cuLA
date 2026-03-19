@@ -670,8 +670,10 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
                 *reinterpret_cast<__half2*>(&sKK(row, i * 4))     = h01;
                 *reinterpret_cast<__half2*>(&sKK(row, i * 4 + 2)) = h23;
             } else {
-                *reinterpret_cast<float2*>(&sKK(row, i * 4))     = f01;
-                *reinterpret_cast<float2*>(&sKK(row, i * 4 + 2)) = f23;
+                sKK(row, i * 4) = tfloat32_t(f01.x);
+                sKK(row, i * 4 + 1) = tfloat32_t(f01.y);
+                sKK(row, i * 4 + 2) = tfloat32_t(f23.x);
+                sKK(row, i * 4 + 3) = tfloat32_t(f23.y);
             }
         }
     } else {
