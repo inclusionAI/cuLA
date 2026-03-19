@@ -282,10 +282,13 @@ struct KdaChunkFwdIntraKernelSm100 {
 };
 
 // ===================================================================
-// Default Kernel type: uses the self-contained mainloop
+// Default Kernel types: parameterized by UseTF32Inverse
 // ===================================================================
-using KdaChunkFwdIntraKernelSm100Default =
-    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100>;
+using KdaChunkFwdIntraKernelSm100_TF32 =
+    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<true, false>>;
+
+using KdaChunkFwdIntraKernelSm100_FP16 =
+    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<false, false>>;
 
 // ===================================================================
 // __global__ kernel wrapper (free function — CUDA requires this)
@@ -302,8 +305,8 @@ kda_fwd_intra_sm100_kernel_entry(
 // ===================================================================
 // Host-side launcher: constructs TMA descriptors and launches kernel
 // ===================================================================
-inline void run_kda_fwd_intra_sm100_impl(KDA_fwd_intra_params &params, cudaStream_t stream) {
-    using Kernel = KdaChunkFwdIntraKernelSm100Default;
+template <typename Kernel>
+inline void run_kda_fwd_intra_sm100_impl_dispatch(KDA_fwd_intra_params &params, cudaStream_t stream) {
 
     auto shape_QKG  = make_shape(params.total_q_len, params.d, params.h);
     auto stride_QKG = make_stride(params.h * params.d, _1{}, params.d);
@@ -356,6 +359,17 @@ inline void run_kda_fwd_intra_sm100_impl(KDA_fwd_intra_params &params, cudaStrea
     dim3 grid_dim(Kernel::TileScheduler::get_grid_shape(params.tile_scheduler_params));
     dim3 block_dim(Kernel::NumTotalThreads, 1, 1);
     kernel_fn<<<grid_dim, block_dim, smem_size, stream>>>(params, tma_params);
+}
+
+// ===================================================================
+// Runtime dispatch based on params.use_tf32_inverse
+// ===================================================================
+inline void run_kda_fwd_intra_sm100_impl(KDA_fwd_intra_params &params, cudaStream_t stream) {
+    if (params.use_tf32_inverse) {
+        run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_TF32>(params, stream);
+    } else {
+        run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_FP16>(params, stream);
+    }
 }
 
 } // namespace flashla

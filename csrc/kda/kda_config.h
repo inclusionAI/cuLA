@@ -12,6 +12,7 @@ struct KDA_fwd_intra_params {
     int d;
     int chunk_size;
     float scale;
+    bool use_tf32_inverse;
 
     void *__restrict__ q_ptr;             //[b, t, h, d]
     void *__restrict__ k_ptr;             //[b, t, h, d]

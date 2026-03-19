@@ -43,6 +43,7 @@ def chunk_kda_fwd(
     disable_recompute: bool = False,
     return_intermediate_states: bool = False,
     cp_context: FLACPContext | None = None,
+    use_tf32_inverse: bool = True,
 ):
     # Apply gate activation
     g_org = None
@@ -79,7 +80,8 @@ def chunk_kda_fwd(
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
         safe_gate=safe_gate,
-        disable_recompute=disable_recompute
+        disable_recompute=disable_recompute,
+        use_tf32_inverse=use_tf32_inverse
     )
 
     if cp_context is not None:

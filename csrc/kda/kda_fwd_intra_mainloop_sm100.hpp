@@ -32,6 +32,7 @@ struct KdaChunkFwdIntraSm100NamedBarriers {
 // constants, and the persistent loop bodies for each warp role.
 // The Kernel struct is templated on this Mainloop.
 // ===================================================================
+template <bool UseTF32Inverse_ = true, bool RoundingTF32_ = false>
 struct KdaChunkFwdIntraMainloopSm100 {
 
     // ===================== Tile / Buffer Constants =====================
@@ -46,13 +47,15 @@ struct KdaChunkFwdIntraMainloopSm100 {
     static constexpr int StagesAcc   = 2;
 
     // matrix inversion config
-    static constexpr bool UseTF32Inverse = true;
+    // TODO: optimize perf, larger band conflict for TF32 inverse
+    // NOTE: use TF32 inverse gets better accuracy, but causes about 11% kernel time increase currently
+    static constexpr bool UseTF32Inverse = UseTF32Inverse_;
     // NOTE: when enabling RoundingTF32=true, do x+=0x1000u for rounding, 
     // theoretically better precision, but lower performance
     // otherwise, better performance but theoretically lower precision
     // default to false, because FLA impl uses tl.dot directly which does not use rounding
     // ref: https://triton-lang.org/main/python-api/generated/triton.language.dot.html
-    static constexpr bool RoundingTF32   = false;
+    static constexpr bool RoundingTF32   = RoundingTF32_;
 
     // double buffer in TMEM, overlap prologue A matrix with MMA
     enum class TmemAllocation : uint32_t {

@@ -14,7 +14,8 @@ void ChunkKDAFwdIntra(
     at::Tensor Akk_out,
     at::Tensor tile_counter,
     float scale,
-    int chunk_size);
+    int chunk_size,
+    bool use_tf32_inverse);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashLA";
