@@ -205,9 +205,17 @@ private:
     auto load_row = [&](int y) {
       auto row = make_tensor<ElementView>(Shape<Int<N>>{});
       copy(CopyOp{}, std::forward<TensorT>(mat)(y, _), row);
-
-      auto row_cvt = make_tensor_like<ElementCompute>(row);
-      copy(row, row_cvt);
+      
+      auto row_cvt = [&]() {
+        if constexpr (RoundingTF32) {
+          return make_tensor_like<ElementCompute>(row);
+        } else {
+          return row;
+        }
+      }();
+      if constexpr (RoundingTF32) {
+        copy(row, row_cvt);
+      }
 
       if constexpr (GarbageFilledDiagonal || GarbageFilledUpperTriangular) {
         CUTE_UNROLL
@@ -221,8 +229,16 @@ private:
     };
 
     auto store_row = [&](int y, auto row) {
-      auto row_cvt = make_tensor_like<ElementView>(row);
-      copy(row, row_cvt);
+      auto row_cvt = [&]() {
+        if constexpr (RoundingTF32) {
+          return make_tensor_like<ElementView>(row);
+        } else {
+          return row;
+        }
+      }();
+      if constexpr (RoundingTF32) {
+        copy(row, row_cvt);
+      }
       copy(CopyOp{}, row_cvt, std::forward<TensorT>(mat)(y, _));
     };
 

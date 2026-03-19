@@ -104,10 +104,11 @@ struct KdaChunkFwdIntraMainloopSm100 {
     ));
 
     // inv(KK) (tf32)
-    using SmemLayoutOutputTF32 = decltype(tile_to_shape(
+    using SmemLayoutOutputTF32 = decltype(coalesce(tile_to_shape(
         UMMA::Layout_K_SW32_Atom<tf32>{},
-        Shape<Int<TileT>, Int<TileT>>{}
-    ));
+        Shape<Int<TileT>, Int<TileT>>{},
+        Step<_1, _2>{}
+    ), Shape<_1, _1>{}));
 
     using SmemLayoutInvKK = std::conditional_t<!UseTF32Inverse, SmemLayoutOutputFP16, SmemLayoutOutputTF32>;
 
@@ -151,6 +152,12 @@ struct KdaChunkFwdIntraMainloopSm100 {
         !UseTF32Inverse,
         cutlass::half_t,
         cutlass::tfloat32_t
+    >;
+    // NOTE: avoid tfloat32 cast in R2G store
+    using InverseOutputType = std::conditional_t<
+        !UseTF32Inverse,
+        cutlass::half_t,
+        float
     >;
     using CollectiveInverse = std::conditional_t<
         !UseTF32Inverse, 
@@ -757,11 +764,18 @@ struct KdaChunkFwdIntraMainloopSm100 {
             //     cute::print_tensor(sKK_inv);
             // }
             auto sKK_inv_pipe_slice = sKK_inv(_, _);
+            auto sKK_out_pipe_slice = [&]() {
+                if constexpr (!UseTF32Inverse) {
+                    return sKK_inv_pipe_slice;
+                } else {
+                    return recast<float>(sKK_inv_pipe_slice);
+                }
+            }();
             auto collective_inverse = CollectiveInverse(KdaChunkFwdIntraSm100NamedBarriers::InverseMath);
             collective_inverse.compute(sKK_inv_pipe_slice);
 
             // cast to Element in registers, then R2G directly — no extra R2S + S2R round-trip
-            using GmemTileCopyAtomInv = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, InverseType>;
+            using GmemTileCopyAtomInv = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, InverseOutputType>;
             using GmemTiledCopyInv =
             decltype(make_tiled_copy(GmemTileCopyAtomInv{}, GmemLayoutAtom{}, Layout<Shape<_1, Int<kGmemElemsPerStore>>>{}));
 
@@ -789,7 +803,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
             // }
 
             // S2R with GmemTiledCopy layout, reading InverseType from smem
-            Tensor tOsInv = gmem_thr_copy_inv.partition_S(sKK_inv_pipe_slice);
+            Tensor tOsInv = gmem_thr_copy_inv.partition_S(sKK_out_pipe_slice);
             Tensor tOrInv = make_fragment_like(tOsInv);
             cute::copy(gmem_tiled_copy_inv, tOsInv, tOrInv);
 
