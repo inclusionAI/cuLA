@@ -146,14 +146,14 @@ struct CollectiveInverseTF32 {
     int thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
 
     auto sT_view = recast<ElementView>(sT);
-    auto t8X8sT = flat_divide(sT_view, Shape<_8, _8>{});
+    auto t16X16sT = flat_divide(sT_view, Shape<_16, _16>{});
     // if (thread_idx == 1) {
     //   printf("Before diagonal 8x8, mat:\n");
     //   cute::print_tensor(t8X8sT);
     // }
     // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
-    if (thread_idx < 64) {  // compute 8x8 inverse on diagnal directly
-      compute_diagonal_inverse_NxN<8>(t8X8sT(_, _, thread_idx / 8, thread_idx / 8), thread_idx % 8);
+    if (thread_idx < 64) {  // compute 16x16 inverse on diagnal directly
+      compute_diagonal_inverse_NxN<16>(t16X16sT(_, _, thread_idx / 16, thread_idx / 16), thread_idx % 16);
     }
     cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
 
@@ -163,11 +163,11 @@ struct CollectiveInverseTF32 {
     // }
     // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
 
-    auto t16X16sT = flat_divide(sT_view, Shape<_16, _16>{});
+    // auto t16X16sT = flat_divide(sT_view, Shape<_16, _16>{});
     // 四个warp做8x8 -> 16x16
-    blockwise_diagonal_inversed_8x8_to_16x16(t16X16sT(_, _, thread_idx / 32, thread_idx / 32));
+    // blockwise_diagonal_inversed_8x8_to_16x16(t16X16sT(_, _, thread_idx / 32, thread_idx / 32));
 
-    cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
+    // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
     // if (thread_idx == 1) {
     //   printf("After 8x8 to 16x16, mat:\n");
     //   cute::print_tensor(t16X16sT);

@@ -47,7 +47,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
     // matrix inversion config
     static constexpr bool UseTF32Inverse = true;
-    // NOTE: when enbale RoundingTF32=true, do x+=0x1000u for rounding, 
+    // NOTE: when enabling RoundingTF32=true, do x+=0x1000u for rounding, 
     // theoretically better precision, but lower performance
     // otherwise, better performance but theoretically lower precision
     // default to false, because FLA impl uses tl.dot directly which does not use rounding
