@@ -23,26 +23,53 @@ is_contiguous(Layout&& layout) {
 
 namespace detail::SM80 {
 
-// SM80 version of make_acc_into_op in "flat/hopper/collective/flat_common.hpp"
+// ============================================================================
+// convert_c_layout_to_a_layout — Compile-time layout reshape: C-fragment → A-fragment
+// ============================================================================
+// The C-fragment (accumulator) layout is (FragAtomC, MMA_M, MMA_N).
+// The A-fragment (operand A) layout is  (FragAtomA, MMA_M, MMA_K).
+//
+// When FragAtomA > FragAtomC (e.g. SM80_16x8x16 where A has 8 vals/atom but
+// C has 4 vals/atom, ratio=2), the N-dimension is split: MMA_N → (ratio, MMA_N/ratio),
+// and the "ratio" factor is folded into the value (FragAtom) dimension:
+//   C: ((2,2), MMA_M, MMA_N) → ((2,2,ratio), MMA_M, MMA_N/ratio)
+//
+// For SM80_16x8x8 TF32 (used in the inverse), FragAtomA == FragAtomC == 4,
+// so ratio=1 and this function returns the C-layout unchanged. The function is
+// still called to maintain a uniform code path and to reinterpret the fragment's
+// rank-3 indexing in A-operand terms for the per-k-atom shuffle loop.
+//
 template <typename CLayout, typename TiledMMA>
 CUTE_DEVICE constexpr auto
 convert_c_layout_to_a_layout(CLayout const& c, TiledMMA const& tiled_mma) {
-  constexpr auto c_frag_atom_size = size<0>(CLayout{});
-  constexpr auto a_frag_atom_size = size<1>(typename TiledMMA::AtomLayoutA_TV{});
+  constexpr auto c_frag_atom_size = size<0>(CLayout{});            // values per C atom (4 for SM80_16x8)
+  constexpr auto a_frag_atom_size = size<1>(typename TiledMMA::AtomLayoutA_TV{});  // values per A atom
   static_assert(a_frag_atom_size % c_frag_atom_size == 0);
-  constexpr auto ratio = a_frag_atom_size / c_frag_atom_size;
+  constexpr auto ratio = a_frag_atom_size / c_frag_atom_size;      // 1 for 16x8x8, 2 for 16x8x16
   if constexpr (ratio == 1) {
+    // SM80_16x8x8: C and A have the same value count per atom → no reshape needed
     return CLayout{};
   } else {
-    // e.g. the mma instruction shape is 16x8x16, we need to convert from ((2,2), MMA_M, MMA_N) to ((2,2,2), MMA_M, MMA_N/2)
-
-    constexpr auto tiler   = make_shape(_, _, Int<ratio>{});    // keep the first mode (FragAtom) and second mode (MMA_M)
+    // SM80_16x8x16: A atom has 2× more values than C atom.
+    // Split N-dimension by ratio, fold the extra factor into the value dimension:
+    //   C: (FragAtom, MMA_M, MMA_N)
+    //   → logical_divide by (_, _, ratio): (FragAtom, MMA_M, (ratio, MMA_N/ratio))
+    //   → flatten first + third[0]: ((FragAtom, ratio), MMA_M, MMA_N/ratio)
+    constexpr auto tiler   = make_shape(_, _, Int<ratio>{});    // keep FragAtom and MMA_M, split MMA_N
     constexpr auto divided = logical_divide(CLayout{}, tiler);  // (FragAtom, MMA_M, (ratio, MMA_N/ratio))
 
     return make_layout(flatten(make_layout(get<0>(divided), get<2, 0>(divided))), get<1>(divided), get<2, 1>(divided));
   }
 }
 
+// ============================================================================
+// make_acc_into_op — Generic acc→operand conversion (FP16 path only)
+// ============================================================================
+// Works for FP16 MMA because C-layout and A-layout have the SAME thread-to-K
+// mapping ({2*t0, 2*t0+1} for both). A simple in-thread element copy suffices.
+// For TF32 MMA, thread-to-K mappings DIFFER between C and A layouts, so this
+// function is INCORRECT for TF32. Use convert_fp32_acc_to_tf32_operandA_layout
+// instead, which performs cross-thread __shfl_sync shuffles.
 template <class Element, class Accumulator, class TiledMMA>
 CUTE_DEVICE auto
 make_acc_into_op(Accumulator const& acc, TiledMMA const& tiled_mma) {
@@ -52,6 +79,33 @@ make_acc_into_op(Accumulator const& acc, TiledMMA const& tiled_mma) {
   return operand;
 }
 
+// ============================================================================
+// convert_fp32_acc_to_tf32_operandA_layout — Cross-thread shuffle: C-layout → A-layout (TF32)
+// ============================================================================
+// Converts an MMA accumulator fragment (C-layout, float) into an A-operand fragment
+// (A-layout, float or tf32) via warp-level __shfl_sync shuffles.
+//
+// Why this is needed:
+//   The SM80 TF32 MMA (16x8x8) has different thread-value (TV) mappings for
+//   C-layout vs A-layout. Specifically, the K-dimension ownership differs:
+//     C-layout: t0 selects M-row group (stride 32), v0/v1 select M sub-rows
+//     A-layout: t0 selects K-column pair {t0, t0+4}, v0 selects M-half, v1 selects K-half
+//   This means values must be redistributed ACROSS threads (not just within a thread).
+//
+// Algorithm overview (per k-atom, 4 values each):
+//   1. Read all 4 src values into locals (avoid read-after-write hazard)
+//   2. For each M-half (v0_tf32 ∈ {0,1}):
+//      a. Select the 2 source values for this M-half (maps to v1_bf16 in C-layout)
+//      b. Shuffle from source threads: src_lane = t0/2 (K-lo) or t0/2+2 (K-hi)
+//      c. Select v0_bf16=0 or v0_bf16=1 based on t0 parity (even/odd)
+//   3. Write 4 output values (with optional TF32 rounding)
+//
+// Cost: 8 __shfl_sync per k-atom (2 M-halves × 4 shuffles each).
+//
+// Template parameters:
+//   NumKAtoms   — number of K-atoms to process (1, 2, or 4)
+//   RoundingTF32 — if true, output is tfloat32_t with explicit rounding;
+//                  if false, output is float and MMA hardware truncates
 template <int NumKAtoms = 4, bool RoundingTF32 = false, class FragSrc, class FragDst, class TiledMMA>
 CUTE_DEVICE void
 convert_fp32_acc_to_tf32_operandA_layout(
@@ -60,61 +114,80 @@ convert_fp32_acc_to_tf32_operandA_layout(
 {
   using ElemSrc = typename cute::remove_cvref_t<FragSrc>::value_type;
   using ElemDst = typename cute::remove_cvref_t<FragDst>::value_type;
-  static_assert(cute::is_same_v<ElemSrc, float>, "Fragment must be float; tf32 truncation is done by MMA hw");
-  static_assert(RoundingTF32 || cute::is_same_v<ElemDst, float>, "Fragment must be float with no rounding; tf32 truncation is done by MMA hw");
-  static_assert(!RoundingTF32 || cute::is_same_v<ElemDst, cutlass::tfloat32_t>, "Fragment must be tfloat32 with rounding inside this function");
+  static_assert(cute::is_same_v<ElemSrc, float>, "Fragment input must be float with acc data dtype");
+  static_assert(RoundingTF32 || cute::is_same_v<ElemDst, float>, "Fragment must be float with no rounding; tf32 truncation is done by MMA hardware");
+  static_assert(!RoundingTF32 || cute::is_same_v<ElemDst, cutlass::tfloat32_t>, "Fragment must be tfloat32 with rounding; tf32 truncation is done manually");
 
-  // convert acc layout to A layout of the corresponding TiledMMA
+  // Reinterpret the source fragment with A-layout indexing.
+  // For SM80_16x8x8 TF32, ratio=1 so this is effectively a no-op (same shape).
+  // For SM80_16x8x16, this would reshape (4, M, N) → (8, M, N/2) to align k-atoms.
   auto frag_src_cvt = make_tensor(frag_src.data(), convert_c_layout_to_a_layout(frag_src.layout(), tiled_mma));
 
-  int tid = lane_id;  // lane within warp
+  // Thread decomposition within a warp of 32 threads.
+  // tid = t0 + 4*t1, where t0 ∈ [0,4) indexes K-groups, t1 ∈ [0,8) indexes M-rows.
+  int tid = lane_id;
   int t0 = tid % 4;
-  bool sel_odd = (t0 & 1);  // t0%2: selects v0_bf16=1 result
+  // Parity of t0 determines which v0_bf16 value to select after shuffle:
+  //   even t0 → needs v0_bf16=0 (K = 2*(t0/2) = t0)
+  //   odd  t0 → needs v0_bf16=1 (K = 2*(t0/2)+1 = t0)
+  bool sel_odd = (t0 & 1);
 
-  // Source lane for v1_tf32=0: t0_src = t0/2, lane = t0_src + (tid & ~3)
-  // Source lane for v1_tf32=1: t0_src = t0/2+2, lane = (t0/2+2) + (tid & ~3)
-  int src_lane_lo = (t0 / 2)     + (tid & ~3);
-  int src_lane_hi = (t0 / 2 + 2) + (tid & ~3);
+  // Compute source lane IDs for the K-dimension shuffle.
+  // In C-layout, thread with t0_src holds K = {2*t0_src, 2*t0_src+1}.
+  // We need K = t0 (from t0_src = t0/2) and K = t0+4 (from t0_src = t0/2+2).
+  // The upper bits of lane_id (t1 portion) stay the same: (tid & ~3).
+  int src_lane_lo = (t0 / 2)     + (tid & ~3);   // source for K = t0     (v1_tf32=0)
+  int src_lane_hi = (t0 / 2 + 2) + (tid & ~3);   // source for K = t0 + 4 (v1_tf32=1)
 
-  // Process NumKAtoms k-iterations, each with 4 values: [4j+0, 4j+1, 4j+2, 4j+3]
-  // BF16 fragment layout per k-iter: (v0_bf16=0,v1_bf16=0), (v0_bf16=1,v1_bf16=0),
-  //                                   (v0_bf16=0,v1_bf16=1), (v0_bf16=1,v1_bf16=1)
-  // TF32 output layout per k-iter:   (v0_tf32=0,v1_tf32=0), (v0_tf32=1,v1_tf32=0),
-  //                                   (v0_tf32=0,v1_tf32=1), (v0_tf32=1,v1_tf32=1)
+  // Process each k-atom independently. Each atom has 4 values indexed as:
+  //   C-layout: [4j+0]=(v0=0,v1=0), [4j+1]=(v0=1,v1=0), [4j+2]=(v0=0,v1=1), [4j+3]=(v0=1,v1=1)
+  //     where v0 selects K sub-position, v1 selects M sub-row
+  //   A-layout: [4j+0]=(v0=0,v1=0), [4j+1]=(v0=1,v1=0), [4j+2]=(v0=0,v1=1), [4j+3]=(v0=1,v1=1)
+  //     where v0 selects M half (0 or +8), v1 selects K half (lo or hi)
   CUTE_UNROLL
   for (int j = 0; j < NumKAtoms; j++) {
-    // Read all 4 input values for this k-iter before writing any output,
-    // to avoid read-after-write hazard (in-place update).
-    float in0 = frag_src_cvt(0 + 4*j);  // v0_bf16=0, v1_bf16=0
-    float in1 = frag_src_cvt(1 + 4*j);  // v0_bf16=1, v1_bf16=0
-    float in2 = frag_src_cvt(2 + 4*j);  // v0_bf16=0, v1_bf16=1
-    float in3 = frag_src_cvt(3 + 4*j);  // v0_bf16=1, v1_bf16=1
+    // Step 1: Read all 4 input values BEFORE writing any output.
+    // This prevents read-after-write hazard when src and dst share storage
+    // (output positions overlap with input positions within the same k-atom).
+    float in0 = frag_src_cvt(0 + 4*j);  // C-layout: (v0=0, v1=0) → K-lo, M-row-0
+    float in1 = frag_src_cvt(1 + 4*j);  // C-layout: (v0=1, v1=0) → K-hi, M-row-0
+    float in2 = frag_src_cvt(2 + 4*j);  // C-layout: (v0=0, v1=1) → K-lo, M-row-1
+    float in3 = frag_src_cvt(3 + 4*j);  // C-layout: (v0=1, v1=1) → K-hi, M-row-1
 
-    // For v0_tf32=0: M is selected by v1_bf16=0, so source values are (in0, in1)
-    // For v0_tf32=1: M is selected by v1_bf16=1, so source values are (in2, in3)
+    // Step 2: Process each M-half (v0_tf32) independently.
+    // v0_tf32=0 (M-half 0) needs data from v1_bf16=0 → (in0, in1)
+    // v0_tf32=1 (M-half 1) needs data from v1_bf16=1 → (in2, in3)
     float out_vals[4];
     CUTE_UNROLL
     for (int v0_tf32 = 0; v0_tf32 < 2; v0_tf32++) {
-      float val0 = (v0_tf32 == 0) ? in0 : in2;  // v0_bf16=0 at chosen v1_bf16
-      float val1 = (v0_tf32 == 0) ? in1 : in3;  // v0_bf16=1 at chosen v1_bf16
+      // Select the two source values for this M-half.
+      // In C-layout, v1 selects M-row; in A-layout, v0 selects M-half.
+      // So v0_tf32 maps to v1_bf16 for M-row selection.
+      float val0 = (v0_tf32 == 0) ? in0 : in2;  // v0_bf16=0 at chosen M-half
+      float val1 = (v0_tf32 == 0) ? in1 : in3;  // v0_bf16=1 at chosen M-half
 
-      // Shuffle to get values from source threads
-      float recv0_lo = __shfl_sync(0xFFFFFFFF, val0, src_lane_lo);
-      float recv1_lo = __shfl_sync(0xFFFFFFFF, val1, src_lane_lo);
-      float recv0_hi = __shfl_sync(0xFFFFFFFF, val0, src_lane_hi);
-      float recv1_hi = __shfl_sync(0xFFFFFFFF, val1, src_lane_hi);
+      // Step 3: Cross-thread shuffle for K-dimension remapping.
+      // Fetch both v0_bf16 values (=0 and =1) from the source threads,
+      // then select the correct one based on t0 parity.
+      float recv0_lo = __shfl_sync(0xFFFFFFFF, val0, src_lane_lo);  // v0_bf16=0 from K-lo source
+      float recv1_lo = __shfl_sync(0xFFFFFFFF, val1, src_lane_lo);  // v0_bf16=1 from K-lo source
+      float recv0_hi = __shfl_sync(0xFFFFFFFF, val0, src_lane_hi);  // v0_bf16=0 from K-hi source
+      float recv1_hi = __shfl_sync(0xFFFFFFFF, val1, src_lane_hi);  // v0_bf16=1 from K-hi source
 
-      // Select based on t0%2: even → v0_bf16=0, odd → v0_bf16=1
-      out_vals[v0_tf32 + 0] = sel_odd ? recv1_lo : recv0_lo;  // v1_tf32=0
-      out_vals[v0_tf32 + 2] = sel_odd ? recv1_hi : recv0_hi;  // v1_tf32=1
+      // Step 4: Select correct value based on t0 parity.
+      // Even t0 needs v0_bf16=0 (recv0), odd t0 needs v0_bf16=1 (recv1).
+      out_vals[v0_tf32 + 0] = sel_odd ? recv1_lo : recv0_lo;  // v1_tf32=0 (K-lo half)
+      out_vals[v0_tf32 + 2] = sel_odd ? recv1_hi : recv0_hi;  // v1_tf32=1 (K-hi half)
     }
 
-    // Write all 4 output values
+    // Step 5: Write output values in A-layout order.
+    // If RoundingTF32: explicit cast to tfloat32_t applies rounding (x += 0x1000u).
+    // If !RoundingTF32: store as float; MMA hardware truncates to TF32 precision.
     if constexpr (RoundingTF32) {
-      frag_dst(0 + 4*j) = (ElemDst)out_vals[0];
-      frag_dst(1 + 4*j) = (ElemDst)out_vals[1];
-      frag_dst(2 + 4*j) = (ElemDst)out_vals[2];
-      frag_dst(3 + 4*j) = (ElemDst)out_vals[3];
+      frag_dst(0 + 4*j) = (ElemDst)out_vals[0];  // (v0_tf32=0, v1_tf32=0) → M-half-0, K-lo
+      frag_dst(1 + 4*j) = (ElemDst)out_vals[1];  // (v0_tf32=1, v1_tf32=0) → M-half-1, K-lo
+      frag_dst(2 + 4*j) = (ElemDst)out_vals[2];  // (v0_tf32=0, v1_tf32=1) → M-half-0, K-hi
+      frag_dst(3 + 4*j) = (ElemDst)out_vals[3];  // (v0_tf32=1, v1_tf32=1) → M-half-1, K-hi
     } else {
       frag_dst(0 + 4*j) = out_vals[0];
       frag_dst(1 + 4*j) = out_vals[1];
@@ -523,9 +596,10 @@ private:
     gemm(tiled_mma, tOrDC_mma, tOrAinv_mma, tOrO);
 
     if constexpr (!RoundingTF32) {
-      // no need for conversion
+      // no need for conversion: MMA hardware truncates float→tf32
       copy(O_tiled_copy, tOrO_cv, tOsO);
     } else {
+      // Explicit rounding: convert float→tfloat32_t before store to SMEM
       auto tOrO_cv_cvt = make_tensor_like<Element>(tOrO_cv);
       transform(tOrO_cv, tOrO_cv_cvt, [](auto v) { return Element(v); });
       copy(O_tiled_copy, tOrO_cv_cvt, tOsO);

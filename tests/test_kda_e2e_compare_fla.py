@@ -172,9 +172,9 @@ def test_safe_gate_chunk(
             (4, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True),
             (4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16, True),
             (4, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True),
-            # ======Varlen test with real-world trace=======
+            # ======Varlen test with simulated trace=======
             (
-                4,
+                32,
                 128,
                 0,
                 [
@@ -202,7 +202,7 @@ def test_safe_gate_chunk(
                 True,
             ),
             (
-                4,
+                32,
                 128,
                 0,
                 [
@@ -229,7 +229,7 @@ def test_safe_gate_chunk(
                 True,
             ),
             (
-                4,
+                32,
                 128,
                 0,
                 [
@@ -255,7 +255,7 @@ def test_safe_gate_chunk(
                 True,
             ),
             (
-                4,
+                32,
                 128,
                 0,
                 [

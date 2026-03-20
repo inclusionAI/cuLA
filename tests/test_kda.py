@@ -17,24 +17,24 @@ from flashla.kda.chunk import chunk_kda
 @pytest.mark.parametrize(
     (
         "B", "T", "H", "D",
-        "scale", "gate_logit_normalizer", "mask_p",
+        "gate_logit_normalizer", "mask_p",
         "use_qk_l2norm_in_kernel", "use_gate_in_kernel",
         "safe_gate", "dtype",
     ),
     [
         pytest.param(
             *test,
-            id="B{}-T{}-H{}-D{}-scale{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-{}".format(*test),
+            id="B{}-T{}-H{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-{}".format(*test),
         )
         for test in [
-            (1, 63, 1, 128, 1, 1, 0, False, False, True, torch.bfloat16),
-            (2, 500, 3, 128, 1, 1, 0, False, False, True, torch.bfloat16),
-            (2, 1000, 3, 128, 0.1, 1, 0.5, False, False, True, torch.bfloat16),
-            (3, 1024, 4, 128, 1, 0.1, 0, False, False, True, torch.bfloat16),
-            (4, 1024, 4, 128, 0.1, 1, 0, False, False, True, torch.bfloat16),
-            (4, 1024, 4, 128, 0.1, 1, 0, True, False, True, torch.bfloat16),
-            (2, 1500, 4, 128, 0.1, 10, 0, False, True, True, torch.bfloat16),
-            (4, 2048, 8, 128, 0.1, 1, 0, False, True, True, torch.bfloat16),
+            (1, 63, 1, 128, 1, 0, False, False, True, torch.bfloat16),
+            (2, 500, 3, 128, 1, 0, False, False, True, torch.bfloat16),
+            (2, 1000, 3, 128, 1, 0.5, False, False, True, torch.bfloat16),
+            (3, 1024, 4, 128, 0.1, 0, False, False, True, torch.bfloat16),
+            (4, 1024, 4, 128, 1, 0, False, False, True, torch.bfloat16),
+            (4, 1024, 4, 128, 1, 0, True, False, True, torch.bfloat16),
+            (2, 1500, 4, 128, 10, 0, False, True, True, torch.bfloat16),
+            (4, 2048, 8, 128, 1, 0, False, True, True, torch.bfloat16),
         ]
     ],
 )
@@ -43,7 +43,6 @@ def test_safe_gate_chunk(
     T: int,
     H: int,
     D: int,
-    scale: float,
     gate_logit_normalizer: float,
     mask_p: float,
     use_qk_l2norm_in_kernel: bool,
@@ -92,7 +91,6 @@ def test_safe_gate_chunk(
         v=v.clone(),
         g=(naive_kda_gate_fn(g, A_log, dt_bias) if use_gate_in_kernel else g.clone()),
         beta=beta.clone(),
-        scale=scale,
         initial_state=h0.clone(),
         output_final_state=True,
     )
@@ -111,7 +109,6 @@ def test_safe_gate_chunk(
         beta=beta.clone(),
         A_log=(A_log.clone() if use_gate_in_kernel else None),
         dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-        scale=scale,
         initial_state=h0.clone(),
         output_final_state=True,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
@@ -149,14 +146,14 @@ def test_safe_gate_chunk(
             (4, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True),
             (4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16, True),
             (4, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True),
-            # ======Varlen test with real-world trace=======
-            (4, 128, 0, [0,  247,  699,  982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824,
+            # ======Varlen test with simulated trace=======
+            (32, 128, 0, [0,  247,  699,  982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824,
         5101, 5919, 6426, 7137, 7392, 7800, 8192], torch.bfloat16, True),
-            (4, 128, 0.9, [0,  652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236,
+            (32, 128, 0, [0,  652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236,
         5543, 6255, 6480, 6947, 7616, 8192], torch.bfloat16, True),
-            (4, 128, 0.9, [0,  315,  973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459,
+            (32, 128, 0, [0,  315,  973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459,
         6318, 6669, 6979, 7583, 8192], torch.bfloat16, True),
-            (4, 128, 0.9, [0,  494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090,
+            (32, 128, 0, [0,  494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090,
         6718, 7244, 7870, 8192], torch.bfloat16, True),
         ]
     ],
