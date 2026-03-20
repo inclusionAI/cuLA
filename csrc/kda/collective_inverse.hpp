@@ -147,44 +147,19 @@ struct CollectiveInverseTF32 {
 
     auto sT_view = recast<ElementView>(sT);
     auto t16X16sT = flat_divide(sT_view, Shape<_16, _16>{});
-    // if (thread_idx == 1) {
-    //   printf("Before diagonal 8x8, mat:\n");
-    //   cute::print_tensor(t8X8sT);
-    // }
-    // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
+
     if (thread_idx < 64) {  // compute 16x16 inverse on diagnal directly
       compute_diagonal_inverse_NxN<16>(t16X16sT(_, _, thread_idx / 16, thread_idx / 16), thread_idx % 16);
     }
     cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
 
-    // if (thread_idx == 1) {
-    //   printf("After diagonal 8x8, mat:\n");
-    //   cute::print_tensor(t8X8sT);
-    // }
-    // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
-
-    // auto t16X16sT = flat_divide(sT_view, Shape<_16, _16>{});
-    // 四个warp做8x8 -> 16x16
-    // blockwise_diagonal_inversed_8x8_to_16x16(t16X16sT(_, _, thread_idx / 32, thread_idx / 32));
-
-    // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
-    // if (thread_idx == 1) {
-    //   printf("After 8x8 to 16x16, mat:\n");
-    //   cute::print_tensor(t16X16sT);
-    // }
-    // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
-
     auto t32X32sT = flat_divide(sT_view, Shape<_32, _32>{});
-    if (thread_idx < 64) { // 两个warp做16x16 -> 32x32
+    if (thread_idx < 64) { // two warps for 16x16 -> 32x32
       blockwise_diagonal_inversed_16x16_to_32x32(t32X32sT(_, _, thread_idx / 32, thread_idx /32));
     }
-    // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
-    // if (thread_idx == 1) {
-    //   printf("After 16x16 to 32x32, mat:\n");
-    //   cute::print_tensor(t32X32sT);
-    // }
+
     cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
-    // 一个warpgroup做32x32 -> 64x64
+    // one warpgroup for 32x32 -> 64x64
     blockwise_diagonal_inversed_32x32_to_64x64(sT_view);
   }
 
@@ -267,18 +242,7 @@ private:
       | C D |        | -inv(D)C inv(A)   inv(D) |
   */
 
-  template <typename TensorT>
-  CUTE_DEVICE void
-  blockwise_diagonal_inversed_4x4_to_8x8(TensorT&& mat) {
-    constexpr auto L = typename std::remove_const_t<std::remove_reference_t<TensorT>>::layout_type{};
-    static_assert(rank(L) == 2);
-    static_assert(size<0>(L) == 8);
-    static_assert(size<1>(L) == 8);
-    auto mat_NxN_2x2 = flat_divide(std::forward<TensorT>(mat), Shape<_4, _4>{});
-
-    // FIXME: implement
-  }
-
+  // not used
   template <typename TensorT>
   CUTE_DEVICE void
   blockwise_diagonal_inversed_8x8_to_16x16(TensorT&& mat) {
@@ -625,9 +589,6 @@ private:
     Tensor sAinv = select_tensor<1, 0>(mat_16x2X16x2_2x2(make_coord(_, x), _, _0{}, _0{}));  // NOTE: not y!
     Tensor sO    = mat_16x2X16x2_2x2(make_coord(_, y), _, _1{}, _0{});  // needs cross-warp reduction
 
-    // Tensor tOrDinv = thr_mma1.partition_fragment_A(sDinv);
-    // Tensor tOrC    = thr_mma1.partition_fragment_B(sC);
-    // Tensor tOrAinv = thr_mma2.partition_fragment_B(sAinv);
     Tensor tOrDinv = make_fragment_like<ElementView>(partition_shape_A(tiled_mma1, Shape<_16, _32>{}));
     Tensor tOrC    = make_fragment_like<ElementView>(partition_shape_B(tiled_mma1, Shape<_16, _32>{}));
     Tensor tOrAinv = make_fragment_like<ElementView>(partition_shape_B(tiled_mma2, Shape<_32, _16>{}));
@@ -743,44 +704,25 @@ struct CollectiveInverse {
     int thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
 
     auto t8X8sT = flat_divide(sT, Shape<_8, _8>{});
-    // if (thread_idx == 1) {
-    //   printf("Before diagonal 8x8, mat:\n");
-    //   cute::print_tensor(t8X8sT);
-    // }
-    // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
     if (thread_idx < 64) {  // compute 8x8 inverse on diagnal directly
       compute_diagonal_inverse_NxN<8>(t8X8sT(_, _, thread_idx / 8, thread_idx / 8), thread_idx % 8);
     }
 
     cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
-    // if (thread_idx == 1) {
-    //   printf("After diagonal 8x8, mat:\n");
-    //   cute::print_tensor(t8X8sT);
-    // }
-    // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
 
     auto t16X16sT = flat_divide(sT, Shape<_16, _16>{});
-    // 四个warp做8x8 -> 16x16
+    // four warps for 8x8 -> 16x16
     blockwise_diagonal_inversed_8x8_to_16x16(t16X16sT(_, _, thread_idx / 32, thread_idx / 32));
 
     cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
-    // if (thread_idx == 1) {
-    //   printf("After 8x8 to 16x16, mat:\n");
-    //   cute::print_tensor(t16X16sT);
-    // }
-    // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
 
     auto t32X32sT = flat_divide(sT, Shape<_32, _32>{});
-    if (thread_idx < 64) { // 两个warp做16x16 -> 32x32
+    if (thread_idx < 64) { // two warps for 16x16 -> 32x32
       blockwise_diagonal_inversed_16x16_to_32x32(t32X32sT(_, _, thread_idx / 32, thread_idx /32));
     }
     cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
-    // if (thread_idx == 1) {
-    //   printf("After 16x16 to 32x32, mat:\n");
-    //   cute::print_tensor(t32X32sT);
-    // }
-    // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, wg_sync_named_barrier_id_);
-    // 一个warpgroup做32x32 -> 64x64
+
+    // one warpgroup for 32x32 -> 64x64
     blockwise_diagonal_inversed_32x32_to_64x64(sT);
   }
 
@@ -902,16 +844,6 @@ private:
     Tensor sAinv = select_tensor<1, 0>(mat_8x8_2x2(_, _, _0{}, _0{}));
     Tensor sO    = mat_8x8_2x2(_, _, _1{}, _0{});
 
-    // int thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
-    // if (thread_idx == 1) {
-    //   printf("sDinv\n");
-    //   cute::print_tensor(sDinv);
-    //   printf("sC\n");
-    //   cute::print_tensor(sC);
-    //   printf("sAinv\n");
-    //   cute::print_tensor(sAinv);
-    // }
-
     Tensor sDinv_m_bcast = make_tensor(sDinv.data(), logical_product(sDinv.layout(), Tile<Layout<_2, _0>>{}));
     Tensor sO_m_bcast    = make_tensor(sO.data(), logical_product(sO.layout(), Tile<Layout<_2, _0>>{}));
 
@@ -936,25 +868,9 @@ private:
     copy(D_tiled_copy, tOsDinv(make_coord(_, _0{}), _, _), tOrDinv_cv(make_coord(_, _0{}), _, _));
     copy(C_tiled_copy, tOsC, tOrC_cv);
 
-    // if (thread_idx == 1) {
-    //   printf("inv(D): tOrDinv\n");
-    //   cute::print_tensor(tOrDinv);
-    //   printf("inv(D): partition S, tOsDinv\n");
-    //   cute::print_tensor(tOsDinv);
-    //   printf("inv(D): partition D, tOrDinv_cv\n");
-    //   cute::print_tensor(tOrDinv_cv);
-    //   printf("C: tOrC\n");
-    //   cute::print_tensor(tOrC);
-    // }
-
     clear(tDCrDC);
     gemm(tiled_mma, tOrDinv, tOrC, tDCrDC);
     transform(tDCrDC(make_coord(_, _0{}), _, _), [](auto v) { return -v; });
-
-    // if (thread_idx == 1) {
-    //   printf("Acc: tDCrDC\n");
-    //   cute::print_tensor(tDCrDC);
-    // }
 
     /////////////////////////////////////////////////////////////////////////////
     // -inv(D)C inv(A)
@@ -962,31 +878,12 @@ private:
 
     copy(A_tiled_copy, tOsAinv, tOrAinv_cv);
 
-    // if (thread_idx == 1) {
-    //   printf("inv(D)C Operand A: tOrDC\n");
-    //   cute::print_tensor(tOrDC);
-    //   printf("inv(A): tOrAinv\n");
-    //   cute::print_tensor(tOrAinv);
-    // }
-
     clear(tOrO);
     gemm(tiled_mma, tOrDC, tOrAinv, tOrO);
-
-    // if (thread_idx == 1) {
-    //   printf("inv(D)C inv(A) Acc: tOrO\n");
-    //   cute::print_tensor(tOrO);
-    //   printf("tOrO_cv\n");
-    //   cute::print_tensor(tOrO_cv);
-    // }
 
     auto tOrO_cv_cvt = make_tensor_like<Element>(tOrO_cv(make_coord(_, _0{}), _, _));
     transform(tOrO_cv(make_coord(_, _0{}), _, _), tOrO_cv_cvt, [](auto v) { return Element(v); });
     copy(O_tiled_copy, tOrO_cv_cvt, tOsO(make_coord(_, _0{}), _, _));
-
-    // if (thread_idx == 1) {
-    //   printf("Final Output sO\n");
-    //   cute::print_tensor(sO);
-    // }
   }
 
   template <typename TensorT>
