@@ -656,7 +656,7 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
             res[j] *= float(beta_row);
         }
     }
-    // TODO: support tf32 inverse
+
     if (row < sub_seq_len) {
         // R2S: convert to fp16 and write to SMEM for inverse warpgroup
         #pragma unroll

@@ -48,7 +48,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
     // matrix inversion config
     // TODO: optimize perf, larger band conflict for TF32 inverse
-    // NOTE: use TF32 inverse gets better accuracy, but causes about 11% kernel time increase currently
+    // NOTE: using TF32 inverse gets better accuracy, but causes about 11% kernel time increase currently
     static constexpr bool UseTF32Inverse = UseTF32Inverse_;
     // NOTE: when enabling RoundingTF32=true, do x+=0x1000u for rounding, 
     // theoretically better precision, but lower performance
@@ -108,7 +108,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
     // inv(KK) (tf32)
     using SmemLayoutOutputTF32 = decltype(coalesce(tile_to_shape(
-        UMMA::Layout_K_SW32_Atom<tf32>{},
+        UMMA::Layout_K_SW128_Atom<tf32>{},
         Shape<Int<TileT>, Int<TileT>>{},
         Step<_1, _2>{}
     ), Shape<_1, _1>{}));
