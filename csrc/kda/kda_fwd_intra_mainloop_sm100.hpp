@@ -32,6 +32,7 @@ struct KdaChunkFwdIntraSm100NamedBarriers {
 // constants, and the persistent loop bodies for each warp role.
 // The Kernel struct is templated on this Mainloop.
 // ===================================================================
+template <bool UseTF32Inverse_ = true, bool RoundingTF32_ = false>
 struct KdaChunkFwdIntraMainloopSm100 {
 
     // ===================== Tile / Buffer Constants =====================
@@ -44,6 +45,17 @@ struct KdaChunkFwdIntraMainloopSm100 {
     static constexpr int StagesLoad  = 2;
     static constexpr int StagesMma   = 2;
     static constexpr int StagesAcc   = 2;
+
+    // matrix inversion config
+    // TODO: optimize perf, larger band conflict for TF32 inverse
+    // NOTE: using TF32 inverse gets better accuracy, but causes about 11% kernel time increase currently
+    static constexpr bool UseTF32Inverse = UseTF32Inverse_;
+    // NOTE: when enabling RoundingTF32=true, do x+=0x1000u for rounding, 
+    // theoretically better precision, but lower performance
+    // otherwise, better performance but theoretically lower precision
+    // default to false, because FLA impl uses tl.dot directly which does not use rounding
+    // ref: https://triton-lang.org/main/python-api/generated/triton.language.dot.html
+    static constexpr bool RoundingTF32   = RoundingTF32_;
 
     // double buffer in TMEM, overlap prologue A matrix with MMA
     enum class TmemAllocation : uint32_t {
@@ -95,10 +107,13 @@ struct KdaChunkFwdIntraMainloopSm100 {
     ));
 
     // inv(KK) (tf32)
-    using SmemLayoutOutputTF32 = decltype(tile_to_shape(
-        UMMA::Layout_K_INTER_Atom<tf32>{},
-        Shape<Int<TileT>, Int<TileT>>{}
-    ));
+    using SmemLayoutOutputTF32 = decltype(coalesce(tile_to_shape(
+        UMMA::Layout_K_SW128_Atom<tf32>{},
+        Shape<Int<TileT>, Int<TileT>>{},
+        Step<_1, _2>{}
+    ), Shape<_1, _1>{}));
+
+    using SmemLayoutInvKK = std::conditional_t<!UseTF32Inverse, SmemLayoutOutputFP16, SmemLayoutOutputTF32>;
 
     using TiledMMA_KDAqk_N16_MASK02 = decltype(make_tiled_mma(
         SM100_MMA_TF32_TS_MASK02<tf32, tf32, float, TileT, SubTileT, UMMA::Major::K, UMMA::Major::K>{}
@@ -136,8 +151,22 @@ struct KdaChunkFwdIntraMainloopSm100 {
     using PipelineKKInvReady = cutlass::PipelineAsync<StagesAcc>;
 
     // ===================== Matrix Inverse =====================
-    using InverseType       = cutlass::half_t;
-    using CollectiveInverse = flashla::CollectiveInverse<InverseType, true, false>;
+    using InverseType = std::conditional_t<
+        !UseTF32Inverse,
+        cutlass::half_t,
+        cutlass::tfloat32_t
+    >;
+    // NOTE: avoid tfloat32 cast in R2G store
+    using InverseOutputType = std::conditional_t<
+        !UseTF32Inverse,
+        cutlass::half_t,
+        float
+    >;
+    using CollectiveInverse = std::conditional_t<
+        !UseTF32Inverse, 
+        flashla::CollectiveInverse<InverseType, true, false>,
+        flashla::CollectiveInverseTF32<InverseType, true, false, RoundingTF32>
+    >;
 
     // ===================== GMEM Store ===========
     // Akk: R2G store bf16
@@ -172,7 +201,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
         } kg_all[StagesMma]; // 20KB
 
         // inv(KK), double buffer
-        array_aligned<fp16, cosize_v<SmemLayoutOutputFP16>> kk[StagesAcc]; // 16KB
+        array_aligned<InverseType, cosize_v<SmemLayoutInvKK>> kk[StagesAcc]; // 16KB
 
         // ---- Pipeline shared storage ----
         alignas(16) typename PipelineQKG::SharedStorage pipe_qkg_load_storage;
@@ -452,10 +481,10 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 float beta_row = shared_plan->beta_smem[beta_pipe_state_read.index()][row];
 
                 // Create SMEM tensor view for KK output (fp16)
-                Tensor sKK = make_tensor(make_smem_ptr(shared_plan->kk[buf_acc_idx].data()), SmemLayoutOutputFP16{});
+                Tensor sKK = make_tensor(make_smem_ptr(shared_plan->kk[buf_acc_idx].data()), SmemLayoutInvKK{});
 
                 if (wg_idx == 0) {
-                    fwd_epilogue_qk_kk<TileT>(
+                    fwd_epilogue_qk_kk<TileT, UseTF32Inverse, RoundingTF32>(
                         static_cast<int>(TmemAllocation::QK) + buf_acc_idx * 256,
                         idx_in_warpgroup,
                         sub_seq_len,
@@ -707,8 +736,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
         int thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
         int *chunk_indices_ptr = (int*)params.chunk_indices_ptr;
         int *cu_seqlens_ptr = (int*)params.cu_seqlens_ptr;
-        // TODO: tf32 inverse
-        static_assert(sizeof(InverseType) == sizeof(Element));
+        static_assert(UseTF32Inverse || sizeof(InverseType) == sizeof(Element));
 
         CUTE_NO_UNROLL
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
@@ -733,13 +761,24 @@ struct KdaChunkFwdIntraMainloopSm100 {
             fence_view_async_shared();
 
             // Create SMEM tensor view for KK output (fp16)
-            Tensor sKK_inv = make_tensor(make_smem_ptr(shared_plan->kk[kk_inv_pipe_state_read.index()].data()), SmemLayoutOutputFP16{});
+            Tensor sKK_inv = make_tensor(make_smem_ptr(shared_plan->kk[kk_inv_pipe_state_read.index()].data()), SmemLayoutInvKK{});
+            // if (thread_idx == 0) {
+            //     printf("sKK, Before Inverse\n");
+            //     cute::print_tensor(sKK_inv);
+            // }
             auto sKK_inv_pipe_slice = sKK_inv(_, _);
+            auto sKK_out_pipe_slice = [&]() {
+                if constexpr (!UseTF32Inverse) {
+                    return sKK_inv_pipe_slice;
+                } else {
+                    return recast<float>(sKK_inv_pipe_slice);
+                }
+            }();
             auto collective_inverse = CollectiveInverse(KdaChunkFwdIntraSm100NamedBarriers::InverseMath);
             collective_inverse.compute(sKK_inv_pipe_slice);
 
             // cast to Element in registers, then R2G directly — no extra R2S + S2R round-trip
-            using GmemTileCopyAtomInv = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, InverseType>;
+            using GmemTileCopyAtomInv = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, InverseOutputType>;
             using GmemTiledCopyInv =
             decltype(make_tiled_copy(GmemTileCopyAtomInv{}, GmemLayoutAtom{}, Layout<Shape<_1, Int<kGmemElemsPerStore>>>{}));
 
@@ -761,9 +800,13 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
             // wait for inverse done
             cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, KdaChunkFwdIntraSm100NamedBarriers::InverseMath);
+            // if (thread_idx == 0) {
+            //     printf("sKK, After Inverse\n");
+            //     cute::print_tensor(sKK_inv);
+            // }
 
             // S2R with GmemTiledCopy layout, reading InverseType from smem
-            Tensor tOsInv = gmem_thr_copy_inv.partition_S(sKK_inv_pipe_slice);
+            Tensor tOsInv = gmem_thr_copy_inv.partition_S(sKK_out_pipe_slice);
             Tensor tOrInv = make_fragment_like(tOsInv);
             cute::copy(gmem_tiled_copy_inv, tOsInv, tOrInv);
 

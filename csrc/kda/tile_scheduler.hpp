@@ -59,7 +59,6 @@ struct StaticPersistentTileScheduler {
       return current_tile_id < total_tiles();
     }
 
-    // Keep the same decode interface as NaiveTileScheduler
     CUTLASS_DEVICE
     static auto decode_tile_coord(int tile_id, int num_heads, int *chunk_indices_ptr, int *cu_seqlens_ptr) {
       using namespace cute;

@@ -629,7 +629,7 @@ __forceinline__ __device__ void fwd_epilogue_t2r_qk(
 // sub_seq_len: actual sequence length within this tile
 // beta_row: beta scaling factor for this thread's row (from beta_smem)
 // sKK: SMEM tensor for inverse warpgroup (fp16)
-template <int TileT, typename KK_SMEM_TENSOR>
+template <int TileT, bool UseTF32Inverse, bool RoundingTF32, typename KK_SMEM_TENSOR>
 __forceinline__ __device__ void fwd_epilogue_t2r_kk(
     int tmem_kk_addr, int idx_in_warpgroup, int sub_seq_len,
     float beta_row,
@@ -656,7 +656,7 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
             res[j] *= float(beta_row);
         }
     }
-    // TODO: support tf32 inverse
+
     if (row < sub_seq_len) {
         // R2S: convert to fp16 and write to SMEM for inverse warpgroup
         #pragma unroll
@@ -664,17 +664,37 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
             // Convert 4 floats → 4 fp16 values, store as 2×half2
             float2 f01 = reinterpret_cast<float2*>(res)[i * 2];
             float2 f23 = reinterpret_cast<float2*>(res)[i * 2 + 1];
-            __half2 h01 = __float22half2_rn(f01);
-            __half2 h23 = __float22half2_rn(f23);
-            *reinterpret_cast<__half2*>(&sKK(row, i * 4))     = h01;
-            *reinterpret_cast<__half2*>(&sKK(row, i * 4 + 2)) = h23;
+            if constexpr (!UseTF32Inverse) {
+                __half2 h01 = __float22half2_rn(f01);
+                __half2 h23 = __float22half2_rn(f23);
+                *reinterpret_cast<__half2*>(&sKK(row, i * 4))     = h01;
+                *reinterpret_cast<__half2*>(&sKK(row, i * 4 + 2)) = h23;
+            } else {
+                if constexpr (RoundingTF32) {
+                    sKK(row, i * 4) = tfloat32_t(f01.x);
+                    sKK(row, i * 4 + 1) = tfloat32_t(f01.y);
+                    sKK(row, i * 4 + 2) = tfloat32_t(f23.x);
+                    sKK(row, i * 4 + 3) = tfloat32_t(f23.y);
+                } else {
+                    *reinterpret_cast<float2*>(&sKK(row, i * 4))     = f01;
+                    *reinterpret_cast<float2*>(&sKK(row, i * 4 + 2)) = f23;
+                }
+            }
         }
     } else {
         // NOTE: must write zeros to SMEM of invalid token postitions in the current chunk
         // R2S zero
         #pragma unroll
         for (int i = 0; i < TileT; ++i) {
-            sKK(row, i) = half_t(0.0f);
+            if constexpr (!UseTF32Inverse) {
+                sKK(row, i) = half_t(0.0f);
+            } else {
+                if constexpr (RoundingTF32) {
+                    sKK(row, i) = tfloat32_t(0.0f);
+                } else {
+                    *reinterpret_cast<float*>(&sKK(row, i)) = 0.0f;
+                }
+            }
         }
     }
 }
@@ -690,7 +710,7 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
 // beta_row: beta scaling factor for this thread's row (from beta_smem)
 // qk_out_base: global memory pointer for QK row output (bf16, lower threads only)
 // sKK: SMEM tensor for KK inverse (fp16, upper threads only)
-template <int TileT, typename KK_SMEM_TENSOR>
+template <int TileT, bool UseTF32Inverse, bool RoundingTF32, typename KK_SMEM_TENSOR>
 __forceinline__ __device__ void fwd_epilogue_qk_kk(
     int tmem_qk_addr, int idx_in_warpgroup, int sub_seq_len,
     float scale, float beta_row, __nv_bfloat16 *qk_out_base,
@@ -698,7 +718,7 @@ __forceinline__ __device__ void fwd_epilogue_qk_kk(
     if (idx_in_warpgroup < 64) {
         fwd_epilogue_t2r_qk<TileT>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, scale, qk_out_base);
     } else {
-        fwd_epilogue_t2r_kk<TileT>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, beta_row, sKK);
+        fwd_epilogue_t2r_kk<TileT, UseTF32Inverse, RoundingTF32>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, beta_row, sKK);
     }
 }
 

@@ -754,6 +754,7 @@ def chunk_kda_fwd_intra(
     chunk_indices: torch.LongTensor | None = None,
     safe_gate: bool = False,
     disable_recompute: bool = False,
+    use_tf32_inverse: bool = True,
 ):
     assert safe_gate, "Only safe_gate=True is supported in chunk_kda_fwd_intra for now"
     B, T, H, K = k.shape
@@ -787,7 +788,7 @@ def chunk_kda_fwd_intra(
     tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
     flashla_cuda.chunk_kda_fwd_intra_cuda(
         q, k, gk, beta, cu_seqlens, chunk_indices,
-        Aqk, Akk, tile_counter, scale, chunk_size
+        Aqk, Akk, tile_counter, scale, chunk_size, use_tf32_inverse
     )
     # rearrange back
     if B != 1:

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kda_config.h"
+#include "kda_config.hpp"
 
 namespace flashla {
 
