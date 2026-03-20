@@ -11,15 +11,15 @@ from fla.ops.cp.chunk_delta_h import (
     compress_h0,
 )
 from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
-from flashla.kda.chunk_intra import chunk_kda_fwd_intra
+from cula.kda.chunk_intra import chunk_kda_fwd_intra
 from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
-_delta_h_mod = importlib.import_module("flashla.chunk_delta_h")
+_delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h")
 chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
-_fwd_o_mod = importlib.import_module("flashla.fwd_o")
+_fwd_o_mod = importlib.import_module("cula.ops.fwd_o")
 chunk_gla_fwd_o = _fwd_o_mod.chunk_gla_fwd_o
 
 def chunk_kda_fwd(

@@ -11,7 +11,7 @@ from fla.ops.kda.naive import naive_recurrent_kda
 from fla.ops.kda.gate import naive_kda_gate
 from fla.utils import assert_close, device
 
-from flashla.kda.chunk import chunk_kda
+from cula.kda.chunk import chunk_kda
 
 
 @pytest.mark.parametrize(

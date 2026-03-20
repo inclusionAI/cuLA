@@ -18,7 +18,7 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
 # Our implementation
-from flashla.chunk_delta_h import ChunkDeltaRuleFwdH, reference_chunk_delta_rule_fwd_h
+from cula.ops.chunk_delta_h import ChunkDeltaRuleFwdH, reference_chunk_delta_rule_fwd_h
 
 
 def fla_reference_chunk_fwd_h(

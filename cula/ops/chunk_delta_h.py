@@ -1195,7 +1195,7 @@ class ChunkDeltaRuleFwdH:
                 if use_initial_state:
                     # Wait for load warp's TMA h0 load into SMEM, then read from SMEM
                     h0_h = load_h0_C.wait_and_advance()
-                    for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
+                    for ei in cutlass.range(cute.size(tTR_rKV), unroll_full=True):
                         v_coord, k_coord = tTR_cM_h[ei]
                         tTR_rKV[ei] = sH0[(k_coord, v_coord, 0)]
                     h0_h.release()
@@ -1236,8 +1236,8 @@ class ChunkDeltaRuleFwdH:
                     h_handle = h_out_P.acquire_and_advance()
                     cute.copy(tiled_r2s_h, tRS_rH, tRS_sH[(None, None, None, h_handle.index)])
                     cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
+                        'async.shared',
+                        space='cta',
                     )
                     h_handle.commit()
 
@@ -1291,8 +1291,8 @@ class ChunkDeltaRuleFwdH:
                         cute.copy(tiled_r2s_vnew, tRS_rVnew_st,
                                   tRS_sVnew_store[(None, None, None, vnew_st_h.index)])
                         cute.arch.fence_proxy(
-                            cute.arch.ProxyKind.async_shared,
-                            space=cute.arch.SharedSpace.shared_cta,
+                            'async.shared',
+                            space='cta',
                         )
                         vnew_st_h.commit()
 
@@ -1314,7 +1314,7 @@ class ChunkDeltaRuleFwdH:
                         # Step 2: Sync all 4 CUDA warps so all 128 scales are visible
                         self.gk_precompute_bar.arrive_and_wait()
                         # Step 3: Apply precomputed scales (SMEM read only, no exp2)
-                        for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
+                        for ei in cutlass.range(cute.size(tTR_rKV), unroll_full=True):
                             v_coord, k_coord = tTR_cM_h[ei]
                             tTR_rKV[ei] = tTR_rKV[ei] * sGK_smem[(k_coord, gk_h.index)]
                         gk_h.release()
@@ -1339,7 +1339,7 @@ class ChunkDeltaRuleFwdH:
                 # ===== After main loop: store final state ht (fp32 reg → fp32 GMEM) =====
                 if store_final_state:
                     gHt = ht_tensor[None, None, (hidx, bidx)]  # (V, K)
-                    for ei in cutlass.range_constexpr(cute.size(tTR_rKV)):
+                    for ei in cutlass.range(cute.size(tTR_rKV), unroll_full=True):
                         v_coord, k_coord = tTR_cM_h[ei]
                         gHt[v_coord + v_tile_idx * self.BV, k_coord] = tTR_rKV[ei]
 

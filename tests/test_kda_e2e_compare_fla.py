@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from fla.utils import assert_close, device
 from fla.ops.kda.chunk import chunk_kda as fla_chunk_kda
 
-from flashla.kda.chunk import chunk_kda as flashla_chunk_kda
+from cula.kda.chunk import chunk_kda as cula_chunk_kda
 
 
 @pytest.mark.parametrize(
@@ -117,7 +117,7 @@ def test_safe_gate_chunk(
     ref_dq, ref_dk, ref_dv, ref_dg, ref_db, ref_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
     q.grad = k.grad = v.grad = g.grad = beta.grad = h0.grad = None
 
-    tri, tri_ht = flashla_chunk_kda(
+    tri, tri_ht = cula_chunk_kda(
         q=(
             F.normalize(q.clone(), p=2, dim=-1)
             if not use_qk_l2norm_in_kernel
@@ -316,7 +316,7 @@ def test_safe_gate_chunk_varlen(
     do = torch.randn_like(v)
     dht = torch.rand_like(h0)
 
-    tri, tri_ht = flashla_chunk_kda(
+    tri, tri_ht = cula_chunk_kda(
         q=F.normalize(q.clone(), p=2, dim=-1),
         k=k.clone(),
         v=v.clone(),

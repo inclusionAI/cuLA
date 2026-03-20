@@ -784,7 +784,7 @@ class ChunkGlaFwdO:
         # LOAD WARP
         # =====================================================================
         if warp_idx == self.load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
+            cute.arch.setmaxregister_decrease(self.num_regs_others)
 
             cpasync.prefetch_descriptor(tma_atom_q)
             cpasync.prefetch_descriptor(tma_atom_g)
@@ -864,7 +864,7 @@ class ChunkGlaFwdO:
         # STORE WARP
         # =====================================================================
         elif warp_idx == self.store_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
+            cute.arch.setmaxregister_decrease(self.num_regs_others)
 
             cpasync.prefetch_descriptor(tma_atom_o)
 
@@ -964,13 +964,13 @@ class ChunkGlaFwdO:
         # EMPTY WARP
         # =====================================================================
         elif warp_idx == self.empty_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
+            cute.arch.setmaxregister_decrease(self.num_regs_others)
 
         # =====================================================================
         # MMA WARP
         # =====================================================================
         elif warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
+            cute.arch.setmaxregister_decrease(self.num_regs_others)
 
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 # Phase 1: QH MMA — qg(TMEM) × h(SMEM) → acc_qh(TMEM)
@@ -1025,7 +1025,7 @@ class ChunkGlaFwdO:
         # CUDA WARPS: Gating + Masking → TMEM
         # =====================================================================
         elif warp_idx in self.cuda_warp_ids:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_cuda)
+            cute.arch.setmaxregister_increase(self.num_regs_cuda)
 
             local_tidx = tidx % (self.threads_per_warp * len(self.cuda_warp_ids))
             scale_f32 = Float32(self.scale)
@@ -1197,8 +1197,8 @@ class ChunkGlaFwdO:
                 o_h = o_ready_P.acquire_and_advance()
                 cute.copy(tiled_r2s_o, tRS_rO, tRS_sO[(None, None, None, 0)])
                 cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
+                    'async.shared',
+                    space='cta',
                 )
                 o_h.commit()
 

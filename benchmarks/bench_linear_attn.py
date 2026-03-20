@@ -11,7 +11,7 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64, Float32
 
 
-from flashla.linear_attn import LinearAttentionChunkwise
+from cula.ops.linear_attn import LinearAttentionChunkwise
 
 import torch
 from einops import rearrange

@@ -12,9 +12,9 @@ from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2, gather
 from fla.utils import IS_GATHER_SUPPORTED, IS_TF32_SUPPORTED, autotune_cache_kwargs
 
-from flashla.utils import prepare_uniform_cu_seqlens
+from cula.utils import prepare_uniform_cu_seqlens
 
-import flashla.cudac as flashla_cuda
+import cula.cudac as cula_cuda
 
 if IS_TF32_SUPPORTED:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr('tf32')
@@ -786,7 +786,7 @@ def chunk_kda_fwd_intra(
     if B != 1:
         q, k, gk, beta, Aqk, Akk = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, gk, beta, Aqk, Akk))
     tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
-    flashla_cuda.chunk_kda_fwd_intra_cuda(
+    cula_cuda.chunk_kda_fwd_intra_cuda(
         q, k, gk, beta, cu_seqlens, chunk_indices,
         Aqk, Akk, tile_counter, scale, chunk_size, use_tf32_inverse
     )

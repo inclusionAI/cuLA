@@ -31,14 +31,11 @@ import random
 import pytest
 import torch
 
-# Add flash-linear-attention to path for Triton reference
-sys.path.insert(0, "/ossfs/workspace/flash-linear-attention")
-
-# Import directly from the module file to avoid flashla package __init__ (requires cudac)
+# Import directly from the module file to avoid cula package __init__ (requires cudac)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import importlib.util
 _spec = importlib.util.spec_from_file_location(
-    "fwd_o", os.path.join(os.path.dirname(__file__), "..", "flashla", "fwd_o.py"))
+    "fwd_o", os.path.join(os.path.dirname(__file__), "..", "cula", "ops", "fwd_o.py"))
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 ChunkGlaFwdO = _mod.ChunkGlaFwdO

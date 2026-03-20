@@ -32,12 +32,12 @@ def get_arch_flags():
     major, minor = map(int, nvcc_version_number.split("."))
     print(f"Compiling using NVCC {major}.{minor}")
 
-    DISABLE_SM100 = is_flag_set("FLASHLA_DISABLE_SM100")
-    DISABLE_SM90 = is_flag_set("FLASHLA_DISABLE_SM90")
+    DISABLE_SM100 = is_flag_set("CULA_DISABLE_SM100")
+    DISABLE_SM90 = is_flag_set("CULA_DISABLE_SM90")
     if major < 12 or (major == 12 and minor <= 8):
         assert (
             DISABLE_SM100
-        ), "sm100 compilation requires NVCC 12.9 or higher. Please set FLASHLA_DISABLE_SM100=1 to disable sm100 compilation, or update your environment."
+        ), "sm100 compilation requires NVCC 12.9 or higher. Please set CULA_DISABLE_SM100=1 to disable sm100 compilation, or update your environment."
 
     arch_flags = []
     if not DISABLE_SM100:
@@ -64,7 +64,7 @@ else:
 ext_modules = []
 ext_modules.append(
     CUDAExtension(
-        name="flashla.cudac",
+        name="cula.cudac",
         sources=[
             "csrc/pybind.cu",
             "csrc/kda_api.cu",
@@ -102,12 +102,12 @@ ext_modules.append(
 )
 
 setup(
-    name="flashla",
+    name="cula",
     use_scm_version={
-        "write_to": "flashla/_version.py",
+        "write_to": "cula/_version.py",
         "local_scheme": "node-and-date",
     },
-    packages=find_packages(include=["flashla"]),
+    packages=find_packages(include=["cula", "cula.*"]),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
 )

@@ -31,7 +31,7 @@ import importlib
 import pathlib
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
-_fwd_o_mod = importlib.import_module("flashla.fwd_o")
+_fwd_o_mod = importlib.import_module("cula.ops.fwd_o")
 chunk_gla_fwd_o = _fwd_o_mod.chunk_gla_fwd_o
 build_chunk_indices = _fwd_o_mod.build_chunk_indices
 

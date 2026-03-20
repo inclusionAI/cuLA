@@ -8,6 +8,7 @@ Compares against:
 """
 
 import sys
+import pathlib
 import argparse
 import warnings
 
@@ -20,8 +21,8 @@ from cutlass.cute.runtime import from_dlpack, make_ptr
 # Suppress third-party deprecation warnings (e.g. torch.jit)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-sys.path.insert(0, "/ossfs/workspace/flashla")
-from flashla.lightning_attn import LinearAttentionChunkwiseDecay, lightning_attn_fwd, lightning_attn_fwd_varlen
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from cula.ops.lightning_attn import LinearAttentionChunkwiseDecay, lightning_attn_fwd, lightning_attn_fwd_varlen
 
 try:
     from fla.ops.simple_gla import chunk_simple_gla

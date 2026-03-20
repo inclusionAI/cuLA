@@ -12,7 +12,7 @@ from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.constant import RCP_LN2
 from benchmarks.utils import set_seed, exclusive_cumsum, generate_random_seq_lens, SEED
 
-from flashla.kda.chunk_intra import chunk_kda_fwd_intra as flashla_chunk_kda_fwd_intra
+from cula.kda.chunk_intra import chunk_kda_fwd_intra as cula_chunk_kda_fwd_intra
 
 # Constant params
 B, H, D = 2, 64, 128
@@ -111,7 +111,7 @@ def benchmark_chunk_intra_uniform():
             chunk_size=chunk_size, chunk_indices=chunk_indices,
             safe_gate=True,
         )
-        out_cula = flashla_chunk_kda_fwd_intra(
+        out_cula = cula_chunk_kda_fwd_intra(
             q=q, k=k, v=v, gk=g, beta=beta,
             scale=scale, cu_seqlens=cu_seqlens,
             chunk_size=chunk_size, chunk_indices=chunk_indices,
@@ -132,7 +132,7 @@ def benchmark_chunk_intra_uniform():
             ),
         )
         ms_cula = triton.testing.do_bench(
-            lambda: flashla_chunk_kda_fwd_intra(
+            lambda: cula_chunk_kda_fwd_intra(
                 q=q, k=k, v=v, gk=g, beta=beta,
                 scale=scale, cu_seqlens=cu_seqlens,
                 chunk_size=chunk_size, chunk_indices=chunk_indices,
@@ -177,7 +177,7 @@ def benchmark_chunk_intra_varlen():
             chunk_size=chunk_size, chunk_indices=chunk_indices,
             safe_gate=True,
         )
-        out_cula = flashla_chunk_kda_fwd_intra(
+        out_cula = cula_chunk_kda_fwd_intra(
             q=q, k=k, v=v, gk=g, beta=beta,
             scale=scale, cu_seqlens=cu_seqlens,
             chunk_size=chunk_size, chunk_indices=chunk_indices,
@@ -197,7 +197,7 @@ def benchmark_chunk_intra_varlen():
             ),
         )
         ms_cula = triton.testing.do_bench(
-            lambda: flashla_chunk_kda_fwd_intra(
+            lambda: cula_chunk_kda_fwd_intra(
                 q=q, k=k, v=v, gk=g, beta=beta,
                 scale=scale, cu_seqlens=cu_seqlens,
                 chunk_size=chunk_size, chunk_indices=chunk_indices,

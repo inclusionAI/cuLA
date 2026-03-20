@@ -76,7 +76,7 @@ from cutlass.cute.typing import Int32, Int64, Float32
 
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 
-import flashla.utils
+import cula.utils
 
 # Global debug switch - set to False to disable ALL print statements
 # When False, cutlass.const_expr(PRINT_DEBUG) will eliminate code at compile time

@@ -13,7 +13,7 @@ from fla.ops.kda.gate import fused_kda_gate, naive_kda_gate
 from fla.ops.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device
 
-from flashla.kda_wrapper import flash_kda_prefill
+from cula.kda.fully_fused import flash_kda_prefill
 
 # ---------------------------------- Tests for FlashKDA Impl ----------------------------------
 

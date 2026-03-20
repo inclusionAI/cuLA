@@ -4,11 +4,11 @@ requires = ["setuptools>=61", "wheel", "setuptools_scm>=6.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flashla"
+name = "cula"
 dynamic = ["version"]
-description = "FlashLA CUDA extension"
+description = "cuLA CUDA extension"
 readme = "README.md"
-authors = [ { name = "flashla contributors" } ]
+authors = [ { name = "cula contributors" } ]
 requires-python = ">=3.8"
 dependencies = [
     "nvidia-cutlass-dsl==4.4.1",
@@ -21,11 +21,11 @@ license = { text = "MIT" }
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["flashla"]
+include = ["cula"]
 
 [tool.setuptools_scm]
 # write generated version into package for runtime access
-write_to = "flashla/_version.py"
+write_to = "cula/_version.py"
 # add a date-based local suffix when needed
 local_scheme = "node-and-date"
 # fallback for non-git sources

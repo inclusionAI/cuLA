@@ -24,12 +24,11 @@ import torch
 import importlib
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
-_wu_mod = importlib.import_module("flashla.recompute_wu")
+_wu_mod = importlib.import_module("cula.ops.recompute_wu")
 recompute_w_u_fwd = _wu_mod.recompute_w_u_fwd
 recompute_w_u_fwd_ref = _wu_mod.recompute_w_u_fwd_ref
 
 # ─── FLA baseline imports ───
-sys.path.insert(0, "/ossfs/workspace/flash-linear-attention")
 from fla.ops.kda.wy_fast import recompute_w_u_fwd as fla_recompute_w_u_fwd
 
 

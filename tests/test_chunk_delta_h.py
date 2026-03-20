@@ -14,14 +14,13 @@ import pytest
 import torch
 
 # ─── FLA reference ───
-sys.path.insert(0, "/ossfs/workspace/flash-linear-attention")
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as fla_fwd_h
 
-# ─── CuTe DSL kernel (via importlib to avoid flashla __init__ requiring cudac) ───
+# ─── CuTe DSL kernel (via importlib to avoid cula __init__ requiring cudac) ───
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import importlib.util
 _spec = importlib.util.spec_from_file_location(
-    "chunk_delta_h", os.path.join(os.path.dirname(__file__), "..", "flashla", "chunk_delta_h.py"))
+    "chunk_delta_h", os.path.join(os.path.dirname(__file__), "..", "cula", "ops", "chunk_delta_h.py"))
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 chunk_gated_delta_rule_fwd_h = _mod.chunk_gated_delta_rule_fwd_h

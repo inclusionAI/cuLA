@@ -1,9 +1,9 @@
 __version__ = "0.1.0"
 
-from flashla.lightning_attn import LinearAttentionChunkwiseDecay
+from cula.ops.lightning_attn import LinearAttentionChunkwiseDecay
 
 # Matrix inversion kernel
-from flashla.inv import MatrixInverse64x64
+from cula.ops.inv import MatrixInverse64x64
 
 __all__ = [
     "LinearAttentionChunkwiseDecay",

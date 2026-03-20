@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-bench_kda.py — Benchmark: flashla CuTe DSL vs FLA Triton baseline
+bench_kda.py — Benchmark: cuLA CuTe DSL vs FLA Triton baseline
                for chunk_kda (KDA forward)
 
 Compares:
-  - Accuracy: RMSE, relative max diff between flashla and FLA outputs
+  - Accuracy: RMSE, relative max diff between cuLA and FLA outputs
   - Performance: kernel execution time (ms) with CUDA events
 
 Modes:
@@ -27,7 +27,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import torch
 
 from fla.ops.kda import chunk_kda as fla_chunk_kda
-from flashla.kda.chunk import chunk_kda as flashla_chunk_kda
+from cula.kda.chunk import chunk_kda as cula_chunk_kda
 from benchmarks.utils import (
     set_seed, exclusive_cumsum, prepare_safe_gate_inputs, SEED,
 )
@@ -107,7 +107,7 @@ def run_kda(q, k, v, g, beta, scale, A_log, dt_bias,
 # ============================================================
 def bench_fixed(configs):
     print("\n" + "=" * 100)
-    print(" Fixed-Length Benchmark: flashla CuTe DSL vs FLA Triton")
+    print(" Fixed-Length Benchmark: cuLA CuTe DSL vs FLA Triton")
     print("=" * 100)
     results = []
 
@@ -130,34 +130,31 @@ def bench_fixed(configs):
 
         # Accuracy: compare outputs
         o_fla, _ = run_kda(**common, fn=fla_chunk_kda)
-        o_flashla, _ = run_kda(**common, fn=flashla_chunk_kda)
+        o_cula, _ = run_kda(**common, fn=cula_chunk_kda)
         torch.cuda.synchronize()
 
-        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_flashla)
+        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
 
         # Performance
         def fn_fla(**common_kw):
             return lambda: run_kda(**common_kw, fn=fla_chunk_kda)
 
-        def fn_flashla(**common_kw):
-            return lambda: run_kda(**common_kw, fn=flashla_chunk_kda)
+        def fn_cula(**common_kw):
+            return lambda: run_kda(**common_kw, fn=cula_chunk_kda)
 
         ms_fla = time_kernel(fn_fla(**common))
-        ms_flashla = time_kernel(fn_flashla(**common))
-        speedup = ms_fla / ms_flashla if ms_flashla > 0 else float('inf')
+        ms_cula = time_kernel(fn_cula(**common))
+        speedup = ms_fla / ms_cula if ms_cula > 0 else float('inf')
 
         r = {
             'B': B, 'T': T,
             'rmse': rmse, 'rel_max': rel_max, 'mean_diff': mean_diff,
-            'ms_fla': ms_fla, 'ms_flashla': ms_flashla, 'speedup': speedup,
+            'ms_fla': ms_fla, 'ms_cula': ms_cula, 'speedup': speedup,
         }
         results.append(r)
-        print(f"  B={B:2d} T={T:5d} | "
-              f"RMSE={rmse:.6f} rel_max={rel_max:.6f} | "
-              f"FLA={ms_fla:.4f}ms flashla={ms_flashla:.4f}ms | "
-              f"speedup={speedup:.2f}x")
+        print(f"  B={B:2d} T={T:5d}  done  ({speedup:.2f}x)")
 
-        del o_fla, o_flashla, q, k, v, g, beta, A_log, dt_bias, inputs
+        del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
         torch.cuda.empty_cache()
 
     return results
@@ -168,7 +165,7 @@ def bench_fixed(configs):
 # ============================================================
 def bench_varlen(configs):
     print("\n" + "=" * 100)
-    print(" Varlen Benchmark: flashla CuTe DSL vs FLA Triton")
+    print(" Varlen Benchmark: cuLA CuTe DSL vs FLA Triton")
     print("=" * 100)
     results = []
 
@@ -191,21 +188,21 @@ def bench_varlen(configs):
 
         # Accuracy
         o_fla, _ = run_kda(**common, fn=fla_chunk_kda)
-        o_flashla, _ = run_kda(**common, fn=flashla_chunk_kda)
+        o_cula, _ = run_kda(**common, fn=cula_chunk_kda)
         torch.cuda.synchronize()
 
-        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_flashla)
+        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
 
         # Performance
         def fn_fla(**common_kw):
             return lambda: run_kda(**common_kw, fn=fla_chunk_kda)
 
-        def fn_flashla(**common_kw):
-            return lambda: run_kda(**common_kw, fn=flashla_chunk_kda)
+        def fn_cula(**common_kw):
+            return lambda: run_kda(**common_kw, fn=cula_chunk_kda)
 
         ms_fla = time_kernel(fn_fla(**common))
-        ms_flashla = time_kernel(fn_flashla(**common))
-        speedup = ms_fla / ms_flashla if ms_flashla > 0 else float('inf')
+        ms_cula = time_kernel(fn_cula(**common))
+        speedup = ms_fla / ms_cula if ms_cula > 0 else float('inf')
 
         n_seqs = len(seq_lens)
         min_l, max_l = min(seq_lens), max(seq_lens)
@@ -215,15 +212,12 @@ def bench_varlen(configs):
         r = {
             'tag': tag, 'T_total': T, 'n_seqs': n_seqs,
             'rmse': rmse, 'rel_max': rel_max, 'mean_diff': mean_diff,
-            'ms_fla': ms_fla, 'ms_flashla': ms_flashla, 'speedup': speedup,
+            'ms_fla': ms_fla, 'ms_cula': ms_cula, 'speedup': speedup,
         }
         results.append(r)
-        print(f"  {tag:45s} | "
-              f"RMSE={rmse:.6f} rel_max={rel_max:.6f} | "
-              f"FLA={ms_fla:.4f}ms flashla={ms_flashla:.4f}ms | "
-              f"speedup={speedup:.2f}x")
+        print(f"  {tag:45s}  done  ({speedup:.2f}x)")
 
-        del o_fla, o_flashla, q, k, v, g, beta, A_log, dt_bias, inputs
+        del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
         torch.cuda.empty_cache()
 
     return results
@@ -236,7 +230,7 @@ def print_report(fixed_results, varlen_results):
     sep = "=" * 110
     print(f"\n\n{sep}")
     print("                       BENCHMARK REPORT: chunk_kda")
-    print("                       flashla CuTe DSL vs FLA Triton")
+    print("                       cuLA CuTe DSL vs FLA Triton")
     print(f"                       H={H}  D={D}  dtype=bf16  safe_gate=True")
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
@@ -248,24 +242,24 @@ def print_report(fixed_results, varlen_results):
         print("\n  [Fixed-Length]")
         print(f"  {'─' * 85}")
         print(f"  {'B':>3s}  {'T':>5s}  │  {'RMSE':>10s}  {'rel_max':>10s}"
-              f"  │  {'FLA(ms)':>9s}  {'flashla(ms)':>11s}  {'Speedup':>8s}")
+              f"  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>11s}  {'Speedup':>8s}")
         print(f"  {'─' * 85}")
         for r in fixed_results:
             print(f"  {r['B']:3d}  {r['T']:5d}  │  "
                   f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  │  "
-                  f"{r['ms_fla']:9.4f}  {r['ms_flashla']:11.4f}  {r['speedup']:7.2f}x")
+                  f"{r['ms_fla']:9.4f}  {r['ms_cula']:11.4f}  {r['speedup']:7.2f}x")
         print(f"  {'─' * 85}")
 
     if varlen_results:
         print("\n  [Varlen]")
         print(f"  {'─' * 100}")
         print(f"  {'Config':>45s}  │  {'RMSE':>10s}  {'rel_max':>10s}"
-              f"  │  {'FLA(ms)':>9s}  {'flashla(ms)':>11s}  {'Speedup':>8s}")
+              f"  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>11s}  {'Speedup':>8s}")
         print(f"  {'─' * 100}")
         for r in varlen_results:
             print(f"  {r['tag']:>45s}  │  "
                   f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  │  "
-                  f"{r['ms_fla']:9.4f}  {r['ms_flashla']:11.4f}  {r['speedup']:7.2f}x")
+                  f"{r['ms_fla']:9.4f}  {r['ms_cula']:11.4f}  {r['speedup']:7.2f}x")
         print(f"  {'─' * 100}")
 
     print(f"\n{sep}\n")
@@ -276,7 +270,7 @@ def print_report(fixed_results, varlen_results):
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="bench_kda: flashla CuTe DSL vs FLA Triton baseline"
+        description="bench_kda: cuLA CuTe DSL vs FLA Triton baseline"
     )
     parser.add_argument(
         "--mode", type=str, default="both",
