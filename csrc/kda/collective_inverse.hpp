@@ -360,16 +360,6 @@ private:
     Tensor sAinv = select_tensor<1, 0>(mat_8x8_2x2(_, _, _0{}, _0{}));
     Tensor sO    = mat_8x8_2x2(_, _, _1{}, _0{});
 
-    // int thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
-    // if (thread_idx == 1) {
-    //   printf("sDinv\n");
-    //   cute::print_tensor(sDinv);
-    //   printf("sC\n");
-    //   cute::print_tensor(sC);
-    //   printf("sAinv\n");
-    //   cute::print_tensor(sAinv);
-    // }
-
     Tensor sDinv_m_bcast = make_tensor(sDinv.data(), logical_product(sDinv.layout(), Tile<Layout<_2, _0>>{}));
     Tensor sO_m_bcast    = make_tensor(sO.data(), logical_product(sO.layout(), Tile<Layout<_2, _0>>{}));
 
@@ -396,17 +386,6 @@ private:
     copy(D_tiled_copy, tOsDinv, tOrDinv_cv);
     copy(C_tiled_copy, tOsC, tOrC_cv);
 
-    // if (thread_idx == 1) {
-    //   printf("inv(D): tOrDinv\n");
-    //   cute::print_tensor(tOrDinv);
-    //   printf("inv(D): partition S, tOsDinv\n");
-    //   cute::print_tensor(tOsDinv);
-    //   printf("inv(D): partition D, tOrDinv_cv\n");
-    //   cute::print_tensor(tOrDinv_cv);
-    //   printf("C: tOrC\n");
-    //   cute::print_tensor(tOrC);
-    // }
-
     clear(tDCrDC);
     auto tOrDinv_mma = [&]() {
       if constexpr (!RoundingTF32) {
@@ -425,11 +404,6 @@ private:
     gemm(tiled_mma, tOrDinv_mma, tOrC_mma, tDCrDC);
     transform(tDCrDC, [](auto v) { return -v; });
 
-    // if (thread_idx == 1) {
-    //   printf("Acc: tDCrDC\n");
-    //   cute::print_tensor(tDCrDC);
-    // }
-
     /////////////////////////////////////////////////////////////////////////////
     // -inv(D)C inv(A)
     Tensor tOrDC = make_fragment_like<ElementView>(partition_shape_A(tiled_mma, Shape<_16, _8>{}));
@@ -444,13 +418,6 @@ private:
     }();
 
     copy(A_tiled_copy, tOsAinv, tOrAinv_cv);
-
-    // if (thread_idx == 1) {
-    //   printf("inv(D)C Operand A: tOrDC\n");
-    //   cute::print_tensor(tOrDC);
-    //   printf("inv(A): tOrAinv\n");
-    //   cute::print_tensor(tOrAinv);
-    // }
 
     clear(tOrO);
     auto tOrAinv_mma = [&]() {
@@ -467,21 +434,9 @@ private:
       copy(O_tiled_copy, tOrO_cv, tOsO);
     } else {
       auto tOrO_cv_cvt = make_tensor_like<Element>(tOrO_cv);
-      // if (thread_idx == 1) {
-      //   printf("inv(D)C inv(A) Acc: tOrO\n");
-      //   cute::print_tensor(tOrO);
-      //   printf("tOrO_cv\n");
-      //   cute::print_tensor(tOrO_cv);
-      // }
-
       transform(tOrO_cv, tOrO_cv_cvt, [](auto v) { return Element(v); });
       copy(O_tiled_copy, tOrO_cv_cvt, tOsO);
     }
-
-    // if (thread_idx == 1) {
-    //   printf("Final Output sO\n");
-    //   cute::print_tensor(sO);
-    // }
   }
 
   template <typename TensorT>
