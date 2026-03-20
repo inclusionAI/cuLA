@@ -97,7 +97,13 @@ class KDARecomputeWU:
         self.buffer_align_bytes = 1024
 
         self.bproc_stage = 1
-        self.acc_stage = 1
+        self.acc_stage = 2
+
+        # Staging buffer for coalesced GMEM stores (transpose via SMEM)
+        # sStage[BT, BN + PAD] bf16 — PAD avoids bank conflicts
+        self.stage_pad = 4
+        self.stage_stride_row = self.BN + self.stage_pad  # stride in elements for BT dim
+        self.stage_elems = self.BT * self.stage_stride_row
 
         if persistent:
             # occ=2 persistent: keep 2-CTA-per-SM parallelism
@@ -343,6 +349,10 @@ class KDARecomputeWU:
                 cute.struct.MemRange[self.io_dtype, self.BT + 2],
                 128,
             ]
+            sStage: cute.struct.Align[
+                cute.struct.MemRange[self.io_dtype, self.stage_elems],
+                self.buffer_align_bytes,
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -484,6 +494,14 @@ class KDARecomputeWU:
             cute.make_ptr(self.io_dtype, storage.sBeta.data_ptr().toint(),
                           cute.AddressSpace.smem),
             cute.make_layout((self.BT,), stride=(1,)),
+        )
+        sStage_ptr = cute.make_ptr(
+            self.io_dtype, storage.sStage.data_ptr().toint(),
+            cute.AddressSpace.smem,
+        )
+        sStage = cute.make_tensor(
+            sStage_ptr,
+            cute.make_layout((self.BT, self.BN), stride=(self.stage_stride_row, 1)),
         )
 
         # ---------- Pipelines ----------
@@ -791,8 +809,19 @@ class KDARecomputeWU:
                     cute.arch.fence_view_async_tmem_store()
                     bproc_h.commit()
 
-                    # === Overlap with MMA K: write kg + precompute V ===
+                    # === Overlap with MMA K: precompute V + write kg ===
                     k_off = time_base * K + i_kv * self.BK
+
+                    # Precompute v*beta FIRST (while sK/sV/sGK still held)
+                    for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
+                        m_coord, k_coord = tTR_cM[ei]
+                        v_val    = sV[(k_coord, m_coord, kgk_h.index)].to(self.acc_dtype)
+                        beta_val = sBeta[k_coord].to(self.acc_dtype)
+                        tTR_rBproc[ei] = (v_val * beta_val).to(self.io_dtype)
+                    kgk_h.release()
+                    tRT_rBproc.store(tTR_rBproc.load())
+
+                    # Stage kg through SMEM for coalesced GMEM writes
                     kg_tile_p = cute.make_ptr(
                         self.io_dtype, (kg_ptr + k_off).toint(),
                         cute.AddressSpace.gmem, assumed_align=2,
@@ -803,30 +832,30 @@ class KDARecomputeWU:
                     )
                     for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                         m_coord, k_coord = tTR_cM[ei]
-                        kg_tile[(k_coord, m_coord)] = tTR_rKg[ei]
+                        sStage[(k_coord, m_coord)] = tTR_rKg[ei]
+                    cuda_sync.arrive_and_wait()
+                    for si in cutlass.range_constexpr(self.BT * self.BK // self.num_cuda_threads):
+                        flat_idx = local_tidx + si * self.num_cuda_threads
+                        s_row = flat_idx // self.BK
+                        s_col = flat_idx % self.BK
+                        kg_tile[(s_row, s_col)] = sStage[(s_row, s_col)]
+                    cuda_sync.arrive_and_wait()
 
-                    # Precompute v*beta during MMA K (all data on same barrier)
-                    for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
-                        m_coord, k_coord = tTR_cM[ei]
-                        v_val    = sV[(k_coord, m_coord, kgk_h.index)].to(self.acc_dtype)
-                        beta_val = sBeta[k_coord].to(self.acc_dtype)
-                        tTR_rBproc[ei] = (v_val * beta_val).to(self.io_dtype)
-                    kgk_h.release()
-                    tRT_rBproc.store(tTR_rBproc.load())
+                    # === K MMA done: R2T V first to unblock MMA V, then read K result ===
 
-                    # === K MMA done: T2R result, immediately R2T V -> MMA V ===
-                    acc_h = acc_done_C.wait_and_advance()
-                    cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, acc_h.index)], tTR_rAcc)
-                    cute.arch.fence_view_async_tmem_load()
-                    acc_h.release()
-
-                    # R2T V bproc -> TMEM -> signal MMA V start
+                    # R2T V bproc -> TMEM -> signal MMA V start (BEFORE reading K result)
                     bproc_h2 = bproc_P.acquire_and_advance()
                     cute.copy(tiled_r2t, tRT_rBproc, tRT_tA[(None, None, None, None, 0)])
                     cute.arch.fence_view_async_tmem_store()
                     bproc_h2.commit()
 
-                    # Write w to GMEM (overlaps with MMA V)
+                    # Now read K result from acc (MMA V can run on acc[1] concurrently)
+                    acc_h = acc_done_C.wait_and_advance()
+                    cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, acc_h.index)], tTR_rAcc)
+                    cute.arch.fence_view_async_tmem_load()
+                    acc_h.release()
+
+                    # Write w to GMEM via SMEM staging (overlaps with MMA V)
                     w_tile_p = cute.make_ptr(
                         self.io_dtype, (w_ptr + k_off).toint(),
                         cute.AddressSpace.gmem, assumed_align=2,
@@ -837,7 +866,14 @@ class KDARecomputeWU:
                     )
                     for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                         m_coord, n_coord = tTR_cM[ei]
-                        w_tile[(n_coord, m_coord)] = tTR_rAcc[ei].to(self.io_dtype)
+                        sStage[(n_coord, m_coord)] = tTR_rAcc[ei].to(self.io_dtype)
+                    cuda_sync.arrive_and_wait()
+                    for si in cutlass.range_constexpr(self.BT * self.BK // self.num_cuda_threads):
+                        flat_idx = local_tidx + si * self.num_cuda_threads
+                        s_row = flat_idx // self.BK
+                        s_col = flat_idx % self.BK
+                        w_tile[(s_row, s_col)] = sStage[(s_row, s_col)]
+                    cuda_sync.arrive_and_wait()
 
                     # === V MMA done ===
                     acc_h2 = acc_done_C.wait_and_advance()
@@ -856,7 +892,14 @@ class KDARecomputeWU:
                     )
                     for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                         m_coord, n_coord = tTR_cM[ei]
-                        u_tile[(n_coord, m_coord)] = tTR_rAcc[ei].to(self.io_dtype)
+                        sStage[(n_coord, m_coord)] = tTR_rAcc[ei].to(self.io_dtype)
+                    cuda_sync.arrive_and_wait()
+                    for si in cutlass.range_constexpr(self.BT * self.BV // self.num_cuda_threads):
+                        flat_idx = local_tidx + si * self.num_cuda_threads
+                        s_row = flat_idx // self.BV
+                        s_col = flat_idx % self.BV
+                        u_tile[(s_row, s_col)] = sStage[(s_row, s_col)]
+                    cuda_sync.arrive_and_wait()
 
         # ---------- TMEM cleanup ----------
         tmem.relinquish_alloc_permit()

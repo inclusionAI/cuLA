@@ -153,7 +153,7 @@ def bench_fixed(configs):
         }
         results.append(r)
         print(f"  B={B:2d} T={T:5d} | "
-              f"RMSE={rmse:.6f} rel_max={rel_max:.6f} mean_diff={mean_diff:.8f} | "
+              f"RMSE={rmse:.6f} rel_max={rel_max:.6f} | "
               f"FLA={ms_fla:.4f}ms flashla={ms_flashla:.4f}ms | "
               f"speedup={speedup:.2f}x")
 
@@ -219,7 +219,7 @@ def bench_varlen(configs):
         }
         results.append(r)
         print(f"  {tag:45s} | "
-              f"RMSE={rmse:.6f} rel_max={rel_max:.6f} mean_diff={mean_diff:.8f} | "
+              f"RMSE={rmse:.6f} rel_max={rel_max:.6f} | "
               f"FLA={ms_fla:.4f}ms flashla={ms_flashla:.4f}ms | "
               f"speedup={speedup:.2f}x")
 
@@ -246,27 +246,27 @@ def print_report(fixed_results, varlen_results):
 
     if fixed_results:
         print("\n  [Fixed-Length]")
-        print(f"  {'─' * 100}")
-        print(f"  {'B':>3s}  {'T':>5s}  │  {'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
+        print(f"  {'─' * 85}")
+        print(f"  {'B':>3s}  {'T':>5s}  │  {'RMSE':>10s}  {'rel_max':>10s}"
               f"  │  {'FLA(ms)':>9s}  {'flashla(ms)':>11s}  {'Speedup':>8s}")
-        print(f"  {'─' * 100}")
+        print(f"  {'─' * 85}")
         for r in fixed_results:
             print(f"  {r['B']:3d}  {r['T']:5d}  │  "
-                  f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                  f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  │  "
                   f"{r['ms_fla']:9.4f}  {r['ms_flashla']:11.4f}  {r['speedup']:7.2f}x")
-        print(f"  {'─' * 100}")
+        print(f"  {'─' * 85}")
 
     if varlen_results:
         print("\n  [Varlen]")
-        print(f"  {'─' * 115}")
-        print(f"  {'Config':>45s}  │  {'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
+        print(f"  {'─' * 100}")
+        print(f"  {'Config':>45s}  │  {'RMSE':>10s}  {'rel_max':>10s}"
               f"  │  {'FLA(ms)':>9s}  {'flashla(ms)':>11s}  {'Speedup':>8s}")
-        print(f"  {'─' * 115}")
+        print(f"  {'─' * 100}")
         for r in varlen_results:
             print(f"  {r['tag']:>45s}  │  "
-                  f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                  f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  │  "
                   f"{r['ms_fla']:9.4f}  {r['ms_flashla']:11.4f}  {r['speedup']:7.2f}x")
-        print(f"  {'─' * 115}")
+        print(f"  {'─' * 100}")
 
     print(f"\n{sep}\n")
 
@@ -303,9 +303,9 @@ def main():
 
     fixed_configs = [
         # (B, T)
-        (1, 128), (1, 256), (1, 512), (1, 1024), (1, 2048),
+        (1, 512), (1, 1024), 
         (1, 4096), (1, 8192), (1, 16384),
-        (2, 128), (2, 256), (2, 512), (2, 1024), (2, 2048),
+        (2, 512), (2, 1024), 
         (2, 4096), (2, 8192), (2, 16384),
     ]
 
