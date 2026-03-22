@@ -96,36 +96,35 @@ FLA baseline: [flash-linear-attention@5da31d19](https://github.com/fla-org/flash
 
 | B | T | FLA Triton (ms) | cuLA (ms) | Speedup |
 |---|---|-----------------|-----------|---------|
-| 1 | 128 | 0.557 | 0.519 | **1.07x** |
-| 1 | 256 | 0.542 | 0.511 | **1.06x** |
-| 1 | 512 | 0.540 | 0.507 | **1.06x** |
-| 1 | 1024 | 0.534 | 0.505 | **1.06x** |
-| 1 | 2048 | 0.550 | 0.510 | **1.08x** |
-| 1 | 4096 | 0.881 | 0.597 | **1.48x** |
-| 1 | 8192 | 1.683 | 1.126 | **1.50x** |
-| 1 | 16384 | 3.295 | 2.180 | **1.51x** |
-| 2 | 128 | 0.562 | 0.516 | **1.09x** |
-| 2 | 256 | 0.553 | 0.517 | **1.07x** |
-| 2 | 512 | 0.547 | 0.514 | **1.06x** |
-| 2 | 1024 | 0.537 | 0.508 | **1.06x** |
-| 2 | 2048 | 0.819 | 0.598 | **1.37x** |
-| 2 | 4096 | 1.560 | 1.129 | **1.38x** |
-| 2 | 8192 | 3.044 | 2.189 | **1.39x** |
-| 2 | 16384 | 6.020 | 4.336 | **1.39x** |
+| 1 | 512 | 0.572 | 0.530 | **1.08x** |
+| 1 | 1024 | 0.553 | 0.523 | **1.06x** |
+| 1 | 4096 | 0.885 | 0.586 | **1.51x** |
+| 1 | 8192 | 1.686 | 1.099 | **1.53x** |
+| 1 | 16384 | 3.298 | 2.131 | **1.55x** |
+| 2 | 512 | 0.567 | 0.534 | **1.06x** |
+| 2 | 1024 | 0.557 | 0.520 | **1.07x** |
+| 2 | 4096 | 1.563 | 1.102 | **1.42x** |
+| 2 | 8192 | 3.048 | 2.145 | **1.42x** |
+| 2 | 16384 | 6.043 | 4.231 | **1.43x** |
 
 ### KDA — Variable-Length (H=64, D=128, bf16)
 
 | Config | FLA Triton (ms) | cuLA (ms) | Speedup |
 |--------|-----------------|-----------|---------|
-| 1seq, T=4096 | 0.881 | 0.597 | **1.48x** |
-| 1seq, T=8192 | 1.723 | 1.166 | **1.48x** |
-| 1seq, T=16384 | 3.306 | 2.197 | **1.50x** |
-| 20seqs, T=4096, uniform | 0.898 | 0.679 | **1.32x** |
-| 20seqs, T=8192, uniform | 1.604 | 1.190 | **1.35x** |
-| 20seqs, T=16384, uniform | 3.057 | 2.235 | **1.37x** |
-| 20seqs, T=4096, skewed | 0.866 | 0.616 | **1.41x** |
-| 20seqs, T=8192, skewed | 1.693 | 1.137 | **1.49x** |
-| 20seqs, T=16384, skewed | 3.363 | 2.189 | **1.54x** |
+| 1seq, T=4096 | 0.893 | 0.586 | **1.52x** |
+| 1seq, T=8192 | 1.689 | 1.097 | **1.54x** |
+| 1seq, T=16384 | 3.296 | 2.133 | **1.55x** |
+| 20seqs, T=4096, uniform | 0.902 | 0.671 | **1.34x** |
+| 20seqs, T=8192, uniform | 1.610 | 1.168 | **1.38x** |
+| 25seqs, T=8192, uniform | 1.629 | 1.182 | **1.38x** |
+| 20seqs, T=16384, uniform | 3.059 | 2.181 | **1.40x** |
+| 25seqs, T=16384, uniform | 3.070 | 2.187 | **1.40x** |
+| 20seqs, T=4096, skewed | 0.872 | 0.608 | **1.43x** |
+| 20seqs, T=8192, skewed | 1.698 | 1.111 | **1.53x** |
+| 20seqs, T=16384, skewed | 3.340 | 2.134 | **1.57x** |
+| 20seqs, T=4096, tail-heavy | 0.910 | 0.617 | **1.48x** |
+| 20seqs, T=8192, tail-heavy | 1.757 | 1.125 | **1.56x** |
+| 20seqs, T=16384, tail-heavy | 3.489 | 2.155 | **1.62x** |
 
 To reproduce:
 
@@ -133,37 +132,41 @@ To reproduce:
 python benchmarks/bench_kda.py --mode both
 ```
 
-<details>
-<summary>Sample output</summary>
+### Lightning Attention — Prefill (H=64, D=128, bf16)
 
+| B | T | FLA Triton (ms) | cuLA (ms) | Speedup |
+|---|---|-----------------|-----------|---------|
+| 1 | 1024 | 0.094 | 0.070 | **1.34x** |
+| 1 | 4096 | 0.205 | 0.154 | **1.33x** |
+| 1 | 8192 | 0.393 | 0.291 | **1.35x** |
+| 1 | 16384 | 0.765 | 0.561 | **1.36x** |
+| 2 | 1024 | 0.109 | 0.064 | **1.71x** |
+| 2 | 4096 | 0.386 | 0.175 | **2.21x** |
+| 2 | 8192 | 0.753 | 0.326 | **2.31x** |
+| 2 | 16384 | 1.486 | 0.631 | **2.36x** |
+
+### Lightning Attention — Variable-Length (H=64, D=128, bf16)
+
+Persistent CuTe DSL kernel vs FLA Triton varlen, 126 configs (N=5..25 seqs, T=1K..32K, uniform/skewed/random).
+
+| N (seqs) | T | Dist | cuLA (ms) | FLA Triton (ms) | Speedup |
+|----------|---|------|-----------|-----------------|---------|
+| 5 | 1024 | uniform | 0.079 | 0.184 | **2.33x** |
+| 5 | 8192 | skewed | 0.216 | 0.404 | **1.87x** |
+| 10 | 16384 | skewed | 0.401 | 0.731 | **1.82x** |
+| 16 | 8192 | uniform | 0.250 | 0.403 | **1.61x** |
+| 16 | 32768 | uniform | 0.724 | 1.298 | **1.79x** |
+| 20 | 16384 | skewed | 0.445 | 0.732 | **1.65x** |
+| 20 | 32768 | skewed | 0.776 | 1.452 | **1.87x** |
+| 25 | 32768 | random | 0.793 | 1.449 | **1.83x** |
+
+Summary (126 configs): **avg=1.58x**, min=0.94x, max=2.33x. Persistent vs Non-persistent output is **bit-exact**.
+
+To reproduce:
+
+```bash
+python benchmarks/bench_lightning_attn.py --modes no_state h0_ht varlen
 ```
-                       BENCHMARK REPORT: chunk_kda
-                       flashla CuTe DSL vs FLA Triton
-                       H=64  D=128  dtype=bf16  safe_gate=True
-                       Warmup=10  Iters=100
-================================================================================
-  [Fixed-Length]
-  ────────────────────────────────────────────────────────────────────────────
-    B      T  │        RMSE     rel_max     mean_diff  │    FLA(ms)  flashla(ms)   Speedup
-  ────────────────────────────────────────────────────────────────────────────
-    1    128  │    0.000003    0.003311    0.00000023  │     0.5571       0.5194     1.07x
-    1   1024  │    0.000003    0.006061    0.00000021  │     0.5343       0.5049     1.06x
-    1   4096  │    0.000004    0.005000    0.00000042  │     0.8809       0.5966     1.48x
-    1   8192  │    0.000003    0.005376    0.00000028  │     1.6833       1.1257     1.50x
-    1  16384  │    0.000004    0.004717    0.00000034  │     3.2949       2.1799     1.51x
-    2   4096  │    0.000003    0.005376    0.00000028  │     1.5602       1.1286     1.38x
-    2  16384  │    0.000003    0.004717    0.00000030  │     6.0200       4.3357     1.39x
-  ...
-
-  [Varlen]
-  ────────────────────────────────────────────────────────────────────────────
-    1seqs T=16384           │     3.3063       2.1971     1.50x
-    20seqs T=8192           │     1.6041       1.1896     1.35x
-    20seqs T=16384          │     3.3627       2.1891     1.54x
-  ...
-```
-
-</details>
 
 ## Tests
 
@@ -194,9 +197,9 @@ tests/test_kda_e2e_compare_fla.py::test_safe_gate_chunk_varlen[...]             
 
 CUDA kernel tuning is significantly more labor-intensive than Triton — contributions from the open-source community are warmly welcomed!
 
-## Status & Roadmap
+## Roadmap
 
-### Status
+### **Current Status**
 
 - [x] **Modular KDA Forward (Blackwell)** — compatible with Context Parallelism (CP)
   - [x] `chunk_intra_subchunk`
@@ -206,13 +209,40 @@ CUDA kernel tuning is significantly more labor-intensive than Triton — contrib
 - [x] **Fused Lightning Prefill (Blackwell)**
 - [x] **Lightning Decode (Hopper & Blackwell)**
 
-### Roadmap
+### **Roadmap**
 
-[ ] Integrate into [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) via FLA's kernel dispatch mechanism
-[ ] GDN Modular Forward / Backward (compatible with Kimi CP)
-[ ] Fully fused blackwell KDA prefilling
-[ ] kernel-level comm & compute overlapping (via nvshmem)
-[ ] More aggressive fusion of small neighbor kernels like 
+* [ ] Integrate into [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) via FLA's kernel dispatch mechanism
+* [ ] More fusions.
+
+**Train**
+
+* [x] Modular KDA Forward (sm100, compatible with Kimi CP)
+  * [x] kda chunk intra
+  * [x] chunk gated delta h
+  * [ ] recompute wu
+  * [x] chunk fwd o
+
+* [ ] Modular GDN Forward / Backward Kernels (compatible with Kimi CP)
+
+* [ ] More backward supports
+
+* [ ] Kernel-level compute-communication overlapping CP linear attention kernels (via **nvshmem**)
+
+**Inference**
+
+* [x] Lightning prefill kernel (sm100)
+
+* [x] Lightning decode kernel (sm90 & sm100)
+
+* [x] Fused KDA prefill kernel (sm90)
+
+* [ ] Fused KDA prefill kernel (sm100)
+
+* [ ] Small B/H optimizations
+
+* [ ] MTP support
+
+* [ ] More aggressive fusion of small neighbor kernels like cumsum for inference scenarios.
 
 ## Acknowledgements
 
@@ -221,3 +251,5 @@ This project is inspired by [flash-linear-attention](https://github.com/fla-org/
 ## Contact
 
 If you're interested in an internship or job opportunity, feel free to reach out: **shuyan.ycf@antgroup.com**  / **chaofanyu@gmail.com**
+
+No cuda experiences are required as long as you're a quick leaner.

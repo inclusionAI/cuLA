@@ -152,7 +152,7 @@ def bench_fixed(configs):
             'ms_fla': ms_fla, 'ms_cula': ms_cula, 'speedup': speedup,
         }
         results.append(r)
-        print(f"  B={B:2d} T={T:5d}  done  ({speedup:.2f}x)")
+        # print(f"  B={B:2d} T={T:5d}  done  ({speedup:.2f}x)")
 
         del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
         torch.cuda.empty_cache()
@@ -215,7 +215,7 @@ def bench_varlen(configs):
             'ms_fla': ms_fla, 'ms_cula': ms_cula, 'speedup': speedup,
         }
         results.append(r)
-        print(f"  {tag:45s}  done  ({speedup:.2f}x)")
+        # print(f"  {tag:45s}  done  ({speedup:.2f}x)")
 
         del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
         torch.cuda.empty_cache()
