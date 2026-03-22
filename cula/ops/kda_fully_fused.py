@@ -140,6 +140,10 @@ class KDAChunkwise:
         num_regs_subchunk: int = 192,
         num_regs_others: int = 64,  # Optimized: best config from comprehensive sweep
     ):
+        cc = torch.cuda.get_device_capability()
+        assert cc[0] == 10 and cc[1] == 0, (
+            f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
+        )
         # make scale a constant
         self.scale = scale
         self.safe_gate = safe_gate

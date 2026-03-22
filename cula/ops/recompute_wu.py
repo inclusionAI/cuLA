@@ -67,6 +67,13 @@ class KDARecomputeWU:
         is_varlen: bool = False,
         persistent: bool = False,
     ):
+        assert K == 128 and V == 128, (
+            f"K and V must both be 128, got K={K}, V={V}"
+        )
+        cc = torch.cuda.get_device_capability()
+        assert cc[0] == 10 and cc[1] == 0, (
+            f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
+        )
         self.K = K
         self.V = V
         self.BT = chunk_size
@@ -916,7 +923,7 @@ _dummy_cu_seqlens = None
 _dummy_chunk_indices = None
 
 
-def _compile_recompute_wu(H, K, V, chunk_size=64, block_k=None, block_v=None, persistent=False, is_varlen=False):
+def _compile_recompute_wu(H, K, V, chunk_size=64, block_k=None, block_v=None, persistent=True, is_varlen=False):
     key = (H, K, V, chunk_size, block_k, block_v, persistent, is_varlen)
     if key in _recompute_wu_cache:
         return _recompute_wu_cache[key]
@@ -977,7 +984,7 @@ def _compile_recompute_wu(H, K, V, chunk_size=64, block_k=None, block_v=None, pe
 
 def recompute_w_u_fwd(k, v, beta, A, gk,
                       cu_seqlens=None, chunk_indices=None,
-                      persistent=False, block_k=None, block_v=None):
+                      persistent=True, block_k=None, block_v=None):
     is_varlen = cu_seqlens is not None
 
     if is_varlen:

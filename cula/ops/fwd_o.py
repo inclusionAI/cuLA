@@ -122,6 +122,13 @@ class ChunkGlaFwdO:
         min_occupancy: int = 2,
         persistent: bool = True,
     ):
+        assert head_dim_k == 128 and head_dim_v == 128, (
+            f"head_dim_k and head_dim_v must both be 128, got head_dim_k={head_dim_k}, head_dim_v={head_dim_v}"
+        )
+        cc = torch.cuda.get_device_capability()
+        assert cc[0] == 10 and cc[1] == 0, (
+            f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
+        )
         self.chunk_size = chunk_size
         self.head_dim_k = head_dim_k
         self.head_dim_v = head_dim_v

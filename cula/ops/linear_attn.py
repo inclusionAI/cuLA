@@ -108,6 +108,10 @@ class LinearAttentionChunkwise:
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
     ):
+        cc = torch.cuda.get_device_capability()
+        assert cc[0] == 10 and cc[1] == 0, (
+            f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
+        )
         self.chunk_size = chunk_size
         self.qk_acc_dtype = qk_acc_dtype
         self.kv_acc_dtype = kv_acc_dtype
