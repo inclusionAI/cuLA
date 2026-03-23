@@ -199,18 +199,6 @@ CUDA kernel tuning is significantly more labor-intensive than Triton — contrib
 
 ## Roadmap
 
-### **Current Status**
-
-- [x] **Modular KDA Forward (Blackwell)** — compatible with Context Parallelism (CP)
-  - [x] `chunk_intra_subchunk`
-  - [x] `chunk_gated_delta_h`
-  - [x] `chunk_fwd_o`
-- [x] **Fused KDA Forward (Hopper)**
-- [x] **Fused Lightning Prefill (Blackwell)**
-- [x] **Lightning Decode (Hopper & Blackwell)**
-
-### **Roadmap**
-
 * [ ] Integrate into [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) via FLA's kernel dispatch mechanism
 * [ ] More fusions.
 
@@ -252,4 +240,4 @@ This project is inspired by [flash-linear-attention](https://github.com/fla-org/
 
 If you're interested in an internship or job opportunity, feel free to reach out: **shuyan.ycf@antgroup.com**  / **chaofanyu@gmail.com**
 
-No cuda experiences are required as long as you're a quick leaner.
+No CUDA experience is required as long as you're a quick learner.
