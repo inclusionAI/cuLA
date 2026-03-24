@@ -129,7 +129,7 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
   struct VarlenProblemShape {
-    int64_t const* cu_seqlens;
+    int32_t const* cu_seqlens;
     int64_t        total_seqlen;
     int32_t        num_seqs;
     int32_t        num_q_heads;

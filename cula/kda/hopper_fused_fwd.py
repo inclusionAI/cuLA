@@ -31,7 +31,7 @@ def _get_cache_buf(name: str, nbytes: int, device: torch.device) -> torch.Tensor
 
 @functools.cache
 def _prepare_uniform_cu_seqlens(batch_size: int, seqlen: int, device: torch.device) -> torch.Tensor:
-    return torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, device=device, dtype=torch.int64)
+    return torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, device=device, dtype=torch.int32)
 
 
 class HopperChunkKDAFunction(torch.autograd.Function):
@@ -54,8 +54,8 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         use_gate_in_kernel: bool = False,
         safe_gate: bool = False,
         lower_bound: float | None = None,
-        cu_seqlens: torch.LongTensor | None = None,
-        chunk_indices: torch.LongTensor | None = None,
+        cu_seqlens: torch.IntTensor | None = None,
+        chunk_indices: torch.IntTensor | None = None,
     ):
         chunk_size = 64
         assert q.shape[-2] == v.shape[-2] == k.shape[-2], "Number of heads must be the same for q, k, v."
@@ -152,8 +152,8 @@ def flash_kda_prefill_hopper(
     use_gate_in_kernel: bool = False,
     safe_gate: bool = False,
     lower_bound: float | None = None,
-    cu_seqlens: torch.LongTensor | None = None,
-    chunk_indices: torch.LongTensor | None = None,
+    cu_seqlens: torch.IntTensor | None = None,
+    chunk_indices: torch.IntTensor | None = None,
     **kwargs,
 ):
     r"""
@@ -188,9 +188,9 @@ def flash_kda_prefill_hopper(
             The safe range is approximately [-5, 0). Default: `False`.
         lower_bound (Optional[float]):
             Lower bound for the forget gate activation function. Default: `None`.
-        cu_seqlens (torch.LongTensor):
-            Cumulative sequence lengths of shape `[N+1]`.
-        chunk_indices (torch.LongTensor):
+        cu_seqlens (torch.IntTensor):
+            Cumulative sequence lengths of shape `[N+1]`, int32.
+        chunk_indices (torch.IntTensor):
             Chunk indices for variable-length training.
 
     Returns:

@@ -29,8 +29,8 @@ class ChunkKDAFunction(torch.autograd.Function):
         output_final_state: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
         use_gate_in_kernel: bool = False,
-        cu_seqlens: torch.LongTensor | None = None,
-        cu_seqlens_cpu: torch.LongTensor | None = None,
+        cu_seqlens: torch.IntTensor | None = None,
+        cu_seqlens_cpu: torch.IntTensor | None = None,
         safe_gate: bool = False,
         lower_bound: float | None = None,
         disable_recompute: bool = False,
@@ -149,8 +149,8 @@ def chunk_kda(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     use_gate_in_kernel: bool = False,
-    cu_seqlens: torch.LongTensor | None = None,
-    cu_seqlens_cpu: torch.LongTensor | None = None,
+    cu_seqlens: torch.IntTensor | None = None,
+    cu_seqlens_cpu: torch.IntTensor | None = None,
     safe_gate: bool = False,
     lower_bound: float | None = None,
     disable_recompute: bool = False,
@@ -189,12 +189,12 @@ def chunk_kda(
               `A_log` (shape `[H]`) and the optional `dt_bias` (shape `[H * K]`) should be provided.
             - If `False`, `g` is expected to be the pre-computed decay value.
             Default: `False`.
-        cu_seqlens (torch.LongTensor):
+        cu_seqlens (torch.IntTensor):
             Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
-            consistent with the FlashAttention API.
-        cu_seqlens_cpu (torch.LongTensor):
+            consistent with the FlashAttention API. Must be int32.
+        cu_seqlens_cpu (torch.IntTensor):
             Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
-            consistent with the FlashAttention API.
+            consistent with the FlashAttention API. Must be int32.
         safe_gate (bool):
             Whether the kernel can assume the input gate values `g` are in a safe range.
             When `True`, the kernel can use M=16 TensorCore acceleration.
@@ -255,7 +255,7 @@ def chunk_kda(
         # for variable-length inputs, the batch size `B` is expected to be 1 and `cu_seqlens` is required
         >>> q, k, v, beta, g = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, beta, g))
         # for a batch with 4 sequences, `cu_seqlens` with 5 start/end positions are expected
-        >>> cu_seqlens = q.new_tensor([0, 2048, 4096, 6144, 8192], dtype=torch.long)
+        >>> cu_seqlens = q.new_tensor([0, 2048, 4096, 6144, 8192], dtype=torch.int32)
         >>> o, ht = chunk_kda(
             q, k, v, g, beta,
             A_log=A_log,

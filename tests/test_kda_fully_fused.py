@@ -143,7 +143,7 @@ def test_safe_gate_chunk_varlen(
     from fla.ops.kda.gate import naive_kda_lowerbound_gate
 
     torch.manual_seed(42)
-    cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
+    cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
     cu_seqlens_cpu = cu_seqlens.cpu()
     T = cu_seqlens[-1]
     N = len(cu_seqlens) - 1

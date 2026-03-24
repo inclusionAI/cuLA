@@ -172,7 +172,7 @@ def _make_varlen_inputs(seq_lens, H, K, V, use_gk=False, use_h0=False, seed=42):
     if use_h0:
         h0 = torch.randn(num_seqs, H, K, V, dtype=torch.float32, device=device) * 0.01
 
-    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.long, device=device)
+    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
     return k, w, u, gk_val, h0, cu_seqlens
 
 
@@ -235,7 +235,7 @@ def test_varlen_vs_nonvarlen():
     h_nv, vnew_nv, _ = run_cute_dsl(k, w, u, save_new_value=True)
 
     # Varlen with single sequence (should be identical)
-    cu_seqlens = torch.tensor([0, T], dtype=torch.long, device=device)
+    cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device=device)
     h_vl, vnew_vl, _ = run_cute_dsl(k, w, u, save_new_value=True, cu_seqlens=cu_seqlens)
 
     torch.testing.assert_close(

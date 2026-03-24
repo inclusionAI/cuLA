@@ -60,7 +60,7 @@ kda_fwd_prefill(
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
     TORCH_CHECK(k.dtype() == torch::kBFloat16, "k must be bfloat16");
     TORCH_CHECK(v.dtype() == torch::kBFloat16, "v must be bfloat16");
-    TORCH_CHECK(cu_seqlens.dtype() == torch::kInt64, "cu_seqlens must be int64");
+    TORCH_CHECK(cu_seqlens.dtype() == torch::kInt32, "cu_seqlens must be int32");
 
     // Validate contiguity
     TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
@@ -120,7 +120,7 @@ kda_fwd_prefill(
         input_state_ptr,
         alpha_ptr,
         beta_ptr,
-        cu_seqlens.data_ptr<int64_t>(),
+        cu_seqlens.data_ptr<int32_t>(),
         workspace_buffer.data_ptr<uint8_t>(),
         static_cast<int32_t>(num_seqs),
         static_cast<int32_t>(num_q_heads),

@@ -20,7 +20,7 @@ void launch_kda_fwd_prefill_kernel(
     TState const*  input_state,
     float const*   alpha,
     float const*   beta,
-    int64_t const* cu_seqlens,
+    int32_t const* cu_seqlens,
     uint8_t*       workspace_buffer,
     int32_t        num_seqs,
     int32_t        num_q_heads,

@@ -42,8 +42,8 @@ def chunk_kda_fwd(
     scale: float,
     initial_state: torch.Tensor,
     output_final_state: bool,
-    cu_seqlens: torch.LongTensor | None = None,
-    chunk_indices: torch.LongTensor | None = None,
+    cu_seqlens: torch.IntTensor | None = None,
+    chunk_indices: torch.IntTensor | None = None,
     chunk_size: int = 64,
 ):
     w, u, kg, Aqk, Akk = chunk_kda_fwd_intra(
@@ -96,8 +96,8 @@ def chunk_kda_bwd(
     initial_state: torch.Tensor,
     do: torch.Tensor,
     dht: torch.Tensor,
-    cu_seqlens: torch.LongTensor | None = None,
-    chunk_indices: torch.LongTensor | None = None,
+    cu_seqlens: torch.IntTensor | None = None,
+    chunk_indices: torch.IntTensor | None = None,
     chunk_size: int = 64,
 ):
     w, u, qg, kg = recompute_w_u_fwd(
@@ -220,8 +220,8 @@ class ChunkKDAFunction(torch.autograd.Function):
         use_gate_in_kernel: bool = False,
         safe_gate: bool = False,
         lower_bound: float | None = None,
-        cu_seqlens: torch.LongTensor | None = None,
-        chunk_indices: torch.LongTensor | None = None,
+        cu_seqlens: torch.IntTensor | None = None,
+        chunk_indices: torch.IntTensor | None = None,
     ):
         chunk_size = 64
         assert q.shape[-2] == v.shape[-2] == k.shape[-2], "Number of heads must be the same for q, k, v."
@@ -490,8 +490,8 @@ def flash_kda_prefill(
     use_gate_in_kernel: bool = False,
     safe_gate: bool = False,
     lower_bound: float | None = None,
-    cu_seqlens: torch.LongTensor | None = None,
-    chunk_indices: torch.LongTensor | None = None,
+    cu_seqlens: torch.IntTensor | None = None,
+    chunk_indices: torch.IntTensor | None = None,
     **kwargs,
 ):
     r"""
@@ -533,10 +533,10 @@ def flash_kda_prefill(
             Lower bound for the forget gate activation function when `use_gate_in_kernel=True`.
             This parameter modifies the internal forget gate activation and is recommended
             to be set to `-5` when `safe_gate` is enabled. Default: `None`.
-        cu_seqlens (torch.LongTensor):
+        cu_seqlens (torch.IntTensor):
             Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
             consistent with the FlashAttention API.
-        chunk_indices (torch.LongTensor):
+        chunk_indices (torch.IntTensor):
             Chunk indices used for variable-length training,
 
     Returns:

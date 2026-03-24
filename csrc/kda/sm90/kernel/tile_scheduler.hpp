@@ -126,9 +126,9 @@ struct IndividualTileScheduler {
       static_assert(dependent_false<GroupingTag>, "unknown grouping relation");
     }
 
-    int64_t s       = problem_size.cu_seqlens[seq_idx];
-    int64_t e       = problem_size.cu_seqlens[seq_idx + 1];
-    int64_t seq_len = e - s;
+    int32_t s       = problem_size.cu_seqlens[seq_idx];
+    int32_t e       = problem_size.cu_seqlens[seq_idx + 1];
+    int32_t seq_len = e - s;
 
     if (scheduled) {
       seq_idx = -1;

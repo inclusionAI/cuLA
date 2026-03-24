@@ -173,9 +173,7 @@ def test_safe_gate_chunk_varlen(
             "https://github.com/fla-org/flash-linear-attention/tree/d1097c609b23b5f478f490da0fbd00060b0e9dc3")
 
     torch.manual_seed(42)
-    cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
-    # NOTE: cu_seqlens must be int32 for FlashLA CUDA Impl
-    cu_seqlens = cu_seqlens.to(torch.int32)
+    cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
     cu_seqlens_cpu = cu_seqlens.cpu()
     T = cu_seqlens[-1]
     N = len(cu_seqlens) - 1
