@@ -176,6 +176,9 @@ python -m pytest tests/test_kda_e2e_compare_fla.py -v
 
 # End-to-end test against naive KDA reference
 python -m pytest tests/test_kda.py -v
+
+# Tests for KDA fused forward
+python -m pytest tests/test_kda_fully_fused.py -v
 ```
 
 <details>

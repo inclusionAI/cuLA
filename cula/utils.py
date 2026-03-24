@@ -4,12 +4,71 @@
 """
 Utility functions for FlashLA debugging and development.
 """
+import functools
+from typing import Callable, Tuple
+
 import torch
 
 import cutlass
 from cutlass import cute
 
 from fla.utils import tensor_cache
+
+
+# ---------------------------------------------------------------------------
+# Device architecture helpers
+# ---------------------------------------------------------------------------
+
+@functools.cache
+def get_device_sm_version(device: torch.device | str | int | None = None) -> Tuple[int, int]:
+    """Return the CUDA compute capability (major, minor) for *device*.
+
+    Args:
+        device: Any value accepted by ``torch.device``.  When ``None`` the
+                currently active CUDA device is used.
+
+    Returns:
+        ``(major, minor)`` tuple, e.g. ``(9, 0)`` for sm90a or ``(10, 0)``
+        for sm100a.
+
+    Example::
+
+        major, minor = get_device_sm_version()
+        if major == 10:   # Blackwell
+            ...
+        elif major == 9:  # Hopper
+            ...
+    """
+    if device is None:
+        device = torch.cuda.current_device()
+    prop = torch.cuda.get_device_properties(device)
+    return prop.major, prop.minor
+
+
+def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callable:
+    """Return the appropriate ``flash_kda_prefill`` implementation for *device*.
+
+    - sm100 (Blackwell) → cula.kda.blackwell_fused_fwd.flash_kda_prefill
+    - sm90  (Hopper)    → cula.kda.hopper_fused_fwd.flash_kda_prefill_hopper
+
+    Args:
+        device: CUDA device to query.  Defaults to the currently active device.
+
+    Raises:
+        RuntimeError: If the device architecture is not supported.
+    """
+    major, minor = get_device_sm_version(device)
+    if major == 10 and minor == 0:
+        from cula.kda.blackwell_fused_fwd import flash_kda_prefill
+        return flash_kda_prefill
+    elif major == 9 and minor == 0:
+        from cula.kda.hopper_fused_fwd import flash_kda_prefill_hopper
+        return flash_kda_prefill_hopper
+    else:
+        raise RuntimeError(
+            f"Unsupported CUDA compute capability sm_{major}{minor}. "
+            "Only sm90a (Hopper) and sm100a (Blackwell) are supported."
+        )
 
 @cute.jit
 def print_tensor_2d(tensor: cute.Tensor):
