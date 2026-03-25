@@ -1,9 +1,9 @@
 #pragma once
 
-#include "cute/tensor.hpp"
-#include "cutlass/detail/layout.hpp"
+#include <cute/tensor.hpp>
+#include <cutlass/detail/layout.hpp>
 
-namespace flat {
+namespace kerutils {
 
 using namespace cute;
 
@@ -44,4 +44,4 @@ alignment_for_swizzle(Layout&& layout) {
   return cutlass::detail::alignment_for_swizzle(std::forward<Layout>(layout));
 }
 
-}  // namespace flat
+} // namespace kerutils

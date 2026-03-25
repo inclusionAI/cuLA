@@ -1,8 +1,7 @@
 #pragma once
 
 #include "kda_fwd_common.cuh"
-#include "common_utils.hpp"
-#include "sm100_utils.hpp"
+#include <kerutils/kerutils.cuh>
 #include "sm100_umma_ext.hpp"
 
 #include <cutlass/barrier.h>
@@ -15,7 +14,7 @@
 
 #include "kda_fwd_intra_mainloop_sm100.hpp"
 
-namespace flashla {
+namespace kda::sm100 {
 
 using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
@@ -136,8 +135,8 @@ struct KdaChunkFwdIntraKernelSm100 {
         // === Unified TMA load pipeline: Q + K + G ===
         typename PipelineQKG::Params qkg_load_pipe_params;
         qkg_load_pipe_params.transaction_bytes =
-            sizeof(bf16)  * cosize_v<SmemLayoutInputBF16> +   // Q
-            sizeof(bf16)  * cosize_v<SmemLayoutInputBF16> +   // K
+            sizeof(ku::bf16)  * cosize_v<SmemLayoutInputBF16> +   // Q
+            sizeof(ku::bf16)  * cosize_v<SmemLayoutInputBF16> +   // K
             sizeof(float) * cosize_v<SmemLayoutInputFP32>;    // G
         qkg_load_pipe_params.is_leader    = lane_predicate && (role == WarpRole::Load);
         qkg_load_pipe_params.num_consumers = NumCudaCoreThreads;
@@ -315,7 +314,7 @@ inline void run_kda_fwd_intra_sm100_impl_dispatch(KDA_fwd_intra_params &params, 
     auto tma_Q = cute::make_tma_copy(
         SM90_TMA_LOAD{},
         make_tensor(
-            make_gmem_ptr((bf16*)params.q_ptr),
+            make_gmem_ptr((ku::bf16*)params.q_ptr),
             make_layout(shape_QKG, stride_QKG)
         ),
         typename Kernel::SmemLayoutInputBF16{}
@@ -324,7 +323,7 @@ inline void run_kda_fwd_intra_sm100_impl_dispatch(KDA_fwd_intra_params &params, 
     auto tma_K = cute::make_tma_copy(
         SM90_TMA_LOAD{},
         make_tensor(
-            make_gmem_ptr((bf16*)params.k_ptr),
+            make_gmem_ptr((ku::bf16*)params.k_ptr),
             make_layout(shape_QKG, stride_QKG)
         ),
         typename Kernel::SmemLayoutInputBF16{}
@@ -372,4 +371,4 @@ inline void run_kda_fwd_intra_sm100_impl(KDA_fwd_intra_params &params, cudaStrea
     }
 }
 
-} // namespace flashla
+} // namespace kda::sm100

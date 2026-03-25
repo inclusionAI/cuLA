@@ -1,12 +1,77 @@
-// Adapted from https://github.com/deepseek-ai/FlashMLA/blob/main/csrc/kerutils/include/kerutils/device/sm100/intrinsics.cuh
 #pragma once
 
 #include <cute/tensor.hpp>
-#include <cutlass/detail/layout.hpp>
 
-namespace flashla {
+#include "kerutils/device/common.h"
 
-using namespace cute;
+namespace kerutils {
+
+// ============================================================
+// Vectorized float2 arithmetic
+// ============================================================
+
+// Vectorized addition for float32 (https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-add)
+CUTE_DEVICE
+float2 float2_add(const float2 &a, const float2 &b) {
+    float2 c;
+    asm volatile(
+        "add.f32x2 %0, %1, %2;\n"
+        : "=l"(reinterpret_cast<uint64_t&>(c))
+        : "l"(reinterpret_cast<uint64_t const&>(a)),
+          "l"(reinterpret_cast<uint64_t const&>(b))
+    );
+    return c;
+}
+
+// Vectorized subtraction for float32
+CUTE_DEVICE
+float2 float2_sub(const float2 &a, const float2 &b) {
+    float2 c;
+    asm volatile(
+        "sub.f32x2 %0, %1, %2;\n"
+        : "=l"(reinterpret_cast<uint64_t&>(c))
+        : "l"(reinterpret_cast<uint64_t const&>(a)),
+          "l"(reinterpret_cast<uint64_t const&>(b))
+    );
+    return c;
+}
+
+// Vectorized multiplication for float32 (https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-mul)
+CUTE_DEVICE
+float2 float2_mul(const float2 &a, const float2 &b) {
+    float2 c;
+    asm volatile(
+        "mul.f32x2 %0, %1, %2;\n"
+        : "=l"(reinterpret_cast<uint64_t&>(c))
+        : "l"(reinterpret_cast<uint64_t const&>(a)),
+          "l"(reinterpret_cast<uint64_t const&>(b)));
+    return c;
+}
+
+// Vectorized fused multiply-add for float32 (https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-fma)
+CUTE_DEVICE
+float2 float2_fma(const float2 &a, const float2 &b, const float2 &c) {
+    // return a*b+c
+    float2 d;
+    asm volatile(
+        "fma.rn.f32x2 %0, %1, %2, %3;\n"
+        : "=l"(reinterpret_cast<uint64_t&>(d))
+        : "l"(reinterpret_cast<uint64_t const&>(a)),
+          "l"(reinterpret_cast<uint64_t const&>(b)),
+          "l"(reinterpret_cast<uint64_t const&>(c)));
+    return d;
+}
+
+// Vectorized negation for float32
+CUTE_DEVICE
+float2 float2_neg(const float2 &a) {
+    float2 t = {-1.0f, -1.0f};
+    return float2_mul(a, t);
+}
+
+// ============================================================
+// tcgen05 fence intrinsics (SM100)
+// ============================================================
 
 // tcgen05.fence::before_thread_sync (https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-special-sync-operations-fence)
 __device__ __forceinline__ void tcgen05_before_thread_sync() {
@@ -18,72 +83,9 @@ __device__ __forceinline__ void tcgen05_after_thread_sync() {
     asm volatile("tcgen05.fence::after_thread_sync;");
 }
 
-// Perform SS UTCMMA
-// sA and sB should be shared memory tensors (i.e. make_tensor(make_shared_ptr(XXX), XXX)) while tC_frag should be tmem fragment
-template<
-    typename TiledMMA,
-    typename TensorA,
-    typename TensorB,
-    typename TensorFragC
->
-CUTE_DEVICE
-void utcmma_ss(
-    TiledMMA &tiled_mma,
-    TensorA sA,
-    TensorB sB,
-    TensorFragC tC_frag,
-    bool clear_accum
-) {
-    tiled_mma.accumulate_ = clear_accum ? UMMA::ScaleOut::Zero : UMMA::ScaleOut::One;
-    ThrMMA thr_mma = tiled_mma.get_slice(_0{}); // Since A/B/C are already CTA-local tiles, this number does not matter
-    auto sA_frag = thr_mma.partition_fragment_A(sA);
-    auto sB_frag = thr_mma.partition_fragment_B(sB);
-    static_assert(size<2>(sA_frag) == size<2>(sB_frag));
-    static_assert(size<1>(sA_frag) == size<1>(tC_frag));
-    static_assert(size<1>(sB_frag) == size<2>(tC_frag));
-    CUTE_UNROLL
-    for (int k = 0; k < size<2>(sA_frag); ++k) {
-        cute::gemm(
-            tiled_mma,
-            sA_frag(_, _, k),
-            sB_frag(_, _, k),
-            tC_frag
-        );
-        tiled_mma.accumulate_ = UMMA::ScaleOut::One;
-    }
-}
-
-// Perform TS UTCMMA
-// sB should be shared memory tensors (i.e. make_tensor(make_shared_ptr(XXX), XXX)) while tA_frag and tC_frag should be tmem fragment
-template<
-    typename TiledMMA,
-    typename TensorA,
-    typename TensorB,
-    typename TensorFragC
->
-CUTE_DEVICE
-void utcmma_ts(
-    TiledMMA &tiled_mma,
-    TensorA tA_frag,
-    TensorB sB,
-    TensorFragC tC_frag,
-    bool clear_accum
-) {
-    tiled_mma.accumulate_ = clear_accum ? UMMA::ScaleOut::Zero : UMMA::ScaleOut::One;
-    ThrMMA thr_mma = tiled_mma.get_slice(_0{}); // Since A/B/C are already CTA-local tiles, this number does not matter
-    auto sB_frag = thr_mma.partition_fragment_B(sB);
-    static_assert(size<2>(tA_frag) == size<2>(sB_frag));
-    CUTE_UNROLL
-    for (int k = 0; k < size<2>(tA_frag); ++k) {
-        cute::gemm(
-            tiled_mma,
-            tA_frag(_, _, k),
-            sB_frag(_, _, k),
-            tC_frag
-        );
-        tiled_mma.accumulate_ = UMMA::ScaleOut::One;
-    }
-}
+// ============================================================
+// Tensor memory (TMEM) load/store intrinsics (SM100)
+// ============================================================
 
 // Load from tensor memory, 32 data path lanes, 32-bit pattern, repeated N times. (https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-ld)
 template <int kNumElements>
@@ -144,6 +146,4 @@ void tmem_st_32dp32bNx(uint32_t tmem_start, void const* data_) {
 #endif
 }
 
-
-
-}
+}  // namespace kerutils

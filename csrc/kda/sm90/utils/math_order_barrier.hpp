@@ -3,7 +3,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/arch/barrier.h"
 
-namespace flat {
+namespace kda::sm90 {
 
 // cutlass' OrderedSequenceBarrier uses mbarrier
 template <

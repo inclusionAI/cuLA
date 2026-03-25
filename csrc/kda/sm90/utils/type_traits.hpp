@@ -4,7 +4,7 @@
 
 #include "cutlass/numeric_types.h"
 
-namespace flat {
+namespace kda::sm90 {
 
 // clang-format off
 template <typename T> struct map_to_cutlass;
@@ -33,4 +33,4 @@ struct first_non_void<void, Ts...> : first_non_void<Ts...> {};
 template <typename... Ts>
 using first_non_void_t = typename first_non_void<Ts...>::type;
 
-}  // namespace flat
+}  // namespace kda::sm90

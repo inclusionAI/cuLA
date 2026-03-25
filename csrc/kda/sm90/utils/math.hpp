@@ -2,7 +2,7 @@
 
 #include "cute/config.hpp"
 
-namespace flat {
+namespace kda::sm90 {
 
 namespace detail {
 
@@ -20,4 +20,4 @@ next_power_of_two(T n) {
   return static_cast<T>(1) << detail::ceil_log2(n);
 }
 
-}  // namespace flat
+}  // namespace kda::sm90

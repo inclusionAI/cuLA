@@ -2,7 +2,7 @@
 
 #include "cute/config.hpp"
 
-namespace flat {
+namespace kda::sm90 {
 
 struct Unused {
   using Params = Unused;

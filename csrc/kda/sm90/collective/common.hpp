@@ -3,7 +3,7 @@
 #include "cutlass/kernel_hardware_info.h"
 #include "cute/tensor.hpp"
 
-namespace flat::collective {
+namespace kda::sm90::collective {
 
 using namespace cute;
 
@@ -432,68 +432,4 @@ extract_broadcast_operandA_to_operandB_bf16_layout(FragA const& frag_A, FragB& f
   }
 }
 
-template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
-          class CopyAtom, class TV, class Tiler, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
-          typename Engine2, typename Layout2, typename Engine3, typename Layout3>
-CUTLASS_DEVICE void copy_pred(TiledCopy<CopyAtom, TV, Tiler> const &tiled_copy, Tensor<Engine0, Layout0> const &S,
-                         Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
-                         Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
-    // Decay TiledCopy to CopyAtom
-    auto copy_atom = static_cast<CopyAtom const&>(tiled_copy);
-    CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
-    CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
-    CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
-    CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));                     // MMA_M
-    CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));                     // MMA_K
-    // There's no case where !Clear_OOB_K && Clear_OOB_MN
-    static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
-    auto has_with_bool = cute::is_valid([](auto t)->void_t<decltype(declval<typename decltype(t)::Traits>().with(true))>{}, copy_atom);
-    #pragma unroll
-    for (int m = 0; m < size<1>(S); ++m) {
-        bool predicate_mn = Is_even_MN || get<0>(identity_MN(_0{}, m, _0{})) < max_MN;
-        // NOTE: currently only this predicate is true because we set Clear_OOB_MN=false
-        if constexpr (Is_even_MN || !Clear_OOB_MN) {
-            if (Is_even_MN || predicate_mn) {
-                #pragma unroll
-                for (int k = 0; k < size<2>(S); ++k) {
-                    if constexpr (Is_even_K || !Clear_OOB_K) {
-                        if (Is_even_K || predicate_K(k)) { cute::copy(copy_atom, S(_, m, k), D(_, m, k)); }
-                    } else {  // Clear_OOB_K == true && Is_even_K == false
-                        // If copy traits can be transformed with a predicate value, do it, otherwise branch here
-                        if constexpr (has_with_bool) {
-                            cute::copy(copy_atom.with(predicate_K(k)), S(_, m, k), D(_, m, k));
-                        } else {
-                            if (predicate_K(k)) {
-                                cute::copy(copy_atom, S(_, m, k), D(_, m, k));
-                            } else {
-                                cute::clear(D(_, m, k));
-                            }
-                        }
-                    }
-                }
-            }
-        } else {  // Clear_OOB_MN == true && Is_even_MN == false, also implies Clear_OOB_K == true
-            if constexpr (!has_with_bool) {
-                if (predicate_mn) {
-                    #pragma unroll
-                    for (int k = 0; k < size<2>(S); ++k) {
-                        if (Is_even_K || predicate_K(k)) {
-                            cute::copy(copy_atom, S(_, m, k), D(_, m, k));
-                        } else if (Clear_OOB_K) {
-                            cute::clear(D(_, m, k));
-                        }
-                    }
-                } else {
-                    cute::clear(D(_, m, _));
-                }
-            } else {  // combine the mn predicate with the k predicate
-                #pragma unroll
-                for (int k = 0; k < size<2>(S); ++k) {
-                    cute::copy(copy_atom.with(predicate_mn && (Is_even_K || predicate_K(k))), S(_, m, k), D(_, m, k));
-                }
-            }
-        }
-    }
-}
-
-}  // namespace flat::collective
+}  // namespace kda::sm90::collective

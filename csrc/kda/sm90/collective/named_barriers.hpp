@@ -1,6 +1,6 @@
 #pragma once
 
-namespace flat::collective {
+namespace kda::sm90::collective {
 
 struct FlatSharedNamedBarriers {
   static constexpr int AllMmaThreadsSync   = 0;

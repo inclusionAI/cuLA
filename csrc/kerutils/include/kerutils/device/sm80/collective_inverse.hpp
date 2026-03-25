@@ -4,9 +4,9 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/arch/barrier.h>
 
-#include "common_utils.hpp"
+#include "kerutils/common/cute_ext.hpp"
 
-namespace flashla {
+namespace kerutils {
 
 using namespace cute;
 
@@ -1112,4 +1112,4 @@ private:
   int wg_sync_named_barrier_id_;
 };
 
-}
+}  // namespace kerutils

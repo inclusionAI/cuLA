@@ -10,7 +10,7 @@
 #include "kda/sm90/utils/common.hpp"
 #include "kda/sm90/utils/unused.hpp"
 
-namespace flat::kernel {
+namespace kda::sm90::kernel {
 
 using namespace cute;
 
@@ -132,12 +132,8 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
     int32_t const* cu_seqlens;
     int64_t        total_seqlen;
     int32_t        num_seqs;
-    int32_t        num_q_heads;
-    int32_t        num_k_heads;
-    int32_t        num_v_heads;
-    int32_t        num_o_heads;
-    int32_t        num_sab_heads;  // state, alpha, beta
-    int32_t        head_size;  // d
+    int32_t        num_heads;   // Q, K, V, O all share the same head count in KDA
+    int32_t        head_size;   // d
   };
   using ProblemShape = VarlenProblemShape;
 
@@ -534,4 +530,4 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
   }
 };
 
-}  // namespace flat::kernel
+}  // namespace kda::sm90::kernel

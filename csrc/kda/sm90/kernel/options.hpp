@@ -4,7 +4,7 @@
 
 #include "cutlass/cutlass.h"
 
-namespace flat::kernel {
+namespace kda::sm90::kernel {
 
 template <auto kTag, class Value>
 struct Option {
@@ -72,9 +72,8 @@ enum class Tag {
   kNeedsDecay,  // linear/lighting attn
   kNeedsAlpha,  // gated delta rule
   kNeedsBeta,   // delta rule
-  kIsGVA,
   kInitStateFromInput,  // if true, initialize state by reading global memory instead of zero initialization.
   kSafeGate,            // KDA
 };
 
-}  // namespace flat::kernel
+}  // namespace kda::sm90::kernel

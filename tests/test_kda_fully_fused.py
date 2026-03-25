@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.kda import chunk_kda, fused_recurrent_kda
+from fla.ops import chunk_kda as fla_chunk_kda
 from fla.ops.kda.gate import naive_kda_gate
 from fla.ops.kda.naive import naive_recurrent_kda
 from fla.utils import assert_close, device
@@ -90,6 +90,22 @@ def test_safe_gate_chunk(
         output_final_state=True,
     )
 
+    ref_fla, ref_ht_fla = fla_chunk_kda(
+        q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
+        k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        A_log=(A_log.clone() if use_gate_in_kernel else None),
+        dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
+        initial_state=h0.clone(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+    )
+
     tri, tri_ht = cula_kda_fused_fwd(
         q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
         k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),
@@ -108,6 +124,8 @@ def test_safe_gate_chunk(
 
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+    assert_close("o", ref_fla, tri, 0.005)
+    assert_close("ht", ref_ht_fla, tri_ht, 0.005)
 
 
 @pytest.mark.parametrize(
@@ -178,6 +196,20 @@ def test_safe_gate_chunk_varlen(
         lower_bound=-5.0 if safe_gate else None,
     )
 
+    ref_fla, ref_ht_fla = fla_chunk_kda(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        initial_state=h0.clone(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        safe_gate=safe_gate,
+        lower_bound=-5.0 if safe_gate else None,
+    )
+
     ref = []
     ref_ht = []
     for i in range(N):
@@ -197,3 +229,5 @@ def test_safe_gate_chunk_varlen(
 
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+    assert_close("o", ref_fla, tri, 0.005)
+    assert_close("ht", ref_ht_fla, tri_ht, 0.005)

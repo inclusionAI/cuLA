@@ -1,5 +1,5 @@
 #include <torch/python.h>
-#include "kda/kda_fwd_common.cuh"
+#include "kda/sm100/kda_fwd_common.cuh"
 #include "cutlass/cutlass.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -41,5 +41,5 @@ void ChunkKDAFwdIntra(
     params.num_sm = device_prop->multiProcessorCount;
     params.tile_scheduler_params = StaticPersistentTileScheduler::Params{tile_num, params.h, params.num_sm, (int*)tile_counter.data_ptr()};
 
-    flashla::run_kda_fwd_intra_sm100(params, at::cuda::getCurrentCUDAStream());
+    kda::sm100::run_kda_fwd_intra_sm100(params, at::cuda::getCurrentCUDAStream());
 }

@@ -44,7 +44,7 @@ cuLA is a drop-in replacement for [FLA](https://github.com/fla-org/flash-linear-
 
 ```python
 import torch
-from flashla.kda.chunk import chunk_kda  # <-- one-line change from fla.ops.kda
+from cula.kda.chunk import chunk_kda  # <-- one-line change from fla.ops.kda
 
 B, T, H, K, V = 2, 2048, 4, 128, 128
 device = 'cuda'

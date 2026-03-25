@@ -25,35 +25,26 @@ kda_fwd_prefill(
 ) {
     // Q, K, V: [packed_seq, H, D] (already packed by Python layer)
     auto packed_seq   = q.size(0);
-    auto num_q_heads  = q.size(1);
+    auto num_heads    = q.size(1);
     auto head_size    = q.size(2);
-    auto num_k_heads  = k.size(1);
-    auto num_v_heads  = v.size(1);
     auto num_seqs     = cu_seqlens.size(0) - 1;
 
-    // KDA constraint: num_q_heads == num_v_heads
-    TORCH_CHECK(num_q_heads == num_v_heads,
-        "KDA requires num_q_heads == num_v_heads, got ", num_q_heads, " vs ", num_v_heads);
+    // KDA constraint: all head counts must be the same
+    TORCH_CHECK(num_heads == k.size(1),
+        "KDA requires num_q_heads == num_k_heads, got ", num_heads, " vs ", k.size(1));
+    TORCH_CHECK(num_heads == v.size(1),
+        "KDA requires num_q_heads == num_v_heads, got ", num_heads, " vs ", v.size(1));
     TORCH_CHECK(head_size == v.size(2),
-        "KDA requires K == V head dim, got ", head_size, " vs ", v.size(2));
-
-    // GQA check
-    if (num_k_heads != num_v_heads) {
-        TORCH_CHECK(num_q_heads % num_k_heads == 0,
-            "GQA: num_q_heads must be divisible by num_k_heads");
-    }
-
-    auto num_o_heads   = num_q_heads;
-    auto num_sab_heads = std::max(num_q_heads, num_v_heads);
+        "KDA requires Q and V head dim to match, got ", head_size, " vs ", v.size(2));
 
     // Allocate output if not provided
     torch::Tensor output = output_.has_value() ? output_.value()
-        : torch::empty({packed_seq, num_o_heads, head_size},
+        : torch::empty({packed_seq, num_heads, head_size},
                        torch::TensorOptions().dtype(q.dtype()).device(q.device()));
 
     // Allocate output state if not provided
     torch::Tensor output_state = output_state_.has_value() ? output_state_.value()
-        : torch::zeros({num_seqs, num_sab_heads, head_size, head_size},
+        : torch::zeros({num_seqs, num_heads, head_size, head_size},
                        torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
 
     // Validate dtypes
@@ -80,16 +71,16 @@ kda_fwd_prefill(
         auto& alpha = alpha_.value();
         TORCH_CHECK(alpha.dtype() == torch::kFloat32, "alpha must be float32");
         TORCH_CHECK(alpha.is_contiguous(), "alpha must be contiguous");
-        TORCH_CHECK(alpha.size(0) == packed_seq && alpha.size(1) == num_sab_heads && alpha.size(2) == head_size,
-            "alpha shape must be [packed_seq, num_sab_heads, head_size]");
+        TORCH_CHECK(alpha.size(0) == packed_seq && alpha.size(1) == num_heads && alpha.size(2) == head_size,
+            "alpha shape must be [packed_seq, num_heads, head_size]");
         alpha_ptr = alpha.data_ptr<float>();
     }
     if (beta_.has_value()) {
         auto& beta = beta_.value();
         TORCH_CHECK(beta.dtype() == torch::kFloat32, "beta must be float32");
         TORCH_CHECK(beta.is_contiguous(), "beta must be contiguous");
-        TORCH_CHECK(beta.size(0) == packed_seq && beta.size(1) == num_sab_heads,
-            "beta shape must be [packed_seq, num_sab_heads]");
+        TORCH_CHECK(beta.size(0) == packed_seq && beta.size(1) == num_heads,
+            "beta shape must be [packed_seq, num_heads]");
         beta_ptr = beta.data_ptr<float>();
     }
     if (input_state_.has_value()) {
@@ -110,7 +101,7 @@ kda_fwd_prefill(
     using bf16 = cute::bfloat16_t;
     using Sm90 = cutlass::arch::Sm90;
 
-    flat::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float>(
+    kda::sm90::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float>(
         stream,
         reinterpret_cast<bf16*>(output.data_ptr()),
         output_state.data_ptr<float>(),
@@ -123,10 +114,7 @@ kda_fwd_prefill(
         cu_seqlens.data_ptr<int32_t>(),
         workspace_buffer.data_ptr<uint8_t>(),
         static_cast<int32_t>(num_seqs),
-        static_cast<int32_t>(num_q_heads),
-        static_cast<int32_t>(num_k_heads),
-        static_cast<int32_t>(num_v_heads),
-        static_cast<int32_t>(num_o_heads),
+        static_cast<int32_t>(num_heads),
         static_cast<int32_t>(head_size),
         static_cast<int64_t>(packed_seq),
         scale,

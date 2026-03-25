@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-Utility functions for FlashLA debugging and development.
+Utility functions for cuLA debugging and development.
 """
 import functools
 from typing import Callable, Tuple

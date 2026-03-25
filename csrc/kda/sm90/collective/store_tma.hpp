@@ -6,10 +6,11 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cute/tensor.hpp"
 
-#include "kda/sm90/utils/cute_ext.hpp"
+#include <kerutils/kerutils.cuh>
 
-namespace flat::collective {
+namespace kda::sm90::collective {
 
+using ku::alignment_for_swizzle;
 using namespace cute;
 
 /*
@@ -163,7 +164,7 @@ struct CollectiveStoreTma {
       DPRINTF0_W("slice view GMEM O: seq_idx:%d head_idx:%d tok_offset:%lld\n",
                  work_desc.seq_idx, work_desc.o_head_idx(), work_desc.tok_offset);
       Tensor m_varlen_head = tma_store_.get_tma_tensor(
-          make_shape(problem_size.head_size, problem_size.total_seqlen, problem_size.num_o_heads)
+          make_shape(problem_size.head_size, problem_size.total_seqlen, problem_size.num_heads)
       );                                                                                          // global view to the packed varlen sequence
       Tensor m_varlen = m_varlen_head(_, _, work_desc.o_head_idx());                              // slice into current head_idx
       Tensor m_offset = domain_offset(make_coord(_0{}, work_desc.tok_offset), m_varlen);          // offset to start of the current sequence
@@ -266,4 +267,4 @@ private:
   void*          tensormaps_;
 };
 
-}  // namespace flat::collective
+}  // namespace kda::sm90::collective

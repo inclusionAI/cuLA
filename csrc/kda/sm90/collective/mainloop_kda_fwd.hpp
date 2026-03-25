@@ -3,6 +3,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 
+#include <kerutils/kerutils.cuh>
 
 #include "kda/sm90/collective/common.hpp"
 #include "kda/sm90/collective/load_tma.hpp"
@@ -11,9 +12,7 @@
 #include "kda/sm90/kernel/options.hpp"
 
 #include "kda/sm90/collective/load_predicated.hpp"
-#include "kda/sm90/collective/inverse.hpp"
 
-#include "kda/sm90/utils/cute_ext.hpp"
 #include "kda/sm90/utils/unused.hpp"
 #include "kda/sm90/utils/math_order_barrier.hpp"
 
@@ -23,7 +22,7 @@
 
 #define WORKAROUND_WGMMA_PERFORMANCE_LOSS() if (thread_idx > 8192) { __syncwarp(); }
 
-namespace flat::collective {
+namespace kda::sm90::collective {
 
 struct KdaNamedBarriers : FlatSharedNamedBarriers {
   static constexpr int StateMath  = FlatSharedNamedBarriers::NumBarriersUsed + 0;
@@ -35,9 +34,12 @@ struct KdaNamedBarriers : FlatSharedNamedBarriers {
   static constexpr int StateMathWarp0 = FlatSharedNamedBarriers::NumBarriersUsed + 2;
 };
 
+using ku::select_layout;
+using ku::select_tensor;
+using ku::alignment_for_swizzle;
 using namespace cute;
-using flat::kernel::find_option_t;
-using flat::kernel::Tag;
+using kda::sm90::kernel::find_option_t;
+using kda::sm90::kernel::Tag;
 
 template <
     class Element_,
@@ -278,7 +280,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
   ));
 
   using InverseType       = cutlass::half_t;
-  using CollectiveInverse = flat::collective::CollectiveInverse<InverseType, true, false>;
+  using CollectiveInverse = ku::CollectiveInverse<InverseType, true, false>;
 
   using ElementAccumulatorSK = float;
   using TileShapeSK          = decltype(make_shape(HeadSizeV, BlkSeqKV, HeadSizeQK));
@@ -497,21 +499,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
   template <class ProblemShape>
   static bool
   can_implement(ProblemShape const& problem_size, Arguments const& args) {
-    auto ratio = problem_size.num_q_heads > problem_size.num_v_heads
-                     ? problem_size.num_q_heads / problem_size.num_v_heads
-                     : problem_size.num_v_heads / problem_size.num_q_heads;
-
-    constexpr bool IsGVAEnabled = find_option_t<Tag::kIsGVA, false_type, Options>::value;
-
-    bool is_gqa_like = (problem_size.num_k_heads == problem_size.num_v_heads) &&
-                       (problem_size.num_q_heads == ratio * problem_size.num_k_heads) &&
-                       (problem_size.num_q_heads == ratio * problem_size.num_v_heads);
-
-    bool is_gva_like = (problem_size.num_q_heads == problem_size.num_k_heads) &&
-                       (problem_size.num_v_heads == ratio * problem_size.num_q_heads) &&
-                       (problem_size.num_v_heads == ratio * problem_size.num_k_heads);
     return true &&
-           ((!IsGVAEnabled && is_gqa_like) || (IsGVAEnabled && is_gva_like)) &&
            (problem_size.head_size <= get<2>(TileShape{})) &&
            ((problem_size.head_size % Alignment) == 0);
   }
@@ -524,7 +512,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     int32_t d = problem_size.head_size;
 
     auto params_qk = CollectiveMmaQK::to_underlying_arguments(
-        make_shape(s, t, d, problem_size.num_q_heads),
+        make_shape(s, t, d, problem_size.num_heads),
         typename CollectiveMmaQK::Arguments{
             args.ptr_Q, args.dQ,
             args.ptr_K, args.dK,  // never used, dummy
@@ -533,7 +521,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     );
 
     auto params_kv_k = CollectiveMmaKV_G2S::to_underlying_arguments(
-        make_shape(d, d, s, problem_size.num_k_heads),
+        make_shape(d, d, s, problem_size.num_heads),
         typename CollectiveMmaKV_G2S::Arguments{
             args.ptr_V, select<1, 0, 2>(args.dV),  // not used
             args.ptr_K, select<1, 0, 2>(args.dK),  // used as G2S for K
@@ -541,7 +529,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         /*workspace=*/nullptr
     );
 
-    auto alpha_shape = make_shape(s, d, problem_size.num_sab_heads);
+    auto alpha_shape = make_shape(s, d, problem_size.num_heads);
     auto alpha_stride = make_stride(
         get<0>(args.dAlpha),  // seqlen stride
         get<1>(args.dAlpha),  // head_dim stride
@@ -557,7 +545,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     );
 
     auto params_kv_v = CollectiveMmaKV_G2S::to_underlying_arguments(
-        make_shape(d, d, s, problem_size.num_v_heads),
+        make_shape(d, d, s, problem_size.num_heads),
         typename CollectiveMmaKV_G2S::Arguments{
             args.ptr_V, select<1, 0, 2>(args.dV),  // used as G2S for V
             args.ptr_K, select<1, 0, 2>(args.dK),  // not used
@@ -567,8 +555,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
 
     auto params_o = CollectiveStoreO::to_underlying_arguments(
-        make_shape(d, s, d, problem_size.num_o_heads),  // in O1
-        // make_shape(d, s, s, problem_size.num_o_heads),  // in O2
+        make_shape(d, s, d, problem_size.num_heads),  // in O1
+        // make_shape(d, s, s, problem_size.num_heads),  // in O2
         typename CollectiveStoreO::Arguments{args.ptr_O, select<1, 0, 2>(args.dO), workspace},
         workspace
     );
@@ -587,9 +575,9 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
         // TODO: refactor all name to varname_vartype
         // .alpha_ptr    = args.alpha_ptr,
-        // .alpha_layout = make_layout(make_shape(s, problem_size.num_sab_heads), args.alpha_stride),
+        // .alpha_layout = make_layout(make_shape(s, problem_size.num_heads), args.alpha_stride),
         .beta_ptr     = args.beta_ptr,
-        .beta_layout  = make_layout(make_shape(s, problem_size.num_sab_heads), args.beta_stride),
+        .beta_layout  = make_layout(make_shape(s, problem_size.num_heads), args.beta_stride),
     };
   }
 
@@ -896,7 +884,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
     auto kv_load = [&](auto& tKVrKV) INLINE_LAMBDA {
       DPRINTF0_WG("[%d,%d,%d,%d]>> load tKVgKV -> tKVrKV\n", seq_idx, q_head_idx, k_head_idx, v_head_idx);
-      int  num_state_heads = problem_size.num_sab_heads;
+      int  num_state_heads = problem_size.num_heads;
       int  state_head_idx  = work_desc.o_head_idx();
       auto gKV             = make_tensor(
           make_gmem_ptr(params.ptr_input_state),
@@ -921,8 +909,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
     auto kv_store = [&]() INLINE_LAMBDA {  // tKVrKV is carried over whole mainloop
       DPRINTF0_WG("[%d,%d,%d,%d]>> save tKVrKV -> tKVgKV\n", seq_idx, q_head_idx, k_head_idx, v_head_idx);
-      int  num_state_heads = problem_size.num_sab_heads;
-      int  state_head_idx  = work_desc.o_head_idx();  // num_o_heads == num_sab_heads
+      int  num_state_heads = problem_size.num_heads;
+      int  state_head_idx  = work_desc.o_head_idx();
       auto gKV             = make_tensor(
           make_gmem_ptr(params.ptr_output_state),
           make_layout(make_shape(Int<HeadSizeQK>{}, Int<HeadSizeV>{}, num_state_heads, problem_size.num_seqs))
@@ -2448,4 +2436,4 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
   }
 };
 
-}  // namespace flat::collective
+}  // namespace kda::sm90::collective

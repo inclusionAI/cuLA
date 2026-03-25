@@ -1,12 +1,12 @@
 #pragma once
 
 #include <cute/tensor.hpp>
-#include <cutlass/detail/layout.hpp>
 
-namespace flashla {
+#include "kerutils/device/common.h"
 
-using namespace cute;
+namespace kerutils {
 
+// TMA copy helper with optional multicast support
 template<
     typename TMA,
     typename Tensor0,
@@ -21,7 +21,7 @@ void launch_tma_copy(
     const cute::TMA::CacheHintSm90 &cache_hint = cute::TMA::CacheHintSm90::EVICT_NORMAL,
     const uint16_t &multicast_mask = 0
 ) {
-    auto thr_tma = tma_copy.get_slice(_0{});
+    auto thr_tma = tma_copy.get_slice(cute::_0{});
     cute::copy(
         tma_copy.with(bar, multicast_mask, cache_hint),
         thr_tma.partition_S(src),
@@ -29,4 +29,4 @@ void launch_tma_copy(
     );
 }
 
-}
+}  // namespace kerutils

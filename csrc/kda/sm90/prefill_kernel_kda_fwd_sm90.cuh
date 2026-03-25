@@ -12,12 +12,11 @@
 #include "kda/sm90/device/device_universal.hpp"
 #include "kda/sm90/kernel/builder_kda_fwd.hpp"
 
-namespace flat {
+namespace kda::sm90 {
 
 using namespace cute;
 
 template <
-    bool IsGVA,
     bool NeedsBeta,
     bool NeedsAlpha,
     bool InitStateFromInput,
@@ -39,16 +38,13 @@ void launch_kda_fwd_prefill_kernel_gbai(
     int32_t const* cu_seqlens,
     uint8_t*       workspace_buffer,
     int32_t        num_seqs,
-    int32_t        num_q_heads,
-    int32_t        num_k_heads,
-    int32_t        num_v_heads,
-    int32_t        num_o_heads,
+    int32_t        num_heads,
     int32_t        head_size,
     int64_t        total_seqlen,
     float          scale,
     int32_t        sm_count
 ) {
-#if defined(FLAT_SM90A_ENABLED)
+#if defined(CULA_SM90A_ENABLED)
   constexpr bool HopperSupported = true;
 #else
   constexpr bool HopperSupported = false;
@@ -57,14 +53,13 @@ void launch_kda_fwd_prefill_kernel_gbai(
   if constexpr (HopperSupported) {
     static_assert(std::is_same_v<TQKV, TO>);
 
-    using namespace flat::kernel;
+    using namespace kda::sm90::kernel;
     using T = map_to_cutlass_t<TQKV>;
 
     cutlass::KernelHardwareInfo hw_info;
     hw_info.sm_count = sm_count;
 
     using SafeGateType = std::conditional_t<SafeGate, cute::true_type, cute::false_type>;
-    using IsGVAType = std::conditional_t<IsGVA, cute::true_type, cute::false_type>;
     using NeedsBetaType = std::conditional_t<NeedsBeta, cute::true_type, cute::false_type>;
     using NeedsAlphaType = std::conditional_t<NeedsAlpha, cute::true_type, cute::false_type>;
     using InitStateType = std::conditional_t<InitStateFromInput, cute::true_type, cute::false_type>;
@@ -73,14 +68,13 @@ void launch_kda_fwd_prefill_kernel_gbai(
       add_option(Option<Tag::kInitStateFromInput, InitStateType>{},
       add_option(Option<Tag::kNeedsAlpha, NeedsAlphaType>{},
       add_option(Option<Tag::kNeedsBeta, NeedsBetaType>{},
-      add_option(Option<Tag::kIsGVA, IsGVAType>{},
       add_option(Option<Tag::kIsDeltaRule, cute::true_type>{},
-      DefaultOptions{})))))));
+      DefaultOptions{}))))));
 
     using TileShape = Shape<_64, _64, _128>;
     using Scheduler = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
     using Operation = cutlass::device::Universal<
-        typename flat::kernel::FlatBuilderKdaFwd<
+        typename kda::sm90::kernel::FlatBuilderKdaFwd<
             T, float, float,
             TileShape,
             /*LayoutQ=*/cute::tuple<int64_t, _1, int32_t>,
@@ -92,43 +86,30 @@ void launch_kda_fwd_prefill_kernel_gbai(
 
     // NOTE: LayoutQ/K/V in (seq, head_size, (b,h)) coordinate semantics
 
-    int32_t num_sab_heads = std::max(num_q_heads, num_v_heads);
-
-    int32_t q_tok_stride = num_q_heads * head_size;
-    int32_t o_tok_stride = num_o_heads * head_size;
-    int32_t k_tok_stride = num_k_heads * head_size;
-    int32_t v_tok_stride = num_v_heads * head_size;
-
-    int32_t q_head_stride = head_size;
-    int32_t o_head_stride = head_size;
-    int32_t k_head_stride = head_size;
-    int32_t v_head_stride = head_size;
+    int32_t tok_stride  = num_heads * head_size;
+    int32_t head_stride = head_size;
 
     Operation op;
     Arguments arguments{
         .problem_size = {
-            .cu_seqlens    = cu_seqlens,
-            .total_seqlen  = total_seqlen,
-            .num_seqs      = num_seqs,
-            .num_q_heads   = num_q_heads,
-            .num_k_heads   = num_k_heads,
-            .num_v_heads   = num_v_heads,
-            .num_o_heads   = num_o_heads,
-            .num_sab_heads = num_sab_heads,
-            .head_size     = head_size,
+            .cu_seqlens   = cu_seqlens,
+            .total_seqlen = total_seqlen,
+            .num_seqs     = num_seqs,
+            .num_heads    = num_heads,
+            .head_size    = head_size,
         },
         .mainloop = {
             // clang-format off
-                .ptr_Q = (T*)q,      .dQ = {q_tok_stride, _1{}, q_head_stride},
-                .ptr_K = (T*)k,      .dK = {k_tok_stride, _1{}, k_head_stride},
-                .ptr_V = (T*)v,      .dV = {v_tok_stride, _1{}, v_head_stride},
-                .ptr_O = (T*)output, .dO = {o_tok_stride, _1{}, o_head_stride},
-                .ptr_Alpha = alpha,  .dAlpha = {k_tok_stride, _1{}, k_head_stride},
+                .ptr_Q = (T*)q,      .dQ = {tok_stride, _1{}, head_stride},
+                .ptr_K = (T*)k,      .dK = {tok_stride, _1{}, head_stride},
+                .ptr_V = (T*)v,      .dV = {tok_stride, _1{}, head_stride},
+                .ptr_O = (T*)output, .dO = {tok_stride, _1{}, head_stride},
+                .ptr_Alpha = alpha,  .dAlpha = {tok_stride, _1{}, head_stride},
                 .ptr_output_state = (float*)output_state,
                 .ptr_input_state  = (float*)input_state,
                 .scale = scale,
-                // .alpha_ptr = alpha, .alpha_stride = {k_tok_stride, _1{}, k_head_stride},
-                .beta_ptr  = beta,  .beta_stride  = {num_sab_heads, 1},
+                // .alpha_ptr = alpha, .alpha_stride = {tok_stride, _1{}, head_stride},
+                .beta_ptr  = beta,  .beta_stride  = {num_heads, 1},
         },  // clang-format on
         .hw_info = hw_info
     };
@@ -158,4 +139,4 @@ void launch_kda_fwd_prefill_kernel_gbai(
   }
 }
 
-};  // namespace flat
+};  // namespace kda::sm90

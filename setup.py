@@ -64,6 +64,10 @@ def get_features_args():
     features_args = []
     return features_args
 
+print("Detecting GPU architectures...")
+_has_sm100, _has_sm90 = detect_gpu_archs()
+DISABLE_SM100 = resolve_disable_flag("CULA_DISABLE_SM100", _has_sm100)
+DISABLE_SM90 = resolve_disable_flag("CULA_DISABLE_SM90", _has_sm90)
 
 def get_arch_flags():
     # Check NVCC Version
@@ -76,12 +80,6 @@ def get_arch_flags():
     major, minor = map(int, nvcc_version_number.split("."))
     print(f"Compiling using NVCC {major}.{minor}")
 
-    print("Detecting GPU architectures...")
-    has_sm100, has_sm90 = detect_gpu_archs()
-
-    DISABLE_SM100 = resolve_disable_flag("CULA_DISABLE_SM100", has_sm100)
-    DISABLE_SM90 = resolve_disable_flag("CULA_DISABLE_SM90", has_sm90)
-
     if major < 12 or (major == 12 and minor <= 8):
         assert (
             DISABLE_SM100
@@ -93,7 +91,7 @@ def get_arch_flags():
         arch_flags.extend(["-DCULA_SM100_ENABLED"])
     if not DISABLE_SM90:
         arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
-        arch_flags.extend(["-DFLAT_SM90A_ENABLED"])
+        arch_flags.extend(["-DCULA_SM90A_ENABLED"])
     return arch_flags
 
 
@@ -111,22 +109,17 @@ if IS_WINDOWS:
 else:
     cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations"]
 
-print("Detecting GPU architectures for source file selection...")
-_has_sm100, _has_sm90 = detect_gpu_archs()
-DISABLE_SM100 = resolve_disable_flag("CULA_DISABLE_SM100", _has_sm100)
-DISABLE_SM90 = resolve_disable_flag("CULA_DISABLE_SM90", _has_sm90)
-
 cuda_sources = [
-    "csrc/pybind.cu",
+    "csrc/api/pybind.cu",
 ]
 if not DISABLE_SM100:
     cuda_sources.extend([
-        "csrc/kda_api_sm100.cu",
-        "csrc/kda/kda_fwd_sm100.cu",
+        "csrc/api/kda_sm100.cu",
+        "csrc/kda/sm100/kda_fwd_sm100.cu",
     ])
 if not DISABLE_SM90:
     cuda_sources.extend([
-        "csrc/kda_api_sm90.cu",
+        "csrc/api/kda_sm90.cu",
         "csrc/kda/sm90/kda_fwd_sm90.cu",
         "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu",
     ])
@@ -160,6 +153,7 @@ ext_modules.append(
         },
         include_dirs=[
             Path(this_dir) / "csrc",
+            Path(this_dir) / "csrc" / "kerutils" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
             "/usr/local/cuda/include/cccl",

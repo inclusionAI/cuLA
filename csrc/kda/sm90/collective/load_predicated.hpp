@@ -6,7 +6,7 @@
 
 #include "kda/sm90/utils/unused.hpp"
 
-namespace flat::collective {
+namespace kda::sm90::collective {
 
 using namespace cute;
 
@@ -63,7 +63,7 @@ struct CollectiveLoadVector {
     constexpr auto BlkSeqQ = decltype(get<0>(tile_shape))::value;
 
     Tensor g = [&] {
-      auto head_idx = work_desc.o_head_idx();  // num_o_heads == num_sab_heads
+      auto head_idx = work_desc.o_head_idx();
       DPRINTF0_W("slice view GMEM %s: seq_idx:%d head_idx:%d tok_offset:%lld\n", to_string(kind), work_desc.seq_idx, head_idx, work_desc.tok_offset);
       Tensor m_varlen_head = make_tensor(make_gmem_ptr(src_), src_layout_);
 
@@ -144,4 +144,4 @@ private:
   SharedStorage&    storage_;
 };
 
-}  // namespace flat::collective
+}  // namespace kda::sm90::collective

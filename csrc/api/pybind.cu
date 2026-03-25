@@ -19,7 +19,7 @@ void ChunkKDAFwdIntra(
     bool use_tf32_inverse);
 #endif
 
-#if defined(FLAT_SM90A_ENABLED)
+#if defined(CULA_SM90A_ENABLED)
 std::tuple<torch::Tensor, torch::Tensor> kda_fwd_prefill(
     std::optional<torch::Tensor> output_,
     std::optional<torch::Tensor> output_state_,
@@ -36,11 +36,11 @@ std::tuple<torch::Tensor, torch::Tensor> kda_fwd_prefill(
 #endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "FlashLA";
+    m.doc() = "cuLA";
 #if defined(CULA_SM100_ENABLED)
     m.def("chunk_kda_fwd_intra_cuda", &ChunkKDAFwdIntra);
 #endif
-#if defined(FLAT_SM90A_ENABLED)
+#if defined(CULA_SM90A_ENABLED)
     m.def("kda_fwd_prefill", &kda_fwd_prefill);
 #endif
 }
