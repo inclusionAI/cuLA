@@ -334,6 +334,7 @@ def main():
         varlen_res = bench_varlen(varlen_configs)
 
     print_report(fixed_res, varlen_res)
+    return fixed_res, varlen_res
 
 
 if __name__ == "__main__":

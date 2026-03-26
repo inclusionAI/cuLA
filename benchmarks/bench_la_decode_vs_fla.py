@@ -298,6 +298,8 @@ def main():
     print("               cute: linear_attention_decode does cache lookup + CUstream() per call.")
     print("  Both modes:  same g_gamma decay, same softmax_scale, state write-back included.")
 
+    return results
+
 
 if __name__ == "__main__":
     main()
