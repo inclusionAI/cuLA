@@ -88,84 +88,20 @@ print(f'Final state shape: {final_state.shape}')  # [2, 4, 128, 128]
 
 ## Benchmarks
 
-All benchmarks run on a single **NVIDIA GB200** GPU with **CUDA Toolkit 13.0**, **PyTorch 2.9.1**, **Triton 3.5.1**.
+See [BENCHMARK.md](BENCHMARK.md) for detailed results.
 
+All benchmarks run on a single **NVIDIA GB200** GPU with **CUDA Toolkit 13.0**, **PyTorch 2.9.1**, **Triton 3.5.1**.
 FLA baseline: [flash-linear-attention v0.4.2](https://github.com/fla-org/flash-linear-attention/releases/tag/v0.4.2).
 
-### KDA — Fixed-Length (H=64, D=128, bf16)
+**Highlights:**
+- **KDA:** up to **1.4x** speedup over FLA Triton on fixed-length and variable-length sequences.
+- **Lightning Attention Prefill:** up to **2.4x** speedup (B=2).
+- **Lightning Attention Varlen:** **avg 1.6x** speedup across 60+ configs (uniform/skewed/random).
 
-| B | T | FLA Triton (ms) | cuLA (ms) | Speedup |
-|---|---|-----------------|-----------|---------|
-| 1 | 512 | 0.590 | 0.532 | **1.11x** |
-| 1 | 1024 | 0.552 | 0.520 | **1.06x** |
-| 1 | 4096 | 0.832 | 0.588 | **1.41x** |
-| 1 | 8192 | 1.579 | 1.099 | **1.44x** |
-| 1 | 16384 | 3.081 | 2.140 | **1.44x** |
-| 2 | 512 | 0.569 | 0.526 | **1.08x** |
-| 2 | 1024 | 0.579 | 0.523 | **1.11x** |
-| 2 | 4096 | 1.576 | 1.104 | **1.43x** |
-| 2 | 8192 | 3.070 | 2.140 | **1.43x** |
-| 2 | 16384 | 6.088 | 4.228 | **1.44x** |
-
-### KDA — Variable-Length (H=64, D=128, bf16)
-
-| Config | FLA Triton (ms) | cuLA (ms) | Speedup |
-|--------|-----------------|-----------|---------|
-| 1seq, T=4096 | 0.836 | 0.586 | **1.43x** |
-| 1seq, T=8192 | 1.578 | 1.099 | **1.44x** |
-| 1seq, T=16384 | 3.077 | 2.134 | **1.44x** |
-| 20seqs, T=4096, uniform | 0.937 | 0.672 | **1.40x** |
-| 20seqs, T=8192, uniform | 1.636 | 1.167 | **1.40x** |
-| 25seqs, T=8192, uniform | 1.663 | 1.180 | **1.41x** |
-| 20seqs, T=16384, uniform | 3.078 | 2.180 | **1.41x** |
-| 25seqs, T=16384, uniform | 3.088 | 2.182 | **1.42x** |
-| 20seqs, T=4096, skewed | 0.868 | 0.608 | **1.43x** |
-| 20seqs, T=8192, skewed | 1.592 | 1.113 | **1.43x** |
-| 20seqs, T=16384, skewed | 3.040 | 2.132 | **1.43x** |
-| 20seqs, T=4096, tail-heavy | 0.884 | 0.613 | **1.44x** |
-| 20seqs, T=8192, tail-heavy | 1.624 | 1.125 | **1.44x** |
-| 20seqs, T=16384, tail-heavy | 3.116 | 2.160 | **1.44x** |
-
-To reproduce:
+To regenerate benchmarks:
 
 ```bash
-python benchmarks/bench_kda.py --mode both
-```
-
-### Lightning Attention — Prefill (H=64, D=128, bf16)
-
-| B | T | FLA Triton (ms) | cuLA (ms) | Speedup |
-|---|---|-----------------|-----------|---------|
-| 1 | 1024 | 0.111 | 0.071 | **1.56x** |
-| 1 | 4096 | 0.207 | 0.156 | **1.32x** |
-| 1 | 8192 | 0.394 | 0.293 | **1.34x** |
-| 1 | 16384 | 0.768 | 0.561 | **1.37x** |
-| 2 | 1024 | 0.110 | 0.074 | **1.49x** |
-| 2 | 4096 | 0.386 | 0.176 | **2.20x** |
-| 2 | 8192 | 0.754 | 0.327 | **2.30x** |
-| 2 | 16384 | 1.487 | 0.631 | **2.36x** |
-
-### Lightning Attention — Variable-Length (H=64, D=128, bf16)
-
-Persistent CuTe DSL kernel vs FLA Triton varlen, 126 configs (N=5..25 seqs, T=1K..32K, uniform/skewed/random).
-
-| N (seqs) | T | Dist | cuLA (ms) | FLA Triton (ms) | Speedup |
-|----------|---|------|-----------|-----------------|---------|
-| 5 | 1024 | uniform | 0.077 | 0.158 | **2.04x** |
-| 5 | 8192 | skewed | 0.216 | 0.404 | **1.87x** |
-| 10 | 16384 | skewed | 0.402 | 0.733 | **1.82x** |
-| 16 | 8192 | uniform | 0.251 | 0.401 | **1.60x** |
-| 16 | 32768 | uniform | 0.725 | 1.299 | **1.79x** |
-| 20 | 16384 | skewed | 0.444 | 0.734 | **1.65x** |
-| 20 | 32768 | skewed | 0.777 | 1.371 | **1.76x** |
-| 25 | 32768 | random | 0.794 | 1.323 | **1.67x** |
-
-Summary (126 configs): **avg=1.58x**, min=0.97x, max=2.09x. Persistent vs Non-persistent output is **numerically equivalent** (125/126 bit-exact).
-
-To reproduce:
-
-```bash
-python benchmarks/bench_lightning_attn.py --modes no_state h0_ht varlen
+python benchmarks/generate_benchmark_md.py
 ```
 
 ## Tests
