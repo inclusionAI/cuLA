@@ -59,8 +59,11 @@ def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callabl
     """
     major, minor = get_device_sm_version(device)
     if major == 10 and minor == 0:
-        from cula.kda.blackwell_fused_fwd import flash_kda_prefill
-        return flash_kda_prefill
+        # TODO
+        raise NotImplementedError(
+            "The sm100a (Blackwell) implementation of fused prefill is not yet available. " \
+            "Please use a sm90a (Hopper) device or wait for future updates."
+        )
     elif major == 9 and minor == 0:
         from cula.kda.hopper_fused_fwd import flash_kda_prefill_hopper
         return flash_kda_prefill_hopper

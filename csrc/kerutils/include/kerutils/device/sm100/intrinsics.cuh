@@ -4,7 +4,59 @@
 
 #include "kerutils/device/common.h"
 
+// Adapted from https://github.com/deepseek-ai/FlashMLA/blob/main/csrc/kerutils/include/kerutils/device/sm100/intrinsics.cuh
 namespace kerutils {
+
+// ============================================================
+// TMA gather4 intrinsics (SM100)
+// ============================================================
+
+// tma gather4 (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-tensor)
+// Please pay attention that the coordinates of TMA gather4 are int32, which may lead to overflow under some scenarios
+CUTE_DEVICE
+void tma_gather4(const void* desc_ptr, transac_bar_t &mbar_ptr, void* smem_ptr, int col_idx, int4 row_idxs, int64_t cache_hint) {
+    uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+    uint32_t mbar_addr = cute::cast_smem_ptr_to_uint(&mbar_ptr);
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;\n"
+        :
+        : "r"(smem_addr), "l"(desc_ptr), "r"(col_idx), 
+          "r"(row_idxs.x), "r"(row_idxs.y), "r"(row_idxs.z), "r"(row_idxs.w), 
+          "r"(mbar_addr), "l"(cache_hint)
+        : "memory"
+    );
+}
+
+// tma gather4 prefetch (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-prefetch-tensor)
+// Please pay attention that the coordinates of TMA gather4 are int32, which may lead to overflow under some scenarios
+CUTE_DEVICE
+void tma_gather4_prefetch(const void* desc_ptr, int col_idx, int4 row_idxs, int64_t cache_hint) {
+    asm volatile(
+        "cp.async.bulk.prefetch.tensor.2d.L2.global.tile::gather4.L2::cache_hint [%0, {%1, %2, %3, %4, %5}], %6;\n"
+        :
+        : "l"(desc_ptr), "r"(col_idx), 
+          "r"(row_idxs.x), "r"(row_idxs.y), "r"(row_idxs.z), "r"(row_idxs.w), 
+          "l"(cache_hint)
+    );
+}
+
+// tma gather4 with cta_group::2, allowing for synchronization across CTAs within a pair of CTAs (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-tensor)
+template<bool USE_CTA0_MBAR = false>
+CUTE_DEVICE void tma_gather4_cta_group_2(const void* desc_ptr, transac_bar_t &mbar_ptr, void* smem_ptr, int col_idx, int4 row_idxs, int64_t cache_hint) {
+    uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+    uint32_t mbar_addr = cute::cast_smem_ptr_to_uint(&mbar_ptr);
+    if constexpr (USE_CTA0_MBAR) {
+        mbar_addr &= cute::Sm100MmaPeerBitMask;
+    }
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;\n"
+        :
+        : "r"(smem_addr), "l"(desc_ptr), "r"(col_idx), 
+          "r"(row_idxs.x), "r"(row_idxs.y), "r"(row_idxs.z), "r"(row_idxs.w), 
+          "r"(mbar_addr), "l"(cache_hint)
+        : "memory"
+    );
+}
 
 // ============================================================
 // Vectorized float2 arithmetic

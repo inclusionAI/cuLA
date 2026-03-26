@@ -5,15 +5,8 @@ import pathlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
-from einops import rearrange
-from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
-from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
-from fla.ops.common.chunk_o import chunk_bwd_dv_local
-from fla.ops.gla.chunk import chunk_gla_bwd_dA, chunk_gla_fwd_o_gk
-# from fla.ops.kda.chunk_inter import chunk_kda_bwd_dqkwg
-from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra, chunk_kda_fwd_intra
-from fla.ops.kda.gate import kda_gate_bwd, kda_gate_fwd
-from fla.ops.kda.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
+from fla.modules.l2norm import l2norm_fwd
+from fla.ops.kda.gate import kda_gate_fwd
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
@@ -32,173 +25,6 @@ COMPILE_OPTIONS = "--generate-line-info --ptxas-options '--verbose'"
 # Cached dummy tensors to avoid per-call allocation overhead (~0.12ms)
 # Key: device -> {cu_seqlens, state_dummy, cu_seqlens_cute, state_cute}
 _dummy_cache = {}
-
-def chunk_kda_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: float,
-    initial_state: torch.Tensor,
-    output_final_state: bool,
-    cu_seqlens: torch.IntTensor | None = None,
-    chunk_indices: torch.IntTensor | None = None,
-    chunk_size: int = 64,
-):
-    w, u, kg, Aqk, Akk = chunk_kda_fwd_intra(
-        q=q,
-        k=k,
-        v=v,
-        gk=g,
-        beta=beta,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-    )
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
-        k=kg,
-        w=w,
-        u=u,
-        gk=g,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        use_exp2=True,
-    )
-
-    o = chunk_gla_fwd_o_gk(
-        q=q,
-        v=v_new,
-        g=g,
-        A=Aqk,
-        h=h,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-        use_exp2=True,
-    )
-    return o, Aqk, Akk, final_state
-
-
-def chunk_kda_bwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    Aqk: torch.Tensor,
-    Akk: torch.Tensor,
-    scale: float,
-    initial_state: torch.Tensor,
-    do: torch.Tensor,
-    dht: torch.Tensor,
-    cu_seqlens: torch.IntTensor | None = None,
-    chunk_indices: torch.IntTensor | None = None,
-    chunk_size: int = 64,
-):
-    w, u, qg, kg = recompute_w_u_fwd(
-        q=q,
-        k=k,
-        v=v,
-        beta=beta,
-        A=Akk,
-        gk=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
-    h, v_new, _ = chunk_gated_delta_rule_fwd_h(
-        k=kg,
-        w=w,
-        u=u,
-        gk=g,
-        initial_state=initial_state,
-        output_final_state=False,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        use_exp2=True,
-    )
-    dv = chunk_bwd_dv_local(
-        q=q,
-        k=k,
-        do=do,
-        A=Aqk,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-    )
-
-    dh, dh0, dv = chunk_gated_delta_rule_bwd_dhu(
-        q=qg,
-        k=kg,
-        w=w,
-        gk=g,
-        h0=initial_state,
-        dht=dht,
-        do=do,
-        dv=dv,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        use_exp2=True,
-    )
-    # dq dk in fp32
-    dAqk = chunk_gla_bwd_dA(
-        v=v_new,
-        do=do,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-    )
-    dq, dk, dw, dg = chunk_kda_bwd_dqkwg(
-        q=q,
-        k=k,
-        v=v_new,
-        w=w,
-        g=g,
-        h=h,
-        dv=dv,
-        do=do,
-        dh=dh,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-    )
-    dk, dv, db, dg, dAkk = prepare_wy_repr_bwd(
-        k=k,
-        v=v,
-        beta=beta,
-        gk=g,
-        A=Akk,
-        dk=dk,
-        dw=dw,
-        du=dv,
-        dg=dg,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
-    dq, dk, db, dg = chunk_kda_bwd_intra(
-        q=q,
-        k=k,
-        g=g,
-        beta=beta,
-        dAqk=dAqk,
-        dAkk=dAkk,
-        dq=dq,
-        dk=dk,
-        db=db,
-        dg=dg,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-    )
-    return dq, dk, dv, db, dg, dh0
 
 class ChunkKDAFunction(torch.autograd.Function):
     @staticmethod
@@ -426,56 +252,8 @@ class ChunkKDAFunction(torch.autograd.Function):
         dht: torch.Tensor,
     ):
         raise NotImplementedError("Backward pass is not implemented yet.")
-        # (q, q_rstd, k, k_rstd, v, g, g_org, beta, A_log, dt_bias, Aqk, Akk, initial_state, cu_seqlens, chunk_indices) = (
-        #     ctx.saved_tensors
-        # )
-        # if ctx.use_gate_in_kernel:
-        #     g = kda_gate_fwd(
-        #         g=g_org,
-        #         A_log=A_log,
-        #         dt_bias=dt_bias,
-        #     )
-        #     g = chunk_local_cumsum(
-        #         g=g,
-        #         chunk_size=ctx.chunk_size,
-        #         scale=RCP_LN2,
-        #         cu_seqlens=cu_seqlens,
-        #         chunk_indices=chunk_indices
-        #     )
-        # dq, dk, dv, db, dg, dh0 = chunk_kda_bwd(
-        #     q=q,
-        #     k=k,
-        #     v=v,
-        #     g=g,
-        #     beta=beta,
-        #     Aqk=Aqk,
-        #     Akk=Akk,
-        #     scale=ctx.scale,
-        #     initial_state=initial_state,
-        #     do=do,
-        #     dht=dht,
-        #     cu_seqlens=cu_seqlens,
-        #     chunk_indices=chunk_indices,
-        #     chunk_size=ctx.chunk_size,
-        # )
-        # if ctx.use_qk_l2norm_in_kernel:
-        #     dq = l2norm_bwd(q, q_rstd, dq)
-        #     dk = l2norm_bwd(k, k_rstd, dk)
-        # dA, dbias = None, None
-        # if ctx.use_gate_in_kernel:
-        #     dg, dA, dbias = kda_gate_bwd(
-        #         g=g_org,
-        #         A_log=A_log,
-        #         dt_bias=dt_bias,
-        #         dyg=dg,
-        #         dyb=db,
-        #     )
-        #     dA = dA.to(A_log)
-        #     if dt_bias is not None:
-        #         dbias = dbias.to(dt_bias)
-        # return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), dA, dbias, None, dh0, None, None, None, None, None
 
-# TODO: support varlen with cu_seqlens
+# TODO: Blackwell fused prefill is still under development
 @torch.compiler.disable
 def flash_kda_prefill(
     q: torch.Tensor,
@@ -545,8 +323,6 @@ def flash_kda_prefill(
         final_state (torch.Tensor):
             Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
     """
-    # TODO
-    # assert safe_gate == False, "safe_gate=True is not supported in flash_kda_prefill yet."
     # initial_state is now supported
     assert cu_seqlens is None or q.shape[0] == 1, "For varlen, batch size must be 1. Flatten sequences first."
     # assert output_final_state == False, "output_final_state=True is not supported in cutedsl_kda_prefill yet."

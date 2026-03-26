@@ -107,10 +107,10 @@ python benchmarks/generate_benchmark_md.py
 ## Tests
 
 ```bash
-# End-to-end test (forward + backward) against FLA Triton implementation
-python -m pytest tests/test_kda_e2e_compare_fla.py -v
+# Tests for modular KDA forward against FLA Triton implementation
+python -m pytest tests/test_kda_compare_fla.py -v
 
-# End-to-end test against naive KDA reference
+# Tests for modular KDA forward against naive KDA reference
 python -m pytest tests/test_kda.py -v
 
 # Tests for KDA fused forward
