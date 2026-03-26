@@ -199,6 +199,7 @@ def flash_kda_prefill_hopper(
         final_state (torch.Tensor):
             Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
     """
+    assert safe_gate, "Only support safe_gate=True."
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(

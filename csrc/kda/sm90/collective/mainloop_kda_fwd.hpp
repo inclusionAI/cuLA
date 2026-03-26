@@ -54,7 +54,9 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
   using ElementAccumulatorO  = ElementAccumulatorQK;
   using ElementAccumulatorKV = ElementAccumulatorKV_;
   using ElementO             = Element;
-  using ElementAlphaBeta     = float;
+  using ElementAlpha         = float;
+  // TODO: support bf16 beta
+  using ElementBeta          = float;
   using ElementGatedMMA      = cutlass::tfloat32_t;
 
   using TileShape = TileShape_;
@@ -83,7 +85,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
   static constexpr int NeedsDecay = find_option_t<Tag::kNeedsDecay, cute::false_type, Options>::value;
   static_assert(!NeedsDecay, "Kda does not supports decay");
-  static constexpr int SafeGate = find_option_t<Tag::kSafeGate, cute::false_type, Options>::value;
+  static constexpr int SafeGate = true; // only support safe_gate=true
 
   static constexpr int NumLoadThreads     = NumLoadWarpGroups * 128;
   static constexpr int NumStateMmaThreads = NumStateMmaWarpGroups * 128;
@@ -100,8 +102,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
   using StagesQ      = cutlass::gemm::collective::StageCount<StageCountQ>;
   using StagesK      = cutlass::gemm::collective::StageCount<StageCountK>;
   using StagesV      = cutlass::gemm::collective::StageCount<StageCountV>;
-  using StagesQ_K_Scaled = cutlass::gemm::collective::StageCount<1>;
-  using StagesO      = cutlass::gemm::collective::StageCount<2>;
+  using StagesQ_K_Scaled = cutlass::gemm::collective::StageCount<2>;
+  using StagesO      = cutlass::gemm::collective::StageCount<1>;
   using ClusterShape = Shape<_1, _1, _1>;
 
   using StagesQK = cutlass::gemm::collective::StageCount<2>;
@@ -178,7 +180,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
       TileShapeKV, ClusterShape, DummyStages,
       cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
 
-  using SmemLayoutAlphaAtom = GMMA::Layout_K_SW128_Atom<ElementAlphaBeta>;
+  using SmemLayoutAlphaAtom = GMMA::Layout_K_SW128_Atom<ElementAlpha>;
   using SmemLayoutAlpha_SD = decltype(
     tile_to_shape(
       SmemLayoutAlphaAtom{},
@@ -315,15 +317,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
   using GmemStrideBeta = Stride<int64_t, int32_t>;
   using GmemLayoutBeta = Layout<Shape<int64_t, int32_t>, GmemStrideBeta>;  // (seq, head)
 
-  // (blk, pipe, cumsum_log/cumprod),
-  //   0 for cumsum(log(alpha)) aka log(cumprod(alpha))
-  //   1 for cumprod(alpha)
-  //   2 for cumprod(alpha) * scale
-  using AlphaCumSumLogIdx      = _0;
-  using AlphaCumProdIdx        = _1;
-  using AlphaCumProdScaleIdx   = _2;
-
-  // using SmemLayoutAlpha = decltype(make_layout(make_shape(BlkSeqQ, HeadSize, Int<StagesAlpha::value>{})));
   // only store the last row in Alpha
   using SmemLayoutAlphaLast = decltype(make_layout(make_shape(HeadSize, Int<StagesAlpha::value>{})));
   using SmemLayoutBeta  = decltype(make_layout(make_shape(BlkSeqQ, Int<StagesBeta::value>{})));
@@ -337,10 +330,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
   using MainloopQKPipeline = cutlass::PipelineAsync<StagesQK::value>;
   using MainloopKKPipeline = cutlass::PipelineAsync<StagesKK::value>;
 
-  // manage Aux WG1 <-> Math WG2/3
-  using MainloopQAuxPipeline = cutlass::PipelineAsync<StagesQ::value>;
-  using MainloopKAuxPipeline = cutlass::PipelineAsync<StagesK::value>;
-  using MainloopAlphaAuxPipeline = std::conditional_t<NeedsAlpha, cutlass::PipelineAsync<StagesAlpha::value>, Unused>;
   using MainloopAlphaLastPipeline = std::conditional_t<NeedsAlpha, cutlass::PipelineAsync<StagesAlpha::value>, Unused>;
 
   using MainloopBetaPipeline  = std::conditional_t<NeedsBeta, cutlass::PipelineAsync<StagesBeta::value>, Unused>;
@@ -353,84 +342,17 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
   using QKPipelineState = cutlass::PipelineState<MainloopQKPipeline::Stages>;
   using KKPipelineState = cutlass::PipelineState<MainloopKKPipeline::Stages>;
 
-  using QAuxPipelineState = cutlass::PipelineState<MainloopQAuxPipeline::Stages>;
-  using KAuxPipelineState = cutlass::PipelineState<MainloopKAuxPipeline::Stages>;
-  using AlphaAuxPipelineState = std::conditional_t<NeedsAlpha, cutlass::PipelineState<MainloopAlphaAuxPipeline::Stages>, Unused>;
   using AlphaLastPipelineState = std::conditional_t<NeedsAlpha, cutlass::PipelineState<MainloopAlphaLastPipeline::Stages>, Unused>;
 
   using AlphaPipelineState = std::conditional_t<NeedsAlpha, cutlass::PipelineState<MainloopAlphaPipeline::Stages>, Unused>;
   using BetaPipelineState  = std::conditional_t<NeedsBeta, cutlass::PipelineState<MainloopBetaPipeline::Stages>, Unused>;
 
-  using AlphaProcessor = Unused;
-
-  // struct AlphaProcessor {
-  //   CUTE_DEVICE
-  //   AlphaProcessor(float scale) : scale_(scale) {}
-
-  //   template <typename T>
-  //   CUTE_DEVICE
-  //   void operator()(T&& vecs) {
-  //     constexpr int WarpSize = cutlass::NumThreadsPerWarp;
-  //     int lane_id = cutlass::canonical_lane_idx();
-
-  //     Tensor vecs_32        = flat_divide(std::forward<T>(vecs), make_tile(Int<WarpSize>{}));  // ((32), iter, cumsum_log/cumprod/cumprod_scale)
-  //     Tensor vec_cumsum_log = vecs_32(make_coord(_), _, AlphaCumSumLogIdx{});
-  //     Tensor vec_cumprod    = vecs_32(make_coord(_), _, AlphaCumProdIdx{});
-  //     Tensor vec_cumprod_s  = vecs_32(make_coord(_), _, AlphaCumProdScaleIdx{});  // cumprod * scale
-  //     Tensor frag           = make_tensor<float>(size<1>(vec_cumprod));
-
-  //     CUTE_UNROLL
-  //     for (int iter = 0; iter < size(frag); ++iter) { frag(iter) = log2f(vec_cumsum_log(lane_id, iter) + 1e-10f); }
-
-  //     CUTE_UNROLL
-  //     for (int offset = 1; offset < WarpSize; offset *= 2) {
-  //       CUTE_UNROLL
-  //       for (int iter = 0; iter < size(frag); ++iter) {
-  //         auto v = __shfl_up_sync(0xFFFFFFFF, frag(iter), offset);
-  //         if (lane_id >= offset) {
-  //           frag(iter) += v;
-  //         }
-  //       }
-  //     }
-
-  //     float sum = 0.0f;
-  //     CUTE_UNROLL
-  //     for (int iter = 1; iter < size(frag); ++iter) {
-  //       sum += __shfl_sync(0xFFFFFFFF, frag(iter - 1), 31);
-  //       frag(iter) += sum;
-  //     }
-
-  //     CUTE_UNROLL
-  //     for (int iter = 0; iter < size(frag); ++iter) {
-  //       vec_cumsum_log(lane_id, iter) = frag(iter);
-  //       float cumprod = exp2f(frag(iter));
-  //       vec_cumprod(lane_id, iter) = cumprod;
-  //       vec_cumprod_s(lane_id, iter) = cumprod * scale_;
-  //     }
-  //   }
-
-  //   float scale_ = 1.0f;
-  // };
-
   using BetaProcessor = Unused;
-  // struct BetaProcessor {
-  //   template <typename T>
-  //   CUTE_DEVICE
-  //   void operator()(T&& vec) {
-  //     int lane_id = cutlass::canonical_lane_idx();
-  //     int warp_size = cutlass::NumThreadsPerWarp;
-  //     for (int i = lane_id; i < size(vec); i += warp_size) {
-  //       auto val = vec(i);
-  //       val = max(val, 1e-10f);  // clamp due to fusion with IKK before matrix inverse
-  //       vec(i) = 1.0f / val;
-  //     }
-  //   }
-  // };
 
   static constexpr int LoadQBytes  = size(QKSmemLayoutQ{}(_, _, _0{})) * sizeof(Element);
   static constexpr int LoadKBytes  = size(KVSmemLayoutK{}(_, _, _0{})) * sizeof(Element);
   static constexpr int LoadVBytes  = size(KVSmemLayoutV{}(_, _, _0{})) * sizeof(Element);
-  static constexpr int LoadAlphaBytes = size(QKQSmemLayoutAlpha{}(_, _, _0{})) * sizeof(ElementAlphaBeta);
+  static constexpr int LoadAlphaBytes = size(QKQSmemLayoutAlpha{}(_, _, _0{})) * sizeof(ElementAlpha);
   static constexpr int StoreOBytes = CollectiveStoreO::TmaTransactionBytes;
 
   using SharedStorageO = typename CollectiveStoreO::SharedStorage;
@@ -439,6 +361,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     alignas(alignment_for_swizzle(QKSmemLayoutQ{})) cute::array_aligned<Element, cute::cosize_v<QKSmemLayoutQ>> smem_q;
     alignas(alignment_for_swizzle(KVSmemLayoutK{})) cute::array_aligned<Element, cute::cosize_v<KVSmemLayoutK>> smem_k;
     alignas(alignment_for_swizzle(KVSmemLayoutV{})) cute::array_aligned<Element, cute::cosize_v<KVSmemLayoutV>> smem_v;
+    alignas(alignment_for_swizzle(QKQSmemLayoutAlpha{})) cute::array_aligned<ElementAlpha, cute::cosize_v<QKQSmemLayoutAlpha>> smem_alpha;
     alignas(alignment_for_swizzle(SmemLayoutQK{})) cute::array_aligned<Element, cute::cosize_v<SmemLayoutQK>> smem_qk;
     alignas(alignment_for_swizzle(SmemLayoutKK{})) cute::array_aligned<InverseType, cute::cosize_v<SmemLayoutKK>> smem_kk;
     // smemq_k_scaled for exp(alpha) * Q and exp(alpha) * K in QS and KS, computed in Math WG2/3
@@ -446,12 +369,9 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
     SharedStorageO smem_o;
 
-    cute::array_aligned<float, cute::cosize_v<SmemLayoutBeta>>  smem_beta;
-    // cute::array_aligned<float, cute::cosize_v<SmemLayoutAlpha>> smem_alpha;
-    // store G2S Alpha and reused for exp(-alpha) * K for KK^T operand B, QK^T operand B
-    alignas(alignment_for_swizzle(QKQSmemLayoutAlpha{})) cute::array_aligned<ElementAlphaBeta, cute::cosize_v<QKQSmemLayoutAlpha>> smem_alpha;
+    cute::array_aligned<ElementBeta, cute::cosize_v<SmemLayoutBeta>>  smem_beta;
     // store last row in Alpha separately, used for S'=K^T NewV's epilogue and S+=decay(S') (one fused epilogue)
-    cute::array_aligned<float, cute::cosize_v<SmemLayoutAlphaLast>> smem_alpha_last;
+    cute::array_aligned<ElementAlpha, cute::cosize_v<SmemLayoutAlphaLast>> smem_alpha_last;
   };
 
   using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;
@@ -462,10 +382,9 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
   using LoadQ = CollectiveLoadTma<LoadKind::kQ, MainloopQPipeline, Element, QKSmemLayoutQ, TMA_Q>;
   using LoadK = CollectiveLoadTma<LoadKind::kK, MainloopKPipeline, Element, KVSmemLayoutK, TMA_K>;
   using LoadV = CollectiveLoadTma<LoadKind::kV, MainloopVPipeline, Element, KVSmemLayoutV, TMA_V>;
-  using LoadAlpha = CollectiveLoadTma<LoadKind::kAlpha, MainloopAlphaPipeline, ElementAlphaBeta, QKQSmemLayoutAlpha, TMA_Alpha>;
+  using LoadAlpha = CollectiveLoadTma<LoadKind::kAlpha, MainloopAlphaPipeline, ElementAlpha, QKQSmemLayoutAlpha, TMA_Alpha>;
 
-  // using LoadAlpha = CollectiveLoadVector<LoadKindVector::kAlpha, MainloopAlphaPipeline, float, GmemLayoutAlpha, float, SmemLayoutAlpha, AlphaProcessor>;
-  using LoadBeta  = CollectiveLoadVector<LoadKindVector::kBeta, MainloopBetaPipeline, float, GmemLayoutBeta, float, SmemLayoutBeta, BetaProcessor>;
+  using LoadBeta  = CollectiveLoadVector<LoadKindVector::kBeta, MainloopBetaPipeline, ElementBeta, GmemLayoutBeta, ElementBeta, SmemLayoutBeta, BetaProcessor>;
 
   struct Arguments {  // clang-format off
     Element const* ptr_Q; LayoutQ dQ;
@@ -476,8 +395,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     float*        ptr_output_state; // layout fixed (kdim, vdim, num_heads, num_seqs):LayoutLeft{}
     float const*  ptr_input_state;
     float scale;
-    // float const* alpha_ptr; GmemStrideAlpha alpha_stride;
-    float const* beta_ptr;  GmemStrideBeta beta_stride;
+    ElementBeta const* beta_ptr;  GmemStrideBeta beta_stride;
   };  // clang-format on
 
   struct Params {
@@ -492,8 +410,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     float*       ptr_output_state;
     float const* ptr_input_state;
 
-    // float const* alpha_ptr; GmemLayoutAlpha alpha_layout;
-    float const* beta_ptr;  GmemLayoutBeta beta_layout;
+    ElementBeta const* beta_ptr;  GmemLayoutBeta beta_layout;
   };
 
   template <class ProblemShape>
@@ -574,8 +491,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         .ptr_input_state  = args.ptr_input_state,
 
         // TODO: refactor all name to varname_vartype
-        // .alpha_ptr    = args.alpha_ptr,
-        // .alpha_layout = make_layout(make_shape(s, problem_size.num_heads), args.alpha_stride),
         .beta_ptr     = args.beta_ptr,
         .beta_layout  = make_layout(make_shape(s, problem_size.num_heads), args.beta_stride),
     };
@@ -626,8 +541,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
     CUTE_NO_UNROLL
     for (int blk = 0; blk < num_blocks; ++blk) {
-      q_collective_load.step(q_src_dst, blk, q_smem_pipe_write, lane_predicate);
       alpha_collective_load.step(alpha_src_dst, blk, alpha_smem_pipe_write, lane_predicate);
+      q_collective_load.step(q_src_dst, blk, q_smem_pipe_write, lane_predicate);
       k_collective_load.step(k_src_dst, blk, k_smem_pipe_write, lane_predicate);
       v_collective_load.step(v_src_dst, blk, v_smem_pipe_write, lane_predicate);
     }
@@ -749,6 +664,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
     int thread_idx    = int(threadIdx.x) - NumLoadThreads;
     int warpgroup_idx = thread_idx / cutlass::NumThreadsPerWarpGroup;
+    int thread_idx_in_wg = thread_idx % cutlass::NumThreadsPerWarpGroup;
 
     float scale = params.scale;
 
@@ -769,28 +685,24 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     Tensor sQ_K_scaled = make_tensor(make_smem_ptr(storage.smem_q_k_scaled.data()), QKScaledSmemLayoutQ{});
     Tensor sQ_K_scaled_Kt = make_tensor(make_smem_ptr(storage.smem_q_k_scaled.data()), QKScaledSmemLayoutKt{});
     
-    int local_thread_idx = thread_idx;
-    if (thread_idx >= 128) {
-      local_thread_idx = thread_idx - 128;
-    }
     ///////////////////////////////////////////////////////////////////////////
     // Q@S, K@S, Q/K prologue
     // each WG process 32 at a time, reduce peak register usage
     // each WG process half head dim (64) at all
     auto qk_tiled_mma_rs_quar = TiledMmaQK_RS_Quar{};
-    auto qk_thr_mma_rs_quar = qk_tiled_mma_rs_quar.get_thread_slice(local_thread_idx);
+    auto qk_thr_mma_rs_quar = qk_tiled_mma_rs_quar.get_thread_slice(thread_idx_in_wg);
     constexpr auto tiler_alpha = Shape<_64, Shape<_32, _1>>{};
     constexpr auto tiler_qk = Shape<_64, Shape<_32, _1>>{};
     constexpr auto tiler_alpha_last = Shape<_32>{};
     // used for Alpha S2R (float)
-    using CopyAlphaAtom = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAlphaBeta>;
+    using CopyAlphaAtom = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAlpha>;
     // used for Q/K S2R and R2S (fp16/bf16)
     using CopyOpS2R    = SM75_U32x4_LDSM_N;
     using CopyOpR2S    = SM90_U32x4_STSM_N;
     auto tiled_load_qk_quar = make_tiled_copy_A(Copy_Atom<CopyOpS2R, Element>{}, qk_thr_mma_rs_quar);
-    auto thr_load_qk_quar   = tiled_load_qk_quar.get_thread_slice(local_thread_idx);
+    auto thr_load_qk_quar   = tiled_load_qk_quar.get_thread_slice(thread_idx_in_wg);
     auto tiled_store_qk_quar = make_tiled_copy_A(Copy_Atom<CopyOpR2S, Element>{}, qk_thr_mma_rs_quar);
-    auto thr_store_qk_quar  = tiled_store_qk_quar.get_thread_slice(local_thread_idx);
+    auto thr_store_qk_quar  = tiled_store_qk_quar.get_thread_slice(thread_idx_in_wg);
 
     auto cMq_quar  = make_identity_tensor(select<0, 2>(TileShapeQK_Quar{}));     // (QTok, HeadDim / 2)
     auto tQcMq_quar = qk_thr_mma_rs_quar.partition_A(cMq_quar);                       // (idx) -> (tok_q, head_dim / 2)
@@ -798,7 +710,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     ///////////////////////////////////////////////////////////////////////////
     // K@K  (basically I + strict_lower_triangular(K K^T)
     auto kk_tiled_mma = TiledMmaKK{};
-    auto kk_thr_mma   = kk_tiled_mma.get_thread_slice(local_thread_idx);
+    auto kk_thr_mma   = kk_tiled_mma.get_thread_slice(thread_idx_in_wg);
     Tensor tKKsK = kk_thr_mma.partition_B(sKqk);
     Tensor tKKrA = kk_thr_mma.make_fragment_A(tKKsK);
     auto cMqk    = make_identity_tensor(select<0, 1>(TileShapeQK{}));  // (QTok, KTok)
@@ -996,8 +908,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
       }
     };
 
-    // auto o_store = [&]
-
     auto compute_loop_body = [&](int blk, auto is_first_block_, auto is_final_block_) INLINE_LAMBDA {
       constexpr bool is_first_block = decltype(is_first_block_)::value;
       constexpr bool is_final_block = decltype(is_final_block_)::value;
@@ -1005,71 +915,101 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
       auto sQqk_curr = sQqk(_, _, q_smem_pipe_read.index());
       auto sKqk_curr = sKqk(_, _, k_smem_pipe_read.index());
-      auto sQ_K_scaled_curr = sQ_K_scaled(_, _, _0{});
+      auto sQ_scaled_curr = sQ_K_scaled(_, _, _0{});
+      auto sK_scaled_curr = sQ_K_scaled(_, _, _1{});
       auto sAlast_curr = AlphaLast(_, alpha_last_smem_pipe_read.index());
       auto sAqkq_curr = sAqkq(_, _, alpha_smem_pipe_read.index());
       auto sQqk_slice = flat_divide(sQqk_curr, tiler_qk);
       auto sKqk_slice = flat_divide(sKqk_curr, tiler_qk);
-      auto sQ_K_scaled_slice = flat_divide(sQ_K_scaled_curr, tiler_qk);
+      auto sQ_scaled_slice = flat_divide(sQ_scaled_curr, tiler_qk);
+      auto sK_scaled_slice = flat_divide(sK_scaled_curr, tiler_qk);
       auto sAqkq_slice = flat_divide(sAqkq_curr, tiler_alpha);
       auto sAlast_slice = flat_divide(sAlast_curr, tiler_alpha_last);
       
       if constexpr (NeedsAlpha) {
         alpha_pipeline.consumer_wait(alpha_smem_pipe_read);
       }
-      auto sQqk_0 = sQqk_slice(_, _, _0{}, make_coord(_0{}, _0{}));
-      auto tQKrQ_0 = qk_thr_mma_rs_quar.partition_fragment_A(sQqk_0);
-      // reuse these registers
-      auto tArA_0 = make_fragment_like<ElementAlphaBeta>(tQKrQ_0);
-      auto tArA_1 = make_fragment_like<ElementAlphaBeta>(tQKrQ_0);
-      auto tArA_2 = make_fragment_like<ElementAlphaBeta>(tQKrQ_0);
-      auto tArA_3 = make_fragment_like<ElementAlphaBeta>(tQKrQ_0);
+      DPRINTF0_WG("compute: q_pipeline.consumer_wait: smem_pipe_read:%d\n", q_smem_pipe_read.index());
+      q_pipeline.consumer_wait(q_smem_pipe_read);
+      DPRINTF0_WG("compute: k_pipeline.consumer_wait: smem_pipe_read:%d\n", k_smem_pipe_read.index());
+      k_pipeline.consumer_wait(k_smem_pipe_read);
+
       // load alpha and exp2(alpha) only once  
       // and reuse these registers in exp(alpha) * Q/K prologue
-      // FIXME: how to reduce register spilling?
       if constexpr (!is_first_block) {
-        if constexpr (SafeGate) {
-          if (thread_idx < 128) {
-            // S2R Alpha
-            auto sAqkq_0 = sAqkq_slice(_, _, _0{}, make_coord(_0{}, _0{}));
-            auto tAsA_0 = qk_thr_mma_rs_quar.partition_A(sAqkq_0);
-            copy(CopyAlphaAtom{}, tAsA_0, tArA_0);
+        // make sure sQ_K_scaled is already consumed for previous K^@V
+        cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::StateMath);
+        // Each WG iterates over 2 slices of 32 elements each.
+        // WG0 (thread_idx < 128): wg_idx=0, processes alpha indices {0,1}, Q/K dim1=0
+        // WG1 (thread_idx >= 128): wg_idx=1, processes alpha indices {2,3}, Q/K dim1=1
+        {
+          int wg_idx = thread_idx / 128;         // 0 or 1
+          int alpha_base = wg_idx * 2;           // 0 or 2
 
-            cute::transform(tArA_0, [](auto g) {
+          // Allocate Q/K register fragments once (reused across slices)
+          // Only shape/layout matters for partition_fragment_A, use compile-time indices
+          auto tQKrQ_wg = qk_thr_mma_rs_quar.partition_fragment_A(sQqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
+          auto tQKrK_wg = qk_thr_mma_rs_quar.partition_fragment_A(sKqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
+          auto tArA = make_fragment_like<ElementAlpha>(tQKrQ_wg);
+
+          for (int s = 0; s < 2; ++s) {
+            // S2R Alpha: alpha_col = wg_idx * 2 + s
+            int alpha_col = alpha_base + s;
+            auto sA_cur = sAqkq_slice(_, _, _0{}, make_coord(0, alpha_col));
+            auto tAsA_cur = qk_thr_mma_rs_quar.partition_A(sA_cur);
+            copy(CopyAlphaAtom{}, tAsA_cur, tArA);
+
+            cute::transform(tArA, [](auto g) {
               return exp2f(g);
             });
 
-            auto sAqkq_1 = sAqkq_slice(_, _, _0{}, make_coord(_0{}, _1{}));
-            auto tAsA_1 = qk_thr_mma_rs_quar.partition_A(sAqkq_1);
-            copy(CopyAlphaAtom{}, tAsA_1, tArA_1);
+            // S2R Q
+            auto sQqk_cur = sQqk_slice(_, _, _0{}, make_coord(s, wg_idx));
+            auto tQKsQ_cur = thr_load_qk_quar.partition_S(sQqk_cur);
+            auto tQKrQ_cv = thr_load_qk_quar.retile_D(tQKrQ_wg);
+            copy(tiled_load_qk_quar, tQKsQ_cur, tQKrQ_cv);
 
-            cute::transform(tArA_1, [](auto g) {
-              return exp2f(g);
-            });
-          } else {
-            auto sAqkq_2 = sAqkq_slice(_, _, _0{}, make_coord(_0{}, _2{}));
-            auto tAsA_2 = qk_thr_mma_rs_quar.partition_A(sAqkq_2);
-            copy(CopyAlphaAtom{}, tAsA_2, tArA_2);
-
-            cute::transform(tArA_2, [](auto g) {
-              return exp2f(g);
+            // element-wise exp(alpha) * Q
+            cute::transform(tQKrQ_wg, tArA, tQKrQ_wg, [&](auto q, auto alpha) {
+              Element dst = Element(alpha * float(q));
+              return dst;
             });
 
-            auto sAqkq_3 = sAqkq_slice(_, _, _0{}, make_coord(_0{}, _3{}));
-            auto tAsA_3 = qk_thr_mma_rs_quar.partition_A(sAqkq_3);
-            copy(CopyAlphaAtom{}, tAsA_3, tArA_3);
+            // R2S Q -> stage 0
+            auto sQ_scaled_cur = sQ_scaled_slice(_, _, _0{}, make_coord(s, wg_idx));
+            auto tQKsQ_out = thr_store_qk_quar.partition_D(sQ_scaled_cur);
+            auto tQKrQ_out_cv = thr_store_qk_quar.retile_S(tQKrQ_wg);
+            copy(tiled_store_qk_quar, tQKrQ_out_cv, tQKsQ_out);
 
-            cute::transform(tArA_3, [](auto g) {
-              return exp2f(g);
+            // S2R K
+            auto sKqk_cur = sKqk_slice(_, _, _0{}, make_coord(s, wg_idx));
+            auto tQKsK_cur = thr_load_qk_quar.partition_S(sKqk_cur);
+            auto tQKrK_cv = thr_load_qk_quar.retile_D(tQKrK_wg);
+            copy(tiled_load_qk_quar, tQKsK_cur, tQKrK_cv);
+
+            // element-wise exp(alpha) * K
+            cute::transform(tQKrK_wg, tArA, tQKrK_wg, [&](auto k, auto alpha) {
+              Element dst = Element(alpha * float(k));
+              return dst;
             });
+
+            // R2S K -> stage 1
+            auto sK_scaled_cur = sK_scaled_slice(_, _, _0{}, make_coord(s, wg_idx));
+            auto tQKsK_out = thr_store_qk_quar.partition_D(sK_scaled_cur);
+            auto tQKrK_out_cv = thr_store_qk_quar.retile_S(tQKrK_wg);
+            copy(tiled_store_qk_quar, tQKrK_out_cv, tQKsK_out);
           }
         }
         cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::StateMath);
+        // fence to produce data for WGMMA async proxy
+        cutlass::arch::fence_view_async_shared();
+        // if (blk <= 1 && thread_idx == 0) {
+        //   printf("After Q/K prologue: exp(alpha) * Q at stage 0, exp(alpha) * K at stage 1\n");
+        //   cute::print_tensor(sQ_K_scaled_curr);
+        // }
       }
 
       // 2.1 Q @ KV, NOTE: use old KV here
-      DPRINTF0_WG("compute: q_pipeline.consumer_wait: smem_pipe_read:%d\n", q_smem_pipe_read.index());
-      q_pipeline.consumer_wait(q_smem_pipe_read);
 
       DPRINTF0_WG("[%d,%d,%d,%d]** dispatch O WGMMA\n", seq_idx, q_head_idx, k_head_idx, v_head_idx);
       auto tOrO = partition_fragment_C(o1_thr_mma, select<0, 1>(TileShapeO1{}));
@@ -1078,104 +1018,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         q_pipeline.consumer_release(q_smem_pipe_read);
         ++q_smem_pipe_read;
       } else {
-        // 
-        if constexpr (SafeGate) {
-          // Q prologue: exp(alpha) * scale * Q, each WG processes half HeadDim (64x64)
-          if (thread_idx < 128) {
-            // 0-32, 32-64
-            // Slice 0
-            // S2R Q
-            auto tQKsQ_0 = thr_load_qk_quar.partition_S(sQqk_0);
-            auto tQKrQ_0_cv = thr_load_qk_quar.retile_D(tQKrQ_0);
-            copy(tiled_load_qk_quar, tQKsQ_0, tQKrQ_0_cv);
-
-            // element-wise between Alpha and Q
-            cute::transform(tQKrQ_0, tArA_0, tQKrQ_0, [&](auto q, auto alpha) {
-              Element dst = Element(alpha * float(q));
-              return dst;
-            });
-            
-            // R2S Q
-            auto sQ_K_scaled_0 = sQ_K_scaled_slice(_, _, _0{}, make_coord(_0{}, _0{}));
-            auto tQKsQ_0_out = thr_store_qk_quar.partition_D(sQ_K_scaled_0);
-            auto tQKrQ_0_out_cv = thr_store_qk_quar.retile_S(tQKrQ_0);
-            copy(tiled_store_qk_quar, tQKrQ_0_out_cv, tQKsQ_0_out);
-            
-            // Slice 1
-            // S2R Q
-            auto sQqk_1 = sQqk_slice(_, _, _0{}, make_coord(_1{}, _0{}));
-            auto tQKsQ_1 = thr_load_qk_quar.partition_S(sQqk_1);
-            // reuse register
-            auto tQKrQ_1_cv = thr_load_qk_quar.retile_D(tQKrQ_0);
-            copy(tiled_load_qk_quar, tQKsQ_1, tQKrQ_1_cv);
-
-            // element-wise between Alpha and Q
-            cute::transform(tQKrQ_0, tArA_1, tQKrQ_0, [&](auto q, auto alpha) {
-              Element dst = Element(alpha * float(q));
-              return dst;
-            });
-            
-            // R2S Q
-            auto sQ_K_scaled_1 = sQ_K_scaled_slice(_, _, _0{}, make_coord(_1{}, _0{}));
-            auto tQKsQ_1_out = thr_store_qk_quar.partition_D(sQ_K_scaled_1);
-            auto tQKrQ_1_out_cv = thr_store_qk_quar.retile_S(tQKrQ_0);
-            copy(tiled_store_qk_quar, tQKrQ_1_out_cv, tQKsQ_1_out);
-          } else {
-            // 64-96, 96-128
-            // Slice 0
-            // S2R Q
-            auto sQqk_2 = sQqk_slice(_, _, _0{}, make_coord(_0{}, _1{}));
-            auto tQKrQ_2 = qk_thr_mma_rs_quar.partition_fragment_A(sQqk_2);
-            auto tQKsQ_2 = thr_load_qk_quar.partition_S(sQqk_2);
-            auto tQKrQ_2_cv = thr_load_qk_quar.retile_D(tQKrQ_2);
-            copy(tiled_load_qk_quar, tQKsQ_2, tQKrQ_2_cv);
-
-            // element-wise between Alpha and Q
-            cute::transform(tQKrQ_2, tArA_2, tQKrQ_2, [&](auto q, auto alpha) {
-              Element dst = Element(alpha * float(q));
-              return dst;
-            });
-            
-            // R2S Q
-            auto sQ_K_scaled_0 = sQ_K_scaled_slice(_, _, _0{}, make_coord(_0{}, _1{}));
-            auto tQKsQ_0_out = thr_store_qk_quar.partition_D(sQ_K_scaled_0);
-            auto tQKrQ_0_out_cv = thr_store_qk_quar.retile_S(tQKrQ_2);
-            copy(tiled_store_qk_quar, tQKrQ_0_out_cv, tQKsQ_0_out);
-            
-            // Slice 1
-            // S2R Q
-            auto sQqk_3 = sQqk_slice(_, _, _0{}, make_coord(_1{}, _1{}));
-            auto tQKsQ_3 = thr_load_qk_quar.partition_S(sQqk_3);
-            // reuse register
-            auto tQKrQ_3_cv = thr_load_qk_quar.retile_D(tQKrQ_2);
-            copy(tiled_load_qk_quar, tQKsQ_3, tQKrQ_3_cv);
-
-            // element-wise between Alpha and Q
-            cute::transform(tQKrQ_2, tArA_3, tQKrQ_2, [&](auto q, auto alpha) {
-              Element dst = Element(alpha * float(q));
-              return dst;
-            });
-            
-            // R2S Q
-            auto sQ_K_scaled_1 = sQ_K_scaled_slice(_, _, _0{}, make_coord(_1{}, _1{}));
-            auto tQKsQ_1_out = thr_store_qk_quar.partition_D(sQ_K_scaled_1);
-            auto tQKrQ_1_out_cv = thr_store_qk_quar.retile_S(tQKrQ_2);
-            copy(tiled_store_qk_quar, tQKrQ_1_out_cv, tQKsQ_1_out);
-          }
-          // if (blk <= 1 && thread_idx == 0) {
-          //   printf("Before Q prologue: \n");
-          //   cute::print_tensor(sQqk_slice);
-          // }
-
-          // wait for smemq_k_scaled ready
-          cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::StateMath);
-          // fence to produce data for WGMMA async proxy
-          cutlass::arch::fence_view_async_shared();
-          // if (blk <= 1 && thread_idx == 0) {
-          //   printf("After Q prologue: exp(alpha) * Q\n");
-          //   cute::print_tensor(sQ_K_scaled_curr);
-          // }
-        }
         Tensor tOrKV = make_acc_into_op<Element>(tKVrKV, typename TiledMmaO1::LayoutA_TV{});
         warpgroup_fence_operand(tOrKV);
         warpgroup_fence_operand(tOrO);
@@ -1206,112 +1048,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         o1_epi(tOrO);
       }
 
-      DPRINTF0_WG("compute: k_pipeline.consumer_wait: smem_pipe_read:%d\n", k_smem_pipe_read.index());
-      k_pipeline.consumer_wait(k_smem_pipe_read);
-
       auto tSKrSK = partition_fragment_C(sk_thr_mma,  sVkv(_, _, _0{}));
       if constexpr (!is_first_block) {
-        // synchronize 2 WGs before rewriting sQ_K_scaled
-        cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::StateMath);
-        if constexpr (SafeGate) {
-          // K prologue: exp(alpha) * K, each WG processes half HeadDim (64x64)
-          if (thread_idx < 128) {
-            // 0-32, 32-64
-            // Slice 0
-            // S2R K
-            auto sKqk_0 = sKqk_slice(_, _, _0{}, make_coord(_0{}, _0{}));
-            auto tQKrK_0 = qk_thr_mma_rs_quar.partition_fragment_A(sKqk_0);
-            auto tQKsK_0 = thr_load_qk_quar.partition_S(sKqk_0);
-            auto tQKrK_0_cv = thr_load_qk_quar.retile_D(tQKrK_0);
-            copy(tiled_load_qk_quar, tQKsK_0, tQKrK_0_cv);
-
-            // element-wise between Alpha and Q
-            cute::transform(tQKrK_0, tArA_0, tQKrK_0, [&](auto k, auto alpha) {
-              Element dst = Element(alpha * float(k));
-              return dst;
-            });
-            
-            // R2S K
-            auto sQ_K_scaled_0 = sQ_K_scaled_slice(_, _, _0{}, make_coord(_0{}, _0{}));
-            auto tQKsK_0_out = thr_store_qk_quar.partition_D(sQ_K_scaled_0);
-            auto tQKrK_0_out_cv = thr_store_qk_quar.retile_S(tQKrK_0);
-            copy(tiled_store_qk_quar, tQKrK_0_out_cv, tQKsK_0_out);
-            
-            // Slice 1
-            // S2R K
-            auto sKqk_1 = sKqk_slice(_, _, _0{}, make_coord(_1{}, _0{}));
-            auto tQKsK_1 = thr_load_qk_quar.partition_S(sKqk_1);
-            // reuse register
-            auto tQKrK_1_cv = thr_load_qk_quar.retile_D(tQKrK_0);
-            copy(tiled_load_qk_quar, tQKsK_1, tQKrK_1_cv);
-
-            // element-wise between Alpha and Q
-            cute::transform(tQKrK_0, tArA_1, tQKrK_0, [&](auto k, auto alpha) {
-              Element dst = Element(alpha * float(k));
-              return dst;
-            });
-            
-            // R2S K
-            auto sQ_K_scaled_1 = sQ_K_scaled_slice(_, _, _0{}, make_coord(_1{}, _0{}));
-            auto tQKsK_1_out = thr_store_qk_quar.partition_D(sQ_K_scaled_1);
-            auto tQKrK_1_out_cv = thr_store_qk_quar.retile_S(tQKrK_0);
-            copy(tiled_store_qk_quar, tQKrK_1_out_cv, tQKsK_1_out);
-          } else {
-            // 64-96, 96-128
-            // Slice 0
-            // S2R K
-            auto sKqk_2 = sKqk_slice(_, _, _0{}, make_coord(_0{}, _1{}));
-            auto tQKrK_2 = qk_thr_mma_rs_quar.partition_fragment_A(sKqk_2);
-            auto tQKsK_2 = thr_load_qk_quar.partition_S(sKqk_2);
-            auto tQKrK_2_cv = thr_load_qk_quar.retile_D(tQKrK_2);
-            copy(tiled_load_qk_quar, tQKsK_2, tQKrK_2_cv);
-
-            // element-wise between Alpha and Q
-            cute::transform(tQKrK_2, tArA_2, tQKrK_2, [&](auto k, auto alpha) {
-              Element dst = Element(alpha * float(k));
-              return dst;
-            });
-            
-            // R2S K
-            auto sQ_K_scaled_0 = sQ_K_scaled_slice(_, _, _0{}, make_coord(_0{}, _1{}));
-            auto tQKsK_0_out = thr_store_qk_quar.partition_D(sQ_K_scaled_0);
-            auto tQKrK_0_out_cv = thr_store_qk_quar.retile_S(tQKrK_2);
-            copy(tiled_store_qk_quar, tQKrK_0_out_cv, tQKsK_0_out);
-            
-            // Slice 1
-            // S2R K
-            auto sKqk_3 = sKqk_slice(_, _, _0{}, make_coord(_1{}, _1{}));
-            auto tQKsK_3 = thr_load_qk_quar.partition_S(sKqk_3);
-            // reuse register
-            auto tQKrK_3_cv = thr_load_qk_quar.retile_D(tQKrK_2);
-            copy(tiled_load_qk_quar, tQKsK_3, tQKrK_3_cv);
-
-            // element-wise between Alpha and Q
-            cute::transform(tQKrK_2, tArA_3, tQKrK_2, [&](auto k, auto alpha) {
-              Element dst = Element(alpha * float(k));
-              return dst;
-            });
-            
-            // R2S K
-            auto sQ_K_scaled_1 = sQ_K_scaled_slice(_, _, _0{}, make_coord(_1{}, _1{}));
-            auto tQKsK_1_out = thr_store_qk_quar.partition_D(sQ_K_scaled_1);
-            auto tQKrK_1_out_cv = thr_store_qk_quar.retile_S(tQKrK_2);
-            copy(tiled_store_qk_quar, tQKrK_1_out_cv, tQKsK_1_out);
-          }
-          // if (blk <= 1 && thread_idx == 0) {
-          //   printf("Before K prologue: \n");
-          //   cute::print_tensor(sKqk_slice);
-          // }
-
-          // wait for smemq_k_scaled ready
-          cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::StateMath);
-          // fence to produce data for WGMMA async proxy
-          cutlass::arch::fence_view_async_shared();
-          // if (blk <= 1 && thread_idx == 0) {
-          //   printf("After K prologue: exp(alpha) * K\n");
-          //   cute::print_tensor(sQ_K_scaled_slice);
-          // }
-        }
 
         auto tSKrS = make_acc_into_op<Element>(tKVrKV, typename TiledMmaSK::LayoutA_TV{});
         warpgroup_fence_operand(tSKrSK);
@@ -1323,11 +1061,10 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         // if (blk <= 6 && thread_idx == 0) {
         //   printf("=======Before K@S, block_idx: %d, thread_idx: %d=======\n", blk, thread_idx);
         //   cute::print_tensor(tSKrS);
-        //    cute::print_tensor(sQ_K_scaled_slice);
         // }
 
-        // SK
-        gemm_zero_acc(sk_tiled_mma, tSKrS, tSKrK(_, _, _, 0), tSKrSK);
+        // SK: K_scaled is in stage 1 of sQ_K_scaled
+        gemm_zero_acc(sk_tiled_mma, tSKrS, tSKrK(_, _, _, 1), tSKrSK);
         warpgroup_commit_batch();
         math_barriers.notify_next_blocked(warpgroup_idx);
         warpgroup_wait<0>();
@@ -1425,11 +1162,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
       /////////////////////////////////////////////////////////////////////////
       // 3. update KV
-
-      // reuse smem Alpha
-      // NOTE: we reuse the current stage of smemAlpha
-      ElementAlphaBeta* sAqkq_stage_ptr = &sAqkq(0, 0, alpha_smem_pipe_read.index());
-      Tensor sKkv = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(sAqkq_stage_ptr)), KVSmemLayoutK{});
       Tensor tKVsK = kv_thr_mma.partition_B(sQ_K_scaled_Kt);
       Tensor tKVrK = kv_thr_mma.make_fragment_B(tKVsK);
 
@@ -1437,177 +1169,68 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         alpha_last_pipeline.consumer_wait(alpha_last_smem_pipe_read);
         cutlass::arch::fence_view_async_shared();
       }
-      // w/o lower bound gate, decay S in prologue, otherwise in epilogue
-      if (SafeGate) {
-        s_decay(tKVrKV, alpha_last_smem_pipe_read);
-      }
+      s_decay(tKVrKV, alpha_last_smem_pipe_read);
 
-      if (SafeGate) {
-        // synchronize 2 WGs before rewriting sQ_K_scaled
-        cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::StateMath);
-        // exp(alpha_last - alpha) * K
-        if (thread_idx < 128) {
-            // 0-32, 32-64
-            // Slice 0
+      // synchronize 2 WGs before rewriting sQ_K_scaled
+      cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::StateMath);
+      // exp(alpha_last - alpha) * K
+      // Each WG iterates over 2 slices of 32 elements each.
+      // WG0 (thread_idx < 128): wg_idx=0, alpha_last indices {0,1}, K/output dim1=0
+      // WG1 (thread_idx >= 128): wg_idx=1, alpha_last indices {2,3}, K/output dim1=1
+      {
+          int wg_idx = thread_idx / 128;         // 0 or 1
+          int alpha_base = wg_idx * 2;           // 0 or 2
+
+          // Allocate K/Alpha register fragments once (reused across slices)
+          auto tQKrK_wg = qk_thr_mma_rs_quar.partition_fragment_A(sKqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
+          auto tArA_wg = make_fragment_like<ElementAlpha>(tQKrK_wg);
+
+          for (int s = 0; s < 2; ++s) {
+            // S2R Alpha
+            int alpha_col = alpha_base + s;
+            auto sA_cur = sAqkq_slice(_, _, _0{}, make_coord(0, alpha_col));
+            auto tAsA_cur = qk_thr_mma_rs_quar.partition_A(sA_cur);
+            copy(CopyAlphaAtom{}, tAsA_cur, tArA_wg);
+
             // S2R K
-            auto sKqk_0 = sKqk_slice(_, _, _0{}, make_coord(_0{}, _0{}));
-            auto tQKrK_0 = qk_thr_mma_rs_quar.partition_fragment_A(sKqk_0);
-            auto tQKsK_0 = thr_load_qk_quar.partition_S(sKqk_0);
-            auto tQKrK_0_cv = thr_load_qk_quar.retile_D(tQKrK_0);
-            copy(tiled_load_qk_quar, tQKsK_0, tQKrK_0_cv);
+            auto sKqk_cur = sKqk_slice(_, _, _0{}, make_coord(s, wg_idx));
+            auto tQKsK_cur = thr_load_qk_quar.partition_S(sKqk_cur);
+            auto tQKrK_cv = thr_load_qk_quar.retile_D(tQKrK_wg);
+            copy(tiled_load_qk_quar, tQKsK_cur, tQKrK_cv);
 
-            // S2R Alpha
-            auto sAqkq_0 = sAqkq_slice(_, _, _0{}, make_coord(_0{}, _0{}));
-            auto tAsA_0 = qk_thr_mma_rs_quar.partition_A(sAqkq_0);
-            auto tArA_0 = make_fragment_like<ElementAlphaBeta>(tQKrK_0);
-            copy(CopyAlphaAtom{}, tAsA_0, tArA_0);
-
-            // element-wise for K, Alpha and AlphaLast
-            auto alpha_last_0 = sAlast_slice(_, _0{});
+            // element-wise: exp(alpha_last - alpha) * K
+            int alast_idx = alpha_base + s;
+            auto alpha_last_cur = sAlast_slice(_, alast_idx);
             for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i){
               auto coord = tQcMq_quar(i);
-              auto [s, t] = coord;
-              auto alpha = tArA_0(i);
-              auto k = tQKrK_0(i);
-              auto alpha_last = alpha_last_0(t);
+              auto [seq, t] = coord;
+              auto alpha = tArA_wg(i);
+              auto k = tQKrK_wg(i);
+              auto alpha_last = alpha_last_cur(t);
               auto k_scaled = Element(exp2f(alpha_last - alpha) * float(k));
-              tQKrK_0(i) = k_scaled;
-              // NOTE: sQ_K_scaled is rewritten in each chunk, need to mask at last!
+              tQKrK_wg(i) = k_scaled;
               if constexpr (is_final_block) {
-                if (s >= B) {
-                  tQKrK_0(i) = Element(0.0f);
+                if (seq >= B) {
+                  tQKrK_wg(i) = Element(0.0f);
                 }
               }
             });
 
-            // R2S K
-            auto sQ_K_scaled_0 = sQ_K_scaled_slice(_, _, _0{}, make_coord(_0{}, _0{}));
-            auto tQKsK_0_out = thr_store_qk_quar.partition_D(sQ_K_scaled_0);
-            auto tQKrK_0_out_cv = thr_store_qk_quar.retile_S(tQKrK_0);
-            copy(tiled_store_qk_quar, tQKrK_0_out_cv, tQKsK_0_out);
-            
-            // Slice 1
-            auto sKqk_1 = sKqk_slice(_, _, _0{}, make_coord(_1{}, _0{}));
-            auto tQKsK_1 = thr_load_qk_quar.partition_S(sKqk_1);
-            // reuse register
-            auto tQKrK_1_cv = thr_load_qk_quar.retile_D(tQKrK_0);
-            copy(tiled_load_qk_quar, tQKsK_1, tQKrK_1_cv);
-            
-            // S2R Alpha
-            auto sAqkq_1 = sAqkq_slice(_, _, _0{}, make_coord(_0{}, _1{}));
-            auto tAsA_1 = qk_thr_mma_rs_quar.partition_A(sAqkq_1);
-            // reuse register
-            copy(CopyAlphaAtom{}, tAsA_1, tArA_0);
-
-            // element-wise for K, Alpha and AlphaLast
-            auto alpha_last_1 = sAlast_slice(_, _1{});
-            for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i){
-              auto coord = tQcMq_quar(i);
-              auto [s, t] = coord;
-              auto alpha = tArA_0(i);
-              auto k = tQKrK_0(i);
-              auto alpha_last = alpha_last_1(t);
-              auto k_scaled = Element(exp2f(alpha_last - alpha) * float(k));
-              tQKrK_0(i) = k_scaled;
-              if constexpr (is_final_block) {
-                if (s >= B) {
-                  tQKrK_0(i) = Element(0.0f);
-                }
-              }
-            });
-
-            // R2S K
-            auto sQ_K_scaled_1 = sQ_K_scaled_slice(_, _, _0{}, make_coord(_1{}, _0{}));
-            auto tQKsK_1_out = thr_store_qk_quar.partition_D(sQ_K_scaled_1);
-            auto tQKrK_1_out_cv = thr_store_qk_quar.retile_S(tQKrK_0);
-            copy(tiled_store_qk_quar, tQKrK_1_out_cv, tQKsK_1_out);
-        } else {
-            // 64-96, 96-128
-            // Slice 0
-            // S2R K
-            auto sKqk_0 = sKqk_slice(_, _, _0{}, make_coord(_0{}, _1{}));
-            auto tQKrK_0 = qk_thr_mma_rs_quar.partition_fragment_A(sKqk_0);
-            auto tQKsK_0 = thr_load_qk_quar.partition_S(sKqk_0);
-            auto tQKrK_0_cv = thr_load_qk_quar.retile_D(tQKrK_0);
-            copy(tiled_load_qk_quar, tQKsK_0, tQKrK_0_cv);
-
-            // S2R Alpha
-            auto sAqkq_0 = sAqkq_slice(_, _, _0{}, make_coord(_0{}, _2{}));
-            auto tAsA_0 = qk_thr_mma_rs_quar.partition_A(sAqkq_0);
-            auto tArA_0 = make_fragment_like<ElementAlphaBeta>(tQKrK_0);
-            copy(CopyAlphaAtom{}, tAsA_0, tArA_0);
-
-            // element-wise for K, Alpha and AlphaLast
-            auto alpha_last_0 = sAlast_slice(_, _2{});
-            for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i){
-              auto coord = tQcMq_quar(i);
-              auto [s, t] = coord;
-              auto alpha = tArA_0(i);
-              auto k = tQKrK_0(i);
-              auto alpha_last = alpha_last_0(t);
-              auto k_scaled = Element(exp2f(alpha_last - alpha) * float(k));
-              tQKrK_0(i) = k_scaled;
-              if constexpr (is_final_block) {
-                if (s >= B) {
-                  tQKrK_0(i) = Element(0.0f);
-                }
-              }
-            });
-
-            // R2S K
-            auto sQ_K_scaled_0 = sQ_K_scaled_slice(_, _, _0{}, make_coord(_0{}, _1{}));
-            auto tQKsK_0_out = thr_store_qk_quar.partition_D(sQ_K_scaled_0);
-            auto tQKrK_0_out_cv = thr_store_qk_quar.retile_S(tQKrK_0);
-            copy(tiled_store_qk_quar, tQKrK_0_out_cv, tQKsK_0_out);
-            
-            // Slice 1
-            auto sKqk_1 = sKqk_slice(_, _, _0{}, make_coord(_1{}, _1{}));
-            auto tQKsK_1 = thr_load_qk_quar.partition_S(sKqk_1);
-            // reuse register
-            auto tQKrK_1_cv = thr_load_qk_quar.retile_D(tQKrK_0);
-            copy(tiled_load_qk_quar, tQKsK_1, tQKrK_1_cv);
-            
-            // S2R Alpha
-            auto sAqkq_1 = sAqkq_slice(_, _, _0{}, make_coord(_0{}, _3{}));
-            auto tAsA_1 = qk_thr_mma_rs_quar.partition_A(sAqkq_1);
-            // reuse register
-            copy(CopyAlphaAtom{}, tAsA_1, tArA_0);
-
-            // element-wise for K, Alpha and AlphaLast
-            auto alpha_last_1 = sAlast_slice(_, _3{});
-            for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i){
-              auto coord = tQcMq_quar(i);
-              auto [s, t] = coord;
-              auto alpha = tArA_0(i);
-              auto k = tQKrK_0(i);
-              auto alpha_last = alpha_last_1(t);
-              auto k_scaled = Element(exp2f(alpha_last - alpha) * float(k));
-              tQKrK_0(i) = k_scaled;
-              if constexpr (is_final_block) {
-                if (s >= B) {
-                  tQKrK_0(i) = Element(0.0f);
-                }
-              }
-            });
-
-            // R2S K
-            auto sQ_K_scaled_1 = sQ_K_scaled_slice(_, _, _0{}, make_coord(_1{}, _1{}));
-            auto tQKsK_1_out = thr_store_qk_quar.partition_D(sQ_K_scaled_1);
-            auto tQKrK_1_out_cv = thr_store_qk_quar.retile_S(tQKrK_0);
-            copy(tiled_store_qk_quar, tQKrK_1_out_cv, tQKsK_1_out);
-        }
-
-        // wait for smemq_k_scaled ready
-        cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::StateMath);
-        // fence to produce data for WGMMA async proxy
-        cutlass::arch::fence_view_async_shared();
+            // R2S K -> stage 0 (reuse for KV update)
+            auto sQ_scaled_cur = sQ_scaled_slice(_, _, _0{}, make_coord(s, wg_idx));
+            auto tQKsK_out = thr_store_qk_quar.partition_D(sQ_scaled_cur);
+            auto tQKrK_out_cv = thr_store_qk_quar.retile_S(tQKrK_wg);
+            copy(tiled_store_qk_quar, tQKrK_out_cv, tQKsK_out);
+          }
       }
+      // wait for smemq_k_scaled ready
+      cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::StateMath);
+      // fence to produce data for WGMMA async proxy
+      cutlass::arch::fence_view_async_shared();
 
-      if (SafeGate) {
-        if constexpr (NeedsAlpha) {
-          alpha_last_pipeline.consumer_release(alpha_last_smem_pipe_read);
-          ++alpha_last_smem_pipe_read;
-        }
+      if constexpr (NeedsAlpha) {
+        alpha_last_pipeline.consumer_release(alpha_last_smem_pipe_read);
+        ++alpha_last_smem_pipe_read;
       }
 
       DPRINTF0_WG("[%d,%d,%d,%d]** dispatch KV WGMMA\n", seq_idx, q_head_idx, k_head_idx, v_head_idx);
@@ -1694,7 +1317,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     float scale = params.scale;
 
     Tensor Beta  = make_tensor(make_smem_ptr(storage.smem_beta.data()), SmemLayoutBeta{});
-    // Tensor Alpha = make_tensor(make_smem_ptr(storage.smem_alpha.data()), SmemLayoutAlpha{});
 
     Tensor sQqk = make_tensor(make_smem_ptr(storage.smem_q.data()), QKSmemLayoutQ{});
     Tensor sKqk = make_tensor(make_smem_ptr(storage.smem_k.data()), QKSmemLayoutK{});
@@ -1732,7 +1354,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
     auto qk_kk_subchunk_mma_and_store = [&](int blk) INLINE_LAMBDA {
       using CopyOp_R2S    = SM90_U32x2_STSM_N;
-      using CopyAlphaAtom  = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAlphaBeta>;
+      using CopyAlphaAtom  = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAlpha>;
       // Q/K S2R: use BF16 MMA's LDSM tiled copy for efficient shared memory loads,
       // then convert register layout to TF32 MMA layout via warp shuffles.
       // This replaces the previous AutoVectorizingCopy<16> which caused 50% more smem traffic.
@@ -1744,10 +1366,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
       using MMA_BF16 = SM80_16x8x8_F32BF16BF16F32_TN;
       using TiledMma_BF16_SubChunk = decltype(make_tiled_mma(MMA_BF16{}, Layout<Shape<_1, _2, _1>>{}, TileShape_SubChunk{}));
 
-      int local_thread_idx = thread_idx;
-      if (thread_idx >= 64) {
-        local_thread_idx = thread_idx - 64;
-      }
+      int local_thread_idx = thread_idx % 64;
       auto tiledmma_subchunk = TiledMma_SubChunk{};
       auto thr_mma_subchunk = tiledmma_subchunk.get_thread_slice(local_thread_idx);
       auto tiledmma_bf16_subchunk = TiledMma_BF16_SubChunk{};
@@ -1833,7 +1452,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         // S2R g_r_j in BF16 MMA operand A layout (single load)
         Tensor sAqkq_r_j = sAqkq_slice(_, _, r_, make_coord(_0{}, j));
         Tensor tAsA_r_j = alpha_Q_bf16_thr_copy.partition_S(sAqkq_r_j);
-        Tensor tArA_r_j = make_fragment_like<ElementAlphaBeta>(tv_layout_bf16_mma_A);
+        Tensor tArA_r_j = make_fragment_like<ElementAlpha>(tv_layout_bf16_mma_A);
         Tensor tArA_r_j_cv = alpha_Q_bf16_thr_copy.retile_D(tArA_r_j);
         copy(alpha_Q_bf16_tiled_copy, tAsA_r_j, tArA_r_j_cv);
 
@@ -1842,7 +1461,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         // g_first is broadcast (all M rows identical), so operand B only needs the
         // v1=0 subset of operand A. We shuffle v1=0 values from t1=0 thread and
         // output directly as operand B fragment, saving 8 float registers.
-        Tensor tArAfirst_r_j_kt = make_fragment_like<ElementAlphaBeta>(tv_layout_bf16_mma_B);
+        Tensor tArAfirst_r_j_kt = make_fragment_like<ElementAlpha>(tv_layout_bf16_mma_B);
         broadcast_row0_operandA_to_operandB_bf16_layout(tArA_r_j, tArAfirst_r_j_kt, local_thread_idx);
 
         // gqn_r_j = exp2(g_r_j - g_r_j_first[None, :]) in BF16 MMA A layout.
@@ -1905,7 +1524,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         // S2R g_c_j in BF16 MMA operand B layout
         Tensor sAqkq_c_j = sAqkq_slice(_, _, c_, make_coord(_0{}, j));
         Tensor tAsA_c_j = alpha_Kt_bf16_thr_copy.partition_S(sAqkq_c_j);
-        Tensor tArA_c_j = make_fragment_like<ElementAlphaBeta>(tv_layout_bf16_mma_B);
+        Tensor tArA_c_j = make_fragment_like<ElementAlpha>(tv_layout_bf16_mma_B);
         Tensor tArA_c_j_cv = alpha_Kt_bf16_thr_copy.retile_D(tArA_c_j);
         copy(alpha_Kt_bf16_tiled_copy, tAsA_c_j, tArA_c_j_cv);
 
@@ -2036,13 +1655,10 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
       if (thread_idx < 64) {
         // Q/K0@K0, Q/K3@K3, Q/K3@K0, Q/K3@K1, Q/K3@K2
 
-        // TODO: Q/K0@K0, Q/K3@K3 in cuda core
         // NOTE: tensor core MMA for safe gate with lower_bound >= -5
         gemm_tensor_core_1x16x16x128(Int<0>{}, Int<0>{}, /*is_diagonal_=*/cute::true_type{}, /*is_first_subchunk_=*/cute::true_type{});
 
         // Q/K3@K0, Q/K3@K1, Q/K3@K2
-        // FIXME: higher register pressure with three acc? maybe split into two compute parts
-        // FIXME: precision issue in bf16 MMA, maybe half?
         // allocate acc_3_0, acc_3_1, acc_3_2 [16, 16]
         Tensor tQKrQK_3_0 = partition_fragment_C(tiledmma_subchunk, select<0,1>(TileShape_SubChunk{}));
         Tensor tKKrKK_3_0 = partition_fragment_C(tiledmma_subchunk, select<0,1>(TileShape_SubChunk{}));
@@ -2112,7 +1728,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         });
 
         // R2S qk_3_0, kk_3_0, wait for current QK/KK free
-        // TODO: fused R2S with 16x48 matrix
         r2s_subchunk_acc(_3{}, _0{}, tQKrQK_3_0, tKKrKK_3_0);
 
         // R2S qk_3_1, kk_3_1
@@ -2283,8 +1898,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         // R2S qk_2_2, kk_2_2
         r2s_subchunk_acc(_2{}, _2{}, tQKrQK_2_2, tKKrKK_2_2);
 
-        // TODO: Q/K2@K2, Q/K1@K1 in cuda core for numerical safety
-
         // mask QK/KK (1,2) (1,3), (2,3)
         // zero_fill(1, 2);
         // zero_fill(1, 3);
@@ -2396,10 +2009,12 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
       //   }
       // }
 
-      // QK is ready to consume
+      // QK/KK is ready to consume
       cutlass::arch::fence_view_async_shared();
       qk_pipeline.producer_commit(qk_smem_pipe_write);
       ++qk_smem_pipe_write;
+      kk_pipeline.producer_commit(kk_smem_pipe_write);
+      ++kk_smem_pipe_write;
 
       k_pipeline.consumer_release(k_smem_pipe_read);
       ++k_smem_pipe_read;
@@ -2409,10 +2024,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         alpha_pipeline.consumer_release(alpha_smem_pipe_read);
         ++alpha_smem_pipe_read;
       }
-
-      cutlass::arch::fence_view_async_shared();
-      kk_pipeline.producer_commit(kk_smem_pipe_write);
-      ++kk_smem_pipe_write;
 
       if constexpr (NeedsBeta) {
         beta_pipeline.consumer_release(beta_smem_pipe_read);

@@ -20,7 +20,6 @@ round_down(T1 a, T2 b) {
   return (a / b) * b;
 }
 
-template<bool SafeGate>
 constexpr std::tuple<uint32_t, uint32_t, uint32_t>
 get_register_requirements(
     uint32_t max_threads_per_block,
@@ -34,8 +33,8 @@ get_register_requirements(
 #else
   uint32_t load_registers = 40;
 #endif
-  // TODO: better tuning if updated compute logic
-  uint32_t total_aux_load_budget = !SafeGate ? 160 : 160;
+  // TODO: better tuning
+  uint32_t total_aux_load_budget = 176;
   uint32_t aux_registers = total_aux_load_budget - load_registers;  // (24 + X) or (40 + X)
 
   uint32_t total_registers = round_down(64 * 1024 / min_blocks_per_multiprocessor, max_threads_per_block * reg_alloc_granularity) / cutlass::NumThreadsPerWarpGroup;
@@ -71,9 +70,6 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
   using MainloopQKPipeline = typename CollectiveMainloop::MainloopQKPipeline;
   using MainloopKKPipeline = typename CollectiveMainloop::MainloopKKPipeline;
 
-  using MainloopQAuxPipeline = typename CollectiveMainloop::MainloopQAuxPipeline;
-  using MainloopKAuxPipeline = typename CollectiveMainloop::MainloopKAuxPipeline;
-  using MainloopAlphaAuxPipeline = typename CollectiveMainloop::MainloopAlphaAuxPipeline;
   using MainloopAlphaLastPipeline = typename CollectiveMainloop::MainloopAlphaLastPipeline;
 
   using MainloopAlphaPipeline = typename CollectiveMainloop::MainloopAlphaPipeline;
@@ -108,14 +104,8 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
     alignas(16) QKPipelineStorage qk_pipeline_storage;
     alignas(16) KKPipelineStorage kk_pipeline_storage;
 
-    using QAuxPipelineStorage = typename MainloopQAuxPipeline::SharedStorage;
-    using KAuxPipelineStorage = typename MainloopKAuxPipeline::SharedStorage;
-    using AlphaAuxPipelineStorage = typename MainloopAlphaAuxPipeline::SharedStorage;
     using AlphaLastPipelineStorage = typename MainloopAlphaLastPipeline::SharedStorage;
 
-    alignas(16) QAuxPipelineStorage q_aux_pipeline_storage;
-    alignas(16) KAuxPipelineStorage k_aux_pipeline_storage;
-    alignas(16) AlphaAuxPipelineStorage alpha_aux_pipeline_storage;
     alignas(16) AlphaLastPipelineStorage alpha_last_pipeline_storage;
 
     using AlphaPipelineStorage = typename MainloopAlphaPipeline::SharedStorage;
@@ -179,7 +169,7 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
   static constexpr int MinBlocksPerMultiprocessor = 1;
   static constexpr int MaxThreadsPerBlock         = (NumLoadWarpGroups + NumStateMmaWarpGroups + NumAuxMmaWarpGroups) * cutlass::NumThreadsPerWarpGroup;
 
-  static constexpr auto     RegisterRequirements        = get_register_requirements<SafeGate>(MaxThreadsPerBlock, MinBlocksPerMultiprocessor, NumStateMmaWarpGroups);
+  static constexpr auto     RegisterRequirements        = get_register_requirements(MaxThreadsPerBlock, MinBlocksPerMultiprocessor, NumStateMmaWarpGroups);
   static constexpr uint32_t LdStRegisterRequirement     = get<0>(RegisterRequirements);
   static constexpr uint32_t StateMmaRegisterRequirement = get<1>(RegisterRequirements);
   static constexpr uint32_t AuxMmaRegisterRequirement   = get<2>(RegisterRequirements);
@@ -279,7 +269,7 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
     if constexpr (NeedsAlpha) {
       alpha_pipeline_params.transaction_bytes = CollectiveMainloop::LoadAlphaBytes;
       alpha_pipeline_params.is_leader = lane_predicate && (ldst_warp_role == LdStWarpRole::LoadQKV);
-      alpha_pipeline_params.num_consumers = NumStateMathThreads + NumAuxMathThreads + (SafeGate ? cutlass::NumThreadsPerWarp : 0);
+      alpha_pipeline_params.num_consumers = NumStateMathThreads + NumAuxMathThreads + cutlass::NumThreadsPerWarp;
     }
 
     OPipelineParams o_pipeline_params;
@@ -296,7 +286,7 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
 
     AlphaLastPipelineParams alpha_last_pipeline_params;
     if constexpr (NeedsAlpha) {
-      alpha_last_pipeline_params.producer_arv_count = SafeGate ? cutlass::NumThreadsPerWarp : NumAuxMathThreads;
+      alpha_last_pipeline_params.producer_arv_count = cutlass::NumThreadsPerWarp;
       alpha_last_pipeline_params.consumer_arv_count = NumStateMathThreads;
     }
 
@@ -323,11 +313,9 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
       if constexpr (NeedsBeta) { beta_pipeline_params.role = MainloopBetaPipeline::ThreadCategory::Producer; }
     }
     if (warp_group_role == WarpGroupRole::LdSt && ldst_warp_role == LdStWarpRole::LoadAlpha) {
-      if constexpr (SafeGate) {
-        // LoadAlpha warp consumes alpha_pipeline (reads last row) and produces alpha_last_pipeline
-        if constexpr (NeedsAlpha) { alpha_pipeline_params.role = MainloopAlphaPipeline::ThreadCategory::Consumer; }
-        alpha_last_pipeline_params.role = MainloopAlphaLastPipeline::ThreadCategory::Producer;
-      }
+      // LoadAlpha warp consumes alpha_pipeline (reads last row) and produces alpha_last_pipeline
+      if constexpr (NeedsAlpha) { alpha_pipeline_params.role = MainloopAlphaPipeline::ThreadCategory::Consumer; }
+      alpha_last_pipeline_params.role = MainloopAlphaLastPipeline::ThreadCategory::Producer;
     }
     if (warp_group_role == WarpGroupRole::Math0 || warp_group_role == WarpGroupRole::Math1) {
       DPRINTF0_WG("warp_group_role: MathX\n");
@@ -357,9 +345,6 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
 
       if constexpr (NeedsAlpha) {
         alpha_pipeline_params.role = MainloopAlphaPipeline::ThreadCategory::Consumer;
-        if constexpr (!SafeGate) {
-          alpha_last_pipeline_params.role = MainloopAlphaLastPipeline::ThreadCategory::Producer;
-        }
       }
       if constexpr (NeedsBeta) { beta_pipeline_params.role = MainloopBetaPipeline::ThreadCategory::Consumer; }
     }
@@ -451,22 +436,20 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
           }
         }
       } else if (ldst_warp_role == LdStWarpRole::LoadAlpha) {
-          // produce the last row of Alpha
-          if constexpr (NeedsAlpha) {
-            if constexpr (SafeGate) {
-            auto work_desc = scheduler.get_next_work(params.scheduler, params.problem_size);
-            CUTE_NO_UNROLL
-            for (; work_desc.is_valid(params.scheduler); work_desc = scheduler.get_next_work(params.scheduler, params.problem_size)) {
-              DPRINTF0_WG("LsSt working on LoadAlpha+ExtractLast, seq_idx:%d, sab_head_idx:%d, seq_len:%lld)\n",
-                          work_desc.seq_idx, work_desc.o_head_idx(), work_desc.seq_len);
-              auto tile_shape = typename CollectiveMainloop::TileShape{};
-              collective_mainloop.extract_alpha_last(
-                  params.mainloop, params.problem_size, tile_shape, work_desc,
-                  alpha_pipeline, alpha_smem_pipe_read,
-                  alpha_last_pipeline, alpha_last_smem_pipe_write,
-                  storage.tensors.mainloop
-              );
-            }
+        // produce the last row of Alpha
+        if constexpr (NeedsAlpha) {
+          auto work_desc = scheduler.get_next_work(params.scheduler, params.problem_size);
+          CUTE_NO_UNROLL
+          for (; work_desc.is_valid(params.scheduler); work_desc = scheduler.get_next_work(params.scheduler, params.problem_size)) {
+            DPRINTF0_WG("LsSt working on LoadAlpha+ExtractLast, seq_idx:%d, sab_head_idx:%d, seq_len:%lld)\n",
+                        work_desc.seq_idx, work_desc.o_head_idx(), work_desc.seq_len);
+            auto tile_shape = typename CollectiveMainloop::TileShape{};
+            collective_mainloop.extract_alpha_last(
+                params.mainloop, params.problem_size, tile_shape, work_desc,
+                alpha_pipeline, alpha_smem_pipe_read,
+                alpha_last_pipeline, alpha_last_smem_pipe_write,
+                storage.tensors.mainloop
+            );
           }
         }
       } else if (ldst_warp_role == LdStWarpRole::StoreO) {
