@@ -108,15 +108,10 @@ void launch_kda_fwd_prefill_kernel_gbai(
                 .ptr_output_state = (float*)output_state,
                 .ptr_input_state  = (float*)input_state,
                 .scale = scale,
-                // .alpha_ptr = alpha, .alpha_stride = {tok_stride, _1{}, head_stride},
                 .beta_ptr  = beta,  .beta_stride  = {num_heads, 1},
         },  // clang-format on
         .hw_info = hw_info
     };
-
-    // replaced with torch allocated buffer, avoid cudaMalloc and cudaFree at runtime
-    // size_t                                      workspace_size = op.get_workspace_size(arguments);
-    // cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
 
     cutlass::Status status;
     status = op.can_implement(arguments);

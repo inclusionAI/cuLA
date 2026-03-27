@@ -188,7 +188,6 @@ def test_safe_gate_chunk_varlen(
     dtype: torch.dtype,
     safe_gate: bool,
 ):
-
     torch.manual_seed(42)
     cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
     cu_seqlens_cpu = cu_seqlens.cpu()

@@ -76,28 +76,12 @@ void launch_kda_fwd_prefill_kernel(
   if (init_state) {
     if (needs_beta && needs_alpha && safe_gate) {
       LAUNCH(true, true, true, true);
-    } else if (needs_beta && needs_alpha && !safe_gate) {
-      // LAUNCH(true, true, true, false);
-    } else if (needs_beta && !needs_alpha) {
-      // LAUNCH(true, false, true);
-    } else if (!needs_beta && needs_alpha) {
-      // LAUNCH(false, true, true);
-    } else if (!needs_beta && !needs_alpha) {
-      // LAUNCH(false, false, true);
     } else {
       throw std::runtime_error("unreachable");
     }
   } else {
     if (needs_beta && needs_alpha && safe_gate) {
       LAUNCH(true, true, false, true);
-    } else if (needs_beta && needs_alpha && !safe_gate) {
-      // LAUNCH(true, true, false, false);
-    } else if (needs_beta && !needs_alpha) {
-      // LAUNCH(true, false, false);
-    } else if (!needs_beta && needs_alpha) {
-      // LAUNCH(false, true, false);
-    } else if (!needs_beta && !needs_alpha) {
-      // LAUNCH(false, false, false);
     } else {
       throw std::runtime_error("unreachable");
     }

@@ -61,15 +61,12 @@ constexpr auto add_option(Option<kTag, Value> new_option, std::tuple<Options...>
 }
 
 enum class Tag {
-  kIsLinearAttn,
   kIsDeltaRule,
   kIsPersistent,
   kNumMmaWarpGroups,
   kStagesQ,
   kStagesK,
   kStagesV,
-  kNeedsScale,
-  kNeedsDecay,  // linear/lighting attn
   kNeedsAlpha,  // gated delta rule
   kNeedsBeta,   // delta rule
   kInitStateFromInput,  // if true, initialize state by reading global memory instead of zero initialization.

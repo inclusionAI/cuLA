@@ -7,7 +7,7 @@ from fla.modules.l2norm import l2norm_fwd
 from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
-from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard, tensor_cache
 
 import cula.cudac as cula_cuda
 
@@ -29,7 +29,7 @@ def _get_cache_buf(name: str, nbytes: int, device: torch.device) -> torch.Tensor
     return buf
 
 
-@functools.cache
+@tensor_cache
 def _prepare_uniform_cu_seqlens(batch_size: int, seqlen: int, device: torch.device) -> torch.Tensor:
     return torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, device=device, dtype=torch.int32)
 

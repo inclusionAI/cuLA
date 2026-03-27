@@ -27,11 +27,11 @@ namespace kda::sm90::collective {
 struct KdaNamedBarriers : FlatSharedNamedBarriers {
   static constexpr int StateMath  = FlatSharedNamedBarriers::NumBarriersUsed + 0;
   static constexpr int AuxMath = FlatSharedNamedBarriers::NumBarriersUsed + 1;
+  static constexpr int StateMathWG0 = FlatSharedNamedBarriers::NumBarriersUsed + 2;
   // NOTE: only for debug
   // used for subchunk MMA with two groups, each group has 2 warps
-  // static constexpr int AuxMathWarp0 = FlatSharedNamedBarriers::NumBarriersUsed + 2;
-  // static constexpr int AuxMathWarp1 = FlatSharedNamedBarriers::NumBarriersUsed + 3;
-  static constexpr int StateMathWarp0 = FlatSharedNamedBarriers::NumBarriersUsed + 2;
+  // static constexpr int AuxMathWarp0 = FlatSharedNamedBarriers::NumBarriersUsed + 3;
+  // static constexpr int AuxMathWarp1 = FlatSharedNamedBarriers::NumBarriersUsed + 4;
 };
 
 using ku::select_layout;
@@ -82,9 +82,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
   static constexpr int NeedsAlpha = find_option_t<Tag::kNeedsAlpha, cute::true_type, Options>::value;
   static constexpr int NeedsBeta  = find_option_t<Tag::kNeedsBeta, cute::true_type, Options>::value;
+  static_assert(NeedsAlpha && NeedsBeta, "Alpha and Beta are both used in KDA.");
 
-  static constexpr int NeedsDecay = find_option_t<Tag::kNeedsDecay, cute::false_type, Options>::value;
-  static_assert(!NeedsDecay, "Kda does not supports decay");
   static constexpr int SafeGate = true; // only support safe_gate=true
 
   static constexpr int NumLoadThreads     = NumLoadWarpGroups * 128;
@@ -157,13 +156,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     )
   );
   static_assert(size(TiledMmaQK_RS{}) == NumAuxMmaThreads);
-  using TiledMmaQK_RS_Half = decltype(
-    make_tiled_mma(
-      decltype(cute::GMMA::rs_op_selector<Element, Element, ElementAccumulatorQK, TileShapeQK_Half>()){},
-      AtomLayoutQK{}
-    )
-  );
-  static_assert(size(TiledMmaQK_RS_Half{}) == NumAuxMmaThreads);
   using TiledMmaQK_RS_Quar = decltype(
     make_tiled_mma(
       decltype(cute::GMMA::rs_op_selector<Element, Element, ElementAccumulatorQK, TileShapeQK_Quar>()){},
@@ -240,7 +232,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
   using TiledMmaO1 = decltype(convert_to_gmma_rs(typename CollectiveMmaO1::TiledMma{}));
   using TiledMmaO2 = decltype(convert_to_gmma_rs(typename CollectiveMmaO2::TiledMma{}));
 
-  static constexpr int TiledMmaQKNumThreads = size(TiledMmaQK{});
   static_assert(size(TiledMmaQK{}) == NumAuxMmaThreads);
 
   static_assert(size(TiledMmaKV{}) == NumStateMmaThreads);
@@ -311,7 +302,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
   using TiledMmaSK   = decltype(convert_to_gmma_rs(typename CollectiveMmaSK::TiledMma{}));    // ??   = -S@K^t + V^t
   using TiledMmaNewV = decltype(convert_to_gmma_rs(typename CollectiveMmaNewV::TiledMma{}));  // NewV = ??@T^t
 
-  static constexpr int TiledMmaKKNumThreads = size(TiledMmaKK{});
   static_assert(size(TiledMmaKK{}) == NumAuxMmaThreads);
 
   using GmemStrideBeta = Stride<int64_t, int32_t>;
@@ -884,11 +874,11 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
       // TODO: use tKKcMkk? no more allocating fragments
       auto tKKrKK         = kk_thr_mma.partition_fragment_C(sKK_inv_pipe_slice);
       auto tKKrKK_cv      = thr_store_kk.retile_S(tKKrKK);
-      auto collective_inverse = CollectiveInverse(KdaNamedBarriers::StateMathWarp0);
+      auto collective_inverse = CollectiveInverse(KdaNamedBarriers::StateMathWG0);
       collective_inverse.compute(sKK_inv_pipe_slice);
       // FIXME: we can ignore core matrices above diagonal
       if constexpr (NeedsBeta || !std::is_same_v<InverseType, Element>) {
-        cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, KdaNamedBarriers::StateMathWarp0);
+        cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, KdaNamedBarriers::StateMathWG0);
         using CopyOpS2R    = SM75_U32x4_LDSM_N;
         auto tiled_load_kk = make_tiled_copy_C(Copy_Atom<CopyOpS2R, InverseType>{}, kk_tiled_mma);
         auto thr_load_kk   = tiled_load_kk.get_thread_slice(thread_idx);
@@ -1236,19 +1226,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
       DPRINTF0_WG("[%d,%d,%d,%d]** dispatch KV WGMMA\n", seq_idx, q_head_idx, k_head_idx, v_head_idx);
       warpgroup_fence_operand(tOrV_or_tKVrV);
       warpgroup_fence_operand(tKVrKV);
-      // ======DEBUG=======
-      // if constexpr (is_final_block) {
-      //   if (thread_idx == 0) {
-      //     printf("\n");
-      //     printf("=======Before K^T@NewV, block_idx: %d, thread_idx: %d=======\n", blk, thread_idx);
-      //     printf("tOrV_or_tKVrV\n");
-      //     cute::print_tensor(tOrV_or_tKVrV);
-      //     printf("tKVrKV\n");
-      //     cute::print_tensor(tKVrKV);
-      //     printf("=======Before K^T@NewV, block_idx: %d, thread_idx: %d=======\n", blk, thread_idx);
-      //     printf("\n");
-      //   }
-      // }
+
       math_barriers.ordered_or_wait(warpgroup_idx);
       warpgroup_arrive();
       gemm(kv_tiled_mma, tOrV_or_tKVrV, tKVrK(_, _, _, 0), tKVrKV);
@@ -1404,21 +1382,12 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
       auto sAqkq_curr = sAqkq(_, _, alpha_smem_pipe_read.index());
       Tensor sBeta_curr = Beta(_, beta_smem_pipe_read.index());
 
-      // TODO: modify to local_tile?
       // (_16,(_32,_1),_4,(_2,_2)):(_64,(_1,_0),_1024,(_32,_4096))
       auto sQqk_slice = flat_divide(sQqk_curr, tiler_subchunk_qk);
       auto sKqk_slice = flat_divide(sKqk_curr, tiler_subchunk_qk);
       // (_16,(_32,_1),_4,(_1,_4)):(_32,(_1,_0),_512,(_0,_2048))
       auto sAqkq_slice = flat_divide(sAqkq_curr, tiler_subchunk_alpha);
       auto sBeta_slice = flat_divide(sBeta_curr, tiler_subchunk_beta);
-
-      // =====DEBUG=====
-      // if (blk <= 1 && thread_idx == 64) {
-      //   printf("sQqk_slice\n");
-      //   cute::print_tensor(sQqk_slice);
-      //   printf("sAqkq_slice\n");
-      //   cute::print_tensor(sAqkq_slice);
-      // }
 
       // Acc results
       constexpr auto tiler_acc_qk_kk = Shape<_16, _16>{};
@@ -1651,7 +1620,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         copy(O_tiled_copy_kk, tKKrKK_r_c_cvt_cv, tKKsKK_r_c);
       };
 
-      // g_i_j/q_i_j/k_i_j: 第i个subchunk的第j个head dim slice
+      // g_i_j/q_i_j/k_i_j: the j-th head dim slice of the i-th subchunk
       if (thread_idx < 64) {
         // Q/K0@K0, Q/K3@K3, Q/K3@K0, Q/K3@K1, Q/K3@K2
 
@@ -1729,38 +1698,12 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
         // R2S qk_3_0, kk_3_0, wait for current QK/KK free
         r2s_subchunk_acc(_3{}, _0{}, tQKrQK_3_0, tKKrKK_3_0);
-
         // R2S qk_3_1, kk_3_1
         r2s_subchunk_acc(_3{}, _1{}, tQKrQK_3_1, tKKrKK_3_1);
-
         // R2S qk_3_2, kk_3_2
         r2s_subchunk_acc(_3{}, _2{}, tQKrQK_3_2, tKKrKK_3_2);
-
         // R2S qk_3_3, kk_3_3
         r2s_subchunk_acc(_3{}, _3{}, tQKrQK_3_3, tKKrKK_3_3);
-
-        // no need to wait, only for debug
-        // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarp * 2, KdaNamedBarriers::AuxMathWarp0);
-        // if (blk <= 1 && thread_idx == 0) {
-        //   printf("After Q3/K3@K0 R2S, sKK_inv_3_0:\n");
-        //   cute::print_tensor(sKK_inv_3_0);
-        //   printf("After Q3/K3@K0 R2S, sKK_inv_3_1:\n");
-        //   cute::print_tensor(sKK_inv_3_1);
-        //   printf("After Q3/K3@K0 R2S, sKK_inv_3_2:\n");
-        //   cute::print_tensor(sKK_inv_3_2);
-        //   printf("After Q3/K3@K0 R2S, sQK_3_0:\n");
-        //   cute::print_tensor(sQK_3_0);
-        //   printf("After Q3/K3@K1 R2S, sQK_3_1:\n");
-        //   cute::print_tensor(sQK_3_1);
-        //   printf("After Q3/K3@K2 R2S, sQK_3_2:\n");
-        //   cute::print_tensor(sQK_3_2);
-        // }
-
-        // mask QK/KK (0,1) (0,2), (0,3)
-        // zero_fill(0, 1);
-        // zero_fill(0, 2);
-        // zero_fill(0, 3);
-
       } else {
         // Q/K1@K0, Q/K2@K0, Q/K2@K1, Q/K2@K2, Q/K1@K1
 
@@ -1817,20 +1760,10 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         // R2S qk_1_0, kk_1_0, wait for current QK/KK free
         kk_pipeline.producer_acquire(kk_smem_pipe_write);
         qk_pipeline.producer_acquire(qk_smem_pipe_write);
-        r2s_subchunk_acc(_1{}, _0{}, tQKrQK_1_0, tKKrKK_1_0);
 
+        r2s_subchunk_acc(_1{}, _0{}, tQKrQK_1_0, tKKrKK_1_0);
         // R2S qk_1_1, kk_1_1
         r2s_subchunk_acc(_1{}, _1{}, tQKrQK_1_1, tKKrKK_1_1);
-
-        // no need to wait, only for debug
-        // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarp * 2, KdaNamedBarriers::AuxMath2);
-        // if (blk <= 1 && thread_idx == 64) {
-        //   printf("After Q1/K1@K0 R2S, sQK_1_0:\n");
-        //   cute::print_tensor(sQK_1_0);
-        //   printf("After Q1/K1@K0 R2S, sKK_inv_1_0:\n");
-        //   cute::print_tensor(sKK_inv_1_0);
-        // }
-
 
         // Q/K2@K0, Q/K2@K1
         // allocate acc_2_0, acc_2_1 [16, 16]
@@ -1891,44 +1824,10 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
         // R2S qk_2_0, kk_2_0, wait for current QK/KK free
         r2s_subchunk_acc(_2{}, _0{}, tQKrQK_2_0, tKKrKK_2_0);
-
         // R2S qk_2_1, kk_2_1
         r2s_subchunk_acc(_2{}, _1{}, tQKrQK_2_1, tKKrKK_2_1);
-
         // R2S qk_2_2, kk_2_2
         r2s_subchunk_acc(_2{}, _2{}, tQKrQK_2_2, tKKrKK_2_2);
-
-        // mask QK/KK (1,2) (1,3), (2,3)
-        // zero_fill(1, 2);
-        // zero_fill(1, 3);
-        // zero_fill(2, 3);
-
-        // =====DEBUG======
-        // Tensor sQK_1_1 = sQK_slice(_, _, 1, 1);
-        // Tensor sKK_inv_1_1 = sKK_inv_slice(_, _, 1, 1);
-        // Tensor sQK_2_2 = sQK_slice(_, _, 2, 2);
-        // Tensor sKK_inv_2_2 = sKK_inv_slice(_, _, 2, 2);
-        // // no need to wait, only for debug
-        // cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarp * 2, KdaNamedBarriers::AuxMathWarp1);
-        // if (blk <= 1 && thread_idx == 96) {
-        //   printf("After Q2/K2@K0 R2S, sQK_2_0:\n");
-        //   cute::print_tensor(sQK_2_0);
-        //   printf("After Q2/K2@K0 R2S, sKK_inv_2_0:\n");
-        //   cute::print_tensor(sKK_inv_2_0);
-        //   printf("After Q2/K2@K1 R2S, sQK_2_1:\n");
-        //   cute::print_tensor(sQK_2_1);
-        //   printf("After Q2/K2@K1 R2S, sKK_inv_2_1:\n");
-        //   cute::print_tensor(sKK_inv_2_1);
-        //   printf("After Q1/K1@K1 R2S, sQK_1_1:\n");
-        //   cute::print_tensor(sQK_1_1);
-        //   printf("After Q1/K1@K1 R2S, sKK_inv_1_1:\n");
-        //   cute::print_tensor(sKK_inv_1_1);
-        //   printf("After Q2/K2@K2 R2S, sQK_2_2:\n");
-        //   cute::print_tensor(sQK_2_2);
-        //   printf("After Q2/K2@K2 R2S, sKK_inv_2_2:\n");
-        //   cute::print_tensor(sKK_inv_2_2);
-        // }
-
       }
     };
 
