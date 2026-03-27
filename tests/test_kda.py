@@ -5,7 +5,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from fla.ops.kda.gate import naive_kda_gate
+from fla.ops.kda.gate import naive_kda_gate, naive_kda_lowerbound_gate
 from fla.ops.kda.naive import naive_recurrent_kda
 from fla.utils import assert_close, device
 
@@ -54,14 +54,6 @@ def test_safe_gate_chunk(
     safe_gate: bool,
     dtype: torch.dtype,
 ):
-    try:
-        from fla.ops.kda.gate import naive_kda_lowerbound_gate
-    except Exception:
-        raise ImportError(
-            "Please install flash-linear-attention after this commit "
-            "https://github.com/fla-org/flash-linear-attention/tree/d1097c609b23b5f478f490da0fbd00060b0e9dc3"
-        )
-
     torch.manual_seed(42)
     q = torch.rand(B, T, H, D, dtype=dtype)
     k = torch.rand(B, T, H, D, dtype=dtype)
@@ -196,14 +188,6 @@ def test_safe_gate_chunk_varlen(
     dtype: torch.dtype,
     safe_gate: bool,
 ):
-    try:
-        pass
-    except Exception:
-        raise ImportError(
-            "Please install flash-linear-attention after this commit "
-            "https://github.com/fla-org/flash-linear-attention/tree/d1097c609b23b5f478f490da0fbd00060b0e9dc3"
-        )
-
     torch.manual_seed(42)
     cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
     cu_seqlens_cpu = cu_seqlens.cpu()

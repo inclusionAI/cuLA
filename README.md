@@ -21,10 +21,20 @@ This recurrence reduces the complexity from $O(N^2)$ (standard attention) to $O(
 ```bash
 git clone <repo-url>
 git submodule update --init --recursive
+```
 
-# Install PyTorch (CUDA 13.0)
-pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu130
+cuLA supports both **Hopper (SM90)** and **Blackwell (SM100)** GPUs. Install PyTorch for your target hardware, then follow the common steps below.
 
+**Install PyTorch:**
+
+| GPU | CUDA Toolkit | PyTorch |
+|-----|-------------|---------|
+| Blackwell (SM100) | 13.0 | `pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu130` |
+| Hopper (SM90) | 12.9 | `pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu129` |
+
+**Install cuLA & dependencies:**
+
+```bash
 # Install flash-linear-attention for benchmark repro
 cd third_party/flash-linear-attention
 pip install -e .
@@ -34,13 +44,16 @@ cd ../..
 pip install -e . --no-build-isolation
 ```
 
-> **Requirements:** Python 3.12+, CUDA Toolkit 13.0, NVCC 12.9+ (SM100a support), PyTorch 2.9.1+
+> **Requirements:**
+> - **Blackwell (SM100):** Python 3.12+, CUDA Toolkit 13.0, NVCC 12.9+ (SM100a support), PyTorch 2.9.1+
 >
+> - **Hopper (SM90):** Python 3.12+, CUDA Toolkit 12.9, NVCC 12.9+, PyTorch 2.9.1+
+
 > **Note:** The PyTorch CUDA version must match your system CUDA Toolkit version. Check with `nvcc --version` and `python -c "import torch; print(torch.version.cuda)"`.
 
 ## Quick Start
 
-### KDA (Kimi Delta Attention)
+### KDA (Kimi Delta Attention) — Blackwell (SM100)
 
 cuLA is a drop-in replacement for [FLA](https://github.com/fla-org/flash-linear-attention) — just change the import:
 
@@ -63,7 +76,6 @@ init_state = torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
 # Forward
 o, final_state = chunk_kda(
     q=q, k=k, v=v, g=g, beta=beta,
-    scale=1.0,
     A_log=A_log,
     dt_bias=dt_bias,
     initial_state=init_state,
@@ -86,24 +98,37 @@ print(f'Final state shape: {final_state.shape}')  # [2, 4, 128, 128]
 - `safe_gate=True` is required (leverages M=16 TensorCore acceleration).
 - `beta` and `initial_state` must be `float32`.
 - `cu_seqlens` (for variable-length sequences) must be `int32`.
-- Matrix inversion uses FP16 precision.
 
 ## Benchmarks
 
+### Blackwell (SM100)
+
 See [BENCHMARK.md](BENCHMARK.md) for detailed results.
 
-All benchmarks run on a single **NVIDIA GB200** GPU with **CUDA Toolkit 13.0**, **PyTorch 2.9.1**, **Triton 3.5.1**.
+Benchmarks run on a single **NVIDIA GB200** GPU with **CUDA Toolkit 13.0**, **PyTorch 2.9.1**, **Triton 3.5.1**.
+
+### Hopper (SM90)
+
+See [BENCHMARK_hopper.md](BENCHMARK_hopper.md) for detailed results.
+
+Benchmarks run on a single **NVIDIA H200** GPU with **CUDA Toolkit 12.9**, **PyTorch 2.9.1**, **Triton 3.5.1**.
+
 FLA baseline: [flash-linear-attention v0.4.2](https://github.com/fla-org/flash-linear-attention/releases/tag/v0.4.2).
 
 **Highlights:**
-- **KDA:** up to **1.4x** speedup over FLA Triton on fixed-length and variable-length sequences.
-- **Lightning Attention Prefill:** up to **2.4x** speedup (B=2).
-- **Lightning Attention Varlen:** **avg 1.6x** speedup across 60+ configs (uniform/skewed/random).
+- **KDA (Blackwell):** **avg 1.21x** speedup on fixed-length, **avg 1.25x** on variable-length (18 configs, uniform/skewed/random).
+- **Lightning Attention Prefill (Blackwell):** up to **1.95x** speedup (B=2).
+- **Lightning Attention Varlen (Blackwell):** **avg 1.69x** speedup across 60+ configs (uniform/skewed/random).
+- **KDA Fused Forward (Hopper):** **avg 1.52x** speedup across fixed-length and variable-length sequences.
 
 To regenerate benchmarks:
 
 ```bash
+# Blackwell (SM100)
 python benchmarks/generate_benchmark_md.py
+
+# Hopper (SM90)
+python benchmarks/generate_benchmark_hopper_md.py
 ```
 
 ## Tests

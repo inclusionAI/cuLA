@@ -1,8 +1,8 @@
 import functools
 import random
 
+import numpy as np
 import torch
-import torch.nn.functional as F
 from einops import rearrange
 from fla.modules.l2norm import l2norm_fwd
 from fla.ops.kda.gate import kda_gate_chunk_cumsum
@@ -57,14 +57,14 @@ def gen_qkv(seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype=to
 
 def generate_random_seq_lens(num_seqs: int, total_len: int, min_seq_len: int, variance: float = 1.0, seed: int = 42) -> list:
     """
-    生成随机的序列长度列表，满足：
-    - 序列数量为 num_seqs
-    - 总长度为 total_len
-    - 每个序列长度 >= min_seq_len
-    - variance: 方差控制参数
-        - 0.0: 完全均衡，所有序列长度尽可能相等
-        - 1.0: 正常随机分配
-        - >1.0: 更不均衡，序列长度差异更大
+    Generate a list of random sequence lengths satisfying:
+    - Number of sequences: num_seqs
+    - Total length: total_len
+    - Each sequence length >= min_seq_len
+    - variance: controls the distribution of lengths
+        - 0.0: perfectly balanced, all lengths as equal as possible
+        - 1.0: normal random allocation
+        - >1.0: more imbalanced, larger differences between lengths
     """
     assert total_len >= num_seqs * min_seq_len, (
         f"total_len ({total_len}) must be >= num_seqs ({num_seqs}) * min_seq_len ({min_seq_len})"
@@ -72,33 +72,33 @@ def generate_random_seq_lens(num_seqs: int, total_len: int, min_seq_len: int, va
 
     random.seed(seed)
 
-    # 计算均衡情况下每个序列的长度
+    # Compute balanced sequence length
     base_len = total_len // num_seqs
     remainder = total_len % num_seqs
 
     if variance == 0.0:
-        # 完全均衡分配
+        # Perfectly balanced allocation
         seq_lens = [base_len] * num_seqs
-        # 将余数分配给前几个序列
+        # Distribute remainder to the first few sequences
         for i in range(remainder):
             seq_lens[i] += 1
     else:
-        # 先给每个序列分配最小长度
+        # Assign minimum length to each sequence first
         seq_lens = [min_seq_len] * num_seqs
         remaining = total_len - num_seqs * min_seq_len
 
         if remaining > 0:
             if variance >= 1.0:
-                # 高方差：使用 Dirichlet 分布生成权重
-                # alpha 越小，分布越不均匀
+                # High variance: use Dirichlet distribution to generate weights
+                # Smaller alpha leads to more uneven distribution
                 alpha = 1.0 / variance
                 weights = [random.gammavariate(alpha, 1.0) for _ in range(num_seqs)]
                 total_weight = sum(weights)
                 weights = [w / total_weight for w in weights]
 
-                # 按权重分配剩余长度
+                # Distribute remaining length by weights
                 extra_lens = [int(remaining * w) for w in weights]
-                # 处理舍入误差
+                # Handle rounding error
                 diff = remaining - sum(extra_lens)
                 for i in range(abs(diff)):
                     idx = random.randint(0, num_seqs - 1)
@@ -107,32 +107,32 @@ def generate_random_seq_lens(num_seqs: int, total_len: int, min_seq_len: int, va
                 for i in range(num_seqs):
                     seq_lens[i] += extra_lens[i]
             else:
-                # 低方差 (0 < variance < 1)：在均衡和随机之间插值
-                # 先计算均衡分配
+                # Low variance (0 < variance < 1): interpolate between balanced and random
+                # Compute balanced allocation
                 balanced = [base_len] * num_seqs
                 for i in range(remainder):
                     balanced[i] += 1
 
-                # 计算随机分配
+                # Compute random allocation
                 random_lens = [min_seq_len] * num_seqs
                 for _ in range(remaining):
                     idx = random.randint(0, num_seqs - 1)
                     random_lens[idx] += 1
 
-                # 按 variance 插值
+                # Interpolate by variance
                 seq_lens = [int(balanced[i] * (1 - variance) + random_lens[i] * variance) for i in range(num_seqs)]
-                # 修正总长度
+                # Fix total length
                 diff = total_len - sum(seq_lens)
                 for i in range(abs(diff)):
                     idx = i % num_seqs
                     seq_lens[idx] += 1 if diff > 0 else -1
 
-    # 确保所有序列长度 >= min_seq_len
+    # Ensure all sequence lengths >= min_seq_len
     for i in range(num_seqs):
         if seq_lens[i] < min_seq_len:
             deficit = min_seq_len - seq_lens[i]
             seq_lens[i] = min_seq_len
-            # 从其他序列借用
+            # Borrow from other sequences
             for j in range(num_seqs):
                 if j != i and seq_lens[j] > min_seq_len:
                     take = min(deficit, seq_lens[j] - min_seq_len)
@@ -148,11 +148,75 @@ def generate_random_seq_lens(num_seqs: int, total_len: int, min_seq_len: int, va
 
 
 # ==============================================================================
+# Varlen sequence length generators
+# ==============================================================================
+
+
+def gen_uniform(N, T):
+    """All sequences have equal length."""
+    per = T // N
+    lens = [per] * N
+    lens[0] += T - per * N  # absorb remainder
+    return lens
+
+
+def gen_skewed(N, T):
+    """One long sequence + many short ones."""
+    if N == 1:
+        return [T]
+    short = max(1, T // (2 * (N - 1)))
+    long_len = T - short * (N - 1)
+    return [long_len] + [short] * (N - 1)
+
+
+def gen_random(N, T, seed=42):
+    """Random sequence lengths summing to T."""
+    rng = np.random.RandomState(seed)
+    raw = rng.dirichlet(np.ones(N))
+    lens = np.maximum(1, np.round(raw * T).astype(int))
+    diff = T - lens.sum()
+    lens[0] += diff
+    lens = np.maximum(1, lens)
+    return lens.tolist()
+
+
+def build_varlen_configs(
+    num_seqs_list=(1, 5, 10, 20),
+    total_lens=(4096, 8192, 16384),
+    dists=("uniform", "random", "skewed"),
+    random_seed=42,
+):
+    """Build a list of (seq_lens, total_len, dist_name) configs for varlen benchmarks.
+
+    Returns:
+        list of (seq_lens: list[int], total_len: int, dist: str)
+    """
+    configs = []
+    for T in total_lens:
+        for N in num_seqs_list:
+            if T // N < 1:
+                continue
+            for d in dists:
+                if d == "uniform":
+                    seq_lens = gen_uniform(N, T)
+                elif d == "skewed":
+                    seq_lens = gen_skewed(N, T)
+                elif d == "random":
+                    seq_lens = gen_random(N, T, seed=random_seed)
+                else:
+                    raise ValueError(f"Unknown dist: {d}")
+                configs.append((seq_lens, T, d))
+    return configs
+
+
+# ==============================================================================
 # Common input preparation functions for benchmarks and demos
 # ==============================================================================
 
 
-def prepare_safe_gate_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED):
+def prepare_safe_gate_inputs(
+    batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED, has_init_state=False
+):
     """Prepare inputs for safe_gate benchmarks (use_gate_in_kernel=True, safe_gate=True).
 
     All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
@@ -177,6 +241,11 @@ def prepare_safe_gate_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
 
+    init_state = None
+    if has_init_state:
+        num_seqs = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else batch_size
+        init_state = torch.randn(num_seqs, H, D, D, dtype=torch.float, device=device).requires_grad_(False)
+
     return dict(
         q=q,
         k=k,
@@ -188,79 +257,8 @@ def prepare_safe_gate_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        init_state=None,
+        init_state=init_state,
         lower_bound=-5.0,
-    )
-
-
-def prepare_no_gate_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED):
-    """Prepare inputs for use_gate_in_kernel=False benchmarks.
-
-    All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
-    """
-    dtype = torch.bfloat16
-    scale = D ** (-0.5)
-
-    set_seed(seed)
-
-    q = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    k = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    v = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    g = F.logsigmoid(torch.randn(batch_size, T, H, D, dtype=torch.float, device=device)).requires_grad_(False)
-    beta = torch.randn(batch_size, T, H, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
-
-    # flatten to batch_size=1 for cu_seqlens compatibility
-    if batch_size != 1:
-        q, k, v, g, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g, beta))
-
-    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
-
-    return dict(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
-
-
-def prepare_kernel_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED):
-    """Prepare inputs for kernel-level benchmarks (l2norm pre-applied).
-
-    All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
-    """
-    dtype = torch.bfloat16
-    scale = D ** (-0.5)
-
-    set_seed(seed)
-
-    q = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    k = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    v = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    g = F.logsigmoid(torch.randn(batch_size, T, H, D, dtype=dtype, device=device)).requires_grad_(False)
-    beta = torch.randn(batch_size, T, H, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
-
-    q, _ = l2norm_fwd(q)
-    k, _ = l2norm_fwd(k)
-
-    # flatten to batch_size=1 for cu_seqlens compatibility
-    if batch_size != 1:
-        q, k, v, g, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g, beta))
-
-    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
-
-    return dict(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
     )
 
 

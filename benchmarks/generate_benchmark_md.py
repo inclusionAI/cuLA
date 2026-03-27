@@ -27,7 +27,6 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
 os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
 
 import contextlib  # noqa: E402
@@ -177,6 +176,13 @@ def format_benchmark_md(env, kda_fixed, kda_varlen, la_standard, la_varlen, la_d
         sp = f"**{r['speedup']:.2f}x**"
         w(f"| {r['B']} | {r['T']} | {r['ms_fla']:.3f} | {r['ms_cula']:.3f} | {sp} |")
 
+    kda_fixed_sp = [r["speedup"] for r in kda_fixed if _valid(r.get("speedup", float("nan")))]
+    if kda_fixed_sp:
+        w(
+            f"\nSummary ({len(kda_fixed_sp)} configs): "
+            f"**avg={np.mean(kda_fixed_sp):.2f}x**, min={np.min(kda_fixed_sp):.2f}x, max={np.max(kda_fixed_sp):.2f}x.\n"
+        )
+
     # Varlen
     w(f"\n### Variable-Length (H={KDA_H}, D={KDA_D}, bf16)\n")
     w("| Config | FLA Triton (ms) | cuLA (ms) | Speedup |")
@@ -185,6 +191,13 @@ def format_benchmark_md(env, kda_fixed, kda_varlen, la_standard, la_varlen, la_d
         tag = r.get("tag", "unknown")
         sp = f"**{r['speedup']:.2f}x**"
         w(f"| {tag} | {r['ms_fla']:.3f} | {r['ms_cula']:.3f} | {sp} |")
+
+    kda_varlen_sp = [r["speedup"] for r in kda_varlen if _valid(r.get("speedup", float("nan")))]
+    if kda_varlen_sp:
+        w(
+            f"\nSummary ({len(kda_varlen_sp)} configs): "
+            f"**avg={np.mean(kda_varlen_sp):.2f}x**, min={np.min(kda_varlen_sp):.2f}x, max={np.max(kda_varlen_sp):.2f}x.\n"
+        )
 
     w("\nTo reproduce:\n")
     w("```bash")

@@ -29,6 +29,7 @@ from fla.ops.kda import chunk_kda as fla_chunk_kda
 
 from benchmarks.utils import (
     SEED,
+    build_varlen_configs,
     exclusive_cumsum,
     prepare_safe_gate_inputs,
     set_seed,
@@ -77,22 +78,6 @@ def accuracy_stats(ref, out):
     rel_max = max_diff / denom if denom > 0 else 0.0
     mean_diff = diff.mean().item()
     return rmse, rel_max, mean_diff
-
-
-def gen_varlen_seqs(target_total, n_seqs, seed=0):
-    """Generate n_seqs random seq lengths summing to target_total.
-    Lengths vary ~2-3x (log-uniform-ish), each rounded up to multiple of 2."""
-    import random
-
-    rng = random.Random(seed)
-    raw = [rng.uniform(0.4, 1.0) for _ in range(n_seqs)]
-    s = sum(raw)
-    lens = [max(2, round(r / s * target_total / 2) * 2) for r in raw]
-    diff = target_total - sum(lens)
-    lens[-1] += diff
-    if lens[-1] < 2:
-        lens[-1] = 2
-    return lens
 
 
 def run_kda(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, lower_bound, fn):
@@ -197,7 +182,7 @@ def bench_varlen(configs):
     print("=" * 100)
     results = []
 
-    for seq_lens, total_len in configs:
+    for seq_lens, total_len, dist in configs:
         set_seed(SEED)
         device = torch.device("cuda")
         torch.cuda.empty_cache()
@@ -245,10 +230,11 @@ def bench_varlen(configs):
         n_seqs = len(seq_lens)
         min_l, max_l = min(seq_lens), max(seq_lens)
         avg_l = T // n_seqs
-        tag = f"{n_seqs}seqs T={T} [{min_l}..{max_l}] avg={avg_l}"
+        tag = f"{dist:>7s} {n_seqs:>2d}seqs T={T} [{min_l}..{max_l}] avg={avg_l}"
 
         r = {
             "tag": tag,
+            "dist": dist,
             "T_total": T,
             "n_seqs": n_seqs,
             "rmse": rmse,
@@ -360,27 +346,11 @@ def main():
         (2, 16384),
     ]
 
-    varlen_configs = [
-        # (seq_lens, total_len)
-        # Single sequence
-        ([4096], 4096),
-        ([8192], 8192),
-        ([16384], 16384),
-        # Normal varlen (~20-25 seqs, 2-3x variation)
-        (gen_varlen_seqs(4096, 20, seed=1), 4096),
-        (gen_varlen_seqs(8192, 20, seed=2), 8192),
-        (gen_varlen_seqs(8192, 25, seed=3), 8192),
-        (gen_varlen_seqs(16384, 20, seed=4), 16384),
-        (gen_varlen_seqs(16384, 25, seed=5), 16384),
-        # Extreme varlen: 1 long seq + many short seqs
-        ([4096 - 19 * 64] + [64] * 19, 4096),
-        ([8192 - 19 * 64] + [64] * 19, 8192),
-        ([16384 - 19 * 64] + [64] * 19, 16384),
-        # Extreme varlen: many tiny seqs + 1 huge seq
-        ([64] * 19 + [4096 - 19 * 64], 4096),
-        ([64] * 19 + [8192 - 19 * 64], 8192),
-        ([64] * 19 + [16384 - 19 * 64], 16384),
-    ]
+    varlen_configs = build_varlen_configs(
+        num_seqs_list=(10, 20),
+        total_lens=(4096, 8192, 16384),
+        dists=("uniform", "random", "skewed"),
+    )
 
     fixed_res, varlen_res = [], []
 
