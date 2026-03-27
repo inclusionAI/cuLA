@@ -40,6 +40,7 @@ NUM_STAGES = 2
 NUM_THREADS = 128  # 4 warps
 NUM_BLOCKS_PER_STATE = 8
 
+
 @cute.kernel
 def la_decode_kernel_small_batch_pretranspose(
     tiled_copy_load: cute.TiledCopy,
@@ -85,18 +86,10 @@ def la_decode_kernel_small_batch_pretranspose(
     # Allocate shared memory for output (size V) - use BFloat16 to match SGLang
     sOutput = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((V,)), 16)
 
-    r_k = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
-    r_q = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
-    r_v = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
-    r_h = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
+    r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_q = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_v = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_h = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_decay_scale = -cutlass.Float32(decay_scales[i_h])
     r_decay = cute.exp(r_decay_scale)
 
@@ -107,9 +100,7 @@ def la_decode_kernel_small_batch_pretranspose(
     gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (batch_idx, None, 0))
 
     # V 方向分 tiles
-    gSrc = cute.local_tile(
-        gSrc_batch, (TILE_V, TILE_K), (None, 0)
-    )  # (TILE_V, TILE_K, num_v_tiles)
+    gSrc = cute.local_tile(gSrc_batch, (TILE_V, TILE_K), (None, 0))  # (TILE_V, TILE_K, num_v_tiles)
 
     # Partition for load
     thr_copy_load = tiled_copy_load.get_slice(tidx)
@@ -183,9 +174,7 @@ def la_decode_kernel_small_batch_pretranspose(
                 sum_hq += r_h[i] * r_q[i]
 
             for offset in [16, 8, 4, 2, 1]:
-                sum_hq += cute.arch.shuffle_sync_bfly(
-                    sum_hq, offset=offset, mask=-1, mask_and_clamp=31
-                )
+                sum_hq += cute.arch.shuffle_sync_bfly(sum_hq, offset=offset, mask=-1, mask_and_clamp=31)
 
             o_idx = v_tiles * TILE_V + row + row_offset
             if lane_id == 0 and o_idx < V:
@@ -198,6 +187,7 @@ def la_decode_kernel_small_batch_pretranspose(
     cute.arch.barrier()  # Ensure all writes to sOutput are complete
     if tidx >= start_v_tiles * TILE_V and tidx < end_v_tiles * TILE_V:
         o[(i_n, i_hv, tidx)] = sOutput[tidx]
+
 
 @cute.kernel
 def la_decode_kernel_big_batch_pretranspose(
@@ -241,18 +231,10 @@ def la_decode_kernel_big_batch_pretranspose(
     # Allocate shared memory for output (size V) - use BFloat16 to match SGLang
     sOutput = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((V,)), 16)
 
-    r_k = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
-    r_q = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
-    r_v = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
-    r_h = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
+    r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_q = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_v = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_h = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
 
     cute.arch.barrier()
 
@@ -261,9 +243,7 @@ def la_decode_kernel_big_batch_pretranspose(
     gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (batch_idx, None, 0))
 
     # V 方向分 tiles
-    gSrc = cute.local_tile(
-        gSrc_batch, (TILE_V, TILE_K), (None, 0)
-    )  # (TILE_V, TILE_K, num_v_tiles)
+    gSrc = cute.local_tile(gSrc_batch, (TILE_V, TILE_K), (None, 0))  # (TILE_V, TILE_K, num_v_tiles)
 
     # Partition for load
     thr_copy_load = tiled_copy_load.get_slice(tidx)
@@ -340,9 +320,7 @@ def la_decode_kernel_big_batch_pretranspose(
                 sum_hq += r_h[i] * r_q[i]
 
             for offset in [16, 8, 4, 2, 1]:
-                sum_hq += cute.arch.shuffle_sync_bfly(
-                    sum_hq, offset=offset, mask=-1, mask_and_clamp=31
-                )
+                sum_hq += cute.arch.shuffle_sync_bfly(sum_hq, offset=offset, mask=-1, mask_and_clamp=31)
 
             o_idx = v_tiles * TILE_V + row + row_offset
             if lane_id == 0 and o_idx < V:
@@ -356,6 +334,7 @@ def la_decode_kernel_big_batch_pretranspose(
 
     if tidx < V:
         o[(i_n, i_hv, tidx)] = sOutput[tidx]
+
 
 @cute.jit
 def run_la_decode_kernel_big_batch_pretranspose(
@@ -399,9 +378,7 @@ def run_la_decode_kernel_big_batch_pretranspose(
 
     num_v_tiles = cute.ceil_div(v_dim, TILE_V)
 
-    vec_size = (
-        TILE_K // 32
-    )  # Each thread in a warp processes this many elements (always 4 for TILE_K=128)
+    vec_size = TILE_K // 32  # Each thread in a warp processes this many elements (always 4 for TILE_K=128)
 
     # print(f"Batched CP.ASYNC Load + Store (bypass L1 cache)")
     # print(f"  {batch_size} batches x {v_dim}x{k_dim} matrices")
@@ -410,9 +387,7 @@ def run_la_decode_kernel_big_batch_pretranspose(
     # print(f"  Total: {total_data_mb:.1f} MB\n")
 
     # Create SMEM layout
-    smem_layout_staged = cute.make_layout(
-        (TILE_V, TILE_K, NUM_STAGES), stride=(TILE_K, 1, TILE_V * TILE_K)
-    )
+    smem_layout_staged = cute.make_layout((TILE_V, TILE_K, NUM_STAGES), stride=(TILE_K, 1, TILE_V * TILE_K))
 
     # sData: TILE_V * TILE_K * NUM_STAGES * 4 bytes (Float32)
     # sOutput: V * 2 bytes (BFloat16)
@@ -486,14 +461,10 @@ def run_la_decode_kernel_small_batch_pretranspose(
 
     num_v_tiles = cute.ceil_div(v_dim, TILE_V)
 
-    vec_size = (
-        TILE_K // 32
-    )  # Each thread in a warp processes this many elements (always 4 for TILE_K=128)
+    vec_size = TILE_K // 32  # Each thread in a warp processes this many elements (always 4 for TILE_K=128)
 
     # Create SMEM layout
-    smem_layout_staged = cute.make_layout(
-        (TILE_V, TILE_K, NUM_STAGES), stride=(TILE_K, 1, TILE_V * TILE_K)
-    )
+    smem_layout_staged = cute.make_layout((TILE_V, TILE_K, NUM_STAGES), stride=(TILE_K, 1, TILE_V * TILE_K))
 
     # sData: TILE_V * TILE_K * NUM_STAGES * 4 bytes (Float32)
     # sOutput: TILE_V * 2 bytes (BFloat16)
@@ -576,15 +547,15 @@ def linear_attention_decode(
     """
     B = q.shape[0]
     H = q.shape[1]
-    
+
     k_dim_block = HEAD_DIM // K_SPLIT_DIM
     if k_dim_block > 1:
         raise NotImplementedError(f"CuTe kernel doesn't support K splitting (k_dim_block={k_dim_block})")
-    
+
     # Get compiled kernel (cached)
     cache_key = (B, 1, H, HEAD_DIM, HEAD_DIM, softmax_scale)
     cache = _get_compiled_kernel(*cache_key)
-    
+
     h0_source = s
     # First-time compilation
     if "compiled" not in cache:
@@ -594,16 +565,16 @@ def linear_attention_decode(
             run_func = run_la_decode_kernel_small_batch_pretranspose
         else:
             run_func = run_la_decode_kernel_big_batch_pretranspose
-        
+
         # Create views for compilation
         q_view = q
         k_view = k
         v_view = v
         o_view = out
-        
+
         # Use s_offsets directly (pass to kernel but not actually used in current implementation)
         h0_indices = s_offsets
-        
+
         # Convert to CuTe format for compilation
         h0_tensor = from_dlpack(h0_source, assumed_align=16)
         decay_tensor = from_dlpack(decay_scales, assumed_align=16)
@@ -612,22 +583,33 @@ def linear_attention_decode(
         v_tensor = from_dlpack(v_view, assumed_align=16)
         o_tensor = from_dlpack(o_view, assumed_align=16)
         h0_idx_tensor = from_dlpack(h0_indices, assumed_align=16)
-        
+
         compiled = cute.compile(
             run_func,
-            h0_tensor, decay_tensor, q_tensor, k_tensor, v_tensor,
-            o_tensor, h0_idx_tensor,
-            softmax_scale=softmax_scale, H=H, B=B, T=1, K=HEAD_DIM, V=HEAD_DIM,
+            h0_tensor,
+            decay_tensor,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            h0_idx_tensor,
+            softmax_scale=softmax_scale,
+            H=H,
+            B=B,
+            T=1,
+            K=HEAD_DIM,
+            V=HEAD_DIM,
             stream=stream,
             options="--enable-tvm-ffi",
         )
         cache["compiled"] = compiled
-    
+
     compiled = cache["compiled"]
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    
+
     compiled(h0_source, decay_scales, q, k, v, out, s_offsets, stream)
-    
+
+
 def seg_la_d_kernel_cute(
     q: torch.Tensor,  # [B, 1, heads, HEAD_DIM]
     k: torch.Tensor,  # [B, 1, heads, HEAD_DIM]
@@ -651,8 +633,20 @@ def seg_la_d_kernel_cute(
     """
     # Call the main implementation
     linear_attention_decode(
-        q, k, v, s, out, softmax_scale,
-        stride_q, stride_k, stride_v, stride_s, stride_o,
-        s_offsets, decay_scales,
-        HEAD_DIM, K_SPLIT_DIM, V_SPLIT_DIM
+        q,
+        k,
+        v,
+        s,
+        out,
+        softmax_scale,
+        stride_q,
+        stride_k,
+        stride_v,
+        stride_s,
+        stride_o,
+        s_offsets,
+        decay_scales,
+        HEAD_DIM,
+        K_SPLIT_DIM,
+        V_SPLIT_DIM,
     )

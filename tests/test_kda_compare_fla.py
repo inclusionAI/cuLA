@@ -27,9 +27,7 @@ from cula.kda.chunk import chunk_kda as cula_chunk_kda
     [
         pytest.param(
             *test,
-            id="B{}-T{}-H{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-{}".format(
-                *test
-            ),
+            id="B{}-T{}-H{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-{}".format(*test),
         )
         for test in [
             (1, 63, 1, 128, 1, 0, False, False, True, torch.bfloat16),
@@ -76,27 +74,15 @@ def test_safe_gate_chunk(
     beta = torch.randn(B, T, H, dtype=torch.float32).sigmoid()
     h0 = torch.randn(B, H, D, D, dtype=torch.float32)
     if use_gate_in_kernel:
-        A_log, dt_bias = map(
-            lambda x: x.to(device).requires_grad_(True), (A_log, dt_bias)
-        )
-    q, k, v, g, beta, h0 = map(
-        lambda x: x.to(device).requires_grad_(True), (q, k, v, g, beta, h0)
-    )
+        A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(True), (A_log, dt_bias))
+    q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(True), (q, k, v, g, beta, h0))
 
     do = torch.randn_like(v)
     dht = torch.randn_like(h0)
 
     ref, ref_ht = fla_chunk_kda(
-        q=(
-            F.normalize(q.clone(), p=2, dim=-1)
-            if not use_qk_l2norm_in_kernel
-            else q.clone()
-        ),
-        k=(
-            F.normalize(k.clone(), p=2, dim=-1)
-            if not use_qk_l2norm_in_kernel
-            else k.clone()
-        ),
+        q=(F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone()),
+        k=(F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone()),
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),
@@ -117,16 +103,8 @@ def test_safe_gate_chunk(
     q.grad = k.grad = v.grad = g.grad = beta.grad = h0.grad = None
 
     tri, tri_ht = cula_chunk_kda(
-        q=(
-            F.normalize(q.clone(), p=2, dim=-1)
-            if not use_qk_l2norm_in_kernel
-            else q.clone()
-        ),
-        k=(
-            F.normalize(k.clone(), p=2, dim=-1)
-            if not use_qk_l2norm_in_kernel
-            else k.clone()
-        ),
+        q=(F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone()),
+        k=(F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone()),
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),
@@ -162,9 +140,7 @@ def test_safe_gate_chunk(
 @pytest.mark.parametrize(
     ("H", "D", "mask_p", "cu_seqlens", "dtype", "safe_gate"),
     [
-        pytest.param(
-            *test, id="H{}-D{}-mask_p{}-cu_seqlens{}-{}-safe_gate{}".format(*test)
-        )
+        pytest.param(*test, id="H{}-D{}-mask_p{}-cu_seqlens{}-{}-safe_gate{}".format(*test))
         for test in [
             (4, 128, 0.1, [0, 15], torch.bfloat16, True),
             (4, 128, 0.9, [0, 256, 500, 1000], torch.bfloat16, True),
@@ -307,9 +283,7 @@ def test_safe_gate_chunk_varlen(
     beta = torch.randn(1, T, H, dtype=torch.float32).sigmoid()
     h0 = torch.randn((N, H, D, D), dtype=torch.float32)
 
-    q, k, v, g, beta, h0 = map(
-        lambda x: x.to(device).requires_grad_(), (q, k, v, g, beta, h0)
-    )
+    q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(), (q, k, v, g, beta, h0))
     do = torch.randn_like(v)
     dht = torch.rand_like(h0)
 

@@ -19,6 +19,7 @@ def _get_device_sm_count(device: torch.device) -> int:
 
 _cache_buf = {}
 
+
 def _get_cache_buf(name: str, nbytes: int, device: torch.device) -> torch.Tensor:
     key = (name, device)
     buf = _cache_buf.get(key)
@@ -67,7 +68,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
 
         # set batch size to 1 after handling cu_seqlens
         if batch_size != 1:
-            q, k, v, g, beta = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, g, beta))
+            q, k, v, g, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g, beta))
 
         # gate preprocessing
         if use_gate_in_kernel:
@@ -113,12 +114,14 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         # call the C++ kernel
         # Signature: kda_fwd_prefill(output_, output_state_, q, k, v, input_state_, alpha_, beta_, cu_seqlens, workspace, scale, safe_gate)
         o, final_state = cula_cuda.kda_fwd_prefill(
-            None,            # output_ (auto-allocate)
-            None,            # output_state_ (auto-allocate)
-            q, k, v,
-            initial_state,   # input_state_
-            g,               # alpha_
-            beta,            # beta_
+            None,  # output_ (auto-allocate)
+            None,  # output_state_ (auto-allocate)
+            q,
+            k,
+            v,
+            initial_state,  # input_state_
+            g,  # alpha_
+            beta,  # beta_
             cu_seqlens,
             workspace_buffer,
             scale,
@@ -126,7 +129,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         )
 
         # reshape back
-        o = rearrange(o, '(b t) h d -> b t h d', b=batch_size)
+        o = rearrange(o, "(b t) h d -> b t h d", b=batch_size)
 
         return o.to(q.dtype), final_state
 

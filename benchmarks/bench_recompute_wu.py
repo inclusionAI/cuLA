@@ -78,9 +78,7 @@ def make_inputs(B, T, H, seed=42):
     beta = torch.sigmoid(torch.randn(B, T, H, device=device, dtype=dtype))
     gk_raw = -torch.abs(torch.randn(B, T, H, K, device=device, dtype=torch.float32)) * 0.1
     gk = gk_raw.cumsum(dim=1)
-    A = torch.tril(
-        torch.randn(B, NT, H, BT, BT, device=device, dtype=dtype) * 0.1
-    ).reshape(B, T, H, BT)
+    A = torch.tril(torch.randn(B, NT, H, BT, BT, device=device, dtype=dtype) * 0.1).reshape(B, T, H, BT)
     return k, v, beta, A, gk
 
 
@@ -119,18 +117,26 @@ def bench(configs):
 
         ms_fla = time_kernel(run_fla)
         ms_cute = time_kernel(run_cute)
-        speedup = ms_fla / ms_cute if ms_cute > 0 else float('inf')
+        speedup = ms_fla / ms_cute if ms_cute > 0 else float("inf")
 
         r = {
-            'B': B, 'T': T, 'H': H,
-            'w_max': w_max, 'u_max': u_max, 'kg_max': kg_max,
-            'ms_fla': ms_fla, 'ms_cute': ms_cute, 'speedup': speedup,
+            "B": B,
+            "T": T,
+            "H": H,
+            "w_max": w_max,
+            "u_max": u_max,
+            "kg_max": kg_max,
+            "ms_fla": ms_fla,
+            "ms_cute": ms_cute,
+            "speedup": speedup,
         }
         results.append(r)
-        print(f"  B={B:2d} T={T:5d} H={H:2d} | "
-              f"w_diff={w_max:.4f} u_diff={u_max:.4f} kg_diff={kg_max:.6f} | "
-              f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms | "
-              f"speedup={speedup:.2f}x")
+        print(
+            f"  B={B:2d} T={T:5d} H={H:2d} | "
+            f"w_diff={w_max:.4f} u_diff={u_max:.4f} kg_diff={kg_max:.6f} | "
+            f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms | "
+            f"speedup={speedup:.2f}x"
+        )
 
     return results
 
@@ -155,8 +161,7 @@ def check_correctness():
         kg_max, _ = accuracy_stats(kg_ref, kg_cute)
         ok = w_max < 1.0 and u_max < 1.0 and kg_max < 1.0
         status = "PASS" if ok else "FAIL"
-        print(f"  B={B:2d} T={T:4d} H={H:2d} | "
-              f"w={w_max:.6f} u={u_max:.6f} kg={kg_max:.6f} | {status}")
+        print(f"  B={B:2d} T={T:4d} H={H:2d} | w={w_max:.6f} u={u_max:.6f} kg={kg_max:.6f} | {status}")
 
 
 # ============================================================

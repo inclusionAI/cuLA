@@ -15,15 +15,17 @@ from cula.ops.linear_attn import LinearAttentionChunkwise
 
 PRINT_DEBUG = False
 
+
 def print_chunkwise(t, name):
     if not PRINT_DEBUG:
         return
     print(f"--------{name}:")
     c = t.shape[1] // 64
     for i in range(c):
-        beg = i*64
+        beg = i * 64
         end = beg + 64
         print(t[:, beg:end])
+
 
 def print_chunkwise_bhncd(t, name):
     if not PRINT_DEBUG:
@@ -32,6 +34,7 @@ def print_chunkwise_bhncd(t, name):
     c = t.shape[2]
     for i in range(c):
         print(t[:, :, i])
+
 
 def get_mask(n, slope=1):
     mask = torch.triu(torch.zeros(n, n).float().fill_(float("-inf")), 1)
@@ -55,10 +58,11 @@ def get_full_mask(n, slopes):
 
     return mask
 
+
 def linear_attn(q, k, v, s=None):
-    q = q.transpose(1,2)
-    k = k.transpose(1,2)
-    v = v.transpose(1,2)
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
 
     b, h, n, d = q.shape
     mask = get_full_mask(n, s).to(q.device).to(torch.float32)
@@ -66,8 +70,9 @@ def linear_attn(q, k, v, s=None):
     qk = (qk.to(torch.float32) * mask).to(q.dtype)
     o = torch.matmul(qk, v)
 
-    o = o.transpose(1,2)
+    o = o.transpose(1, 2)
     return o
+
 
 def naive_recurrent_linear_attn(
     q: torch.Tensor,
@@ -89,9 +94,10 @@ def naive_recurrent_linear_attn(
     if initial_state is not None:
         S = S + initial_state
     for t in range(T):
-        S = S + torch.einsum('b h k, b h v -> b h k v', k[:, t], v[:, t])
-        o[:, t] = torch.einsum('b h k v, b h k -> b h v', S, q[:, t] * scale)
+        S = S + torch.einsum("b h k, b h v -> b h k v", k[:, t], v[:, t])
+        o[:, t] = torch.einsum("b h k v, b h k -> b h v", S, q[:, t] * scale)
     return o.to(dtype), S if output_final_state else None
+
 
 def naive_chunk_linear_attn(
     q: torch.Tensor,
@@ -103,9 +109,9 @@ def naive_chunk_linear_attn(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if scale is None:
         scale = q.shape[-1] ** -0.5
-    q = rearrange(q, 'b (n c) h d -> b h n c d', c=chunk_size) * scale
-    k = rearrange(k, 'b (n c) h d -> b h n c d', c=chunk_size)
-    v = rearrange(v, 'b (n c) h d -> b h n c d', c=chunk_size)
+    q = rearrange(q, "b (n c) h d -> b h n c d", c=chunk_size) * scale
+    k = rearrange(k, "b (n c) h d -> b h n c d", c=chunk_size)
+    v = rearrange(v, "b (n c) h d -> b h n c d", c=chunk_size)
     # b h n d d
     kv = k.transpose(-1, -2) @ v
     print_chunkwise_bhncd(kv.transpose(-1, -2)[:, :, 0], "kv")
@@ -113,31 +119,29 @@ def naive_chunk_linear_attn(
     kv = torch.cat([torch.zeros_like(kv[:, :, :1]), kv[:, :, :-1]], dim=2)
     inter = q @ kv
     qk = q @ k.transpose(-1, -2)
-    intra = (qk.masked_fill_(
-        torch.triu(torch.ones(chunk_size, chunk_size, dtype=bool, device=q.device), diagonal=1),
-        0,
-    )) @ v
+    intra = (
+        qk.masked_fill_(
+            torch.triu(torch.ones(chunk_size, chunk_size, dtype=bool, device=q.device), diagonal=1),
+            0,
+        )
+    ) @ v
     print_chunkwise_bhncd(inter.transpose(-1, -2), "ointer_naive")
     o = inter + intra
     if normalize:
         o = normalize_output(q * scale, k, o)
-    return rearrange(o, 'b h n c d -> b (n c) h d')
+    return rearrange(o, "b h n c d -> b (n c) h d")
+
 
 def test_triton_linear_attn(
-  args,
-  Q,
-  K,
-  V,  
-  decay,
-  problem_size,
+    args,
+    Q,
+    K,
+    V,
+    decay,
+    problem_size,
 ) -> torch.Tensor:
     B, S, H, D = problem_size
-    (
-        chunk_size,
-        acc_dtype,
-        io_dtype,
-        iterations
-    ) = args
+    (chunk_size, acc_dtype, io_dtype, iterations) = args
 
     # warmup
     for _ in range(2):
@@ -151,24 +155,20 @@ def test_triton_linear_attn(
 
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
-    print(f"Triton Execution time: {elapsed*1000/iterations:.2f} ms (average over {iterations} iterations)")
+    print(f"Triton Execution time: {elapsed * 1000 / iterations:.2f} ms (average over {iterations} iterations)")
     return tri, elapsed
 
+
 def test_cutedsl_linear_attn(
-  args,
-  Q,
-  K,
-  V,  
-  decay,
-  problem_size,
+    args,
+    Q,
+    K,
+    V,
+    decay,
+    problem_size,
 ) -> torch.Tensor:
     B, S, H, D = problem_size
-    (
-        chunk_size,
-        acc_dtype,
-        io_dtype,
-        iterations
-    ) = args
+    (chunk_size, acc_dtype, io_dtype, iterations) = args
     attn_kernel = LinearAttentionChunkwise(
         chunk_size=chunk_size,
         qk_acc_dtype=acc_dtype,
@@ -181,7 +181,7 @@ def test_cutedsl_linear_attn(
     k_cute = from_dlpack(K)
     v_cute = from_dlpack(V)
     decay_cute = from_dlpack(decay)
-    
+
     O = torch.zeros_like(Q)
     o_cute = from_dlpack(O)
 
@@ -233,9 +233,10 @@ def test_cutedsl_linear_attn(
 
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
-    print(f"\nCuteDSL Execution time: {elapsed*1000/iterations:.2f} ms (average over {iterations} iterations)")
+    print(f"\nCuteDSL Execution time: {elapsed * 1000 / iterations:.2f} ms (average over {iterations} iterations)")
 
     return O, elapsed
+
 
 def test_fused_recurrent(
     B: int,
@@ -272,7 +273,7 @@ def test_fused_recurrent(
             iterations,
         )
 
-        tri, triton_elapsed = test_triton_linear_attn(args, q, k, v, decay, problem_size=(B,T,H,D))
+        tri, triton_elapsed = test_triton_linear_attn(args, q, k, v, decay, problem_size=(B, T, H, D))
         # tri, tri_ht = fused_recurrent_linear_attn(q, k, v, scale=scale, initial_state=h0, output_final_state=False, normalize=False)
         # ((tri * do).sum() + (tri_ht * dht).sum()).backward()
         # tri_dq, q.grad = q.grad.clone(), None
@@ -295,18 +296,15 @@ def test_fused_recurrent(
 
         if D == 128:
             cutedsl_o, cutedsl_elapsed = test_cutedsl_linear_attn(args, q, k, v, decay, problem_size=(B, T, H, D))
-            print_chunkwise(cutedsl_o, 'CUTEDSL_O')
-            assert_close('o', tri, cutedsl_o, 0.01)
+            print_chunkwise(cutedsl_o, "CUTEDSL_O")
+            assert_close("o", tri, cutedsl_o, 0.01)
 
-            print(f"Speedup triton_time / cutedsl_time: {float(triton_elapsed)/cutedsl_elapsed:.2f}x")
-
-        
+            print(f"Speedup triton_time / cutedsl_time: {float(triton_elapsed) / cutedsl_elapsed:.2f}x")
 
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     B, T, H, D = 64, 4096, 64, 128
     # B, T, H, D = 1, 192, 1, 128
     # B, T, H, D = 2, 4096, 16, 128
     # B, T, H, D = 2, 8*4096, 64, 128
-    test_fused_recurrent(B, T, H, D, scale=1., dtype=torch.bfloat16, iterations=4)
+    test_fused_recurrent(B, T, H, D, scale=1.0, dtype=torch.bfloat16, iterations=4)

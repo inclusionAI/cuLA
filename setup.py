@@ -24,6 +24,7 @@ def detect_gpu_archs() -> tuple[set[int], set[int]]:
     """
     try:
         import torch
+
         if not torch.cuda.is_available():
             return False, False
         has_sm100 = False
@@ -54,8 +55,7 @@ def resolve_disable_flag(env_name: str, detected: bool) -> bool:
     # Auto-detect: disable if no matching device found
     disable = not detected
     if disable:
-        print(f"  No matching GPU detected; auto-setting {env_name}=1 (disable). "
-              f"Set {env_name}=0 to override.")
+        print(f"  No matching GPU detected; auto-setting {env_name}=1 (disable). Set {env_name}=0 to override.")
     return disable
 
 
@@ -63,10 +63,12 @@ def get_features_args():
     features_args = []
     return features_args
 
+
 print("Detecting GPU architectures...")
 _has_sm100, _has_sm90 = detect_gpu_archs()
 DISABLE_SM100 = resolve_disable_flag("CULA_DISABLE_SM100", _has_sm100)
 DISABLE_SM90 = resolve_disable_flag("CULA_DISABLE_SM90", _has_sm90)
+
 
 def get_arch_flags():
     # Check NVCC Version
@@ -80,9 +82,9 @@ def get_arch_flags():
     print(f"Compiling using NVCC {major}.{minor}")
 
     if major < 12 or (major == 12 and minor <= 8):
-        assert (
-            DISABLE_SM100
-        ), "sm100 compilation requires NVCC 12.9 or higher. Please set CULA_DISABLE_SM100=1 to disable sm100 compilation, or update your environment."
+        assert DISABLE_SM100, (
+            "sm100 compilation requires NVCC 12.9 or higher. Please set CULA_DISABLE_SM100=1 to disable sm100 compilation, or update your environment."
+        )
 
     arch_flags = []
     if not DISABLE_SM100:
@@ -112,16 +114,20 @@ cuda_sources = [
     "csrc/api/pybind.cu",
 ]
 if not DISABLE_SM100:
-    cuda_sources.extend([
-        "csrc/api/kda_sm100.cu",
-        "csrc/kda/sm100/kda_fwd_sm100.cu",
-    ])
+    cuda_sources.extend(
+        [
+            "csrc/api/kda_sm100.cu",
+            "csrc/kda/sm100/kda_fwd_sm100.cu",
+        ]
+    )
 if not DISABLE_SM90:
-    cuda_sources.extend([
-        "csrc/api/kda_sm90.cu",
-        "csrc/kda/sm90/kda_fwd_sm90.cu",
-        "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu",
-    ])
+    cuda_sources.extend(
+        [
+            "csrc/api/kda_sm90.cu",
+            "csrc/kda/sm90/kda_fwd_sm90.cu",
+            "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu",
+        ]
+    )
 
 ext_modules = []
 ext_modules.append(

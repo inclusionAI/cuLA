@@ -118,9 +118,7 @@ class ChunkGlaFwdO:
             f"head_dim_k and head_dim_v must both be 128, got head_dim_k={head_dim_k}, head_dim_v={head_dim_v}"
         )
         cc = torch.cuda.get_device_capability()
-        assert cc[0] == 10 and cc[1] == 0, (
-            f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
-        )
+        assert cc[0] == 10 and cc[1] == 0, f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
         self.chunk_size = chunk_size
         self.head_dim_k = head_dim_k
         self.head_dim_v = head_dim_v
@@ -131,9 +129,9 @@ class ChunkGlaFwdO:
         self.is_varlen = is_varlen
         self.persistent = persistent
 
-        self.BT = chunk_size    # 64
-        self.BK = BK            # 128
-        self.BV = BV            # 128
+        self.BT = chunk_size  # 64
+        self.BK = BK  # 128
+        self.BV = BV  # 128
 
         self.threads_per_warp = 32
         self.cuda_warp_ids = (0, 1, 2, 3)
@@ -190,7 +188,8 @@ class ChunkGlaFwdO:
         self.av_mma_tiler = (self.BT, self.BV, self.BT)
 
         self.tmem_dealloc_sync_barrier = pipeline.NamedBarrier(
-            barrier_id=2, num_threads=self.threads_per_cta,
+            barrier_id=2,
+            num_threads=self.threads_per_cta,
         )
         self.buffer_align_bytes = 1024
 
@@ -201,6 +200,7 @@ class ChunkGlaFwdO:
             # Persistent kernel: grid = SM_count.  Each CTA loops over
             # multiple work units via grid-stride.
             import torch
+
             sm_count = torch.cuda.get_device_properties(0).multi_processor_count
             return (sm_count, 1, 1)
         elif self.is_varlen:
@@ -212,8 +212,10 @@ class ChunkGlaFwdO:
 
     @staticmethod
     def _plan_tmem_offsets(
-        qh_tiled_mma, tile_qh,
-        qg_tmem_layout, am_tmem_layout,
+        qh_tiled_mma,
+        tile_qh,
+        qg_tmem_layout,
+        am_tmem_layout,
         acc_stages,
     ):
         """Plan TMEM offsets for dual-ACC, QG A-operand, AM A-operand.
@@ -244,22 +246,24 @@ class ChunkGlaFwdO:
             total *= 2
         assert total <= SM100_TMEM_CAPACITY_COLS, f"TMEM overflow: {total} > {SM100_TMEM_CAPACITY_COLS}"
         if cutlass.const_expr(PRINT_DEBUG):
-            print(f"  TMEM: ACC_QH={num_acc}@{acc_qh_off}, ACC_AV={num_acc}@{acc_av_off}, QG={num_qg}@{qg_off}, AM@{am_off}, total={total}")
+            print(
+                f"  TMEM: ACC_QH={num_acc}@{acc_qh_off}, ACC_AV={num_acc}@{acc_av_off}, QG={num_qg}@{qg_off}, AM@{am_off}, total={total}"
+            )
         return acc_qh_off, acc_av_off, qg_off, am_off, total
 
     @cute.jit
     def __call__(
         self,
-        q_in: cute.Tensor,             # [B, T, H, K] (B=1 for varlen)
-        v_in: cute.Tensor,             # [B, T, H, V] (B=1 for varlen)
-        g_in: cute.Tensor,             # [B, T, H, K] fp32 (B=1 for varlen)
-        h_in: cute.Tensor,             # [B, NT, H, K, V] (B=1 for varlen)
-        o_in: cute.Tensor,             # [B, T, H, V] (B=1 for varlen)
-        A_in: cute.Tensor,             # [B, T, H, BT] (B=1 for varlen)
-        cu_seqlens_in: cute.Tensor,    # [N+1] int32
-        chunk_indices_in: cute.Tensor, # [NT, 2] int32
+        q_in: cute.Tensor,  # [B, T, H, K] (B=1 for varlen)
+        v_in: cute.Tensor,  # [B, T, H, V] (B=1 for varlen)
+        g_in: cute.Tensor,  # [B, T, H, K] fp32 (B=1 for varlen)
+        h_in: cute.Tensor,  # [B, NT, H, K, V] (B=1 for varlen)
+        o_in: cute.Tensor,  # [B, T, H, V] (B=1 for varlen)
+        A_in: cute.Tensor,  # [B, T, H, BT] (B=1 for varlen)
+        cu_seqlens_in: cute.Tensor,  # [N+1] int32
+        chunk_indices_in: cute.Tensor,  # [NT, 2] int32
         problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
-        total_nt: Int32,               # total chunks across all seqs (varlen)
+        total_nt: Int32,  # total chunks across all seqs (varlen)
         stream,
     ):
         # Extract pointers from tensor args (TVM-FFI compatible)
@@ -345,43 +349,52 @@ class ChunkGlaFwdO:
         # B is MN-major because h_T GMEM has V(=N) contiguous
         qh_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.K,    # A: K-major (TMEM requires K-major)
-            tcgen05.OperandMajorMode.MN,   # B: MN-major (V contiguous in GMEM)
+            tcgen05.OperandMajorMode.K,  # A: K-major (TMEM requires K-major)
+            tcgen05.OperandMajorMode.MN,  # B: MN-major (V contiguous in GMEM)
             self.acc_dtype,
             self.cta_group,
             self.qh_mma_tiler[:2],
-            tcgen05.OperandSource.TMEM,    # A from TMEM
+            tcgen05.OperandSource.TMEM,  # A from TMEM
         )
 
         # AV MMA: A=A_masked from TMEM, B=v from SMEM
         # B is MN-major because v_T GMEM has V(=N) contiguous
         av_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.K,    # A: K-major (TMEM requires K-major)
-            tcgen05.OperandMajorMode.MN,   # B: MN-major (V contiguous in GMEM)
+            tcgen05.OperandMajorMode.K,  # A: K-major (TMEM requires K-major)
+            tcgen05.OperandMajorMode.MN,  # B: MN-major (V contiguous in GMEM)
             self.acc_dtype,
             self.cta_group,
             self.av_mma_tiler[:2],
-            tcgen05.OperandSource.TMEM,    # A from TMEM
+            tcgen05.OperandSource.TMEM,  # A from TMEM
         )
 
         # ===================== TMEM layouts =====================
         # QG A-operand TMEM layout
         qg_tmem_layout = sm100_utils.make_smem_layout_a(
-            qh_tiled_mma, self.qh_mma_tiler, self.io_dtype, 1,
+            qh_tiled_mma,
+            self.qh_mma_tiler,
+            self.io_dtype,
+            1,
         )
         # AM A-operand TMEM layout
         am_tmem_layout = sm100_utils.make_smem_layout_a(
-            av_tiled_mma, self.av_mma_tiler, self.io_dtype, 1,
+            av_tiled_mma,
+            self.av_mma_tiler,
+            self.io_dtype,
+            1,
         )
 
         # ===================== TMEM offsets =====================
-        (self.tmem_acc_qh_off, self.tmem_acc_av_off, self.tmem_qg_off, self.tmem_am_off, self.tmem_total) = \
+        (self.tmem_acc_qh_off, self.tmem_acc_av_off, self.tmem_qg_off, self.tmem_am_off, self.tmem_total) = (
             self._plan_tmem_offsets(
-                qh_tiled_mma, self.qh_mma_tiler,
-                qg_tmem_layout, am_tmem_layout,
+                qh_tiled_mma,
+                self.qh_mma_tiler,
+                qg_tmem_layout,
+                am_tmem_layout,
                 self.acc_stage,
             )
+        )
 
         # ===================== SMEM layouts =====================
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
@@ -389,31 +402,45 @@ class ChunkGlaFwdO:
 
         # Epilog SMEM for q (ROW_MAJOR BT×BK, bf16)
         q_epi_staged = sm100_utils.make_smem_layout_epi(
-            self.io_dtype, utils.LayoutEnum.ROW_MAJOR,
-            (self.BT, self.BK), self.q_stage,
+            self.io_dtype,
+            utils.LayoutEnum.ROW_MAJOR,
+            (self.BT, self.BK),
+            self.q_stage,
         )
         # Epilog SMEM for g (ROW_MAJOR BT×BK, fp32)
         g_epi_staged = sm100_utils.make_smem_layout_epi(
-            self.g_dtype, utils.LayoutEnum.ROW_MAJOR,
-            (self.BT, self.BK), self.g_stage,
+            self.g_dtype,
+            utils.LayoutEnum.ROW_MAJOR,
+            (self.BT, self.BK),
+            self.g_stage,
         )
         # Epilog SMEM for A (ROW_MAJOR BT×BT)
         a_epi_staged = sm100_utils.make_smem_layout_epi(
-            self.io_dtype, utils.LayoutEnum.ROW_MAJOR,
-            (self.BT, self.BT), self.a_stage,
+            self.io_dtype,
+            utils.LayoutEnum.ROW_MAJOR,
+            (self.BT, self.BT),
+            self.a_stage,
         )
         # MMA B-operand SMEM for h (QH MMA B)
         h_smem_staged = sm100_utils.make_smem_layout_b(
-            qh_tiled_mma, self.qh_mma_tiler, self.io_dtype, self.h_stage,
+            qh_tiled_mma,
+            self.qh_mma_tiler,
+            self.io_dtype,
+            self.h_stage,
         )
         # MMA B-operand SMEM for v (AV MMA B)
         v_smem_staged = sm100_utils.make_smem_layout_b(
-            av_tiled_mma, self.av_mma_tiler, self.io_dtype, self.v_stage,
+            av_tiled_mma,
+            self.av_mma_tiler,
+            self.io_dtype,
+            self.v_stage,
         )
         # Output epilog for TMA store (ROW_MAJOR BT×BV)
         o_epi_staged = sm100_utils.make_smem_layout_epi(
-            self.io_dtype, utils.LayoutEnum.ROW_MAJOR,
-            (self.BT, self.BV), self.o_stage,
+            self.io_dtype,
+            utils.LayoutEnum.ROW_MAJOR,
+            (self.BT, self.BV),
+            self.o_stage,
         )
 
         # ===================== Cluster layout =====================
@@ -426,35 +453,55 @@ class ChunkGlaFwdO:
         # q, g, A: non-MMA epilog TMA (simple 2D tiles)
         q_epi_smem = cute.select(q_epi_staged, mode=[0, 1])
         tma_atom_q, tma_tensor_q = cpasync.make_tiled_tma_atom(
-            tma_load_op, q, q_epi_smem, (self.BT, self.BK),
+            tma_load_op,
+            q,
+            q_epi_smem,
+            (self.BT, self.BK),
         )
         g_epi_smem = cute.select(g_epi_staged, mode=[0, 1])
         tma_atom_g, tma_tensor_g = cpasync.make_tiled_tma_atom(
-            tma_load_op, g, g_epi_smem, (self.BT, self.BK),
+            tma_load_op,
+            g,
+            g_epi_smem,
+            (self.BT, self.BK),
         )
         a_epi_smem = cute.select(a_epi_staged, mode=[0, 1])
         tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
-            tma_load_op, A, a_epi_smem, (self.BT, self.BT),
+            tma_load_op,
+            A,
+            a_epi_smem,
+            (self.BT, self.BT),
         )
 
         # h: MMA B TMA (transposed view)
         h_smem_1 = cute.select(h_smem_staged, mode=[0, 1, 2])
         tma_atom_h, tma_tensor_h = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op, h_T, h_smem_1, self.qh_mma_tiler, qh_tiled_mma,
+            tma_load_op,
+            h_T,
+            h_smem_1,
+            self.qh_mma_tiler,
+            qh_tiled_mma,
             cluster_layout.shape,
         )
 
         # v: MMA B TMA (transposed view)
         v_smem_1 = cute.select(v_smem_staged, mode=[0, 1, 2])
         tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op, v_T, v_smem_1, self.av_mma_tiler, av_tiled_mma,
+            tma_load_op,
+            v_T,
+            v_smem_1,
+            self.av_mma_tiler,
+            av_tiled_mma,
             cluster_layout.shape,
         )
 
         # O: TMA store
         o_epi_smem = cute.select(o_epi_staged, mode=[0, 1])
         tma_atom_o, tma_tensor_o = cpasync.make_tiled_tma_atom(
-            tma_store_op, o, o_epi_smem, (self.BT, self.BV),
+            tma_store_op,
+            o,
+            o_epi_smem,
+            (self.BT, self.BV),
         )
 
         # ===================== TMA byte counts =====================
@@ -472,10 +519,10 @@ class ChunkGlaFwdO:
             load_h_mbar: cute.struct.MemRange[Int64, self.h_stage * 2]
             load_v_mbar: cute.struct.MemRange[Int64, self.v_stage * 2]
             load_a_mbar: cute.struct.MemRange[Int64, self.a_stage * 2]
-            qg_mbar: cute.struct.MemRange[Int64, self.acc_stage * 2]   # CUDA→MMA: qg ready
-            am_mbar: cute.struct.MemRange[Int64, self.acc_stage * 2]   # CUDA→MMA: am ready
+            qg_mbar: cute.struct.MemRange[Int64, self.acc_stage * 2]  # CUDA→MMA: qg ready
+            am_mbar: cute.struct.MemRange[Int64, self.acc_stage * 2]  # CUDA→MMA: am ready
             acc_done_mbar: cute.struct.MemRange[Int64, self.acc_stage * 2]  # MMA→CUDA: both ACC done
-            o_ready_mbar: cute.struct.MemRange[Int64, self.o_stage * 2]   # CUDA→Load: o ready
+            o_ready_mbar: cute.struct.MemRange[Int64, self.o_stage * 2]  # CUDA→Load: o ready
 
             sQ_epi: cute.struct.Align[
                 cute.struct.MemRange[self.io_dtype, cute.cosize(q_epi_staged)],
@@ -542,11 +589,14 @@ class ChunkGlaFwdO:
             o_thr_dim1 = self.BV // async_copy_elems  # 128/8 = 16
             assert self.BT % o_thr_dim0 == 0
             o_thr_layout = cute.make_ordered_layout(
-                (o_thr_dim0, o_thr_dim1), order=(1, 0),
+                (o_thr_dim0, o_thr_dim1),
+                order=(1, 0),
             )  # mode 1 (BV) faster → coalesced GMEM writes
             o_val_layout = cute.make_layout((1, async_copy_elems))  # (1, 8)
             gmem_tiled_copy_o = cute.make_tiled_copy_tv(
-                atom_universal_copy, o_thr_layout, o_val_layout,
+                atom_universal_copy,
+                o_thr_layout,
+                o_val_layout,
             )
         else:
             gmem_tiled_copy_o = None
@@ -558,18 +608,31 @@ class ChunkGlaFwdO:
 
         # ===================== Launch =====================
         self.kernel(
-            qh_tiled_mma, av_tiled_mma, am_coord_mma,
-            tma_atom_q, tma_tensor_q,
-            tma_atom_g, tma_tensor_g,
-            tma_atom_h, tma_tensor_h,
-            tma_atom_v, tma_tensor_v,
-            tma_atom_a, tma_tensor_a,
-            tma_atom_o, tma_tensor_o,
-            q_epi_staged, g_epi_staged, a_epi_staged,
-            h_smem_staged, v_smem_staged,
+            qh_tiled_mma,
+            av_tiled_mma,
+            am_coord_mma,
+            tma_atom_q,
+            tma_tensor_q,
+            tma_atom_g,
+            tma_tensor_g,
+            tma_atom_h,
+            tma_tensor_h,
+            tma_atom_v,
+            tma_tensor_v,
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_o,
+            tma_tensor_o,
+            q_epi_staged,
+            g_epi_staged,
+            a_epi_staged,
+            h_smem_staged,
+            v_smem_staged,
             o_epi_staged,
-            qg_tmem_layout, am_tmem_layout,
-            cu_seqlens, chunk_indices,
+            qg_tmem_layout,
+            am_tmem_layout,
+            cu_seqlens,
+            chunk_indices,
             o_tensor,
             gmem_tiled_copy_o,
             problem_size,
@@ -585,17 +648,29 @@ class ChunkGlaFwdO:
     @cute.kernel
     def kernel(
         self,
-        qh_tiled_mma, av_tiled_mma, am_coord_mma,
-        tma_atom_q, tma_tensor_q,
-        tma_atom_g, tma_tensor_g,
-        tma_atom_h, tma_tensor_h,
-        tma_atom_v, tma_tensor_v,
-        tma_atom_a, tma_tensor_a,
-        tma_atom_o, tma_tensor_o,
-        q_epi_staged, g_epi_staged, a_epi_staged,
-        h_smem_staged, v_smem_staged,
+        qh_tiled_mma,
+        av_tiled_mma,
+        am_coord_mma,
+        tma_atom_q,
+        tma_tensor_q,
+        tma_atom_g,
+        tma_tensor_g,
+        tma_atom_h,
+        tma_tensor_h,
+        tma_atom_v,
+        tma_tensor_v,
+        tma_atom_a,
+        tma_tensor_a,
+        tma_atom_o,
+        tma_tensor_o,
+        q_epi_staged,
+        g_epi_staged,
+        a_epi_staged,
+        h_smem_staged,
+        v_smem_staged,
         o_epi_staged,
-        qg_tmem_layout, am_tmem_layout,
+        qg_tmem_layout,
+        am_tmem_layout,
         cu_seqlens: cute.Tensor,
         chunk_indices: cute.Tensor,
         o_tensor: cute.Tensor,
@@ -820,39 +895,67 @@ class ChunkGlaFwdO:
 
                 # --- Unconditional TMA partitions ---
                 bSG_sQ, bSG_gQ = self._epilog_partition_varlen(
-                    tma_atom_q, tma_q_v[None, None, (i_h, data_bidx)], (self.BT, self.BK), sQ_epi,
+                    tma_atom_q,
+                    tma_q_v[None, None, (i_h, data_bidx)],
+                    (self.BT, self.BK),
+                    sQ_epi,
                 )
                 bSG_sG, bSG_gG = self._epilog_partition_varlen(
-                    tma_atom_g, tma_g_v[None, None, (i_h, data_bidx)], (self.BT, self.BK), sG_epi,
+                    tma_atom_g,
+                    tma_g_v[None, None, (i_h, data_bidx)],
+                    (self.BT, self.BK),
+                    sG_epi,
                 )
                 bSG_sA, bSG_gA = self._epilog_partition_varlen(
-                    tma_atom_a, tma_a_v[None, None, (i_h, data_bidx)], (self.BT, self.BT), sA_epi,
+                    tma_atom_a,
+                    tma_a_v[None, None, (i_h, data_bidx)],
+                    (self.BT, self.BT),
+                    sA_epi,
                 )
                 tHsH, tHgH = self._tma_partition_B(
-                    tma_atom_h, tma_tensor_h, sH, self.qh_mma_tiler, qh_tiled_mma, i_tg, i_h,
+                    tma_atom_h,
+                    tma_tensor_h,
+                    sH,
+                    self.qh_mma_tiler,
+                    qh_tiled_mma,
+                    i_tg,
+                    i_h,
                 )
                 tVsV, tVgV = self._tma_partition_B(
-                    tma_atom_v, tma_v_v, sV, self.av_mma_tiler, av_tiled_mma, data_bidx, i_h,
+                    tma_atom_v,
+                    tma_v_v,
+                    sV,
+                    self.av_mma_tiler,
+                    av_tiled_mma,
+                    data_bidx,
+                    i_h,
                 )
 
                 epi_tile_t = i_t
                 for i_k in cutlass.range(self.num_k_tiles, unroll_full=True):
                     q_h = load_q_P.acquire_and_advance()
-                    cute.copy(atom=tma_atom_q, src=bSG_gQ[(None, epi_tile_t, 0)],
-                              dst=bSG_sQ[None, q_h.index], tma_bar_ptr=q_h.barrier)
+                    cute.copy(
+                        atom=tma_atom_q,
+                        src=bSG_gQ[(None, epi_tile_t, 0)],
+                        dst=bSG_sQ[None, q_h.index],
+                        tma_bar_ptr=q_h.barrier,
+                    )
                     g_h = load_g_P.acquire_and_advance()
-                    cute.copy(atom=tma_atom_g, src=bSG_gG[(None, epi_tile_t, 0)],
-                              dst=bSG_sG[None, g_h.index], tma_bar_ptr=g_h.barrier)
+                    cute.copy(
+                        atom=tma_atom_g,
+                        src=bSG_gG[(None, epi_tile_t, 0)],
+                        dst=bSG_sG[None, g_h.index],
+                        tma_bar_ptr=g_h.barrier,
+                    )
                     h_h = load_h_P.acquire_and_advance()
-                    cute.copy(atom=tma_atom_h, src=tHgH[None, i_v, 0],
-                              dst=tHsH[None, h_h.index], tma_bar_ptr=h_h.barrier)
+                    cute.copy(atom=tma_atom_h, src=tHgH[None, i_v, 0], dst=tHsH[None, h_h.index], tma_bar_ptr=h_h.barrier)
 
                 v_h = load_v_P.acquire_and_advance()
-                cute.copy(atom=tma_atom_v, src=tVgV[None, i_v, i_t],
-                          dst=tVsV[None, v_h.index], tma_bar_ptr=v_h.barrier)
+                cute.copy(atom=tma_atom_v, src=tVgV[None, i_v, i_t], dst=tVsV[None, v_h.index], tma_bar_ptr=v_h.barrier)
                 a_h = load_a_P.acquire_and_advance()
-                cute.copy(atom=tma_atom_a, src=bSG_gA[(None, epi_tile_t, 0)],
-                          dst=bSG_sA[None, a_h.index], tma_bar_ptr=a_h.barrier)
+                cute.copy(
+                    atom=tma_atom_a, src=bSG_gA[(None, epi_tile_t, 0)], dst=bSG_sA[None, a_h.index], tma_bar_ptr=a_h.barrier
+                )
 
         # =====================================================================
         # STORE WARP
@@ -893,21 +996,22 @@ class ChunkGlaFwdO:
 
                     # Bulk prefetch: SMEM → registers (all 256 bf16 at once)
                     cute.autovec_copy(tOsO, tOrO)
-                    o_chunk_raw = (o_tensor.iterator
-                        + (tok_offset + i_t * BT) * H * V
-                        + i_h * V
-                        + i_v * self.BV)
+                    o_chunk_raw = o_tensor.iterator + (tok_offset + i_t * BT) * H * V + i_h * V + i_v * self.BV
                     o_chunk_ptr = cute.make_ptr(
-                        self.io_dtype, o_chunk_raw.toint(),
-                        cute.AddressSpace.gmem, assumed_align=16,
+                        self.io_dtype,
+                        o_chunk_raw.toint(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
                     )
                     o_stride_bt = cute.assume(
-                        H * V, divby=128 // self.io_dtype.width,
+                        H * V,
+                        divby=128 // self.io_dtype.width,
                     )
                     gO_chunk = cute.make_tensor(
                         o_chunk_ptr,
                         cute.make_layout(
-                            (self.BT, self.BV), stride=(o_stride_bt, 1),
+                            (self.BT, self.BV),
+                            stride=(o_stride_bt, 1),
                         ),
                     )
                     tOgO = gmem_thr_copy.partition_D(gO_chunk)
@@ -935,7 +1039,10 @@ class ChunkGlaFwdO:
 
                     gO = tma_tensor_o[None, None, (i_h, data_bidx)]
                     _, bSG_sO, bSG_gO = self._epilog_partition(
-                        tma_atom_o, gO, (self.BT, self.BV), sO,
+                        tma_atom_o,
+                        gO,
+                        (self.BT, self.BV),
+                        sO,
                     )
                     cute.copy(tma_atom_o, bSG_sO[None, 0], bSG_gO[(None, i_t, i_v)])
                     cute.arch.cp_async_bulk_commit_group()
@@ -945,7 +1052,10 @@ class ChunkGlaFwdO:
                 # ---- Non-persistent non-varlen: single TMA store ----
                 gO = tma_tensor_o[None, None, (i_h, data_bidx)]
                 _, bSG_sO, bSG_gO = self._epilog_partition(
-                    tma_atom_o, gO, (self.BT, self.BV), sO,
+                    tma_atom_o,
+                    gO,
+                    (self.BT, self.BV),
+                    sO,
                 )
                 for wu_iter in cutlass.range(0, num_iters, unroll=0):
                     o_h = o_ready_C.wait_and_advance()
@@ -1083,7 +1193,10 @@ class ChunkGlaFwdO:
 
             # R2S: ACC T2R regs → sO (ROW_MAJOR, BT×BV)
             r2s_atom_o = sm100_utils.get_smem_store_op(
-                utils.LayoutEnum.ROW_MAJOR, self.io_dtype, self.acc_dtype, tiled_t2r_acc,
+                utils.LayoutEnum.ROW_MAJOR,
+                self.io_dtype,
+                self.acc_dtype,
+                tiled_t2r_acc,
             )
             tiled_r2s_o = cute.make_tiled_copy_D(r2s_atom_o, tiled_t2r_acc)
             thr_r2s_o = tiled_r2s_o.get_slice(local_tidx)
@@ -1191,8 +1304,8 @@ class ChunkGlaFwdO:
                 o_h = o_ready_P.acquire_and_advance()
                 cute.copy(tiled_r2s_o, tRS_rO, tRS_sO[(None, None, None, 0)])
                 cute.arch.fence_proxy(
-                    'async.shared',
-                    space='cta',
+                    "async.shared",
+                    space="cta",
                 )
                 o_h.commit()
 
@@ -1204,7 +1317,7 @@ class ChunkGlaFwdO:
     @cute.jit
     def _tma_partition_B(self, tma_atom, tma_tensor, smem, tile_shape, tiled_mma, batch_idx, head_idx):
         """Partition B operand for TMA.
-        
+
         The GMEM layout mode 2 is (batch, H), so the coord is (batch_idx, head_idx).
         """
         if cutlass.const_expr(PRINT_DEBUG):
@@ -1214,9 +1327,7 @@ class ChunkGlaFwdO:
         tiler = cute.slice_(tile_shape, coord)
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"_tma_partition_B: tiler (sliced) = {tiler}")
-        gX = cute.local_tile(
-            tma_tensor, tiler, (None, None, (batch_idx, head_idx))
-        )
+        gX = cute.local_tile(tma_tensor, tiler, (None, None, (batch_idx, head_idx)))
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"_tma_partition_B: gX (local_tile result) = {gX}")
         thr_mma = tiled_mma.get_slice(0)
@@ -1224,8 +1335,11 @@ class ChunkGlaFwdO:
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"_tma_partition_B: tCgX (partition_B result) = {tCgX}")
         tXsX, tXgX = cpasync.tma_partition(
-            tma_atom, 0, cute.make_layout(1),
-            cute.group_modes(smem, 0, 3), cute.group_modes(tCgX, 0, 3),
+            tma_atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(smem, 0, 3),
+            cute.group_modes(tCgX, 0, 3),
         )
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"_tma_partition_B: tXsX = {tXsX}")
@@ -1249,14 +1363,18 @@ class ChunkGlaFwdO:
         # select mode2 = (head_idx, batch_idx)
         gC = cute.local_tile(
             tma_tensor_3d,
-            epi_tile,   # (BT, BK) or (BT, BT) — tiles first 2 modes
+            epi_tile,  # (BT, BK) or (BT, BT) — tiles first 2 modes
             (None, None, (head_idx, batch_idx)),  # keep T/K tiles, fix mode2
         )
         # gC: (BT, BK/BT, NT, NK) — mode2 consumed by coord selection
         sC_g = cute.group_modes(sC, 0, 2)
         gC_g = cute.group_modes(gC, 0, 2)
         bSG_sC, bSG_gC = cpasync.tma_partition(
-            atom, 0, cute.make_layout(1), sC_g, gC_g,
+            atom,
+            0,
+            cute.make_layout(1),
+            sC_g,
+            gC_g,
         )
         return bSG_sC, bSG_gC
 
@@ -1274,7 +1392,11 @@ class ChunkGlaFwdO:
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"_epilog_partition: gC_g (grouped) = {gC_g}")
         bSG_sC, bSG_gC = cpasync.tma_partition(
-            atom, 0, cute.make_layout(1), sC_g, gC_g,
+            atom,
+            0,
+            cute.make_layout(1),
+            sC_g,
+            gC_g,
         )
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"_epilog_partition: bSG_gC (tma_partition result) = {bSG_gC}")
@@ -1295,7 +1417,11 @@ class ChunkGlaFwdO:
         sC_g = cute.group_modes(sC, 0, 2)
         gC_g = cute.group_modes(gC_tiled, 0, 2)
         bSG_sC, bSG_gC = cpasync.tma_partition(
-            atom, 0, cute.make_layout(1), sC_g, gC_g,
+            atom,
+            0,
+            cute.make_layout(1),
+            sC_g,
+            gC_g,
         )
         return bSG_sC, bSG_gC
 
@@ -1303,6 +1429,7 @@ class ChunkGlaFwdO:
 # =====================================================================
 # Varlen preprocessing helpers
 # =====================================================================
+
 
 def prepare_chunked(tensor, cu_seqlens, chunk_offsets, BT=64):
     """
@@ -1322,6 +1449,7 @@ def prepare_chunked(tensor, cu_seqlens, chunk_offsets, BT=64):
         chunked: [total_nt, BT, H, F] — chunk-indexed tensor with zero-padding
     """
     import torch
+
     cu_seqlens_cpu = cu_seqlens.cpu().tolist() if isinstance(cu_seqlens, torch.Tensor) else list(cu_seqlens)
     chunk_offsets_cpu = chunk_offsets.cpu().tolist() if isinstance(chunk_offsets, torch.Tensor) else list(chunk_offsets)
 
@@ -1339,7 +1467,7 @@ def prepare_chunked(tensor, cu_seqlens, chunk_offsets, BT=64):
         for c in range(nt):
             src_start = tok_off + c * BT
             chunk_len = min(BT, seq_len - c * BT)
-            chunked[co + c, :chunk_len] = tensor[src_start:src_start + chunk_len]
+            chunked[co + c, :chunk_len] = tensor[src_start : src_start + chunk_len]
     return chunked
 
 
@@ -1348,7 +1476,7 @@ def prepare_v_chunked(v, cu_seqlens, chunk_offsets, BT=64):
     return prepare_chunked(v[0], cu_seqlens, chunk_offsets, BT)
 
 
-def build_chunk_indices(seq_lens, BT=64, device='cuda'):
+def build_chunk_indices(seq_lens, BT=64, device="cuda"):
     """
     Build chunk_indices tensor in the same format as FLA's prepare_chunk_indices.
 
@@ -1365,6 +1493,7 @@ def build_chunk_indices(seq_lens, BT=64, device='cuda'):
         chunk_indices: [NT, 2] int32 tensor
     """
     import torch
+
     pairs = []
     for seq_idx, sl in enumerate(seq_lens):
         nt = (sl + BT - 1) // BT
@@ -1384,6 +1513,7 @@ def build_chunk_offsets(seq_lens, BT=64):
 # =====================================================================
 # Reference implementation
 # =====================================================================
+
 
 def reference_chunk_gla_fwd_o(q, v, g, h, A, scale, chunk_size=64):
     """
@@ -1416,7 +1546,7 @@ def reference_chunk_gla_fwd_o(q, v, g, h, A, scale, chunk_size=64):
             for i_h in range(H):
                 q_chunk = q[b, t_start:t_end, i_h, :]
                 g_chunk = g[b, t_start:t_end, i_h, :].float()
-                qg = (q_chunk.float() * (2.0 ** g_chunk)).to(q.dtype)
+                qg = (q_chunk.float() * (2.0**g_chunk)).to(q.dtype)
 
                 h_state = h[b, i_t, i_h, :, :]
 
@@ -1463,8 +1593,8 @@ def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size):
         persistent=persistent,
     )
 
-    sym_a = cute.sym_int()   # B (non-varlen: dynamic B; varlen: fixed 1)
-    sym_b = cute.sym_int()   # T (non-varlen) or T_total (varlen)
+    sym_a = cute.sym_int()  # B (non-varlen: dynamic B; varlen: fixed 1)
+    sym_b = cute.sym_int()  # T (non-varlen) or T_total (varlen)
     sym_nt = cute.sym_int()  # NT_total
     sym_cu = cute.sym_int()  # cu_seqlens size
     sym_ci = cute.sym_int()  # chunk_indices size
@@ -1475,74 +1605,108 @@ def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size):
         # varlen: tensors are [1, T_total, H, ...] (4D with B=1)
         # This avoids squeeze(0) CPU overhead at the call site.
         q_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (1, sym_b, H, K),
-            stride_order=(3, 2, 1, 0), assumed_align=128,
+            cutlass.BFloat16,
+            (1, sym_b, H, K),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
         )
         v_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (1, sym_b, H, V),
-            stride_order=(3, 2, 1, 0), assumed_align=128,
+            cutlass.BFloat16,
+            (1, sym_b, H, V),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
         )
         g_fake = make_fake_compact_tensor(
-            cutlass.Float32, (1, sym_b, H, K),
-            stride_order=(3, 2, 1, 0), assumed_align=128,
+            cutlass.Float32,
+            (1, sym_b, H, K),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
         )
         o_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (1, sym_b, H, V),
-            stride_order=(3, 2, 1, 0), assumed_align=128,
+            cutlass.BFloat16,
+            (1, sym_b, H, V),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
         )
         A_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (1, sym_b, H, BT),
-            stride_order=(3, 2, 1, 0), assumed_align=128,
+            cutlass.BFloat16,
+            (1, sym_b, H, BT),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
         )
     else:
         # non-varlen: tensors are [B, T, H, ...] (4D)
         q_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (sym_a, sym_b, H, K),
-            stride_order=(3, 2, 1, 0), assumed_align=128,
+            cutlass.BFloat16,
+            (sym_a, sym_b, H, K),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
         )
         v_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (sym_a, sym_b, H, V),
-            stride_order=(3, 2, 1, 0), assumed_align=128,
+            cutlass.BFloat16,
+            (sym_a, sym_b, H, V),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
         )
         g_fake = make_fake_compact_tensor(
-            cutlass.Float32, (sym_a, sym_b, H, K),
-            stride_order=(3, 2, 1, 0), assumed_align=128,
+            cutlass.Float32,
+            (sym_a, sym_b, H, K),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
         )
         o_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (sym_a, sym_b, H, V),
-            stride_order=(3, 2, 1, 0), assumed_align=128,
+            cutlass.BFloat16,
+            (sym_a, sym_b, H, V),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
         )
         A_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (sym_a, sym_b, H, BT),
-            stride_order=(3, 2, 1, 0), assumed_align=128,
+            cutlass.BFloat16,
+            (sym_a, sym_b, H, BT),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
         )
 
     if is_varlen:
         # varlen: h is [1, NT_total, H, K, V] (5D with B=1)
         h_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (1, sym_nt, H, K, V),
-            stride_order=(4, 3, 2, 1, 0), assumed_align=128,
+            cutlass.BFloat16,
+            (1, sym_nt, H, K, V),
+            stride_order=(4, 3, 2, 1, 0),
+            assumed_align=128,
         )
     else:
         # non-varlen: h is [B, NT, H, K, V] (5D)
         h_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (sym_a, sym_nt, H, K, V),
-            stride_order=(4, 3, 2, 1, 0), assumed_align=128,
+            cutlass.BFloat16,
+            (sym_a, sym_nt, H, K, V),
+            stride_order=(4, 3, 2, 1, 0),
+            assumed_align=128,
         )
     # chunk_indices is [NT, 2]
     ci_fake = make_fake_compact_tensor(
-        cutlass.Int32, (sym_ci, 2),
-        stride_order=(1, 0), assumed_align=128,
+        cutlass.Int32,
+        (sym_ci, 2),
+        stride_order=(1, 0),
+        assumed_align=128,
     )
     cu_fake = make_fake_compact_tensor(
-        cutlass.Int32, (sym_cu,), assumed_align=128,
+        cutlass.Int32,
+        (sym_cu,),
+        assumed_align=128,
     )
     stream_fake = make_fake_stream(use_tvm_ffi_env_stream=True)
 
     compiled_fn = cute.compile(
         kernel_obj,
-        q_fake, v_fake, g_fake, h_fake, o_fake, A_fake,
-        cu_fake, ci_fake,
+        q_fake,
+        v_fake,
+        g_fake,
+        h_fake,
+        o_fake,
+        A_fake,
+        cu_fake,
+        ci_fake,
         (Int32(1), Int32(1), Int32(H), Int32(K), Int32(V)),
         Int32(1),
         stream_fake,
@@ -1565,7 +1729,13 @@ def _get_compiled_fwd_o(is_varlen, persistent, H, K, V, scale, chunk_size):
     key = (is_varlen, persistent, H, K, V, scale, chunk_size)
     if key not in _fwd_o_kernel_cache:
         _fwd_o_kernel_cache[key] = _compile_fwd_o_variant(
-            is_varlen, persistent, H, K, V, scale, chunk_size,
+            is_varlen,
+            persistent,
+            H,
+            K,
+            V,
+            scale,
+            chunk_size,
         )
     return _fwd_o_kernel_cache[key]
 
@@ -1614,12 +1784,11 @@ def chunk_gla_fwd_o(
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
 
     if is_varlen:
-        assert cu_seqlens is not None and chunk_indices is not None, \
+        assert cu_seqlens is not None and chunk_indices is not None, (
             "cu_seqlens and chunk_indices are required for varlen mode"
-        assert q.dim() == 4 and q.shape[0] == 1, \
-            f"varlen mode expects [1, T_total, H, K] input, got shape {q.shape}"
-        assert h.dim() == 5 and h.shape[0] == 1, \
-            f"varlen mode expects [1, NT_total, H, K, V] for h, got shape {h.shape}"
+        )
+        assert q.dim() == 4 and q.shape[0] == 1, f"varlen mode expects [1, T_total, H, K] input, got shape {q.shape}"
+        assert h.dim() == 5 and h.shape[0] == 1, f"varlen mode expects [1, NT_total, H, K, V] for h, got shape {h.shape}"
         T_total = q.shape[1]
         H = q.shape[2]
         K = q.shape[3]
@@ -1645,15 +1814,28 @@ def chunk_gla_fwd_o(
             chunk_indices = _fwd_o_dummy_chunk_indices
 
     compiled_fn = _get_compiled_fwd_o(
-        is_varlen, persistent, H, K, V, scale, chunk_size,
+        is_varlen,
+        persistent,
+        H,
+        K,
+        V,
+        scale,
+        chunk_size,
     )
 
     # TVM-FFI: pass torch tensors directly; stream is auto-provided
     # by make_fake_stream(use_tvm_ffi_env_stream=True).
     compiled_fn(
-        q, v, g, h, o, A,
-        cu_seqlens, chunk_indices,
-        ps, Int32(total_nt_val),
+        q,
+        v,
+        g,
+        h,
+        o,
+        A,
+        cu_seqlens,
+        chunk_indices,
+        ps,
+        Int32(total_nt_val),
     )
 
 
@@ -1661,10 +1843,10 @@ def chunk_gla_fwd_o(
 # Main
 # =====================================================================
 
+
 def main():
     parser = argparse.ArgumentParser(description="Chunk GLA FWD O kernel test")
-    parser.add_argument("--test", type=str, default="correctness",
-                        choices=["correctness", "benchmark", "both"])
+    parser.add_argument("--test", type=str, default="correctness", choices=["correctness", "benchmark", "both"])
     parser.add_argument("--B", type=int, default=2)
     parser.add_argument("--T", type=int, default=256)
     parser.add_argument("--H", type=int, default=4)
@@ -1675,7 +1857,7 @@ def main():
     args = parser.parse_args()
 
     if args.scale is None:
-        args.scale = args.K ** -0.5
+        args.scale = args.K**-0.5
     B, T, H, K, V = args.B, args.T, args.H, args.K, args.V
     BT = args.chunk_size
     scale = args.scale
@@ -1683,7 +1865,7 @@ def main():
     dtype, device = torch.bfloat16, "cuda"
 
     print(f"Config: B={B}, T={T}, H={H}, K={K}, V={V}, BT={BT}, scale={scale:.4f}")
-    print(f"  Chunks per seq: {NT}, Total chunks: {B*NT}")
+    print(f"  Chunks per seq: {NT}, Total chunks: {B * NT}")
 
     if args.test in ("correctness", "both"):
         all_pass = True
@@ -1701,8 +1883,15 @@ def main():
         o_nv = torch.zeros(B, T, H, V, dtype=dtype, device=device)
 
         chunk_gla_fwd_o(
-            q=q_nv, v=v_nv, g=g_nv, h=h_nv, o=o_nv, A=A_nv,
-            scale=scale, chunk_size=BT, is_varlen=False,
+            q=q_nv,
+            v=v_nv,
+            g=g_nv,
+            h=h_nv,
+            o=o_nv,
+            A=A_nv,
+            scale=scale,
+            chunk_size=BT,
+            is_varlen=False,
         )
         torch.cuda.synchronize()
 
@@ -1754,15 +1943,21 @@ def main():
                     co = chunk_offsets_list[seq_idx]
                     nt_seq = (sl + BT - 1) // BT
                     o_seq = reference_chunk_gla_fwd_o(
-                        q_flat[:, s:e], v_flat[:, s:e],
-                        g_flat[:, s:e], h_flat[:, co:co+nt_seq],
-                        A_flat[:, s:e], scale, BT)
+                        q_flat[:, s:e], v_flat[:, s:e], g_flat[:, s:e], h_flat[:, co : co + nt_seq], A_flat[:, s:e], scale, BT
+                    )
                     o_ref_flat[:, s:e] = o_seq
 
                 chunk_gla_fwd_o(
-                    q=q_flat, v=v_flat, g=g_flat, h=h_flat, o=o_flat, A=A_flat,
-                    scale=scale, chunk_size=BT,
-                    cu_seqlens=cu_seqlens_t, chunk_indices=ci_t,
+                    q=q_flat,
+                    v=v_flat,
+                    g=g_flat,
+                    h=h_flat,
+                    o=o_flat,
+                    A=A_flat,
+                    scale=scale,
+                    chunk_size=BT,
+                    cu_seqlens=cu_seqlens_t,
+                    chunk_indices=ci_t,
                     is_varlen=True,
                 )
                 torch.cuda.synchronize()
@@ -1771,12 +1966,12 @@ def main():
                 status = "PASS" if max_diff < 0.02 else "FAIL"
                 tok_offs = [cu_seqlens_list[i] for i in range(num_seqs)]
                 aligned = all(t % BT == 0 for t in tok_offs)
-                print(f"  seq_lens={seq_lens} T={T_total} aligned={aligned}: "
-                      f"max_diff={max_diff:.6f} [{status}]")
+                print(f"  seq_lens={seq_lens} T={T_total} aligned={aligned}: max_diff={max_diff:.6f} [{status}]")
                 all_pass = all_pass and (max_diff < 0.02)
 
             except Exception as e:
                 import traceback
+
                 print(f"  seq_lens={seq_lens}: ERROR - {e}")
                 traceback.print_exc()
                 all_pass = False
@@ -1794,13 +1989,20 @@ def main():
             o_ref_cr = reference_chunk_gla_fwd_o(q_cr, v_cr, g_cr, h_cr, A_cr, scale, BT)
 
             chunk_gla_fwd_o(
-                q=q_cr, v=v_cr, g=g_cr, h=h_cr, o=o_cr, A=A_cr,
-                scale=scale, chunk_size=BT, is_varlen=False,
+                q=q_cr,
+                v=v_cr,
+                g=g_cr,
+                h=h_cr,
+                o=o_cr,
+                A=A_cr,
+                scale=scale,
+                chunk_size=BT,
+                is_varlen=False,
             )
             torch.cuda.synchronize()
             md = (o_ref_cr.float() - o_cr.float()).abs().max().item()
             status = "PASS" if md < 0.02 else "FAIL"
-            print(f"  Run {i+1}/3: max_diff={md:.6f} [{status}]")
+            print(f"  Run {i + 1}/3: max_diff={md:.6f} [{status}]")
             all_pass = all_pass and (md < 0.02)
 
         print(f"\n{'ALL PASS' if all_pass else 'SOME FAILED'}")
@@ -1820,8 +2022,15 @@ def main():
             # Warmup (also triggers lazy compilation if needed)
             for _ in range(3):
                 chunk_gla_fwd_o(
-                    q=q_b, v=v_b, g=g_b, h=h_b, o=o_b, A=A_b,
-                    scale=scale, chunk_size=BT, is_varlen=False,
+                    q=q_b,
+                    v=v_b,
+                    g=g_b,
+                    h=h_b,
+                    o=o_b,
+                    A=A_b,
+                    scale=scale,
+                    chunk_size=BT,
+                    is_varlen=False,
                 )
             torch.cuda.synchronize()
 
@@ -1832,8 +2041,15 @@ def main():
             start.record()
             for _ in range(N_iters):
                 chunk_gla_fwd_o(
-                    q=q_b, v=v_b, g=g_b, h=h_b, o=o_b, A=A_b,
-                    scale=scale, chunk_size=BT, is_varlen=False,
+                    q=q_b,
+                    v=v_b,
+                    g=g_b,
+                    h=h_b,
+                    o=o_b,
+                    A=A_b,
+                    scale=scale,
+                    chunk_size=BT,
+                    is_varlen=False,
                 )
             end.record()
             torch.cuda.synchronize()
@@ -1843,18 +2059,21 @@ def main():
             try:
                 sys.path.insert(0, "/ossfs/workspace/flash-linear-attention")
                 from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
+
                 for _ in range(10):
-                    chunk_gla_fwd_o_gk(q=q_b, v=v_b, g=g_b, A=A_b, h=h_b.flatten(0, 1),
-                                       scale=scale, chunk_size=BT, use_exp2=True)
+                    chunk_gla_fwd_o_gk(
+                        q=q_b, v=v_b, g=g_b, A=A_b, h=h_b.flatten(0, 1), scale=scale, chunk_size=BT, use_exp2=True
+                    )
                 torch.cuda.synchronize()
                 start.record()
                 for _ in range(N_iters):
-                    chunk_gla_fwd_o_gk(q=q_b, v=v_b, g=g_b, A=A_b, h=h_b.flatten(0, 1),
-                                       scale=scale, chunk_size=BT, use_exp2=True)
+                    chunk_gla_fwd_o_gk(
+                        q=q_b, v=v_b, g=g_b, A=A_b, h=h_b.flatten(0, 1), scale=scale, chunk_size=BT, use_exp2=True
+                    )
                 end.record()
                 torch.cuda.synchronize()
                 ms_fla = start.elapsed_time(end) / N_iters
-                print(f"  Triton T={bench_T}: {ms_fla:.3f} ms  speedup={ms_fla/ms:.2f}x")
+                print(f"  Triton T={bench_T}: {ms_fla:.3f} ms  speedup={ms_fla / ms:.2f}x")
             except Exception as e:
                 print(f"  Triton benchmark failed: {e}")
 

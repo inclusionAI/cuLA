@@ -93,7 +93,7 @@ def bench_non_varlen(configs):
     results = []
 
     for B, T, H in configs:
-        scale = K ** -0.5
+        scale = K**-0.5
         NT = (T + BT - 1) // BT
         torch.manual_seed(42)
         torch.cuda.empty_cache()
@@ -106,8 +106,14 @@ def bench_non_varlen(configs):
 
         # ---- FLA baseline (accuracy) ----
         o_fla = chunk_gla_fwd_o_gk(
-            q=q, v=v, g=g, A=A, h=h.flatten(0, 1),
-            scale=scale, chunk_size=BT, use_exp2=True,
+            q=q,
+            v=v,
+            g=g,
+            A=A,
+            h=h.flatten(0, 1),
+            scale=scale,
+            chunk_size=BT,
+            use_exp2=True,
         )
 
         # ---- CuTe DSL (accuracy) ----
@@ -115,9 +121,16 @@ def bench_non_varlen(configs):
 
         # Warmup / first call triggers compilation via cache
         chunk_gla_fwd_o(
-            q=q, v=v, g=g, h=h, o=o_cute_t, A=A,
-            scale=scale, chunk_size=BT,
-            is_varlen=False, persistent=True,
+            q=q,
+            v=v,
+            g=g,
+            h=h,
+            o=o_cute_t,
+            A=A,
+            scale=scale,
+            chunk_size=BT,
+            is_varlen=False,
+            persistent=True,
         )
         torch.cuda.synchronize()
 
@@ -126,31 +139,52 @@ def bench_non_varlen(configs):
         # ---- Performance timing ----
         def run_fla(q=q, v=v, g=g, A=A, h=h, scale=scale):
             chunk_gla_fwd_o_gk(
-                q=q, v=v, g=g, A=A, h=h.flatten(0, 1),
-                scale=scale, chunk_size=BT, use_exp2=True,
+                q=q,
+                v=v,
+                g=g,
+                A=A,
+                h=h.flatten(0, 1),
+                scale=scale,
+                chunk_size=BT,
+                use_exp2=True,
             )
 
         def run_cute(q=q, v=v, g=g, h=h, o=o_cute_t, A=A, scale=scale):
             chunk_gla_fwd_o(
-                q=q, v=v, g=g, h=h, o=o, A=A,
-                scale=scale, chunk_size=BT,
-                is_varlen=False, persistent=True,
+                q=q,
+                v=v,
+                g=g,
+                h=h,
+                o=o,
+                A=A,
+                scale=scale,
+                chunk_size=BT,
+                is_varlen=False,
+                persistent=True,
             )
 
         ms_fla = time_kernel(run_fla)
         ms_cute = time_kernel(run_cute)
-        speedup = ms_fla / ms_cute if ms_cute > 0 else float('inf')
+        speedup = ms_fla / ms_cute if ms_cute > 0 else float("inf")
 
         r = {
-            'B': B, 'T': T, 'H': H,
-            'max_diff': max_diff, 'rel_max_diff': rel_max_diff, 'mean_diff': mean_diff,
-            'ms_fla': ms_fla, 'ms_cute': ms_cute, 'speedup': speedup,
+            "B": B,
+            "T": T,
+            "H": H,
+            "max_diff": max_diff,
+            "rel_max_diff": rel_max_diff,
+            "mean_diff": mean_diff,
+            "ms_fla": ms_fla,
+            "ms_cute": ms_cute,
+            "speedup": speedup,
         }
         results.append(r)
-        print(f"  B={B:2d} T={T:5d} H={H:2d} | "
-              f"max_diff={max_diff:.6f} rel_max={rel_max_diff:.6f} mean_diff={mean_diff:.8f} | "
-              f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms | "
-              f"speedup={speedup:.2f}x")
+        print(
+            f"  B={B:2d} T={T:5d} H={H:2d} | "
+            f"max_diff={max_diff:.6f} rel_max={rel_max_diff:.6f} mean_diff={mean_diff:.8f} | "
+            f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms | "
+            f"speedup={speedup:.2f}x"
+        )
 
     return results
 
@@ -162,6 +196,7 @@ def gen_varlen_seqs(target_total, n_seqs, seed=0):
     """Generate n_seqs random seq lengths summing to target_total.
     Lengths vary ~2-3x (log-uniform-ish), each rounded up to multiple of 2."""
     import random
+
     rng = random.Random(seed)
     # Sample raw weights with 2-3x spread via log-uniform
     raw = [rng.uniform(0.4, 1.0) for _ in range(n_seqs)]
@@ -182,7 +217,7 @@ def bench_varlen(configs):
     results = []
 
     for seq_lens, H in configs:
-        scale = K ** -0.5
+        scale = K**-0.5
         len(seq_lens)
         T_total = sum(seq_lens)
         cu_seqlens_list = [0]
@@ -205,9 +240,15 @@ def bench_varlen(configs):
         cu_fla = torch.tensor(cu_seqlens_list, dtype=torch.long, device=device)
 
         o_fla = chunk_gla_fwd_o_gk(
-            q=q_flat, v=v_flat, g=g_flat, A=A_flat, h=h_flat.flatten(0, 1),
-            scale=scale, cu_seqlens=cu_fla,
-            chunk_size=BT, use_exp2=True,
+            q=q_flat,
+            v=v_flat,
+            g=g_flat,
+            A=A_flat,
+            h=h_flat.flatten(0, 1),
+            scale=scale,
+            cu_seqlens=cu_fla,
+            chunk_size=BT,
+            use_exp2=True,
         )
 
         # ---- CuTe DSL varlen ----
@@ -217,10 +258,18 @@ def bench_varlen(configs):
 
         # Warmup / first call triggers compilation via cache
         chunk_gla_fwd_o(
-            q=q_flat, v=v_flat, g=g_flat, h=h_flat, o=o_cute_flat, A=A_flat,
-            scale=scale, chunk_size=BT,
-            cu_seqlens=cu_cute, chunk_indices=ci_cute,
-            is_varlen=True, persistent=True,
+            q=q_flat,
+            v=v_flat,
+            g=g_flat,
+            h=h_flat,
+            o=o_cute_flat,
+            A=A_flat,
+            scale=scale,
+            chunk_size=BT,
+            cu_seqlens=cu_cute,
+            chunk_indices=ci_cute,
+            is_varlen=True,
+            persistent=True,
         )
         torch.cuda.synchronize()
 
@@ -228,42 +277,72 @@ def bench_varlen(configs):
         max_diff, rel_max_diff, mean_diff = accuracy_stats(o_fla.squeeze(0), o_cute_flat.squeeze(0))
 
         # ---- Performance timing ----
-        def run_fla(q_flat=q_flat, v_flat=v_flat, g_flat=g_flat, A_flat=A_flat,
-                    h_flat=h_flat, cu_fla=cu_fla, scale=scale):
+        def run_fla(q_flat=q_flat, v_flat=v_flat, g_flat=g_flat, A_flat=A_flat, h_flat=h_flat, cu_fla=cu_fla, scale=scale):
             chunk_gla_fwd_o_gk(
-                q=q_flat, v=v_flat, g=g_flat, A=A_flat, h=h_flat.flatten(0, 1),
-                scale=scale, cu_seqlens=cu_fla,
-                chunk_size=BT, use_exp2=True,
+                q=q_flat,
+                v=v_flat,
+                g=g_flat,
+                A=A_flat,
+                h=h_flat.flatten(0, 1),
+                scale=scale,
+                cu_seqlens=cu_fla,
+                chunk_size=BT,
+                use_exp2=True,
             )
 
-        def run_cute(q_flat=q_flat, v_flat=v_flat, g_flat=g_flat,
-                     h_flat=h_flat, o=o_cute_flat, A_flat=A_flat,
-                     cu_cute=cu_cute, ci_cute=ci_cute, scale=scale):
+        def run_cute(
+            q_flat=q_flat,
+            v_flat=v_flat,
+            g_flat=g_flat,
+            h_flat=h_flat,
+            o=o_cute_flat,
+            A_flat=A_flat,
+            cu_cute=cu_cute,
+            ci_cute=ci_cute,
+            scale=scale,
+        ):
             chunk_gla_fwd_o(
-                q=q_flat, v=v_flat, g=g_flat, h=h_flat, o=o, A=A_flat,
-                scale=scale, chunk_size=BT,
-                cu_seqlens=cu_cute, chunk_indices=ci_cute,
-                is_varlen=True, persistent=True,
+                q=q_flat,
+                v=v_flat,
+                g=g_flat,
+                h=h_flat,
+                o=o,
+                A=A_flat,
+                scale=scale,
+                chunk_size=BT,
+                cu_seqlens=cu_cute,
+                chunk_indices=ci_cute,
+                is_varlen=True,
+                persistent=True,
             )
 
         ms_fla = time_kernel(run_fla)
         ms_cute = time_kernel(run_cute)
-        speedup = ms_fla / ms_cute if ms_cute > 0 else float('inf')
+        speedup = ms_fla / ms_cute if ms_cute > 0 else float("inf")
 
         n_seqs = len(seq_lens)
         min_l, max_l = min(seq_lens), max(seq_lens)
         avg_l = T_total // n_seqs
         tag = f"{n_seqs}seqs T={T_total} [{min_l}..{max_l}] avg={avg_l}"
         r = {
-            'tag': tag, 'T_total': T_total, 'H': H, 'n_seqs': n_seqs,
-            'max_diff': max_diff, 'rel_max_diff': rel_max_diff, 'mean_diff': mean_diff,
-            'ms_fla': ms_fla, 'ms_cute': ms_cute, 'speedup': speedup,
+            "tag": tag,
+            "T_total": T_total,
+            "H": H,
+            "n_seqs": n_seqs,
+            "max_diff": max_diff,
+            "rel_max_diff": rel_max_diff,
+            "mean_diff": mean_diff,
+            "ms_fla": ms_fla,
+            "ms_cute": ms_cute,
+            "speedup": speedup,
         }
         results.append(r)
-        print(f"  {tag:45s} H={H:2d} | "
-              f"max_diff={max_diff:.6f} rel_max={rel_max_diff:.6f} mean_diff={mean_diff:.8f} | "
-              f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms | "
-              f"speedup={speedup:.2f}x")
+        print(
+            f"  {tag:45s} H={H:2d} | "
+            f"max_diff={max_diff:.6f} rel_max={rel_max_diff:.6f} mean_diff={mean_diff:.8f} | "
+            f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms | "
+            f"speedup={speedup:.2f}x"
+        )
 
     return results
 
@@ -285,28 +364,36 @@ def print_report(nv_results, vl_results):
 
     if nv_results:
         print("\n  [Non-Varlen]")
-        hdr = (f"  {'B':>3s}  {'T':>5s}  {'H':>3s}  │  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
-               f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}")
+        hdr = (
+            f"  {'B':>3s}  {'T':>5s}  {'H':>3s}  │  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
+            f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}"
+        )
         print(f"  {'─' * 90}")
         print(hdr)
         print(f"  {'─' * 90}")
         for r in nv_results:
-            print(f"  {r['B']:3d}  {r['T']:5d}  {r['H']:3d}  │  "
-                  f"{r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
-                  f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x")
+            print(
+                f"  {r['B']:3d}  {r['T']:5d}  {r['H']:3d}  │  "
+                f"{r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x"
+            )
         print(f"  {'─' * 90}")
 
     if vl_results:
         print("\n  [Varlen]")
-        hdr = (f"  {'Config':>45s}  {'H':>3s}  │  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
-               f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}")
+        hdr = (
+            f"  {'Config':>45s}  {'H':>3s}  │  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
+            f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}"
+        )
         print(f"  {'─' * 117}")
         print(hdr)
         print(f"  {'─' * 117}")
         for r in vl_results:
-            print(f"  {r['tag']:>45s}  {r['H']:3d}  │  "
-                  f"{r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
-                  f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x")
+            print(
+                f"  {r['tag']:>45s}  {r['H']:3d}  │  "
+                f"{r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x"
+            )
         print(f"  {'─' * 117}")
 
     print(f"\n{sep}\n")
@@ -316,16 +403,17 @@ def print_report(nv_results, vl_results):
 # Main
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(
-        description="bench_fwd_o: CuTe DSL (SM100a) vs FLA Triton baseline"
-    )
+    parser = argparse.ArgumentParser(description="bench_fwd_o: CuTe DSL (SM100a) vs FLA Triton baseline")
     parser.add_argument(
-        "--mode", type=str, default="both",
+        "--mode",
+        type=str,
+        default="both",
         choices=["non-varlen", "varlen", "both"],
         help="Which benchmark mode to run (default: both)",
     )
     parser.add_argument(
-        "--ncu", action="store_true",
+        "--ncu",
+        action="store_true",
         help="NCU profiling mode: warmup=1, iters=1",
     )
     args = parser.parse_args()

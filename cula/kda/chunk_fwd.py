@@ -24,6 +24,7 @@ chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
 _fwd_o_mod = importlib.import_module("cula.ops.fwd_o")
 chunk_gla_fwd_o = _fwd_o_mod.chunk_gla_fwd_o
 
+
 def chunk_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -70,13 +71,7 @@ def chunk_kda_fwd(
             lower_bound=lower_bound,
         )
     else:
-        g = chunk_local_cumsum(
-            g=g,
-            scale=RCP_LN2,
-            chunk_size=chunk_size,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices
-        )
+        g = chunk_local_cumsum(g=g, scale=RCP_LN2, chunk_size=chunk_size, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices)
 
     # qg = None if disable_recompute is False
     w, u, qg, kg, Aqk, Akk = chunk_kda_fwd_intra(
@@ -91,7 +86,7 @@ def chunk_kda_fwd(
         chunk_indices=chunk_indices,
         safe_gate=safe_gate,
         disable_recompute=disable_recompute,
-        use_tf32_inverse=use_tf32_inverse
+        use_tf32_inverse=use_tf32_inverse,
     )
 
     if cp_context is not None:

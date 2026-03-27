@@ -50,7 +50,7 @@ def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None):
 
     # flatten to batch_size=1 for cu_seqlens compatibility
     if batch_size != 1:
-        q, k, v, g_raw, beta = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, g_raw, beta))
+        q, k, v, g_raw, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g_raw, beta))
 
     # gate preprocessing
     A_log = torch.randn(H, dtype=torch.float, device=device)
@@ -95,28 +95,40 @@ def benchmark_chunk_intra_uniform():
     print("=" * 90)
     print(f"  Uniform-Length ChunkIntra Benchmark: cuLA vs FLA Triton  B={B} H={H} D={D}")
     print("=" * 90)
-    print(f"{'B':>4} {'T':>7} │ {'RMSE':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}")
+    print(
+        f"{'B':>4} {'T':>7} │ {'RMSE':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
+    )
     print("─" * 90)
 
     for T in T_vals:
         seq_lens = [T] * B
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-        q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(
-            B, T, H, D, device, cu_seqlens=cu_seqlens
-        )
+        q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens)
 
         # Accuracy: run once and compare
         out_fla = fla_chunk_kda_fwd_intra(
-            q=q, k=k, v=v, gk=g, beta=beta,
-            scale=scale, cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size, chunk_indices=chunk_indices,
+            q=q,
+            k=k,
+            v=v,
+            gk=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
             safe_gate=True,
         )
         out_cula = cula_chunk_kda_fwd_intra(
-            q=q, k=k, v=v, gk=g, beta=beta,
-            scale=scale, cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size, chunk_indices=chunk_indices,
+            q=q,
+            k=k,
+            v=v,
+            gk=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
             safe_gate=True,
         )
         # Compare the first output tensor (o)
@@ -127,23 +139,37 @@ def benchmark_chunk_intra_uniform():
         # Performance
         ms_fla = triton.testing.do_bench(
             lambda: fla_chunk_kda_fwd_intra(
-                q=q, k=k, v=v, gk=g, beta=beta,
-                scale=scale, cu_seqlens=cu_seqlens,
-                chunk_size=chunk_size, chunk_indices=chunk_indices,
+                q=q,
+                k=k,
+                v=v,
+                gk=g,
+                beta=beta,
+                scale=scale,
+                cu_seqlens=cu_seqlens,
+                chunk_size=chunk_size,
+                chunk_indices=chunk_indices,
                 safe_gate=True,
             ),
         )
         ms_cula = triton.testing.do_bench(
             lambda: cula_chunk_kda_fwd_intra(
-                q=q, k=k, v=v, gk=g, beta=beta,
-                scale=scale, cu_seqlens=cu_seqlens,
-                chunk_size=chunk_size, chunk_indices=chunk_indices,
+                q=q,
+                k=k,
+                v=v,
+                gk=g,
+                beta=beta,
+                scale=scale,
+                cu_seqlens=cu_seqlens,
+                chunk_size=chunk_size,
+                chunk_indices=chunk_indices,
                 safe_gate=True,
             ),
         )
-        speedup = ms_fla / ms_cula if ms_cula > 0 else float('inf')
+        speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
-        print(f"{B:>4} {T:>7} │ {rmse:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x")
+        print(
+            f"{B:>4} {T:>7} │ {rmse:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
+        )
 
     print("─" * 90)
 
@@ -160,7 +186,9 @@ def benchmark_chunk_intra_varlen():
     print("=" * 100)
     print(f"  Varlen ChunkIntra Benchmark: cuLA vs FLA Triton  NUM_SEQS={NUM_SEQS} H={H} D={D}")
     print("=" * 100)
-    print(f"{'total_len':>10} │ {'RMSE':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}")
+    print(
+        f"{'total_len':>10} │ {'RMSE':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
+    )
     print("─" * 100)
 
     for total_len in total_len_vals:
@@ -168,21 +196,31 @@ def benchmark_chunk_intra_varlen():
         T = total_len
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-        q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(
-            B, T, H, D, device, cu_seqlens=cu_seqlens
-        )
+        q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens)
 
         # Accuracy
         out_fla = fla_chunk_kda_fwd_intra(
-            q=q, k=k, v=v, gk=g, beta=beta,
-            scale=scale, cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size, chunk_indices=chunk_indices,
+            q=q,
+            k=k,
+            v=v,
+            gk=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
             safe_gate=True,
         )
         out_cula = cula_chunk_kda_fwd_intra(
-            q=q, k=k, v=v, gk=g, beta=beta,
-            scale=scale, cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size, chunk_indices=chunk_indices,
+            q=q,
+            k=k,
+            v=v,
+            gk=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
             safe_gate=True,
         )
         o_fla = out_fla[0] if isinstance(out_fla, (tuple, list)) else out_fla
@@ -192,23 +230,37 @@ def benchmark_chunk_intra_varlen():
         # Performance
         ms_fla = triton.testing.do_bench(
             lambda: fla_chunk_kda_fwd_intra(
-                q=q, k=k, v=v, gk=g, beta=beta,
-                scale=scale, cu_seqlens=cu_seqlens,
-                chunk_size=chunk_size, chunk_indices=chunk_indices,
+                q=q,
+                k=k,
+                v=v,
+                gk=g,
+                beta=beta,
+                scale=scale,
+                cu_seqlens=cu_seqlens,
+                chunk_size=chunk_size,
+                chunk_indices=chunk_indices,
                 safe_gate=True,
             ),
         )
         ms_cula = triton.testing.do_bench(
             lambda: cula_chunk_kda_fwd_intra(
-                q=q, k=k, v=v, gk=g, beta=beta,
-                scale=scale, cu_seqlens=cu_seqlens,
-                chunk_size=chunk_size, chunk_indices=chunk_indices,
+                q=q,
+                k=k,
+                v=v,
+                gk=g,
+                beta=beta,
+                scale=scale,
+                cu_seqlens=cu_seqlens,
+                chunk_size=chunk_size,
+                chunk_indices=chunk_indices,
                 safe_gate=True,
             ),
         )
-        speedup = ms_fla / ms_cula if ms_cula > 0 else float('inf')
+        speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
-        print(f"{total_len:>10} │ {rmse:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x")
+        print(
+            f"{total_len:>10} │ {rmse:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
+        )
 
     print("─" * 100)
 

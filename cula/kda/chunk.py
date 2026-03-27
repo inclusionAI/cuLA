@@ -45,8 +45,9 @@ class ChunkKDAFunction(torch.autograd.Function):
             q, q_rstd = l2norm_fwd(q)
             k, k_rstd = l2norm_fwd(k)
 
-        chunk_indices = prepare_chunk_indices(
-            cu_seqlens, chunk_size, cu_seqlens_cpu=cu_seqlens_cpu) if cu_seqlens is not None else None
+        chunk_indices = (
+            prepare_chunk_indices(cu_seqlens, chunk_size, cu_seqlens_cpu=cu_seqlens_cpu) if cu_seqlens is not None else None
+        )
 
         g_org = g if use_gate_in_kernel else None
 
@@ -78,9 +79,27 @@ class ChunkKDAFunction(torch.autograd.Function):
             return o.type_as(q), final_state, h
 
         ctx.save_for_backward(
-            q, q_rstd, k, k_rstd, v, g, g_org, beta, A_log, dt_bias, Aqk, Akk,
-            w, u, qg, kg, v_new, h,
-            initial_state, cu_seqlens, chunk_indices
+            q,
+            q_rstd,
+            k,
+            k_rstd,
+            v,
+            g,
+            g_org,
+            beta,
+            A_log,
+            dt_bias,
+            Aqk,
+            Akk,
+            w,
+            u,
+            qg,
+            kg,
+            v_new,
+            h,
+            initial_state,
+            cu_seqlens,
+            chunk_indices,
         )
         ctx.chunk_size = chunk_size
         ctx.safe_gate = safe_gate
@@ -100,11 +119,29 @@ class ChunkKDAFunction(torch.autograd.Function):
         do: torch.Tensor,
         dht: torch.Tensor,
     ):
-        (q, q_rstd, k, k_rstd, v, g, g_org, beta, A_log, dt_bias, Aqk, Akk,
-         w, u, qg, kg, v_new, h,
-         initial_state, cu_seqlens, chunk_indices) = (
-            ctx.saved_tensors
-        )
+        (
+            q,
+            q_rstd,
+            k,
+            k_rstd,
+            v,
+            g,
+            g_org,
+            beta,
+            A_log,
+            dt_bias,
+            Aqk,
+            Akk,
+            w,
+            u,
+            qg,
+            kg,
+            v_new,
+            h,
+            initial_state,
+            cu_seqlens,
+            chunk_indices,
+        ) = ctx.saved_tensors
 
         dq, dk, dv, db, dg, dh0, dA, dbias = chunk_kda_bwd(
             q=q,
@@ -122,19 +159,45 @@ class ChunkKDAFunction(torch.autograd.Function):
             chunk_indices=chunk_indices,
             chunk_size=ctx.chunk_size,
             safe_gate=ctx.safe_gate,
-            g_org=g_org, lower_bound=ctx.lower_bound,
+            g_org=g_org,
+            lower_bound=ctx.lower_bound,
             use_gate_in_kernel=ctx.use_gate_in_kernel,
-            A_log=A_log, dt_bias=dt_bias,
+            A_log=A_log,
+            dt_bias=dt_bias,
             disable_recompute=ctx.disable_recompute,
-            w=w, u=u, qg=qg, kg=kg, v_new=v_new, h=h,
+            w=w,
+            u=u,
+            qg=qg,
+            kg=kg,
+            v_new=v_new,
+            h=h,
             cp_context=ctx.cp_context,
         )
         if ctx.use_qk_l2norm_in_kernel:
             dq = l2norm_bwd(q, q_rstd, dq)
             dk = l2norm_bwd(k, k_rstd, dk)
 
-        return (dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), dA, dbias, None, dh0,
-                None, None, None, None, None, None, None, None, None, None)
+        return (
+            dq.to(q),
+            dk.to(k),
+            dv.to(v),
+            dg.to(g),
+            db.to(beta),
+            dA,
+            dbias,
+            None,
+            dh0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 @torch.compiler.disable

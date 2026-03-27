@@ -32,7 +32,6 @@ Warp assignment:
   7:   Empty warp (idle)
 """
 
-
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -49,7 +48,6 @@ def _make_coop_group(size: int):
 
 
 class KDARecomputeWU:
-
     def __init__(
         self,
         K: int = 128,
@@ -62,13 +60,9 @@ class KDARecomputeWU:
         is_varlen: bool = False,
         persistent: bool = False,
     ):
-        assert K == 128 and V == 128, (
-            f"K and V must both be 128, got K={K}, V={V}"
-        )
+        assert K == 128 and V == 128, f"K and V must both be 128, got K={K}, V={V}"
         cc = torch.cuda.get_device_capability()
-        assert cc[0] == 10 and cc[1] == 0, (
-            f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
-        )
+        assert cc[0] == 10 and cc[1] == 0, f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
         self.K = K
         self.V = V
         self.BT = chunk_size
@@ -147,14 +141,15 @@ class KDARecomputeWU:
     @cute.jit
     def _tma_partition_B(self, tma_atom, tma_tensor, smem, tile_shape, tiled_mma, batch_idx, hidx):
         coord = (0, None, None)
-        gX = cute.local_tile(
-            tma_tensor, cute.slice_(tile_shape, coord), (None, None, (hidx, batch_idx))
-        )
+        gX = cute.local_tile(tma_tensor, cute.slice_(tile_shape, coord), (None, None, (hidx, batch_idx)))
         thr_mma = tiled_mma.get_slice(0)
         tCgX = thr_mma.partition_B(gX)
         tXsX, tXgX = cpasync.tma_partition(
-            tma_atom, 0, cute.make_layout(1),
-            cute.group_modes(smem, 0, 3), cute.group_modes(tCgX, 0, 3),
+            tma_atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(smem, 0, 3),
+            cute.group_modes(tCgX, 0, 3),
         )
         return tXsX, tXgX
 
@@ -166,7 +161,11 @@ class KDARecomputeWU:
         sC_g = cute.group_modes(smem, 0, 2)
         gC_g = cute.group_modes(gC_tiled, 0, 2)
         bSG_sC, bSG_gC = cpasync.tma_partition(
-            atom, 0, cute.make_layout(1), sC_g, gC_g,
+            atom,
+            0,
+            cute.make_layout(1),
+            sC_g,
+            gC_g,
         )
         return bSG_sC, bSG_gC
 
@@ -179,7 +178,11 @@ class KDARecomputeWU:
         sC_g = cute.group_modes(sC, 0, 2)
         gC_g = cute.group_modes(gC_tiled, 0, 2)
         bSG_sC, bSG_gC = cpasync.tma_partition(
-            atom, 0, cute.make_layout(1), sC_g, gC_g,
+            atom,
+            0,
+            cute.make_layout(1),
+            sC_g,
+            gC_g,
         )
         return bSG_sC, bSG_gC
 
@@ -232,12 +235,19 @@ class KDARecomputeWU:
         )
 
         tmem_a_layout = sm100_utils.make_smem_layout_a(
-            tiled_mma, self.mma_tiler, self.io_dtype, 1,
+            tiled_mma,
+            self.mma_tiler,
+            self.io_dtype,
+            1,
         )
 
         (self.tmem_acc_off, self.tmem_a_off, self.tmem_total) = self._plan_tmem_offsets(
-            tiled_mma, self.mma_tiler, tmem_a_layout,
-            self.acc_stage, self.io_dtype, self.acc_dtype,
+            tiled_mma,
+            self.mma_tiler,
+            tmem_a_layout,
+            self.acc_stage,
+            self.io_dtype,
+            self.acc_dtype,
         )
 
         # ---------- TMA load op ----------
@@ -245,7 +255,10 @@ class KDARecomputeWU:
 
         # ---------- SMEM layout: A_mat (MMA B operand) ----------
         a_smem_staged = sm100_utils.make_smem_layout_b(
-            tiled_mma, self.mma_tiler, self.io_dtype, self.a_stage,
+            tiled_mma,
+            self.mma_tiler,
+            self.io_dtype,
+            self.a_stage,
         )
 
         cluster_layout = cute.tiled_divide(
@@ -255,16 +268,22 @@ class KDARecomputeWU:
 
         # ---------- SMEM layouts: k (bf16), v (bf16), gk (fp32) ----------
         k_epi_staged = sm100_utils.make_smem_layout_epi(
-            self.io_dtype, utils.LayoutEnum.ROW_MAJOR,
-            (self.BT, self.BK), self.kgk_stage,
+            self.io_dtype,
+            utils.LayoutEnum.ROW_MAJOR,
+            (self.BT, self.BK),
+            self.kgk_stage,
         )
         v_epi_staged = sm100_utils.make_smem_layout_epi(
-            self.io_dtype, utils.LayoutEnum.ROW_MAJOR,
-            (self.BT, self.BV), self.v_tma_stage,
+            self.io_dtype,
+            utils.LayoutEnum.ROW_MAJOR,
+            (self.BT, self.BV),
+            self.v_tma_stage,
         )
         gk_epi_staged = sm100_utils.make_smem_layout_epi(
-            self.acc_dtype, utils.LayoutEnum.ROW_MAJOR,
-            (self.BT, self.BK), self.kgk_stage,
+            self.acc_dtype,
+            utils.LayoutEnum.ROW_MAJOR,
+            (self.BT, self.BK),
+            self.kgk_stage,
         )
 
         # ---------- GMEM tensors (token-indexed) ----------
@@ -297,24 +316,37 @@ class KDARecomputeWU:
         # ---------- TMA descriptors ----------
         a_smem_one = cute.select(a_smem_staged, mode=[0, 1, 2])
         tma_atom_A, tma_tensor_A = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op, A_gmem, a_smem_one, self.mma_tiler, tiled_mma,
+            tma_load_op,
+            A_gmem,
+            a_smem_one,
+            self.mma_tiler,
+            tiled_mma,
             cluster_layout.shape,
         )
         self.tma_A_bytes = cute.size_in_bytes(self.io_dtype, a_smem_one)
 
         k_epi_smem = cute.select(k_epi_staged, mode=[0, 1])
         tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
-            tma_load_op, k_gmem, k_epi_smem, (self.BT, self.BK),
+            tma_load_op,
+            k_gmem,
+            k_epi_smem,
+            (self.BT, self.BK),
         )
 
         v_epi_smem = cute.select(v_epi_staged, mode=[0, 1])
         tma_atom_v, tma_tensor_v = cpasync.make_tiled_tma_atom(
-            tma_load_op, v_gmem, v_epi_smem, (self.BT, self.BV),
+            tma_load_op,
+            v_gmem,
+            v_epi_smem,
+            (self.BT, self.BV),
         )
 
         gk_epi_smem = cute.select(gk_epi_staged, mode=[0, 1])
         tma_atom_gk, tma_tensor_gk = cpasync.make_tiled_tma_atom(
-            tma_load_op, gk_gmem, gk_epi_smem, (self.BT, self.BK),
+            tma_load_op,
+            gk_gmem,
+            gk_epi_smem,
+            (self.BT, self.BK),
         )
 
         # ---------- TMA byte counts ----------
@@ -376,18 +408,25 @@ class KDARecomputeWU:
 
         self.kernel(
             tiled_mma,
-            tma_atom_A, tma_tensor_A,
-            tma_atom_k, tma_tensor_k,
-            tma_atom_v, tma_tensor_v,
-            tma_atom_gk, tma_tensor_gk,
+            tma_atom_A,
+            tma_tensor_A,
+            tma_atom_k,
+            tma_tensor_k,
+            tma_atom_v,
+            tma_tensor_v,
+            tma_atom_gk,
+            tma_tensor_gk,
             tmem_a_layout,
             a_smem_staged,
             k_epi_staged,
             v_epi_staged,
             gk_epi_staged,
             beta_ptr,
-            w_ptr, u_ptr, kg_ptr,
-            cu_seqlens, chunk_indices,
+            w_ptr,
+            u_ptr,
+            kg_ptr,
+            cu_seqlens,
+            chunk_indices,
             problem_size,
             total_nt,
         ).launch(
@@ -483,17 +522,17 @@ class KDARecomputeWU:
         # ---------- SMEM ----------
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
-        sA  = storage.sA.get_tensor(a_smem_staged.outer,  swizzle=a_smem_staged.inner)
-        sK  = storage.sK.get_tensor(k_epi_staged.outer,   swizzle=k_epi_staged.inner)
-        sV  = storage.sV.get_tensor(v_epi_staged.outer,   swizzle=v_epi_staged.inner)
+        sA = storage.sA.get_tensor(a_smem_staged.outer, swizzle=a_smem_staged.inner)
+        sK = storage.sK.get_tensor(k_epi_staged.outer, swizzle=k_epi_staged.inner)
+        sV = storage.sV.get_tensor(v_epi_staged.outer, swizzle=v_epi_staged.inner)
         sGK = storage.sGK.get_tensor(gk_epi_staged.outer, swizzle=gk_epi_staged.inner)
         sBeta = cute.make_tensor(
-            cute.make_ptr(self.io_dtype, storage.sBeta.data_ptr().toint(),
-                          cute.AddressSpace.smem),
+            cute.make_ptr(self.io_dtype, storage.sBeta.data_ptr().toint(), cute.AddressSpace.smem),
             cute.make_layout((self.BT,), stride=(1,)),
         )
         sStage_ptr = cute.make_ptr(
-            self.io_dtype, storage.sStage.data_ptr().toint(),
+            self.io_dtype,
+            storage.sStage.data_ptr().toint(),
             cute.AddressSpace.smem,
         )
         sStage = cute.make_tensor(
@@ -533,8 +572,7 @@ class KDARecomputeWU:
         ).make_participants()
 
         # ---------- TMEM ----------
-        tmem_alloc_bar = pipeline.NamedBarrier(
-            barrier_id=1, num_threads=self.threads_per_cta)
+        tmem_alloc_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=self.threads_per_cta)
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_bar,
@@ -580,42 +618,78 @@ class KDARecomputeWU:
 
                 # --- Domain offset (varlen) or alias (non-varlen) ---
                 if cutlass.const_expr(self.is_varlen):
-                    tma_k_v  = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_k)
-                    tma_v_v  = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_v)
+                    tma_k_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_k)
+                    tma_v_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_v)
                     tma_gk_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_gk)
-                    tma_A_v  = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_A)
+                    tma_A_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_A)
                 else:
-                    tma_k_v  = tma_tensor_k
-                    tma_v_v  = tma_tensor_v
+                    tma_k_v = tma_tensor_k
+                    tma_v_v = tma_tensor_v
                     tma_gk_v = tma_tensor_gk
-                    tma_A_v  = tma_tensor_A
+                    tma_A_v = tma_tensor_A
 
                 # --- TMA partitions per WU ---
                 if cutlass.const_expr(self.is_varlen):
                     bSG_sK, bSG_gK = self._epilog_partition_varlen(
-                        tma_atom_k,  tma_k_v[None, None, (i_h, data_bidx)],  (self.BT, self.BK), sK,
+                        tma_atom_k,
+                        tma_k_v[None, None, (i_h, data_bidx)],
+                        (self.BT, self.BK),
+                        sK,
                     )
                     bSG_sV, bSG_gV = self._epilog_partition_varlen(
-                        tma_atom_v,  tma_v_v[None, None, (i_h, data_bidx)],  (self.BT, self.BV), sV,
+                        tma_atom_v,
+                        tma_v_v[None, None, (i_h, data_bidx)],
+                        (self.BT, self.BV),
+                        sV,
                     )
                     bSG_sGK, bSG_gGK = self._epilog_partition_varlen(
-                        tma_atom_gk, tma_gk_v[None, None, (i_h, data_bidx)], (self.BT, self.BK), sGK,
+                        tma_atom_gk,
+                        tma_gk_v[None, None, (i_h, data_bidx)],
+                        (self.BT, self.BK),
+                        sGK,
                     )
                     tAsA, tAgA = self._tma_partition_B(
-                        tma_atom_A, tma_A_v, sA, self.mma_tiler, tiled_mma, data_bidx, i_h,
+                        tma_atom_A,
+                        tma_A_v,
+                        sA,
+                        self.mma_tiler,
+                        tiled_mma,
+                        data_bidx,
+                        i_h,
                     )
                 else:
                     bSG_sK, bSG_gK = self._data_tma_partition(
-                        tma_atom_k,  tma_k_v,  (self.BT, self.BK), sK,  i_h, data_bidx,
+                        tma_atom_k,
+                        tma_k_v,
+                        (self.BT, self.BK),
+                        sK,
+                        i_h,
+                        data_bidx,
                     )
                     bSG_sV, bSG_gV = self._data_tma_partition(
-                        tma_atom_v,  tma_v_v,  (self.BT, self.BV), sV,  i_h, data_bidx,
+                        tma_atom_v,
+                        tma_v_v,
+                        (self.BT, self.BV),
+                        sV,
+                        i_h,
+                        data_bidx,
                     )
                     bSG_sGK, bSG_gGK = self._data_tma_partition(
-                        tma_atom_gk, tma_gk_v, (self.BT, self.BK), sGK, i_h, data_bidx,
+                        tma_atom_gk,
+                        tma_gk_v,
+                        (self.BT, self.BK),
+                        sGK,
+                        i_h,
+                        data_bidx,
                     )
                     tAsA, tAgA = self._tma_partition_B(
-                        tma_atom_A, tma_A_v, sA, self.mma_tiler, tiled_mma, data_bidx, i_h,
+                        tma_atom_A,
+                        tma_A_v,
+                        sA,
+                        self.mma_tiler,
+                        tiled_mma,
+                        data_bidx,
+                        i_h,
                     )
 
                 # --- Issue TMA loads ---
@@ -727,9 +801,7 @@ class KDARecomputeWU:
             )
             tiled_r2t = tcgen05.make_tmem_copy(r2t_atom, tCrA)
             thr_r2t = tiled_r2t.get_slice(local_tidx)
-            r2t_src_shape = cute.slice_(
-                thr_r2t.partition_S(tCrA).shape, (None, None, None, None, 0)
-            )
+            r2t_src_shape = cute.slice_(thr_r2t.partition_S(tCrA).shape, (None, None, None, None, 0))
             tRT_tA = thr_r2t.partition_D(tCrA)
 
             out_tile = cute.dice(self.mma_tiler, (1, 1, None))
@@ -737,13 +809,12 @@ class KDARecomputeWU:
             tTR_cM = thr_t2r.partition_D(cM_id)
 
             # Rmem tensors (hoisted outside WU loop to minimise register lifetime)
-            tTR_rAcc   = cute.make_rmem_tensor(tTR_sOut.shape, self.acc_dtype)
+            tTR_rAcc = cute.make_rmem_tensor(tTR_sOut.shape, self.acc_dtype)
             tTR_rBproc = cute.make_rmem_tensor(tTR_sOut.shape, self.io_dtype)
             tRT_rBproc = cute.make_rmem_tensor(r2t_src_shape, self.io_dtype)
-            tTR_rKg    = cute.make_rmem_tensor(tTR_sOut.shape, self.io_dtype)
+            tTR_rKg = cute.make_rmem_tensor(tTR_sOut.shape, self.io_dtype)
 
-            cuda_sync = pipeline.NamedBarrier(
-                barrier_id=2, num_threads=self.num_cuda_threads)
+            cuda_sync = pipeline.NamedBarrier(barrier_id=2, num_threads=self.num_cuda_threads)
 
             # ====== Per-WU loop ======
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
@@ -769,8 +840,10 @@ class KDARecomputeWU:
 
                 # Load beta cooperatively (no A wait needed: CUDA warps don't read sA)
                 beta_gmem_p = cute.make_ptr(
-                    self.io_dtype, (beta_ptr + time_base).toint(),
-                    cute.AddressSpace.gmem, assumed_align=2,
+                    self.io_dtype,
+                    (beta_ptr + time_base).toint(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=2,
                 )
                 beta_gmem = cute.make_tensor(
                     beta_gmem_p,
@@ -786,12 +859,12 @@ class KDARecomputeWU:
 
                     for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                         m_coord, k_coord = tTR_cM[ei]
-                        k_val    = sK[(k_coord,  m_coord, kgk_h.index)].to(self.acc_dtype)
-                        gk_val   = sGK[(k_coord, m_coord, kgk_h.index)]
-                        gn_val   = sGK[(self.BT - 1, m_coord, kgk_h.index)]
+                        k_val = sK[(k_coord, m_coord, kgk_h.index)].to(self.acc_dtype)
+                        gk_val = sGK[(k_coord, m_coord, kgk_h.index)]
+                        gn_val = sGK[(self.BT - 1, m_coord, kgk_h.index)]
                         beta_val = sBeta[k_coord].to(self.acc_dtype)
                         tTR_rBproc[ei] = (k_val * beta_val * cute.exp2(gk_val)).to(self.io_dtype)
-                        tTR_rKg[ei]    = (k_val * cute.exp2(gn_val - gk_val)).to(self.io_dtype)
+                        tTR_rKg[ei] = (k_val * cute.exp2(gn_val - gk_val)).to(self.io_dtype)
 
                     # R2T K bproc -> TMEM -> signal MMA K start
                     tRT_rBproc.store(tTR_rBproc.load())
@@ -806,7 +879,7 @@ class KDARecomputeWU:
                     # Precompute v*beta FIRST (while sK/sV/sGK still held)
                     for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                         m_coord, k_coord = tTR_cM[ei]
-                        v_val    = sV[(k_coord, m_coord, kgk_h.index)].to(self.acc_dtype)
+                        v_val = sV[(k_coord, m_coord, kgk_h.index)].to(self.acc_dtype)
                         beta_val = sBeta[k_coord].to(self.acc_dtype)
                         tTR_rBproc[ei] = (v_val * beta_val).to(self.io_dtype)
                     kgk_h.release()
@@ -814,8 +887,10 @@ class KDARecomputeWU:
 
                     # Stage kg through SMEM for coalesced GMEM writes
                     kg_tile_p = cute.make_ptr(
-                        self.io_dtype, (kg_ptr + k_off).toint(),
-                        cute.AddressSpace.gmem, assumed_align=2,
+                        self.io_dtype,
+                        (kg_ptr + k_off).toint(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=2,
                     )
                     kg_tile = cute.make_tensor(
                         kg_tile_p,
@@ -848,8 +923,10 @@ class KDARecomputeWU:
 
                     # Write w to GMEM via SMEM staging (overlaps with MMA V)
                     w_tile_p = cute.make_ptr(
-                        self.io_dtype, (w_ptr + k_off).toint(),
-                        cute.AddressSpace.gmem, assumed_align=2,
+                        self.io_dtype,
+                        (w_ptr + k_off).toint(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=2,
                     )
                     w_tile = cute.make_tensor(
                         w_tile_p,
@@ -874,8 +951,10 @@ class KDARecomputeWU:
 
                     v_off = time_base * V + i_kv * self.BV
                     u_tile_p = cute.make_ptr(
-                        self.io_dtype, (u_ptr + v_off).toint(),
-                        cute.AddressSpace.gmem, assumed_align=2,
+                        self.io_dtype,
+                        (u_ptr + v_off).toint(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=2,
                     )
                     u_tile = cute.make_tensor(
                         u_tile_p,
@@ -913,9 +992,13 @@ def _compile_recompute_wu(H, K, V, chunk_size=64, block_k=None, block_v=None, pe
         return _recompute_wu_cache[key]
 
     kernel_obj = KDARecomputeWU(
-        K=K, V=V, chunk_size=chunk_size,
-        block_k=block_k, block_v=block_v,
-        persistent=persistent, is_varlen=is_varlen,
+        K=K,
+        V=V,
+        chunk_size=chunk_size,
+        block_k=block_k,
+        block_v=block_v,
+        persistent=persistent,
+        is_varlen=is_varlen,
     )
 
     sym_a = cute.sym_int()
@@ -925,23 +1008,27 @@ def _compile_recompute_wu(H, K, V, chunk_size=64, block_k=None, block_v=None, pe
     BT = chunk_size
 
     if is_varlen:
-        k_fake    = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, K),  stride_order=(2,1,0), assumed_align=128)
-        v_fake    = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, V),  stride_order=(2,1,0), assumed_align=128)
-        beta_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H),     stride_order=(1,0),   assumed_align=128)
-        A_fake    = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, BT), stride_order=(2,1,0), assumed_align=128)
-        gk_fake   = make_fake_compact_tensor(cutlass.Float32,  (sym_a, H, K),  stride_order=(2,1,0), assumed_align=128)
-        w_fake    = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, K),  stride_order=(2,1,0), assumed_align=128)
-        u_fake    = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, V),  stride_order=(2,1,0), assumed_align=128)
-        kg_fake   = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, K),  stride_order=(2,1,0), assumed_align=128)
+        k_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, K), stride_order=(2, 1, 0), assumed_align=128)
+        v_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, V), stride_order=(2, 1, 0), assumed_align=128)
+        beta_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H), stride_order=(1, 0), assumed_align=128)
+        A_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, BT), stride_order=(2, 1, 0), assumed_align=128)
+        gk_fake = make_fake_compact_tensor(cutlass.Float32, (sym_a, H, K), stride_order=(2, 1, 0), assumed_align=128)
+        w_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, K), stride_order=(2, 1, 0), assumed_align=128)
+        u_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, V), stride_order=(2, 1, 0), assumed_align=128)
+        kg_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, K), stride_order=(2, 1, 0), assumed_align=128)
     else:
-        k_fake    = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, K),  stride_order=(3,2,1,0), assumed_align=128)
-        v_fake    = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, V),  stride_order=(3,2,1,0), assumed_align=128)
-        beta_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H),     stride_order=(2,1,0),   assumed_align=128)
-        A_fake    = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, BT), stride_order=(3,2,1,0), assumed_align=128)
-        gk_fake   = make_fake_compact_tensor(cutlass.Float32,  (sym_a, sym_b, H, K),  stride_order=(3,2,1,0), assumed_align=128)
-        w_fake    = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, K),  stride_order=(3,2,1,0), assumed_align=128)
-        u_fake    = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, V),  stride_order=(3,2,1,0), assumed_align=128)
-        kg_fake   = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, K),  stride_order=(3,2,1,0), assumed_align=128)
+        k_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
+        v_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, V), stride_order=(3, 2, 1, 0), assumed_align=128)
+        beta_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H), stride_order=(2, 1, 0), assumed_align=128)
+        A_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_b, H, BT), stride_order=(3, 2, 1, 0), assumed_align=128
+        )
+        gk_fake = make_fake_compact_tensor(cutlass.Float32, (sym_a, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
+        w_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
+        u_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, V), stride_order=(3, 2, 1, 0), assumed_align=128)
+        kg_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128
+        )
 
     cu_fake = make_fake_compact_tensor(cutlass.Int32, (sym_cu,), assumed_align=128)
     ci_fake = make_fake_compact_tensor(cutlass.Int32, (sym_ci,), assumed_align=128)
@@ -949,9 +1036,16 @@ def _compile_recompute_wu(H, K, V, chunk_size=64, block_k=None, block_v=None, pe
 
     compiled_fn = cute.compile(
         kernel_obj,
-        k_fake, v_fake, beta_fake, A_fake, gk_fake,
-        w_fake, u_fake, kg_fake,
-        cu_fake, ci_fake,
+        k_fake,
+        v_fake,
+        beta_fake,
+        A_fake,
+        gk_fake,
+        w_fake,
+        u_fake,
+        kg_fake,
+        cu_fake,
+        ci_fake,
         (Int32(1), Int32(1), Int32(H), Int32(K), Int32(V)),
         Int32(1),
         stream_fake,
@@ -965,17 +1059,16 @@ def _compile_recompute_wu(H, K, V, chunk_size=64, block_k=None, block_v=None, pe
 # Public API
 # ============================================================================
 
-def recompute_w_u_fwd(k, v, beta, A, gk,
-                      cu_seqlens=None, chunk_indices=None,
-                      persistent=True, block_k=None, block_v=None):
+
+def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, persistent=True, block_k=None, block_v=None):
     is_varlen = cu_seqlens is not None
 
     if is_varlen:
         assert chunk_indices is not None
-        T_total  = k.shape[0]
-        H, K     = k.shape[1], k.shape[2]
-        V        = v.shape[2]
-        BT       = A.shape[-1]
+        T_total = k.shape[0]
+        H, K = k.shape[1], k.shape[2]
+        V = v.shape[2]
+        BT = A.shape[-1]
         num_seqs = cu_seqlens.shape[0] - 1
         total_nt = chunk_indices.shape[0] // 2
         ps = (Int32(num_seqs), Int32(T_total), Int32(H), Int32(K), Int32(V))
@@ -983,9 +1076,9 @@ def recompute_w_u_fwd(k, v, beta, A, gk,
         ci_s = chunk_indices
     else:
         B, T, H, K = k.shape
-        V    = v.shape[-1]
-        BT   = A.shape[-1]
-        NT   = (T + BT - 1) // BT
+        V = v.shape[-1]
+        BT = A.shape[-1]
+        NT = (T + BT - 1) // BT
         total_nt = B * NT
         ps = (Int32(B), Int32(T), Int32(H), Int32(K), Int32(V))
         global _dummy_cu_seqlens, _dummy_chunk_indices
@@ -996,13 +1089,19 @@ def recompute_w_u_fwd(k, v, beta, A, gk,
         cu_s = _dummy_cu_seqlens
         ci_s = _dummy_chunk_indices
 
-    w  = torch.empty_like(k)
-    u  = torch.empty_like(v)
+    w = torch.empty_like(k)
+    u = torch.empty_like(v)
     kg = torch.empty_like(k)
 
     compiled_fn = _compile_recompute_wu(
-        H, K, V, chunk_size=BT, block_k=block_k, block_v=block_v,
-        persistent=persistent, is_varlen=is_varlen,
+        H,
+        K,
+        V,
+        chunk_size=BT,
+        block_k=block_k,
+        block_v=block_v,
+        persistent=persistent,
+        is_varlen=is_varlen,
     )
     compiled_fn(k, v, beta, A, gk, w, u, kg, cu_s, ci_s, ps, Int32(total_nt))
     return w, u, None, kg
@@ -1012,53 +1111,54 @@ def recompute_w_u_fwd(k, v, beta, A, gk,
 # Reference
 # ============================================================================
 
+
 def recompute_w_u_fwd_ref(k, v, beta, A, gk):
     """Reference implementation supporting both [B,T,H,K] and [T_total,H,K] inputs."""
     if k.dim() == 4:
         B, T, H, K = k.shape
         BT = A.shape[-1]
         NT = (T + BT - 1) // BT
-        w  = torch.empty_like(k)
-        u  = torch.empty_like(v)
+        w = torch.empty_like(k)
+        u = torch.empty_like(v)
         kg = torch.empty_like(k)
         for b in range(B):
             for h in range(H):
                 for it in range(NT):
                     t0, t1 = it * BT, min((it + 1) * BT, T)
-                    b_A    = A[b, t0:t1, h, :t1-t0].float()
+                    b_A = A[b, t0:t1, h, : t1 - t0].float()
                     b_beta = beta[b, t0:t1, h].float()
-                    b_k    = k[b, t0:t1, h, :].float()
-                    b_gk   = gk[b, t0:t1, h, :].float()
-                    b_v    = v[b, t0:t1, h, :].float()
-                    w[b, t0:t1, h, :]  = (b_A @ (b_k * b_beta[:, None] * 2.0**b_gk)).to(k.dtype)
-                    u[b, t0:t1, h, :]  = (b_A @ (b_v * b_beta[:, None])).to(v.dtype)
-                    b_gn = gk[b, t1-1, h, :].float()
-                    kg[b, t0:t1, h, :] = (b_k * 2.0**(b_gn - b_gk)).to(k.dtype)
+                    b_k = k[b, t0:t1, h, :].float()
+                    b_gk = gk[b, t0:t1, h, :].float()
+                    b_v = v[b, t0:t1, h, :].float()
+                    w[b, t0:t1, h, :] = (b_A @ (b_k * b_beta[:, None] * 2.0**b_gk)).to(k.dtype)
+                    u[b, t0:t1, h, :] = (b_A @ (b_v * b_beta[:, None])).to(v.dtype)
+                    b_gn = gk[b, t1 - 1, h, :].float()
+                    kg[b, t0:t1, h, :] = (b_k * 2.0 ** (b_gn - b_gk)).to(k.dtype)
         return w, u, None, kg
     else:
         # varlen: k is [T_total, H, K]
         T_total, H, K = k.shape
         BT = A.shape[-1]
         NT = (T_total + BT - 1) // BT
-        w  = torch.empty_like(k)
-        u  = torch.empty_like(v)
+        w = torch.empty_like(k)
+        u = torch.empty_like(v)
         kg = torch.empty_like(k)
         for h in range(H):
             for it in range(NT):
                 t0, t1 = it * BT, min((it + 1) * BT, T_total)
-                b_A    = A[t0:t1, h, :t1-t0].float()
+                b_A = A[t0:t1, h, : t1 - t0].float()
                 b_beta = beta[t0:t1, h].float()
-                b_k    = k[t0:t1, h, :].float()
-                b_gk   = gk[t0:t1, h, :].float()
-                b_v    = v[t0:t1, h, :].float()
-                w[t0:t1, h, :]  = (b_A @ (b_k * b_beta[:, None] * 2.0**b_gk)).to(k.dtype)
-                u[t0:t1, h, :]  = (b_A @ (b_v * b_beta[:, None])).to(v.dtype)
-                b_gn = gk[t1-1, h, :].float()
-                kg[t0:t1, h, :] = (b_k * 2.0**(b_gn - b_gk)).to(k.dtype)
+                b_k = k[t0:t1, h, :].float()
+                b_gk = gk[t0:t1, h, :].float()
+                b_v = v[t0:t1, h, :].float()
+                w[t0:t1, h, :] = (b_A @ (b_k * b_beta[:, None] * 2.0**b_gk)).to(k.dtype)
+                u[t0:t1, h, :] = (b_A @ (b_v * b_beta[:, None])).to(v.dtype)
+                b_gn = gk[t1 - 1, h, :].float()
+                kg[t0:t1, h, :] = (b_k * 2.0 ** (b_gn - b_gk)).to(k.dtype)
         return w, u, None, kg
 
 
-def build_chunk_indices_wu(seq_lens, BT=64, device='cuda'):
+def build_chunk_indices_wu(seq_lens, BT=64, device="cuda"):
     """Build chunk_indices [NT*2] for varlen recompute_wu."""
     pairs = []
     for seq_idx, sl in enumerate(seq_lens):
@@ -1071,8 +1171,10 @@ def build_chunk_indices_wu(seq_lens, BT=64, device='cuda'):
 # Test & Benchmark
 # ============================================================================
 
+
 def main():
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", choices=["correctness", "benchmark", "both"], default="both")
     parser.add_argument("--persistent", type=int, default=0)
@@ -1097,10 +1199,10 @@ def main():
     torch.cuda.synchronize()
     w, u, _, kg = recompute_w_u_fwd(k, v, beta, A, gk, persistent=do_persistent)
     torch.cuda.synchronize()
-    dw  = (w.float()  - w_ref.float()).abs().max().item()
-    du  = (u.float()  - u_ref.float()).abs().max().item()
+    dw = (w.float() - w_ref.float()).abs().max().item()
+    du = (u.float() - u_ref.float()).abs().max().item()
     dkg = (kg.float() - kg_ref.float()).abs().max().item()
-    ok  = dw < 1.0 and du < 1.0 and dkg < 1.0
+    ok = dw < 1.0 and du < 1.0 and dkg < 1.0
     print(f"  K=64 V=64: w={dw:.6f} u={du:.6f} kg={dkg:.6f} {'PASS' if ok else 'FAIL'}")
 
     # Test K=128,V=128
@@ -1138,35 +1240,43 @@ def main():
         ci_t = build_chunk_indices_wu(seq_lens, BT=BT3, device="cuda")
 
         torch.manual_seed(77)
-        k_f    = torch.randn(T_total, H3, K3, device="cuda", dtype=torch.bfloat16) * 0.1
-        v_f    = torch.randn(T_total, H3, V3, device="cuda", dtype=torch.bfloat16) * 0.1
+        k_f = torch.randn(T_total, H3, K3, device="cuda", dtype=torch.bfloat16) * 0.1
+        v_f = torch.randn(T_total, H3, V3, device="cuda", dtype=torch.bfloat16) * 0.1
         beta_f = torch.sigmoid(torch.randn(T_total, H3, device="cuda", dtype=torch.bfloat16))
-        gk_f   = (-torch.abs(torch.randn(T_total, H3, K3, device="cuda", dtype=torch.float32)) * 0.1).cumsum(dim=0)
+        gk_f = (-torch.abs(torch.randn(T_total, H3, K3, device="cuda", dtype=torch.float32)) * 0.1).cumsum(dim=0)
         NT_total = T_total // BT3
         A_f = (
             torch.tril(torch.randn(NT_total, H3, BT3, BT3, device="cuda", dtype=torch.bfloat16) * 0.1)
-            .permute(0, 2, 1, 3).contiguous().reshape(T_total, H3, BT3)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .reshape(T_total, H3, BT3)
         )
 
         w_rf = torch.empty_like(k_f)
         u_rf = torch.empty_like(v_f)
         kg_rf = torch.empty_like(k_f)
         for si, sl in enumerate(seq_lens):
-            s, e = cu_list[si], cu_list[si+1]
+            s, e = cu_list[si], cu_list[si + 1]
             wr, ur, _, kgr = recompute_w_u_fwd_ref(k_f[s:e], v_f[s:e], beta_f[s:e], A_f[s:e], gk_f[s:e])
             w_rf[s:e] = wr
             u_rf[s:e] = ur
             kg_rf[s:e] = kgr
 
         wf, uf, _, kgf = recompute_w_u_fwd(
-            k_f, v_f, beta_f, A_f, gk_f,
-            cu_seqlens=cu_t, chunk_indices=ci_t, persistent=do_persistent,
+            k_f,
+            v_f,
+            beta_f,
+            A_f,
+            gk_f,
+            cu_seqlens=cu_t,
+            chunk_indices=ci_t,
+            persistent=do_persistent,
         )
         torch.cuda.synchronize()
-        dwf  = (wf.float()  - w_rf.float()).abs().max().item()
-        duf  = (uf.float()  - u_rf.float()).abs().max().item()
+        dwf = (wf.float() - w_rf.float()).abs().max().item()
+        duf = (uf.float() - u_rf.float()).abs().max().item()
         dkgf = (kgf.float() - kg_rf.float()).abs().max().item()
-        okf  = dwf < 1.0 and duf < 1.0 and dkgf < 1.0
+        okf = dwf < 1.0 and duf < 1.0 and dkgf < 1.0
         all_ok = all_ok and okf
         print(f"  seq_lens={seq_lens}: w={dwf:.6f} u={duf:.6f} kg={dkgf:.6f} {'PASS' if okf else 'FAIL'}")
 
@@ -1177,15 +1287,15 @@ def main():
         BTb = 64
         NTb = Tb // BTb
         torch.manual_seed(999)
-        kb    = torch.randn(Bb, Tb, Hb, Kb, device="cuda", dtype=torch.bfloat16) * 0.1
-        vb    = torch.randn(Bb, Tb, Hb, Vb, device="cuda", dtype=torch.bfloat16) * 0.1
+        kb = torch.randn(Bb, Tb, Hb, Kb, device="cuda", dtype=torch.bfloat16) * 0.1
+        vb = torch.randn(Bb, Tb, Hb, Vb, device="cuda", dtype=torch.bfloat16) * 0.1
         betab = torch.sigmoid(torch.randn(Bb, Tb, Hb, device="cuda", dtype=torch.bfloat16))
-        gkb   = (-torch.abs(torch.randn(Bb, Tb, Hb, Kb, device="cuda", dtype=torch.float32)) * 0.1).cumsum(dim=1)
-        Ab    = torch.tril(torch.randn(Bb, NTb, Hb, BTb, BTb, device="cuda", dtype=torch.bfloat16) * 0.1).reshape(Bb, Tb, Hb, BTb)
+        gkb = (-torch.abs(torch.randn(Bb, Tb, Hb, Kb, device="cuda", dtype=torch.float32)) * 0.1).cumsum(dim=1)
+        Ab = torch.tril(torch.randn(Bb, NTb, Hb, BTb, BTb, device="cuda", dtype=torch.bfloat16) * 0.1).reshape(Bb, Tb, Hb, BTb)
 
         n_iter = 20
         start = torch.cuda.Event(enable_timing=True)
-        end   = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
 
         for mode, p in [("non-persistent (occ=2, 1-stage)", False), ("persistent   (occ=2, 2-stage A)", True)]:
             for _ in range(3):
@@ -1201,6 +1311,7 @@ def main():
 
         try:
             from fla.ops.kda.wy_fast import recompute_w_u_fwd as fla_recompute
+
             for _ in range(3):
                 fla_recompute(kb, vb, betab, Ab, gk=gkb)
             torch.cuda.synchronize()

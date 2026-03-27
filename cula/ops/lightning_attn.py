@@ -44,7 +44,7 @@ Mathematical formulation:
 For each head h with decay parameter s_h:
 - λ_h = exp(-s_h) where s_h > 0
 - Intra-chunk: O_intra = (QK^T ⊙ D) · V where D_ij = exp(-s·(i-j)) for i≥j
-- Inter-chunk state: S_i = λ^C · S_{i-1} + K_i^T V_i  
+- Inter-chunk state: S_i = λ^C · S_{i-1} + K_i^T V_i
 - Inter-chunk output: O_inter = (Q · S) ⊙ exp(-s·offset)
 - Final output: O = O_intra + O_inter
 """
@@ -76,27 +76,31 @@ def _atomic_add_global_i32(ptr_i64, addend_i32, *, loc=None, ip=None):
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc, ip=ip,
+        loc=loc,
+        ip=ip,
     )
     return Int32(result)
 
 
-PRINT_DEBUG=False
+PRINT_DEBUG = False
+
 
 class MaskEnum:
     """Enumeration for different mask types."""
+
     NONE = 0
     PADDING = 1
     CAUSAL = 2
 
+
 class LinearAttentionChunkwiseDecay:
     """
     Chunkwise Linear Attention with Per-Head Exponential Decay using CuTe DSL
-    
+
     Implements the Lightning Attention algorithm with headwise exponential decay factors.
     Decomposes attention into intra-chunk (local) and inter-chunk (global) components,
     applying exponential decay to both components.
-    
+
     Args:
         chunk_size: Size of each attention chunk (default: 64)
         acc_dtype: Accumulator data type for all MMA computations (default: Float32)
@@ -121,13 +125,9 @@ class LinearAttentionChunkwiseDecay:
         is_varlen: bool = False,
         persistent: bool = True,
     ):
-        assert K == 128 and V == 128, (
-            f"K and V must both be 128, got K={K}, V={V}"
-        )
+        assert K == 128 and V == 128, f"K and V must both be 128, got K={K}, V={V}"
         cc = torch.cuda.get_device_capability()
-        assert cc[0] == 10 and cc[1] == 0, (
-            f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
-        )
+        assert cc[0] == 10 and cc[1] == 0, f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
         self.chunk_size = chunk_size
         self.acc_dtype = acc_dtype
         self.io_dtype = io_dtype
@@ -222,12 +222,8 @@ class LinearAttentionChunkwiseDecay:
         # (MMA, MMA_M, MMA_N)
         acc_shape_qk = tiled_mma_qk.partition_shape_C(tile_shape_mnk_qk[:2])
         # (MMA, MMA_M, MMA_N)
-        tCtAccQK_fake = tiled_mma_qk.make_fragment_C(
-            cute.append(acc_shape_qk, acc_stages)
-        )
-        tCtAccQK_fake2 = tiled_mma_qk.make_fragment_C(
-            cute.append(acc_shape_qk, 1)
-        )
+        tCtAccQK_fake = tiled_mma_qk.make_fragment_C(cute.append(acc_shape_qk, acc_stages))
+        tCtAccQK_fake2 = tiled_mma_qk.make_fragment_C(cute.append(acc_shape_qk, 1))
         num_qk_acc_cols = tcgen05.find_tmem_tensor_col_offset(tCtAccQK_fake)
         num_qk_acc_cols2 = tcgen05.find_tmem_tensor_col_offset(tCtAccQK_fake2)
         # NOTE: 64dp makes the datapath utilization halved
@@ -235,18 +231,14 @@ class LinearAttentionChunkwiseDecay:
             print(f"tCtAccQK_fake={tCtAccQK_fake}, num_qk_acc_cols={num_qk_acc_cols}, num_qk_acc_cols2={num_qk_acc_cols2}")
 
         acc_shape_pv = tiled_mma_pv.partition_shape_C(tile_shape_mnk_pv[:2])
-        tCtAccPV_fake = tiled_mma_pv.make_fragment_C(
-            cute.append(acc_shape_pv, acc_stages)
-        )
+        tCtAccPV_fake = tiled_mma_pv.make_fragment_C(cute.append(acc_shape_pv, acc_stages))
         num_pv_acc_cols = tcgen05.find_tmem_tensor_col_offset(tCtAccPV_fake)
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"tCtAccPV_fake={tCtAccPV_fake}, num_pv_acc_cols={num_pv_acc_cols}")
 
         # KV state with configurable stages for pipeline optimization
         acc_shape_kv = tiled_mma_kv.partition_shape_C(tile_shape_mnk_kv[:2])
-        tCtAccKV_fake = tiled_mma_kv.make_fragment_C(
-            cute.append(acc_shape_kv, kv_stages)
-        )
+        tCtAccKV_fake = tiled_mma_kv.make_fragment_C(cute.append(acc_shape_kv, kv_stages))
         num_kv_acc_cols = tcgen05.find_tmem_tensor_col_offset(tCtAccKV_fake)
         # KV16 needs separate allocation (cannot trivially reuse KV due to layout differences)
         # BF16 has half columns of FP32
@@ -256,9 +248,7 @@ class LinearAttentionChunkwiseDecay:
 
         acc_shape_sq = tiled_mma_sq.partition_shape_C(tile_shape_mnk_sq[:2])
         # No Stage for QS since state has no stages.
-        tCtAccSQ_fake = tiled_mma_sq.make_fragment_C(
-            cute.append(acc_shape_sq, 1)
-        )
+        tCtAccSQ_fake = tiled_mma_sq.make_fragment_C(cute.append(acc_shape_sq, 1))
         num_sq_acc_cols = tcgen05.find_tmem_tensor_col_offset(tCtAccSQ_fake)
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"tCtAccSQ_fake={tCtAccSQ_fake}, num_sq_acc_cols={num_sq_acc_cols}")
@@ -276,10 +266,9 @@ class LinearAttentionChunkwiseDecay:
             num_tmem_cols_total *= 2
         assert num_tmem_cols_total <= SM100_TMEM_CAPACITY_COLS
 
-
         if cutlass.const_expr(PRINT_DEBUG):
             # Always print TMEM allocation details for capacity analysis
-            print("="*80)
+            print("=" * 80)
             print("TMEM Allocation Details:")
             print(f"  QK acc:      {num_qk_acc_cols:4d} cols @ offset {num_qk_acc_cols_offset:4d} (stages={acc_stages})")
             print(f"  PV acc:      {num_pv_acc_cols:4d} cols @ offset {num_pv_acc_cols_offset:4d} (stages={acc_stages})")
@@ -290,10 +279,12 @@ class LinearAttentionChunkwiseDecay:
             print(f"  Total (raw): {num_tmem_cols_total_tmp:4d} cols")
             print(f"  Total (pow2):{num_tmem_cols_total:4d} cols")
             print(f"  Capacity:    {SM100_TMEM_CAPACITY_COLS:4d} cols")
-            print(f"  Usage:       {num_tmem_cols_total/SM100_TMEM_CAPACITY_COLS*100:5.1f}%")
+            print(f"  Usage:       {num_tmem_cols_total / SM100_TMEM_CAPACITY_COLS * 100:5.1f}%")
             print(f"  Margin:      {SM100_TMEM_CAPACITY_COLS - num_tmem_cols_total:4d} cols available")
-            print(f"  Size (KB):   {num_tmem_cols_total * BITS_PER_TMEM_COL / 8 / 1024:.1f} KB / {SM100_TMEM_CAPACITY_COLS * BITS_PER_TMEM_COL / 8 / 1024:.1f} KB")
-            print("="*80)
+            print(
+                f"  Size (KB):   {num_tmem_cols_total * BITS_PER_TMEM_COL / 8 / 1024:.1f} KB / {SM100_TMEM_CAPACITY_COLS * BITS_PER_TMEM_COL / 8 / 1024:.1f} KB"
+            )
+            print("=" * 80)
 
         return (
             num_qk_acc_cols_offset,
@@ -320,7 +311,7 @@ class LinearAttentionChunkwiseDecay:
         self,
         o_shape: cute.Shape,
         chunk_size: int,
-        ) -> cute.Shape:
+    ) -> cute.Shape:
         """Compute tile scheduler parameters based on the chunk size and MMA tiler."""
         # (D, S, (H, B))
         return (
@@ -341,10 +332,10 @@ class LinearAttentionChunkwiseDecay:
         decay_in: cute.Tensor,
         initial_state_in: cute.Tensor,
         final_state_in: cute.Tensor,
-        cu_seqlens_in: cute.Tensor,            # [N+1] int32, varlen only (None otherwise)
+        cu_seqlens_in: cute.Tensor,  # [N+1] int32, varlen only (None otherwise)
         initial_state_indices_in: cute.Tensor,  # [N] int32, varlen only (None otherwise)
-        o_tensor_in: cute.Tensor,              # Output tensor for varlen CopyUniversal tail store
-        workspace_in: cute.Tensor,             # Workspace for persistent kernel atomic counter
+        o_tensor_in: cute.Tensor,  # Output tensor for varlen CopyUniversal tail store
+        workspace_in: cute.Tensor,  # Workspace for persistent kernel atomic counter
         problem_size: tuple[Int32, Int32],  # (N, T) for varlen, (B, S) for non-varlen
         stream,  # CUstream type annotation removed to avoid import issues
     ):
@@ -385,26 +376,26 @@ class LinearAttentionChunkwiseDecay:
         # For non-varlen: input is [B, S, H, D] → view as (S, D, (H,B))
         if cutlass.const_expr(self.is_varlen):
             # Varlen: B=N (num_seqs), S=T (total_tokens), no batch stride
-            q_layout = cute.make_layout((S, D, H), stride=(D*H, 1, D))
-            k_layout = cute.make_layout((S, D, H), stride=(D*H, 1, D))
-            v_layout = cute.make_layout((D, S, H), stride=(1, D*H, D))
-            o_layout = cute.make_layout((D, S, H), stride=(1, D*H, D))
+            q_layout = cute.make_layout((S, D, H), stride=(D * H, 1, D))
+            k_layout = cute.make_layout((S, D, H), stride=(D * H, 1, D))
+            v_layout = cute.make_layout((D, S, H), stride=(1, D * H, D))
+            o_layout = cute.make_layout((D, S, H), stride=(1, D * H, D))
         else:
             q_layout = cute.make_layout(
-                (S, D, (H,B)),
-                stride=(D*H, 1, (D, D*H*S)),
+                (S, D, (H, B)),
+                stride=(D * H, 1, (D, D * H * S)),
             )
             k_layout = cute.make_layout(
-                (S, D, (H,B)),
-                stride=(D*H, 1, (D, D*H*S)),
+                (S, D, (H, B)),
+                stride=(D * H, 1, (D, D * H * S)),
             )
             v_layout = cute.make_layout(
-                (D, S, (H,B)),
-                stride=(1, D*H, (D, D*H*S)),
+                (D, S, (H, B)),
+                stride=(1, D * H, (D, D * H * S)),
             )
             o_layout = cute.make_layout(
-                (D, S, (H,B)),
-                stride=(1, D*H, (D, D*H*S)),
+                (D, S, (H, B)),
+                stride=(1, D * H, (D, D * H * S)),
             )
         q = cute.make_tensor(q_in.iterator, q_layout)
         k = cute.make_tensor(k_in.iterator, k_layout)
@@ -418,7 +409,7 @@ class LinearAttentionChunkwiseDecay:
         # pool dimension — strides are correct regardless of actual pool_size.
         fstate_layout = cute.make_layout(
             (D, D, (H, B)),
-            stride=(1, D, (D*D, D*D*H)),
+            stride=(1, D, (D * D, D * D * H)),
         )
         if cutlass.const_expr(self.has_initial_state):
             initial_state = cute.make_tensor(initial_state_in.iterator, fstate_layout)
@@ -520,8 +511,8 @@ class LinearAttentionChunkwiseDecay:
         # Output shape, (D, C)
 
         # TODO: check transpose here
-        self.epi_tile = (self.vp_mma_tiler[0], self.vp_mma_tiler[1]) # (D, S)
-        self.qk_epi_tile = (self.qk_mma_tiler[0], self.qk_mma_tiler[1]) # qk
+        self.epi_tile = (self.vp_mma_tiler[0], self.vp_mma_tiler[1])  # (D, S)
+        self.qk_epi_tile = (self.qk_mma_tiler[0], self.qk_mma_tiler[1])  # qk
 
         # Q&K^T
         q_smem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -582,7 +573,7 @@ class LinearAttentionChunkwiseDecay:
         tma_store_op = cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()
 
         # TMA load for Q
-        q_smem_layout = cute.select(q_smem_layout_staged, mode=[0,1,2])
+        q_smem_layout = cute.select(q_smem_layout_staged, mode=[0, 1, 2])
         tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
             q,
@@ -625,7 +616,7 @@ class LinearAttentionChunkwiseDecay:
         v_copy_size = cute.size_in_bytes(self.v_dtype, v_smem_layout)
         self.tma_copy_q_bytes = q_copy_size
         self.tma_copy_k_bytes = k_copy_size
-        self.tma_copy_v_bytes = k_copy_size        
+        self.tma_copy_v_bytes = k_copy_size
 
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"q_layout: {cute.pretty_str(q_layout)}")
@@ -674,52 +665,52 @@ class LinearAttentionChunkwiseDecay:
         class SharedStorage:
             # Pipeline barriers
             # Inputs
-            load_q_mbar_ptr: cute.struct.MemRange[Int64, self.q_stage * 2] # type: ignore
-            load_k_mbar_ptr: cute.struct.MemRange[Int64, self.k_stage * 2] # type: ignore
-            load_v_mbar_ptr: cute.struct.MemRange[Int64, self.v_stage * 2] # type: ignore
+            load_q_mbar_ptr: cute.struct.MemRange[Int64, self.q_stage * 2]  # type: ignore
+            load_k_mbar_ptr: cute.struct.MemRange[Int64, self.k_stage * 2]  # type: ignore
+            load_v_mbar_ptr: cute.struct.MemRange[Int64, self.v_stage * 2]  # type: ignore
             # Masking
-            s_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
+            s_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2]  # type: ignore
             # KV
-            kv_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
-            kv16_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
-            p_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
-            o_intra_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
-            o_inter_mbar_ptr: cute.struct.MemRange[Int64, 1 * 2] # type: ignore
-            smem_o_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2] # type: ignore
-            k_weighted_mbar_ptr: cute.struct.MemRange[Int64, 1 * 2] # type: ignore
+            kv_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2]  # type: ignore
+            kv16_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2]  # type: ignore
+            p_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2]  # type: ignore
+            o_intra_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2]  # type: ignore
+            o_inter_mbar_ptr: cute.struct.MemRange[Int64, 1 * 2]  # type: ignore
+            smem_o_mbar_ptr: cute.struct.MemRange[Int64, self.acc_stage * 2]  # type: ignore
+            k_weighted_mbar_ptr: cute.struct.MemRange[Int64, 1 * 2]  # type: ignore
             # Tmem holding buffer
             tmem_holding_buf: Int32
             # Smem tensors
             sO: cute.struct.Align[
-                cute.struct.MemRange[self.o_dtype, cute.cosize(o_smem_layout_staged)], # type: ignore
+                cute.struct.MemRange[self.o_dtype, cute.cosize(o_smem_layout_staged)],  # type: ignore
                 self.buffer_align_bytes,
             ]
             sQ: cute.struct.Align[
-                cute.struct.MemRange[self.q_dtype, cute.cosize(q_smem_layout_staged)], # type: ignore
+                cute.struct.MemRange[self.q_dtype, cute.cosize(q_smem_layout_staged)],  # type: ignore
                 self.buffer_align_bytes,
             ]
             sK: cute.struct.Align[
-                cute.struct.MemRange[self.k_dtype, cute.cosize(k_smem_layout_staged)], # type: ignore
+                cute.struct.MemRange[self.k_dtype, cute.cosize(k_smem_layout_staged)],  # type: ignore
                 self.buffer_align_bytes,
             ]
             sV: cute.struct.Align[
-                cute.struct.MemRange[self.v_dtype, cute.cosize(v_smem_layout_staged)], # type: ignore
+                cute.struct.MemRange[self.v_dtype, cute.cosize(v_smem_layout_staged)],  # type: ignore
                 self.buffer_align_bytes,
             ]
             # Store QK
             sP: cute.struct.Align[
-                cute.struct.MemRange[self.v_dtype, cute.cosize(p_smem_layout_staged)], # type: ignore
+                cute.struct.MemRange[self.v_dtype, cute.cosize(p_smem_layout_staged)],  # type: ignore
                 self.buffer_align_bytes,
             ]
             # Decay lookup table: exp(-s*k) for k=0..C-1 (64 FP32 = 256 bytes)
             sDecayLUT: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, self.chunk_size], # type: ignore
+                cute.struct.MemRange[cutlass.Float32, self.chunk_size],  # type: ignore
                 self.buffer_align_bytes,
             ]
             # Separate weighted K buffer for KV GEMM (single stage)
             # Allows K weighting to run in parallel with QK GEMM
             sK_weighted: cute.struct.Align[
-                cute.struct.MemRange[self.k_dtype, cute.cosize(kv_k_smem_layout_single)], # type: ignore
+                cute.struct.MemRange[self.k_dtype, cute.cosize(kv_k_smem_layout_single)],  # type: ignore
                 self.buffer_align_bytes,
             ]
             # Double-buffered work index for persistent dynamic scheduling
@@ -731,6 +722,7 @@ class LinearAttentionChunkwiseDecay:
 
         if cutlass.const_expr(self.is_varlen and self.persistent):
             import torch as _torch
+
             sm_count = _torch.cuda.get_device_properties(0).multi_processor_count
             self.grid = (sm_count, 1, 1)
         elif cutlass.const_expr(self.is_varlen):
@@ -805,10 +797,10 @@ class LinearAttentionChunkwiseDecay:
         decay: cute.Pointer,
         initial_state: cute.Tensor,
         final_state: cute.Tensor,
-        cu_seqlens: cute.Tensor,                # [N+1] int32, varlen only
-        initial_state_indices: cute.Tensor,      # [N] int32, varlen only
-        o_tensor: cute.Tensor,                   # Output tensor for varlen CopyUniversal tail store
-        workspace_iter: cute.Pointer,            # Workspace for persistent kernel atomic counter
+        cu_seqlens: cute.Tensor,  # [N+1] int32, varlen only
+        initial_state_indices: cute.Tensor,  # [N] int32, varlen only
+        o_tensor: cute.Tensor,  # Output tensor for varlen CopyUniversal tail store
+        workspace_iter: cute.Pointer,  # Workspace for persistent kernel atomic counter
         q_smem_layout_staged: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
         kv_k_smem_layout_staged: cute.ComposedLayout,
@@ -858,75 +850,57 @@ class LinearAttentionChunkwiseDecay:
         mma_s0_producer, mma_s0_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=self.acc_stage,
             producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.cuda_warp_ids)
-            ),
+            consumer_group=make_thread_cooperative_group(self.threads_per_warp * len(self.cuda_warp_ids)),
             barrier_storage=storage.s_mbar_ptr.data_ptr(),
         ).make_participants()
         # Notify cuda core to convert 32-bit accumulator to 16-bit
         kv_producer, kv_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=self.kv_stage,  # Keep configurable for future optimization
-            producer_group=make_thread_cooperative_group(len([self.mma_warp_id]),),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.cuda_warp_ids)
+            producer_group=make_thread_cooperative_group(
+                len([self.mma_warp_id]),
             ),
+            consumer_group=make_thread_cooperative_group(self.threads_per_warp * len(self.cuda_warp_ids)),
             barrier_storage=storage.kv_mbar_ptr.data_ptr(),
         ).make_participants()
         # Notify mma warp that 16bit state is ready for mma as operand A
         kv16_producer, kv16_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=self.kv_stage,  # Keep configurable for future optimization
-            producer_group=make_thread_cooperative_group(len(self.cuda_warp_ids),),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len([self.mma_warp_id])
+            producer_group=make_thread_cooperative_group(
+                len(self.cuda_warp_ids),
             ),
+            consumer_group=make_thread_cooperative_group(self.threads_per_warp * len([self.mma_warp_id])),
             barrier_storage=storage.kv16_mbar_ptr.data_ptr(),
         ).make_participants()
         p_producer, p_consumer = pipeline.PipelineAsync.create(
             num_stages=self.acc_stage,
-            producer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.cuda_warp_ids)
-            ),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len([self.mma_warp_id])
-            ),
+            producer_group=make_thread_cooperative_group(self.threads_per_warp * len(self.cuda_warp_ids)),
+            consumer_group=make_thread_cooperative_group(self.threads_per_warp * len([self.mma_warp_id])),
             barrier_storage=storage.p_mbar_ptr.data_ptr(),
         ).make_participants()
         o_intra_producer, o_intra_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=self.acc_stage,
             producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.cuda_warp_ids)
-            ),
+            consumer_group=make_thread_cooperative_group(self.threads_per_warp * len(self.cuda_warp_ids)),
             barrier_storage=storage.o_intra_mbar_ptr.data_ptr(),
         ).make_participants()
         o_inter_producer, o_inter_consumer = pipeline.PipelineUmmaAsync.create(
             # NO STAGE for Q*STATE
             num_stages=1,
             producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.cuda_warp_ids)
-            ),
+            consumer_group=make_thread_cooperative_group(self.threads_per_warp * len(self.cuda_warp_ids)),
             barrier_storage=storage.o_inter_mbar_ptr.data_ptr(),
         ).make_participants()
         smem_o_producer, smem_o_consumer = pipeline.PipelineAsync.create(
             num_stages=self.acc_stage,
-            producer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.cuda_warp_ids)
-            ),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len([self.epilogue_warp_id])
-            ),
+            producer_group=make_thread_cooperative_group(self.threads_per_warp * len(self.cuda_warp_ids)),
+            consumer_group=make_thread_cooperative_group(self.threads_per_warp * len([self.epilogue_warp_id])),
             barrier_storage=storage.smem_o_mbar_ptr.data_ptr(),
         ).make_participants()
         # K weighted signal: CUDA core weights K in SMEM, MMA waits before KV GEMM
         k_weighted_producer, k_weighted_consumer = pipeline.PipelineAsync.create(
             num_stages=1,
-            producer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.cuda_warp_ids)
-            ),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len([self.mma_warp_id])
-            ),
+            producer_group=make_thread_cooperative_group(self.threads_per_warp * len(self.cuda_warp_ids)),
+            consumer_group=make_thread_cooperative_group(self.threads_per_warp * len([self.mma_warp_id])),
             barrier_storage=storage.k_weighted_mbar_ptr.data_ptr(),
         ).make_participants()
         # (state_load pipeline removed — h0/ht now use direct GMEM↔RMEM)
@@ -952,47 +926,29 @@ class LinearAttentionChunkwiseDecay:
         # Generate smem tensor Q/K/V/O
         # (MMA, MMA_Q, MMA_D, STAGE_Q)
         # sQ: ((64,16),1,(4,2),2):((64,1),0,(16,4096),8192)>
-        sQ = storage.sQ.get_tensor(
-            q_smem_layout_staged.outer, swizzle=q_smem_layout_staged.inner
-        )
+        sQ = storage.sQ.get_tensor(q_smem_layout_staged.outer, swizzle=q_smem_layout_staged.inner)
         q_as_b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             sq_tiled_mma,
             self.sq_mma_tiler,
             self.q_dtype,
             self.q_stage,
         )
-        sQ_sq = storage.sQ.get_tensor(
-            q_as_b_smem_layout_staged.outer, swizzle=q_as_b_smem_layout_staged.inner
-        )
+        sQ_sq = storage.sQ.get_tensor(q_as_b_smem_layout_staged.outer, swizzle=q_as_b_smem_layout_staged.inner)
         # (MMA, MMA_K, MMA_D, STAGE_K)
         # sK: tensor<ptr<bf16, smem, align<1024>, S<3,4,3>> o
         # ((64,16),1,(4,2),2):((64,1),0,(16,4096),8192)>
-        sK = storage.sK.get_tensor(
-            k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
-        )
-        sK_kv = storage.sK.get_tensor(
-            kv_k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
-        )
+        sK = storage.sK.get_tensor(k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner)
+        sK_kv = storage.sK.get_tensor(kv_k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner)
         # Separate weighted K buffer for KV GEMM (allows parallel K weighting)
-        sK_weighted = storage.sK_weighted.get_tensor(
-            kv_k_smem_layout_single.outer, swizzle=kv_k_smem_layout_single.inner
-        )
+        sK_weighted = storage.sK_weighted.get_tensor(kv_k_smem_layout_single.outer, swizzle=kv_k_smem_layout_single.inner)
         # Decay lookup table
-        sDecayLUT = cute.make_tensor(
-            storage.sDecayLUT.data_ptr(), cute.make_layout(self.chunk_size)
-        )
+        sDecayLUT = cute.make_tensor(storage.sDecayLUT.data_ptr(), cute.make_layout(self.chunk_size))
         # (((64,2),16),1,4,2):(((1,4096),64),0,1024,8192)>
-        sV = storage.sV.get_tensor(
-            v_smem_layout_staged.outer, swizzle=v_smem_layout_staged.inner
-        )
+        sV = storage.sV.get_tensor(v_smem_layout_staged.outer, swizzle=v_smem_layout_staged.inner)
         # (MMA, MMA_N, MMA_K, STAGE)
-        sP = storage.sP.get_tensor(
-            p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner
-        )
+        sP = storage.sP.get_tensor(p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner)
         # (MMA, MMA_M, MMA_K, STAGE_O)
-        sO = storage.sO.get_tensor(
-            o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner
-        )
+        sO = storage.sO.get_tensor(o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner)
 
         qk_smem_layout_staged = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
@@ -1001,7 +957,8 @@ class LinearAttentionChunkwiseDecay:
             self.acc_stage,
         )
         sQK = storage.sP.get_tensor(
-            qk_smem_layout_staged.outer, swizzle=qk_smem_layout_staged.inner,
+            qk_smem_layout_staged.outer,
+            swizzle=qk_smem_layout_staged.inner,
         )
 
         # CopyUniversal epilogue SMEM layout for varlen tail O store
@@ -1013,9 +970,7 @@ class LinearAttentionChunkwiseDecay:
                 (self.D, self.chunk_size),
                 self.acc_stage,
             )
-            sO_epi = storage.sO.get_tensor(
-                o_epi_staged.outer, swizzle=o_epi_staged.inner
-            )
+            sO_epi = storage.sO.get_tensor(o_epi_staged.outer, swizzle=o_epi_staged.inner)
 
         if cutlass.const_expr(PRINT_DEBUG):
             print(f"sQ: {cute.pretty_str(sQ)}")
@@ -1160,7 +1115,7 @@ class LinearAttentionChunkwiseDecay:
         # (Must be outside warp if/elif to avoid SharedStorage serialization)
         # Use self.chunk_size and self.kv_mma_tiler[0] as compile-time D
         # ========================================================
-        _C = self.chunk_size       # compile-time 64
+        _C = self.chunk_size  # compile-time 64
         _D = self.kv_mma_tiler[0]  # compile-time 128
         HALF_D = _D // 2  # 64
         HALF_SMEM_ELEMS = _C * HALF_D  # 64 * 64 = 4096
@@ -1176,16 +1131,10 @@ class LinearAttentionChunkwiseDecay:
             k_smem_layout_epi,
             target_profile=(1, 1, 1),
         )
-        sK_flat_s2r = storage.sK.get_tensor(
-            k_smem_layout_coalesce.outer, swizzle=k_smem_layout_coalesce.inner
-        )
+        sK_flat_s2r = storage.sK.get_tensor(k_smem_layout_coalesce.outer, swizzle=k_smem_layout_coalesce.inner)
 
         # Half-size MMA for partitioned S2R: process (_C, HALF_D) per pass
-        mma_op_half = cute.nvgpu.warp.MmaF16BF16Op(
-            ab_dtype=self.io_dtype,
-            acc_dtype=self.acc_dtype,
-            shape_mnk=(16, 8, 16)
-        )
+        mma_op_half = cute.nvgpu.warp.MmaF16BF16Op(ab_dtype=self.io_dtype, acc_dtype=self.acc_dtype, shape_mnk=(16, 8, 16))
         k_s2r_tiler_half = (_C, _C, HALF_D)  # (M=64, N=64, K=64)
         tiled_mma_k_half = cute.make_tiled_mma(
             mma_op_half,
@@ -1207,14 +1156,15 @@ class LinearAttentionChunkwiseDecay:
 
         # Half-width SMEM views split along D
         k_sml_epi_half = sm100_utils.make_smem_layout_epi(
-            self.k_dtype, utils.LayoutEnum.ROW_MAJOR,
-            (_C, HALF_D), self.k_stage,
+            self.k_dtype,
+            utils.LayoutEnum.ROW_MAJOR,
+            (_C, HALF_D),
+            self.k_stage,
         )
         k_sml_half = cute.coalesce(k_sml_epi_half, target_profile=(1, 1, 1))
         # Fix stage stride: half layout has stride _C*HALF_D but actual SMEM uses _C*_D
         k_half_outer = cute.make_layout(
-            k_sml_half.outer.shape,
-            stride=(*k_sml_half.outer.stride[:-1], k_sml_half.outer.stride[-1] * 2)
+            k_sml_half.outer.shape, stride=(*k_sml_half.outer.stride[:-1], k_sml_half.outer.stride[-1] * 2)
         )
         sK_s2r_h0 = cute.make_tensor(sK_flat_s2r.iterator, layout=k_half_outer)
         sK_s2r_h1 = cute.make_tensor(sK_flat_s2r.iterator + HALF_SMEM_ELEMS, layout=k_half_outer)
@@ -1223,19 +1173,21 @@ class LinearAttentionChunkwiseDecay:
         # sK_weighted half views (single stage) for CUDA core R2S writes
         # Use epilogue layout for S2R/R2S compatibility
         k_sml_epi_single = sm100_utils.make_smem_layout_epi(
-            self.k_dtype, utils.LayoutEnum.ROW_MAJOR,
-            (_C, HALF_D), 1,  # single stage
+            self.k_dtype,
+            utils.LayoutEnum.ROW_MAJOR,
+            (_C, HALF_D),
+            1,  # single stage
         )
         k_sml_single = cute.coalesce(k_sml_epi_single, target_profile=(1, 1, 1))
         # Create flat view of sK_weighted with epilogue layout
         k_weighted_epi = sm100_utils.make_smem_layout_epi(
-            self.k_dtype, utils.LayoutEnum.ROW_MAJOR,
-            (_C, _D), 1,  # single stage
+            self.k_dtype,
+            utils.LayoutEnum.ROW_MAJOR,
+            (_C, _D),
+            1,  # single stage
         )
         k_weighted_coalesce = cute.coalesce(k_weighted_epi, target_profile=(1, 1, 1))
-        sK_weighted_flat = storage.sK_weighted.get_tensor(
-            k_weighted_coalesce.outer, swizzle=k_weighted_coalesce.inner
-        )
+        sK_weighted_flat = storage.sK_weighted.get_tensor(k_weighted_coalesce.outer, swizzle=k_weighted_coalesce.inner)
         # Single-stage half layout (no stage stride adjustment needed)
         sK_weighted_h0 = cute.make_tensor(sK_weighted_flat.iterator, layout=k_sml_single.outer)
         sK_weighted_h1 = cute.make_tensor(sK_weighted_flat.iterator + HALF_SMEM_ELEMS, layout=k_sml_single.outer)
@@ -1255,8 +1207,7 @@ class LinearAttentionChunkwiseDecay:
             sWorkIdx = storage.sWorkIdx.get_tensor(cute.make_layout((2,)))
             if warp_idx == self.load_warp_id:
                 with cute.arch.elect_one():
-                    first_work_idx = _atomic_add_global_i32(
-                        workspace_iter.toint().ir_value(), Int32(1).ir_value())
+                    first_work_idx = _atomic_add_global_i32(workspace_iter.toint().ir_value(), Int32(1).ir_value())
                     sWorkIdx[(0,)] = first_work_idx
                     cute.arch.fence_acq_rel_cta()
                     cute.arch.mbarrier_arrive(sched_mbar_base)
@@ -1382,8 +1333,7 @@ class LinearAttentionChunkwiseDecay:
                     # CTA barrier: sync all warps before WU transition
                     cute.arch.barrier(barrier_id=1, number_of_threads=self.threads_per_cta)
                     with cute.arch.elect_one():
-                        next_idx = _atomic_add_global_i32(
-                            workspace_iter.toint().ir_value(), Int32(1).ir_value())
+                        next_idx = _atomic_add_global_i32(workspace_iter.toint().ir_value(), Int32(1).ir_value())
                         sWorkIdx[(sched_buf,)] = next_idx
                         cute.arch.fence_acq_rel_cta()
                         cute.arch.mbarrier_arrive(sched_mbar_base + sched_buf)
@@ -1396,7 +1346,6 @@ class LinearAttentionChunkwiseDecay:
                     should_continue = wu_iter < num_iters
                 else:
                     should_continue = False
-
 
         # ///////////////////////////////////////////////////////////////////////////////
         # COMPUTE WARPS
@@ -1461,18 +1410,18 @@ class LinearAttentionChunkwiseDecay:
                         b_stage_idx=k_handle.index,
                         acc_stage_idx=s0_handle.index,
                     )
-                    # Release Q. 
+                    # Release Q.
                     q_handle.release()
                     # Commit S = QK.
                     s0_handle.commit()
 
                     # Wait for CUDA core to finish weighting K for per-position decay
                     kw_handle = k_weighted_consumer.wait_and_advance()
-                    
+
                     # Wait for V, then execute KV GEMM (moved earlier)
                     v_handle = load_v_consumer.wait_and_advance()
                     kv_handle = kv_producer.acquire_and_advance()
-                    
+
                     # Execute KV GEMM: State = K_weighted^T @ V
                     kv_tiled_mma = self.exec_mma(
                         tiled_mma=kv_tiled_mma,
@@ -1487,11 +1436,11 @@ class LinearAttentionChunkwiseDecay:
                     kv_handle.commit()
                     k_handle.release()
                     kw_handle.release()
-                    
+
                     # Now wait for P and execute VP GEMM
                     p_handle = p_consumer.wait_and_advance()
                     o_intra_handle = o_intra_producer.acquire_and_advance()
-                    
+
                     # VP GEMM: O_intra = P @ V
                     vp_tiled_mma = self.exec_mma(
                         tiled_mma=vp_tiled_mma,
@@ -1504,7 +1453,7 @@ class LinearAttentionChunkwiseDecay:
                     )
                     p_handle.release()
                     o_intra_handle.commit()
-                    
+
                     # Release K V here
                     v_handle.release()
 
@@ -1533,27 +1482,23 @@ class LinearAttentionChunkwiseDecay:
         elif warp_idx in self.cuda_warp_ids:
             cute.arch.setmaxregister_increase(self.num_regs_cuda)
 
-            #----------------------------------------------------------
+            # ----------------------------------------------------------
             local_tidx = tidx % (self.threads_per_warp * len(self.cuda_warp_ids))
 
             # constant mask tensor
             cM = cute.make_identity_tensor(self.qk_mma_tiler[:2])
-            
+
             # With ACC_STAGE
             # O1
             (
                 tiled_copy_t2r_pv,
                 tTR_tAcc_base_pv,
                 tTR_rAcc_pv,
-            ) = self.epilog_tmem_copy_and_partition(
-                tidx, tCtAccPV, self.vp_mma_tiler, use_2cta_instrs=False
-            )
+            ) = self.epilog_tmem_copy_and_partition(tidx, tCtAccPV, self.vp_mma_tiler, use_2cta_instrs=False)
 
             # ((ATOM_V, REST_V), EPI_M, EPI_N)
             tTR_rO = cute.make_rmem_tensor(tTR_rAcc_pv.shape, self.io_dtype)
-            tiled_copy_r2s_o, tRS_rO, tRS_sO = self.epilog_smem_copy_and_partition_o(
-                tiled_copy_t2r_pv, tTR_rO, tidx, sO
-            )
+            tiled_copy_r2s_o, tRS_rO, tRS_sO = self.epilog_smem_copy_and_partition_o(tiled_copy_t2r_pv, tTR_rO, tidx, sO)
 
             thr_copy_r2s_o = tiled_copy_r2s_o.get_slice(tidx)
 
@@ -1570,16 +1515,13 @@ class LinearAttentionChunkwiseDecay:
                 tiled_copy_t2r_sq,
                 tTR_tAcc_base_sq,
                 tTR_rAcc_sq,
-            ) = self.epilog_tmem_copy_and_partition(
-                tidx, tCtAccSQ, self.sq_mma_tiler, use_2cta_instrs=False
-            )
+            ) = self.epilog_tmem_copy_and_partition(tidx, tCtAccSQ, self.sq_mma_tiler, use_2cta_instrs=False)
 
             # Position identity tensor for SQ output (D, C)
             # Used to apply per-position inter-chunk decay: exp(-s*(pos+1))
             cM_sq = cute.make_identity_tensor(self.sq_mma_tiler[:2])
             thr_copy_t2r_sq_thread = tiled_copy_t2r_sq.get_slice(tidx)
             tTR_cSQ = thr_copy_t2r_sq_thread.partition_D(cM_sq)
-
 
             if cutlass.const_expr(PRINT_DEBUG):
                 print(f"tiled_copy_t2r_pv: {tiled_copy_t2r_pv}")
@@ -1605,7 +1547,7 @@ class LinearAttentionChunkwiseDecay:
                 local_tidx,
                 # (MMA, MMA_M, MMA_N, N_STAGE)
                 # (MMA_M, MMA_N, STAGE)
-                tCtAccQK[((None,None), 0, 0, None)]
+                tCtAccQK[((None, None), 0, 0, None)],
             )
             # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
             tTR_cS = thr_t2r_S.partition_D(cM)
@@ -1634,7 +1576,7 @@ class LinearAttentionChunkwiseDecay:
                 print(f"tTR_rP: {tTR_rP}")
                 print(f"tRS_rP: {tRS_rP}")
                 print(f"tRS_sP: {tRS_sP}")
-            #-------------------------------------------------------
+            # -------------------------------------------------------
 
             # With ACC_STAGE
             # KV
@@ -1642,7 +1584,7 @@ class LinearAttentionChunkwiseDecay:
             tCtAccKV_slice = tCtAccKV[((None, None), 0, 0, None)]
             (
                 tiled_copy_t2r_kv,
-                _, # thr_t2r
+                _,  # thr_t2r
                 tTR_tKV,
                 tTR_rKV,
             ) = self.tmem_load_partition_kv(
@@ -1661,8 +1603,7 @@ class LinearAttentionChunkwiseDecay:
                 local_tidx,
                 tCtAcc=tCtAccKV,
             )
-            tmem_store_rKV = cute.make_tensor(tTR_rKV.iterator,
-                                              layout=tmem_store_rAccKV_f32.layout)
+            tmem_store_rKV = cute.make_tensor(tTR_rKV.iterator, layout=tmem_store_rAccKV_f32.layout)
 
             # BF16 TMEM store partition (for kv16 state used by SQ MMA)
             (
@@ -1673,10 +1614,7 @@ class LinearAttentionChunkwiseDecay:
                 local_tidx,
                 tCtAcc=tCtStateAsF32,
             )
-            tmem_store_rAccKVAsBF16 = cute.recast_tensor(
-                tmem_store_rAccKV,
-                dtype=self.io_dtype
-            )
+            tmem_store_rAccKVAsBF16 = cute.recast_tensor(tmem_store_rAccKV, dtype=self.io_dtype)
             ############################################################
 
             if cutlass.const_expr(PRINT_DEBUG):
@@ -1684,9 +1622,9 @@ class LinearAttentionChunkwiseDecay:
                 print(f"LOAD tTR_tKV: {tTR_tKV}")
                 print(f"LOAD tTR_rKV: {tTR_rKV}")
 
-            #-------------------------------------------------------
+            # -------------------------------------------------------
             # K decay weighting: thread-local partitioning (needs local_tidx)
-            #-------------------------------------------------------
+            # -------------------------------------------------------
             thr_load_k_half = tiled_load_k_half.get_slice(local_tidx)
             thr_store_k_half = tiled_store_k_half.get_slice(local_tidx)
 
@@ -1698,9 +1636,7 @@ class LinearAttentionChunkwiseDecay:
             # Register fragment prototype (for make_fragment_like)
             thr_mma_k_half = tiled_mma_k_half.get_slice(local_tidx)
             sK_s2r_h0_0 = sK_s2r_h0[None, None, 0]
-            tKrK_half_proto = thr_mma_k_half.make_fragment_A(
-                thr_mma_k_half.partition_A(sK_s2r_h0_0)
-            )
+            tKrK_half_proto = thr_mma_k_half.make_fragment_A(thr_mma_k_half.partition_A(sK_s2r_h0_0))
 
             # Identity tensor partition for mapping thread elements to (row, col)
             tKcK_half = thr_mma_k_half.partition_A(cK_half)
@@ -1712,11 +1648,10 @@ class LinearAttentionChunkwiseDecay:
                 print(f"tKsK_s2r_h[0]: {cute.pretty_str(tKsK_s2r_h[0])}")
                 print(f"tKrK_half_proto: {cute.pretty_str(tKrK_half_proto)}")
                 print(f"tKcK_half: {cute.pretty_str(tKcK_half)}")
-            #-------------------------------------------------------
+            # -------------------------------------------------------
 
             # RMEM flat view of KV state (D FP32 values per thread)
-            init_flat = cute.make_tensor(
-                tTR_rKV.iterator, layout=cute.make_layout(_D))
+            init_flat = cute.make_tensor(tTR_rKV.iterator, layout=cute.make_layout(_D))
 
             # Identity tensor for O/PV output position tracking (D, C)
             # Used for tail chunk zeroing in varlen mode
@@ -1765,9 +1700,7 @@ class LinearAttentionChunkwiseDecay:
                 # -------------- Initial State Loading (h0) ----------------
                 if cutlass.const_expr(self.has_initial_state):
                     gState_h0 = initial_state[None, None, (hidx, state_idx)]
-                    gRow_h0 = cute.make_tensor(
-                        gState_h0.iterator + local_tidx,
-                        cute.make_layout(_D, stride=_D))
+                    gRow_h0 = cute.make_tensor(gState_h0.iterator + local_tidx, cute.make_layout(_D, stride=_D))
                     cute.autovec_copy(gRow_h0, init_flat)
 
                     # Store raw h0 as BF16 to kv16 TMEM for SQ MMA at idx=0
@@ -1793,8 +1726,8 @@ class LinearAttentionChunkwiseDecay:
                     if local_tidx == lut_k:
                         sDecayLUT[lut_k] = cute.exp(-decay_s_cuda * cutlass.Float32(lut_k))
                 cute.arch.fence_proxy(
-                    'async.shared',
-                    space='cta',
+                    "async.shared",
+                    space="cta",
                 )
                 self.cuda_sync_barrier.sync()
 
@@ -1822,13 +1755,13 @@ class LinearAttentionChunkwiseDecay:
                         tmem_store_tAccKVi = tmem_store_tAccKV[None, None, None, None, kv16_handle.index]
                         cute.copy(tmem_store_kv, tmem_store_rAccKV, tmem_store_tAccKVi)
                         cute.arch.fence_view_async_tmem_store()
-                        
+
                         kv_state_decayed = tTR_rKV.load() * block_decay
                         tTR_rKV.store(kv_state_decayed)
                         tmem_store_tKVi_f32 = tmem_store_tAccKV_f32[None, None, None, None, 0]
                         cute.copy(tmem_store_kv_f32, tmem_store_rKV, tmem_store_tKVi_f32)
                         cute.arch.fence_view_async_tmem_store()
-                        
+
                         kv16_handle.commit()
 
                     # Weight K to separate buffer (sK_weighted)
@@ -1839,9 +1772,7 @@ class LinearAttentionChunkwiseDecay:
                     for half_idx in cutlass.range_constexpr(2):
                         tKrK_half = cute.make_fragment_like(tKrK_half_proto, self.io_dtype)
                         tKrK_half_cv = thr_load_k_half.retile(tKrK_half)
-                        cute.copy(tiled_load_k_half,
-                                  tKsK_s2r_h[half_idx][None, None, None, k_stage_idx],
-                                  tKrK_half_cv)
+                        cute.copy(tiled_load_k_half, tKsK_s2r_h[half_idx][None, None, None, k_stage_idx], tKrK_half_cv)
 
                         for i in cutlass.range_constexpr(cute.size(tKcK_half)):
                             row, col = tKcK_half[i]
@@ -1853,13 +1784,11 @@ class LinearAttentionChunkwiseDecay:
                                     tKrK_half[i] = self.io_dtype(0.0)
 
                         tKrK_half_cv_dst = thr_store_k_half.retile(tKrK_half)
-                        cute.copy(tiled_store_k_half,
-                                  tKrK_half_cv_dst,
-                                  tKsK_r2s_h_weighted[half_idx][None, None, None, 0])
+                        cute.copy(tiled_store_k_half, tKrK_half_cv_dst, tKsK_r2s_h_weighted[half_idx][None, None, None, 0])
 
                     cute.arch.fence_proxy(
-                        'async.shared',
-                        space='cta',
+                        "async.shared",
+                        space="cta",
                     )
                     kw_prod_handle = k_weighted_producer.acquire_and_advance()
                     kw_prod_handle.commit()
@@ -1887,8 +1816,8 @@ class LinearAttentionChunkwiseDecay:
                     tRS_sPi = tRS_sP[(None, None, None, p_handle.index)]
                     cute.copy(tiled_r2s_P, tRS_rP, tRS_sPi)
                     cute.arch.fence_proxy(
-                        'async.shared',
-                        space='cta',
+                        "async.shared",
+                        space="cta",
                     )
                     s0_handle.release()
                     p_handle.commit()
@@ -1928,8 +1857,8 @@ class LinearAttentionChunkwiseDecay:
                     smem_o_handle = smem_o_producer.acquire_and_advance()
                     cute.copy(tiled_copy_r2s_o, tRS_rO, tRS_sO[(None, None, None, smem_o_handle.index)])
                     cute.arch.fence_proxy(
-                        'async.shared',
-                        space='cta',
+                        "async.shared",
+                        space="cta",
                     )
                     smem_o_handle.commit()
 
@@ -1945,12 +1874,9 @@ class LinearAttentionChunkwiseDecay:
                         gState_ht = initial_state[None, None, (hidx, state_idx)]
                     else:
                         gState_ht = final_state[None, None, (hidx, state_idx)]
-                    gRow_ht = cute.make_tensor(
-                        gState_ht.iterator + local_tidx,
-                        cute.make_layout(_D, stride=_D))
+                    gRow_ht = cute.make_tensor(gState_ht.iterator + local_tidx, cute.make_layout(_D, stride=_D))
 
-                    out_flat = cute.make_tensor(
-                        tTR_rKV.iterator, layout=cute.make_layout(_D))
+                    out_flat = cute.make_tensor(tTR_rKV.iterator, layout=cute.make_layout(_D))
                     cute.autovec_copy(out_flat, gRow_ht)
 
                 # Advance k_stage_offset by number of chunks in this WU
@@ -1993,11 +1919,14 @@ class LinearAttentionChunkwiseDecay:
                 o_thr_dim0 = D // async_copy_elems  # 128/8 = 16
                 o_thr_dim1 = self.threads_per_warp // o_thr_dim0  # 32/16 = 2
                 o_thr_layout = cute.make_ordered_layout(
-                    (o_thr_dim0, o_thr_dim1), order=(0, 1),
+                    (o_thr_dim0, o_thr_dim1),
+                    order=(0, 1),
                 )
                 o_val_layout = cute.make_layout((async_copy_elems, 1))
                 gmem_tiled_copy_o = cute.make_tiled_copy_tv(
-                    atom_universal_copy_o, o_thr_layout, o_val_layout,
+                    atom_universal_copy_o,
+                    o_thr_layout,
+                    o_val_layout,
                 )
 
             wu_iter = Int32(0)
@@ -2028,9 +1957,7 @@ class LinearAttentionChunkwiseDecay:
                 else:
                     tma_tensor_o_use = tma_tensor_o
 
-                gO_pre_partition = cute.flat_divide(
-                    tma_tensor_o_use, cute.select(self.vp_mma_tiler, mode=[0, 1])
-                )
+                gO_pre_partition = cute.flat_divide(tma_tensor_o_use, cute.select(self.vp_mma_tiler, mode=[0, 1]))
 
                 if cutlass.const_expr(self.is_varlen):
                     gO_pre_partition = gO_pre_partition[None, None, None, None, hidx]
@@ -2038,7 +1965,10 @@ class LinearAttentionChunkwiseDecay:
                     gO_pre_partition = gO_pre_partition[None, None, None, None, (hidx, bidx)]
 
                 tma_atom_o, bSG_sO, bSG_gO = self.epilog_gmem_copy_and_partition(
-                    tma_atom_o, gO_pre_partition, self.epi_tile, sO,
+                    tma_atom_o,
+                    gO_pre_partition,
+                    self.epi_tile,
+                    sO,
                 )
 
                 for chunk_start in cutlass.range(0, seq_len, C, unroll=0):
@@ -2064,26 +1994,25 @@ class LinearAttentionChunkwiseDecay:
                             tOrO = cute.make_fragment_like(tOsO, self.io_dtype)
                             cute.autovec_copy(tOsO, tOrO)
 
-                            o_chunk_raw = (o_tensor.iterator
-                                + (bos + chunk_start) * D * H
-                                + hidx * D)
+                            o_chunk_raw = o_tensor.iterator + (bos + chunk_start) * D * H + hidx * D
                             o_chunk_ptr = cute.make_ptr(
-                                self.io_dtype, o_chunk_raw.toint(),
-                                cute.AddressSpace.gmem, assumed_align=16,
+                                self.io_dtype,
+                                o_chunk_raw.toint(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16,
                             )
                             o_stride_c = D * H
                             gO_chunk = cute.make_tensor(
                                 o_chunk_ptr,
                                 cute.make_layout(
-                                    (D, C), stride=(1, o_stride_c),
+                                    (D, C),
+                                    stride=(1, o_stride_c),
                                 ),
                             )
 
                             tOgO = gmem_thr_copy_o.partition_D(gO_chunk)
 
-                            for rest_c in cutlass.range_constexpr(
-                                cute.size(tOrO.shape[2])
-                            ):
+                            for rest_c in cutlass.range_constexpr(cute.size(tOrO.shape[2])):
                                 c_coord = tOcO[0, 0, rest_c][1]
                                 if c_coord < remaining:
                                     cute.copy(
@@ -2172,9 +2101,7 @@ class LinearAttentionChunkwiseDecay:
             - tRS_sO: The partitioned tensor C (smem destination)
         :rtype: tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
         """
-        copy_atom_r2s = sm100_utils.get_smem_store_op(
-            self.o_layout, self.io_dtype, self.acc_dtype, tiled_copy_t2r
-        )
+        copy_atom_r2s = sm100_utils.get_smem_store_op(self.o_layout, self.io_dtype, self.acc_dtype, tiled_copy_t2r)
         tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
         # (R2S, R2S_M, R2S_N, PIPE_D)
         thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
@@ -2217,7 +2144,7 @@ class LinearAttentionChunkwiseDecay:
             # (D, C, TILES_D, TILES_C)
             gC_mnl,
             # epi: (D, C)
-            epi_tile
+            epi_tile,
         )
 
         tma_atom_c = atom
@@ -2235,7 +2162,7 @@ class LinearAttentionChunkwiseDecay:
             gC_for_tma_partition,
         )
         return tma_atom_c, bSG_sC, bSG_gC
-            
+
     def tmem_load_partition_kv(self, mma_tiler, tState, local_tidx):
         # Make tiledCopy for tensor memory load
         # D,D
@@ -2251,16 +2178,11 @@ class LinearAttentionChunkwiseDecay:
         )
         fake_sState = cute.make_tensor(
             cute.make_ptr(self.io_dtype, 0, cute.AddressSpace.smem),
-            cute.dice(self.kv_mma_tiler, (1,1,None)),
+            cute.dice(self.kv_mma_tiler, (1, 1, None)),
         )
-        return self.make_tmem_load_and_partition(
-            copy_atom_t2r, tState, (None, None, 0), local_tidx, fake_sState
-        )
+        return self.make_tmem_load_and_partition(copy_atom_t2r, tState, (None, None, 0), local_tidx, fake_sState)
 
-    
-    def make_tmem_load_and_partition(
-        self, copy_atom_t2r, tmem_tensor, tmem_tile_coord, local_tidx, smem_tensor
-    ):
+    def make_tmem_load_and_partition(self, copy_atom_t2r, tmem_tensor, tmem_tile_coord, local_tidx, smem_tensor):
         dtype = tmem_tensor.element_type
         # TMEM: (EPITILE_M, EPITILE_N, STAGES)
         tiled_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tmem_tensor[tmem_tile_coord])
@@ -2326,16 +2248,16 @@ class LinearAttentionChunkwiseDecay:
 
     @cute.jit
     def tmem_load_and_partition_qk(
-      self,
-      local_tidx,
-      tQK,  
+        self,
+        local_tidx,
+        tQK,
     ):
         # 64,64
         copy_atom_t2r_qk = cute.make_copy_atom(
             # 32b x 8 x 8
             tcgen05.Ld16x256bOp(tcgen05.Repetition(8), tcgen05.Pack.NONE),
             self.acc_dtype,
-        ) 
+        )
         fake_sQK = cute.make_tensor(
             cute.make_ptr(self.io_dtype, 0, cute.AddressSpace.smem),
             cute.dice(self.qk_mma_tiler, (1, 1, None)),
@@ -2357,13 +2279,15 @@ class LinearAttentionChunkwiseDecay:
 
     @cute.jit
     def smem_store_and_partition_qk(
-        self, local_tidx, smem_p, tiled_t2r_qk, tPrP_t2r, tiled_mma = None,
+        self,
+        local_tidx,
+        smem_p,
+        tiled_t2r_qk,
+        tPrP_t2r,
+        tiled_mma=None,
     ):
         copy_atom_r2s_qk = sm100_utils.get_smem_store_op(
-            utils.LayoutEnum.from_tensor(smem_p),
-            self.io_dtype,
-            self.acc_dtype,
-            tiled_t2r_qk
+            utils.LayoutEnum.from_tensor(smem_p), self.io_dtype, self.acc_dtype, tiled_t2r_qk
         )
         # num_dp, num_bits, num_rep, pack = sm100_utils.get_tmem_copy_properties(tiled_t2r_qk)
         tiled_r2s_qk = cute.make_tiled_copy_D(copy_atom_r2s_qk, tiled_t2r_qk)
@@ -2388,13 +2312,14 @@ class LinearAttentionChunkwiseDecay:
 
     @cute.jit
     def smem_store_acc_as_ab_and_partition_x(
-        self, local_tidx, smem_x, tiled_t2r_x, tXrX_t2r,
+        self,
+        local_tidx,
+        smem_x,
+        tiled_t2r_x,
+        tXrX_t2r,
     ):
         copy_atom_r2s_x = sm100_utils.get_smem_store_op(
-            utils.LayoutEnum.from_tensor(smem_x),
-            self.io_dtype,
-            self.acc_dtype,
-            tiled_t2r_x
+            utils.LayoutEnum.from_tensor(smem_x), self.io_dtype, self.acc_dtype, tiled_t2r_x
         )
         tiled_r2s_x = cute.make_tiled_copy_D(copy_atom_r2s_x, tiled_t2r_x)
         thr_r2s_x = tiled_r2s_x.get_slice(local_tidx)
@@ -2429,9 +2354,7 @@ class LinearAttentionChunkwiseDecay:
             smem_y[None, None, 0],
         )
 
-    def make_tmem_load_and_partition_acc(
-        self, copy_atom_t2r, tmem_tensor, tmem_tile_coord, local_tidx, smem_tensor
-    ):
+    def make_tmem_load_and_partition_acc(self, copy_atom_t2r, tmem_tensor, tmem_tile_coord, local_tidx, smem_tensor):
         dtype = tmem_tensor.element_type
         tiled_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tmem_tensor[tmem_tile_coord])
         thr_t2r = tiled_t2r.get_slice(local_tidx)
@@ -2473,7 +2396,7 @@ class LinearAttentionChunkwiseDecay:
         copy_atom_t2r = cute.make_copy_atom(
             tcgen05.Ld32x32bOp(tcgen05.Repetition(32), tcgen05.Pack.NONE),
             self.acc_dtype,
-        ) 
+        )
         # (EPI_TILE_M, EPI_TILE_N, 1, 1, STAGE)
         tAcc_epi = cute.flat_divide(
             # ((EPI_TILE_M, EPI_TILE_N), EPI_M, EPI_N, STAGE)
@@ -2481,9 +2404,7 @@ class LinearAttentionChunkwiseDecay:
             epitile,
         )
         # (EPI_TILE_M, EPI_TILE_N)
-        tiled_copy_t2r = tcgen05.make_tmem_copy(
-            copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)]
-        )
+        tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)])
 
         thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
         # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, STAGE)
@@ -2532,39 +2453,39 @@ class LinearAttentionChunkwiseDecay:
         # Uses precomputed decay LUT instead of exp() calls
         # Phase 3 Optimization 3.5: Loop unrolling by 2x for better ILP
         size = cute.size(acc_qk)
-        
+
         # Process pairs of elements (unrolled by 2) for instruction-level parallelism
         for i in cutlass.range_constexpr(0, size - 1, 2):
             # Element i
             index_q0, index_k0 = index_transform(*index_qk[i])
             distance0 = index_q0 - index_k0
-            
+
             if debug:
                 cute.printf("index_qk[{}], {},{}", i, index_q0, index_k0)
-            
+
             if index_q0 < index_k0:
                 acc_qk[i] = cutlass.Float32(0.0)
                 p[i] = cutlass.BFloat16(0.0)
             else:
                 # Use LUT: decay_lut[distance] = exp(-s*distance)
                 p[i] = (acc_qk[i] * decay_lut[distance0]).to(self.q_dtype)
-            
+
             # Element i+1 (unrolled for ILP)
-            index_q1, index_k1 = index_transform(*index_qk[i+1])
+            index_q1, index_k1 = index_transform(*index_qk[i + 1])
             distance1 = index_q1 - index_k1
-            
+
             if index_q1 < index_k1:
-                acc_qk[i+1] = cutlass.Float32(0.0)
-                p[i+1] = cutlass.BFloat16(0.0)
+                acc_qk[i + 1] = cutlass.Float32(0.0)
+                p[i + 1] = cutlass.BFloat16(0.0)
             else:
-                p[i+1] = (acc_qk[i+1] * decay_lut[distance1]).to(self.q_dtype)
-        
+                p[i + 1] = (acc_qk[i + 1] * decay_lut[distance1]).to(self.q_dtype)
+
         # Handle last element if size is odd
         if size % 2 == 1:
             i = size - 1
             index_q, index_k = index_transform(*index_qk[i])
             distance = index_q - index_k
-            
+
             if index_q < index_k:
                 acc_qk[i] = cutlass.Float32(0.0)
                 p[i] = cutlass.BFloat16(0.0)
@@ -2585,10 +2506,10 @@ class LinearAttentionChunkwiseDecay:
         decay_lut: cute.Tensor,  # Decay LUT: sDecayLUT[k] = exp(-s*k) for k=0..C-1
     ):
         """Apply per-position inter-chunk decay to SQ MMA output.
-        
+
         For position t within the chunk, multiply by exp(-s*(t+1)).
         Uses decay_lut[pos] * decay_lut[1] = exp(-s*pos) * exp(-s) = exp(-s*(pos+1))
-        
+
         Args:
             acc_sq: SQ MMA output register tensor (FP32)
             index_sq: Position identity partition giving (d_idx, pos_idx) per element
@@ -2596,16 +2517,16 @@ class LinearAttentionChunkwiseDecay:
         """
         size = cute.size(acc_sq)
         decay_one = decay_lut[1]  # exp(-s)
-        
+
         for i in cutlass.range_constexpr(0, size - 1, 2):
             # Element i: get position within chunk (column index of SQ output)
             pos0 = index_sq[i][1]
             acc_sq[i] = cutlass.Float32(acc_sq[i]) * decay_lut[pos0] * decay_one
-            
+
             # Element i+1 (unrolled for ILP)
             pos1 = index_sq[i + 1][1]
             acc_sq[i + 1] = cutlass.Float32(acc_sq[i + 1]) * decay_lut[pos1] * decay_one
-            
+
         # Handle last element if size is odd
         if size % 2 == 1:
             i_last = size - 1
@@ -2613,9 +2534,7 @@ class LinearAttentionChunkwiseDecay:
             acc_sq[i_last] = cutlass.Float32(acc_sq[i_last]) * decay_lut[pos_last] * decay_one
 
     @cute.jit
-    def make_tmem_store_and_partition(
-        self, copy_atom_r2t, tmem_tensor, local_tidx
-    ):
+    def make_tmem_store_and_partition(self, copy_atom_r2t, tmem_tensor, local_tidx):
         tiled_r2t = tcgen05.make_tmem_copy(copy_atom_r2t, tmem_tensor)
         thr_r2t = tiled_r2t.get_slice(local_tidx)
         tRT_t = thr_r2t.partition_D(tmem_tensor)
@@ -2636,9 +2555,7 @@ class LinearAttentionChunkwiseDecay:
         # (MMA, MMA_N, MMA_K, INPUT_STAGE)
         tCrB = tiled_mma.make_fragment_B(smem_b)
         # (MMA, MMA_M, MMA_N, ACC_STAGE)
-        tCtAcc = self.mma_partition_c(
-            tiled_mma, tile_shape_mnk, tmem_acc_ptr, acc_stages
-        )
+        tCtAcc = self.mma_partition_c(tiled_mma, tile_shape_mnk, tmem_acc_ptr, acc_stages)
         return tCrA, tCrB, tCtAcc
 
     @cute.jit
@@ -2657,9 +2574,7 @@ class LinearAttentionChunkwiseDecay:
         # (MMA, MMA_N, MMA_K, INPUT_STAGE)
         tCrB = tiled_mma.make_fragment_B(smem_b)
         # (MMA, MMA_M, MMA_N, INTERNAL_STAGE)
-        tCtAcc = self.mma_partition_c(
-            tiled_mma, tile_shape_mnk, tmem_acc_ptr, acc_stages
-        )
+        tCtAcc = self.mma_partition_c(tiled_mma, tile_shape_mnk, tmem_acc_ptr, acc_stages)
         return tCrA, tCrB, tCtAcc
 
     @cute.jit
@@ -2727,29 +2642,31 @@ class LinearAttentionChunkwiseDecay:
         operand_mode = operand_mode.upper()
         coord = None
         if cutlass.const_expr(operand_mode == "B"):
-            coord = (0, None, None) 
+            coord = (0, None, None)
         elif cutlass.const_expr(operand_mode == "C"):
             coord = (None, None, 0)
-        elif cutlass.const_expr(operand_mode == 'A'):
-            coord = (None, 0, None) 
+        elif cutlass.const_expr(operand_mode == "A"):
+            coord = (None, 0, None)
         else:
             raise RuntimeError(f"unknown operand mode: {operand_mode}")
-            
+
         gX = cute.local_tile(
             tensor_x,
-            cute.slice_(tile_shape, coord), # 
-            (None, None, hidx) if cutlass.const_expr(self.is_varlen) and not no_cta_coord
-            else (None, None, (hidx, bidx)) if not no_cta_coord
-            else (None, None, None)
+            cute.slice_(tile_shape, coord),  #
+            (None, None, hidx)
+            if cutlass.const_expr(self.is_varlen) and not no_cta_coord
+            else (None, None, (hidx, bidx))
+            if not no_cta_coord
+            else (None, None, None),
         )
         # Partition global tensor with regard to TiledMMA
         thr_mma = tiled_mma.get_slice(0)
         # tCgX: (MMA, MMA_M, MMA_K, TILES_M, TILES_K)
-        if cutlass.const_expr(operand_mode == 'A'):
+        if cutlass.const_expr(operand_mode == "A"):
             tCgX = thr_mma.partition_A(gX)
-        elif cutlass.const_expr(operand_mode == 'B'):
+        elif cutlass.const_expr(operand_mode == "B"):
             tCgX = thr_mma.partition_B(gX)
-        elif cutlass.const_expr(operand_mode == 'C'):
+        elif cutlass.const_expr(operand_mode == "C"):
             tCgX = thr_mma.partition_C(gX)
         else:
             raise RuntimeError("unknown operand mode")
@@ -2782,12 +2699,13 @@ class LinearAttentionChunkwiseDecay:
         # ((ATOM_V, REST_V), TILES_N, TILES_K)
         tXsX, tXgX = cute.nvgpu.cpasync.tma_partition(
             tma_atom_x,
-            0, # no multicast
+            0,  # no multicast
             cute.make_layout(1),
             cute.group_modes(smem_x, 0, 3),
             cute.group_modes(tCgX, 0, 3),
         )
         return tXsX, tXgX
+
 
 def make_thread_cooperative_group(size: int):
     """Helper to create thread cooperative groups for pipeline synchronization."""
@@ -2827,40 +2745,54 @@ def _compile_single_variant(has_initial_state, output_final_state, H, D, scale, 
 
     # Q, K, V, O: (B, S, H, D) row-major bf16
     q_fake = make_fake_compact_tensor(
-        cutlass.BFloat16, (sym_b, sym_s, H, D),
-        stride_order=(3, 2, 1, 0), assumed_align=128,
+        cutlass.BFloat16,
+        (sym_b, sym_s, H, D),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
     )
     k_fake = make_fake_compact_tensor(
-        cutlass.BFloat16, (sym_b, sym_s, H, D),
-        stride_order=(3, 2, 1, 0), assumed_align=128,
+        cutlass.BFloat16,
+        (sym_b, sym_s, H, D),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
     )
     v_fake = make_fake_compact_tensor(
-        cutlass.BFloat16, (sym_b, sym_s, H, D),
-        stride_order=(3, 2, 1, 0), assumed_align=128,
+        cutlass.BFloat16,
+        (sym_b, sym_s, H, D),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
     )
     o_fake = make_fake_compact_tensor(
-        cutlass.BFloat16, (sym_b, sym_s, H, D),
-        stride_order=(3, 2, 1, 0), assumed_align=128,
+        cutlass.BFloat16,
+        (sym_b, sym_s, H, D),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
     )
 
     # decay: (H,) float32
     decay_fake = make_fake_compact_tensor(
-        cutlass.Float32, (H,), assumed_align=128,
+        cutlass.Float32,
+        (H,),
+        assumed_align=128,
     )
 
     # initial_state / final_state: (B, H, D, D) float32 or None
     h0_fake = (
         make_fake_compact_tensor(
-            cutlass.Float32, (sym_b, H, D, D),
-            stride_order=(3, 2, 1, 0), assumed_align=128,
+            cutlass.Float32,
+            (sym_b, H, D, D),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
         )
         if has_initial_state
         else None
     )
     ht_fake = (
         make_fake_compact_tensor(
-            cutlass.Float32, (sym_b, H, D, D),
-            stride_order=(3, 2, 1, 0), assumed_align=128,
+            cutlass.Float32,
+            (sym_b, H, D, D),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
         )
         if output_final_state
         else None
@@ -2872,22 +2804,34 @@ def _compile_single_variant(has_initial_state, output_final_state, H, D, scale, 
     # (never dereferenced — guarded by const_expr(is_varlen)),
     # but CuteDSL requires valid tensors, not None.
     dummy_cu_fake = make_fake_compact_tensor(
-        cutlass.Int32, (2,), assumed_align=128,
+        cutlass.Int32,
+        (2,),
+        assumed_align=128,
     )
     dummy_idx_fake = make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=128,
+        cutlass.Int32,
+        (1,),
+        assumed_align=128,
     )
 
     # Dummy workspace for non-varlen (never dereferenced, persistent=False)
     workspace_fake = make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=128,
+        cutlass.Int32,
+        (1,),
+        assumed_align=128,
     )
 
     compiled_fn = cute.compile(
         kernel_obj,
-        q_fake, k_fake, v_fake, o_fake, decay_fake,
-        h0_fake, ht_fake,
-        dummy_cu_fake, dummy_idx_fake,
+        q_fake,
+        k_fake,
+        v_fake,
+        o_fake,
+        decay_fake,
+        h0_fake,
+        ht_fake,
+        dummy_cu_fake,
+        dummy_idx_fake,
         o_fake,  # o_tensor (reuse o_fake — never dereferenced for non-varlen)
         workspace_fake,
         (Int32(1), Int32(1)),  # dummy (B, S)
@@ -2911,7 +2855,12 @@ def _get_compiled_kernel(has_initial_state, output_final_state, H, D, scale, chu
     key = (has_initial_state, output_final_state, H, D, scale, chunk_size)
     if key not in _kernel_cache:
         _kernel_cache[key] = _compile_single_variant(
-            has_initial_state, output_final_state, H, D, scale, chunk_size,
+            has_initial_state,
+            output_final_state,
+            H,
+            D,
+            scale,
+            chunk_size,
         )
     return _kernel_cache[key]
 
@@ -2955,7 +2904,12 @@ def lightning_attn_fwd(
     has_initial_state = initial_state is not None
 
     compiled_fn = _get_compiled_kernel(
-        has_initial_state, output_final_state, H, D, scale, chunk_size,
+        has_initial_state,
+        output_final_state,
+        H,
+        D,
+        scale,
+        chunk_size,
     )
 
     if output_final_state:
@@ -2970,9 +2924,15 @@ def lightning_attn_fwd(
     _dummy_idx = torch.zeros(1, dtype=torch.int32, device=Q.device)
     _dummy_workspace = torch.zeros(1, dtype=torch.int32, device=Q.device)
     compiled_fn(
-        Q, K, V, O, decay,
-        initial_state, ht,
-        _dummy_cu, _dummy_idx,
+        Q,
+        K,
+        V,
+        O,
+        decay,
+        initial_state,
+        ht,
+        _dummy_cu,
+        _dummy_idx,
         O,  # o_tensor (reuse O — never dereferenced for non-varlen)
         _dummy_workspace,
         (Int32(B), Int32(S)),
@@ -3013,32 +2973,44 @@ def _compile_single_variant_varlen(H, D, scale, chunk_size, persistent=True):
     # Q, K, V, O: [1, T, H, D] row-major bf16
     # For varlen, B=1 in the physical tensor but we view as (T, D, H)
     q_fake = make_fake_compact_tensor(
-        cutlass.BFloat16, (1, sym_t, H, D),
-        stride_order=(3, 2, 1, 0), assumed_align=128,
+        cutlass.BFloat16,
+        (1, sym_t, H, D),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
     )
     k_fake = make_fake_compact_tensor(
-        cutlass.BFloat16, (1, sym_t, H, D),
-        stride_order=(3, 2, 1, 0), assumed_align=128,
+        cutlass.BFloat16,
+        (1, sym_t, H, D),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
     )
     v_fake = make_fake_compact_tensor(
-        cutlass.BFloat16, (1, sym_t, H, D),
-        stride_order=(3, 2, 1, 0), assumed_align=128,
+        cutlass.BFloat16,
+        (1, sym_t, H, D),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
     )
     o_fake = make_fake_compact_tensor(
-        cutlass.BFloat16, (1, sym_t, H, D),
-        stride_order=(3, 2, 1, 0), assumed_align=128,
+        cutlass.BFloat16,
+        (1, sym_t, H, D),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
     )
 
     # decay: (H,) float32
     decay_fake = make_fake_compact_tensor(
-        cutlass.Float32, (H,), assumed_align=128,
+        cutlass.Float32,
+        (H,),
+        assumed_align=128,
     )
 
     # State pool: [pool_size, H, D, D] float32 — always present for varlen
     # Use sym_n as pool dimension (actual pool may be larger, strides are correct)
     h0_fake = make_fake_compact_tensor(
-        cutlass.Float32, (sym_n, H, D, D),
-        stride_order=(3, 2, 1, 0), assumed_align=128,
+        cutlass.Float32,
+        (sym_n, H, D, D),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
     )
     # final_state is same as initial_state for INPLACE_UPDATE
     ht_fake = h0_fake
@@ -3046,27 +3018,39 @@ def _compile_single_variant_varlen(H, D, scale, chunk_size, persistent=True):
     # cu_seqlens: [N+1] int32 — requires separate sym because size differs from N
     sym_cu = cute.sym_int()
     cu_seqlens_fake = make_fake_compact_tensor(
-        cutlass.Int32, (sym_cu,), assumed_align=128,
+        cutlass.Int32,
+        (sym_cu,),
+        assumed_align=128,
     )
 
     # initial_state_indices: [N] int32
     sym_idx = cute.sym_int()
     indices_fake = make_fake_compact_tensor(
-        cutlass.Int32, (sym_idx,), assumed_align=128,
+        cutlass.Int32,
+        (sym_idx,),
+        assumed_align=128,
     )
 
     stream_fake = make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Workspace for persistent kernel atomic counter (int32, zeroed before each call)
     workspace_fake = make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=128,
+        cutlass.Int32,
+        (1,),
+        assumed_align=128,
     )
 
     compiled_fn = cute.compile(
         kernel_obj,
-        q_fake, k_fake, v_fake, o_fake, decay_fake,
-        h0_fake, ht_fake,
-        cu_seqlens_fake, indices_fake,
+        q_fake,
+        k_fake,
+        v_fake,
+        o_fake,
+        decay_fake,
+        h0_fake,
+        ht_fake,
+        cu_seqlens_fake,
+        indices_fake,
         o_fake,  # o_tensor for CopyUniversal tail store
         workspace_fake,
         (Int32(1), Int32(1)),  # dummy (N, T)
@@ -3084,7 +3068,11 @@ def _get_compiled_kernel_varlen(H, D, scale, chunk_size, persistent=True):
     key = (H, D, scale, chunk_size, persistent)
     if key not in _varlen_kernel_cache:
         _varlen_kernel_cache[key] = _compile_single_variant_varlen(
-            H, D, scale, chunk_size, persistent=persistent,
+            H,
+            D,
+            scale,
+            chunk_size,
+            persistent=persistent,
         )
     return _varlen_kernel_cache[key]
 
@@ -3151,9 +3139,15 @@ def lightning_attn_fwd_varlen(
 
     # TVM-FFI: pass torch tensors directly
     compiled_fn(
-        Q, K, V, O, decay,
-        state_pool, state_pool,  # initial_state = final_state = state_pool (INPLACE_UPDATE)
-        cu_seqlens, initial_state_indices,
+        Q,
+        K,
+        V,
+        O,
+        decay,
+        state_pool,
+        state_pool,  # initial_state = final_state = state_pool (INPLACE_UPDATE)
+        cu_seqlens,
+        initial_state_indices,
         O,  # o_tensor for CopyUniversal tail store
         workspace,
         (Int32(N), Int32(T)),
@@ -3166,32 +3160,20 @@ def main():
     """
     Example usage of LinearAttentionChunkwise with CuTe DSL
     """
-    parser = argparse.ArgumentParser(
-        description="Chunkwise Linear Attention with Headwise Decay"
-    )
+    parser = argparse.ArgumentParser(description="Chunkwise Linear Attention with Headwise Decay")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
     parser.add_argument("--seq_len", type=int, default=4096, help="Sequence length")
     parser.add_argument("--num_heads", type=int, default=64, help="Number of heads")
     parser.add_argument("--head_dim", type=int, default=128, help="Head dimension")
     parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size")
     parser.add_argument("--decay", type=float, default=0.95, help="Decay factor")
-    parser.add_argument(
-        "--io_dtype", type=cutlass.dtype, default=cutlass.BFloat16,
-        help="Input/output data type"
-    )
-    parser.add_argument(
-        "--acc_dtype", type=cutlass.dtype, default=cutlass.Float32,
-        help="Accumulation data type"
-    )
-    parser.add_argument(
-        "--warmup_iterations", type=int, default=0, help="Warmup iterations"
-    )
-    parser.add_argument(
-        "--iterations", type=int, default=1, help="Benchmark iterations"
-    )
-    
+    parser.add_argument("--io_dtype", type=cutlass.dtype, default=cutlass.BFloat16, help="Input/output data type")
+    parser.add_argument("--acc_dtype", type=cutlass.dtype, default=cutlass.Float32, help="Accumulation data type")
+    parser.add_argument("--warmup_iterations", type=int, default=0, help="Warmup iterations")
+    parser.add_argument("--iterations", type=int, default=1, help="Benchmark iterations")
+
     args = parser.parse_args()
-    
+
     print("Running Chunkwise Linear Attention with CuTe DSL:")
     print(f"  Batch size: {args.batch_size}")
     print(f"  Sequence length: {args.seq_len}")
@@ -3203,29 +3185,34 @@ def main():
     print(f"  Accumulation dtype: {args.acc_dtype}")
     print(f"  Warmup iterations: {args.warmup_iterations}")
     print(f"  Benchmark iterations: {args.iterations}")
-    
+
     if not torch.cuda.is_available():
         print("CUDA is not available!")
         return
-    
+
     # Create inputs
     B, S, H, D = args.batch_size, args.seq_len, args.num_heads, args.head_dim
-    
+
     # Input tensors in format [B, S, H, D]
     Q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    
+
     # Per-head decay coefficients [H]
     decay = torch.full((H,), args.decay, device="cuda", dtype=torch.float32)
 
-    scale = 1.0 / (D ** 0.5)
+    scale = 1.0 / (D**0.5)
 
     # Compile with TVM-FFI cache (first call compiles, subsequent calls reuse)
     start_time = time.time()
     O, ht = lightning_attn_fwd(
-        Q, K, V, decay, scale=scale,
-        initial_state=None, output_final_state=True,
+        Q,
+        K,
+        V,
+        decay,
+        scale=scale,
+        initial_state=None,
+        output_final_state=True,
         chunk_size=args.chunk_size,
     )
     compilation_time = time.time() - start_time
@@ -3236,26 +3223,36 @@ def main():
     # Warmup (uses cached kernel — no recompilation)
     for _ in range(args.warmup_iterations):
         O, ht = lightning_attn_fwd(
-            Q, K, V, decay, scale=scale,
-            initial_state=None, output_final_state=True,
+            Q,
+            K,
+            V,
+            decay,
+            scale=scale,
+            initial_state=None,
+            output_final_state=True,
             chunk_size=args.chunk_size,
         )
-    
+
     # Benchmark
     torch.cuda.synchronize()
     start = time.perf_counter()
-    
+
     for _ in range(args.iterations):
         O, ht = lightning_attn_fwd(
-            Q, K, V, decay, scale=scale,
-            initial_state=None, output_final_state=True,
+            Q,
+            K,
+            V,
+            decay,
+            scale=scale,
+            initial_state=None,
+            output_final_state=True,
             chunk_size=args.chunk_size,
         )
-    
+
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
-    
-    print(f"\nExecution time: {elapsed*1000/args.iterations:.2f} ms (average over {args.iterations} iterations)")
+
+    print(f"\nExecution time: {elapsed * 1000 / args.iterations:.2f} ms (average over {args.iterations} iterations)")
     print("\nPASS")
 
 

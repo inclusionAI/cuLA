@@ -28,6 +28,7 @@ COMPILE_OPTIONS = "--generate-line-info --ptxas-options '--verbose'"
 # Key: device -> {cu_seqlens, state_dummy, cu_seqlens_cute, state_cute}
 _dummy_cache = {}
 
+
 class ChunkKDAFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
@@ -55,7 +56,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         assert q.shape[-2] == v.shape[-2] == k.shape[-2], "Number of heads must be the same for q, k, v."
 
         global compiled_kernel_cache
-    
+
         B, S, H, D = q.shape
         is_varlen = cu_seqlens is not None
         if is_varlen:
@@ -71,37 +72,34 @@ class ChunkKDAFunction(torch.autograd.Function):
         g_org = None
         if use_gate_in_kernel:
             try:
-              from fla.ops.kda.gate import kda_gate_chunk_cumsum
-              g_org = g
-              if safe_gate:
-                  assert lower_bound is not None, "lower_bound must be set when use safe_gate"
-              g = kda_gate_chunk_cumsum(
-                  g=g_org,
-                  A_log=A_log,
-                  dt_bias=dt_bias,
-                  scale=RCP_LN2,
-                  chunk_size=chunk_size,
-                  cu_seqlens=cu_seqlens,
-                  chunk_indices=chunk_indices,
-                  lower_bound=lower_bound,
-              )
+                from fla.ops.kda.gate import kda_gate_chunk_cumsum
+
+                g_org = g
+                if safe_gate:
+                    assert lower_bound is not None, "lower_bound must be set when use safe_gate"
+                g = kda_gate_chunk_cumsum(
+                    g=g_org,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    scale=RCP_LN2,
+                    chunk_size=chunk_size,
+                    cu_seqlens=cu_seqlens,
+                    chunk_indices=chunk_indices,
+                    lower_bound=lower_bound,
+                )
             except ImportError:
-              warnings.warn("Can't use safe gate due to older FLA version, worse numerical issues.")
-              g_org = g
-              g = kda_gate_fwd(
-                  g=g_org,
-                  A_log=A_log,
-                  dt_bias=dt_bias,
-              )
+                warnings.warn("Can't use safe gate due to older FLA version, worse numerical issues.")
+                g_org = g
+                g = kda_gate_fwd(
+                    g=g_org,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                )
         # only in safe_gate && use_gate_in_kernel, cumsum is fused into kda_gate_chunk_cumsum
         if not (safe_gate and use_gate_in_kernel):
-          g = chunk_local_cumsum(
-              g=g,
-              chunk_size=chunk_size,
-              scale=RCP_LN2,
-              cu_seqlens=cu_seqlens,
-              chunk_indices=chunk_indices
-          )
+            g = chunk_local_cumsum(
+                g=g, chunk_size=chunk_size, scale=RCP_LN2, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
+            )
         q_rstd, k_rstd = None, None
         if use_qk_l2norm_in_kernel:
             q, q_rstd = l2norm_fwd(q)
@@ -133,14 +131,14 @@ class ChunkKDAFunction(torch.autograd.Function):
                 _dummy_cu = torch.zeros(2, dtype=torch.int32, device=dev)
                 _dummy_st = torch.empty(1, dtype=torch.float32, device=dev)
                 _dummy_cache[dev] = {
-                    'cu_seqlens': _dummy_cu,
-                    'cu_seqlens_cute': from_dlpack(_dummy_cu.detach()),
-                    'state_dummy': _dummy_st,
-                    'state_cute': from_dlpack(_dummy_st.detach()),
+                    "cu_seqlens": _dummy_cu,
+                    "cu_seqlens_cute": from_dlpack(_dummy_cu.detach()),
+                    "state_dummy": _dummy_st,
+                    "state_cute": from_dlpack(_dummy_st.detach()),
                 }
             dc = _dummy_cache[dev]
-            cu_seqlens_i32 = dc['cu_seqlens']
-            cu_seqlens_cute = dc['cu_seqlens_cute']
+            cu_seqlens_i32 = dc["cu_seqlens"]
+            cu_seqlens_cute = dc["cu_seqlens_cute"]
 
         # Workspace buffer for TMA descriptor modification (varlen tail tiles)
         # Same approach as flashkda: per-CTA slot for modified TMA descriptors
@@ -150,26 +148,26 @@ class ChunkKDAFunction(torch.autograd.Function):
             _dummy_cu = torch.zeros(2, dtype=torch.int32, device=dev)
             _dummy_st = torch.empty(1, dtype=torch.float32, device=dev)
             _dummy_cache[dev] = {
-                'cu_seqlens': _dummy_cu,
-                'cu_seqlens_cute': from_dlpack(_dummy_cu.detach()),
-                'state_dummy': _dummy_st,
-                'state_cute': from_dlpack(_dummy_st.detach()),
+                "cu_seqlens": _dummy_cu,
+                "cu_seqlens_cute": from_dlpack(_dummy_cu.detach()),
+                "state_dummy": _dummy_st,
+                "state_cute": from_dlpack(_dummy_st.detach()),
             }
         dc = _dummy_cache[dev]
         if is_varlen:
             ws_size = num_seqs * 128
             # Allocate/reuse workspace (grow if needed)
-            if 'workspace' not in dc or dc['workspace'].numel() < ws_size:
+            if "workspace" not in dc or dc["workspace"].numel() < ws_size:
                 ws_buf = torch.zeros(ws_size, dtype=torch.uint8, device=dev)
-                dc['workspace'] = ws_buf
-                dc['workspace_cute'] = from_dlpack(ws_buf.detach())
-            workspace_cute = dc['workspace_cute']
+                dc["workspace"] = ws_buf
+                dc["workspace_cute"] = from_dlpack(ws_buf.detach())
+            workspace_cute = dc["workspace_cute"]
         else:
-            if 'workspace' not in dc:
+            if "workspace" not in dc:
                 ws_buf = torch.zeros(128, dtype=torch.uint8, device=dev)
-                dc['workspace'] = ws_buf
-                dc['workspace_cute'] = from_dlpack(ws_buf.detach())
-            workspace_cute = dc['workspace_cute']
+                dc["workspace"] = ws_buf
+                dc["workspace_cute"] = from_dlpack(ws_buf.detach())
+            workspace_cute = dc["workspace_cute"]
 
         # State shape: [num_seqs, H, D, D]
         # Prepare initial_state and final_state tensors
@@ -179,7 +177,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         else:
             # Use cached tiny dummy (pointer won't be dereferenced when has_initial_state=False)
             initial_state_f32 = None
-            initial_state_cute = _dummy_cache[q.device]['state_cute']
+            initial_state_cute = _dummy_cache[q.device]["state_cute"]
 
         if output_final_state:
             final_state_f32 = torch.zeros(num_seqs, H, D, D, dtype=torch.float32, device=q.device)
@@ -187,7 +185,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         else:
             # Use cached tiny dummy (pointer won't be dereferenced when output_final_state=False)
             final_state_f32 = None
-            final_state_cute = _dummy_cache[q.device]['state_cute']
+            final_state_cute = _dummy_cache[q.device]["state_cute"]
 
         # problem_size: (num_seqs, total_tokens_or_seq_len, H, D)
         problem_size = (num_seqs, S, H, D)
@@ -254,6 +252,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         dht: torch.Tensor,
     ):
         raise NotImplementedError("Backward pass is not implemented yet.")
+
 
 # TODO: Blackwell fused prefill is still under development
 @torch.compiler.disable

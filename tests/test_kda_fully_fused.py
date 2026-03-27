@@ -15,12 +15,19 @@ from cula.utils import get_kda_fused_fwd
 
 cula_kda_fused_fwd = get_kda_fused_fwd(device)
 
+
 @pytest.mark.parametrize(
     (
-        "B", "T", "H", "D",
-        "gate_logit_normalizer", "mask_p",
-        "use_qk_l2norm_in_kernel", "use_gate_in_kernel",
-        "safe_gate", "dtype",
+        "B",
+        "T",
+        "H",
+        "D",
+        "gate_logit_normalizer",
+        "mask_p",
+        "use_qk_l2norm_in_kernel",
+        "use_gate_in_kernel",
+        "safe_gate",
+        "dtype",
     ),
     [
         pytest.param(
@@ -138,14 +145,38 @@ def test_safe_gate_chunk(
             (4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16, True),
             (4, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True),
             # ======Varlen test with simulated trace=======
-            (32, 128, 0, [0,  247,  699,  982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824,
-        5101, 5919, 6426, 7137, 7392, 7800, 8192], torch.bfloat16, True),
-            (32, 128, 0, [0,  652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236,
-        5543, 6255, 6480, 6947, 7616, 8192], torch.bfloat16, True),
-            (32, 128, 0, [0,  315,  973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459,
-        6318, 6669, 6979, 7583, 8192], torch.bfloat16, True),
-            (32, 128, 0, [0,  494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090,
-        6718, 7244, 7870, 8192], torch.bfloat16, True),
+            (
+                32,
+                128,
+                0,
+                [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192],
+                torch.bfloat16,
+                True,
+            ),
+            (
+                32,
+                128,
+                0,
+                [0, 652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236, 5543, 6255, 6480, 6947, 7616, 8192],
+                torch.bfloat16,
+                True,
+            ),
+            (
+                32,
+                128,
+                0,
+                [0, 315, 973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459, 6318, 6669, 6979, 7583, 8192],
+                torch.bfloat16,
+                True,
+            ),
+            (
+                32,
+                128,
+                0,
+                [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
+                torch.bfloat16,
+                True,
+            ),
         ]
     ],
 )
@@ -212,11 +243,11 @@ def test_safe_gate_chunk_varlen(
     ref_ht = []
     for i in range(N):
         ref_i, ref_ht_i = naive_recurrent_kda(
-            q=F.normalize(q[:, cu_seqlens[i]: cu_seqlens[i + 1]], p=2, dim=-1),
-            k=k[:, cu_seqlens[i]: cu_seqlens[i + 1]],
-            v=v[:, cu_seqlens[i]: cu_seqlens[i + 1]],
-            beta=beta[:, cu_seqlens[i]: cu_seqlens[i + 1]],
-            g=g[:, cu_seqlens[i]: cu_seqlens[i + 1]],
+            q=F.normalize(q[:, cu_seqlens[i] : cu_seqlens[i + 1]], p=2, dim=-1),
+            k=k[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            v=v[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            beta=beta[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            g=g[:, cu_seqlens[i] : cu_seqlens[i + 1]],
             initial_state=h0[i],
             output_final_state=True,
         )

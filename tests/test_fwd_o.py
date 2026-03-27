@@ -37,7 +37,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import importlib.util
 
 _spec = importlib.util.spec_from_file_location(
-    "fwd_o", os.path.join(os.path.dirname(__file__), "..", "cula", "ops", "fwd_o.py"))
+    "fwd_o", os.path.join(os.path.dirname(__file__), "..", "cula", "ops", "fwd_o.py")
+)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 ChunkGlaFwdO = _mod.ChunkGlaFwdO
@@ -58,11 +59,17 @@ DEVICE = "cuda"
 # Helpers — non-varlen
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def triton_chunk_gla_fwd_o(q, v, g, h, A, scale, chunk_size=64):
     """Call the Triton reference kernel (non-varlen). FLA expects h as [B*NT, H, K, V]."""
     return triton_chunk_gla_fwd_o_gk(
-        q=q, v=v, g=g, A=A, h=h.flatten(0, 1),
-        scale=scale, chunk_size=chunk_size,
+        q=q,
+        v=v,
+        g=g,
+        A=A,
+        h=h.flatten(0, 1),
+        scale=scale,
+        chunk_size=chunk_size,
         use_exp2=True,
     )
 
@@ -85,6 +92,7 @@ def assert_close(name, ref, out, atol=0.005):
 # Helpers — varlen
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def make_cu_seqlens(seq_lens, device=DEVICE):
     """Build cu_seqlens [N+1] int32 from list of lengths."""
     cu = [0]
@@ -93,8 +101,7 @@ def make_cu_seqlens(seq_lens, device=DEVICE):
     return torch.tensor(cu, dtype=torch.int32, device=device)
 
 
-def gen_varlen_data(seq_lens, H, seed=42, g_scale=0.1, h_scale=0.01,
-                    zero_h=False, zero_A=False, zero_g=False):
+def gen_varlen_data(seq_lens, H, seed=42, g_scale=0.1, h_scale=0.01, zero_h=False, zero_A=False, zero_g=False):
     """Generate all tensors for a varlen fwd_o test case.
 
     Returns dict with q, v, g, h, A, o, cu_seqlens, chunk_indices, scale,
@@ -104,7 +111,7 @@ def gen_varlen_data(seq_lens, H, seed=42, g_scale=0.1, h_scale=0.01,
     torch.manual_seed(seed)
     T_total = sum(seq_lens)
     total_nt = sum((s + BT - 1) // BT for s in seq_lens)
-    scale = K ** -0.5
+    scale = K**-0.5
 
     q = torch.randn(1, T_total, H, K, dtype=DTYPE, device=DEVICE)
     v = torch.randn(1, T_total, H, V, dtype=DTYPE, device=DEVICE)
@@ -129,21 +136,38 @@ def gen_varlen_data(seq_lens, H, seed=42, g_scale=0.1, h_scale=0.01,
     chunk_indices = build_chunk_indices(seq_lens, BT=BT, device=DEVICE)
 
     return dict(
-        q=q, v=v, g=g, h=h, A=A, o=o,
-        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
-        scale=scale, seq_lens=seq_lens,
-        T_total=T_total, total_nt=total_nt, H=H,
+        q=q,
+        v=v,
+        g=g,
+        h=h,
+        A=A,
+        o=o,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        scale=scale,
+        seq_lens=seq_lens,
+        T_total=T_total,
+        total_nt=total_nt,
+        H=H,
     )
 
 
 def run_cute_varlen(d):
     """Run CuTe DSL varlen kernel, return output [T_total, H, V]."""
-    o = d['o'].zero_()
+    o = d["o"].zero_()
     chunk_gla_fwd_o(
-        q=d['q'], v=d['v'], g=d['g'], h=d['h'], o=o, A=d['A'],
-        scale=d['scale'], chunk_size=BT,
-        cu_seqlens=d['cu_seqlens'], chunk_indices=d['chunk_indices'],
-        is_varlen=True, persistent=True,
+        q=d["q"],
+        v=d["v"],
+        g=d["g"],
+        h=d["h"],
+        o=o,
+        A=d["A"],
+        scale=d["scale"],
+        chunk_size=BT,
+        cu_seqlens=d["cu_seqlens"],
+        chunk_indices=d["chunk_indices"],
+        is_varlen=True,
+        persistent=True,
     )
     torch.cuda.synchronize()
     return o.squeeze(0)  # [1, T_total, H, V] → [T_total, H, V]
@@ -151,20 +175,20 @@ def run_cute_varlen(d):
 
 def run_pytorch_ref_per_seq(d):
     """Run PyTorch reference per-sequence, return [T_total, H, V]."""
-    seq_lens = d['seq_lens']
-    o_ref = torch.zeros(d['T_total'], d['H'], V, dtype=DTYPE, device=DEVICE)
+    seq_lens = d["seq_lens"]
+    o_ref = torch.zeros(d["T_total"], d["H"], V, dtype=DTYPE, device=DEVICE)
     nt_offset = 0
-    cu = d['cu_seqlens']
+    cu = d["cu_seqlens"]
     for i, slen in enumerate(seq_lens):
         start = cu[i].item()
         end = cu[i + 1].item()
         nt_i = (slen + BT - 1) // BT
-        qi = d['q'][:, start:end]
-        vi = d['v'][:, start:end]
-        gi = d['g'][:, start:end]
-        hi = d['h'][:, nt_offset:nt_offset + nt_i]
-        Ai = d['A'][:, start:end]
-        oi = reference_chunk_gla_fwd_o(qi, vi, gi, hi, Ai, d['scale'], BT)
+        qi = d["q"][:, start:end]
+        vi = d["v"][:, start:end]
+        gi = d["g"][:, start:end]
+        hi = d["h"][:, nt_offset : nt_offset + nt_i]
+        Ai = d["A"][:, start:end]
+        oi = reference_chunk_gla_fwd_o(qi, vi, gi, hi, Ai, d["scale"], BT)
         o_ref[start:end] = oi.squeeze(0)
         nt_offset += nt_i
     return o_ref
@@ -172,36 +196,49 @@ def run_pytorch_ref_per_seq(d):
 
 def run_fla_varlen(d):
     """Run FLA Triton varlen kernel, return [T_total, H, V]."""
-    cu_fla = d['cu_seqlens'].to(torch.int64)
-    h_flat = d['h'].flatten(0, 1)  # [1, NT, H, K, V] -> [NT, H, K, V]
+    cu_fla = d["cu_seqlens"].to(torch.int64)
+    h_flat = d["h"].flatten(0, 1)  # [1, NT, H, K, V] -> [NT, H, K, V]
     o_fla = triton_chunk_gla_fwd_o_gk(
-        q=d['q'], v=d['v'], g=d['g'], A=d['A'], h=h_flat,
-        scale=d['scale'], cu_seqlens=cu_fla,
-        chunk_size=BT, use_exp2=True,
+        q=d["q"],
+        v=d["v"],
+        g=d["g"],
+        A=d["A"],
+        h=h_flat,
+        scale=d["scale"],
+        cu_seqlens=cu_fla,
+        chunk_size=BT,
+        use_exp2=True,
     )
     return o_fla.squeeze(0)
 
 
 def run_cute_non_varlen_per_seq(d):
     """Run CuTe DSL non-varlen kernel per-sequence, return [T_total, H, V]."""
-    seq_lens = d['seq_lens']
-    o_ref = torch.zeros(d['T_total'], d['H'], V, dtype=DTYPE, device=DEVICE)
+    seq_lens = d["seq_lens"]
+    o_ref = torch.zeros(d["T_total"], d["H"], V, dtype=DTYPE, device=DEVICE)
     nt_offset = 0
-    cu = d['cu_seqlens']
+    cu = d["cu_seqlens"]
     for i, slen in enumerate(seq_lens):
         start = cu[i].item()
         end = cu[i + 1].item()
         nt_i = (slen + BT - 1) // BT
-        qi = d['q'][:, start:end]
-        vi = d['v'][:, start:end]
-        gi = d['g'][:, start:end]
-        hi = d['h'][:, nt_offset:nt_offset + nt_i]
-        Ai = d['A'][:, start:end]
-        oi = torch.zeros(1, slen, d['H'], V, dtype=DTYPE, device=DEVICE)
+        qi = d["q"][:, start:end]
+        vi = d["v"][:, start:end]
+        gi = d["g"][:, start:end]
+        hi = d["h"][:, nt_offset : nt_offset + nt_i]
+        Ai = d["A"][:, start:end]
+        oi = torch.zeros(1, slen, d["H"], V, dtype=DTYPE, device=DEVICE)
         chunk_gla_fwd_o(
-            q=qi, v=vi, g=gi, h=hi, o=oi, A=Ai,
-            scale=d['scale'], chunk_size=BT,
-            is_varlen=False, persistent=True,
+            q=qi,
+            v=vi,
+            g=gi,
+            h=hi,
+            o=oi,
+            A=Ai,
+            scale=d["scale"],
+            chunk_size=BT,
+            is_varlen=False,
+            persistent=True,
         )
         torch.cuda.synchronize()
         o_ref[start:end] = oi.squeeze(0)
@@ -223,22 +260,22 @@ def check_accuracy(name, ref, out, atol=0.02):
 
     passed = max_diff < atol
     status = "PASS" if passed else "FAIL"
-    print(f"  [{status}] {name}: "
-          f"max_diff={max_diff:.6f} rel_max={rel_max:.6f} "
-          f"rmse_ratio={rmse_ratio:.6f}")
+    print(f"  [{status}] {name}: max_diff={max_diff:.6f} rel_max={rel_max:.6f} rmse_ratio={rmse_ratio:.6f}")
     if not passed:
         flat_idx = diff.view(-1).argmax().item()
-        print(f"    Worst at flat_idx={flat_idx}: "
-              f"ref={ref_f.view(-1)[flat_idx].item():.6f}, "
-              f"out={out_f.view(-1)[flat_idx].item():.6f}")
+        print(
+            f"    Worst at flat_idx={flat_idx}: "
+            f"ref={ref_f.view(-1)[flat_idx].item():.6f}, "
+            f"out={out_f.view(-1)[flat_idx].item():.6f}"
+        )
     assert passed, f"{name}: max_diff={max_diff:.6f} exceeds atol={atol}"
     return max_diff, rel_max, rmse_ratio
 
 
 def check_per_seq(name, ref, out, d, atol=0.02):
     """Check accuracy per-sequence, to pinpoint which seq fails."""
-    cu = d['cu_seqlens']
-    for i, slen in enumerate(d['seq_lens']):
+    cu = d["cu_seqlens"]
+    for i, slen in enumerate(d["seq_lens"]):
         start = cu[i].item()
         end = cu[i + 1].item()
         check_accuracy(f"{name} seq[{i}] len={slen}", ref[start:end], out[start:end], atol=atol)
@@ -248,17 +285,21 @@ def check_per_seq(name, ref, out, d, atol=0.02):
 # Non-varlen tests: Reference (PyTorch) vs Triton
 # ═══════════════════════════════════════════════════════════════════════
 
-@pytest.mark.parametrize("B,T,H,K,V", [
-    (1, 64, 1, 128, 128),
-    (2, 128, 2, 128, 128),
-    (2, 256, 4, 128, 128),
-    (4, 1024, 4, 128, 128),
-    (1, 192, 2, 128, 128),   # Non-aligned T (not multiple of 64)
-])
+
+@pytest.mark.parametrize(
+    "B,T,H,K,V",
+    [
+        (1, 64, 1, 128, 128),
+        (2, 128, 2, 128, 128),
+        (2, 256, 4, 128, 128),
+        (4, 1024, 4, 128, 128),
+        (1, 192, 2, 128, 128),  # Non-aligned T (not multiple of 64)
+    ],
+)
 def test_reference_vs_triton(B, T, H, K, V):
     """Verify PyTorch reference matches Triton kernel."""
     NT = (T + BT - 1) // BT
-    scale = K ** -0.5
+    scale = K**-0.5
 
     torch.manual_seed(42)
     q = torch.randn(B, T, H, K, dtype=DTYPE, device=DEVICE)
@@ -277,17 +318,21 @@ def test_reference_vs_triton(B, T, H, K, V):
 # Non-varlen tests: CuTe DSL vs Reference
 # ═══════════════════════════════════════════════════════════════════════
 
-@pytest.mark.parametrize("B,T,H,K,V", [
-    (1, 64, 1, 128, 128),
-    (2, 128, 2, 128, 128),
-    (2, 256, 4, 128, 128),
-    (4, 1024, 4, 128, 128),
-    (1, 192, 2, 128, 128),
-])
+
+@pytest.mark.parametrize(
+    "B,T,H,K,V",
+    [
+        (1, 64, 1, 128, 128),
+        (2, 128, 2, 128, 128),
+        (2, 256, 4, 128, 128),
+        (4, 1024, 4, 128, 128),
+        (1, 192, 2, 128, 128),
+    ],
+)
 def test_cute_dsl_vs_reference(B, T, H, K, V):
     """Verify CuTe DSL kernel matches PyTorch reference (non-varlen)."""
     NT = (T + BT - 1) // BT
-    scale = K ** -0.5
+    scale = K**-0.5
 
     torch.manual_seed(42)
     q = torch.randn(B, T, H, K, dtype=DTYPE, device=DEVICE)
@@ -299,8 +344,7 @@ def test_cute_dsl_vs_reference(B, T, H, K, V):
     o_ref = reference_chunk_gla_fwd_o(q, v, g, h, A, scale, BT)
 
     o_cute = torch.zeros_like(q[:, :, :, :V])
-    chunk_gla_fwd_o(q, v, g, h, o_cute, A, scale, chunk_size=BT,
-                    is_varlen=False, persistent=True)
+    chunk_gla_fwd_o(q, v, g, h, o_cute, A, scale, chunk_size=BT, is_varlen=False, persistent=True)
     torch.cuda.synchronize()
 
     assert assert_close(f"CuTe_vs_ref B={B} T={T} H={H}", o_ref, o_cute, atol=0.02)
@@ -310,48 +354,47 @@ def test_cute_dsl_vs_reference(B, T, H, K, V):
 # Varlen tests: CuTe varlen vs PyTorch reference (per-sequence gold standard)
 # ═══════════════════════════════════════════════════════════════════════
 
-@pytest.mark.parametrize("seq_lens,H", [
-    # Single sequence
-    ([64], 4),
-    ([128], 4),
-    ([192], 4),         # non-aligned (3 chunks, last is 64)
-    ([100], 4),         # non-aligned (2 chunks, last is 36)
-    ([1], 4),           # single token
-    ([63], 4),          # < BT
-    ([65], 4),          # BT + 1
 
-    # Two sequences
-    ([64, 64], 4),
-    ([128, 64], 4),
-    ([64, 128], 4),     # short before long
-    ([100, 200], 4),    # both non-aligned
-    ([256, 1], 4),      # long + single token
-
-    # Multiple sequences
-    ([64, 64, 64], 4),
-    ([128, 64, 192], 4),
-    ([256, 128, 64, 64], 4),
-    ([100, 150, 200, 250, 300], 4),  # 5 seqs all non-aligned
-
-    # Same-length sequences
-    ([64, 64, 64, 64], 4),
-    ([128, 128, 128], 4),
-    ([100, 100, 100], 4),   # all non-aligned, same
-
-    # Many short sequences
-    ([64] * 10, 4),
-    ([2] * 20, 4),       # very short seqs
-    ([BT] * 8, 4),       # all exactly BT
-
-    # Mixed extreme lengths
-    ([1, 1024], 4),
-    ([1024, 1], 4),
-    ([1, 64, 1, 128, 1], 4),
-
-    # Larger scale
-    ([256, 512, 128, 64, 256], 64),
-    ([1024, 2048], 64),
-], ids=lambda x: str(x))
+@pytest.mark.parametrize(
+    "seq_lens,H",
+    [
+        # Single sequence
+        ([64], 4),
+        ([128], 4),
+        ([192], 4),  # non-aligned (3 chunks, last is 64)
+        ([100], 4),  # non-aligned (2 chunks, last is 36)
+        ([1], 4),  # single token
+        ([63], 4),  # < BT
+        ([65], 4),  # BT + 1
+        # Two sequences
+        ([64, 64], 4),
+        ([128, 64], 4),
+        ([64, 128], 4),  # short before long
+        ([100, 200], 4),  # both non-aligned
+        ([256, 1], 4),  # long + single token
+        # Multiple sequences
+        ([64, 64, 64], 4),
+        ([128, 64, 192], 4),
+        ([256, 128, 64, 64], 4),
+        ([100, 150, 200, 250, 300], 4),  # 5 seqs all non-aligned
+        # Same-length sequences
+        ([64, 64, 64, 64], 4),
+        ([128, 128, 128], 4),
+        ([100, 100, 100], 4),  # all non-aligned, same
+        # Many short sequences
+        ([64] * 10, 4),
+        ([2] * 20, 4),  # very short seqs
+        ([BT] * 8, 4),  # all exactly BT
+        # Mixed extreme lengths
+        ([1, 1024], 4),
+        ([1024, 1], 4),
+        ([1, 64, 1, 128, 1], 4),
+        # Larger scale
+        ([256, 512, 128, 64, 256], 64),
+        ([1024, 2048], 64),
+    ],
+    ids=lambda x: str(x),
+)
 def test_cute_varlen_vs_torch_baseline(seq_lens, H):
     """CuTe DSL varlen must match per-sequence PyTorch baseline."""
     d = gen_varlen_data(seq_lens, H)
@@ -365,42 +408,42 @@ def test_cute_varlen_vs_torch_baseline(seq_lens, H):
 # Varlen tests: FLA Triton varlen vs PyTorch baseline
 # ═══════════════════════════════════════════════════════════════════════
 
-@pytest.mark.parametrize("seq_lens,H", [
-    # Single sequence
-    ([64], 4),
-    ([128], 4),
-    ([192], 4),
-    ([100], 4),
-    ([1], 4),
-    ([63], 4),
-    ([65], 4),
 
-    # Two sequences
-    ([64, 64], 4),
-    ([128, 64], 4),
-    ([100, 200], 4),
-    ([256, 1], 4),
-
-    # Multiple sequences
-    ([64, 64, 64], 4),
-    ([128, 64, 192], 4),
-    ([256, 128, 64, 64], 4),
-    ([100, 150, 200, 250, 300], 4),
-
-    # Same-length / many short
-    ([64, 64, 64, 64], 4),
-    ([128, 128, 128], 4),
-    ([2] * 20, 4),
-
-    # Mixed extreme
-    ([1, 1024], 4),
-    ([1024, 1], 4),
-    ([1, 64, 1, 128, 1], 4),
-
-    # Larger scale
-    ([256, 512, 128, 64, 256], 64),
-    ([1024, 2048], 64),
-], ids=lambda x: str(x))
+@pytest.mark.parametrize(
+    "seq_lens,H",
+    [
+        # Single sequence
+        ([64], 4),
+        ([128], 4),
+        ([192], 4),
+        ([100], 4),
+        ([1], 4),
+        ([63], 4),
+        ([65], 4),
+        # Two sequences
+        ([64, 64], 4),
+        ([128, 64], 4),
+        ([100, 200], 4),
+        ([256, 1], 4),
+        # Multiple sequences
+        ([64, 64, 64], 4),
+        ([128, 64, 192], 4),
+        ([256, 128, 64, 64], 4),
+        ([100, 150, 200, 250, 300], 4),
+        # Same-length / many short
+        ([64, 64, 64, 64], 4),
+        ([128, 128, 128], 4),
+        ([2] * 20, 4),
+        # Mixed extreme
+        ([1, 1024], 4),
+        ([1024, 1], 4),
+        ([1, 64, 1, 128, 1], 4),
+        # Larger scale
+        ([256, 512, 128, 64, 256], 64),
+        ([1024, 2048], 64),
+    ],
+    ids=lambda x: str(x),
+)
 def test_fla_varlen_vs_torch_baseline(seq_lens, H):
     """FLA Triton varlen must match per-sequence PyTorch baseline."""
     d = gen_varlen_data(seq_lens, H)
@@ -414,21 +457,25 @@ def test_fla_varlen_vs_torch_baseline(seq_lens, H):
 # Varlen tests: CuTe varlen vs CuTe non-varlen (consistency)
 # ═══════════════════════════════════════════════════════════════════════
 
-@pytest.mark.parametrize("seq_lens,H", [
-    ([64], 4),
-    ([128, 64], 4),
-    ([256, 128, 64], 4),
-    ([100, 200], 4),
-    ([64, 64, 64, 64], 4),
-    ([512, 256], 32),
-], ids=lambda x: str(x))
+
+@pytest.mark.parametrize(
+    "seq_lens,H",
+    [
+        ([64], 4),
+        ([128, 64], 4),
+        ([256, 128, 64], 4),
+        ([100, 200], 4),
+        ([64, 64, 64, 64], 4),
+        ([512, 256], 32),
+    ],
+    ids=lambda x: str(x),
+)
 def test_cute_varlen_vs_non_varlen(seq_lens, H):
     """CuTe varlen output must match per-sequence non-varlen output."""
     d = gen_varlen_data(seq_lens, H)
     o_varlen = run_cute_varlen(d)
     o_non_varlen = run_cute_non_varlen_per_seq(d)
-    check_accuracy(f"varlen vs non-varlen seqs={seq_lens} H={H}",
-                   o_non_varlen, o_varlen)
+    check_accuracy(f"varlen vs non-varlen seqs={seq_lens} H={H}", o_non_varlen, o_varlen)
     check_per_seq("consistency", o_non_varlen, o_varlen, d)
 
 
@@ -436,9 +483,15 @@ def test_cute_varlen_vs_non_varlen(seq_lens, H):
 # Varlen tests: Component isolation (pure inter-chunk, pure intra-chunk)
 # ═══════════════════════════════════════════════════════════════════════
 
-@pytest.mark.parametrize("seq_lens", [
-    [64, 128], [100, 200, 64], [256, 512],
-])
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [64, 128],
+        [100, 200, 64],
+        [256, 512],
+    ],
+)
 def test_pure_inter_chunk(seq_lens):
     """With A=0, output is purely from inter-chunk (q*g @ h). Must match torch baseline."""
     H = 4
@@ -450,9 +503,14 @@ def test_pure_inter_chunk(seq_lens):
     check_accuracy(f"pure_inter (A=0) CuTe vs torch seqs={seq_lens}", o_ref, o_cute)
 
 
-@pytest.mark.parametrize("seq_lens", [
-    [64, 128], [100, 200, 64], [256, 512],
-])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [64, 128],
+        [100, 200, 64],
+        [256, 512],
+    ],
+)
 def test_pure_intra_chunk(seq_lens):
     """With h=0, output is purely from intra-chunk (A @ v). Must match torch baseline."""
     H = 4
@@ -464,9 +522,13 @@ def test_pure_intra_chunk(seq_lens):
     check_accuracy(f"pure_intra (h=0) CuTe vs torch seqs={seq_lens}", o_ref, o_cute)
 
 
-@pytest.mark.parametrize("seq_lens", [
-    [64, 128], [100, 200, 64],
-])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [64, 128],
+        [100, 200, 64],
+    ],
+)
 def test_zero_gate(seq_lens):
     """With g=0, exp2(g)=1 so qg=q. Must match torch baseline."""
     H = 4
@@ -481,6 +543,7 @@ def test_zero_gate(seq_lens):
 # ═══════════════════════════════════════════════════════════════════════
 # Varlen tests: Various head counts
 # ═══════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.parametrize("H", [1, 2, 4, 8, 16, 32, 64])
 def test_head_counts(H):
@@ -497,6 +560,7 @@ def test_head_counts(H):
 # ═══════════════════════════════════════════════════════════════════════
 # Varlen tests: Determinism
 # ═══════════════════════════════════════════════════════════════════════
+
 
 def test_determinism():
     """Multiple calls with same input must produce identical output."""
@@ -518,6 +582,7 @@ def test_determinism():
 # ═══════════════════════════════════════════════════════════════════════
 # Varlen tests: Random configs (stress test)
 # ═══════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.parametrize("seed", list(range(10)))
 def test_random_varlen_configs(seed):
@@ -541,6 +606,7 @@ def test_random_varlen_configs(seed):
 # Varlen tests: Gate magnitude (numerical stress)
 # ═══════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.parametrize("g_scale", [0.01, 0.1, 0.5, 1.0])
 def test_gate_magnitude(g_scale):
     """Various gate magnitudes to test numerical stability."""
@@ -551,7 +617,7 @@ def test_gate_magnitude(g_scale):
     o_cute = run_cute_varlen(d)
     o_fla = run_fla_varlen(d)
     # Larger gates → larger values → relax atol proportionally
-    atol = 0.02 * max(1.0, 2 ** g_scale)
+    atol = 0.02 * max(1.0, 2**g_scale)
     check_accuracy(f"g_scale={g_scale} FLA vs torch", o_ref, o_fla, atol=atol)
     check_accuracy(f"g_scale={g_scale} CuTe vs torch", o_ref, o_cute, atol=atol)
 
@@ -560,23 +626,27 @@ def test_gate_magnitude(g_scale):
 # Varlen tests: Persistent vs non-persistent consistency
 # ═══════════════════════════════════════════════════════════════════════
 
-@pytest.mark.parametrize("seq_lens,H", [
-    ([128, 64], 4),
-    ([256, 128, 64], 4),
-    ([100, 200, 300], 32),
-])
+
+@pytest.mark.parametrize(
+    "seq_lens,H",
+    [
+        ([128, 64], 4),
+        ([256, 128, 64], 4),
+        ([100, 200, 300], 32),
+    ],
+)
 def test_persistent_non_varlen_consistency(seq_lens, H):
     """persistent=True non-varlen per-seq must agree with varlen persistent."""
     d = gen_varlen_data(seq_lens, H)
     o_varlen = run_cute_varlen(d)
     o_non_varlen = run_cute_non_varlen_per_seq(d)
-    check_accuracy(f"persistent consistency seqs={seq_lens} H={H}",
-                   o_non_varlen, o_varlen, atol=1e-6)
+    check_accuracy(f"persistent consistency seqs={seq_lens} H={H}", o_non_varlen, o_varlen, atol=1e-6)
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # Varlen tests: Sequence boundary isolation
 # ═══════════════════════════════════════════════════════════════════════
+
 
 def test_sequence_boundary_isolation():
     """Changing data in one sequence must not affect others."""
@@ -586,11 +656,11 @@ def test_sequence_boundary_isolation():
     o1 = run_cute_varlen(d).clone()
 
     # Perturb seq[1] data
-    cu = d['cu_seqlens']
+    cu = d["cu_seqlens"]
     s1_start = cu[1].item()
     s1_end = cu[2].item()
-    d['q'][:, s1_start:s1_end] = torch.randn_like(d['q'][:, s1_start:s1_end]) * 10
-    d['v'][:, s1_start:s1_end] = torch.randn_like(d['v'][:, s1_start:s1_end]) * 10
+    d["q"][:, s1_start:s1_end] = torch.randn_like(d["q"][:, s1_start:s1_end]) * 10
+    d["v"][:, s1_start:s1_end] = torch.randn_like(d["v"][:, s1_start:s1_end]) * 10
 
     o2 = run_cute_varlen(d).clone()
 
@@ -611,12 +681,16 @@ def test_sequence_boundary_isolation():
 # Varlen tests: 3-way cross-validation
 # ═══════════════════════════════════════════════════════════════════════
 
-@pytest.mark.parametrize("seq_lens,H", [
-    ([64, 128], 4),
-    ([100, 200, 64], 4),
-    ([256, 512, 128], 32),
-    ([64, 64, 64, 64, 64], 64),
-])
+
+@pytest.mark.parametrize(
+    "seq_lens,H",
+    [
+        ([64, 128], 4),
+        ([100, 200, 64], 4),
+        ([256, 512, 128], 32),
+        ([64, 64, 64, 64, 64], 64),
+    ],
+)
 def test_three_way_cross_validation(seq_lens, H):
     """All three implementations must agree with torch baseline."""
     d = gen_varlen_data(seq_lens, H)
@@ -632,6 +706,7 @@ def test_three_way_cross_validation(seq_lens, H):
 # ═══════════════════════════════════════════════════════════════════════
 # Manual correctness test runner
 # ═══════════════════════════════════════════════════════════════════════
+
 
 def run_correctness_tests():
     """Run correctness tests manually (not pytest)."""
@@ -649,7 +724,7 @@ def run_correctness_tests():
     for B, T, H, _K, _V, desc in configs:
         print(f"\n--- Test: {desc} (B={B}, T={T}, H={H}, K={K}, V={V}) ---")
         NT = (T + BT - 1) // BT
-        scale = K ** -0.5
+        scale = K**-0.5
 
         torch.manual_seed(42)
         q = torch.randn(B, T, H, K, dtype=DTYPE, device=DEVICE)
@@ -662,8 +737,7 @@ def run_correctness_tests():
 
         try:
             o_cute = torch.zeros_like(q[:, :, :, :V])
-            chunk_gla_fwd_o(q, v, g, h, o_cute, A, scale, chunk_size=BT,
-                            is_varlen=False, persistent=True)
+            chunk_gla_fwd_o(q, v, g, h, o_cute, A, scale, chunk_size=BT, is_varlen=False, persistent=True)
             torch.cuda.synchronize()
             passed = assert_close("CuTe DSL vs Ref", o_ref, o_cute, atol=0.02)
             all_passed = all_passed and passed
@@ -679,7 +753,7 @@ def run_correctness_tests():
             print(f"  Triton failed: {e}")
             all_passed = False
 
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 50}")
     print(f"Overall: {'ALL PASSED' if all_passed else 'SOME FAILED'}")
     return all_passed
 
@@ -687,7 +761,7 @@ def run_correctness_tests():
 def run_benchmark(B=4, T=4096, H=4, num_iters=100):
     """Benchmark CuTe DSL and Triton kernels."""
     NT = (T + BT - 1) // BT
-    scale = K ** -0.5
+    scale = K**-0.5
 
     print(f"\n=== Benchmark: B={B}, T={T}, H={H}, K={K}, V={V} ===")
 
@@ -700,21 +774,18 @@ def run_benchmark(B=4, T=4096, H=4, num_iters=100):
     o = torch.zeros(B, T, H, V, dtype=DTYPE, device=DEVICE)
 
     # --- CuTe DSL ---
-    chunk_gla_fwd_o(q, v, g, h, o, A, scale, chunk_size=BT,
-                    is_varlen=False, persistent=True)
+    chunk_gla_fwd_o(q, v, g, h, o, A, scale, chunk_size=BT, is_varlen=False, persistent=True)
     torch.cuda.synchronize()
 
     for _ in range(5):
-        chunk_gla_fwd_o(q, v, g, h, o, A, scale, chunk_size=BT,
-                        is_varlen=False, persistent=True)
+        chunk_gla_fwd_o(q, v, g, h, o, A, scale, chunk_size=BT, is_varlen=False, persistent=True)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(num_iters):
-        chunk_gla_fwd_o(q, v, g, h, o, A, scale, chunk_size=BT,
-                        is_varlen=False, persistent=True)
+        chunk_gla_fwd_o(q, v, g, h, o, A, scale, chunk_size=BT, is_varlen=False, persistent=True)
     end.record()
     torch.cuda.synchronize()
     cute_ms = start.elapsed_time(end) / num_iters
@@ -731,8 +802,7 @@ def run_benchmark(B=4, T=4096, H=4, num_iters=100):
     torch.cuda.synchronize()
     triton_ms = start.elapsed_time(end) / num_iters
 
-    total_bytes = (q.nelement() + v.nelement() + g.nelement() + h.nelement() +
-                   A.nelement()) * 2  # bf16 = 2 bytes
+    total_bytes = (q.nelement() + v.nelement() + g.nelement() + h.nelement() + A.nelement()) * 2  # bf16 = 2 bytes
     total_bytes += v.nelement() * 2  # output
 
     print(f"  CuTe DSL: {cute_ms:.3f} ms, {total_bytes / (cute_ms * 1e-3) / 1e9:.1f} GB/s")
@@ -742,8 +812,7 @@ def run_benchmark(B=4, T=4096, H=4, num_iters=100):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--test", type=str, default="correctness",
-                        choices=["correctness", "benchmark", "both"])
+    parser.add_argument("--test", type=str, default="correctness", choices=["correctness", "benchmark", "both"])
     parser.add_argument("--B", type=int, default=4)
     parser.add_argument("--T", type=int, default=4096)
     parser.add_argument("--H", type=int, default=4)

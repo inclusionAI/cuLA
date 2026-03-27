@@ -25,12 +25,14 @@ from cula.lightning.la_decode import linear_attention_decode
 
 try:
     from cula.seg_la import SegLaMeta, seg_la_fwd
+
     HAS_SEG_LA = True
 except ImportError:
     HAS_SEG_LA = False
 
 try:
     from fla.ops.common.fused_recurrent import fused_recurrent_fwd
+
     HAS_FLA = True
 except ImportError:
     HAS_FLA = False
@@ -82,7 +84,7 @@ def run_la_decode(q, k, v, state_4d, decay_scales, scale):
     # la_decode state layout: [B*H, V, K] (pretransposed)
     state_cute = (
         state_4d.clone()
-        .permute(0, 1, 3, 2)       # [B, H, V, K]
+        .permute(0, 1, 3, 2)  # [B, H, V, K]
         .reshape(B * H, D, D)
         .contiguous()
     )
@@ -90,11 +92,22 @@ def run_la_decode(q, k, v, state_4d, decay_scales, scale):
     s_offsets = torch.arange(B, device=q.device, dtype=torch.int32)
 
     linear_attention_decode(
-        q, k, v, state_cute, out,
+        q,
+        k,
+        v,
+        state_cute,
+        out,
         softmax_scale=scale,
-        stride_q=0, stride_k=0, stride_v=0, stride_s=0, stride_o=0,
-        s_offsets=s_offsets, decay_scales=decay_scales,
-        HEAD_DIM=D, K_SPLIT_DIM=D, V_SPLIT_DIM=D,
+        stride_q=0,
+        stride_k=0,
+        stride_v=0,
+        stride_s=0,
+        stride_o=0,
+        s_offsets=s_offsets,
+        decay_scales=decay_scales,
+        HEAD_DIM=D,
+        K_SPLIT_DIM=D,
+        V_SPLIT_DIM=D,
     )
     # Convert state back to [B, H, K, V]
     state_out = state_cute.reshape(B, H, D, D).permute(0, 1, 3, 2).contiguous()
@@ -107,11 +120,9 @@ def run_la_decode(q, k, v, state_4d, decay_scales, scale):
 @pytest.mark.parametrize("B", [1, 2, 4, 8, 16, 32, 64, 128, 256])
 def test_output_vs_torch_ref(B):
     H, D = 32, 128
-    scale = D ** -0.5
+    scale = D**-0.5
     layer_idx, num_layers = 12, 24
-    decay_scales = (8 / H * (1 - layer_idx / num_layers)) * torch.arange(
-        H, device="cuda", dtype=torch.float32
-    )
+    decay_scales = (8 / H * (1 - layer_idx / num_layers)) * torch.arange(H, device="cuda", dtype=torch.float32)
 
     q, k, v, state = make_inputs(B, H, D)
     o_ref, state_ref = torch_la_decode_ref(q, k, v, state, decay_scales, scale)
@@ -124,9 +135,7 @@ def test_output_vs_torch_ref(B):
     assert rel_err < 0.01, f"B={B}: output relative RMSE {rel_err:.6f} too large"
 
     # State check
-    state_rmse = torch.sqrt(
-        torch.mean((state_cute - state_ref) ** 2)
-    ).item()
+    state_rmse = torch.sqrt(torch.mean((state_cute - state_ref) ** 2)).item()
     state_max = torch.abs(state_ref).max().item()
     state_rel = state_rmse / (state_max + 1e-8)
     assert state_rel < 0.001, f"B={B}: state relative RMSE {state_rel:.6f} too large"
@@ -135,7 +144,7 @@ def test_output_vs_torch_ref(B):
 @pytest.mark.parametrize("H", [8, 16, 32, 64])
 def test_different_heads(H):
     B, D = 4, 128
-    scale = D ** -0.5
+    scale = D**-0.5
     decay_scales = 0.5 * torch.arange(H, device="cuda", dtype=torch.float32) / H
 
     q, k, v, state = make_inputs(B, H, D)
@@ -154,7 +163,7 @@ def test_different_heads(H):
 def test_zero_decay():
     """With decay=0, state_new = state_old + k⊗v (no decay applied)."""
     B, H, D = 2, 32, 128
-    scale = D ** -0.5
+    scale = D**-0.5
     decay_scales = torch.zeros(H, device="cuda", dtype=torch.float32)
 
     q, k, v, state = make_inputs(B, H, D)
@@ -169,7 +178,7 @@ def test_zero_decay():
 def test_zero_state():
     """With zero initial state, output = q @ (k⊗v) * scale."""
     B, H, D = 4, 32, 128
-    scale = D ** -0.5
+    scale = D**-0.5
     decay_scales = 0.3 * torch.ones(H, device="cuda", dtype=torch.float32)
 
     q, k, v, _ = make_inputs(B, H, D)
@@ -190,7 +199,7 @@ def test_zero_state():
 @pytest.mark.parametrize("B", [1, 8, 32, 128])
 def test_vs_seg_la(B):
     H, D = 32, 128
-    scale = D ** -0.5
+    scale = D**-0.5
     decay_scales = (8 / H * 0.5) * torch.arange(H, device="cuda", dtype=torch.float32)
 
     q, k, v, state = make_inputs(B, H, D)
@@ -199,7 +208,8 @@ def test_vs_seg_la(B):
     state_seg = state.clone().reshape(B, H * D * D).contiguous()
     s_offsets = torch.arange(B, device="cuda", dtype=torch.int32)
     meta = SegLaMeta(
-        batch_size=B, max_q_length=1,
+        batch_size=B,
+        max_q_length=1,
         q_offsets=torch.arange(B + 1, device="cuda", dtype=torch.int32),
         s_offsets=s_offsets,
         q_lengths=torch.ones(B, device="cuda", dtype=torch.int32),
@@ -212,7 +222,7 @@ def test_vs_seg_la(B):
 
     rmse = torch.sqrt(torch.mean((o_cute.float() - o_seg.float()) ** 2)).item()
     max_ref = torch.abs(o_seg.float()).max().item()
-    assert rmse / (max_ref + 1e-8) < 0.005, f"B={B}: vs seg_la mismatch, rel_rmse={rmse/(max_ref+1e-8):.6f}"
+    assert rmse / (max_ref + 1e-8) < 0.005, f"B={B}: vs seg_la mismatch, rel_rmse={rmse / (max_ref + 1e-8):.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +232,7 @@ def test_vs_seg_la(B):
 @pytest.mark.parametrize("B", [1, 8, 32, 128])
 def test_vs_fla(B):
     H, D = 32, 128
-    scale = D ** -0.5
+    scale = D**-0.5
     g_gamma = -(8 / H * 0.5) * torch.arange(H, device="cuda", dtype=torch.float32)
     decay_scales = -g_gamma
 
@@ -234,9 +244,13 @@ def test_vs_fla(B):
     v_4d = v.unsqueeze(1)
     with torch.no_grad():
         o_fla, _ = fused_recurrent_fwd(
-            q_4d, k_4d, v_4d,
-            g_gamma=g_gamma, scale=scale,
-            initial_state=state.clone(), output_final_state=True,
+            q_4d,
+            k_4d,
+            v_4d,
+            g_gamma=g_gamma,
+            scale=scale,
+            initial_state=state.clone(),
+            output_final_state=True,
         )
     o_fla = o_fla.squeeze(1).to(torch.bfloat16)  # [B,H,D]
 
@@ -245,7 +259,7 @@ def test_vs_fla(B):
 
     rmse = torch.sqrt(torch.mean((o_cute.float() - o_fla.float()) ** 2)).item()
     max_ref = torch.abs(o_fla.float()).max().item()
-    assert rmse / (max_ref + 1e-8) < 0.005, f"B={B}: vs fla mismatch, rel_rmse={rmse/(max_ref+1e-8):.6f}"
+    assert rmse / (max_ref + 1e-8) < 0.005, f"B={B}: vs fla mismatch, rel_rmse={rmse / (max_ref + 1e-8):.6f}"
 
 
 if __name__ == "__main__":

@@ -95,6 +95,7 @@ def gen_varlen_seqs(target_total, n_seqs, seed=0):
     """Generate n_seqs random seq lengths summing to target_total.
     Lengths vary ~2-3x (log-uniform-ish), each rounded up to multiple of 2."""
     import random
+
     rng = random.Random(seed)
     raw = [rng.uniform(0.4, 1.0) for _ in range(n_seqs)]
     s = sum(raw)
@@ -108,21 +109,41 @@ def gen_varlen_seqs(target_total, n_seqs, seed=0):
 
 def run_fla(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, lower_bound):
     return fla_chunk_kda(
-        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-        A_log=A_log, dt_bias=dt_bias,
-        initial_state=init_state, output_final_state=True,
-        use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
-        use_gate_in_kernel=True, safe_gate=True, lower_bound=lower_bound,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=init_state,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+        use_gate_in_kernel=True,
+        safe_gate=True,
+        lower_bound=lower_bound,
     )
 
 
 def run_cula(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, lower_bound):
     return cula_kda_fused_fwd(
-        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-        A_log=A_log, dt_bias=dt_bias,
-        initial_state=init_state, output_final_state=True,
-        use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
-        use_gate_in_kernel=True, safe_gate=True, lower_bound=lower_bound,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=init_state,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+        use_gate_in_kernel=True,
+        safe_gate=True,
+        lower_bound=lower_bound,
     )
 
 
@@ -144,13 +165,23 @@ def bench_fixed(configs):
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
         inputs = prepare_safe_gate_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens)
-        q, k, v, g, beta = inputs['q'], inputs['k'], inputs['v'], inputs['g'], inputs['beta']
-        A_log, dt_bias = inputs['A_log'], inputs['dt_bias']
-        scale, init_state, lower_bound = inputs['scale'], inputs['init_state'], inputs['lower_bound']
+        q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
+        A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
+        scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
 
-        common = dict(q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-                      A_log=A_log, dt_bias=dt_bias, init_state=init_state,
-                      cu_seqlens=cu_seqlens, lower_bound=lower_bound)
+        common = dict(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            init_state=init_state,
+            cu_seqlens=cu_seqlens,
+            lower_bound=lower_bound,
+        )
 
         # Accuracy
         o_fla, _ = run_fla(**common)
@@ -162,13 +193,20 @@ def bench_fixed(configs):
         # Performance
         ms_fla = time_kernel(lambda: run_fla(**common))
         ms_cula = time_kernel(lambda: run_cula(**common))
-        speedup = ms_fla / ms_cula if ms_cula > 0 else float('inf')
+        speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
-        results.append({
-            'B': B, 'T': T,
-            'rmse': rmse, 'rel_max': rel_max, 'mean_diff': mean_diff,
-            'ms_fla': ms_fla, 'ms_cula': ms_cula, 'speedup': speedup,
-        })
+        results.append(
+            {
+                "B": B,
+                "T": T,
+                "rmse": rmse,
+                "rel_max": rel_max,
+                "mean_diff": mean_diff,
+                "ms_fla": ms_fla,
+                "ms_cula": ms_cula,
+                "speedup": speedup,
+            }
+        )
 
         del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
         torch.cuda.empty_cache()
@@ -194,13 +232,23 @@ def bench_varlen(configs):
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
         inputs = prepare_safe_gate_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens)
-        q, k, v, g, beta = inputs['q'], inputs['k'], inputs['v'], inputs['g'], inputs['beta']
-        A_log, dt_bias = inputs['A_log'], inputs['dt_bias']
-        scale, init_state, lower_bound = inputs['scale'], inputs['init_state'], inputs['lower_bound']
+        q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
+        A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
+        scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
 
-        common = dict(q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-                      A_log=A_log, dt_bias=dt_bias, init_state=init_state,
-                      cu_seqlens=cu_seqlens, lower_bound=lower_bound)
+        common = dict(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            init_state=init_state,
+            cu_seqlens=cu_seqlens,
+            lower_bound=lower_bound,
+        )
 
         # Accuracy
         o_fla, _ = run_fla(**common)
@@ -212,18 +260,26 @@ def bench_varlen(configs):
         # Performance
         ms_fla = time_kernel(lambda: run_fla(**common))
         ms_cula = time_kernel(lambda: run_cula(**common))
-        speedup = ms_fla / ms_cula if ms_cula > 0 else float('inf')
+        speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         n_seqs = len(seq_lens)
         min_l, max_l = min(seq_lens), max(seq_lens)
         avg_l = T // n_seqs
         tag = f"{n_seqs}seqs T={T} [{min_l}..{max_l}] avg={avg_l}"
 
-        results.append({
-            'tag': tag, 'T_total': T, 'n_seqs': n_seqs,
-            'rmse': rmse, 'rel_max': rel_max, 'mean_diff': mean_diff,
-            'ms_fla': ms_fla, 'ms_cula': ms_cula, 'speedup': speedup,
-        })
+        results.append(
+            {
+                "tag": tag,
+                "T_total": T,
+                "n_seqs": n_seqs,
+                "rmse": rmse,
+                "rel_max": rel_max,
+                "mean_diff": mean_diff,
+                "ms_fla": ms_fla,
+                "ms_cula": ms_cula,
+                "speedup": speedup,
+            }
+        )
 
         del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
         torch.cuda.empty_cache()
@@ -249,25 +305,33 @@ def print_report(fixed_results, varlen_results):
     if fixed_results:
         print("\n  [Fixed-Length]")
         print(f"  {'─' * 90}")
-        print(f"  {'B':>3s}  {'T':>6s}  │  {'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}"
-              f"  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}")
+        print(
+            f"  {'B':>3s}  {'T':>6s}  │  {'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}"
+            f"  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
+        )
         print(f"  {'─' * 90}")
         for r in fixed_results:
-            print(f"  {r['B']:3d}  {r['T']:6d}  │  "
-                  f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
-                  f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x")
+            print(
+                f"  {r['B']:3d}  {r['T']:6d}  │  "
+                f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
+                f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x"
+            )
         print(f"  {'─' * 90}")
 
     if varlen_results:
         print("\n  [Varlen]")
         print(f"  {'─' * 105}")
-        print(f"  {'Config':>45s}  │  {'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}"
-              f"  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}")
+        print(
+            f"  {'Config':>45s}  │  {'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}"
+            f"  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
+        )
         print(f"  {'─' * 105}")
         for r in varlen_results:
-            print(f"  {r['tag']:>45s}  │  "
-                  f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
-                  f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x")
+            print(
+                f"  {r['tag']:>45s}  │  "
+                f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
+                f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x"
+            )
         print(f"  {'─' * 105}")
 
     print(f"\n{sep}\n")
@@ -277,20 +341,22 @@ def print_report(fixed_results, varlen_results):
 # Main
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(
-        description="bench_kda_fused_fwd: cuLA fully-fused KDA forward vs FLA Triton"
-    )
+    parser = argparse.ArgumentParser(description="bench_kda_fused_fwd: cuLA fully-fused KDA forward vs FLA Triton")
     parser.add_argument(
-        "--mode", type=str, default="both",
+        "--mode",
+        type=str,
+        default="both",
         choices=["fixed", "varlen", "both"],
         help="Which benchmark mode to run (default: both)",
     )
     parser.add_argument(
-        "--ncu", action="store_true",
+        "--ncu",
+        action="store_true",
         help="NCU profiling mode: warmup=1, iters=1",
     )
     parser.add_argument(
-        "--sanitizer", action="store_true",
+        "--sanitizer",
+        action="store_true",
         help="Sanitizer mode: warmup=1, iters=1",
     )
     args = parser.parse_args()
@@ -303,14 +369,22 @@ def main():
         SANITIZER_MODE = True
         print("[Sanitizer mode] warmup=1, iters=1")
 
-    print(f"[Device] {torch.cuda.get_device_name(0)}  compute capability {_SM_TAG}  →  using {cula_kda_fused_fwd.__module__}.{cula_kda_fused_fwd.__name__}")
+    print(
+        f"[Device] {torch.cuda.get_device_name(0)}  compute capability {_SM_TAG}  →  using {cula_kda_fused_fwd.__module__}.{cula_kda_fused_fwd.__name__}"
+    )
 
     fixed_configs = [
         # (B, T)
-        (1, 512), (1, 1024),
-        (1, 4096), (1, 8192), (1, 16384),
-        (2, 512), (2, 1024),
-        (2, 4096), (2, 8192), (2, 16384),
+        (1, 512),
+        (1, 1024),
+        (1, 4096),
+        (1, 8192),
+        (1, 16384),
+        (2, 512),
+        (2, 1024),
+        (2, 4096),
+        (2, 8192),
+        (2, 16384),
     ]
 
     varlen_configs = [

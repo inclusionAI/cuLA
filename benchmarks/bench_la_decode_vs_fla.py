@@ -75,12 +75,10 @@ def benchmark_fn(fn, warmup=30, rep=200):
 def run_config(B, H, K, V, layer_idx, num_layers):
     device = "cuda"
     dtype = torch.bfloat16
-    scale = K ** -0.5
+    scale = K**-0.5
 
     # Per-head log decay (Lightning Attention formula)
-    g_gamma = -(8 / H * (1 - layer_idx / num_layers)) * torch.arange(
-        H, device=device, dtype=torch.float32
-    )
+    g_gamma = -(8 / H * (1 - layer_idx / num_layers)) * torch.arange(H, device=device, dtype=torch.float32)
     decay_scales = -g_gamma  # la_decode convention
 
     # ── Random inputs ──────────────────────────────────────────────────────
@@ -94,19 +92,18 @@ def run_config(B, H, K, V, layer_idx, num_layers):
     state_fla = state_init.clone()
     with torch.no_grad():
         o_fla_fp32, ht_fla = fused_recurrent_fwd(
-            q_4d, k_4d, v_4d,
-            g_gamma=g_gamma, scale=scale,
-            initial_state=state_fla, output_final_state=True,
+            q_4d,
+            k_4d,
+            v_4d,
+            g_gamma=g_gamma,
+            scale=scale,
+            initial_state=state_fla,
+            output_final_state=True,
         )
     o_fla = o_fla_fp32.to(dtype)
 
     # ── la_decode output ───────────────────────────────────────────────────
-    state_cute = (
-        state_init.clone()
-        .permute(0, 1, 3, 2)
-        .reshape(B * H, V, K)
-        .contiguous()
-    )
+    state_cute = state_init.clone().permute(0, 1, 3, 2).reshape(B * H, V, K).contiguous()
     q_3d = q_4d.squeeze(1)
     k_3d = k_4d.squeeze(1)
     v_3d = v_4d.squeeze(1)
@@ -115,11 +112,22 @@ def run_config(B, H, K, V, layer_idx, num_layers):
 
     with torch.no_grad():
         linear_attention_decode(
-            q_3d, k_3d, v_3d, state_cute, out_cute,
+            q_3d,
+            k_3d,
+            v_3d,
+            state_cute,
+            out_cute,
             softmax_scale=scale,
-            stride_q=0, stride_k=0, stride_v=0, stride_s=0, stride_o=0,
-            s_offsets=s_offsets, decay_scales=decay_scales,
-            HEAD_DIM=K, K_SPLIT_DIM=K, V_SPLIT_DIM=V,
+            stride_q=0,
+            stride_k=0,
+            stride_v=0,
+            stride_s=0,
+            stride_o=0,
+            s_offsets=s_offsets,
+            decay_scales=decay_scales,
+            HEAD_DIM=K,
+            K_SPLIT_DIM=K,
+            V_SPLIT_DIM=V,
         )
 
     # ── Correctness ────────────────────────────────────────────────────────
@@ -130,9 +138,7 @@ def run_config(B, H, K, V, layer_idx, num_layers):
     rel_maxdiff = torch.abs(o_cute_cmp - o_fla_cmp).max().item() / (max_ref + 1e-8)
 
     state_cute_back = state_cute.reshape(B, H, V, K).permute(0, 1, 3, 2).contiguous()
-    state_rmse = torch.sqrt(
-        torch.mean((state_cute_back - ht_fla.float()) ** 2)
-    ).item()
+    state_rmse = torch.sqrt(torch.mean((state_cute_back - ht_fla.float()) ** 2)).item()
 
     # ==================================================================
     # Mode 1: KERNEL-ONLY (pre-allocated everything, minimal host overhead)
@@ -151,33 +157,42 @@ def run_config(B, H, K, V, layer_idx, num_layers):
 
     def kernel_fla():
         fused_recurrent_fwd_kernel[grid_fla](
-            q=q_4d, k=k_4d, v=v_4d,
-            g=None, g_gamma=g_gamma, gk=None, gv=None,
-            o=fla_o_buf, h0=fla_state_k, ht=fla_ht_buf,
+            q=q_4d,
+            k=k_4d,
+            v=v_4d,
+            g=None,
+            g_gamma=g_gamma,
+            gk=None,
+            gv=None,
+            o=fla_o_buf,
+            h0=fla_state_k,
+            ht=fla_ht_buf,
             cu_seqlens=None,
-            scale=scale, B=B, T=1, H=H, K=K, V=V,
-            BK=BK_fla, BV=BV_fla,
-            USE_G=False, USE_G_GAMMA=True,
-            USE_GK=False, USE_GV=False,
+            scale=scale,
+            B=B,
+            T=1,
+            H=H,
+            K=K,
+            V=V,
+            BK=BK_fla,
+            BV=BV_fla,
+            USE_G=False,
+            USE_G_GAMMA=True,
+            USE_GK=False,
+            USE_GV=False,
             REVERSE=False,
         )
         torch.sum(fla_o_buf, dim=0, out=fla_o_sum)
 
     # cute kernel: pre-create compiled + stream handle
-    cute_state_k = (
-        state_init.clone()
-        .permute(0, 1, 3, 2)
-        .reshape(B * H, V, K)
-        .contiguous()
-    )
+    cute_state_k = state_init.clone().permute(0, 1, 3, 2).reshape(B * H, V, K).contiguous()
     out_cute_k = torch.empty(B, H, V, device=device, dtype=dtype)
     cache = _get_compiled_kernel(B, 1, H, K, V, scale)
     compiled_cute = cache["compiled"]
     stream_handle = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
 
     def kernel_cute():
-        compiled_cute(cute_state_k, decay_scales, q_3d, k_3d, v_3d,
-                      out_cute_k, s_offsets, stream_handle)
+        compiled_cute(cute_state_k, decay_scales, q_3d, k_3d, v_3d, out_cute_k, s_offsets, stream_handle)
 
     with torch.no_grad():
         kernel_fla_ms = benchmark_fn(kernel_fla)
@@ -187,28 +202,38 @@ def run_config(B, H, K, V, layer_idx, num_layers):
     # Mode 2: WRAPPER (full call path as used in production)
     # ==================================================================
     wrap_fla_state = state_init.clone()
-    wrap_cute_state = (
-        state_init.clone()
-        .permute(0, 1, 3, 2)
-        .reshape(B * H, V, K)
-        .contiguous()
-    )
+    wrap_cute_state = state_init.clone().permute(0, 1, 3, 2).reshape(B * H, V, K).contiguous()
     wrap_cute_out = torch.empty(B, H, V, device=device, dtype=dtype)
 
     def wrapper_fla():
         fused_recurrent_fwd(
-            q_4d, k_4d, v_4d,
-            g_gamma=g_gamma, scale=scale,
-            initial_state=wrap_fla_state, output_final_state=True,
+            q_4d,
+            k_4d,
+            v_4d,
+            g_gamma=g_gamma,
+            scale=scale,
+            initial_state=wrap_fla_state,
+            output_final_state=True,
         )
 
     def wrapper_cute():
         linear_attention_decode(
-            q_3d, k_3d, v_3d, wrap_cute_state, wrap_cute_out,
+            q_3d,
+            k_3d,
+            v_3d,
+            wrap_cute_state,
+            wrap_cute_out,
             softmax_scale=scale,
-            stride_q=0, stride_k=0, stride_v=0, stride_s=0, stride_o=0,
-            s_offsets=s_offsets, decay_scales=decay_scales,
-            HEAD_DIM=K, K_SPLIT_DIM=K, V_SPLIT_DIM=V,
+            stride_q=0,
+            stride_k=0,
+            stride_v=0,
+            stride_s=0,
+            stride_o=0,
+            s_offsets=s_offsets,
+            decay_scales=decay_scales,
+            HEAD_DIM=K,
+            K_SPLIT_DIM=K,
+            V_SPLIT_DIM=V,
         )
 
     with torch.no_grad():
@@ -233,11 +258,11 @@ def run_config(B, H, K, V, layer_idx, num_layers):
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(
-        description="Benchmark la_decode vs fla fused_recurrent for decode"
-    )
+    parser = argparse.ArgumentParser(description="Benchmark la_decode vs fla fused_recurrent for decode")
     parser.add_argument(
-        "--batch-sizes", type=int, nargs="+",
+        "--batch-sizes",
+        type=int,
+        nargs="+",
         default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
     )
     parser.add_argument("--heads", type=int, default=32)
@@ -254,10 +279,10 @@ def main():
     print("  dtype=bf16, state=fp32, T=1")
 
     # ── Kernel-only comparison ──────────────────────────────────────────
-    print(f"\n{'='*100}")
+    print(f"\n{'=' * 100}")
     print("  Mode 1: KERNEL-ONLY (pre-allocated buffers, direct kernel dispatch)")
     print("  fla: kernel + sum(0) with pre-allocated out=; cute: compiled() with pre-created stream")
-    print(f"{'='*100}")
+    print(f"{'=' * 100}")
     print(
         f"{'B':>5} | {'fla (ms)':>10} | {'cute (ms)':>10} | "
         f"{'speedup':>8} | {'RMSE':>10} | {'Rel MaxDiff':>12} | {'State RMSE':>12}"
@@ -275,20 +300,15 @@ def main():
         )
 
     # ── Wrapper comparison ──────────────────────────────────────────────
-    print(f"\n{'='*100}")
+    print(f"\n{'=' * 100}")
     print("  Mode 2: WRAPPER (fused_recurrent_fwd vs linear_attention_decode, full call path)")
     print("  fla: alloc o[NK,B,1,H,V]+ht[B,H,K,V] + kernel + sum(0); cute: cache lookup + CUstream + kernel")
-    print(f"{'='*100}")
-    print(
-        f"{'B':>5} | {'fla (ms)':>10} | {'cute (ms)':>10} | {'speedup':>8}"
-    )
+    print(f"{'=' * 100}")
+    print(f"{'B':>5} | {'fla (ms)':>10} | {'cute (ms)':>10} | {'speedup':>8}")
     print("─" * 50)
 
     for r in results:
-        print(
-            f"{r['B']:>5} | {r['wrap_fla_ms']:>10.4f} | {r['wrap_cute_ms']:>10.4f} | "
-            f"{r['wrap_speedup']:>7.2f}x"
-        )
+        print(f"{r['B']:>5} | {r['wrap_fla_ms']:>10.4f} | {r['wrap_cute_ms']:>10.4f} | {r['wrap_speedup']:>7.2f}x")
 
     print()
     print("Notes:")

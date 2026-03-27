@@ -61,9 +61,7 @@ def reset_cuda_error():
 
 def compute_decay(H, layer_idx=12, num_layers=24):
     """Compute per-head decay: decay_s[h] = (8/H)*(1-layer_idx/num_layers)*h."""
-    return (8 / H * (1 - layer_idx / num_layers)) * torch.arange(
-        H, dtype=torch.float32, device=DEVICE
-    )
+    return (8 / H * (1 - layer_idx / num_layers)) * torch.arange(H, dtype=torch.float32, device=DEVICE)
 
 
 # =============================================================================
@@ -123,7 +121,11 @@ def run_fla(Q, K, V, decay, initial_state, output_final_state, warmup, iters):
 
     def fn():
         return chunk_simple_gla_fwd(
-            q=Q, k=K, v=V, g_gamma=g_gamma, scale=scale,
+            q=Q,
+            k=K,
+            v=V,
+            g_gamma=g_gamma,
+            scale=scale,
             initial_state=initial_state,
             output_final_state=output_final_state,
             chunk_size=C,
@@ -141,7 +143,11 @@ def run_cutedsl(Q, K, V, decay, h0, output_final_state, warmup, iters):
 
     def fn():
         return lightning_attn_fwd(
-            Q, K, V, decay, scale=scale,
+            Q,
+            K,
+            V,
+            decay,
+            scale=scale,
             initial_state=h0,
             output_final_state=output_final_state,
             chunk_size=C,
@@ -158,10 +164,17 @@ def run_cutedsl(Q, K, V, decay, h0, output_final_state, warmup, iters):
 
 def run_cutedsl_varlen(Q, K, V, decay, cu_seqlens, persistent, warmup, iters):
     """Run CuteDSL varlen kernel (persistent or non-persistent)."""
+
     def fn():
         return lightning_attn_fwd_varlen(
-            Q, K, V, decay, cu_seqlens,
-            scale=1.0, chunk_size=C, persistent=persistent,
+            Q,
+            K,
+            V,
+            decay,
+            cu_seqlens,
+            scale=1.0,
+            chunk_size=C,
+            persistent=persistent,
         )
 
     t0 = time.time()
@@ -180,10 +193,15 @@ def run_fla_varlen(Q, K, V, decay, cu_seqlens, warmup, iters):
 
     def fn():
         return chunk_simple_gla_fwd(
-            q=Q, k=K, v=V,
-            g_gamma=g_gamma, scale=1.0,
-            initial_state=None, output_final_state=True,
-            cu_seqlens=cu_long, chunk_size=C,
+            q=Q,
+            k=K,
+            v=V,
+            g_gamma=g_gamma,
+            scale=1.0,
+            initial_state=None,
+            output_final_state=True,
+            cu_seqlens=cu_long,
+            chunk_size=C,
         )
 
     fn()  # compile
@@ -272,9 +290,15 @@ def benchmark_varlen_config(N, seq_lens, H, D, warmup, iters, dist=""):
     decay = compute_decay(H)
 
     result = {
-        "B": N, "T": T, "H": H, "D": D, "mode": "varlen",
-        "seq_lens": seq_lens, "dist": dist,
-        "min_seq": min(seq_lens), "max_seq": max(seq_lens),
+        "B": N,
+        "T": T,
+        "H": H,
+        "D": D,
+        "mode": "varlen",
+        "seq_lens": seq_lens,
+        "dist": dist,
+        "min_seq": min(seq_lens),
+        "max_seq": max(seq_lens),
     }
 
     # --- Persistent ---
@@ -354,9 +378,9 @@ def print_standard_result(r):
     dsl = f"{r['cutedsl_ms']:.3f}" if _valid(r.get("cutedsl_ms", float("nan"))) else "ERR"
     sp = f"{r['speedup']:.2f}x" if _valid(r.get("speedup", float("nan"))) else "-"
     omd = f"{r['o_max_diff']:.6f}" if not np.isnan(r.get("o_max_diff", float("nan"))) else "-"
-    orel = f"{r['o_rel_err']*100:.2f}%" if not np.isnan(r.get("o_rel_err", float("nan"))) else "-"
+    orel = f"{r['o_rel_err'] * 100:.2f}%" if not np.isnan(r.get("o_rel_err", float("nan"))) else "-"
     htmd = f"{r['ht_max_diff']:.6f}" if not np.isnan(r.get("ht_max_diff", float("nan"))) else "-"
-    htrel = f"{r['ht_rel_err']*100:.2f}%" if not np.isnan(r.get("ht_rel_err", float("nan"))) else "-"
+    htrel = f"{r['ht_rel_err'] * 100:.2f}%" if not np.isnan(r.get("ht_rel_err", float("nan"))) else "-"
 
     print(f"{cfg:<28} {r['mode']:<10} {fla:>9} {dsl:>12} {sp:>8} {omd:>10} {orel:>8} {htmd:>11} {htrel:>8}")
     if r.get("fla_err"):
@@ -390,12 +414,7 @@ def print_varlen_result(r):
     od = f"{r['p_vs_np_O_diff']:.1e}" if not np.isnan(r.get("p_vs_np_O_diff", float("nan"))) else "-"
     hd = f"{r['p_vs_np_ht_diff']:.1e}" if not np.isnan(r.get("p_vs_np_ht_diff", float("nan"))) else "-"
 
-    print(
-        f"{cfg:<24} {dist:<8} "
-        f"{p_ms:>12} {np_ms:>11} {fla_vl:>11} "
-        f"{pvnp:>6} {pvfla_vl:>8} "
-        f"{od:>10} {hd:>10}"
-    )
+    print(f"{cfg:<24} {dist:<8} {p_ms:>12} {np_ms:>11} {fla_vl:>11} {pvnp:>6} {pvfla_vl:>8} {od:>10} {hd:>10}")
     if r.get("persistent_err"):
         print(f"  >> Persistent error: {r['persistent_err']}")
     if r.get("nonpersistent_err"):
@@ -508,18 +527,24 @@ def run_benchmark_suite(args):
             # persistent vs non-persistent
             pvnp = [r["p_vs_np_speedup"] for r in mode_r if _valid(r.get("p_vs_np_speedup", float("nan")))]
             if pvnp:
-                print(f"    Persist vs NonPer:      avg={np.mean(pvnp):.2f}x  min={np.min(pvnp):.2f}x  max={np.max(pvnp):.2f}x")
+                print(
+                    f"    Persist vs NonPer:      avg={np.mean(pvnp):.2f}x  min={np.min(pvnp):.2f}x  max={np.max(pvnp):.2f}x"
+                )
             pvfla_vl = [r["p_vs_fla_vl_speedup"] for r in mode_r if _valid(r.get("p_vs_fla_vl_speedup", float("nan")))]
             if pvfla_vl:
-                print(f"    Persist vs FLA varlen:   avg={np.mean(pvfla_vl):.2f}x  min={np.min(pvfla_vl):.2f}x  max={np.max(pvfla_vl):.2f}x  (FAIR)")
+                print(
+                    f"    Persist vs FLA varlen:   avg={np.mean(pvfla_vl):.2f}x  min={np.min(pvfla_vl):.2f}x  max={np.max(pvfla_vl):.2f}x  (FAIR)"
+                )
             # accuracy
             od = [r["p_vs_np_O_diff"] for r in mode_r if not np.isnan(r.get("p_vs_np_O_diff", float("nan")))]
             if od:
-                print(f"    P vs NP O diff:         max={max(od):.2e}  (bit-exact={all(x==0 for x in od)})")
+                print(f"    P vs NP O diff:         max={max(od):.2e}  (bit-exact={all(x == 0 for x in od)})")
         else:
             speedups = [r["speedup"] for r in mode_r]
             print(f"\n  [{mode}]  ({len(mode_r)} configs)")
-            print(f"    Speedup (CuteDSL/FLA):  avg={np.mean(speedups):.2f}x  min={np.min(speedups):.2f}x  max={np.max(speedups):.2f}x")
+            print(
+                f"    Speedup (CuteDSL/FLA):  avg={np.mean(speedups):.2f}x  min={np.min(speedups):.2f}x  max={np.max(speedups):.2f}x"
+            )
             o_rels = [r["o_rel_err"] * 100 for r in mode_r if not np.isnan(r.get("o_rel_err", float("nan")))]
             if o_rels:
                 print(f"    O rel err (%):          avg={np.mean(o_rels):.3f}  max={np.max(o_rels):.3f}")
@@ -542,6 +567,7 @@ def run_benchmark_suite(args):
 def plot_results(all_results, modes):
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
@@ -557,11 +583,15 @@ def plot_results(all_results, modes):
         mr = [r for r in all_results if r["mode"] == mode]
 
         if mode == "varlen":
-            hr = [r for r in mr if _valid(r.get("persistent_ms", float("nan"))) and _valid(r.get("nonpersistent_ms", float("nan")))]
+            hr = [
+                r
+                for r in mr
+                if _valid(r.get("persistent_ms", float("nan"))) and _valid(r.get("nonpersistent_ms", float("nan")))
+            ]
             if not hr:
                 ax.set_title("varlen (no data)")
                 continue
-            labels = [f"N{r['B']}T{r['T']}\n{r.get('dist','')[:3]}" for r in hr]
+            labels = [f"N{r['B']}T{r['T']}\n{r.get('dist', '')[:3]}" for r in hr]
             p_ms = [r["persistent_ms"] for r in hr]
             np_ms = [r["nonpersistent_ms"] for r in hr]
             fla_ms = [r["fla_varlen_ms"] if _valid(r.get("fla_varlen_ms", float("nan"))) else 0 for r in hr]
@@ -601,6 +631,7 @@ def plot_results(all_results, modes):
 # =============================================================================
 def generate_report(all_results, modes, args):
     from datetime import datetime
+
     path = os.path.join(os.path.dirname(__file__), "benchmark_report.md")
     with open(path, "w") as f:
         f.write("# Lightning Attention Benchmark Report\n\n")
@@ -628,10 +659,14 @@ def generate_report(all_results, modes, args):
                     np_ = f"{r['nonpersistent_ms']:.3f}" if _valid(r.get("nonpersistent_ms", float("nan"))) else "-"
                     fla_vl = f"{r['fla_varlen_ms']:.3f}" if _valid(r.get("fla_varlen_ms", float("nan"))) else "-"
                     pvnp = f"{r['p_vs_np_speedup']:.2f}x" if _valid(r.get("p_vs_np_speedup", float("nan"))) else "-"
-                    pvfla_vl = f"{r['p_vs_fla_vl_speedup']:.2f}x" if _valid(r.get("p_vs_fla_vl_speedup", float("nan"))) else "-"
+                    pvfla_vl = (
+                        f"{r['p_vs_fla_vl_speedup']:.2f}x" if _valid(r.get("p_vs_fla_vl_speedup", float("nan"))) else "-"
+                    )
                     od = f"{r['p_vs_np_O_diff']:.1e}" if not np.isnan(r.get("p_vs_np_O_diff", float("nan"))) else "-"
                     hd = f"{r['p_vs_np_ht_diff']:.1e}" if not np.isnan(r.get("p_vs_np_ht_diff", float("nan"))) else "-"
-                    f.write(f"| {r['B']} | {r['T']} | {r.get('dist','')} | {p} | {np_} | {fla_vl} | {pvnp} | {pvfla_vl} | {od} | {hd} |\n")
+                    f.write(
+                        f"| {r['B']} | {r['T']} | {r.get('dist', '')} | {p} | {np_} | {fla_vl} | {pvnp} | {pvfla_vl} | {od} | {hd} |\n"
+                    )
             else:
                 has_ht = mode == "h0_ht"
                 if has_ht:
@@ -646,10 +681,10 @@ def generate_report(all_results, modes, args):
                     fla = f"{r['fla_ms']:.3f}" if _valid(r.get("fla_ms", float("nan"))) else "-"
                     dsl = f"{r['cutedsl_ms']:.3f}" if _valid(r.get("cutedsl_ms", float("nan"))) else "-"
                     omd = f"{r['o_max_diff']:.6f}" if not np.isnan(r.get("o_max_diff", float("nan"))) else "-"
-                    orel = f"{r['o_rel_err']*100:.2f}%" if not np.isnan(r.get("o_rel_err", float("nan"))) else "-"
+                    orel = f"{r['o_rel_err'] * 100:.2f}%" if not np.isnan(r.get("o_rel_err", float("nan"))) else "-"
                     if has_ht:
                         htmd = f"{r['ht_max_diff']:.6f}" if not np.isnan(r.get("ht_max_diff", float("nan"))) else "-"
-                        htrel = f"{r['ht_rel_err']*100:.2f}%" if not np.isnan(r.get("ht_rel_err", float("nan"))) else "-"
+                        htrel = f"{r['ht_rel_err'] * 100:.2f}%" if not np.isnan(r.get("ht_rel_err", float("nan"))) else "-"
                         f.write(f"| {cfg} | {fla} | {dsl} | {sp} | {omd} | {orel} | {htmd} | {htrel} |\n")
                     else:
                         f.write(f"| {cfg} | {fla} | {dsl} | {sp} | {omd} | {orel} |\n")
@@ -664,12 +699,16 @@ def generate_report(all_results, modes, args):
             if mode == "varlen":
                 pvfla_vl = [r["p_vs_fla_vl_speedup"] for r in mr if _valid(r.get("p_vs_fla_vl_speedup", float("nan")))]
                 if pvfla_vl:
-                    f.write(f"- **varlen Persist vs FLA varlen (fair)**: avg {np.mean(pvfla_vl):.2f}x, "
-                            f"min {np.min(pvfla_vl):.2f}x, max {np.max(pvfla_vl):.2f}x ({len(pvfla_vl)} configs)\n")
+                    f.write(
+                        f"- **varlen Persist vs FLA varlen (fair)**: avg {np.mean(pvfla_vl):.2f}x, "
+                        f"min {np.min(pvfla_vl):.2f}x, max {np.max(pvfla_vl):.2f}x ({len(pvfla_vl)} configs)\n"
+                    )
             else:
                 speedups = [r["speedup"] for r in mr]
-                f.write(f"- **{mode}**: avg {np.mean(speedups):.2f}x, "
-                        f"min {np.min(speedups):.2f}x, max {np.max(speedups):.2f}x ({len(mr)} configs)\n")
+                f.write(
+                    f"- **{mode}**: avg {np.mean(speedups):.2f}x, "
+                    f"min {np.min(speedups):.2f}x, max {np.max(speedups):.2f}x ({len(mr)} configs)\n"
+                )
         f.write("\n---\n*Generated by bench_lightning_attn.py*\n")
 
     print(f"\nReport saved to {path}")
@@ -683,17 +722,19 @@ def parse_args():
         description="Unified benchmark: Lightning Attention (CuteDSL vs FLA)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--modes", type=str, nargs="+",
-                    default=["no_state", "h0_ht", "varlen"],
-                    choices=["no_state", "h0_ht", "varlen"],
-                    help="Modes to benchmark (default: all three)")
-    p.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 8],
-                    help="Batch sizes for standard (non-varlen) modes")
-    p.add_argument("--seq-lens", type=int, nargs="+",
-                    default=[256, 1024, 4096, 8192, 32768],
-                    help="Sequence lengths for standard modes")
-    p.add_argument("--num-heads", type=int, nargs="+", default=[64],
-                    help="Number of heads to test")
+    p.add_argument(
+        "--modes",
+        type=str,
+        nargs="+",
+        default=["no_state", "h0_ht", "varlen"],
+        choices=["no_state", "h0_ht", "varlen"],
+        help="Modes to benchmark (default: all three)",
+    )
+    p.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 8], help="Batch sizes for standard (non-varlen) modes")
+    p.add_argument(
+        "--seq-lens", type=int, nargs="+", default=[256, 1024, 4096, 8192, 32768], help="Sequence lengths for standard modes"
+    )
+    p.add_argument("--num-heads", type=int, nargs="+", default=[64], help="Number of heads to test")
     p.add_argument("--head-dim", type=int, default=128)
     p.add_argument("--layer-idx", type=int, default=12)
     p.add_argument("--num-layers", type=int, default=24)
