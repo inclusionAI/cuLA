@@ -1,17 +1,19 @@
+import pathlib
+import sys
+
 import torch
 import triton
-import sys, pathlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
 from einops import rearrange
 from fla.modules.l2norm import l2norm_fwd
-from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_intra
+from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.constant import RCP_LN2
-from benchmarks.utils import set_seed, exclusive_cumsum, generate_random_seq_lens, SEED
 
+from benchmarks.utils import SEED, exclusive_cumsum, generate_random_seq_lens, set_seed
 from cula.kda.chunk_intra import chunk_kda_fwd_intra as cula_chunk_kda_fwd_intra
 
 # Constant params

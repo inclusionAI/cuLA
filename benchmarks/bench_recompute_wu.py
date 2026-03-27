@@ -13,15 +13,15 @@ Usage:
   python benchmarks/bench_recompute_wu.py [--ncu]
 """
 
-import os
-import sys
 import argparse
+import os
 
 os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
 os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
 
-import torch
 import importlib
+
+import torch
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
 _wu_mod = importlib.import_module("cula.ops.recompute_wu")
@@ -29,8 +29,7 @@ recompute_w_u_fwd = _wu_mod.recompute_w_u_fwd
 recompute_w_u_fwd_ref = _wu_mod.recompute_w_u_fwd_ref
 
 # ─── FLA baseline imports ───
-from fla.ops.kda.wy_fast import recompute_w_u_fwd as fla_recompute_w_u_fwd
-
+from fla.ops.kda.wy_fast import recompute_w_u_fwd as fla_recompute_w_u_fwd  # noqa: E402
 
 # ============================================================
 # Constants

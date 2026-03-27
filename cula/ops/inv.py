@@ -9,12 +9,10 @@ for 64x64 lower triangular matrices using 4 progressive stages:
   Stage 4: Build full 64x64 inverse
 """
 
-import cutlass.cute as cute
 import cutlass
+import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
-import cuda.bindings.driver as cuda
-from cutlass.cute.typing import Int64
 
 
 class MatrixInverse64x64:
@@ -216,11 +214,9 @@ class MatrixInverse64x64:
         copy_op_s2r = cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=1)
         copy_op_s2r_t = cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=1)
         copy_op_r2s = cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=1)
-        copy_op_r2s_t = cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=True, num_matrices=1)
         copy_atom_s2r = cute.make_copy_atom(copy_op_s2r, mat.element_type)
         copy_atom_s2r_t = cute.make_copy_atom(copy_op_s2r_t, mat.element_type)
         copy_atom_r2s = cute.make_copy_atom(copy_op_r2s, mat.element_type)
-        copy_atom_r2s_t = cute.make_copy_atom(copy_op_r2s_t, mat.element_type)
 
         tidx,_,_ = cute.arch.thread_idx()
         lane_id = tidx % 32
@@ -249,7 +245,6 @@ class MatrixInverse64x64:
         sO_bcast = cute.make_tensor(sO.iterator, cute.blocked_product(sO.layout, cute.make_layout((2,1), stride=(0,0))))
 
         a_shape = cute.dice(mma_atom_shape, (1,None,1))
-        b_shape = cute.dice(mma_atom_shape, (None,1,1))
         c_shape = cute.dice(mma_atom_shape, (1,1,None))
         tOrDInv = thr_mma.make_fragment_A(tiled_mma.partition_shape_A(a_shape))
         tOrC    = thr_mma.make_fragment_B(thr_mma.partition_B(sC))
@@ -373,8 +368,6 @@ class MatrixInverse64x64:
         sC = cute.make_tensor(sC.iterator, layout=cute.select(sC.layout, mode=[1,0]))
         sAInv = cute.make_tensor(sAInv.iterator, layout=cute.select(sAInv.layout, mode=[1,0]))
         
-        a_shape = cute.dice(mma_tiler, (1,None,1))
-        b_shape = cute.dice(mma_tiler, (None,1,1))
         c_shape = cute.dice(mma_tiler, (1,1,None))
         
         # Create fragments
@@ -584,8 +577,6 @@ class MatrixInverse64x64:
         """
         tidx, _, _ = cute.arch.thread_idx()
         tidx = tidx % 128
-        lane_id = tidx % 32  # Within warp
-        warp_id = tidx // 32
 
         # Stage 1: Invert all 8 diagonal 8x8 blocks
         t8x8mat = cute.flat_divide(s_mat, (8, 8))
@@ -666,13 +657,7 @@ class MatrixInverse64x64:
             ]
         
         self.shared_storage = SharedStorage
-        
-        # Create layout for the input matrix
-        mat_layout = cute.make_layout(
-            (self.MATRIX_SIZE, self.MATRIX_SIZE),
-            stride=(self.MATRIX_SIZE, 1),
-        )
-        
+
         # mat_iter is already a Tensor object from the PyTorch conversion
         # Use it directly without creating a new tensor
         mat = mat_iter

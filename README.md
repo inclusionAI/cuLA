@@ -35,6 +35,8 @@ pip install -e . --no-build-isolation
 ```
 
 > **Requirements:** Python 3.12+, CUDA Toolkit 13.0, NVCC 12.9+ (SM100a support), PyTorch 2.9.1+
+>
+> **Note:** The PyTorch CUDA version must match your system CUDA Toolkit version. Check with `nvcc --version` and `python -c "import torch; print(torch.version.cuda)"`.
 
 ## Quick Start
 

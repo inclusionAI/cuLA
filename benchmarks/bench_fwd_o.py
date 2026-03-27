@@ -22,13 +22,12 @@ With --ncu, warmup=1 and iters=1 for ncu profiling:
   ncu --set full -o report python bench_fwd_o.py --mode varlen --ncu
 """
 
-import os
-import sys
 import argparse
-
-import torch
 import importlib
 import pathlib
+import sys
+
+import torch
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
 _fwd_o_mod = importlib.import_module("cula.ops.fwd_o")
@@ -37,8 +36,7 @@ build_chunk_indices = _fwd_o_mod.build_chunk_indices
 
 # ─── FLA baseline imports ───
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
-
+from fla.ops.gla.chunk import chunk_gla_fwd_o_gk  # noqa: E402
 
 # ============================================================
 # Constants
@@ -185,7 +183,7 @@ def bench_varlen(configs):
 
     for seq_lens, H in configs:
         scale = K ** -0.5
-        num_seqs = len(seq_lens)
+        len(seq_lens)
         T_total = sum(seq_lens)
         cu_seqlens_list = [0]
         for sl in seq_lens:

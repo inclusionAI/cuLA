@@ -8,21 +8,23 @@ Compares against:
   3. fla fused_recurrent_fwd (if available)
 """
 
-import sys
 import pathlib
+import sys
+
 import pytest
 import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import os
+
 os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
 os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
 
 from cula.lightning.la_decode import linear_attention_decode
 
 try:
-    from cula.seg_la import seg_la_fwd, SegLaMeta
+    from cula.seg_la import SegLaMeta, seg_la_fwd
     HAS_SEG_LA = True
 except ImportError:
     HAS_SEG_LA = False

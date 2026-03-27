@@ -18,31 +18,23 @@ BV must be a multiple of 64 (tcgen05.mma.ws M-mode constraint for bf16).
 """
 
 import argparse
-import math
-import os
-import sys
-import time
-from typing import Type, Tuple, List, Union
-
-import torch
-import torch.nn.functional as F
-import triton
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu import cpasync, tcgen05
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
-import cutlass.torch as cutlass_torch
+import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-import cutlass.cute.testing as testing
-from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor, make_fake_stream
-from cutlass.cute.typing import Int32, Int64, Float32
+import torch
+import torch.nn.functional as F
+import triton
 from cutlass._mlir.dialects import llvm as _llvm
+from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.cutlass_dsl import T as _T
-
 from fla.ops.utils import prepare_chunk_indices, prepare_lens
 from fla.utils import tensor_cache
+
 
 # in FLA, cumsum returns int64 tensor by default
 @tensor_cache
@@ -88,8 +80,8 @@ class ChunkDeltaRuleFwdH:
         chunk_size: int = 64,
         head_dim_k: int = 128,
         head_dim_v: int = 128,
-        acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
-        io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
+        acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        io_dtype: type[cutlass.Numeric] = cutlass.BFloat16,
         is_varlen: bool = False,
         persistent: bool = True,
     ):
@@ -218,7 +210,7 @@ class ChunkDeltaRuleFwdH:
         cu_seqlens_in: cute.Tensor,    # [N+1] int32
         chunk_offsets_in: cute.Tensor,  # [N+1] int32
         workspace_in: cute.Tensor,     # workspace buffer
-        problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],
+        problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
         total_nt: Int32,
         use_g: Int32,
         use_gk: Int32,
@@ -231,7 +223,6 @@ class ChunkDeltaRuleFwdH:
         k_ptr = k_in.iterator
         w_ptr = w_in.iterator
         u_ptr = u_in.iterator
-        g_ptr = g_in.iterator
         gk_ptr = gk_in.iterator
         h_out_ptr = h_out_in.iterator
         v_new_ptr = v_new_in.iterator
@@ -278,9 +269,6 @@ class ChunkDeltaRuleFwdH:
 
         ht_T_layout = cute.make_layout((V, K, (H, B)), stride=(1, V, (K * V, H * K * V)))
         ht_T = cute.make_tensor(ht_ptr, ht_T_layout)
-
-        gk_layout = cute.make_layout((T, K, (H, data_B)), stride=(H * K, 1, (K, T * H * K)))
-        gk = cute.make_tensor(gk_ptr, gk_layout)
 
         # gk K-first view for TMA: (K, T, (H, data_B)) with K contiguous
         gk_K_layout = cute.make_layout((K, T, (H, data_B)), stride=(1, H * K, (K, T * H * K)))
@@ -580,7 +568,7 @@ class ChunkDeltaRuleFwdH:
         cu_seqlens: cute.Tensor,
         chunk_offsets: cute.Tensor,
         workspace_iter: cute.Pointer,
-        problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],
+        problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
         use_gk: Int32,
         use_initial_state: Int32,
         store_final_state: Int32,
@@ -1714,7 +1702,6 @@ def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size):
     sym_ws = cute.sym_int()  # workspace size (separate from metadata)
     sym_ns = cute.sym_int()  # num_seqs (varlen h0/ht) or B (non-varlen, == sym_a)
 
-    BT = chunk_size
 
     if is_varlen:
         # varlen: data tensors are [T_total, H, ...] (3D)
@@ -2212,7 +2199,6 @@ def main():
     print("\n" + "="*60)
     print("Benchmark: B=4, T=4096, H=64, K=128, V=128")
     Bb, Tb, Hb = 4, 4096, 64
-    NTb = (Tb + BT - 1) // BT
     torch.manual_seed(999)
     kb = torch.randn(Bb, Tb, Hb, K, device="cuda", dtype=torch.bfloat16) * 0.1
     wb = torch.randn(Bb, Tb, Hb, K, device="cuda", dtype=torch.bfloat16) * 0.1

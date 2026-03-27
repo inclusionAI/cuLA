@@ -5,22 +5,19 @@
 Utility functions for cuLA debugging and development.
 """
 import functools
-from typing import Callable, Tuple
-
-import torch
+from collections.abc import Callable
 
 import cutlass
+import torch
 from cutlass import cute
-
 from fla.utils import tensor_cache
-
 
 # ---------------------------------------------------------------------------
 # Device architecture helpers
 # ---------------------------------------------------------------------------
 
 @functools.cache
-def get_device_sm_version(device: torch.device | str | int | None = None) -> Tuple[int, int]:
+def get_device_sm_version(device: torch.device | str | int | None = None) -> tuple[int, int]:
     """Return the CUDA compute capability (major, minor) for *device*.
 
     Args:

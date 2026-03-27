@@ -1,20 +1,22 @@
-import torch
+import pathlib
 import sys
 import warnings
-import pathlib
+
+import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-
-from fla.modules.l2norm import l2norm_fwd
-from fla.ops.kda.gate import kda_gate_fwd
-from fla.ops.utils import chunk_local_cumsum
-from fla.ops.utils.constant import RCP_LN2
-from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
+from fla.modules.l2norm import l2norm_fwd
+
+# from fla.ops.kda.chunk_inter import chunk_kda_bwd_dqkwg
+from fla.ops.kda.gate import kda_gate_fwd
+from fla.ops.utils import chunk_local_cumsum
+from fla.ops.utils.constant import RCP_LN2
+from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 from cula.ops.kda_fully_fused import KDAChunkwise
 

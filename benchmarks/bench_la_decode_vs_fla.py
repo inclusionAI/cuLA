@@ -27,21 +27,22 @@ Usage:
     python benchmarks/bench_la_decode_vs_fla.py --batch-sizes 1 8 64 256
 """
 
+import argparse
 import os
 import sys
-import argparse
 
 os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
 os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
 
+import cuda.bindings.driver as cuda_drv
 import torch
 import triton
-import cuda.bindings.driver as cuda_drv
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from cula.lightning.la_decode import linear_attention_decode, _get_compiled_kernel
 from fla.ops.common.fused_recurrent import fused_recurrent_fwd, fused_recurrent_fwd_kernel
+
+from cula.lightning.la_decode import _get_compiled_kernel, linear_attention_decode
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -247,15 +248,15 @@ def main():
 
     H, K, V = args.heads, args.head_dim, args.head_dim
 
-    print(f"Lightning Attention Decode Benchmark")
-    print(f"  la_decode (CuTe DSL) vs fla fused_recurrent_fwd (Triton)")
+    print("Lightning Attention Decode Benchmark")
+    print("  la_decode (CuTe DSL) vs fla fused_recurrent_fwd (Triton)")
     print(f"  H={H}, K={K}, V={V}, layer={args.layer_idx}/{args.num_layers}")
-    print(f"  dtype=bf16, state=fp32, T=1")
+    print("  dtype=bf16, state=fp32, T=1")
 
     # ── Kernel-only comparison ──────────────────────────────────────────
     print(f"\n{'='*100}")
-    print(f"  Mode 1: KERNEL-ONLY (pre-allocated buffers, direct kernel dispatch)")
-    print(f"  fla: kernel + sum(0) with pre-allocated out=; cute: compiled() with pre-created stream")
+    print("  Mode 1: KERNEL-ONLY (pre-allocated buffers, direct kernel dispatch)")
+    print("  fla: kernel + sum(0) with pre-allocated out=; cute: compiled() with pre-created stream")
     print(f"{'='*100}")
     print(
         f"{'B':>5} | {'fla (ms)':>10} | {'cute (ms)':>10} | "
@@ -275,8 +276,8 @@ def main():
 
     # ── Wrapper comparison ──────────────────────────────────────────────
     print(f"\n{'='*100}")
-    print(f"  Mode 2: WRAPPER (fused_recurrent_fwd vs linear_attention_decode, full call path)")
-    print(f"  fla: alloc o[NK,B,1,H,V]+ht[B,H,K,V] + kernel + sum(0); cute: cache lookup + CUstream + kernel")
+    print("  Mode 2: WRAPPER (fused_recurrent_fwd vs linear_attention_decode, full call path)")
+    print("  fla: alloc o[NK,B,1,H,V]+ht[B,H,K,V] + kernel + sum(0); cute: cache lookup + CUstream + kernel")
     print(f"{'='*100}")
     print(
         f"{'B':>5} | {'fla (ms)':>10} | {'cute (ms)':>10} | {'speedup':>8}"

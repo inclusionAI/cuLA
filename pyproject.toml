@@ -23,6 +23,60 @@ license = { text = "MIT" }
 where = ["."]
 include = ["cula"]
 
+[tool.ruff]
+target-version = "py312"
+line-length = 127
+exclude = [
+    "csrc/",
+    "third_party/",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # Pyflakes
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "I",    # isort
+    "C4",   # flake8-comprehensions
+    "TCH",  # flake8-type-checking
+    "T",    # flake8-debugger
+]
+ignore = [
+    "E501",
+    "E741",
+    "B023",
+    "B006",
+    "B007",
+    "B008",
+    "B028",
+    "B904",
+    "B905",
+    "C408",
+    "C416",
+    "C417",
+    "T201",
+    "TC002",
+    "TC003",
+    "SIM102",
+    "SIM108",
+    "SIM118",
+    "SIM211",
+    "COM812",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cula"]
+force-sort-within-sections = false
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"cula/_version.py" = ["UP007"]
+# TODO: fix undefined names (exp_g, chunk_kda_bwd_dqkwg) — WIP code
+"cula/ops/kda_fully_fused.py" = ["F821"]
+"cula/kda/blackwell_fused_fwd.py" = ["F821"]
+
 [tool.setuptools_scm]
 # write generated version into package for runtime access
 write_to = "cula/_version.py"

@@ -18,19 +18,22 @@ With --ncu, warmup=1 and iters=1 for ncu profiling:
   ncu --set full -o report python bench_kda.py --mode varlen --ncu
 """
 
-import sys
-import pathlib
 import argparse
+import pathlib
+import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import torch
-
 from fla.ops.kda import chunk_kda as fla_chunk_kda
-from cula.kda.chunk import chunk_kda as cula_chunk_kda
+
 from benchmarks.utils import (
-    set_seed, exclusive_cumsum, prepare_safe_gate_inputs, SEED,
+    SEED,
+    exclusive_cumsum,
+    prepare_safe_gate_inputs,
+    set_seed,
 )
+from cula.kda.chunk import chunk_kda as cula_chunk_kda
 
 # ============================================================
 # Constants

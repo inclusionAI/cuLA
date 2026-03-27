@@ -2,18 +2,17 @@
 
 # Adapted from flash-linear-attention: https://github.com/fla-org/flash-linear-attention/blob/main/tests/ops/test_kda.py
 
-import os
 
 import pytest
 import torch
 import torch.nn.functional as F
-
 from fla.ops import chunk_kda as fla_chunk_kda
 from fla.ops.kda.gate import naive_kda_gate
 from fla.ops.kda.naive import naive_recurrent_kda
 from fla.utils import assert_close, device
 
 from cula.utils import get_kda_fused_fwd
+
 cula_kda_fused_fwd = get_kda_fused_fwd(device)
 
 @pytest.mark.parametrize(
@@ -158,7 +157,6 @@ def test_safe_gate_chunk_varlen(
     dtype: torch.dtype,
     safe_gate: bool,
 ):
-    from fla.ops.kda.gate import naive_kda_lowerbound_gate
 
     torch.manual_seed(42)
     cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
@@ -179,8 +177,8 @@ def test_safe_gate_chunk_varlen(
     h0 = torch.randn((N, H, D, D), dtype=torch.float32)
 
     q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(), (q, k, v, g, beta, h0))
-    do = torch.randn_like(v)
-    dht = torch.rand_like(h0)
+    torch.randn_like(v)
+    torch.rand_like(h0)
 
     tri, tri_ht = cula_kda_fused_fwd(
         q=F.normalize(q.clone(), p=2, dim=-1),

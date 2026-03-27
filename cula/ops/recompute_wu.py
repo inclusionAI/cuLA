@@ -32,21 +32,16 @@ Warp assignment:
   7:   Empty warp (idle)
 """
 
-import math
-import os
-import time
-from typing import Type, Tuple
-
-import torch
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu import cpasync, tcgen05
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
+import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor, make_fake_stream
-from cutlass.cute.typing import Int32, Int64, Float32
+import torch
+from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cutlass.cute.typing import Int32, Int64
 
 
 def _make_coop_group(size: int):
@@ -62,8 +57,8 @@ class KDARecomputeWU:
         chunk_size: int = 64,
         block_k: int = None,
         block_v: int = None,
-        io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
-        acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
+        io_dtype: type[cutlass.Numeric] = cutlass.BFloat16,
+        acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         is_varlen: bool = False,
         persistent: bool = False,
     ):
@@ -201,7 +196,7 @@ class KDARecomputeWU:
         kg_in: cute.Tensor,
         cu_seqlens_in: cute.Tensor,
         chunk_indices_in: cute.Tensor,
-        problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],
+        problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
         total_nt: Int32,
         stream,
     ):
@@ -426,16 +421,11 @@ class KDARecomputeWU:
         kg_ptr: cute.Pointer,
         cu_seqlens: cute.Tensor,
         chunk_indices: cute.Tensor,
-        problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],
+        problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
         total_nt: Int32,
     ):
         B, T, H, K, V = problem_size
         BT = self.BT
-
-        if cutlass.const_expr(self.is_varlen):
-            data_B = Int32(1)
-        else:
-            data_B = B
 
         # ===================== Work-unit decode =====================
         if cutlass.const_expr(self.persistent):
@@ -661,13 +651,7 @@ class KDARecomputeWU:
         # =====================================================================
         # STORE WARP -- idle
         # =====================================================================
-        elif warp_idx == self.store_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
-
-        # =====================================================================
-        # EMPTY WARP -- idle
-        # =====================================================================
-        elif warp_idx == self.empty_warp_id:
+        elif warp_idx == self.store_warp_id or warp_idx == self.empty_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
         # =====================================================================
@@ -936,7 +920,6 @@ def _compile_recompute_wu(H, K, V, chunk_size=64, block_k=None, block_v=None, pe
 
     sym_a = cute.sym_int()
     sym_b = cute.sym_int()
-    sym_nt = cute.sym_int()
     sym_cu = cute.sym_int()
     sym_ci = cute.sym_int()
     BT = chunk_size
@@ -1033,7 +1016,6 @@ def recompute_w_u_fwd_ref(k, v, beta, A, gk):
     """Reference implementation supporting both [B,T,H,K] and [T_total,H,K] inputs."""
     if k.dim() == 4:
         B, T, H, K = k.shape
-        V  = v.shape[-1]
         BT = A.shape[-1]
         NT = (T + BT - 1) // BT
         w  = torch.empty_like(k)
@@ -1056,7 +1038,6 @@ def recompute_w_u_fwd_ref(k, v, beta, A, gk):
     else:
         # varlen: k is [T_total, H, K]
         T_total, H, K = k.shape
-        V  = v.shape[-1]
         BT = A.shape[-1]
         NT = (T_total + BT - 1) // BT
         w  = torch.empty_like(k)
@@ -1124,7 +1105,8 @@ def main():
 
     # Test K=128,V=128
     B2, T2, H2, K2, V2 = 1, 128, 1, 128, 128
-    BT2 = 64; NT2 = T2 // BT2
+    BT2 = 64
+    NT2 = T2 // BT2
     torch.manual_seed(43)
     k2 = torch.randn(B2, T2, H2, K2, device="cuda", dtype=torch.bfloat16) * 0.1
     v2 = torch.randn(B2, T2, H2, V2, device="cuda", dtype=torch.bfloat16) * 0.1
@@ -1166,11 +1148,15 @@ def main():
             .permute(0, 2, 1, 3).contiguous().reshape(T_total, H3, BT3)
         )
 
-        w_rf = torch.empty_like(k_f); u_rf = torch.empty_like(v_f); kg_rf = torch.empty_like(k_f)
+        w_rf = torch.empty_like(k_f)
+        u_rf = torch.empty_like(v_f)
+        kg_rf = torch.empty_like(k_f)
         for si, sl in enumerate(seq_lens):
             s, e = cu_list[si], cu_list[si+1]
             wr, ur, _, kgr = recompute_w_u_fwd_ref(k_f[s:e], v_f[s:e], beta_f[s:e], A_f[s:e], gk_f[s:e])
-            w_rf[s:e] = wr; u_rf[s:e] = ur; kg_rf[s:e] = kgr
+            w_rf[s:e] = wr
+            u_rf[s:e] = ur
+            kg_rf[s:e] = kgr
 
         wf, uf, _, kgf = recompute_w_u_fwd(
             k_f, v_f, beta_f, A_f, gk_f,
@@ -1188,7 +1174,8 @@ def main():
     if all_ok and args.test in ("benchmark", "both"):
         print("\n=== Benchmark (B=4, T=4096, H=64, K=128, V=128) ===")
         Bb, Tb, Hb, Kb, Vb = 4, 4096, 64, 128, 128
-        BTb = 64; NTb = Tb // BTb
+        BTb = 64
+        NTb = Tb // BTb
         torch.manual_seed(999)
         kb    = torch.randn(Bb, Tb, Hb, Kb, device="cuda", dtype=torch.bfloat16) * 0.1
         vb    = torch.randn(Bb, Tb, Hb, Vb, device="cuda", dtype=torch.bfloat16) * 0.1

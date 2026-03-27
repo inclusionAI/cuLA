@@ -2,14 +2,12 @@ import functools
 import random
 
 import torch
-import torch.distributions as dist
 import torch.nn.functional as F
-
 from einops import rearrange
 from fla.modules.l2norm import l2norm_fwd
-from fla.ops.utils.index import prepare_chunk_indices
 from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.utils.constant import RCP_LN2
+from fla.ops.utils.index import prepare_chunk_indices
 
 SEED = 42
 CHUNK_SIZE = 64
@@ -148,7 +146,7 @@ def generate_random_seq_lens(
                         break
     
     assert sum(seq_lens) == total_len, f"sum(seq_lens)={sum(seq_lens)} != total_len={total_len}"
-    assert all(s >= min_seq_len for s in seq_lens), f"Some seq_len < min_seq_len"
+    assert all(s >= min_seq_len for s in seq_lens), "Some seq_len < min_seq_len"
     
     return seq_lens
 

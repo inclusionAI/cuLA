@@ -5,9 +5,8 @@
 import pytest
 import torch
 import torch.nn.functional as F
-
-from fla.utils import assert_close, device
 from fla.ops.kda.chunk import chunk_kda as fla_chunk_kda
+from fla.utils import assert_close, device
 
 from cula.kda.chunk import chunk_kda as cula_chunk_kda
 

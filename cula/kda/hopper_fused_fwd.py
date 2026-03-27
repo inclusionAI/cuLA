@@ -3,7 +3,6 @@ import warnings
 
 import torch
 from einops import rearrange
-
 from fla.modules.l2norm import l2norm_fwd
 from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.utils import chunk_local_cumsum

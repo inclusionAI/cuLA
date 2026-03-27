@@ -1,24 +1,17 @@
-import torch
 import time
-
-from fla.ops.linear_attn import chunk_linear_attn, fused_chunk_linear_attn, fused_recurrent_linear_attn
-# from fla.ops.linear_attn.naive import naive_recurrent_linear_attn
-from fla.utils import assert_close, device
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Int32, Int64, Float32
-
-
-from cula.ops.linear_attn import LinearAttentionChunkwise
-
 import torch
+from cutlass.cute.runtime import from_dlpack
 from einops import rearrange
-
+from fla.ops.linear_attn import fused_chunk_linear_attn
 from fla.ops.linear_attn.utils import normalize_output
 
-import torch
+# from fla.ops.linear_attn.naive import naive_recurrent_linear_attn
+from fla.utils import assert_close, device
+
+from cula.ops.linear_attn import LinearAttentionChunkwise
 
 PRINT_DEBUG = False
 
@@ -52,7 +45,7 @@ def get_mask(n, slope=1):
 
 
 def get_full_mask(n, slopes):
-    if slopes == None:
+    if slopes is None:
         mask = torch.tril(torch.ones((n, n)))
     else:
         arr = []
@@ -259,8 +252,7 @@ def test_fused_recurrent(
     v = torch.randn((B, T, H, D), dtype=dtype, device=device)
     decay = torch.randn(H, dtype=dtype, device=device)
     # h0 = torch.randn((B, H, D, D), dtype=torch.float, device=device)
-    h0 = None
-    do = torch.randn_like(v)
+    torch.randn_like(v)
     # dht = torch.randn_like(h0)
 
     with torch.no_grad():

@@ -3,22 +3,20 @@
 Compare our Blackwell SM100 kernel with FLA's reference implementation.
 """
 
-import sys
-import os
-import pathlib
 import argparse
+import pathlib
+import sys
+
 import torch
-import torch.nn.functional as F
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
 # Our implementation
-from cula.ops.chunk_delta_h import ChunkDeltaRuleFwdH, reference_chunk_delta_rule_fwd_h
+from cula.ops.chunk_delta_h import ChunkDeltaRuleFwdH
 
 
 def fla_reference_chunk_fwd_h(
@@ -74,7 +72,7 @@ def fla_reference_chunk_fwd_h(
     for t in range(NT):
         start = t * BT
         end = min((t + 1) * BT, T)
-        actual_bt = end - start
+        end - start
         
         # Store h_out[t] = h (before update) - this matches FLA
         h_out[:, t] = h.to(k.dtype)
@@ -181,7 +179,7 @@ def compare_with_fla(
         h0_fp32 = None
         h0_bf16 = None
     
-    print(f"\n--- Running FLA reference (full gate: apply_h_gate=True) ---")
+    print("\n--- Running FLA reference (full gate: apply_h_gate=True) ---")
     # FLA reference implementation (fp32 precision, full gating)
     h_fla_full, v_new_fla_full, ht_fla_full = fla_reference_chunk_fwd_h(
         k=k,
@@ -199,7 +197,7 @@ def compare_with_fla(
     
     # If gating is enabled, also run reference with v_new-only gating (to match kernel)
     if use_g or use_gk:
-        print(f"\n--- Running FLA reference (v_new gate only: apply_h_gate=False) ---")
+        print("\n--- Running FLA reference (v_new gate only: apply_h_gate=False) ---")
         h_fla_vnew, v_new_fla_vnew, ht_fla_vnew = fla_reference_chunk_fwd_h(
             k=k,
             w=w,
@@ -214,7 +212,7 @@ def compare_with_fla(
     else:
         h_fla_vnew, v_new_fla_vnew, ht_fla_vnew = h_fla_full, v_new_fla_full, ht_fla_full
     
-    print(f"\n--- Running our SM100 kernel ---")
+    print("\n--- Running our SM100 kernel ---")
     
     # Create output tensors for our kernel
     h_out = torch.zeros(B, NT, H, K, V, device="cuda", dtype=torch.bfloat16)
@@ -274,7 +272,7 @@ def compare_with_fla(
     print(f"  Our v_new shape: {v_new_out.shape}")
     print(f"  Our ht shape: {ht_out.shape}")
     
-    print(f"\n--- Comparing outputs ---")
+    print("\n--- Comparing outputs ---")
     
     # Compare v_new against v_new-only gating reference (matches kernel behavior)
     v_new_diff_vnew = (v_new_out.float() - v_new_fla_vnew.float()).abs().max().item()

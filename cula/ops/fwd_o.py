@@ -67,26 +67,18 @@ Kernel design (TMEM A-operand approach):
 """
 
 import argparse
-import math
-import os
 import sys
-import time
-from typing import Type, Tuple, List, Union
-
-import torch
-import torch.nn.functional as F
-
-from fla.ops.utils import prepare_chunk_indices
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu import cpasync, tcgen05
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
-import cutlass.torch as cutlass_torch
+import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor, make_fake_stream
-from cutlass.cute.typing import Int32, Int64, Float32
+import torch
+from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cutlass.cute.typing import Float32, Int32, Int64
+from fla.ops.utils import prepare_chunk_indices
 
 PRINT_DEBUG = False
 PRINT_SMEM_DEBUG = False  # Print SMEM contents after TMA loads for non-aligned varlen debug
@@ -112,9 +104,9 @@ class ChunkGlaFwdO:
         chunk_size: int = 64,
         head_dim_k: int = 128,
         head_dim_v: int = 128,
-        acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
-        io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
-        g_dtype: Type[cutlass.Numeric] = cutlass.Float32,
+        acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        io_dtype: type[cutlass.Numeric] = cutlass.BFloat16,
+        g_dtype: type[cutlass.Numeric] = cutlass.Float32,
         scale: float = 1.0,
         is_varlen: bool = False,
         BK: int = 128,
@@ -266,7 +258,7 @@ class ChunkGlaFwdO:
         A_in: cute.Tensor,             # [B, T, H, BT] (B=1 for varlen)
         cu_seqlens_in: cute.Tensor,    # [N+1] int32
         chunk_indices_in: cute.Tensor, # [NT, 2] int32
-        problem_size: Tuple[Int32, Int32, Int32, Int32, Int32],
+        problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
         total_nt: Int32,               # total chunks across all seqs (varlen)
         stream,
     ):
@@ -613,11 +605,6 @@ class ChunkGlaFwdO:
     ):
         B, T, H, K, V = problem_size
         BT = self.BT
-
-        if cutlass.const_expr(self.is_varlen):
-            data_B = Int32(1)
-        else:
-            data_B = B
 
         # ===================== Work decode =====================
         num_v_tiles = (V + self.BV - 1) // self.BV
@@ -1415,7 +1402,6 @@ def reference_chunk_gla_fwd_o(q, v, g, h, A, scale, chunk_size=64):
         o: [B, T, H, V]
     """
     B, T, H, K = q.shape
-    V = v.shape[-1]
     BT = chunk_size
     NT = (T + BT - 1) // BT
 

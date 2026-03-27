@@ -7,9 +7,10 @@ Test suite for ChunkDeltaRuleFwdH CuTe DSL kernel.
 Tests correctness against FLA's Triton reference (chunk_gated_delta_rule_fwd_h).
 """
 
+import argparse
 import os
 import sys
-import argparse
+
 import pytest
 import torch
 
@@ -19,6 +20,7 @@ from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as fla_fwd
 # ─── CuTe DSL kernel (via importlib to avoid cula __init__ requiring cudac) ───
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import importlib.util
+
 _spec = importlib.util.spec_from_file_location(
     "chunk_delta_h", os.path.join(os.path.dirname(__file__), "..", "cula", "ops", "chunk_delta_h.py"))
 _mod = importlib.util.module_from_spec(_spec)
@@ -301,7 +303,8 @@ def run_correctness_tests():
             all_passed = all_passed and passed
         except Exception as e:
             print(f"  FAILED: {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             all_passed = False
 
     print(f"\n{'='*50}")
@@ -323,9 +326,9 @@ def run_benchmark(B=4, T=4096, H=64, K=128, V=128, num_iters=20):
     h0 = torch.randn(B, H, K, V, dtype=torch.float32, device=device) * 0.01
 
     # --- CuTe DSL ---
-    h_out = torch.zeros(B, NT, H, K, V, device=device, dtype=torch.bfloat16)
-    v_new = torch.zeros(B, T, H, V, device=device, dtype=torch.bfloat16)
-    ht = torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
+    torch.zeros(B, NT, H, K, V, device=device, dtype=torch.bfloat16)
+    torch.zeros(B, T, H, V, device=device, dtype=torch.bfloat16)
+    torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
 
     # Warmup (triggers compilation)
     chunk_gated_delta_rule_fwd_h(

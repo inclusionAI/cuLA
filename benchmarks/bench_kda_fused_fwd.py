@@ -22,20 +22,22 @@ With --ncu, warmup=1 and iters=1 for ncu profiling:
   ncu --set full -o report python bench_kda_fused_fwd.py --mode varlen --ncu
 """
 
-import sys
-import pathlib
 import argparse
+import pathlib
+import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import torch
-import torch.nn.functional as F
-
 from fla.ops.kda import chunk_kda as fla_chunk_kda
-from cula.utils import get_device_sm_version, get_kda_fused_fwd
+
 from benchmarks.utils import (
-    set_seed, exclusive_cumsum, prepare_safe_gate_inputs, SEED,
+    SEED,
+    exclusive_cumsum,
+    prepare_safe_gate_inputs,
+    set_seed,
 )
+from cula.utils import get_device_sm_version, get_kda_fused_fwd
 
 # ============================================================
 # Resolve cuLA fully-fused implementation at import time
@@ -235,7 +237,7 @@ def bench_varlen(configs):
 def print_report(fixed_results, varlen_results):
     sep = "=" * 110
     print(f"\n\n{sep}")
-    print(f"                  BENCHMARK REPORT: cula_kda_fused_fwd (fully-fused)")
+    print("                  BENCHMARK REPORT: cula_kda_fused_fwd (fully-fused)")
     print(f"                  cuLA {_SM_TAG} fully-fused vs FLA Triton")
     print(f"                  H={H}  D={D}  dtype=bf16  safe_gate=True  use_gate_in_kernel=True")
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP

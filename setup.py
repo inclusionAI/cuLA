@@ -1,14 +1,13 @@
 import os
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
-from setuptools import setup, find_packages
-
+from setuptools import find_packages, setup
 from torch.utils.cpp_extension import (
+    CUDA_HOME,
+    IS_WINDOWS,
     BuildExtension,
     CUDAExtension,
-    IS_WINDOWS,
-    CUDA_HOME,
 )
 
 

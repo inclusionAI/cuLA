@@ -7,22 +7,18 @@ Compares against:
   2. FLA chunk_simple_gla (exact numerical match via g_gamma = -s)
 """
 
-import sys
-import pathlib
 import argparse
+import pathlib
+import sys
 import warnings
 
 import torch
-import cutlass
-import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack, make_ptr
 
 # Suppress third-party deprecation warnings (e.g. torch.jit)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from cula.ops.lightning_attn import LinearAttentionChunkwiseDecay, lightning_attn_fwd, lightning_attn_fwd_varlen
+from cula.ops.lightning_attn import lightning_attn_fwd, lightning_attn_fwd_varlen  # noqa: E402
 
 try:
     from fla.ops.simple_gla import chunk_simple_gla
@@ -197,7 +193,8 @@ def test_basic_execution():
         return True
     except Exception as e:
         print(f"  ✗ FAILED: {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -223,7 +220,8 @@ def test_different_decay_values():
         return True
     except Exception as e:
         print(f"  ✗ FAILED: {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -294,7 +292,7 @@ def test_against_fla(B=1, S=128, H=4, D=128, C=64, decay_val=0.1,
     maps as g_gamma = -s, giving identical per-timestep decay exp(-s).
     """
     if not HAS_FLA:
-        print(f"\n  ⊘ SKIPPED: fla library not available")
+        print("\n  ⊘ SKIPPED: fla library not available")
         return True
 
     if verbose:
@@ -330,7 +328,7 @@ def test_against_fla_with_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1,
                                 atol=5e-3, rtol=5e-2, verbose=True):
     """Compare h0/ht against FLA chunk_simple_gla."""
     if not HAS_FLA:
-        print(f"\n  ⊘ SKIPPED: fla library not available")
+        print("\n  ⊘ SKIPPED: fla library not available")
         return True
 
     if verbose:
@@ -407,7 +405,7 @@ def test_varlen_multi_seq(seq_lens=None, H=4, D=128, C=64, decay_val=0.1,
 
     torch.manual_seed(42)
     T = sum(seq_lens)
-    N = len(seq_lens)
+    len(seq_lens)
     cu_seqlens = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(seq_lens), 0).tolist()),
         dtype=torch.int32, device="cuda",
@@ -447,7 +445,7 @@ def test_varlen_with_initial_state(seq_lens=None, H=4, D=128, C=64, decay_val=0.
 
     torch.manual_seed(42)
     T = sum(seq_lens)
-    N = len(seq_lens)
+    len(seq_lens)
     cu_seqlens = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(seq_lens), 0).tolist()),
         dtype=torch.int32, device="cuda",

@@ -23,13 +23,13 @@ Core Formula:
 """
 
 import functools
-from typing import Optional, Tuple
-import torch
+
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
-import cuda.bindings.driver as cuda
 
 # ============================================================================
 # Global configuration
@@ -74,7 +74,6 @@ def la_decode_kernel_small_batch_pretranspose(
     i_n = batch_idx // HV
     i_hv = batch_idx % HV
     i_h = i_hv // (HV // H)
-    i_t = 0
 
     smem = cutlass.utils.SmemAllocator()
 
@@ -231,7 +230,6 @@ def la_decode_kernel_big_batch_pretranspose(
     i_n = batch_idx // HV
     i_hv = batch_idx % HV
     i_h = i_hv // (HV // H)
-    i_t = 0
 
     smem = cutlass.utils.SmemAllocator()
 
@@ -377,7 +375,7 @@ def run_la_decode_kernel_big_batch_pretranspose(
     stream: cuda.CUstream,
 ):
     # h0_source: (B*HV, V, K)
-    batch_size, v_dim, k_dim = (
+    batch_size, v_dim, _k_dim = (
         h0_source.layout.shape[0],
         h0_source.layout.shape[1],
         h0_source.layout.shape[2],
@@ -464,7 +462,7 @@ def run_la_decode_kernel_small_batch_pretranspose(
     stream: cuda.CUstream,
 ):
     # h0_source: (B*H, V, K)
-    batch_size, v_dim, k_dim = (
+    batch_size, v_dim, _k_dim = (
         h0_source.layout.shape[0],
         h0_source.layout.shape[1],
         h0_source.layout.shape[2],
@@ -586,7 +584,6 @@ def linear_attention_decode(
     # Get compiled kernel (cached)
     cache_key = (B, 1, H, HEAD_DIM, HEAD_DIM, softmax_scale)
     cache = _get_compiled_kernel(*cache_key)
-    device = q.device
     
     h0_source = s
     # First-time compilation

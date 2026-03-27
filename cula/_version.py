@@ -12,10 +12,9 @@ __all__ = [
 
 TYPE_CHECKING = False
 if TYPE_CHECKING:
-    from typing import Tuple
     from typing import Union
 
-    VERSION_TUPLE = Tuple[Union[int, str], ...]
+    VERSION_TUPLE = tuple[int | str, ...]
     COMMIT_ID = Union[str, None]
 else:
     VERSION_TUPLE = object

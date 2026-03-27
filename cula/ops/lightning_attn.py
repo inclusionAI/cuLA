@@ -50,27 +50,18 @@ For each head h with decay parameter s_h:
 """
 
 import argparse
-import functools
-import math
-import os
-import sys
 import time
-from typing import Type, Tuple, List, Union
-
-import torch
-import torch.nn.functional as F
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu import cpasync, tcgen05
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
-import cutlass.torch as cutlass_torch
+import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-import cutlass.cute.testing as testing
-from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
-from cutlass.cute.typing import Int32, Int64, Float32
+import torch
 from cutlass._mlir.dialects import llvm as _llvm
+from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.cutlass_dsl import T as _T
 
 
@@ -119,8 +110,8 @@ class LinearAttentionChunkwiseDecay:
     def __init__(
         self,
         chunk_size: int = 64,
-        acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
-        io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
+        acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        io_dtype: type[cutlass.Numeric] = cutlass.BFloat16,
         has_initial_state: bool = False,
         output_final_state: bool = False,
         H: int = 64,
@@ -295,7 +286,7 @@ class LinearAttentionChunkwiseDecay:
             print(f"  KV acc:      {num_kv_acc_cols:4d} cols @ offset {num_kv_acc_cols_offset:4d} (stages={kv_stages})")
             print(f"  KV16:        {num_kv16_acc_cols:4d} cols @ offset {num_kv16_acc_cols_offset:4d} (stages={kv_stages})")
             print(f"  SQ acc:      {num_sq_acc_cols:4d} cols @ offset {num_qs_acc_cols_offset:4d} (stages=1)")
-            print(f"  ---")
+            print("  ---")
             print(f"  Total (raw): {num_tmem_cols_total_tmp:4d} cols")
             print(f"  Total (pow2):{num_tmem_cols_total:4d} cols")
             print(f"  Capacity:    {SM100_TMEM_CAPACITY_COLS:4d} cols")
@@ -354,7 +345,7 @@ class LinearAttentionChunkwiseDecay:
         initial_state_indices_in: cute.Tensor,  # [N] int32, varlen only (None otherwise)
         o_tensor_in: cute.Tensor,              # Output tensor for varlen CopyUniversal tail store
         workspace_in: cute.Tensor,             # Workspace for persistent kernel atomic counter
-        problem_size: Tuple[Int32, Int32],  # (N, T) for varlen, (B, S) for non-varlen
+        problem_size: tuple[Int32, Int32],  # (N, T) for varlen, (B, S) for non-varlen
         stream,  # CUstream type annotation removed to avoid import issues
     ):
         """
@@ -826,7 +817,7 @@ class LinearAttentionChunkwiseDecay:
         o_smem_layout_staged: cute.ComposedLayout,
         p_smem_layout_staged: cute.ComposedLayout,
         state_tmem_layout_staged: cute.ComposedLayout,
-        problem_size: Tuple[Int32, Int32],  # (B, S)
+        problem_size: tuple[Int32, Int32],  # (B, S)
     ):
         """Kernel for chunkwise linear attention with per-position decay."""
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1048,8 +1039,6 @@ class LinearAttentionChunkwiseDecay:
         if cutlass.const_expr(self.is_varlen):
             if cutlass.const_expr(self.persistent):
                 # 1D grid work decode: persistent (grid=SM_count)
-                block_idx_x = cute.arch.block_idx()[0]
-                grid_dim_x = cute.arch.grid_dim()[0]
                 total_work_units = H * B
                 num_iters = Int32(0)  # not used, while loop controls iteration
                 # Pre-initialize variables reassigned inside persistent loop (CuTe DSL requirement)
@@ -1302,7 +1291,6 @@ class LinearAttentionChunkwiseDecay:
                     bos = cu_seqlens[bidx]
                     eos = cu_seqlens[bidx + 1]
                     seq_len = eos - bos
-                    state_idx_tmp = initial_state_indices[bidx]
 
                 # For varlen: apply domain_offset to shift TMA tensors by bos
                 # so chunk_idx 0 maps to tokens [bos, bos+C), etc.
@@ -1494,7 +1482,7 @@ class LinearAttentionChunkwiseDecay:
                         a_stage_idx=v_handle.index,
                         b_stage_idx=0,
                         acc_stage_idx=0,
-                        always_acc=True if (chunk_start != 0 or cutlass.const_expr(self.has_initial_state)) else False,
+                        always_acc=True if (chunk_start != 0 or cutlass.const_expr(self.has_initial_state)) else False,  # noqa: SIM210 -- Cute DSL: const_expr requires explicit True/False form
                     )
                     kv_handle.commit()
                     k_handle.release()
@@ -1547,8 +1535,6 @@ class LinearAttentionChunkwiseDecay:
 
             #----------------------------------------------------------
             local_tidx = tidx % (self.threads_per_warp * len(self.cuda_warp_ids))
-
-            debug = True if cutlass.const_expr(PRINT_DEBUG) and tidx == warp_idx * 32 and hidx == 0 and bidx == 0 and warp_idx == self.cuda_warp_ids[0] else False
 
             # constant mask tensor
             cM = cute.make_identity_tensor(self.qk_mma_tiler[:2])
@@ -1706,7 +1692,6 @@ class LinearAttentionChunkwiseDecay:
 
             # Partition SMEM halves for S2R load and R2S store
             tKsK_s2r_h = [thr_load_k_half.partition_S(h) for h in sK_s2r_halves]
-            tKsK_r2s_h = [thr_store_k_half.partition_D(h) for h in sK_s2r_halves]
             # Partition for writing to separate sK_weighted buffer (single stage)
             tKsK_r2s_h_weighted = [thr_store_k_half.partition_D(h) for h in sK_weighted_halves]
 
@@ -2167,7 +2152,7 @@ class LinearAttentionChunkwiseDecay:
         tTR_rO: cute.Tensor,
         tidx: cutlass.Int32,
         sO: cute.Tensor,
-    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+    ) -> tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
         """
         Make tiledCopy for shared memory store, then use it to partition register array (source)
         and shared memory (destination).
@@ -2185,7 +2170,7 @@ class LinearAttentionChunkwiseDecay:
             - tiled_copy_r2s: The tiled copy operation for register to smem copy(r2s)
             - tRS_rO: The partitioned tensor C (register source)
             - tRS_sO: The partitioned tensor C (smem destination)
-        :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
+        :rtype: tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
         """
         copy_atom_r2s = sm100_utils.get_smem_store_op(
             self.o_layout, self.io_dtype, self.acc_dtype, tiled_copy_t2r
@@ -2467,7 +2452,7 @@ class LinearAttentionChunkwiseDecay:
         tidx: cutlass.Int32,
         tAcc: cute.Tensor,
         mma_tiler: cute.Tile,
-        use_2cta_instrs: Union[cutlass.Boolean, bool],
+        use_2cta_instrs: cutlass.Boolean | bool,
     ) -> tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
         """
         Partitions source and destination tensors for a tensor memory load.
@@ -2518,7 +2503,7 @@ class LinearAttentionChunkwiseDecay:
         )
 
         if cutlass.const_expr(PRINT_DEBUG):
-            print(f"------------ EPILOG TMEM COPY AND PARTITION BEGIN --------------")
+            print("------------ EPILOG TMEM COPY AND PARTITION BEGIN --------------")
             print(f"tAcc: {tAcc}")
             print(f"tAcc_epi: {tAcc_epi}")
             print(f"copy_atom_t2r: {copy_atom_t2r}")
@@ -2526,7 +2511,7 @@ class LinearAttentionChunkwiseDecay:
             print(f"thr_copy_t2r: {thr_copy_t2r}")
             print(f"tTR_tAcc: {tTR_tAcc}")
             print(f"tTR_rAcc: {tTR_rAcc}")
-            print(f"------------ EPILOG TMEM COPY AND PARTITION END --------------")
+            print("------------ EPILOG TMEM COPY AND PARTITION END --------------")
 
         return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
 
@@ -2940,7 +2925,7 @@ def lightning_attn_fwd(
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
     chunk_size: int = 64,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Lightning Attention forward pass with compile cache and TVM-FFI.
 
@@ -3115,7 +3100,7 @@ def lightning_attn_fwd_varlen(
     initial_state_indices: torch.Tensor = None,
     chunk_size: int = 64,
     persistent: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Lightning Attention forward pass with varlen (packed variable-length sequences).
 

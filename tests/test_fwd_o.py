@@ -24,16 +24,18 @@ Varlen test dimensions:
 K=128, V=128, BT=64, dtype=bf16, use_exp2=True throughout.
 """
 
-import os
-import sys
 import argparse
+import os
 import random
+import sys
+
 import pytest
 import torch
 
 # Import directly from the module file to avoid cula package __init__ (requires cudac)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import importlib.util
+
 _spec = importlib.util.spec_from_file_location(
     "fwd_o", os.path.join(os.path.dirname(__file__), "..", "cula", "ops", "fwd_o.py"))
 _mod = importlib.util.module_from_spec(_spec)
@@ -44,7 +46,7 @@ chunk_gla_fwd_o = _mod.chunk_gla_fwd_o
 build_chunk_indices = _mod.build_chunk_indices
 build_chunk_offsets = _mod.build_chunk_offsets
 
-from fla.ops.gla.chunk import chunk_gla_fwd_o_gk as triton_chunk_gla_fwd_o_gk
+from fla.ops.gla.chunk import chunk_gla_fwd_o_gk as triton_chunk_gla_fwd_o_gk  # noqa: E402
 
 # ── Constants ──
 K, V, BT = 128, 128, 64

@@ -1,4 +1,5 @@
 import os
+
 os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
 import importlib
 
@@ -10,11 +11,12 @@ from fla.ops.cp.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h_pre_process,
     compress_h0,
 )
-from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
-from cula.kda.chunk_intra import chunk_kda_fwd_intra
 from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
+
+from cula.kda.chunk_intra import chunk_kda_fwd_intra
+from cula.utils import get_device_sm_version
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
 _delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h")
@@ -45,6 +47,14 @@ def chunk_kda_fwd(
     cp_context: FLACPContext | None = None,
     use_tf32_inverse: bool = True,
 ):
+    major, minor = get_device_sm_version(q.device)
+    if major != 10 or minor != 0:
+        raise RuntimeError(
+            f"chunk_kda requires SM100 (Blackwell) GPUs, "
+            f"but the current device has compute capability sm_{major}{minor}. "
+            f"For SM90 (Hopper), use `get_kda_fused_fwd()` from cula.utils instead."
+        )
+
     # Apply gate activation
     g_org = None
     if use_gate_in_kernel:

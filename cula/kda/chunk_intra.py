@@ -1,20 +1,18 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import warnings
+
 import torch
 import triton
 import triton.language as tl
-
 from einops import rearrange
-from fla.ops.kda.chunk_intra_token_parallel import chunk_kda_fwd_intra_token_parallel
 from fla.ops.kda.wy_fast import recompute_w_u_fwd
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2, gather
 from fla.utils import IS_GATHER_SUPPORTED, IS_TF32_SUPPORTED, autotune_cache_kwargs
 
-from cula.utils import prepare_uniform_cu_seqlens
-
 import cula.cudac as cula_cuda
+from cula.utils import prepare_uniform_cu_seqlens
 
 if IS_TF32_SUPPORTED:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr('tf32')
@@ -759,7 +757,6 @@ def chunk_kda_fwd_intra(
     assert safe_gate, "Only safe_gate=True is supported in chunk_kda_fwd_intra for now"
     B, T, H, K = k.shape
     BT = chunk_size
-    BC = 16
 
     reset_cu_seqlens = False
     if cu_seqlens is None:
@@ -775,9 +772,6 @@ def chunk_kda_fwd_intra(
     # assert cu_seqlens is not None and chunk_indices is not None, "cu_seqlens and chunk_indices must be provided for cuda impl"
     # NOTE: inside kernel we use int32 for cu_seqlens
     assert cu_seqlens.dtype == torch.int32 and chunk_indices.dtype == torch.int32, "cu_seqlens and chunk_indices must be int32 for cuda impl"
-
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    NC = triton.cdiv(BT, BC)
 
     Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
     Akk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)

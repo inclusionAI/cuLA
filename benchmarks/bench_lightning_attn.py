@@ -21,11 +21,12 @@ Usage:
   python benchmarks/bench_lightning_attn.py --modes varlen --num-heads 32 64 --iterations 50
 """
 
+import argparse
+import ctypes
 import os
 import sys
 import time
-import ctypes
-import argparse
+
 import numpy as np
 
 os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
@@ -34,9 +35,9 @@ os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from cula.ops.lightning_attn import lightning_attn_fwd, lightning_attn_fwd_varlen
-
 from fla.ops.simple_gla.chunk import chunk_simple_gla_fwd
+
+from cula.ops.lightning_attn import lightning_attn_fwd, lightning_attn_fwd_varlen
 
 # =============================================================================
 # Constants
@@ -283,6 +284,7 @@ def benchmark_varlen_config(N, seq_lens, H, D, warmup, iters, dist=""):
         result["compile_ms"] = compile_ms
     except Exception as e:
         result["persistent_ms"] = float("nan")
+        result["persistent_err"] = str(e)
         O_p = None
         reset_cuda_error()
 
@@ -292,6 +294,7 @@ def benchmark_varlen_config(N, seq_lens, H, D, warmup, iters, dist=""):
         result["nonpersistent_ms"] = ms_np
     except Exception as e:
         result["nonpersistent_ms"] = float("nan")
+        result["nonpersistent_err"] = str(e)
         O_np = None
         reset_cuda_error()
 
@@ -301,6 +304,7 @@ def benchmark_varlen_config(N, seq_lens, H, D, warmup, iters, dist=""):
         result["fla_varlen_ms"] = fla_vl_ms
     except Exception as e:
         result["fla_varlen_ms"] = float("nan")
+        result["fla_varlen_err"] = str(e)
         reset_cuda_error()
 
     # --- Accuracy: persistent vs non-persistent ---
@@ -355,6 +359,10 @@ def print_standard_result(r):
     htrel = f"{r['ht_rel_err']*100:.2f}%" if not np.isnan(r.get("ht_rel_err", float("nan"))) else "-"
 
     print(f"{cfg:<28} {r['mode']:<10} {fla:>9} {dsl:>12} {sp:>8} {omd:>10} {orel:>8} {htmd:>11} {htrel:>8}")
+    if r.get("fla_err"):
+        print(f"  >> FLA error: {r['fla_err']}")
+    if r.get("cutedsl_err"):
+        print(f"  >> CuteDSL error: {r['cutedsl_err']}")
 
 
 def print_varlen_header():
@@ -388,6 +396,12 @@ def print_varlen_result(r):
         f"{pvnp:>6} {pvfla_vl:>8} "
         f"{od:>10} {hd:>10}"
     )
+    if r.get("persistent_err"):
+        print(f"  >> Persistent error: {r['persistent_err']}")
+    if r.get("nonpersistent_err"):
+        print(f"  >> Non-persistent error: {r['nonpersistent_err']}")
+    if r.get("fla_varlen_err"):
+        print(f"  >> FLA varlen error: {r['fla_varlen_err']}")
 
 
 # =============================================================================
@@ -545,7 +559,7 @@ def plot_results(all_results, modes):
         if mode == "varlen":
             hr = [r for r in mr if _valid(r.get("persistent_ms", float("nan"))) and _valid(r.get("nonpersistent_ms", float("nan")))]
             if not hr:
-                ax.set_title(f"varlen (no data)")
+                ax.set_title("varlen (no data)")
                 continue
             labels = [f"N{r['B']}T{r['T']}\n{r.get('dist','')[:3]}" for r in hr]
             p_ms = [r["persistent_ms"] for r in hr]

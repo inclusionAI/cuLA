@@ -17,29 +17,29 @@ With --ncu, warmup=1 and iters=1 for ncu profiling:
   ncu --set full -o report python bench_chunk_delta_h.py --mode varlen --ncu
 """
 
-import os
-import sys
-import math
 import argparse
+import math
+import os
 import pathlib
+import sys
 
 os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
 os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-import torch
-import numpy as np
 import importlib
+
+import numpy as np
+import torch
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
 _delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h")
 chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
 
 # ─── FLA baseline imports ───
-from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as fla_fwd_h
-from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
-
+from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as fla_fwd_h  # noqa: E402
+from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets  # noqa: E402
 
 # ============================================================
 # Constants
@@ -91,7 +91,7 @@ def bench_non_varlen(configs):
     results = []
 
     for B, T, H, use_gk, use_h0, store_ht, save_vnew in configs:
-        NT = T // BT
+        T // BT
         torch.manual_seed(42)
         torch.cuda.empty_cache()
 
@@ -151,10 +151,14 @@ def bench_non_varlen(configs):
         speedup = ms_fla / ms_cute if ms_cute > 0 else float('inf')
 
         flags = []
-        if use_gk: flags.append("gk")
-        if use_h0: flags.append("h0")
-        if store_ht: flags.append("ht")
-        if save_vnew: flags.append("vn")
+        if use_gk:
+            flags.append("gk")
+        if use_h0:
+            flags.append("h0")
+        if store_ht:
+            flags.append("ht")
+        if save_vnew:
+            flags.append("vn")
         flag_str = f" [{','.join(flags)}]" if flags else ""
 
         r = {
@@ -210,10 +214,10 @@ def bench_varlen(configs):
 
         # Pre-compute chunk_indices (for FLA) and chunk_offsets (for CuTe DSL)
         # so the timing loop measures only kernel execution time.
-        chunk_indices = prepare_chunk_indices(cu_seqlens_long, BT)
+        prepare_chunk_indices(cu_seqlens_long, BT)
         chunk_offsets_cute = prepare_chunk_offsets(cu_seqlens_long, BT).int()
         # Pre-compute total_nt as Python int (avoids GPU→CPU sync in CuTe DSL wrapper)
-        total_nt = int(chunk_offsets_cute[-1].item())
+        int(chunk_offsets_cute[-1].item())
 
         torch.manual_seed(42)
         torch.cuda.empty_cache()
@@ -279,14 +283,18 @@ def bench_varlen(configs):
 
         min_l, max_l = min(seq_lens), max(seq_lens)
         avg_l = total_T // num_seqs
-        actual_ratio = max_l / min_l
+        max_l / min_l
         tag = f"{num_seqs}seqs T={total_T} [{min_l}..{max_l}] avg={avg_l}"
 
         flags = []
-        if use_gk: flags.append("gk")
-        if use_h0: flags.append("h0")
-        if store_ht: flags.append("ht")
-        if save_vnew: flags.append("vn")
+        if use_gk:
+            flags.append("gk")
+        if use_h0:
+            flags.append("h0")
+        if store_ht:
+            flags.append("ht")
+        if save_vnew:
+            flags.append("vn")
         flag_str = f" [{','.join(flags)}]" if flags else ""
 
         r = {

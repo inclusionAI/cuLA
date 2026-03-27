@@ -2,13 +2,11 @@
 
 # Tests for the chunk-decomposed KDA implementation (python/kda/chunk.py)
 
-import os
 import pytest
 import torch
 import torch.nn.functional as F
-
-from fla.ops.kda.naive import naive_recurrent_kda
 from fla.ops.kda.gate import naive_kda_gate
+from fla.ops.kda.naive import naive_recurrent_kda
 from fla.utils import assert_close, device
 
 from cula.kda.chunk import chunk_kda
@@ -167,7 +165,7 @@ def test_safe_gate_chunk_varlen(
     safe_gate: bool,
 ):
     try:
-        from fla.ops.kda.gate import naive_kda_lowerbound_gate
+        pass
     except Exception:
         raise ImportError("Please install flash-linear-attention after this commit "
             "https://github.com/fla-org/flash-linear-attention/tree/d1097c609b23b5f478f490da0fbd00060b0e9dc3")
