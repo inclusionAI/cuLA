@@ -106,9 +106,9 @@ subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 if IS_WINDOWS:
-    cxx_args = ["/O2", "/std:c++17", "/DNDEBUG", "/W0"]
+    cxx_args = ["/O2", "/std:c++20", "/DNDEBUG", "/W0"]
 else:
-    cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations"]
+    cxx_args = ["-O3", "-std=c++20", "-DNDEBUG", "-Wno-deprecated-declarations"]
 
 cuda_sources = [
     "csrc/api/pybind.cu",
@@ -138,7 +138,7 @@ ext_modules.append(
             "cxx": cxx_args + get_features_args(),
             "nvcc": [
                 "-O3",
-                "-std=c++17",
+                "-std=c++20",
                 "-DNDEBUG",
                 # "-D_USE_MATH_DEFINES",
                 "-Wno-deprecated-declarations",
@@ -151,6 +151,7 @@ ext_modules.append(
                 "--use_fast_math",
                 "-lineinfo",
                 "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
+                "-diag-suppress=3189",  # suppress the warning of torch in C++ 20
             ]
             + get_features_args()
             + get_arch_flags()

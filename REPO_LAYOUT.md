@@ -62,7 +62,7 @@ flashla/
 ├── tests/                        # Unit / integration tests
 │   ├── test_kda_e2e_compare_fla.py  # E2E KDA vs FLA Triton
 │   ├── test_kda.py               # KDA vs naive reference
-│   ├── test_kda_fully_fused.py   # Fully fused KDA tests
+│   ├── test_kda_fused_fwd.py   # Fully fused KDA tests
 │   ├── test_chunk_delta_h.py     # Chunk delta-H tests
 │   ├── test_fwd_o.py             # Forward output tests
 │   ├── test_compare_with_fla.py  # General FLA comparison

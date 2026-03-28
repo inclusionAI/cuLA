@@ -43,10 +43,7 @@ sys.path.insert(0, str(ROOT))
 
 os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
 
-import contextlib  # noqa: E402
-
 import numpy as np  # noqa: E402
-import torch  # noqa: E402
 
 from benchmarks.bench_kda import (  # noqa: E402
     D as KDA_D,
@@ -69,31 +66,11 @@ from benchmarks.bench_lightning_attn import (  # noqa: E402
 from benchmarks.bench_lightning_attn import (  # noqa: E402
     run_benchmark_suite as la_run_suite,
 )
+from benchmarks.utils import get_env_info  # noqa: E402
 
-BENCHMARK_MD = ROOT / "BENCHMARK.md"
+BENCHMARK_MD_DEFAULT = "BENCHMARK_GB200.md"
 
 LA_H = 64  # for display only
-
-# ============================================================
-# Helpers
-# ============================================================
-
-
-def get_gpu_name():
-    if torch.cuda.is_available():
-        return torch.cuda.get_device_name(0)
-    return "Unknown GPU"
-
-
-def get_env_info():
-    cuda_version = "Unknown"
-    with contextlib.suppress(Exception):
-        cuda_version = torch.version.cuda or "Unknown"
-    return {
-        "gpu": get_gpu_name(),
-        "cuda": cuda_version,
-        "torch": torch.__version__,
-    }
 
 
 # ============================================================
@@ -305,6 +282,12 @@ def main():
     parser.add_argument(
         "--cache", type=str, default=None, help="Path to a JSON cache file. If exists, skip benchmarks and use cached results."
     )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output markdown filename (relative to project root). Default: BENCHMARK_GB200.md",
+    )
     parser.add_argument("--save-cache", type=str, default=None, help="Save benchmark results to JSON for future --cache use.")
     args = parser.parse_args()
 
@@ -359,8 +342,9 @@ def main():
 
     md = format_benchmark_md(env, kda_fixed, kda_varlen, la_standard, la_varlen, la_decode)
 
-    BENCHMARK_MD.write_text(md)
-    print(f"\nWrote {BENCHMARK_MD}")
+    output_path = ROOT / (args.output if args.output else BENCHMARK_MD_DEFAULT)
+    output_path.write_text(md)
+    print(f"\nWrote {output_path}")
 
 
 if __name__ == "__main__":

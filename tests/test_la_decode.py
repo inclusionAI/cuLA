@@ -18,8 +18,7 @@ Unit tests for la_decode (CuTe DSL Lightning Attention decode kernel).
 
 Compares against:
   1. PyTorch reference implementation
-  2. seg_la Triton decode kernel (if available)
-  3. fla fused_recurrent_fwd (if available)
+  2. fla fused_recurrent_fwd (if available)
 """
 
 import pathlib
@@ -32,17 +31,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import os
 
-os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
 os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
 
 from cula.lightning.la_decode import linear_attention_decode
-
-try:
-    from cula.seg_la import SegLaMeta, seg_la_fwd
-
-    HAS_SEG_LA = True
-except ImportError:
-    HAS_SEG_LA = False
 
 try:
     from fla.ops.common.fused_recurrent import fused_recurrent_fwd
@@ -204,39 +195,6 @@ def test_zero_state():
     rmse = torch.sqrt(torch.mean((o_cute.float() - o_ref.float()) ** 2)).item()
     max_ref = torch.abs(o_ref.float()).max().item()
     assert rmse / (max_ref + 1e-8) < 0.01, "zero state: output mismatch"
-
-
-# ---------------------------------------------------------------------------
-# Tests vs seg_la Triton kernel
-# ---------------------------------------------------------------------------
-@pytest.mark.skipif(not HAS_SEG_LA, reason="seg_la not available")
-@pytest.mark.parametrize("B", [1, 8, 32, 128])
-def test_vs_seg_la(B):
-    H, D = 32, 128
-    scale = D**-0.5
-    decay_scales = (8 / H * 0.5) * torch.arange(H, device="cuda", dtype=torch.float32)
-
-    q, k, v, state = make_inputs(B, H, D)
-
-    # seg_la
-    state_seg = state.clone().reshape(B, H * D * D).contiguous()
-    s_offsets = torch.arange(B, device="cuda", dtype=torch.int32)
-    meta = SegLaMeta(
-        batch_size=B,
-        max_q_length=1,
-        q_offsets=torch.arange(B + 1, device="cuda", dtype=torch.int32),
-        s_offsets=s_offsets,
-        q_lengths=torch.ones(B, device="cuda", dtype=torch.int32),
-        s_scales=torch.ones(B, device="cuda", dtype=torch.int32),
-    )
-    o_seg = seg_la_fwd(q, k, v, state_seg, decay_scales, meta, softmax_scale=scale)
-
-    # la_decode
-    o_cute, _ = run_la_decode(q, k, v, state, decay_scales, scale)
-
-    rmse = torch.sqrt(torch.mean((o_cute.float() - o_seg.float()) ** 2)).item()
-    max_ref = torch.abs(o_seg.float()).max().item()
-    assert rmse / (max_ref + 1e-8) < 0.005, f"B={B}: vs seg_la mismatch, rel_rmse={rmse / (max_ref + 1e-8):.6f}"
 
 
 # ---------------------------------------------------------------------------

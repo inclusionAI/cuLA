@@ -19,7 +19,6 @@ Usage:
 """
 
 import argparse
-import contextlib
 import json
 import os
 import sys
@@ -27,7 +26,6 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import torch
 
 # Ensure project root is on path
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,30 +44,9 @@ from benchmarks.bench_kda_fused_fwd import (  # noqa: E402
 from benchmarks.bench_kda_fused_fwd import (  # noqa: E402
     main as kda_fused_fwd_main,
 )
+from benchmarks.utils import get_env_info  # noqa: E402
 
-BENCHMARK_MD = ROOT / "BENCHMARK_hopper.md"
-
-
-# ============================================================
-# Helpers
-# ============================================================
-
-
-def get_gpu_name():
-    if torch.cuda.is_available():
-        return torch.cuda.get_device_name(0)
-    return "Unknown GPU"
-
-
-def get_env_info():
-    cuda_version = "Unknown"
-    with contextlib.suppress(Exception):
-        cuda_version = torch.version.cuda or "Unknown"
-    return {
-        "gpu": get_gpu_name(),
-        "cuda": cuda_version,
-        "torch": torch.__version__,
-    }
+BENCHMARK_MD_DEFAULT = "BENCHMARK_H200.md"
 
 
 # ============================================================
@@ -158,6 +135,12 @@ def main():
     parser.add_argument(
         "--cache", type=str, default=None, help="Path to a JSON cache file. If exists, skip benchmarks and use cached results."
     )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output markdown filename (relative to project root). Default: BENCHMARK_H200.md",
+    )
     parser.add_argument("--save-cache", type=str, default=None, help="Save benchmark results to JSON for future --cache use.")
     args = parser.parse_args()
 
@@ -203,8 +186,9 @@ def main():
 
     md = format_benchmark_md(env, kda_fused_fixed, kda_fused_varlen)
 
-    BENCHMARK_MD.write_text(md)
-    print(f"\nWrote {BENCHMARK_MD}")
+    output_path = ROOT / (args.output if args.output else BENCHMARK_MD_DEFAULT)
+    output_path.write_text(md)
+    print(f"\nWrote {output_path}")
 
 
 if __name__ == "__main__":

@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import functools
 import random
+import subprocess
 
 import numpy as np
 import torch
@@ -22,6 +24,31 @@ from fla.modules.l2norm import l2norm_fwd
 from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.index import prepare_chunk_indices
+
+
+def get_gpu_name():
+    """Return the name of the first visible CUDA GPU, or 'Unknown GPU'."""
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_name(0)
+    return "Unknown GPU"
+
+
+def get_env_info():
+    """Return a dict with gpu, cuda (from nvcc), and torch version info."""
+    cuda_version = "Unknown"
+    with contextlib.suppress(Exception):
+        out = subprocess.check_output(["nvcc", "--version"], text=True)
+        # e.g. "Cuda compilation tools, release 12.9, V12.9.41"
+        for line in out.splitlines():
+            if "release" in line:
+                cuda_version = line.split("release")[-1].strip().split(",")[0]
+                break
+    return {
+        "gpu": get_gpu_name(),
+        "cuda": cuda_version,
+        "torch": torch.__version__,
+    }
+
 
 SEED = 42
 CHUNK_SIZE = 64

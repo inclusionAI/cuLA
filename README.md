@@ -18,19 +18,24 @@ This recurrence reduces the complexity from $O(N^2)$ (standard attention) to $O(
 
 ## Installation
 
+cuLA supports both **Hopper (SM90)** and **Blackwell (SM100)** GPUs.
+
+> **Requirements (Hopper & Blackwell):** Python 3.12+, CUDA Toolkit 12.9+ (SM100a support), NVCC 12.9+, PyTorch 2.9.1+
+
+> **Note:** The PyTorch CUDA version must match your system CUDA Toolkit version. Check with `nvcc --version` and `python -c "import torch; print(torch.version.cuda)"`.
+
+**Clone cuLA & dependencies:**
+
 ```bash
 git clone <repo-url>
 git submodule update --init --recursive
 ```
 
-cuLA supports both **Hopper (SM90)** and **Blackwell (SM100)** GPUs. Install PyTorch for your target hardware, then follow the common steps below.
-
 **Install PyTorch:**
 
-| GPU | CUDA Toolkit | PyTorch |
-|-----|-------------|---------|
-| Blackwell (SM100) | 13.0 | `pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu130` |
-| Hopper (SM90) | 12.9 | `pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu129` |
+```bash
+pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu129
+```
 
 **Install cuLA & dependencies:**
 
@@ -43,13 +48,6 @@ cd ../..
 # Install cuLA
 pip install -e . --no-build-isolation
 ```
-
-> **Requirements:**
-> - **Blackwell (SM100):** Python 3.12+, CUDA Toolkit 13.0, NVCC 12.9+ (SM100a support), PyTorch 2.9.1+
->
-> - **Hopper (SM90):** Python 3.12+, CUDA Toolkit 12.9, NVCC 12.9+, PyTorch 2.9.1+
-
-> **Note:** The PyTorch CUDA version must match your system CUDA Toolkit version. Check with `nvcc --version` and `python -c "import torch; print(torch.version.cuda)"`.
 
 ## Quick Start
 
@@ -95,30 +93,28 @@ print(f'Final state shape: {final_state.shape}')  # [2, 4, 128, 128]
 ```
 
 **Notes:**
-- `safe_gate=True` is required (leverages M=16 TensorCore acceleration).
+- `safe_gate=True` is required to leverage TensorCore acceleration.
 - `beta` and `initial_state` must be `float32`.
 - `cu_seqlens` (for variable-length sequences) must be `int32`.
 
 ## Benchmarks
 
-### Blackwell (SM100)
-
-See [BENCHMARK.md](BENCHMARK.md) for detailed results.
-
-Benchmarks run on a single **NVIDIA GB200** GPU with **CUDA Toolkit 13.0**, **PyTorch 2.9.1**, **Triton 3.5.1**.
-
-### Hopper (SM90)
-
-See [BENCHMARK_hopper.md](BENCHMARK_hopper.md) for detailed results.
-
-Benchmarks run on a single **NVIDIA H200** GPU with **CUDA Toolkit 12.9**, **PyTorch 2.9.1**, **Triton 3.5.1**.
+Benchmarks run on a single **NVIDIA GB200/H200** GPU with **CUDA Toolkit 12.9**, **PyTorch 2.9.1**, **Triton 3.5.1**.
 
 FLA baseline: [flash-linear-attention v0.4.2](https://github.com/fla-org/flash-linear-attention/releases/tag/v0.4.2).
 
+**Blackwell (SM100)**
+
+See [BENCHMARK_GB200.md](BENCHMARK_GB200.md) for detailed results.
+ 
+**Hopper (SM90)**
+
+See [BENCHMARK_H200.md](BENCHMARK_H200.md) for detailed results.
+
 **Highlights:**
-- **KDA (Blackwell):** **avg 1.21x** speedup on fixed-length, **avg 1.25x** on variable-length (18 configs, uniform/skewed/random).
-- **Lightning Attention Prefill (Blackwell):** up to **1.95x** speedup (B=2).
-- **Lightning Attention Varlen (Blackwell):** **avg 1.69x** speedup across 60+ configs (uniform/skewed/random).
+- **KDA (Blackwell):** **avg 1.31x** speedup on fixed-length, **avg 1.40x** on variable-length (18 configs, uniform/skewed/random).
+- **Lightning Attention Prefill (Blackwell):** up to **1.94x** speedup (B=2).
+- **Lightning Attention Varlen (Blackwell):** **avg 1.57x** speedup across 126 configs (uniform/skewed/random).
 - **KDA Fused Forward (Hopper):** **avg 1.52x** speedup across fixed-length and variable-length sequences.
 
 To regenerate benchmarks:
@@ -136,12 +132,14 @@ python benchmarks/generate_benchmark_hopper_md.py
 ```bash
 # Tests for modular KDA forward against FLA Triton implementation
 python -m pytest tests/test_kda_compare_fla.py -v
-
 # Tests for modular KDA forward against naive KDA reference
 python -m pytest tests/test_kda.py -v
-
 # Tests for KDA fused forward
-python -m pytest tests/test_kda_fully_fused.py -v
+python -m pytest tests/test_kda_fused_fwd.py -v
+# Tests for Lightning Attention fused forward
+python tests/test_lightning_attn.py
+# Tests for Lightning Attention decode
+python -m pytest tests/test_la_decode.py -v
 ```
 
 <details>
