@@ -1,5 +1,5 @@
 # Copyright (c) 2025 ANTGROUP. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 
 """
 Utility functions for cuLA debugging and development.

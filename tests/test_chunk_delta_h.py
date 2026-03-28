@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2025 ANTGROUP. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 
 """
 Test suite for ChunkDeltaRuleFwdH CuTe DSL kernel.

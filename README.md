@@ -163,6 +163,10 @@ tests/test_kda_e2e_compare_fla.py::test_safe_gate_chunk_varlen[...]             
 
 CUDA kernel tuning is significantly more labor-intensive than Triton — contributions from the open-source community are warmly welcomed!
 
+## Repository Layout
+
+See [REPO_LAYOUT.md](REPO_LAYOUT.md) for the full directory structure and a summary of each component.
+
 ## Roadmap
 
 * [ ] Integrate into [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) via FLA's kernel dispatch mechanism

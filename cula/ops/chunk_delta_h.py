@@ -1,5 +1,5 @@
 # Copyright (c) 2025 ANTGROUP. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 
 """
 Chunk Gated Delta Rule Forward H Kernel V2 - No GMEM Roundtrip (Register-Carry)

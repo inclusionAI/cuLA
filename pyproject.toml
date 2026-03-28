@@ -17,7 +17,7 @@ dependencies = [
     "matplotlib",
     "pandas",
 ]
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 
 [tool.setuptools.packages.find]
 where = ["."]
