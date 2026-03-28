@@ -367,20 +367,18 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 {
                     Tensor sQ = make_tensor(make_smem_ptr(shared_plan->q[buf_load_idx].data()), SmemLayoutInputBF16{});
 
-                    // Inter A-matrix: all 4 subchunks → QG_INTER in TMEM
-                    fwd_setup_A_inter_all_QK<HalfK>(
+                    // Fused inter+intra A-matrix: reads sG and sQ/sK ONCE per iteration,
+                    // producing both QG_INTER and QG_INTRA in a single pass.
+                    // Saves ~33% of A-matrix SMEM reads vs two separate calls.
+                    fwd_setup_A_inter_intra_all_QK<HalfK>(
                         sG, sQ, sK,
                         idx_in_warpgroup, sub_seq_len, k_offset,
-                        static_cast<int>(TmemAllocation::QG_INTER) + buf_idx * 128);
-
-                    // Intra A-matrix: all 4 subchunks → QG_INTRA in TMEM
-                    fwd_setup_A_intra_all_QK<HalfK>(
-                        sG, sQ, sK,
-                        idx_in_warpgroup, sub_seq_len, k_offset,
+                        static_cast<int>(TmemAllocation::QG_INTER) + buf_idx * 128,
                         static_cast<int>(TmemAllocation::QG_INTRA) + buf_idx * 128);
 
-                    cutlass::arch::fence_view_async_tmem_store();
-                    ku::tcgen05_before_thread_sync();
+                    // NOTE: TMEM fence (tcgen05.wait::st, blocking) deferred past B-matrix
+                    // to overlap TMEM store latency with B-matrix SMEM computation.
+                    // Safe because B-matrix only touches SMEM, not TMEM.
                 }
 
                 // ============================================================
@@ -425,21 +423,13 @@ struct KdaChunkFwdIntraMainloopSm100 {
                     }
                 }
 
-                // =====DEBUG=====
-                // wait for smem write finished
-                // cutlass::arch::NamedBarrier::arrive_and_wait(128 * 2, KdaChunkFwdIntraSm100NamedBarriers::ComputeCudaCore);
-                // if (threadIdx.x == 0) {
-                //     printf("Iter=%d\n", k_idx);
-                //     printf("sKG_inter (0, 0)");
-                //     cute::print_tensor(sKG_inter);
-                //     printf("sKG_intra (0, 0)");
-                //     cute::print_tensor(sKG_intra);
-                // }
-
-                // All 6 inter + 4 intra B-matrices are ready → signal both pipelines
                 // ============================================================
-                // Step 4: Fence SMEM writes and signal MMA
+                // Step 4: Fence TMEM + SMEM writes and signal MMA
                 // ============================================================
+                // TMEM fence deferred from after A-matrix to here, overlapping
+                // TMEM store latency with B-matrix computation above.
+                cutlass::arch::fence_view_async_tmem_store();
+                ku::tcgen05_before_thread_sync();
                 fence_view_async_shared();
                 qkg_inter_pipeline.producer_commit(qkg_inter_pipe_state_write);
                 ++qkg_inter_pipe_state_write;
@@ -454,21 +444,22 @@ struct KdaChunkFwdIntraMainloopSm100 {
             // ============================================================
             // Post-loop: wait for MMA results, epilogue, signal downstream
             // ============================================================
+            // Reorder blocking waits: start waiting for inverse pipeline slot
+            // and beta data before waiting for MMA, overlapping independent waits.
+            kk_inv_pipeline.producer_acquire(kk_inv_pipe_state_write);
+
+            beta_pipeline.consumer_wait(beta_pipe_state_read);
+
             qk_done_pipeline.consumer_wait(qk_done_pipe_state_read);
             int buf_acc_idx = qk_done_pipe_state_read.index();
 
-            // Wait for beta data from empty warp
-            beta_pipeline.consumer_wait(beta_pipe_state_read);
             fence_view_async_shared();
 
-            kk_inv_pipeline.producer_acquire(kk_inv_pipe_state_write);
-
-            // FIXME: use two WGs to do QK/KK epilogue, each process half of TileT
             // ============================================================
             // QK + KK epilogue: T2R + mask + scale/beta → global / SMEM
             // ============================================================
             // Lower 64 threads in WG0: QK epilogue (scale + causal mask → global bf16)
-            // Upper 64 threads in WG0: KK epilogue (beta + causal mask → SMEM fp16)
+            // Upper 64 threads in WG0: KK epilogue (beta + causal mask → SMEM tf32)
             //
             // TMEM address: QK = 0 (the MMA wrote QK/KK results at QK_02/QK_13;
             // tmem_ld_32dp32bNx reads all 64 rows correctly from the base
@@ -477,8 +468,6 @@ struct KdaChunkFwdIntraMainloopSm100 {
             //
             // KK epilogue applies per-row beta scaling: KK[i, :] *= beta[i]
             // Beta is loaded from beta_smem[pipe_index][row] (Tx1 vector).
-            //
-            // Only WG0 does this since both WGs share the same TMEM.
             {
                 int token_offset = cu_seqlens_ptr[batch_idx];
                 int row = idx_in_warpgroup % 64;
@@ -492,7 +481,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 // Read per-row beta for KK scaling
                 float beta_row = shared_plan->beta_smem[beta_pipe_state_read.index()][row];
 
-                // Create SMEM tensor view for KK output (fp16)
+                // Create SMEM tensor view for KK output (tf32/fp16)
                 Tensor sKK = make_tensor(make_smem_ptr(shared_plan->kk[buf_acc_idx].data()), SmemLayoutInvKK{});
 
                 if (wg_idx == 0) {

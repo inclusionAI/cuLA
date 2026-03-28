@@ -538,6 +538,88 @@ __forceinline__ __device__ void fwd_setup_A_intra_all_QK(
 }
 
 // ============================================================
+// Fused A-matrix inter+intra helper (all 4 subchunks, single pass)
+// ============================================================
+//
+// Fuses fwd_setup_A_inter_all and fwd_setup_A_intra_all into one pass.
+// Reads sG(row, y) and sVec(row, y) ONCE per iteration, computing both
+// inter and intra gated A-matrices. This saves ~33% of SMEM reads in
+// the A-matrix setup path (the dominant source of L1/TEX pressure).
+//
+// Output: two TMEM stores — one for inter, one for intra.
+
+// fwd_setup_A_inter_intra_all: fused inter+intra, single Vec (Q or K)
+template <int TileK, typename G_TENSOR, typename VEC_TENSOR>
+__forceinline__ __device__ void fwd_setup_A_inter_intra_all(
+    G_TENSOR &sG, VEC_TENSOR &sVec,
+    int idx_in_warpgroup, int sub_seq_len, int k_offset,
+    int tmem_addr_inter, int tmem_addr_intra) {
+    int row = idx_in_warpgroup % 64;
+    int sub_tile_i = row / 16;  // 0, 1, 2, or 3
+    float res_inter[TileK];
+    float res_intra[TileK];
+    if (row < sub_seq_len) {
+        int g_first_row = min(sub_tile_i * 16, sub_seq_len - 1);
+        int g_half_row  = min(sub_tile_i * 16 + 8, sub_seq_len - 1);
+        #pragma unroll
+        for (int i = 0; i < TileK / 4; ++i) {
+            int y = i * 4 + k_offset;
+            // Read g[row] and Vec[row] ONCE (shared between inter and intra)
+            float4 g     = *reinterpret_cast<float4*>(&sG(row, y));
+            nvbf16x4 v   = *reinterpret_cast<nvbf16x4*>(&sVec(row, y));
+            float2 va = __bfloat1622float2(v.a);
+            float2 vb = __bfloat1622float2(v.b);
+            float2 g_a = reinterpret_cast<float2*>(&g)[0];
+            float2 g_b = reinterpret_cast<float2*>(&g)[1];
+            // Inter: exp2(g[row] - g_first) * Vec[row]
+            {
+                float4 g_ref = *reinterpret_cast<float4*>(&sG(g_first_row, y));
+                float2 s1 = float2_sub(g_a, reinterpret_cast<float2*>(&g_ref)[0]);
+                float2 s2 = float2_sub(g_b, reinterpret_cast<float2*>(&g_ref)[1]);
+                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                reinterpret_cast<float2*>(&res_inter[i * 4])[0] = float2_mul(s1, va);
+                reinterpret_cast<float2*>(&res_inter[i * 4])[1] = float2_mul(s2, vb);
+            }
+            // Intra: exp2(g[row] - g_half) * Vec[row]
+            {
+                float4 g_ref = *reinterpret_cast<float4*>(&sG(g_half_row, y));
+                float2 s1 = float2_sub(g_a, reinterpret_cast<float2*>(&g_ref)[0]);
+                float2 s2 = float2_sub(g_b, reinterpret_cast<float2*>(&g_ref)[1]);
+                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                reinterpret_cast<float2*>(&res_intra[i * 4])[0] = float2_mul(s1, va);
+                reinterpret_cast<float2*>(&res_intra[i * 4])[1] = float2_mul(s2, vb);
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < TileK; ++i) {
+            res_inter[i] = 0.0f;
+            res_intra[i] = 0.0f;
+        }
+    }
+    ku::tmem_st_32dp32bNx<TileK>(tmem_addr_inter, res_inter);
+    ku::tmem_st_32dp32bNx<TileK>(tmem_addr_intra, res_intra);
+}
+
+// fwd_setup_A_inter_intra_all_QK: fused inter+intra, combined Q + K
+// Threads 0-63 → gated Q (inter + intra), Threads 64-127 → gated K (inter + intra)
+template <int TileK, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
+__forceinline__ __device__ void fwd_setup_A_inter_intra_all_QK(
+    G_TENSOR &sG, Q_TENSOR &sQ, K_TENSOR &sK,
+    int idx_in_warpgroup, int sub_seq_len, int k_offset,
+    int tmem_addr_inter, int tmem_addr_intra) {
+    if (idx_in_warpgroup < 64) {
+        fwd_setup_A_inter_intra_all<TileK>(sG, sQ, idx_in_warpgroup, sub_seq_len, k_offset,
+            tmem_addr_inter + k_offset, tmem_addr_intra + k_offset);
+    } else {
+        fwd_setup_A_inter_intra_all<TileK>(sG, sK, idx_in_warpgroup, sub_seq_len, k_offset,
+            tmem_addr_inter + k_offset, tmem_addr_intra + k_offset);
+    }
+}
+
+// ============================================================
 // Forward Epilogue: T2R + Causal Mask + R2G / R2S helper functions
 // ============================================================
 //
