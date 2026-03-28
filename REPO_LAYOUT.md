@@ -37,6 +37,7 @@ flashla/
 │   │   │   └── utils/            # SM90-specific helpers
 │   │   └── sm100/                # Blackwell KDA kernels (CUTLASS 3.x)
 │   │       ├── kda_fwd_sm100.cu
+│   │       ├── kda_fwd_common.cuh
 │   │       ├── kda_fwd_intra_kernel_sm100.hpp
 │   │       ├── kda_fwd_intra_mainloop_sm100.hpp
 │   │       ├── kda_config.hpp
@@ -56,13 +57,14 @@ flashla/
 │   ├── bench_fwd_o.py            # Forward output benchmark
 │   ├── bench_recompute_wu.py     # Recompute WU benchmark
 │   ├── bench_linear_attn.py      # Linear attention benchmark
-│   ├── generate_benchmark_md.py  # Auto-generate BENCHMARK.md
+│   ├── generate_benchmark_md.py  # Auto-generate BENCHMARK_GB200.md (Blackwell)
+│   ├── generate_benchmark_hopper_md.py  # Auto-generate BENCHMARK_H200.md (Hopper)
 │   └── utils.py                  # Benchmark utilities
 │
 ├── tests/                        # Unit / integration tests
-│   ├── test_kda_e2e_compare_fla.py  # E2E KDA vs FLA Triton
-│   ├── test_kda.py               # KDA vs naive reference
-│   ├── test_kda_fused_fwd.py   # Fully fused KDA tests
+│   ├── test_kda_compare_fla.py   # Modular KDA forward vs FLA Triton
+│   ├── test_kda.py               # Modular KDA forward vs naive reference
+│   ├── test_kda_fused_fwd.py     # Fused KDA forward tests
 │   ├── test_chunk_delta_h.py     # Chunk delta-H tests
 │   ├── test_fwd_o.py             # Forward output tests
 │   ├── test_compare_with_fla.py  # General FLA comparison
@@ -77,7 +79,8 @@ flashla/
 ├── third_party/
 │   └── flash-linear-attention/   # FLA submodule (baseline)
 │
-├── BENCHMARK.md                  # Auto-generated benchmark results
+├── BENCHMARK_GB200.md            # Auto-generated Blackwell benchmark results
+├── BENCHMARK_H200.md             # Auto-generated Hopper benchmark results
 ├── README.md                     # Project overview
 ├── setup.py                      # Build configuration
 ├── pyproject.toml                # Project metadata

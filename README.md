@@ -112,7 +112,7 @@ See [BENCHMARK_GB200.md](BENCHMARK_GB200.md) for detailed results.
 See [BENCHMARK_H200.md](BENCHMARK_H200.md) for detailed results.
 
 **Highlights:**
-- **KDA (Blackwell):** **avg 1.31x** speedup on fixed-length, **avg 1.40x** on variable-length (18 configs, uniform/skewed/random).
+- **KDA Modular Forward (Blackwell):** **avg 1.31x** speedup on fixed-length, **avg 1.40x** on variable-length (18 configs, uniform/skewed/random).
 - **Lightning Attention Prefill (Blackwell):** up to **1.94x** speedup (B=2).
 - **Lightning Attention Varlen (Blackwell):** **avg 1.57x** speedup across 126 configs (uniform/skewed/random).
 - **KDA Fused Forward (Hopper):** **avg 1.52x** speedup across fixed-length and variable-length sequences.
