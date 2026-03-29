@@ -33,6 +33,7 @@ from fla.ops.utils.constant import RCP_LN2
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 from cula.ops.kda_fully_fused import KDAChunkwise
+from cula.utils import USE_FAST_MATH
 
 # Global kernel cache
 compiled_kernel_cache = {}
@@ -132,7 +133,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         stream = cutlass_torch.default_stream()
 
         has_initial_state = initial_state is not None
-        cache_key = (has_initial_state, output_final_state, safe_gate, is_varlen, scale, chunk_size, D)
+        cache_key = (has_initial_state, output_final_state, safe_gate, is_varlen, scale, chunk_size, D, USE_FAST_MATH)
 
         # Prepare cu_seqlens as int32 for kernel
         if is_varlen:
@@ -217,6 +218,7 @@ class ChunkKDAFunction(torch.autograd.Function):
                 has_initial_state=has_initial_state,
                 output_final_state=output_final_state,
                 is_varlen=is_varlen,
+                use_fast_math=USE_FAST_MATH,
             )
             compiled_kernel = cute.compile(
                 attn_kernel,

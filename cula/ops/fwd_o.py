@@ -80,6 +80,8 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Float32, Int32, Int64
 from fla.ops.utils import prepare_chunk_indices
 
+from cula.utils import USE_FAST_MATH
+
 PRINT_DEBUG = False
 PRINT_SMEM_DEBUG = False  # Print SMEM contents after TMA loads for non-aligned varlen debug
 
@@ -113,12 +115,14 @@ class ChunkGlaFwdO:
         BV: int = 128,
         min_occupancy: int = 2,
         persistent: bool = True,
+        use_fast_math: bool = True,
     ):
         assert head_dim_k == 128 and head_dim_v == 128, (
             f"head_dim_k and head_dim_v must both be 128, got head_dim_k={head_dim_k}, head_dim_v={head_dim_v}"
         )
         cc = torch.cuda.get_device_capability()
         assert cc[0] == 10 and cc[1] == 0, f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
+        self.use_fast_math = use_fast_math
         self.chunk_size = chunk_size
         self.head_dim_k = head_dim_k
         self.head_dim_v = head_dim_v
@@ -1237,12 +1241,12 @@ class ChunkGlaFwdO:
                             # Branchless select zeros out-of-bounds results.
                             q_val = sQ_epi[(bt_coord, bk_coord, q_h.index)].to(self.acc_dtype)
                             g_val = sG_epi[(bt_coord, bk_coord, g_h.index)]
-                            result = q_val * cute.exp2(g_val)
+                            result = q_val * cute.exp2(g_val, fastmath=self.use_fast_math)
                             tTR_rQG_fp32[ei] = cutlass.select_(bt_coord < remaining, result, Float32(0.0))
                         else:
                             q_val = sQ_epi[(bt_coord, bk_coord, q_h.index)].to(self.acc_dtype)
                             g_val = sG_epi[(bt_coord, bk_coord, g_h.index)]
-                            tTR_rQG_fp32[ei] = q_val * cute.exp2(g_val)
+                            tTR_rQG_fp32[ei] = q_val * cute.exp2(g_val, fastmath=self.use_fast_math)
 
                     q_h.release()
                     g_h.release()
@@ -1576,7 +1580,7 @@ _fwd_o_dummy_cu_seqlens: torch.Tensor = None
 _fwd_o_dummy_chunk_indices: torch.Tensor = None
 
 
-def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size):
+def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size, use_fast_math):
     """Compile one ChunkGlaFwdO kernel variant. Returns the compiled TVM-FFI callable.
 
     Uses make_fake_compact_tensor and make_fake_stream for compilation with
@@ -1591,6 +1595,7 @@ def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size):
         scale=scale,
         is_varlen=is_varlen,
         persistent=persistent,
+        use_fast_math=use_fast_math,
     )
 
     sym_a = cute.sym_int()  # B (non-varlen: dynamic B; varlen: fixed 1)
@@ -1724,9 +1729,9 @@ def _get_compiled_fwd_o(is_varlen, persistent, H, K, V, scale, chunk_size):
     where a subsequent cute.compile can invalidate previously compiled but
     not-yet-executed functions.
 
-    Cache key: (is_varlen, persistent, H, K, V, scale, chunk_size)
+    Cache key: (is_varlen, persistent, H, K, V, scale, chunk_size, USE_FAST_MATH)
     """
-    key = (is_varlen, persistent, H, K, V, scale, chunk_size)
+    key = (is_varlen, persistent, H, K, V, scale, chunk_size, USE_FAST_MATH)
     if key not in _fwd_o_kernel_cache:
         _fwd_o_kernel_cache[key] = _compile_fwd_o_variant(
             is_varlen,
@@ -1736,6 +1741,7 @@ def _get_compiled_fwd_o(is_varlen, persistent, H, K, V, scale, chunk_size):
             V,
             scale,
             chunk_size,
+            USE_FAST_MATH,
         )
     return _fwd_o_kernel_cache[key]
 

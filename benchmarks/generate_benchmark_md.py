@@ -42,6 +42,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
+os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 
 import numpy as np  # noqa: E402
 

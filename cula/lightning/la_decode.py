@@ -45,6 +45,8 @@ import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 
+from cula.utils import USE_FAST_MATH
+
 # ============================================================================
 # Global configuration
 # ============================================================================
@@ -105,7 +107,7 @@ def la_decode_kernel_small_batch_pretranspose(
     r_v = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_h = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_decay_scale = -cutlass.Float32(decay_scales[i_h])
-    r_decay = cute.exp(r_decay_scale)
+    r_decay = cute.exp(r_decay_scale, fastmath=USE_FAST_MATH)
 
     cute.arch.barrier()
 
@@ -292,7 +294,7 @@ def la_decode_kernel_big_batch_pretranspose(
     for i in range(vec_size):
         r_q[i] = r_q[i] * scale
 
-    r_g = cute.exp(-cutlass.Float32(decay_scales[i_h]))
+    r_g = cute.exp(-cutlass.Float32(decay_scales[i_h]), fastmath=USE_FAST_MATH)
 
     # ===================================================================
     # Mainloop: All threads participate
@@ -511,7 +513,7 @@ def run_la_decode_kernel_small_batch_pretranspose(
 
 
 @functools.cache
-def _get_compiled_kernel(B: int, T: int, H: int, K: int, V: int, softmax_scale: float):
+def _get_compiled_kernel(B: int, T: int, H: int, K: int, V: int, softmax_scale: float, use_fast_math: bool = True):
     """Get or create compiled kernel cache."""
     return {}
 
@@ -567,7 +569,7 @@ def linear_attention_decode(
         raise NotImplementedError(f"CuTe kernel doesn't support K splitting (k_dim_block={k_dim_block})")
 
     # Get compiled kernel (cached)
-    cache_key = (B, 1, H, HEAD_DIM, HEAD_DIM, softmax_scale)
+    cache_key = (B, 1, H, HEAD_DIM, HEAD_DIM, softmax_scale, USE_FAST_MATH)
     cache = _get_compiled_kernel(*cache_key)
 
     h0_source = s

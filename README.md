@@ -41,9 +41,7 @@ pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu129
 
 ```bash
 # Install flash-linear-attention for benchmark repro
-cd third_party/flash-linear-attention
-pip install -e .
-cd ../..
+pip install -e third_party/flash-linear-attention
 
 # Install cuLA
 pip install -e . --no-build-isolation

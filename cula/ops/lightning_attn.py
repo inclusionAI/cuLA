@@ -64,6 +64,8 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.cutlass_dsl import T as _T
 
+from cula.utils import USE_FAST_MATH
+
 
 @cutlass.dsl_user_op
 def _atomic_add_global_i32(ptr_i64, addend_i32, *, loc=None, ip=None):
@@ -124,10 +126,12 @@ class LinearAttentionChunkwiseDecay:
         scale: float = 1.0,
         is_varlen: bool = False,
         persistent: bool = True,
+        use_fast_math: bool = True,
     ):
         assert K == 128 and V == 128, f"K and V must both be 128, got K={K}, V={V}"
         cc = torch.cuda.get_device_capability()
         assert cc[0] == 10 and cc[1] == 0, f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
+        self.use_fast_math = use_fast_math
         self.chunk_size = chunk_size
         self.acc_dtype = acc_dtype
         self.io_dtype = io_dtype
@@ -1039,7 +1043,7 @@ class LinearAttentionChunkwiseDecay:
             decay_tensor = cute.make_tensor(decay, cute.make_layout(H))
             decay_s = decay_tensor[hidx]
             # Block-level decay: λ^C for inter-chunk state accumulation
-            block_decay = cute.exp(-decay_s * cutlass.Float32(C))
+            block_decay = cute.exp(-decay_s * cutlass.Float32(C), fastmath=self.use_fast_math)
 
         # Make fragments/tmem for QK MMA.
         # (MMA, MMA_M, MMA_K, INPUT_STAGE)
@@ -1695,7 +1699,7 @@ class LinearAttentionChunkwiseDecay:
                 # For persistent: hidx was decoded above; for non-persistent: hidx from block_idx
                 decay_tensor_cuda = cute.make_tensor(decay, cute.make_layout(H))
                 decay_s_cuda = decay_tensor_cuda[hidx]
-                block_decay = cute.exp(-decay_s_cuda * cutlass.Float32(C))
+                block_decay = cute.exp(-decay_s_cuda * cutlass.Float32(C), fastmath=self.use_fast_math)
 
                 # -------------- Initial State Loading (h0) ----------------
                 if cutlass.const_expr(self.has_initial_state):
@@ -1724,7 +1728,7 @@ class LinearAttentionChunkwiseDecay:
                 # ============================================================
                 for lut_k in cutlass.range(_C, unroll_full=True):
                     if local_tidx == lut_k:
-                        sDecayLUT[lut_k] = cute.exp(-decay_s_cuda * cutlass.Float32(lut_k))
+                        sDecayLUT[lut_k] = cute.exp(-decay_s_cuda * cutlass.Float32(lut_k), fastmath=self.use_fast_math)
                 cute.arch.fence_proxy(
                     "async.shared",
                     space="cta",
@@ -2738,6 +2742,7 @@ def _compile_single_variant(has_initial_state, output_final_state, H, D, scale, 
         K=D,
         V=D,
         scale=scale,
+        use_fast_math=USE_FAST_MATH,
     )
 
     sym_b = cute.sym_int()
@@ -2850,9 +2855,9 @@ def _get_compiled_kernel(has_initial_state, output_final_state, H, D, scale, chu
     where a subsequent cute.compile can invalidate previously compiled but
     not-yet-executed functions.
 
-    Cache key: (has_initial_state, output_final_state, H, D, scale, chunk_size)
+    Cache key: (has_initial_state, output_final_state, H, D, scale, chunk_size, USE_FAST_MATH)
     """
-    key = (has_initial_state, output_final_state, H, D, scale, chunk_size)
+    key = (has_initial_state, output_final_state, H, D, scale, chunk_size, USE_FAST_MATH)
     if key not in _kernel_cache:
         _kernel_cache[key] = _compile_single_variant(
             has_initial_state,
@@ -2965,6 +2970,7 @@ def _compile_single_variant_varlen(H, D, scale, chunk_size, persistent=True):
         scale=scale,
         is_varlen=True,
         persistent=persistent,
+        use_fast_math=USE_FAST_MATH,
     )
 
     sym_n = cute.sym_int()  # N: number of sequences
@@ -3063,9 +3069,9 @@ def _compile_single_variant_varlen(H, D, scale, chunk_size, persistent=True):
 def _get_compiled_kernel_varlen(H, D, scale, chunk_size, persistent=True):
     """Get a compiled varlen kernel with on-demand compilation.
 
-    Cache key: (H, D, scale, chunk_size, persistent)
+    Cache key: (H, D, scale, chunk_size, persistent, USE_FAST_MATH)
     """
-    key = (H, D, scale, chunk_size, persistent)
+    key = (H, D, scale, chunk_size, persistent, USE_FAST_MATH)
     if key not in _varlen_kernel_cache:
         _varlen_kernel_cache[key] = _compile_single_variant_varlen(
             H,

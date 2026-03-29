@@ -125,6 +125,7 @@ class KDAChunkwise:
         has_initial_state: bool = False,
         output_final_state: bool = False,
         is_varlen: bool = False,
+        use_fast_math: bool = True,
         # num_regs_cuda: int = 248,
         num_regs_cuda: int = 224,
         num_regs_subchunk: int = 192,
@@ -138,6 +139,7 @@ class KDAChunkwise:
         self.has_initial_state = has_initial_state
         self.output_final_state = output_final_state
         self.is_varlen = is_varlen
+        self.use_fast_math = use_fast_math
 
         self.chunk_size = chunk_size
         self.subchunk_size = 16
@@ -2576,7 +2578,7 @@ class KDAChunkwise:
 
                             # exp(g) half in-place — persists for K gating reuse
                             for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
-                                tQrG_persists[half_idx][i] = cute.exp2(tQrG_persists[half_idx][i])
+                                tQrG_persists[half_idx][i] = cute.exp2(tQrG_persists[half_idx][i], fastmath=self.use_fast_math)
 
                             # S2R Q half
                             tQrQ_half = cute.make_fragment_like(tQrQ_half_0, self.q_dtype)
@@ -2831,7 +2833,7 @@ class KDAChunkwise:
                             g_last_val = sG_last[index_k + k_offset, g_stage_idx]
                             k_i = tQrK_half[i].to(cutlass.Float32)
                             g_i = tQrG_half[i]
-                            tQrK_half[i] = (cute.exp2(g_last_val - g_i) * k_i).to(self.k_dtype)
+                            tQrK_half[i] = (cute.exp2(g_last_val - g_i, fastmath=self.use_fast_math) * k_i).to(self.k_dtype)
 
                         # R2S K^T half to sQ_K_scaled
                         tQrK_half_cv_src = thr_store_qk_half.retile(tQrK_half)
@@ -3016,20 +3018,20 @@ class KDAChunkwise:
                                 tRS_rG_bf16[0, _zr, 0] = self.io_dtype(0.0)
                             else:
                                 g_i = tRS_rG[0, _zr, 0]
-                                exp_g_i = cute.exp2(g_i)
+                                exp_g_i = cute.exp2(g_i, fastmath=self.use_fast_math)
                                 q_i = tRS_rQ[0, _zr, 0].to(cutlass.Float32)
                                 tRS_rQ[0, _zr, 0] = (q_i * exp_g_i * self.scale).to(self.io_dtype)
                                 k_i = tRS_rK[0, _zr, 0].to(cutlass.Float32)
                                 tRS_rK[0, _zr, 0] = (k_i * exp_g_i).to(self.io_dtype)
-                                tRS_rG_bf16[0, _zr, 0] = (k_i * cute.exp2(-g_i)).to(self.io_dtype)
+                                tRS_rG_bf16[0, _zr, 0] = (k_i * cute.exp2(-g_i, fastmath=self.use_fast_math)).to(self.io_dtype)
                         else:
                             g_i = tRS_rG[0, _zr, 0]
-                            exp_g_i = cute.exp2(g_i)
+                            exp_g_i = cute.exp2(g_i, fastmath=self.use_fast_math)
                             q_i = tRS_rQ[0, _zr, 0].to(cutlass.Float32)
                             tRS_rQ[0, _zr, 0] = (q_i * exp_g_i * self.scale).to(self.io_dtype)
                             k_i = tRS_rK[0, _zr, 0].to(cutlass.Float32)
                             tRS_rK[0, _zr, 0] = (k_i * exp_g_i).to(self.io_dtype)
-                            tRS_rG_bf16[0, _zr, 0] = (k_i * cute.exp2(-g_i)).to(self.io_dtype)
+                            tRS_rG_bf16[0, _zr, 0] = (k_i * cute.exp2(-g_i, fastmath=self.use_fast_math)).to(self.io_dtype)
 
                     # ============================================================
                     # KDA Step 3: Write gated Q', K_inter, K_intra back to SMEM
@@ -4298,7 +4300,7 @@ class KDAChunkwise:
                 kv_f32[i] = kv_f32[i] * sG_last[i]
             else:
                 # NOTE: when safe_gate=True, sG_last stores the original G values
-                kv_f32[i] = kv_f32[i] * cute.exp2(sG_last[i])
+                kv_f32[i] = kv_f32[i] * cute.exp2(sG_last[i], fastmath=self.use_fast_math)
         return kv_f32
 
     def tmem_load_kv16(self, local_tidx, tState):
@@ -5741,7 +5743,7 @@ class KDAChunkwise:
         # gqn = exp2(g - g_first[None, :]), reuse g
         g_val = tQKrG.load()
         g_first_val = tQKrGfirst.load()
-        g_val = cute.exp2(g_val - g_first_val)
+        g_val = cute.exp2(g_val - g_first_val, fastmath=self.use_fast_math)
         tQKrG.store(g_val)
 
         # S2R q, k
@@ -5792,7 +5794,7 @@ class KDAChunkwise:
         # compute gktn = exp2(g_first - g), reuse g
         g_val = tQKrG.load()
         g_first_val = rG_first.load()
-        g_val = cute.exp2(g_first_val - g_val)
+        g_val = cute.exp2(g_first_val - g_val, fastmath=self.use_fast_math)
         tQKrG.store(g_val)
 
         # S2R k

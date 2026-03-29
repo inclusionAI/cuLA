@@ -33,10 +33,12 @@ With --ncu, warmup=1 and iters=1 for ncu profiling:
 """
 
 import argparse
+import os
 import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 
 import torch
 from fla.ops.kda import chunk_kda as fla_chunk_kda

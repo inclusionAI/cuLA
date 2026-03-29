@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import pathlib
 import sys
 
@@ -19,6 +20,7 @@ import torch
 import triton
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 
 from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_intra
 

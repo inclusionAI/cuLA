@@ -11,10 +11,6 @@ from torch.utils.cpp_extension import (
 )
 
 
-def is_flag_set(flag: str) -> bool:
-    return os.getenv(flag, "FALSE").lower() in ["true", "1", "y", "yes"]
-
-
 def detect_gpu_archs() -> tuple[set[int], set[int]]:
     """
     Query all visible CUDA devices via torch and return two sets:
@@ -63,6 +59,8 @@ def get_features_args():
     features_args = []
     return features_args
 
+
+USE_FAST_MATH = os.getenv("CULA_USE_FAST_MATH", "1") == "1"
 
 print("Detecting GPU architectures...")
 _has_sm100, _has_sm90 = detect_gpu_archs()
@@ -148,14 +146,14 @@ ext_modules.append(
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--expt-relaxed-constexpr",
                 "--expt-extended-lambda",
-                "--use_fast_math",
                 "-lineinfo",
                 "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
                 "-diag-suppress=3189",  # suppress the warning of torch in C++ 20
             ]
             + get_features_args()
             + get_arch_flags()
-            + get_nvcc_thread_args(),
+            + get_nvcc_thread_args()
+            + (["--use_fast_math"] if USE_FAST_MATH else []),
         },
         include_dirs=[
             Path(this_dir) / "csrc",

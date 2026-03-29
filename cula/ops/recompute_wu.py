@@ -42,6 +42,8 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Int32, Int64
 
+from cula.utils import USE_FAST_MATH
+
 
 def _make_coop_group(size: int):
     return pipeline.CooperativeGroup(pipeline.Agent.Thread, size)
@@ -59,10 +61,12 @@ class KDARecomputeWU:
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         is_varlen: bool = False,
         persistent: bool = False,
+        use_fast_math: bool = True,
     ):
         assert K == 128 and V == 128, f"K and V must both be 128, got K={K}, V={V}"
         cc = torch.cuda.get_device_capability()
         assert cc[0] == 10 and cc[1] == 0, f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
+        self.use_fast_math = use_fast_math
         self.K = K
         self.V = V
         self.BT = chunk_size
@@ -863,8 +867,8 @@ class KDARecomputeWU:
                         gk_val = sGK[(k_coord, m_coord, kgk_h.index)]
                         gn_val = sGK[(self.BT - 1, m_coord, kgk_h.index)]
                         beta_val = sBeta[k_coord].to(self.acc_dtype)
-                        tTR_rBproc[ei] = (k_val * beta_val * cute.exp2(gk_val)).to(self.io_dtype)
-                        tTR_rKg[ei] = (k_val * cute.exp2(gn_val - gk_val)).to(self.io_dtype)
+                        tTR_rBproc[ei] = (k_val * beta_val * cute.exp2(gk_val, fastmath=self.use_fast_math)).to(self.io_dtype)
+                        tTR_rKg[ei] = (k_val * cute.exp2(gn_val - gk_val, fastmath=self.use_fast_math)).to(self.io_dtype)
 
                     # R2T K bproc -> TMEM -> signal MMA K start
                     tRT_rBproc.store(tTR_rBproc.load())
@@ -987,7 +991,7 @@ _dummy_chunk_indices = None
 
 
 def _compile_recompute_wu(H, K, V, chunk_size=64, block_k=None, block_v=None, persistent=True, is_varlen=False):
-    key = (H, K, V, chunk_size, block_k, block_v, persistent, is_varlen)
+    key = (H, K, V, chunk_size, block_k, block_v, persistent, is_varlen, USE_FAST_MATH)
     if key in _recompute_wu_cache:
         return _recompute_wu_cache[key]
 
@@ -999,6 +1003,7 @@ def _compile_recompute_wu(H, K, V, chunk_size=64, block_k=None, block_v=None, pe
         block_v=block_v,
         persistent=persistent,
         is_varlen=is_varlen,
+        use_fast_math=USE_FAST_MATH,
     )
 
     sym_a = cute.sym_int()

@@ -45,8 +45,8 @@ import argparse
 import os
 import sys
 
-os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
 os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
+os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 
 import cuda.bindings.driver as cuda_drv
 import torch
@@ -57,6 +57,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from fla.ops.common.fused_recurrent import fused_recurrent_fwd, fused_recurrent_fwd_kernel
 
 from cula.lightning.la_decode import _get_compiled_kernel, linear_attention_decode
+from cula.utils import USE_FAST_MATH
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,7 +202,7 @@ def run_config(B, H, K, V, layer_idx, num_layers):
     # cute kernel: pre-create compiled + stream handle
     cute_state_k = state_init.clone().permute(0, 1, 3, 2).reshape(B * H, V, K).contiguous()
     out_cute_k = torch.empty(B, H, V, device=device, dtype=dtype)
-    cache = _get_compiled_kernel(B, 1, H, K, V, scale)
+    cache = _get_compiled_kernel(B, 1, H, K, V, scale, USE_FAST_MATH)
     compiled_cute = cache["compiled"]
     stream_handle = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
 

@@ -35,6 +35,8 @@ from cutlass.cutlass_dsl import T as _T
 from fla.ops.utils import prepare_chunk_indices, prepare_lens
 from fla.utils import tensor_cache
 
+from cula.utils import USE_FAST_MATH
+
 
 # in FLA, cumsum returns int64 tensor by default
 @tensor_cache
@@ -87,12 +89,14 @@ class ChunkDeltaRuleFwdH:
         io_dtype: type[cutlass.Numeric] = cutlass.BFloat16,
         is_varlen: bool = False,
         persistent: bool = True,
+        use_fast_math: bool = True,
     ):
         assert head_dim_k == 128 and head_dim_v == 128, (
             f"head_dim_k and head_dim_v must both be 128, got head_dim_k={head_dim_k}, head_dim_v={head_dim_v}"
         )
         cc = torch.cuda.get_device_capability()
         assert cc[0] == 10 and cc[1] == 0, f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
+        self.use_fast_math = use_fast_math
         self.chunk_size = chunk_size
         self.head_dim_k = head_dim_k
         self.head_dim_v = head_dim_v
@@ -1397,7 +1401,7 @@ class ChunkDeltaRuleFwdH:
                         # chunk_local_cumsum preprocessing, so they are in base-2 form. We apply exp2()
                         # directly — do NOT multiply by INV_LN2 again (that would double-scale).
                         gk_raw = sGK_smem[(tidx, gk_h.index)]
-                        sGK_smem[(tidx, gk_h.index)] = cute.exp2(gk_raw)
+                        sGK_smem[(tidx, gk_h.index)] = cute.exp2(gk_raw, fastmath=self.use_fast_math)
                         # Step 2: Sync all 4 CUDA warps so all 128 scales are visible
                         self.gk_precompute_bar.arrive_and_wait()
                         # Step 3: Apply precomputed scales (SMEM read only, no exp2)
@@ -1784,7 +1788,7 @@ def reference_bf16_roundtrip(k, w, u, g=None, gk=None, h0=None, chunk_size=64):
 _delta_h_kernel_cache: dict = {}
 
 
-def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size):
+def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size, use_fast_math):
     """Compile one ChunkDeltaRuleFwdH kernel variant. Returns the compiled TVM-FFI callable.
 
     Uses make_fake_compact_tensor and make_fake_stream for compilation with
@@ -1802,6 +1806,7 @@ def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size):
         head_dim_v=V,
         is_varlen=is_varlen,
         persistent=persistent,
+        use_fast_math=use_fast_math,
     )
 
     sym_a = cute.sym_int()  # B (non-varlen) or T_total (varlen)
@@ -1967,9 +1972,9 @@ def _get_compiled_delta_h(is_varlen, persistent, H, K, V, chunk_size):
     where a subsequent cute.compile can invalidate previously compiled but
     not-yet-executed functions.
 
-    Cache key: (is_varlen, persistent, H, K, V, chunk_size)
+    Cache key: (is_varlen, persistent, H, K, V, chunk_size, USE_FAST_MATH)
     """
-    key = (is_varlen, persistent, H, K, V, chunk_size)
+    key = (is_varlen, persistent, H, K, V, chunk_size, USE_FAST_MATH)
     if key not in _delta_h_kernel_cache:
         _delta_h_kernel_cache[key] = _compile_delta_h_variant(
             is_varlen,
@@ -1978,6 +1983,7 @@ def _get_compiled_delta_h(is_varlen, persistent, H, K, V, chunk_size):
             K,
             V,
             chunk_size,
+            USE_FAST_MATH,
         )
     return _delta_h_kernel_cache[key]
 

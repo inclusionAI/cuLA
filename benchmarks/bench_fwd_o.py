@@ -38,6 +38,7 @@ With --ncu, warmup=1 and iters=1 for ncu profiling:
 
 import argparse
 import importlib
+import os
 import pathlib
 import sys
 
@@ -50,6 +51,7 @@ build_chunk_indices = _fwd_o_mod.build_chunk_indices
 
 # ─── FLA baseline imports ───
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 from fla.ops.gla.chunk import chunk_gla_fwd_o_gk  # noqa: E402
 
 # ============================================================

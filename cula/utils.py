@@ -6,12 +6,18 @@ Utility functions for cuLA debugging and development.
 """
 
 import functools
+import os
 from collections.abc import Callable
 
 import cutlass
 import torch
 from cutlass import cute
 from fla.utils import tensor_cache
+
+# ---------------------------------------------------------------------------
+# Fast-math flag (read once at import time)
+# ---------------------------------------------------------------------------
+USE_FAST_MATH: bool = os.getenv("CULA_USE_FAST_MATH", "1") == "1"
 
 # ---------------------------------------------------------------------------
 # Device architecture helpers

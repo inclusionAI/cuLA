@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import time
 
 import cutlass
@@ -26,6 +27,8 @@ from fla.ops.linear_attn.utils import normalize_output
 from fla.utils import assert_close, device
 
 from cula.ops.linear_attn import LinearAttentionChunkwise
+
+os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 
 PRINT_DEBUG = False
 
