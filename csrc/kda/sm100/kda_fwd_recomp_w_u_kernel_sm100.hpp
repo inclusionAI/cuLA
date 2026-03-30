@@ -8,9 +8,10 @@
 #include <cutlass/pipeline/pipeline.hpp>
 #include <cutlass/pipeline/sm100_pipeline.hpp>
 
-#include "kda_fwd_common.cuh"
-#include "kda_fwd_recomp_w_u_mainloop_sm100.hpp"
-#include <kerutils/kerutils.cuh>
+#include "kerutils/kerutils.cuh"
+
+#include "kda/sm100/kda_fwd_common.cuh"
+#include "kda/sm100/kda_fwd_recomp_w_u_mainloop_sm100.hpp"
 
 namespace kda::sm100 {
 
@@ -225,11 +226,13 @@ struct KdaChunkFwdRecompWUKernelSm100 {
         PipelineV v_pipeline(shared_plan->pipe_v_storage, v_pipe_params, ClusterShape{});
 
         // PipelineAsync pipelines (use true_type for barrier init)
-        PipelineBeta beta_pipeline(shared_plan->pipe_beta_storage, beta_pipe_params,
-                                   /*InitBarriers*/ cute::true_type{});
+        PipelineBeta beta_pipeline(
+            shared_plan->pipe_beta_storage,
+            beta_pipe_params,
+            /*InitBarriers*/ cute::true_type{});
 
-        PipelinePrologueReady prologue_ready_pipeline(shared_plan->pipe_prologue_ready_storage,
-                                                      prologue_ready_pipe_params, /*InitBarriers*/ cute::true_type{});
+        PipelinePrologueReady prologue_ready_pipeline(
+            shared_plan->pipe_prologue_ready_storage, prologue_ready_pipe_params, /*InitBarriers*/ cute::true_type{});
 
         PipelineAccDone acc_done_pipeline(shared_plan->pipe_acc_done_storage, acc_done_pipe_params, ClusterShape{});
 
@@ -264,45 +267,80 @@ struct KdaChunkFwdRecompWUKernelSm100 {
         if (role == WarpRole::Prologue) {
             // WG0 (warp 0-3, 128 threads): Element-wise K_proc/V_proc → signal MMA
             cutlass::arch::warpgroup_reg_alloc<NumPrologueRegs>();
-            mainloop.prologue_loop(params, tma_params, shared_plan, tile_scheduler,
-                                   // TMA pipelines (consumer): KG, V
-                                   kg_pipeline, kg_pipe_state_read, v_pipeline, v_pipe_state_read,
-                                   // Beta pipeline (consumer)
-                                   beta_pipeline, beta_pipe_state_read,
-                                   // Prologue -> MMA pipeline (producer)
-                                   prologue_ready_pipeline, prologue_ready_pipe_state_write);
+            mainloop.prologue_loop(
+                params,
+                tma_params,
+                shared_plan,
+                tile_scheduler,
+                // TMA pipelines (consumer): KG, V
+                kg_pipeline,
+                kg_pipe_state_read,
+                v_pipeline,
+                v_pipe_state_read,
+                // Beta pipeline (consumer)
+                beta_pipeline,
+                beta_pipe_state_read,
+                // Prologue -> MMA pipeline (producer)
+                prologue_ready_pipeline,
+                prologue_ready_pipe_state_write);
 
         } else if (role == WarpRole::Epilogue) {
             // WG1 (warp 4-7, 128 threads): kg element-wise + MMA result store w/u → GMEM
             cutlass::arch::warpgroup_reg_alloc<NumEpilogueRegs>();
-            mainloop.epilogue_loop(params, tma_params, shared_plan, tile_scheduler,
-                                   // TMA pipeline (consumer): KG (for kg computation)
-                                   kg_pipeline, kg_pipe_state_read,
-                                   // MMA -> Epilogue pipeline (consumer)
-                                   acc_done_pipeline, acc_done_pipe_state_read);
+            mainloop.epilogue_loop(
+                params,
+                tma_params,
+                shared_plan,
+                tile_scheduler,
+                // TMA pipeline (consumer): KG (for kg computation)
+                kg_pipeline,
+                kg_pipe_state_read,
+                // MMA -> Epilogue pipeline (consumer)
+                acc_done_pipeline,
+                acc_done_pipe_state_read);
 
         } else if (role == WarpRole::Mma) {
             cutlass::arch::warpgroup_reg_dealloc<NumLoadRegs>();
-            mainloop.mma_loop(params, tma_params, shared_plan, tile_scheduler,
-                              // Load -> MMA pipelines (consumer)
-                              a_pipeline, a_pipe_state_read,
-                              // Prologue -> MMA pipeline (consumer)
-                              prologue_ready_pipeline, prologue_ready_pipe_state_read,
-                              // MMA -> Epilogue pipeline (producer)
-                              acc_done_pipeline, acc_done_pipe_state_write);
+            mainloop.mma_loop(
+                params,
+                tma_params,
+                shared_plan,
+                tile_scheduler,
+                // Load -> MMA pipelines (consumer)
+                a_pipeline,
+                a_pipe_state_read,
+                // Prologue -> MMA pipeline (consumer)
+                prologue_ready_pipeline,
+                prologue_ready_pipe_state_read,
+                // MMA -> Epilogue pipeline (producer)
+                acc_done_pipeline,
+                acc_done_pipe_state_write);
 
         } else if (role == WarpRole::Load) {
             cutlass::arch::warpgroup_reg_dealloc<NumLoadRegs>();
-            mainloop.load_loop(params, tma_params, shared_plan, tile_scheduler,
-                               // TMA pipelines (producer)
-                               a_pipeline, a_pipe_state_write, kg_pipeline, kg_pipe_state_write, v_pipeline,
-                               v_pipe_state_write);
+            mainloop.load_loop(
+                params,
+                tma_params,
+                shared_plan,
+                tile_scheduler,
+                // TMA pipelines (producer)
+                a_pipeline,
+                a_pipe_state_write,
+                kg_pipeline,
+                kg_pipe_state_write,
+                v_pipeline,
+                v_pipe_state_write);
 
         } else if (role == WarpRole::LoadAux) {
             cutlass::arch::warpgroup_reg_dealloc<NumLoadRegs>();
-            mainloop.load_aux_loop(params, tma_params, shared_plan, tile_scheduler,
-                                   // Beta pipeline (producer)
-                                   beta_pipeline, beta_pipe_state_write);
+            mainloop.load_aux_loop(
+                params,
+                tma_params,
+                shared_plan,
+                tile_scheduler,
+                // Beta pipeline (producer)
+                beta_pipeline,
+                beta_pipe_state_write);
         }
 
         // === CLEANUP ===
@@ -323,9 +361,8 @@ using KdaChunkFwdRecompWUKernelSm100Default = KdaChunkFwdRecompWUKernelSm100<Kda
 // ===================================================================
 template <typename KernelT, typename TmaParamsT>
 __global__ void
-__launch_bounds__(384, 1, 1)
-    kda_fwd_recomp_w_u_sm100_kernel_entry(__grid_constant__ const KDA_fwd_recomp_w_u_params params,
-                                          __grid_constant__ const TmaParamsT tma_params) {
+__launch_bounds__(384, 1, 1) kda_fwd_recomp_w_u_sm100_kernel_entry(
+    __grid_constant__ const KDA_fwd_recomp_w_u_params params, __grid_constant__ const TmaParamsT tma_params) {
     KernelT kernel_obj;
     kernel_obj(params, tma_params);
 }
@@ -344,24 +381,33 @@ run_kda_fwd_recomp_w_u_sm100_impl(KDA_fwd_recomp_w_u_params& params, cudaStream_
 
     // --- Build TMA descriptors ---
     auto tma_V = cute::make_tma_copy(
-        SM90_TMA_LOAD{}, make_tensor(make_gmem_ptr((bf16*)params.v_ptr), make_layout(shape_KVG, stride_KVG)),
+        SM90_TMA_LOAD{},
+        make_tensor(make_gmem_ptr((bf16*)params.v_ptr), make_layout(shape_KVG, stride_KVG)),
         typename Kernel::SmemLayoutInputBF16{});
 
     auto tma_K = cute::make_tma_copy(
-        SM90_TMA_LOAD{}, make_tensor(make_gmem_ptr((bf16*)params.k_ptr), make_layout(shape_KVG, stride_KVG)),
+        SM90_TMA_LOAD{},
+        make_tensor(make_gmem_ptr((bf16*)params.k_ptr), make_layout(shape_KVG, stride_KVG)),
         typename Kernel::SmemLayoutInputBF16{});
 
     auto tma_G = cute::make_tma_copy(
-        SM90_TMA_LOAD{}, make_tensor(make_gmem_ptr((float*)params.g_ptr), make_layout(shape_KVG, stride_KVG)),
+        SM90_TMA_LOAD{},
+        make_tensor(make_gmem_ptr((float*)params.g_ptr), make_layout(shape_KVG, stride_KVG)),
         typename Kernel::SmemLayoutInputFP32{});
 
     auto tma_Akk = cute::make_tma_copy(
-        SM90_TMA_LOAD{}, make_tensor(make_gmem_ptr((bf16*)params.A_ptr), make_layout(shape_Akk, stride_Akk)),
+        SM90_TMA_LOAD{},
+        make_tensor(make_gmem_ptr((bf16*)params.A_ptr), make_layout(shape_Akk, stride_Akk)),
         typename Kernel::SmemLayoutInputAkkBF16{});
 
     // --- Pack TMA params ---
-    typename Kernel::template TmaParams<decltype(shape_KVG), decltype(shape_Akk), decltype(tma_V), decltype(tma_K),
-                                        decltype(tma_G), decltype(tma_Akk)>
+    typename Kernel::template TmaParams<
+        decltype(shape_KVG),
+        decltype(shape_Akk),
+        decltype(tma_V),
+        decltype(tma_K),
+        decltype(tma_G),
+        decltype(tma_Akk)>
         tma_params = {shape_KVG, shape_Akk, tma_V, tma_K, tma_G, tma_Akk};
 
     // --- Launch config ---

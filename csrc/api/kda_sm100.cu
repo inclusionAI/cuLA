@@ -12,27 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "cutlass/cutlass.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cutlass/cutlass.h>
 #include <torch/python.h>
 
 #include "kda/sm100/kda_fwd_common.cuh"
 
 void
-ChunkKDAFwdIntra(at::Tensor q,
-                 at::Tensor k,
-                 at::Tensor g,
-                 at::Tensor beta,
-                 at::Tensor cu_seqlens,
-                 at::Tensor chunk_indices,
-                 at::Tensor Aqk_out,
-                 at::Tensor Akk_out,
-                 at::Tensor tile_counter,
-                 float scale,
-                 int chunk_size,
-                 bool use_tf32_inverse,
-                 bool unified_gref) {
+ChunkKDAFwdIntra(
+    at::Tensor q,
+    at::Tensor k,
+    at::Tensor g,
+    at::Tensor beta,
+    at::Tensor cu_seqlens,
+    at::Tensor chunk_indices,
+    at::Tensor Aqk_out,
+    at::Tensor Akk_out,
+    at::Tensor tile_counter,
+    float scale,
+    int chunk_size,
+    bool use_tf32_inverse,
+    bool unified_gref) {
     KDA_fwd_intra_params params;
     params.total_q_len = q.size(0) * q.size(1);
     params.b = cu_seqlens.size(0) - 1;
@@ -62,17 +63,18 @@ ChunkKDAFwdIntra(at::Tensor q,
 }
 
 void
-ChunkKDAFwdRecompWU(at::Tensor k,
-                    at::Tensor v,
-                    at::Tensor beta,
-                    at::Tensor A,
-                    at::Tensor g,
-                    at::Tensor cu_seqlens,
-                    at::Tensor chunk_indices,
-                    at::Tensor w_out,
-                    at::Tensor u_out,
-                    at::Tensor kg_out,
-                    int chunk_size) {
+ChunkKDAFwdRecompWU(
+    at::Tensor k,
+    at::Tensor v,
+    at::Tensor beta,
+    at::Tensor A,
+    at::Tensor g,
+    at::Tensor cu_seqlens,
+    at::Tensor chunk_indices,
+    at::Tensor w_out,
+    at::Tensor u_out,
+    at::Tensor kg_out,
+    int chunk_size) {
     KDA_fwd_recomp_w_u_params params;
     params.total_len = k.size(0) * k.size(1);
     params.b = cu_seqlens.size(0) - 1;

@@ -14,10 +14,10 @@
 
 #pragma once
 
-#include "cutlass/arch/arch.h"
-#include "cutlass/arch/reg_reconfig.h"
-#include "cutlass/cutlass.h"
-#include "cutlass/pipeline/pipeline.hpp"
+#include <cutlass/arch/arch.h>
+#include <cutlass/arch/reg_reconfig.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/pipeline/pipeline.hpp>
 
 #include "kda/sm90/kernel/options.hpp"
 #include "kda/sm90/utils/common.hpp"
@@ -34,9 +34,10 @@ round_down(T1 a, T2 b) {
 }
 
 constexpr std::tuple<uint32_t, uint32_t, uint32_t>
-get_register_requirements(uint32_t max_threads_per_block,
-                          uint32_t min_blocks_per_multiprocessor,
-                          uint32_t num_state_mma_warp_groups  // state related mma
+get_register_requirements(
+    uint32_t max_threads_per_block,
+    uint32_t min_blocks_per_multiprocessor,
+    uint32_t num_state_mma_warp_groups  // state related mma
 ) {
     uint32_t reg_alloc_granularity = 8;
 
@@ -52,8 +53,8 @@ get_register_requirements(uint32_t max_threads_per_block,
     uint32_t total_registers =
         round_down(64 * 1024 / min_blocks_per_multiprocessor, max_threads_per_block * reg_alloc_granularity) /
         cutlass::NumThreadsPerWarpGroup;
-    uint32_t mma_registers = round_down((total_registers - load_registers - aux_registers) / num_state_mma_warp_groups,
-                                        reg_alloc_granularity);
+    uint32_t mma_registers = round_down(
+        (total_registers - load_registers - aux_registers) / num_state_mma_warp_groups, reg_alloc_granularity);
 
     // max reg is 255, 248 round to multiple of reg_alloc_granularity;
     return {cute::min(248, load_registers), cute::min(248, mma_registers), cute::min(248, aux_registers)};
@@ -220,7 +221,8 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
     static Params
     to_underlying_arguments(Arguments const& args, void* workspace) {
         return Params{
-            args.problem_size, CollectiveMainloop::to_underlying_arguments(args.problem_size, args.mainloop, workspace),
+            args.problem_size,
+            CollectiveMainloop::to_underlying_arguments(args.problem_size, args.mainloop, workspace),
             TileScheduler::to_underlying_arguments(args.problem_size, args.hw_info, ClusterShape{}, TileShape{})};
     }
 
@@ -380,18 +382,26 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
         MainloopAlphaPipeline alpha_pipeline(storage.alpha_pipeline_storage, alpha_pipeline_params, ClusterShape{});
         MainloopOPipeline o_pipeline(storage.o_pipeline_storage, o_pipeline_params, /*InitBarriers=*/cute::true_type{});
 
-        MainloopAlphaLastPipeline alpha_last_pipeline(storage.alpha_last_pipeline_storage, alpha_last_pipeline_params,
-                                                      /*InitBarriers=*/cute::true_type{});
+        MainloopAlphaLastPipeline alpha_last_pipeline(
+            storage.alpha_last_pipeline_storage,
+            alpha_last_pipeline_params,
+            /*InitBarriers=*/cute::true_type{});
 
-        MainloopQKPipeline qk_pipeline(storage.qk_pipeline_storage, qk_pipeline_params,
-                                       /*InitBarriers=*/cute::true_type{});
-        MainloopKKPipeline kk_pipeline(storage.kk_pipeline_storage, kk_pipeline_params,
-                                       /*InitBarriers=*/cute::true_type{});
+        MainloopQKPipeline qk_pipeline(
+            storage.qk_pipeline_storage,
+            qk_pipeline_params,
+            /*InitBarriers=*/cute::true_type{});
+        MainloopKKPipeline kk_pipeline(
+            storage.kk_pipeline_storage,
+            kk_pipeline_params,
+            /*InitBarriers=*/cute::true_type{});
 
         // MainloopAlphaPipeline alpha_pipeline(storage.alpha_pipeline_storage, alpha_pipeline_params,
         // /*InitBarriers=*/cute::true_type{});
-        MainloopBetaPipeline beta_pipeline(storage.beta_pipeline_storage, beta_pipeline_params,
-                                           /*InitBarriers=*/cute::true_type{});
+        MainloopBetaPipeline beta_pipeline(
+            storage.beta_pipeline_storage,
+            beta_pipeline_params,
+            /*InitBarriers=*/cute::true_type{});
 
         QPipelineState q_smem_pipe_read;
         QPipelineState q_smem_pipe_write = cutlass::make_producer_start_state<MainloopQPipeline>();
@@ -443,14 +453,28 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
                 CUTE_NO_UNROLL
                 for (; work_desc.is_valid(params.scheduler);
                      work_desc = scheduler.get_next_work(params.scheduler, params.problem_size)) {
-                    DPRINTF0_WG("LsSt working on LoadQ/K/V, seq_idx:%d, q/k/v_head_idx:(%d,%d,%d), seq_len:%lld)\n",
-                                work_desc.seq_idx, work_desc.q_head_idx(), work_desc.k_head_idx(),
-                                work_desc.v_head_idx(), work_desc.seq_len);
+                    DPRINTF0_WG(
+                        "LsSt working on LoadQ/K/V, seq_idx:%d, q/k/v_head_idx:(%d,%d,%d), seq_len:%lld)\n",
+                        work_desc.seq_idx,
+                        work_desc.q_head_idx(),
+                        work_desc.k_head_idx(),
+                        work_desc.v_head_idx(),
+                        work_desc.seq_len);
                     auto tile_shape = typename CollectiveMainloop::TileShape{};
-                    collective_mainloop.load_qkv(params.mainloop, params.problem_size, tile_shape, work_desc,
-                                                 q_pipeline, q_smem_pipe_write, k_pipeline, k_smem_pipe_write,
-                                                 v_pipeline, v_smem_pipe_write, alpha_pipeline, alpha_smem_pipe_write,
-                                                 storage.tensors.mainloop);
+                    collective_mainloop.load_qkv(
+                        params.mainloop,
+                        params.problem_size,
+                        tile_shape,
+                        work_desc,
+                        q_pipeline,
+                        q_smem_pipe_write,
+                        k_pipeline,
+                        k_smem_pipe_write,
+                        v_pipeline,
+                        v_smem_pipe_write,
+                        alpha_pipeline,
+                        alpha_smem_pipe_write,
+                        storage.tensors.mainloop);
                 }
             } else if (ldst_warp_role == LdStWarpRole::LoadBeta) {
                 if constexpr (NeedsBeta) {
@@ -458,11 +482,20 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
                     CUTE_NO_UNROLL
                     for (; work_desc.is_valid(params.scheduler);
                          work_desc = scheduler.get_next_work(params.scheduler, params.problem_size)) {
-                        DPRINTF0_WG("LsSt working on LoadBeta, seq_idx:%d, sab_head_idx:%d, seq_len:%lld)\n",
-                                    work_desc.seq_idx, work_desc.o_head_idx(), work_desc.seq_len);
+                        DPRINTF0_WG(
+                            "LsSt working on LoadBeta, seq_idx:%d, sab_head_idx:%d, seq_len:%lld)\n",
+                            work_desc.seq_idx,
+                            work_desc.o_head_idx(),
+                            work_desc.seq_len);
                         auto tile_shape = typename CollectiveMainloop::TileShape{};
-                        collective_mainloop.load_beta(params.mainloop, params.problem_size, tile_shape, work_desc,
-                                                      beta_pipeline, beta_smem_pipe_write, storage.tensors.mainloop);
+                        collective_mainloop.load_beta(
+                            params.mainloop,
+                            params.problem_size,
+                            tile_shape,
+                            work_desc,
+                            beta_pipeline,
+                            beta_smem_pipe_write,
+                            storage.tensors.mainloop);
                     }
                 }
             } else if (ldst_warp_role == LdStWarpRole::LoadAlpha) {
@@ -474,57 +507,118 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
                          work_desc = scheduler.get_next_work(params.scheduler, params.problem_size)) {
                         DPRINTF0_WG(
                             "LsSt working on LoadAlpha+ExtractLast, seq_idx:%d, sab_head_idx:%d, seq_len:%lld)\n",
-                            work_desc.seq_idx, work_desc.o_head_idx(), work_desc.seq_len);
+                            work_desc.seq_idx,
+                            work_desc.o_head_idx(),
+                            work_desc.seq_len);
                         auto tile_shape = typename CollectiveMainloop::TileShape{};
-                        collective_mainloop.extract_alpha_last(params.mainloop, params.problem_size, tile_shape,
-                                                               work_desc, alpha_pipeline, alpha_smem_pipe_read,
-                                                               alpha_last_pipeline, alpha_last_smem_pipe_write,
-                                                               storage.tensors.mainloop);
+                        collective_mainloop.extract_alpha_last(
+                            params.mainloop,
+                            params.problem_size,
+                            tile_shape,
+                            work_desc,
+                            alpha_pipeline,
+                            alpha_smem_pipe_read,
+                            alpha_last_pipeline,
+                            alpha_last_smem_pipe_write,
+                            storage.tensors.mainloop);
                     }
                 }
             } else if (ldst_warp_role == LdStWarpRole::StoreO) {
                 auto work_desc = scheduler.get_next_work(params.scheduler, params.problem_size);
-                DPRINTF0_WG("LsSt working on StoreO, seq_idx:%d, o_head_idx:%d, seq_len:%lld)\n", work_desc.seq_idx,
-                            work_desc.o_head_idx(), work_desc.seq_len);
+                DPRINTF0_WG(
+                    "LsSt working on StoreO, seq_idx:%d, o_head_idx:%d, seq_len:%lld)\n",
+                    work_desc.seq_idx,
+                    work_desc.o_head_idx(),
+                    work_desc.seq_len);
                 auto tile_shape = typename CollectiveMainloop::TileShape{};
-                collective_mainloop.store(params.mainloop.tma_store_o, params.mainloop.tensormaps, params.problem_size,
-                                          tile_shape, work_desc, o_pipeline, o_smem_pipe_read,
-                                          storage.tensors.mainloop.smem_o);
+                collective_mainloop.store(
+                    params.mainloop.tma_store_o,
+                    params.mainloop.tensormaps,
+                    params.problem_size,
+                    tile_shape,
+                    work_desc,
+                    o_pipeline,
+                    o_smem_pipe_read,
+                    storage.tensors.mainloop.smem_o);
             }
         } else if (warp_group_role == WarpGroupRole::Math0 || warp_group_role == WarpGroupRole::Math1) {
-            DPRINTF0_WG("Compute[state]: warp_group_idx:%d, RegisterRequirement:%d\n", warp_group_idx,
-                        StateMmaRegisterRequirement);
+            DPRINTF0_WG(
+                "Compute[state]: warp_group_idx:%d, RegisterRequirement:%d\n",
+                warp_group_idx,
+                StateMmaRegisterRequirement);
             cutlass::arch::warpgroup_reg_alloc<StateMmaRegisterRequirement>();
             auto work_desc = scheduler.get_next_work(params.scheduler, params.problem_size);
             CUTE_NO_UNROLL
             for (; work_desc.is_valid(params.scheduler);
                  work_desc = scheduler.get_next_work(params.scheduler, params.problem_size)) {
-                DPRINTF0_WG("Compute[state]: seq_idx:%d, qk/v/o_head_idx:(%d,%d,%d,%d), seq_len:%lld)\n",
-                            work_desc.seq_idx, work_desc.q_head_idx(), work_desc.k_head_idx(), work_desc.v_head_idx(),
-                            work_desc.o_head_idx(), work_desc.seq_len);
+                DPRINTF0_WG(
+                    "Compute[state]: seq_idx:%d, qk/v/o_head_idx:(%d,%d,%d,%d), seq_len:%lld)\n",
+                    work_desc.seq_idx,
+                    work_desc.q_head_idx(),
+                    work_desc.k_head_idx(),
+                    work_desc.v_head_idx(),
+                    work_desc.o_head_idx(),
+                    work_desc.seq_len);
                 collective_mainloop.compute(
-                    params.mainloop, params.problem_size, work_desc, q_pipeline, q_smem_pipe_read, k_pipeline,
-                    k_smem_pipe_read, v_pipeline, v_smem_pipe_read, o_pipeline, o_smem_pipe_write, qk_pipeline,
-                    qk_smem_pipe_read, kk_pipeline, kk_smem_pipe_read, alpha_pipeline, alpha_smem_pipe_read,
-                    beta_pipeline, beta_smem_pipe_read, alpha_last_pipeline, alpha_last_smem_pipe_read, math_barriers,
+                    params.mainloop,
+                    params.problem_size,
+                    work_desc,
+                    q_pipeline,
+                    q_smem_pipe_read,
+                    k_pipeline,
+                    k_smem_pipe_read,
+                    v_pipeline,
+                    v_smem_pipe_read,
+                    o_pipeline,
+                    o_smem_pipe_write,
+                    qk_pipeline,
+                    qk_smem_pipe_read,
+                    kk_pipeline,
+                    kk_smem_pipe_read,
+                    alpha_pipeline,
+                    alpha_smem_pipe_read,
+                    beta_pipeline,
+                    beta_smem_pipe_read,
+                    alpha_last_pipeline,
+                    alpha_last_smem_pipe_read,
+                    math_barriers,
                     storage.tensors.mainloop);
             }
         } else if (warp_group_role == WarpGroupRole::MathA) {
-            DPRINTF0_WG("Compute[aux]: warp_group_idx:%d, RegisterRequirement:%d\n", warp_group_idx,
-                        AuxMmaRegisterRequirement);
+            DPRINTF0_WG(
+                "Compute[aux]: warp_group_idx:%d, RegisterRequirement:%d\n", warp_group_idx, AuxMmaRegisterRequirement);
             cutlass::arch::warpgroup_reg_alloc<AuxMmaRegisterRequirement>();
             auto work_desc = scheduler.get_next_work(params.scheduler, params.problem_size);
             CUTE_NO_UNROLL
             for (; work_desc.is_valid(params.scheduler);
                  work_desc = scheduler.get_next_work(params.scheduler, params.problem_size)) {
-                DPRINTF0_WG("Compute[aux]: seq_idx:%d, qk/v/o_head_idx:(%d,%d,%d,%d), seq_len:%lld)\n",
-                            work_desc.seq_idx, work_desc.q_head_idx(), work_desc.k_head_idx(), work_desc.v_head_idx(),
-                            work_desc.o_head_idx(), work_desc.seq_len);
+                DPRINTF0_WG(
+                    "Compute[aux]: seq_idx:%d, qk/v/o_head_idx:(%d,%d,%d,%d), seq_len:%lld)\n",
+                    work_desc.seq_idx,
+                    work_desc.q_head_idx(),
+                    work_desc.k_head_idx(),
+                    work_desc.v_head_idx(),
+                    work_desc.o_head_idx(),
+                    work_desc.seq_len);
                 collective_mainloop.compute_aux_safe(
-                    params.mainloop, params.problem_size, work_desc, q_pipeline, q_smem_pipe_read, k_pipeline,
-                    k_smem_pipe_read, qk_pipeline, qk_smem_pipe_write, kk_pipeline, kk_smem_pipe_write, alpha_pipeline,
-                    alpha_smem_pipe_read, beta_pipeline, beta_smem_pipe_read, alpha_last_pipeline,
-                    alpha_last_smem_pipe_write, storage.tensors.mainloop);
+                    params.mainloop,
+                    params.problem_size,
+                    work_desc,
+                    q_pipeline,
+                    q_smem_pipe_read,
+                    k_pipeline,
+                    k_smem_pipe_read,
+                    qk_pipeline,
+                    qk_smem_pipe_write,
+                    kk_pipeline,
+                    kk_smem_pipe_write,
+                    alpha_pipeline,
+                    alpha_smem_pipe_read,
+                    beta_pipeline,
+                    beta_smem_pipe_read,
+                    alpha_last_pipeline,
+                    alpha_last_smem_pipe_write,
+                    storage.tensors.mainloop);
             }
         } else {
             DPRINTF0_WG("Unknown warp role, warp_group_idx:%d\n", warp_group_idx);

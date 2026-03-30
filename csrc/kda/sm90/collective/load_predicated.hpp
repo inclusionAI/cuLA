@@ -30,9 +30,9 @@
 
 #pragma once
 
-#include "cute/tensor.hpp"
-#include "cutlass/cutlass.h"
-#include "cutlass/pipeline/sm90_pipeline.hpp"
+#include <cute/tensor.hpp>
+#include <cutlass/cutlass.h>
+#include <cutlass/pipeline/sm90_pipeline.hpp>
 
 #include "kda/sm90/utils/unused.hpp"
 
@@ -71,13 +71,14 @@ to_string(LoadKindVector kind) {
     }
 }
 
-template <LoadKindVector kKind,
-          class Pipeline,
-          class ElementSrc,
-          class GmemLayout,
-          class ElementDst,
-          class SmemLayout,
-          class VectorProcessor_ = Unused>
+template <
+    LoadKindVector kKind,
+    class Pipeline,
+    class ElementSrc,
+    class GmemLayout,
+    class ElementDst,
+    class SmemLayout,
+    class VectorProcessor_ = Unused>
 struct CollectiveLoadVector {
     using SharedStorage = cute::array_aligned<ElementDst, cute::cosize_v<SmemLayout>>;
     using PipelineState = typename cutlass::PipelineState<Pipeline::Stages>;
@@ -102,8 +103,12 @@ struct CollectiveLoadVector {
 
         Tensor g = [&] {
             auto head_idx = work_desc.o_head_idx();
-            DPRINTF0_W("slice view GMEM %s: seq_idx:%d head_idx:%d tok_offset:%lld\n", to_string(kind),
-                       work_desc.seq_idx, head_idx, work_desc.tok_offset);
+            DPRINTF0_W(
+                "slice view GMEM %s: seq_idx:%d head_idx:%d tok_offset:%lld\n",
+                to_string(kind),
+                work_desc.seq_idx,
+                head_idx,
+                work_desc.tok_offset);
             Tensor m_varlen_head = make_tensor(make_gmem_ptr(src_), src_layout_);
 
             Tensor m_varlen = m_varlen_head(_, head_idx);  // slice into current head_idx

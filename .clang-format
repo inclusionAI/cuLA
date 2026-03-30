@@ -22,10 +22,10 @@ DerivePointerAlignment: false
 # 头文件排序增强逻辑
 SortIncludes: true
 IncludeCategories:
-  - Regex: '^<[^/.]+(.h)?$>'        # 标准库 (如 <vector>, <stdio.h>)
-    Priority: 1
-  - Regex: '^<cuda|^<nv'            # CUDA/NVIDIA 相关
+  - Regex: '^<cuda|^<nv'            # CUDA/NVIDIA 相关 (must match before std lib)
     Priority: 2
+  - Regex: '^<[^/.]+(\.h)?>$'       # 标准库 (如 <vector>, <stdio.h>)
+    Priority: 1
   - Regex: '^[<"](cutlass|cute|ATen|c10|torch)/' # 核心大库
     Priority: 3
   - Regex: '^"kerutils/'            # 内部公共库
@@ -34,9 +34,12 @@ IncludeCategories:
     Priority: 5
 IncludeIsMainRegex: '([-_](test|unittest))?$'
 
-# 针对复杂参数的建议（可选）
+# 当参数换行时，不要对齐到左括号，而是换行并缩进
+AlignAfterOpenBracket: AlwaysBreak
+
+# 既然参数这么多，强制每个参数占用一行（关闭装箱）
 BinPackParameters: false
-BinPackArguments: true
+BinPackArguments: false
 
 # 顶层函数定义的返回类型单独放一行
 AlwaysBreakAfterReturnType: All

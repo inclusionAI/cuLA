@@ -32,11 +32,11 @@
 
 #include <cuda/ptx>
 
-#include "cute/tensor.hpp"
-#include "cutlass/cutlass.h"
-#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include <cute/tensor.hpp>
+#include <cutlass/cutlass.h>
+#include <cutlass/epilogue/collective/collective_builder.hpp>
 
-#include <kerutils/kerutils.cuh>
+#include "kerutils/kerutils.cuh"
 
 namespace kda::sm90::collective {
 
@@ -69,13 +69,14 @@ smid() {
 #endif
 }
 
-template <typename TileShape_MNK_,
-          typename ClusterShape,
-          typename ElementO,
-          typename ElementAccumulator,
-          typename SmemElementO,
-          typename StrideO,
-          int Stages>
+template <
+    typename TileShape_MNK_,
+    typename ClusterShape,
+    typename ElementO,
+    typename ElementAccumulator,
+    typename SmemElementO,
+    typename StrideO,
+    int Stages>
 struct CollectiveStoreTma {
     static_assert(size_v<ClusterShape> == 1);
     using TileShape_MNK = TileShape_MNK_;
@@ -95,10 +96,10 @@ struct CollectiveStoreTma {
     using SmemLayoutAtom = GMMA::Layout_MN_SW32_Atom<SmemElementO>;
 #endif
 
-    using SmemLayoutO =
-        decltype(tile_to_shape(SmemLayoutAtom{},
-                               make_shape(SizeM{}, SizeN{}, Int<Stages>{}),
-                               cute::conditional_t<is_m_major_O, Step<_2, _1, _3>, Step<_1, _2, _3>>{}));
+    using SmemLayoutO = decltype(tile_to_shape(
+        SmemLayoutAtom{},
+        make_shape(SizeM{}, SizeN{}, Int<Stages>{}),
+        cute::conditional_t<is_m_major_O, Step<_2, _1, _3>, Step<_1, _2, _3>>{}));
 
     constexpr static uint32_t TmaTransactionBytes =
         (size(take<0, 2>(SmemLayoutO{})) * static_cast<uint32_t>(sizeof_bits<SmemElementO>::value)) / 8;
@@ -165,9 +166,10 @@ struct CollectiveStoreTma {
 
     template <class ProblemShape>
     static cutlass::Status
-    initialize_workspace(ProblemShape const& problem_shape,
-                         /*Arguments const& args,*/ void* workspace,
-                         cudaStream_t stream) {
+    initialize_workspace(
+        ProblemShape const& problem_shape,
+        /*Arguments const& args,*/ void* workspace,
+        cudaStream_t stream) {
         return cutlass::Status::kSuccess;
     }
 
@@ -183,14 +185,19 @@ struct CollectiveStoreTma {
         constexpr auto HeadSize = decltype(get<2>(tile_shape))::value;
 
         Tensor g = [&] {
-            DPRINTF0_W("slice view GMEM O: seq_idx:%d head_idx:%d tok_offset:%lld\n", work_desc.seq_idx,
-                       work_desc.o_head_idx(), work_desc.tok_offset);
-            Tensor m_varlen_head = tma_store_.get_tma_tensor(
-                make_shape(problem_size.head_size, problem_size.total_seqlen,
-                           problem_size.num_heads));                        // global view to the packed varlen sequence
+            DPRINTF0_W(
+                "slice view GMEM O: seq_idx:%d head_idx:%d tok_offset:%lld\n",
+                work_desc.seq_idx,
+                work_desc.o_head_idx(),
+                work_desc.tok_offset);
+            Tensor m_varlen_head = tma_store_.get_tma_tensor(make_shape(
+                problem_size.head_size,
+                problem_size.total_seqlen,
+                problem_size.num_heads));                                   // global view to the packed varlen sequence
             Tensor m_varlen = m_varlen_head(_, _, work_desc.o_head_idx());  // slice into current head_idx
-            Tensor m_offset = domain_offset(make_coord(_0{}, work_desc.tok_offset),
-                                            m_varlen);  // offset to start of the current sequence
+            Tensor m_offset = domain_offset(
+                make_coord(_0{}, work_desc.tok_offset),
+                m_varlen);  // offset to start of the current sequence
             Tensor g_full =
                 local_tile(m_offset, make_tile(HeadSize, BlkSeqQ), make_coord(_0{}, _));  // (d, blk, iter_blk)
             return g_full;
@@ -218,13 +225,14 @@ struct CollectiveStoreTma {
 
     template <bool kAcquireBarrier = true, typename ProblemSize, typename WorkDesc, typename SrcDst>
     CUTE_DEVICE void
-    step(ProblemSize const& problem_size,
-         WorkDesc const& work_desc,
-         SrcDst const& src_dst,
-         PipelineState& src_pipe,
-         int dst_iter,
-         int num_iters,
-         uint32_t lane_predicate) {
+    step(
+        ProblemSize const& problem_size,
+        WorkDesc const& work_desc,
+        SrcDst const& src_dst,
+        PipelineState& src_pipe,
+        int dst_iter,
+        int num_iters,
+        uint32_t lane_predicate) {
         auto src = get<0>(src_dst);
         auto dst = get<1>(src_dst);
 

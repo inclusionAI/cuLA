@@ -30,9 +30,9 @@
 
 #pragma once
 
-#include "cutlass/numeric_types.h"
-
 #include <type_traits>
+
+#include <cutlass/numeric_types.h>
 
 namespace kda::sm90 {
 

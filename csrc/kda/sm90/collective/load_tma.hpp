@@ -30,9 +30,9 @@
 
 #pragma once
 
-#include "cute/tensor.hpp"
-#include "cutlass/cutlass.h"
-#include "cutlass/pipeline/sm90_pipeline.hpp"
+#include <cute/tensor.hpp>
+#include <cutlass/cutlass.h>
+#include <cutlass/pipeline/sm90_pipeline.hpp>
 
 namespace kda::sm90::collective {
 
@@ -84,39 +84,57 @@ struct CollectiveLoadTma {
 
         Tensor g = [&] {
             if constexpr (kind == LoadKind::kQ) {
-                DPRINTF0_W("slice view GMEM %s: seq_idx:%d head_idx:%d tok_offset:%lld\n", to_string(kind),
-                           work_desc.seq_idx, work_desc.q_head_idx(), work_desc.tok_offset);
-                Tensor m_varlen_head = tma_load.get_tma_tensor(
-                    make_shape(problem_size.total_seqlen, problem_size.head_size,
-                               problem_size.num_heads));  // global view to the packed varlen sequence
+                DPRINTF0_W(
+                    "slice view GMEM %s: seq_idx:%d head_idx:%d tok_offset:%lld\n",
+                    to_string(kind),
+                    work_desc.seq_idx,
+                    work_desc.q_head_idx(),
+                    work_desc.tok_offset);
+                Tensor m_varlen_head = tma_load.get_tma_tensor(make_shape(
+                    problem_size.total_seqlen,
+                    problem_size.head_size,
+                    problem_size.num_heads));  // global view to the packed varlen sequence
                 Tensor m_varlen = m_varlen_head(_, _, work_desc.q_head_idx());  // slice into current head_idx
-                Tensor m_offset = domain_offset(make_coord(work_desc.tok_offset, _0{}),
-                                                m_varlen);  // offset to start of the current sequence
+                Tensor m_offset = domain_offset(
+                    make_coord(work_desc.tok_offset, _0{}),
+                    m_varlen);  // offset to start of the current sequence
                 Tensor g_full =
                     local_tile(m_offset, make_tile(BlkSeqQ, HeadSize), make_coord(_, _0{}));  // (blk, d, iter_blk)
                 return g_full;
             } else if constexpr (kind == LoadKind::kAlpha) {  // same as Q currently
-                DPRINTF0_W("slice view GMEM %s: seq_idx:%d head_idx:%d tok_offset:%lld\n", to_string(kind),
-                           work_desc.seq_idx, work_desc.q_head_idx(), work_desc.tok_offset);
-                Tensor m_varlen_head = tma_load.get_tma_tensor(
-                    make_shape(problem_size.total_seqlen, problem_size.head_size,
-                               problem_size.num_heads));  // global view to the packed varlen sequence
+                DPRINTF0_W(
+                    "slice view GMEM %s: seq_idx:%d head_idx:%d tok_offset:%lld\n",
+                    to_string(kind),
+                    work_desc.seq_idx,
+                    work_desc.q_head_idx(),
+                    work_desc.tok_offset);
+                Tensor m_varlen_head = tma_load.get_tma_tensor(make_shape(
+                    problem_size.total_seqlen,
+                    problem_size.head_size,
+                    problem_size.num_heads));  // global view to the packed varlen sequence
                 Tensor m_varlen = m_varlen_head(_, _, work_desc.q_head_idx());  // slice into current head_idx
-                Tensor m_offset = domain_offset(make_coord(work_desc.tok_offset, _0{}),
-                                                m_varlen);  // offset to start of the current sequence
+                Tensor m_offset = domain_offset(
+                    make_coord(work_desc.tok_offset, _0{}),
+                    m_varlen);  // offset to start of the current sequence
                 Tensor g_full =
                     local_tile(m_offset, make_tile(BlkSeqQ, HeadSize), make_coord(_, _0{}));  // (blk, d, iter_blk)
                 return g_full;
             } else {
                 auto head_idx = (kind == LoadKind::kK ? work_desc.k_head_idx() : work_desc.v_head_idx());
-                DPRINTF0_W("slice view GMEM %s: seq_idx:%d head_idx:%d tok_offset:%lld\n", to_string(kind),
-                           work_desc.seq_idx, head_idx, work_desc.tok_offset);
-                Tensor m_varlen_head = tma_load.get_tma_tensor(
-                    make_shape(problem_size.head_size, problem_size.total_seqlen,
-                               problem_size.num_heads));          // global view to the packed varlen sequence
+                DPRINTF0_W(
+                    "slice view GMEM %s: seq_idx:%d head_idx:%d tok_offset:%lld\n",
+                    to_string(kind),
+                    work_desc.seq_idx,
+                    head_idx,
+                    work_desc.tok_offset);
+                Tensor m_varlen_head = tma_load.get_tma_tensor(make_shape(
+                    problem_size.head_size,
+                    problem_size.total_seqlen,
+                    problem_size.num_heads));                     // global view to the packed varlen sequence
                 Tensor m_varlen = m_varlen_head(_, _, head_idx);  // slice into current head_idx
-                Tensor m_offset = domain_offset(make_coord(_0{}, work_desc.tok_offset),
-                                                m_varlen);  // offset to start of the current sequence
+                Tensor m_offset = domain_offset(
+                    make_coord(_0{}, work_desc.tok_offset),
+                    m_varlen);  // offset to start of the current sequence
                 Tensor g_full =
                     local_tile(m_offset, make_tile(HeadSize, BlkSeqKV), make_coord(_0{}, _));  // (d, blk, iter_blk)
                 return g_full;

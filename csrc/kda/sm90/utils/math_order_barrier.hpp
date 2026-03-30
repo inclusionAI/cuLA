@@ -30,15 +30,16 @@
 
 #pragma once
 
-#include "cutlass/arch/barrier.h"
-#include "cutlass/cutlass.h"
+#include <cutlass/arch/barrier.h>
+#include <cutlass/cutlass.h>
 
 namespace kda::sm90 {
 
 // cutlass' OrderedSequenceBarrier uses mbarrier
-template <bool UseReservedNB_,           // treat nb_id as cutlass::ReservedNamedBarriers
-          uint32_t... WGIdToNBIdMapping  // say 6,4 is passed, means wg0 use nb6 and wg1 use nb4
-          >
+template <
+    bool UseReservedNB_,           // treat nb_id as cutlass::ReservedNamedBarriers
+    uint32_t... WGIdToNBIdMapping  // say 6,4 is passed, means wg0 use nb6 and wg1 use nb4
+    >
 struct OrderedNamedBarriers {
     static constexpr bool UseReservedNB = UseReservedNB_;
     static constexpr int NumWG = sizeof...(WGIdToNBIdMapping);
@@ -89,8 +90,8 @@ struct OrderedNamedBarriers {
         // 2:(1,3)
         CUTE_UNROLL
         for (int i = 1; i < NumWG; ++i) {
-            cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup * NumWG,
-                                                mapping_[(wg_idx + i) % NumWG]);
+            cutlass::arch::NamedBarrier::arrive(
+                cutlass::NumThreadsPerWarpGroup * NumWG, mapping_[(wg_idx + i) % NumWG]);
         }
         // after wg0 called this function
         // 0:(0,3), wg0 has not reached on second ordered_or_wait() or (1,3) wg0 wait on second ordered_or_wait() call

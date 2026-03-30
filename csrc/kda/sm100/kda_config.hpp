@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include "tile_scheduler.hpp"
+#include "kda/sm100/tile_scheduler.hpp"
 
 struct KDA_fwd_intra_params {
     using GmemShapeAkk = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_kv, seqlen_kv, h)

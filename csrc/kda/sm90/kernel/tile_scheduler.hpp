@@ -14,9 +14,9 @@
 
 #pragma once
 
-#include "cutlass/cutlass.h"
-#include "cutlass/fast_math.h"
-#include "cutlass/kernel_hardware_info.h"
+#include <cutlass/cutlass.h>
+#include <cutlass/fast_math.h>
+#include <cutlass/kernel_hardware_info.h>
 
 namespace kda::sm90::kernel {
 
@@ -79,14 +79,20 @@ struct IndividualTileScheduler {
 
     template <typename ProblemSize, typename ClusterShape, typename TileShape>
     static Params
-    to_underlying_arguments(ProblemSize const& problem_size,
-                            cutlass::KernelHardwareInfo const& hw_info,
-                            ClusterShape const& cluster_shape,
-                            TileShape const& tile_shape) {
+    to_underlying_arguments(
+        ProblemSize const& problem_size,
+        cutlass::KernelHardwareInfo const& hw_info,
+        ClusterShape const& cluster_shape,
+        TileShape const& tile_shape) {
         dim3 grid(0, 1, 1);
         grid.x = problem_size.num_seqs * problem_size.num_heads;
-        DPRINTF("to_underlying_arguments: grid:{.x:%d, .y:%d, .z:%d}, num_seqs:%d, num_heads:%d\n", grid.x, grid.y,
-                grid.z, problem_size.num_seqs, problem_size.num_heads);
+        DPRINTF(
+            "to_underlying_arguments: grid:{.x:%d, .y:%d, .z:%d}, num_seqs:%d, num_heads:%d\n",
+            grid.x,
+            grid.y,
+            grid.z,
+            problem_size.num_seqs,
+            problem_size.num_heads);
         return {
             .grid = grid,
             .num_seqs = problem_size.num_seqs,
@@ -113,8 +119,12 @@ struct IndividualTileScheduler {
             seq_idx = -1;
         } else {
             scheduled = true;
-            DPRINTF0_W("get_next_work: this_work={seq_idx:%d head_idx:%d tok_offset:%lld seq_len:%lld}\n", seq_idx,
-                       head_idx, s, seq_len);
+            DPRINTF0_W(
+                "get_next_work: this_work={seq_idx:%d head_idx:%d tok_offset:%lld seq_len:%lld}\n",
+                seq_idx,
+                head_idx,
+                s,
+                seq_len);
         }
 
         return {

@@ -14,9 +14,9 @@
 
 #pragma once
 
-#include "cutlass/cutlass.h"
-
 #include <tuple>
+
+#include <cutlass/cutlass.h>
 
 namespace kda::sm90::kernel {
 

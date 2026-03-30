@@ -31,12 +31,12 @@
 #pragma once
 
 // common
-#include "cutlass/cutlass.h"
-#include "cutlass/device_kernel.h"
+#include <cutlass/cutlass.h>
+#include <cutlass/device_kernel.h>
 
 #if !defined(__CUDACC_RTC__)
-#include "cutlass/cluster_launch.hpp"
-#include "cutlass/trace.h"
+#include <cutlass/cluster_launch.hpp>
+#include <cutlass/trace.h>
 #endif  // !defined(__CUDACC_RTC__)
 
 namespace cutlass::device {
@@ -109,8 +109,8 @@ class Universal {
         }
 
         // query occupancy after setting smem size
-        result = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_active_blocks, device_kernel<Kernel>,
-                                                               Kernel::MaxThreadsPerBlock, smem_size);
+        result = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &max_active_blocks, device_kernel<Kernel>, Kernel::MaxThreadsPerBlock, smem_size);
 
         if (cudaSuccess != result) {
             result = cudaGetLastError();  // to clear the error bit
@@ -126,8 +126,8 @@ class Universal {
     /// Initializes GEMM state from arguments.
     Status
     initialize(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr) {
-        CUTLASS_TRACE_HOST("Universal::initialize() - workspace " << workspace
-                                                                  << ", stream: " << (stream ? "non-null" : "null"));
+        CUTLASS_TRACE_HOST(
+            "Universal::initialize() - workspace " << workspace << ", stream: " << (stream ? "non-null" : "null"));
 
         // Initialize the workspace
         Status status = Kernel::initialize_workspace(args, workspace, stream);
@@ -182,8 +182,10 @@ class Universal {
         Status launch_result;
         // Use extended launch API only for mainloops that use it
         if constexpr (Kernel::ArchTag::kMinComputeCapability >= 90) {
-            dim3 cluster(cute::size<0>(typename Kernel::ClusterShape{}), cute::size<1>(typename Kernel::ClusterShape{}),
-                         cute::size<2>(typename Kernel::ClusterShape{}));
+            dim3 cluster(
+                cute::size<0>(typename Kernel::ClusterShape{}),
+                cute::size<1>(typename Kernel::ClusterShape{}),
+                cute::size<2>(typename Kernel::ClusterShape{}));
             void const* kernel = (void const*)device_kernel<Kernel>;
             void* kernel_params[] = {&params};
             launch_result = ClusterLauncher::launch(grid, cluster, block, smem_size, stream, kernel, kernel_params);

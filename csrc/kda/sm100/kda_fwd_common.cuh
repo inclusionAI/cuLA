@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include "kda_config.hpp"
+#include "kda/sm100/kda_config.hpp"
 
 namespace kda::sm100 {
 

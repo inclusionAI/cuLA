@@ -14,8 +14,10 @@
 
 #pragma once
 
-#include "cutlass/cutlass.h"
-#include "cutlass/gemm/collective/collective_builder.hpp"
+#include <cutlass/cutlass.h>
+#include <cutlass/gemm/collective/collective_builder.hpp>
+
+#include "kerutils/kerutils.cuh"
 
 #include "kda/sm90/collective/common.hpp"
 #include "kda/sm90/collective/load_predicated.hpp"
@@ -25,7 +27,6 @@
 #include "kda/sm90/kernel/options.hpp"
 #include "kda/sm90/utils/math_order_barrier.hpp"
 #include "kda/sm90/utils/unused.hpp"
-#include <kerutils/kerutils.cuh>
 
 // #define INLINE_LAMBDA [[gnu::always_inline]]
 #define INLINE_LAMBDA __attribute__((always_inline))
@@ -55,15 +56,16 @@ using namespace cute;
 using kda::sm90::kernel::find_option_t;
 using kda::sm90::kernel::Tag;
 
-template <class Element_,
-          class ElementAccumulatorQK_,
-          class ElementAccumulatorKV_,
-          class TileShape_,  // (seqlen_q, seqlen_kv, d)
-          class LayoutQ_,
-          class LayoutK_,
-          class LayoutV_,
-          class LayoutO_,  // (seqlen_q/k, d, h)
-          class Options>
+template <
+    class Element_,
+    class ElementAccumulatorQK_,
+    class ElementAccumulatorKV_,
+    class TileShape_,  // (seqlen_q, seqlen_kv, d)
+    class LayoutQ_,
+    class LayoutK_,
+    class LayoutV_,
+    class LayoutO_,  // (seqlen_q/k, d, h)
+    class Options>
 struct FlatMainloopTmaWarpSpecializedKdaFwd {
     using Element = Element_;
     using ElementAccumulatorQK = ElementAccumulatorQK_;
@@ -109,10 +111,10 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     static constexpr uint32_t OrderedBarrierId0 = uint32_t(cutlass::arch::ReservedNamedBarriers::StreamkBarrier0);
     static constexpr uint32_t OrderedBarrierId1 = uint32_t(cutlass::arch::ReservedNamedBarriers::StreamkBarrier1);
 
-    using OrderedMathBarriers =
-        std::conditional_t<NumStateMmaWarpGroups == 2,
-                           OrderedNamedBarriers</*UseReservedNB=*/true, OrderedBarrierId0, OrderedBarrierId1>,
-                           OrderedNamedBarriers</*UseReservedNB=*/true, OrderedBarrierId0>>;
+    using OrderedMathBarriers = std::conditional_t<
+        NumStateMmaWarpGroups == 2,
+        OrderedNamedBarriers</*UseReservedNB=*/true, OrderedBarrierId0, OrderedBarrierId1>,
+        OrderedNamedBarriers</*UseReservedNB=*/true, OrderedBarrierId0>>;
 
     using StagesQ = cutlass::gemm::collective::StageCount<StageCountQ>;
     using StagesK = cutlass::gemm::collective::StageCount<StageCountK>;
@@ -169,9 +171,10 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         TileShapeQK,
         ClusterShape,
         DummyStages,
-        std::conditional_t<IsQKCooperative,
-                           cutlass::gemm::KernelTmaWarpSpecializedCooperative,
-                           cutlass::gemm::KernelTmaWarpSpecialized>>::CollectiveOp;
+        std::conditional_t<
+            IsQKCooperative,
+            cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+            cutlass::gemm::KernelTmaWarpSpecialized>>::CollectiveOp;
 
     // dummy TiledMmaQK RS for S2R/R2S layout consistency
     using AtomLayoutQK = Layout<Shape<Int<BlkSeqQ / 64>, _1, _1>>;
@@ -199,21 +202,22 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
 
     using SmemLayoutAlphaAtom = GMMA::Layout_K_SW128_Atom<ElementAlpha>;
-    using SmemLayoutAlpha_SD =
-        decltype(tile_to_shape(SmemLayoutAlphaAtom{},
-                               make_shape(shape<1>(TileShapeQK{}),
-                                          shape<2>(TileShapeQK{}),
-                                          Int<StagesAlpha::value>{})));  // (blk_kv, head_size), (64, 128)
-    using GmemShapeAlpha = Shape<int64_t, int32_t, int32_t>;             // (seqlen_k, d, h)
+    using SmemLayoutAlpha_SD = decltype(tile_to_shape(
+        SmemLayoutAlphaAtom{},
+        make_shape(
+            shape<1>(TileShapeQK{}),
+            shape<2>(TileShapeQK{}),
+            Int<StagesAlpha::value>{})));                     // (blk_kv, head_size), (64, 128)
+    using GmemShapeAlpha = Shape<int64_t, int32_t, int32_t>;  // (seqlen_k, d, h)
     using GmemStrideAlpha = Stride<int64_t, _1, int32_t>;
     using GmemLayoutAlpha = Layout<GmemShapeAlpha, GmemStrideAlpha>;
     using GmemTiledCopyAlpha = cute::SM90_TMA_LOAD;
-    using TMA_Alpha =
-        decltype(make_tma_copy(GmemTiledCopyAlpha{},
-                               make_tensor(make_gmem_ptr(static_cast<float const*>(nullptr)), GmemLayoutAlpha{}),
-                               take<0, 2>(SmemLayoutAlpha_SD{}),
-                               select<1, 2>(TileShapeQK{}),
-                               size<0>(ClusterShape{})));
+    using TMA_Alpha = decltype(make_tma_copy(
+        GmemTiledCopyAlpha{},
+        make_tensor(make_gmem_ptr(static_cast<float const*>(nullptr)), GmemLayoutAlpha{}),
+        take<0, 2>(SmemLayoutAlpha_SD{}),
+        select<1, 2>(TileShapeQK{}),
+        size<0>(ClusterShape{})));
 
     // raw layout for copy
     using SmemLayoutQ_SD =
@@ -288,13 +292,14 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     static_assert(size(TiledMmaO1{}) == NumStateMmaThreads);
     static_assert(size(TiledMmaO2{}) == NumStateMmaThreads);
 
-    using CollectiveStoreO = CollectiveStoreTma<TileShapeO1,
-                                                ClusterShape,
-                                                ElementO,
-                                                ElementAccumulatorO,
-                                                /*Seme*/ ElementO,
-                                                decltype(select<1, 0, 2>(LayoutO{})),
-                                                StagesO::value>;
+    using CollectiveStoreO = CollectiveStoreTma<
+        TileShapeO1,
+        ClusterShape,
+        ElementO,
+        ElementAccumulatorO,
+        /*Seme*/ ElementO,
+        decltype(select<1, 0, 2>(LayoutO{})),
+        StagesO::value>;
 
     // layout for compute
     using QKSmemLayoutQ = SmemLayoutQ_SD;
@@ -311,16 +316,16 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     using KKTKTSmemLayoutAlpha = decltype(select_layout<1, 0, 2>(SmemLayoutAlpha_SD{}));
 
     // layout for compute output
-    using SmemLayoutQK =
-        decltype(tile_to_shape(GMMA::Layout_K_INTER_Atom<Element>{},
-                               flatten(make_shape(select<0, 1>(TileShapeQK{}), Int<StagesQK::value>{})),
-                               Step<_1, _2, _3>{}));
+    using SmemLayoutQK = decltype(tile_to_shape(
+        GMMA::Layout_K_INTER_Atom<Element>{},
+        flatten(make_shape(select<0, 1>(TileShapeQK{}), Int<StagesQK::value>{})),
+        Step<_1, _2, _3>{}));
     using SmemLayoutO = typename CollectiveStoreO::SmemLayoutO;
 
-    using SmemLayoutKK =
-        decltype(tile_to_shape(GMMA::Layout_K_INTER_Atom<Element>{},
-                               flatten(make_shape(select<0, 1>(TileShapeQK{}), Int<StagesQK::value>{})),
-                               Step<_1, _2, _3>{}));
+    using SmemLayoutKK = decltype(tile_to_shape(
+        GMMA::Layout_K_INTER_Atom<Element>{},
+        flatten(make_shape(select<0, 1>(TileShapeQK{}), Int<StagesQK::value>{})),
+        Step<_1, _2, _3>{}));
 
     using InverseType = cutlass::half_t;
     using CollectiveInverse = ku::CollectiveInverse<InverseType, true, false>;
@@ -450,13 +455,14 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     using LoadAlpha =
         CollectiveLoadTma<LoadKind::kAlpha, MainloopAlphaPipeline, ElementAlpha, QKQSmemLayoutAlpha, TMA_Alpha>;
 
-    using LoadBeta = CollectiveLoadVector<LoadKindVector::kBeta,
-                                          MainloopBetaPipeline,
-                                          ElementBeta,
-                                          GmemLayoutBeta,
-                                          ElementBeta,
-                                          SmemLayoutBeta,
-                                          BetaProcessor>;
+    using LoadBeta = CollectiveLoadVector<
+        LoadKindVector::kBeta,
+        MainloopBetaPipeline,
+        ElementBeta,
+        GmemLayoutBeta,
+        ElementBeta,
+        SmemLayoutBeta,
+        BetaProcessor>;
 
     struct Arguments {  // clang-format off
     Element const* ptr_Q; LayoutQ dQ;
@@ -499,42 +505,52 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         int64_t t = problem_size.total_seqlen;
         int32_t d = problem_size.head_size;
 
-        auto params_qk =
-            CollectiveMmaQK::to_underlying_arguments(make_shape(s, t, d, problem_size.num_heads),
-                                                     typename CollectiveMmaQK::Arguments{
-                                                         args.ptr_Q, args.dQ, args.ptr_K, args.dK,  // never used, dummy
-                                                     },
-                                                     /*workspace=*/nullptr);
+        auto params_qk = CollectiveMmaQK::to_underlying_arguments(
+            make_shape(s, t, d, problem_size.num_heads),
+            typename CollectiveMmaQK::Arguments{
+                args.ptr_Q, args.dQ, args.ptr_K, args.dK,  // never used, dummy
+            },
+            /*workspace=*/nullptr);
 
-        auto params_kv_k =
-            CollectiveMmaKV_G2S::to_underlying_arguments(make_shape(d, d, s, problem_size.num_heads),
-                                                         typename CollectiveMmaKV_G2S::Arguments{
-                                                             args.ptr_V, select<1, 0, 2>(args.dV),  // not used
-                                                             args.ptr_K, select<1, 0, 2>(args.dK),  // used as G2S for K
-                                                         },
-                                                         /*workspace=*/nullptr);
+        auto params_kv_k = CollectiveMmaKV_G2S::to_underlying_arguments(
+            make_shape(d, d, s, problem_size.num_heads),
+            typename CollectiveMmaKV_G2S::Arguments{
+                args.ptr_V,
+                select<1, 0, 2>(args.dV),  // not used
+                args.ptr_K,
+                select<1, 0, 2>(args.dK),  // used as G2S for K
+            },
+            /*workspace=*/nullptr);
 
         auto alpha_shape = make_shape(s, d, problem_size.num_heads);
-        auto alpha_stride = make_stride(get<0>(args.dAlpha),  // seqlen stride
-                                        get<1>(args.dAlpha),  // head_dim stride
-                                        get<2>(args.dAlpha)   // head stride
+        auto alpha_stride = make_stride(
+            get<0>(args.dAlpha),  // seqlen stride
+            get<1>(args.dAlpha),  // head_dim stride
+            get<2>(args.dAlpha)   // head stride
         );
         Tensor mAlpha = make_tensor(make_gmem_ptr(args.ptr_Alpha), make_layout(alpha_shape, alpha_stride));
-        TMA_Alpha tma_load_alpha = make_tma_copy(GmemTiledCopyAlpha{}, mAlpha, take<0, 2>(SmemLayoutAlpha_SD{}),
-                                                 select<1, 2>(TileShapeQK{}), size<0>(ClusterShape{}));
+        TMA_Alpha tma_load_alpha = make_tma_copy(
+            GmemTiledCopyAlpha{},
+            mAlpha,
+            take<0, 2>(SmemLayoutAlpha_SD{}),
+            select<1, 2>(TileShapeQK{}),
+            size<0>(ClusterShape{}));
 
-        auto params_kv_v =
-            CollectiveMmaKV_G2S::to_underlying_arguments(make_shape(d, d, s, problem_size.num_heads),
-                                                         typename CollectiveMmaKV_G2S::Arguments{
-                                                             args.ptr_V, select<1, 0, 2>(args.dV),  // used as G2S for V
-                                                             args.ptr_K, select<1, 0, 2>(args.dK),  // not used
-                                                         },
-                                                         /*workspace=*/nullptr);
+        auto params_kv_v = CollectiveMmaKV_G2S::to_underlying_arguments(
+            make_shape(d, d, s, problem_size.num_heads),
+            typename CollectiveMmaKV_G2S::Arguments{
+                args.ptr_V,
+                select<1, 0, 2>(args.dV),  // used as G2S for V
+                args.ptr_K,
+                select<1, 0, 2>(args.dK),  // not used
+            },
+            /*workspace=*/nullptr);
 
         auto params_o = CollectiveStoreO::to_underlying_arguments(
             make_shape(d, s, d, problem_size.num_heads),  // in O1
             // make_shape(d, s, s, problem_size.num_heads),  // in O2
-            typename CollectiveStoreO::Arguments{args.ptr_O, select<1, 0, 2>(args.dO), workspace}, workspace);
+            typename CollectiveStoreO::Arguments{args.ptr_O, select<1, 0, 2>(args.dO), workspace},
+            workspace);
 
         return Params{
             .tma_load_q = params_qk.tma_load_a,
@@ -561,10 +577,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
     template <class ProblemShape>
     static cutlass::Status
-    initialize_workspace(ProblemShape const& problem_shape,
-                         Arguments const& args,
-                         void* workspace,
-                         cudaStream_t stream) {
+    initialize_workspace(
+        ProblemShape const& problem_shape, Arguments const& args, void* workspace, cudaStream_t stream) {
         return CollectiveStoreO::initialize_workspace(problem_shape, workspace, stream);
     }
 
@@ -579,19 +593,20 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
     template <typename ProblemShape, typename LoadTileShape, typename WorkDesc>
     CUTE_DEVICE void
-    load_qkv(Params const& params,
-             ProblemShape const& problem_size,
-             LoadTileShape const& load_tile_shape,
-             WorkDesc const& work_desc,
-             MainloopQPipeline& q_pipeline,
-             QPipelineState& q_smem_pipe_write,
-             MainloopKPipeline& k_pipeline,
-             KPipelineState& k_smem_pipe_write,
-             MainloopVPipeline& v_pipeline,
-             VPipelineState& v_smem_pipe_write,
-             MainloopAlphaPipeline& alpha_pipeline,
-             AlphaPipelineState& alpha_smem_pipe_write,
-             SharedStorage& storage) {
+    load_qkv(
+        Params const& params,
+        ProblemShape const& problem_size,
+        LoadTileShape const& load_tile_shape,
+        WorkDesc const& work_desc,
+        MainloopQPipeline& q_pipeline,
+        QPipelineState& q_smem_pipe_write,
+        MainloopKPipeline& k_pipeline,
+        KPipelineState& k_smem_pipe_write,
+        MainloopVPipeline& v_pipeline,
+        VPipelineState& v_smem_pipe_write,
+        MainloopAlphaPipeline& alpha_pipeline,
+        AlphaPipelineState& alpha_smem_pipe_write,
+        SharedStorage& storage) {
         int32_t num_blocks = ceil_div(work_desc.seq_len, get<0>(TileShape{}));
         uint32_t lane_predicate = cute::elect_one_sync();
 
@@ -616,13 +631,14 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
     template <typename ProblemShape, typename TileShape, typename WorkDesc>
     CUTE_DEVICE void
-    load_beta(Params const& params,
-              ProblemShape const& problem_size,
-              TileShape const& tile_shape,
-              WorkDesc const& work_desc,
-              MainloopBetaPipeline& pipeline,
-              BetaPipelineState& smem_pipe_write,
-              SharedStorage& storage) {
+    load_beta(
+        Params const& params,
+        ProblemShape const& problem_size,
+        TileShape const& tile_shape,
+        WorkDesc const& work_desc,
+        MainloopBetaPipeline& pipeline,
+        BetaPipelineState& smem_pipe_write,
+        SharedStorage& storage) {
         int32_t num_blocks = ceil_div(work_desc.seq_len, get<0>(TileShape{}));
 
         // fuse post inverse diag(beta) into diagonal of IKK
@@ -641,15 +657,16 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
     template <typename ProblemShape, typename TileShape, typename WorkDesc>
     CUTE_DEVICE void
-    extract_alpha_last(Params const& params,
-                       ProblemShape const& problem_size,
-                       TileShape const& tile_shape,
-                       WorkDesc const& work_desc,
-                       MainloopAlphaPipeline& alpha_pipeline,
-                       AlphaPipelineState& alpha_smem_pipe_read,
-                       MainloopAlphaLastPipeline& alpha_last_pipeline,
-                       AlphaLastPipelineState& alpha_last_smem_pipe_write,
-                       SharedStorage& storage) {
+    extract_alpha_last(
+        Params const& params,
+        ProblemShape const& problem_size,
+        TileShape const& tile_shape,
+        WorkDesc const& work_desc,
+        MainloopAlphaPipeline& alpha_pipeline,
+        AlphaPipelineState& alpha_smem_pipe_read,
+        MainloopAlphaLastPipeline& alpha_last_pipeline,
+        AlphaLastPipelineState& alpha_last_smem_pipe_write,
+        SharedStorage& storage) {
         int thread_idx = threadIdx.x % cutlass::NumThreadsPerWarp;
 
         Tensor sAqkq = make_tensor(make_smem_ptr(storage.smem_alpha.data()), QKQSmemLayoutAlpha{});
@@ -689,14 +706,15 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
     template <typename ProblemSize, typename StoreTileShape, typename WorkDesc, typename PipelineState>
     CUTE_DEVICE void
-    store(TMA_O const& tma_store,
-          void* tensormaps,
-          ProblemSize const& problem_size,
-          StoreTileShape const& store_tile_shape,
-          WorkDesc const& work_desc,
-          MainloopOPipeline& pipeline,
-          PipelineState& smem_pipe_read,
-          SharedStorageO& storage) {
+    store(
+        TMA_O const& tma_store,
+        void* tensormaps,
+        ProblemSize const& problem_size,
+        StoreTileShape const& store_tile_shape,
+        WorkDesc const& work_desc,
+        MainloopOPipeline& pipeline,
+        PipelineState& smem_pipe_read,
+        SharedStorageO& storage) {
         int32_t num_blocks = ceil_div(work_desc.seq_len, get<0>(TileShape{}));
         uint32_t lane_predicate = cute::elect_one_sync();
 
@@ -705,37 +723,41 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
         CUTE_NO_UNROLL
         for (int blk = 0; blk < num_blocks; ++blk) {
-            DPRINTF0_W("O collective_store.step smem_pipe_read:%d -> blk_idx:%d, num_blocks:%d\n",
-                       smem_pipe_read.index(), blk, num_blocks);
+            DPRINTF0_W(
+                "O collective_store.step smem_pipe_read:%d -> blk_idx:%d, num_blocks:%d\n",
+                smem_pipe_read.index(),
+                blk,
+                num_blocks);
             collective_store.step(problem_size, work_desc, src_dst, smem_pipe_read, blk, num_blocks, lane_predicate);
         }
     }
 
     template <class ProblemShape, class WorkDesc>
     CUTE_DEVICE void
-    compute(Params const& params,
-            ProblemShape const& problem_size,
-            WorkDesc const& work_desc,
-            MainloopQPipeline& q_pipeline,
-            QPipelineState& q_smem_pipe_read,
-            MainloopKPipeline& k_pipeline,
-            KPipelineState& k_smem_pipe_read,
-            MainloopVPipeline& v_pipeline,
-            VPipelineState& v_smem_pipe_read,
-            MainloopOPipeline& o_pipeline,
-            OPipelineState& o_smem_pipe_write,
-            MainloopQKPipeline& qk_pipeline,
-            QKPipelineState& qk_smem_pipe_read,
-            MainloopKKPipeline& kk_pipeline,
-            KKPipelineState& kk_smem_pipe_read,
-            MainloopAlphaPipeline& alpha_pipeline,
-            AlphaPipelineState& alpha_smem_pipe_read,
-            MainloopBetaPipeline& beta_pipeline,
-            BetaPipelineState& beta_smem_pipe_read,
-            MainloopAlphaLastPipeline& alpha_last_pipeline,
-            AlphaLastPipelineState& alpha_last_smem_pipe_read,
-            OrderedMathBarriers& math_barriers,
-            SharedStorage& storage) {
+    compute(
+        Params const& params,
+        ProblemShape const& problem_size,
+        WorkDesc const& work_desc,
+        MainloopQPipeline& q_pipeline,
+        QPipelineState& q_smem_pipe_read,
+        MainloopKPipeline& k_pipeline,
+        KPipelineState& k_smem_pipe_read,
+        MainloopVPipeline& v_pipeline,
+        VPipelineState& v_smem_pipe_read,
+        MainloopOPipeline& o_pipeline,
+        OPipelineState& o_smem_pipe_write,
+        MainloopQKPipeline& qk_pipeline,
+        QKPipelineState& qk_smem_pipe_read,
+        MainloopKKPipeline& kk_pipeline,
+        KKPipelineState& kk_smem_pipe_read,
+        MainloopAlphaPipeline& alpha_pipeline,
+        AlphaPipelineState& alpha_smem_pipe_read,
+        MainloopBetaPipeline& beta_pipeline,
+        BetaPipelineState& beta_smem_pipe_read,
+        MainloopAlphaLastPipeline& alpha_last_pipeline,
+        AlphaLastPipelineState& alpha_last_smem_pipe_read,
+        OrderedMathBarriers& math_barriers,
+        SharedStorage& storage) {
         // MAKE NVCC HAPPY!
         constexpr auto zero = Element{};
 
@@ -884,10 +906,11 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 _, _, state_head_idx, seq_idx);  // (KDim, VDim), K-contiguous
             // NOTE: load S in transposed GMEM
             // because in GDN's equation, S = NewV^T @ K, while in KDA, S = K^T @ NewV
-            auto gKV_trans =
-                make_tensor(make_gmem_ptr(gKV.data()),
-                            make_layout(make_shape(get<1>(gKV.layout().shape()), get<0>(gKV.layout().shape())),
-                                        make_stride(get<1>(gKV.layout().stride()), get<0>(gKV.layout().stride()))));
+            auto gKV_trans = make_tensor(
+                make_gmem_ptr(gKV.data()),
+                make_layout(
+                    make_shape(get<1>(gKV.layout().shape()), get<0>(gKV.layout().shape())),
+                    make_stride(get<1>(gKV.layout().stride()), get<0>(gKV.layout().stride()))));
 
             auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, Element>{}, kv_tiled_mma);
             auto thr_copy_kv = tiled_copy_kv.get_thread_slice(thread_idx);
@@ -906,10 +929,11 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 _, _, state_head_idx, seq_idx);  // (KDim, VDim), K-contiguous
             // NOTE: store S in transposed GMEM
             // because in GDN's equation, S = NewV^T @ K, while in KDA, S = K^T @ NewV
-            auto gKV_trans =
-                make_tensor(make_gmem_ptr(gKV.data()),
-                            make_layout(make_shape(get<1>(gKV.layout().shape()), get<0>(gKV.layout().shape())),
-                                        make_stride(get<1>(gKV.layout().stride()), get<0>(gKV.layout().stride()))));
+            auto gKV_trans = make_tensor(
+                make_gmem_ptr(gKV.data()),
+                make_layout(
+                    make_shape(get<1>(gKV.layout().shape()), get<0>(gKV.layout().shape())),
+                    make_stride(get<1>(gKV.layout().stride()), get<0>(gKV.layout().stride()))));
 
             auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, Element>{}, kv_tiled_mma);
             auto thr_copy_kv = tiled_copy_kv.get_thread_slice(thread_idx);
@@ -962,8 +986,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             collective_inverse.compute(sKK_inv_pipe_slice);
             // FIXME: we can ignore core matrices above diagonal
             if constexpr (NeedsBeta || !std::is_same_v<InverseType, Element>) {
-                cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup,
-                                                             KdaNamedBarriers::StateMathWG0);
+                cutlass::arch::NamedBarrier::arrive_and_wait(
+                    cutlass::NumThreadsPerWarpGroup, KdaNamedBarriers::StateMathWG0);
                 using CopyOpS2R = SM75_U32x4_LDSM_N;
                 auto tiled_load_kk = make_tiled_copy_C(Copy_Atom<CopyOpS2R, InverseType>{}, kk_tiled_mma);
                 auto thr_load_kk = tiled_load_kk.get_thread_slice(thread_idx);
@@ -1353,32 +1377,35 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             compute_loop_body(blk, /*is_first_block_=*/cute::false_type{}, /*is_final_block_=*/cute::false_type{});
         }
         if (num_blocks != 1) {
-            compute_loop_body(num_blocks - 1, /*is_first_block_=*/cute::false_type{},
-                              /*is_final_block_=*/cute::true_type{});
+            compute_loop_body(
+                num_blocks - 1,
+                /*is_first_block_=*/cute::false_type{},
+                /*is_final_block_=*/cute::true_type{});
         }
         kv_store();
     }
 
     template <class ProblemShape, class WorkDesc>
     CUTE_DEVICE void
-    compute_aux_safe(Params const& params,
-                     ProblemShape const& problem_size,
-                     WorkDesc const& work_desc,
-                     MainloopQPipeline& q_pipeline,
-                     QPipelineState& q_smem_pipe_read,
-                     MainloopKPipeline& k_pipeline,
-                     KPipelineState& k_smem_pipe_read,
-                     MainloopQKPipeline& qk_pipeline,
-                     QKPipelineState& qk_smem_pipe_write,
-                     MainloopKKPipeline& kk_pipeline,
-                     KKPipelineState& kk_smem_pipe_write,
-                     MainloopAlphaPipeline& alpha_pipeline,
-                     AlphaPipelineState& alpha_smem_pipe_read,
-                     MainloopBetaPipeline& beta_pipeline,
-                     BetaPipelineState& beta_smem_pipe_read,
-                     MainloopAlphaLastPipeline& alpha_last_pipeline,
-                     AlphaLastPipelineState& alpha_last_smem_pipe_write,
-                     SharedStorage& storage) {
+    compute_aux_safe(
+        Params const& params,
+        ProblemShape const& problem_size,
+        WorkDesc const& work_desc,
+        MainloopQPipeline& q_pipeline,
+        QPipelineState& q_smem_pipe_read,
+        MainloopKPipeline& k_pipeline,
+        KPipelineState& k_smem_pipe_read,
+        MainloopQKPipeline& qk_pipeline,
+        QKPipelineState& qk_smem_pipe_write,
+        MainloopKKPipeline& kk_pipeline,
+        KKPipelineState& kk_smem_pipe_write,
+        MainloopAlphaPipeline& alpha_pipeline,
+        AlphaPipelineState& alpha_smem_pipe_read,
+        MainloopBetaPipeline& beta_pipeline,
+        BetaPipelineState& beta_smem_pipe_read,
+        MainloopAlphaLastPipeline& alpha_last_pipeline,
+        AlphaLastPipelineState& alpha_last_smem_pipe_write,
+        SharedStorage& storage) {
         using TileShape_SubChunk = Shape<_16, _16, _32>;
         int thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
 
@@ -1551,8 +1578,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 copy(Q_tiled_copy, tQKsQ_r_j, tQKrQ_r_j_bf16_cv);
                 // gate: Q * exp2(g - g_first) in BF16 MMA layout, producing float
                 Tensor tQKrQ_r_j_float = make_fragment_like<float>(tv_layout_bf16_mma_A);
-                cute::transform(tQKrQ_r_j_bf16, tArA_r_j, tQKrQ_r_j_float,
-                                [&](auto q, auto g) { return float(q) * g; });
+                cute::transform(
+                    tQKrQ_r_j_bf16, tArA_r_j, tQKrQ_r_j_float, [&](auto q, auto g) { return float(q) * g; });
                 // convert BF16 MMA layout → TF32 MMA layout in-place via warp shuffles
                 convert_bf16_to_tf32_operandA_layout(tQKrQ_r_j_float, local_thread_idx);
                 // NOTE: triton tl.dot also lets MMA hardware for truncation
@@ -1565,8 +1592,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 Tensor tQKrK_r_j_bf16_cv = Q_thr_copy.retile_D(tQKrK_r_j_bf16);
                 copy(Q_tiled_copy, tQKsK_r_j, tQKrK_r_j_bf16_cv);
                 Tensor tQKrK_r_j_float = make_fragment_like<float>(tv_layout_bf16_mma_A);
-                cute::transform(tQKrK_r_j_bf16, tArA_r_j, tQKrK_r_j_float,
-                                [&](auto k, auto g) { return float(k) * g; });
+                cute::transform(
+                    tQKrK_r_j_bf16, tArA_r_j, tQKrK_r_j_float, [&](auto k, auto g) { return float(k) * g; });
                 // convert BF16 MMA layout → TF32 MMA layout in-place via warp shuffles
                 convert_bf16_to_tf32_operandA_layout(tQKrK_r_j_float, local_thread_idx);
                 auto tQKrK_r_j = recast<ElementGatedMMA>(tQKrK_r_j_float);
@@ -1579,38 +1606,38 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             // then converts gated result to TF32 MMA B layout.
             // tArAfirst_kt: pre-loaded g_first register tensor (BF16 MMA B layout) for computing gktn = exp2(g_first -
             // g_c) returns tQKrKt = K_c * exp2(g_first - g_c)
-            auto s2r_compute_subchunk_operandB = [&](auto c_, int j, int j0, int j1,
-                                                     auto const& tArAfirst_kt) INLINE_LAMBDA {
-                // S2R g_c_j in BF16 MMA operand B layout
-                Tensor sAqkq_c_j = sAqkq_slice(_, _, c_, make_coord(_0{}, j));
-                Tensor tAsA_c_j = alpha_Kt_bf16_thr_copy.partition_S(sAqkq_c_j);
-                Tensor tArA_c_j = make_fragment_like<ElementAlpha>(tv_layout_bf16_mma_B);
-                Tensor tArA_c_j_cv = alpha_Kt_bf16_thr_copy.retile_D(tArA_c_j);
-                copy(alpha_Kt_bf16_tiled_copy, tAsA_c_j, tArA_c_j_cv);
+            auto s2r_compute_subchunk_operandB =
+                [&](auto c_, int j, int j0, int j1, auto const& tArAfirst_kt) INLINE_LAMBDA {
+                    // S2R g_c_j in BF16 MMA operand B layout
+                    Tensor sAqkq_c_j = sAqkq_slice(_, _, c_, make_coord(_0{}, j));
+                    Tensor tAsA_c_j = alpha_Kt_bf16_thr_copy.partition_S(sAqkq_c_j);
+                    Tensor tArA_c_j = make_fragment_like<ElementAlpha>(tv_layout_bf16_mma_B);
+                    Tensor tArA_c_j_cv = alpha_Kt_bf16_thr_copy.retile_D(tArA_c_j);
+                    copy(alpha_Kt_bf16_tiled_copy, tAsA_c_j, tArA_c_j_cv);
 
-                // compute gktn_c_j = exp2(g_first - g_c_j) in BF16 MMA B layout
-                cute::transform(tArA_c_j, tArAfirst_kt, tArA_c_j,
-                                [&](auto g, auto g_first) { return exp2f(g_first - g); });
+                    // compute gktn_c_j = exp2(g_first - g_c_j) in BF16 MMA B layout
+                    cute::transform(
+                        tArA_c_j, tArAfirst_kt, tArA_c_j, [&](auto g, auto g_first) { return exp2f(g_first - g); });
 
-                // S2R k_c_j using BF16 LDSM
-                Tensor sKqk_c_j = sKqk_slice(_, _, c_, make_coord(j0, j1));
-                Tensor tQKrKt_c_j_bf16 = make_fragment_like<Element>(tv_layout_bf16_mma_B);
-                Tensor tQKsKt_c_j = Kt_thr_copy.partition_S(sKqk_c_j);
-                Tensor tQKrKt_c_j_bf16_cv = Kt_thr_copy.retile_D(tQKrKt_c_j_bf16);
-                copy(Kt_tiled_copy, tQKsKt_c_j, tQKrKt_c_j_bf16_cv);
+                    // S2R k_c_j using BF16 LDSM
+                    Tensor sKqk_c_j = sKqk_slice(_, _, c_, make_coord(j0, j1));
+                    Tensor tQKrKt_c_j_bf16 = make_fragment_like<Element>(tv_layout_bf16_mma_B);
+                    Tensor tQKsKt_c_j = Kt_thr_copy.partition_S(sKqk_c_j);
+                    Tensor tQKrKt_c_j_bf16_cv = Kt_thr_copy.retile_D(tQKrKt_c_j_bf16);
+                    copy(Kt_tiled_copy, tQKsKt_c_j, tQKrKt_c_j_bf16_cv);
 
-                // convert bf16 → float in BF16 MMA B layout
-                Tensor tQKrKt_c_j_float = make_fragment_like<float>(tv_layout_bf16_mma_B);
-                // gate in BF16 MMA B layout (alpha and K are in the same layout)
-                cute::transform(tQKrKt_c_j_bf16, tArA_c_j, tQKrKt_c_j_float,
-                                [&](auto k, auto g) { return float(k) * g; });
+                    // convert bf16 → float in BF16 MMA B layout
+                    Tensor tQKrKt_c_j_float = make_fragment_like<float>(tv_layout_bf16_mma_B);
+                    // gate in BF16 MMA B layout (alpha and K are in the same layout)
+                    cute::transform(
+                        tQKrKt_c_j_bf16, tArA_c_j, tQKrKt_c_j_float, [&](auto k, auto g) { return float(k) * g; });
 
-                // convert BF16 MMA layout → TF32 MMA layout in-place via warp shuffles
-                convert_bf16_to_tf32_operandB_layout(tQKrKt_c_j_float, local_thread_idx);
-                auto tQKrKt_c_j = recast<ElementGatedMMA>(tQKrKt_c_j_float);
+                    // convert BF16 MMA layout → TF32 MMA layout in-place via warp shuffles
+                    convert_bf16_to_tf32_operandB_layout(tQKrKt_c_j_float, local_thread_idx);
+                    auto tQKrKt_c_j = recast<ElementGatedMMA>(tQKrKt_c_j_float);
 
-                return tQKrKt_c_j;
-            };
+                    return tQKrKt_c_j;
+                };
 
             // R2S (register to shared memory) store for subchunk accumulator results
             // Stores both tQKrQK (QK accumulator, fp32 -> Element) and tKKrKK (KK accumulator, fp32 -> InverseType)
@@ -1635,62 +1662,62 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
             // do tensor core GEMM with single 16x16x128
             // NOTE: should use safe_gate with lower_bound >= -5, otherwise overflow issues
-            auto gemm_tensor_core_1x16x16x128 = [&](auto r_, auto c_, auto is_diagonal_,
-                                                    auto is_first_subchunk_) INLINE_LAMBDA {
-                constexpr bool is_first_subchunk = decltype(is_first_subchunk_)::value;
+            auto gemm_tensor_core_1x16x16x128 =
+                [&](auto r_, auto c_, auto is_diagonal_, auto is_first_subchunk_) INLINE_LAMBDA {
+                    constexpr bool is_first_subchunk = decltype(is_first_subchunk_)::value;
 
-                // allocate acc_r_c [16, 16]
-                Tensor tQKrQK_r_c = partition_fragment_C(tiledmma_subchunk, select<0, 1>(TileShape_SubChunk{}));
-                Tensor tKKrKK_r_c = partition_fragment_C(tiledmma_subchunk, select<0, 1>(TileShape_SubChunk{}));
-                clear(tQKrQK_r_c);
-                clear(tKKrKK_r_c);
-                // wait for data ready
-                if constexpr (is_first_subchunk) {
-                    q_pipeline.consumer_wait(q_smem_pipe_read);
-                    k_pipeline.consumer_wait(k_smem_pipe_read);
-                    if constexpr (NeedsAlpha) {
-                        alpha_pipeline.consumer_wait(alpha_smem_pipe_read);
+                    // allocate acc_r_c [16, 16]
+                    Tensor tQKrQK_r_c = partition_fragment_C(tiledmma_subchunk, select<0, 1>(TileShape_SubChunk{}));
+                    Tensor tKKrKK_r_c = partition_fragment_C(tiledmma_subchunk, select<0, 1>(TileShape_SubChunk{}));
+                    clear(tQKrQK_r_c);
+                    clear(tKKrKK_r_c);
+                    // wait for data ready
+                    if constexpr (is_first_subchunk) {
+                        q_pipeline.consumer_wait(q_smem_pipe_read);
+                        k_pipeline.consumer_wait(k_smem_pipe_read);
+                        if constexpr (NeedsAlpha) {
+                            alpha_pipeline.consumer_wait(alpha_smem_pipe_read);
+                        }
                     }
-                }
 
-                // for loop head dim
-                CUTE_NO_UNROLL
-                for (int j = 0; j < NK; ++j) {
-                    int j0 = j % 2, j1 = j / 2;
-                    // S2R Q/K/G/g_first for operand A and element-wise compute
-                    auto [tQKrQ_r_j, tQKrK_r_j, tArAfirst_r_j_kt] = s2r_compute_subchunk_operandA(r_, j, j0, j1);
-                    // S2R K/G for operand B and element-wise compute
-                    auto tQKrKt_c_j = s2r_compute_subchunk_operandB(c_, j, j0, j1, tArAfirst_r_j_kt);
+                    // for loop head dim
+                    CUTE_NO_UNROLL
+                    for (int j = 0; j < NK; ++j) {
+                        int j0 = j % 2, j1 = j / 2;
+                        // S2R Q/K/G/g_first for operand A and element-wise compute
+                        auto [tQKrQ_r_j, tQKrK_r_j, tArAfirst_r_j_kt] = s2r_compute_subchunk_operandA(r_, j, j0, j1);
+                        // S2R K/G for operand B and element-wise compute
+                        auto tQKrKt_c_j = s2r_compute_subchunk_operandB(c_, j, j0, j1, tArAfirst_r_j_kt);
 
-                    // q_r_j/k_r_j @ k_c_j, accumulate acc_r_c
-                    gemm(tiledmma_subchunk, tQKrQ_r_j, tQKrKt_c_j, tQKrQK_r_c);
-                    gemm(tiledmma_subchunk, tQKrK_r_j, tQKrKt_c_j, tKKrKK_r_c);
-                }
+                        // q_r_j/k_r_j @ k_c_j, accumulate acc_r_c
+                        gemm(tiledmma_subchunk, tQKrQ_r_j, tQKrKt_c_j, tQKrQK_r_c);
+                        gemm(tiledmma_subchunk, tQKrK_r_j, tQKrKt_c_j, tKKrKK_r_c);
+                    }
 
-                // S2R beta_j (maybe resident in register?)
-                // epilogue: qk^t * scale
-                cute::transform(tQKrQK_r_c, [scale](auto v) { return v * scale; });
-                // epilogue: kk^t * beta_r
-                if constexpr (is_first_subchunk) {
-                    beta_pipeline.consumer_wait(beta_smem_pipe_read);
-                    cutlass::arch::fence_view_async_shared();
-                }
-                Tensor sBeta_r = sBeta_slice(_, r_);
-                for_each(make_int_sequence<size(tQKcMqk_subchunk)>{}, [&](auto i) {
-                    auto coord = tQKcMqk_subchunk(i);
-                    auto [s, t] = coord;
-                    tKKrKK_r_c(i) *= sBeta_r(s);
-                });
+                    // S2R beta_j (maybe resident in register?)
+                    // epilogue: qk^t * scale
+                    cute::transform(tQKrQK_r_c, [scale](auto v) { return v * scale; });
+                    // epilogue: kk^t * beta_r
+                    if constexpr (is_first_subchunk) {
+                        beta_pipeline.consumer_wait(beta_smem_pipe_read);
+                        cutlass::arch::fence_view_async_shared();
+                    }
+                    Tensor sBeta_r = sBeta_slice(_, r_);
+                    for_each(make_int_sequence<size(tQKcMqk_subchunk)>{}, [&](auto i) {
+                        auto coord = tQKcMqk_subchunk(i);
+                        auto [s, t] = coord;
+                        tKKrKK_r_c(i) *= sBeta_r(s);
+                    });
 
-                // R2S qk_r_c, kk_r_c, wait for current QK/KK free
-                if constexpr (is_first_subchunk) {
-                    kk_pipeline.producer_acquire(kk_smem_pipe_write);
-                }
-                if constexpr (is_first_subchunk) {
-                    qk_pipeline.producer_acquire(qk_smem_pipe_write);
-                }
-                r2s_subchunk_acc(r_, c_, tQKrQK_r_c, tKKrKK_r_c);
-            };
+                    // R2S qk_r_c, kk_r_c, wait for current QK/KK free
+                    if constexpr (is_first_subchunk) {
+                        kk_pipeline.producer_acquire(kk_smem_pipe_write);
+                    }
+                    if constexpr (is_first_subchunk) {
+                        qk_pipeline.producer_acquire(qk_smem_pipe_write);
+                    }
+                    r2s_subchunk_acc(r_, c_, tQKrQK_r_c, tKKrKK_r_c);
+                };
 
             // zero fill for upper triangular of QK and KK, because smem is randomly initialized
             auto zero_fill = [&](int row, int col) INLINE_LAMBDA {
@@ -1717,8 +1744,11 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 // Q/K0@K0, Q/K3@K3, Q/K3@K0, Q/K3@K1, Q/K3@K2
 
                 // NOTE: tensor core MMA for safe gate with lower_bound >= -5
-                gemm_tensor_core_1x16x16x128(Int<0>{}, Int<0>{}, /*is_diagonal_=*/cute::true_type{},
-                                             /*is_first_subchunk_=*/cute::true_type{});
+                gemm_tensor_core_1x16x16x128(
+                    Int<0>{},
+                    Int<0>{},
+                    /*is_diagonal_=*/cute::true_type{},
+                    /*is_first_subchunk_=*/cute::true_type{});
 
                 // Q/K3@K0, Q/K3@K1, Q/K3@K2
                 // allocate acc_3_0, acc_3_1, acc_3_2 [16, 16]

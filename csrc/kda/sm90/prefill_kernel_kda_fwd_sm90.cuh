@@ -14,46 +14,49 @@
 
 #pragma once
 
-#include "cute/tensor.hpp"
-#include "cutlass/cutlass.h"
-#include "cutlass/kernel_hardware_info.h"
-#include "cutlass/util/device_memory.h"
+#include <cstdio>
+
+#include <cute/tensor.hpp>
+#include <cutlass/cutlass.h>
+#include <cutlass/kernel_hardware_info.h>
+#include <cutlass/util/device_memory.h>
 
 #include "kda/sm90/device/device_universal.hpp"
 #include "kda/sm90/kernel/builder_kda_fwd.hpp"
 #include "kda/sm90/utils/common.hpp"
-#include <cstdio>
 
 namespace kda::sm90 {
 
 using namespace cute;
 
-template <bool NeedsBeta,
-          bool NeedsAlpha,
-          bool InitStateFromInput,
-          bool SafeGate,
-          typename ArchTag,
-          typename TO,
-          typename TQKV,
-          typename TState>
+template <
+    bool NeedsBeta,
+    bool NeedsAlpha,
+    bool InitStateFromInput,
+    bool SafeGate,
+    typename ArchTag,
+    typename TO,
+    typename TQKV,
+    typename TState>
 void
-launch_kda_fwd_prefill_kernel_gbai(cudaStream_t stream,
-                                   TO* output,
-                                   TState* output_state,
-                                   TQKV const* q,
-                                   TQKV const* k,
-                                   TQKV const* v,
-                                   TState const* input_state,
-                                   float const* alpha,
-                                   float const* beta,
-                                   int32_t const* cu_seqlens,
-                                   uint8_t* workspace_buffer,
-                                   int32_t num_seqs,
-                                   int32_t num_heads,
-                                   int32_t head_size,
-                                   int64_t total_seqlen,
-                                   float scale,
-                                   int32_t sm_count) {
+launch_kda_fwd_prefill_kernel_gbai(
+    cudaStream_t stream,
+    TO* output,
+    TState* output_state,
+    TQKV const* q,
+    TQKV const* k,
+    TQKV const* v,
+    TState const* input_state,
+    float const* alpha,
+    float const* beta,
+    int32_t const* cu_seqlens,
+    uint8_t* workspace_buffer,
+    int32_t num_seqs,
+    int32_t num_heads,
+    int32_t head_size,
+    int64_t total_seqlen,
+    float scale,
+    int32_t sm_count) {
 #if defined(CULA_SM90A_ENABLED)
     constexpr bool HopperSupported = true;
 #else
@@ -77,18 +80,25 @@ launch_kda_fwd_prefill_kernel_gbai(cudaStream_t stream,
             Option<Tag::kSafeGate, SafeGateType>{},
             add_option(
                 Option<Tag::kInitStateFromInput, InitStateType>{},
-                add_option(Option<Tag::kNeedsAlpha, NeedsAlphaType>{},
-                           add_option(Option<Tag::kNeedsBeta, NeedsBetaType>{},
-                                      add_option(Option<Tag::kIsDeltaRule, cute::true_type>{}, DefaultOptions{}))))));
+                add_option(
+                    Option<Tag::kNeedsAlpha, NeedsAlphaType>{},
+                    add_option(
+                        Option<Tag::kNeedsBeta, NeedsBetaType>{},
+                        add_option(Option<Tag::kIsDeltaRule, cute::true_type>{}, DefaultOptions{}))))));
 
         using TileShape = Shape<_64, _64, _128>;
         using Scheduler = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
         using Operation = cutlass::device::Universal<typename kda::sm90::kernel::FlatBuilderKdaFwd<
-            T, float, float, TileShape,
+            T,
+            float,
+            float,
+            TileShape,
             /*LayoutQ=*/cute::tuple<int64_t, _1, int32_t>,
             /*LayoutK=*/cute::tuple<int64_t, _1, int32_t>,
             /*LayoutV=*/cute::tuple<int64_t, _1, int32_t>,
-            /*LayoutO=*/cute::tuple<int64_t, _1, int32_t>, Scheduler, Options>::Kernel>;
+            /*LayoutO=*/cute::tuple<int64_t, _1, int32_t>,
+            Scheduler,
+            Options>::Kernel>;
         using Arguments = typename Operation::Arguments;
 
         // NOTE: LayoutQ/K/V in (seq, head_size, (b,h)) coordinate semantics
@@ -97,17 +107,18 @@ launch_kda_fwd_prefill_kernel_gbai(cudaStream_t stream,
         int32_t head_stride = head_size;
 
         Operation op;
-        Arguments arguments{.problem_size =
-                                {
-                                    .cu_seqlens = cu_seqlens,
-                                    .total_seqlen = total_seqlen,
-                                    .num_seqs = num_seqs,
-                                    .num_heads = num_heads,
-                                    .head_size = head_size,
-                                },
-                            .mainloop =
-                                {
-                                    // clang-format off
+        Arguments arguments{
+            .problem_size =
+                {
+                    .cu_seqlens = cu_seqlens,
+                    .total_seqlen = total_seqlen,
+                    .num_seqs = num_seqs,
+                    .num_heads = num_heads,
+                    .head_size = head_size,
+                },
+            .mainloop =
+                {
+                    // clang-format off
                 .ptr_Q = (T*)q,      .dQ = {tok_stride, _1{}, head_stride},
                 .ptr_K = (T*)k,      .dK = {tok_stride, _1{}, head_stride},
                 .ptr_V = (T*)v,      .dV = {tok_stride, _1{}, head_stride},
@@ -118,7 +129,7 @@ launch_kda_fwd_prefill_kernel_gbai(cudaStream_t stream,
                 .scale = scale,
                 .beta_ptr  = beta,  .beta_stride  = {num_heads, 1},
         },  // clang-format on
-                            .hw_info = hw_info};
+            .hw_info = hw_info};
 
         cutlass::Status status;
         status = op.can_implement(arguments);

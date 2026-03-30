@@ -30,10 +30,11 @@
 
 #pragma once
 
-#include "kda/sm90/utils/debug.hpp"
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+
+#include "kda/sm90/utils/debug.hpp"
 
 #define FLAT_UNUSED_PARAMETER(x) (void)x
 
@@ -46,13 +47,13 @@
         }                                                                                                \
     } while (0)
 
-#define CUDA_CHECK(expr)                                                                                        \
-    do {                                                                                                        \
-        cudaError_t err = (expr);                                                                               \
-        if (err != cudaSuccess) {                                                                               \
-            std::string buffer(1024, '\0');                                                                     \
-            sprintf(buffer.data(), "CUDA Error: %s, Code: %d at %s:%d\n", cudaGetErrorName(err), err, __FILE__, \
-                    __LINE__);                                                                                  \
-            throw std::runtime_error(buffer.c_str());                                                           \
-        }                                                                                                       \
+#define CUDA_CHECK(expr)                                                                                               \
+    do {                                                                                                               \
+        cudaError_t err = (expr);                                                                                      \
+        if (err != cudaSuccess) {                                                                                      \
+            std::string buffer(1024, '\0');                                                                            \
+            sprintf(                                                                                                   \
+                buffer.data(), "CUDA Error: %s, Code: %d at %s:%d\n", cudaGetErrorName(err), err, __FILE__, __LINE__); \
+            throw std::runtime_error(buffer.c_str());                                                                  \
+        }                                                                                                              \
     } while (0)

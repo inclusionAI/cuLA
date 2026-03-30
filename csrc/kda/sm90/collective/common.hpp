@@ -30,8 +30,8 @@
 
 #pragma once
 
-#include "cute/tensor.hpp"
-#include "cutlass/kernel_hardware_info.h"
+#include <cute/tensor.hpp>
+#include <cutlass/kernel_hardware_info.h>
 
 namespace kda::sm90::collective {
 
@@ -66,11 +66,13 @@ gemm_zero_acc(Atom& atom, TA const& tA, TB const& tB, TC&& tC) {
     gemm_reset_zero_acc(atom, tA, tB, tC);
 }
 
-template <template <cute::GMMA::Major, cute::GMMA::Major, cute::GMMA::ScaleIn, cute::GMMA::ScaleIn> class Primitive,
-          cute::GMMA::Major tA,
-          cute::GMMA::Major tB,
-          cute::GMMA::ScaleIn sA,
-          cute::GMMA::ScaleIn sB>
+template <
+    template <cute::GMMA::Major, cute::GMMA::Major, cute::GMMA::ScaleIn, cute::GMMA::ScaleIn>
+    class Primitive,
+    cute::GMMA::Major tA,
+    cute::GMMA::Major tB,
+    cute::GMMA::ScaleIn sA,
+    cute::GMMA::ScaleIn sB>
 CUTE_DEVICE constexpr auto
 convert_to_gmma_rs(cute::MMA_Atom<Primitive<tA, tB, sA, sB>> const& tiled_mma) {
     using Atom = cute::MMA_Atom<Primitive<tA, tB, sA, sB>>;
@@ -82,9 +84,11 @@ convert_to_gmma_rs(cute::MMA_Atom<Primitive<tA, tB, sA, sB>> const& tiled_mma) {
     return cute::MMA_Atom<RS>{};
 }
 
-template <template <cute::GMMA::ScaleIn, cute::GMMA::ScaleIn> class Primitive,
-          cute::GMMA::ScaleIn sA,
-          cute::GMMA::ScaleIn sB>
+template <
+    template <cute::GMMA::ScaleIn, cute::GMMA::ScaleIn>
+    class Primitive,
+    cute::GMMA::ScaleIn sA,
+    cute::GMMA::ScaleIn sB>
 CUTE_DEVICE constexpr auto
 convert_to_gmma_rs(cute::MMA_Atom<Primitive<sA, sB>> const& tiled_mma) {
     using Atom = cute::MMA_Atom<Primitive<sA, sB>>;

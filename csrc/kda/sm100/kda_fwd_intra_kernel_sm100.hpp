@@ -22,10 +22,11 @@
 #include <cutlass/pipeline/pipeline.hpp>
 #include <cutlass/pipeline/sm100_pipeline.hpp>
 
-#include "kda_fwd_common.cuh"
-#include "kda_fwd_intra_mainloop_sm100.hpp"
-#include "sm100_umma_ext.hpp"
-#include <kerutils/kerutils.cuh>
+#include "kerutils/kerutils.cuh"
+
+#include "kda/sm100/kda_fwd_common.cuh"
+#include "kda/sm100/kda_fwd_intra_mainloop_sm100.hpp"
+#include "kda/sm100/sm100_umma_ext.hpp"
 
 namespace kda::sm100 {
 
@@ -203,19 +204,25 @@ struct KdaChunkFwdIntraKernelSm100 {
         // ---------------------------------------------------------------
         PipelineQKG qkg_load_pipeline(shared_plan->pipe_qkg_load_storage, qkg_load_pipe_params, ClusterShape{});
 
-        PipelineBeta beta_pipeline(shared_plan->pipe_beta_storage, beta_pipe_params,
-                                   /*InitBarriers*/ cute::true_type{});
+        PipelineBeta beta_pipeline(
+            shared_plan->pipe_beta_storage,
+            beta_pipe_params,
+            /*InitBarriers*/ cute::true_type{});
 
         // PipelineQKGInterReady   qkg_inter_pipeline(shared_plan->pipe_qkg_inter_storage, qkg_inter_pipe_params,
         // /*InitBarriers*/cute::true_type{});
-        PipelineQKGInterReady qkg_inter_pipeline(shared_plan->pipe_qkg_inter_storage, qkg_inter_pipe_params,
-                                                 ClusterShape{});
+        PipelineQKGInterReady qkg_inter_pipeline(
+            shared_plan->pipe_qkg_inter_storage, qkg_inter_pipe_params, ClusterShape{});
 
-        PipelineQKDone qk_done_pipeline(shared_plan->pipe_qk_done_storage, qk_done_pipe_params,
-                                        /*InitBarriers*/ cute::true_type{});
+        PipelineQKDone qk_done_pipeline(
+            shared_plan->pipe_qk_done_storage,
+            qk_done_pipe_params,
+            /*InitBarriers*/ cute::true_type{});
 
-        PipelineKKInvReady kk_inv_pipeline(shared_plan->pipe_kk_inv_storage, kk_inv_pipe_params,
-                                           /*InitBarriers*/ cute::true_type{});
+        PipelineKKInvReady kk_inv_pipeline(
+            shared_plan->pipe_kk_inv_storage,
+            kk_inv_pipe_params,
+            /*InitBarriers*/ cute::true_type{});
 
         // ---------------------------------------------------------------
         // Initialize pipeline states
@@ -245,30 +252,48 @@ struct KdaChunkFwdIntraKernelSm100 {
 
         if (role == WarpRole::ComputeCudaCore) {
             cutlass::arch::warpgroup_reg_alloc<NumCudaCoreRegs>();
-            mainloop.compute_cudacore_loop(params, tma_params, shared_plan, tile_scheduler, qkg_load_pipeline,
-                                           qkg_load_pipe_state_read, qkg_inter_pipeline, qkg_inter_pipe_state_write,
-                                           qk_done_pipeline, qk_done_pipe_state_read, beta_pipeline,
-                                           beta_pipe_state_read, kk_inv_pipeline, kk_inv_pipe_state_write);
+            mainloop.compute_cudacore_loop(
+                params,
+                tma_params,
+                shared_plan,
+                tile_scheduler,
+                qkg_load_pipeline,
+                qkg_load_pipe_state_read,
+                qkg_inter_pipeline,
+                qkg_inter_pipe_state_write,
+                qk_done_pipeline,
+                qk_done_pipe_state_read,
+                beta_pipeline,
+                beta_pipe_state_read,
+                kk_inv_pipeline,
+                kk_inv_pipe_state_write);
 
         } else if (role == WarpRole::Mma) {
             cutlass::arch::warpgroup_reg_dealloc<NumLoadRegs>();
-            mainloop.mma_loop(params, tma_params, shared_plan, tile_scheduler, qkg_inter_pipeline,
-                              qkg_inter_pipe_state_read, qk_done_pipeline, qk_done_pipe_state_write);
+            mainloop.mma_loop(
+                params,
+                tma_params,
+                shared_plan,
+                tile_scheduler,
+                qkg_inter_pipeline,
+                qkg_inter_pipe_state_read,
+                qk_done_pipeline,
+                qk_done_pipe_state_write);
 
         } else if (role == WarpRole::Load) {
             cutlass::arch::warpgroup_reg_dealloc<NumLoadRegs>();
-            mainloop.load_loop(params, tma_params, shared_plan, tile_scheduler, qkg_load_pipeline,
-                               qkg_load_pipe_state_write);
+            mainloop.load_loop(
+                params, tma_params, shared_plan, tile_scheduler, qkg_load_pipeline, qkg_load_pipe_state_write);
 
         } else if (role == WarpRole::Inverse) {
             cutlass::arch::warpgroup_reg_dealloc<NumInverseRegs>();
-            mainloop.inverse_loop(params, tma_params, shared_plan, tile_scheduler, kk_inv_pipeline,
-                                  kk_inv_pipe_state_read);
+            mainloop.inverse_loop(
+                params, tma_params, shared_plan, tile_scheduler, kk_inv_pipeline, kk_inv_pipe_state_read);
 
         } else {
             cutlass::arch::warpgroup_reg_dealloc<NumLoadRegs>();
-            mainloop.load_beta_loop(params, tma_params, shared_plan, tile_scheduler, beta_pipeline,
-                                    beta_pipe_state_write);
+            mainloop.load_beta_loop(
+                params, tma_params, shared_plan, tile_scheduler, beta_pipeline, beta_pipe_state_write);
         }
 
         // === CLEANUP ===
@@ -297,8 +322,8 @@ using KdaChunkFwdIntraKernelSm100_FP16_GHalf =
 // ===================================================================
 template <typename KernelT, typename TmaParamsT>
 __global__ void
-__launch_bounds__(512, 1, 1) kda_fwd_intra_sm100_kernel_entry(__grid_constant__ const KDA_fwd_intra_params params,
-                                                              __grid_constant__ const TmaParamsT tma_params) {
+__launch_bounds__(512, 1, 1) kda_fwd_intra_sm100_kernel_entry(
+    __grid_constant__ const KDA_fwd_intra_params params, __grid_constant__ const TmaParamsT tma_params) {
     KernelT kernel_obj;
     kernel_obj(params, tma_params);
 }
@@ -314,15 +339,18 @@ run_kda_fwd_intra_sm100_impl_dispatch(KDA_fwd_intra_params& params, cudaStream_t
 
     // --- Build TMA descriptors ---
     auto tma_Q = cute::make_tma_copy(
-        SM90_TMA_LOAD{}, make_tensor(make_gmem_ptr((ku::bf16*)params.q_ptr), make_layout(shape_QKG, stride_QKG)),
+        SM90_TMA_LOAD{},
+        make_tensor(make_gmem_ptr((ku::bf16*)params.q_ptr), make_layout(shape_QKG, stride_QKG)),
         typename Kernel::SmemLayoutInputBF16{});
 
     auto tma_K = cute::make_tma_copy(
-        SM90_TMA_LOAD{}, make_tensor(make_gmem_ptr((ku::bf16*)params.k_ptr), make_layout(shape_QKG, stride_QKG)),
+        SM90_TMA_LOAD{},
+        make_tensor(make_gmem_ptr((ku::bf16*)params.k_ptr), make_layout(shape_QKG, stride_QKG)),
         typename Kernel::SmemLayoutInputBF16{});
 
     auto tma_G = cute::make_tma_copy(
-        SM90_TMA_LOAD{}, make_tensor(make_gmem_ptr((float*)params.g_ptr), make_layout(shape_QKG, stride_QKG)),
+        SM90_TMA_LOAD{},
+        make_tensor(make_gmem_ptr((float*)params.g_ptr), make_layout(shape_QKG, stride_QKG)),
         typename Kernel::SmemLayoutInputFP32{});
 
     // --- Pack TMA params ---

@@ -19,22 +19,23 @@
 
 namespace cute {
 
-template <class a_type,
-          class b_type,
-          class c_type,
-          int M,
-          int N,
-          UMMA::Major a_major,
-          UMMA::Major b_major,
-          UMMA::ScaleIn a_neg = UMMA::ScaleIn::One,
-          UMMA::ScaleIn b_neg = UMMA::ScaleIn::One,
-          UMMA::Saturate c_sat = UMMA::Saturate::False>
+template <
+    class a_type,
+    class b_type,
+    class c_type,
+    int M,
+    int N,
+    UMMA::Major a_major,
+    UMMA::Major b_major,
+    UMMA::ScaleIn a_neg = UMMA::ScaleIn::One,
+    UMMA::ScaleIn b_neg = UMMA::ScaleIn::One,
+    UMMA::Saturate c_sat = UMMA::Saturate::False>
 struct SM100_MMA_TF32_TS_MASK02 {
-    static_assert(M == 64 || M == 128,
-                  "SM100_MMA_TF32_TS_MASK02 M-mode size should be 64 or 128 for 1 CTA cluster MMA.");
-    static_assert((M == 64 && (N % 8 == 0) && (8 <= N) && (N <= 256)) ||
-                      (M == 128 && (N % 16 == 0) && (16 <= N) && (N <= 256)),
-                  "SM100_MMA_TF32_TS_MASK02 N-mode size should be a multiple of 8 between 8 and 256 for M=64,\
+    static_assert(
+        M == 64 || M == 128, "SM100_MMA_TF32_TS_MASK02 M-mode size should be 64 or 128 for 1 CTA cluster MMA.");
+    static_assert(
+        (M == 64 && (N % 8 == 0) && (8 <= N) && (N <= 256)) || (M == 128 && (N % 16 == 0) && (16 <= N) && (N <= 256)),
+        "SM100_MMA_TF32_TS_MASK02 N-mode size should be a multiple of 8 between 8 and 256 for M=64,\
                  or a multiple of 16 between 16 and 256 for M=128.");
     static_assert(a_major == UMMA::Major::K, "SM100_MMA_TF32_TS_MASK02 A from TMEM can't be transposed");
 
@@ -59,8 +60,15 @@ struct SM100_MMA_TF32_TS_MASK02 {
                 "tcgen05.mma.cta_group::1.kind::tf32 [%0], [%1], %2, %3, {%5, %6, %7, %8}, p; \n\t"
                 "}\n"
                 :
-                : "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"(uint32_t(idescE >> 32)), "r"(scaleC), "r"(mask[0]),
-                  "r"(mask[1]), "r"(mask[2]), "r"(mask[3]));
+                : "r"(tmem_c),
+                  "r"(tmem_a),
+                  "l"(desc_b),
+                  "r"(uint32_t(idescE >> 32)),
+                  "r"(scaleC),
+                  "r"(mask[0]),
+                  "r"(mask[1]),
+                  "r"(mask[2]),
+                  "r"(mask[3]));
         }
 #else
         CUTE_INVALID_CONTROL_PATH(
@@ -69,22 +77,23 @@ struct SM100_MMA_TF32_TS_MASK02 {
     }
 };
 
-template <class a_type,
-          class b_type,
-          class c_type,
-          int M,
-          int N,
-          UMMA::Major a_major,
-          UMMA::Major b_major,
-          UMMA::ScaleIn a_neg = UMMA::ScaleIn::One,
-          UMMA::ScaleIn b_neg = UMMA::ScaleIn::One,
-          UMMA::Saturate c_sat = UMMA::Saturate::False>
+template <
+    class a_type,
+    class b_type,
+    class c_type,
+    int M,
+    int N,
+    UMMA::Major a_major,
+    UMMA::Major b_major,
+    UMMA::ScaleIn a_neg = UMMA::ScaleIn::One,
+    UMMA::ScaleIn b_neg = UMMA::ScaleIn::One,
+    UMMA::Saturate c_sat = UMMA::Saturate::False>
 struct SM100_MMA_TF32_TS_MASK13 {
-    static_assert(M == 64 || M == 128,
-                  "SM100_MMA_TF32_TS_MASK13 M-mode size should be 64 or 128 for 1 CTA cluster MMA.");
-    static_assert((M == 64 && (N % 8 == 0) && (8 <= N) && (N <= 256)) ||
-                      (M == 128 && (N % 16 == 0) && (16 <= N) && (N <= 256)),
-                  "SM100_MMA_TF32_TS_MASK13 N-mode size should be a multiple of 8 between 8 and 256 for M=64,\
+    static_assert(
+        M == 64 || M == 128, "SM100_MMA_TF32_TS_MASK13 M-mode size should be 64 or 128 for 1 CTA cluster MMA.");
+    static_assert(
+        (M == 64 && (N % 8 == 0) && (8 <= N) && (N <= 256)) || (M == 128 && (N % 16 == 0) && (16 <= N) && (N <= 256)),
+        "SM100_MMA_TF32_TS_MASK13 N-mode size should be a multiple of 8 between 8 and 256 for M=64,\
                  or a multiple of 16 between 16 and 256 for M=128.");
     static_assert(a_major == UMMA::Major::K, "SM100_MMA_TF32_TS_MASK13 A from TMEM can't be transposed");
 
@@ -109,8 +118,15 @@ struct SM100_MMA_TF32_TS_MASK13 {
                 "tcgen05.mma.cta_group::1.kind::tf32 [%0], [%1], %2, %3, {%5, %6, %7, %8}, p; \n\t"
                 "}\n"
                 :
-                : "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"(uint32_t(idescE >> 32)), "r"(scaleC), "r"(mask[0]),
-                  "r"(mask[1]), "r"(mask[2]), "r"(mask[3]));
+                : "r"(tmem_c),
+                  "r"(tmem_a),
+                  "l"(desc_b),
+                  "r"(uint32_t(idescE >> 32)),
+                  "r"(scaleC),
+                  "r"(mask[0]),
+                  "r"(mask[1]),
+                  "r"(mask[2]),
+                  "r"(mask[3]));
         }
 #else
         CUTE_INVALID_CONTROL_PATH(
@@ -119,23 +135,25 @@ struct SM100_MMA_TF32_TS_MASK13 {
     }
 };
 
-template <class a_type,
-          class b_type,
-          class c_type,
-          int M,
-          int N,
-          UMMA::Major a_major,
-          UMMA::Major b_major,
-          UMMA::ScaleIn a_neg,
-          UMMA::ScaleIn b_neg,
-          UMMA::Saturate c_sat>
+template <
+    class a_type,
+    class b_type,
+    class c_type,
+    int M,
+    int N,
+    UMMA::Major a_major,
+    UMMA::Major b_major,
+    UMMA::ScaleIn a_neg,
+    UMMA::ScaleIn b_neg,
+    UMMA::Saturate c_sat>
 struct MMA_Traits<SM100_MMA_TF32_TS_MASK02<a_type, b_type, c_type, M, N, a_major, b_major, a_neg, b_neg, c_sat>> {
     using ValTypeD = c_type;
     using ValTypeA = a_type;
     using ValTypeB = b_type;
     using ValTypeC = c_type;
-    static_assert(cute::sizeof_bits_v<a_type> == cute::sizeof_bits_v<b_type> && cute::sizeof_bits_v<b_type> == 32,
-                  "SM100_MMA_TF32_TS_MASK02 supports 32bit types");
+    static_assert(
+        cute::sizeof_bits_v<a_type> == cute::sizeof_bits_v<b_type> && cute::sizeof_bits_v<b_type> == 32,
+        "SM100_MMA_TF32_TS_MASK02 supports 32bit types");
 
     using FrgTypeA = UMMA::tmem_frg_1sm<a_type, a_type, UMMA::TmemAllocMode::NonInterleaved>;
     using FrgTypeB = UMMA::smem_desc<b_major>;
@@ -158,11 +176,12 @@ struct MMA_Traits<SM100_MMA_TF32_TS_MASK02<a_type, b_type, c_type, M, N, a_major
 
     template <class TD, class DLayout, class TA, class ALayout, class TB, class BLayout, class TC, class CLayout>
     CUTE_HOST_DEVICE constexpr friend void
-    mma_unpack(MMA_Traits const& traits,
-               Tensor<TD, DLayout>& D,
-               Tensor<TA, ALayout> const& A,
-               Tensor<TB, BLayout> const& B,
-               Tensor<TC, CLayout> const& C) {
+    mma_unpack(
+        MMA_Traits const& traits,
+        Tensor<TD, DLayout>& D,
+        Tensor<TA, ALayout> const& A,
+        Tensor<TB, BLayout> const& B,
+        Tensor<TC, CLayout> const& C) {
         static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
         static_assert(is_tmem<TA>::value, "Expected tmem in MMA_Atom::call");
         static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
@@ -178,23 +197,25 @@ struct MMA_Traits<SM100_MMA_TF32_TS_MASK02<a_type, b_type, c_type, M, N, a_major
     }
 };
 
-template <class a_type,
-          class b_type,
-          class c_type,
-          int M,
-          int N,
-          UMMA::Major a_major,
-          UMMA::Major b_major,
-          UMMA::ScaleIn a_neg,
-          UMMA::ScaleIn b_neg,
-          UMMA::Saturate c_sat>
+template <
+    class a_type,
+    class b_type,
+    class c_type,
+    int M,
+    int N,
+    UMMA::Major a_major,
+    UMMA::Major b_major,
+    UMMA::ScaleIn a_neg,
+    UMMA::ScaleIn b_neg,
+    UMMA::Saturate c_sat>
 struct MMA_Traits<SM100_MMA_TF32_TS_MASK13<a_type, b_type, c_type, M, N, a_major, b_major, a_neg, b_neg, c_sat>> {
     using ValTypeD = c_type;
     using ValTypeA = a_type;
     using ValTypeB = b_type;
     using ValTypeC = c_type;
-    static_assert(cute::sizeof_bits_v<a_type> == cute::sizeof_bits_v<b_type> && cute::sizeof_bits_v<b_type> == 32,
-                  "SM100_MMA_TF32_TS_MASK13 supports 32bit types");
+    static_assert(
+        cute::sizeof_bits_v<a_type> == cute::sizeof_bits_v<b_type> && cute::sizeof_bits_v<b_type> == 32,
+        "SM100_MMA_TF32_TS_MASK13 supports 32bit types");
 
     using FrgTypeA = UMMA::tmem_frg_1sm<a_type, a_type, UMMA::TmemAllocMode::NonInterleaved>;
     using FrgTypeB = UMMA::smem_desc<b_major>;
@@ -217,11 +238,12 @@ struct MMA_Traits<SM100_MMA_TF32_TS_MASK13<a_type, b_type, c_type, M, N, a_major
 
     template <class TD, class DLayout, class TA, class ALayout, class TB, class BLayout, class TC, class CLayout>
     CUTE_HOST_DEVICE constexpr friend void
-    mma_unpack(MMA_Traits const& traits,
-               Tensor<TD, DLayout>& D,
-               Tensor<TA, ALayout> const& A,
-               Tensor<TB, BLayout> const& B,
-               Tensor<TC, CLayout> const& C) {
+    mma_unpack(
+        MMA_Traits const& traits,
+        Tensor<TD, DLayout>& D,
+        Tensor<TA, ALayout> const& A,
+        Tensor<TB, BLayout> const& B,
+        Tensor<TC, CLayout> const& C) {
         static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
         static_assert(is_tmem<TA>::value, "Expected tmem in MMA_Atom::call");
         static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");

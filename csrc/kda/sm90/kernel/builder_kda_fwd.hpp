@@ -22,46 +22,50 @@
 
 namespace kda::sm90::kernel {
 
-template <class Element_,
-          class ElementAccumulatorQK_,
-          class ElementAccumulatorPV_,
-          class TileShape_,  // BlkSeqQO, BlkSeqKV, HeadSize
-          class LayoutQ_,
-          class LayoutK_,
-          class LayoutV_,
-          class LayoutO_,
-          class DispatchPolicy,
-          class Options = DefaultOptions>
+template <
+    class Element_,
+    class ElementAccumulatorQK_,
+    class ElementAccumulatorPV_,
+    class TileShape_,  // BlkSeqQO, BlkSeqKV, HeadSize
+    class LayoutQ_,
+    class LayoutK_,
+    class LayoutV_,
+    class LayoutO_,
+    class DispatchPolicy,
+    class Options = DefaultOptions>
 struct FlatBuilderKdaFwd;
 
-template <class Element,
-          class ElementAccumulatorQK,
-          class ElementAccumulatorPV,
-          class TileShape,  // BlkSeqQO, BlkSeqKV, HeadSize
-          class LayoutQ,
-          class LayoutK,
-          class LayoutV,
-          class LayoutO,
-          class Options>
-struct FlatBuilderKdaFwd<Element,
-                         ElementAccumulatorQK,
-                         ElementAccumulatorPV,
-                         TileShape,
-                         LayoutQ,
-                         LayoutK,
-                         LayoutV,
-                         LayoutO,
-                         cutlass::gemm::KernelTmaWarpSpecializedCooperative,
-                         Options> {
-    using CollectiveMainloop = kda::sm90::collective::FlatMainloopTmaWarpSpecializedKdaFwd<Element,
-                                                                                           ElementAccumulatorQK,
-                                                                                           ElementAccumulatorPV,
-                                                                                           TileShape,
-                                                                                           LayoutQ,
-                                                                                           LayoutK,
-                                                                                           LayoutV,
-                                                                                           LayoutO,
-                                                                                           Options>;
+template <
+    class Element,
+    class ElementAccumulatorQK,
+    class ElementAccumulatorPV,
+    class TileShape,  // BlkSeqQO, BlkSeqKV, HeadSize
+    class LayoutQ,
+    class LayoutK,
+    class LayoutV,
+    class LayoutO,
+    class Options>
+struct FlatBuilderKdaFwd<
+    Element,
+    ElementAccumulatorQK,
+    ElementAccumulatorPV,
+    TileShape,
+    LayoutQ,
+    LayoutK,
+    LayoutV,
+    LayoutO,
+    cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+    Options> {
+    using CollectiveMainloop = kda::sm90::collective::FlatMainloopTmaWarpSpecializedKdaFwd<
+        Element,
+        ElementAccumulatorQK,
+        ElementAccumulatorPV,
+        TileShape,
+        LayoutQ,
+        LayoutK,
+        LayoutV,
+        LayoutO,
+        Options>;
 
     static constexpr bool kIsPersistent = find_option_t<Tag::kIsPersistent, false_type, Options>::value;
     static_assert(!kIsPersistent, "not implemented");

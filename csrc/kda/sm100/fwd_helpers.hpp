@@ -16,7 +16,7 @@
 
 #include <cute/tensor.hpp>
 
-#include <kerutils/kerutils.cuh>
+#include "kerutils/kerutils.cuh"
 
 namespace kda::sm100 {
 
@@ -335,13 +335,14 @@ fwd_setup_kg_col3_1out(G_TENSOR& sG, K_TENSOR& sK, KG_TENSOR& sKG_intra, int idx
 // fwd_setup_A_inter_intra_all: fused inter+intra, single Vec (Q or K)
 template <int TileK, typename G_TENSOR, typename VEC_TENSOR>
 __forceinline__ __device__ void
-fwd_setup_A_inter_intra_all(G_TENSOR& sG,
-                            VEC_TENSOR& sVec,
-                            int idx_in_warpgroup,
-                            int sub_seq_len,
-                            int k_offset,
-                            int tmem_addr_inter,
-                            int tmem_addr_intra) {
+fwd_setup_A_inter_intra_all(
+    G_TENSOR& sG,
+    VEC_TENSOR& sVec,
+    int idx_in_warpgroup,
+    int sub_seq_len,
+    int k_offset,
+    int tmem_addr_inter,
+    int tmem_addr_intra) {
     int row = idx_in_warpgroup % 64;
     int sub_tile_i = row / 16;  // 0, 1, 2, or 3
     float res_inter[TileK];
@@ -436,13 +437,14 @@ fwd_setup_A_inter_all(
 // Threads 0-63 → gated Q (inter), Threads 64-127 → gated K (inter)
 template <int TileK, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
 __forceinline__ __device__ void
-fwd_setup_A_inter_all_QK(G_TENSOR& sG,
-                         Q_TENSOR& sQ,
-                         K_TENSOR& sK,
-                         int idx_in_warpgroup,
-                         int sub_seq_len,
-                         int k_offset,
-                         int tmem_addr_inter) {
+fwd_setup_A_inter_all_QK(
+    G_TENSOR& sG,
+    Q_TENSOR& sQ,
+    K_TENSOR& sK,
+    int idx_in_warpgroup,
+    int sub_seq_len,
+    int k_offset,
+    int tmem_addr_inter) {
     if (idx_in_warpgroup < 64) {
         fwd_setup_A_inter_all<TileK>(sG, sQ, idx_in_warpgroup, sub_seq_len, k_offset, tmem_addr_inter + k_offset);
     } else {
@@ -454,20 +456,21 @@ fwd_setup_A_inter_all_QK(G_TENSOR& sG,
 // Threads 0-63 → gated Q (inter + intra), Threads 64-127 → gated K (inter + intra)
 template <int TileK, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
 __forceinline__ __device__ void
-fwd_setup_A_inter_intra_all_QK(G_TENSOR& sG,
-                               Q_TENSOR& sQ,
-                               K_TENSOR& sK,
-                               int idx_in_warpgroup,
-                               int sub_seq_len,
-                               int k_offset,
-                               int tmem_addr_inter,
-                               int tmem_addr_intra) {
+fwd_setup_A_inter_intra_all_QK(
+    G_TENSOR& sG,
+    Q_TENSOR& sQ,
+    K_TENSOR& sK,
+    int idx_in_warpgroup,
+    int sub_seq_len,
+    int k_offset,
+    int tmem_addr_inter,
+    int tmem_addr_intra) {
     if (idx_in_warpgroup < 64) {
-        fwd_setup_A_inter_intra_all<TileK>(sG, sQ, idx_in_warpgroup, sub_seq_len, k_offset, tmem_addr_inter + k_offset,
-                                           tmem_addr_intra + k_offset);
+        fwd_setup_A_inter_intra_all<TileK>(
+            sG, sQ, idx_in_warpgroup, sub_seq_len, k_offset, tmem_addr_inter + k_offset, tmem_addr_intra + k_offset);
     } else {
-        fwd_setup_A_inter_intra_all<TileK>(sG, sK, idx_in_warpgroup, sub_seq_len, k_offset, tmem_addr_inter + k_offset,
-                                           tmem_addr_intra + k_offset);
+        fwd_setup_A_inter_intra_all<TileK>(
+            sG, sK, idx_in_warpgroup, sub_seq_len, k_offset, tmem_addr_inter + k_offset, tmem_addr_intra + k_offset);
     }
 }
 
@@ -660,18 +663,19 @@ fwd_epilogue_t2r_kk(int tmem_kk_addr, int idx_in_warpgroup, int sub_seq_len, flo
 // sKK: SMEM tensor for KK inverse (fp16, upper threads only)
 template <int TileT, bool UseTF32Inverse, bool RoundingTF32, typename KK_SMEM_TENSOR>
 __forceinline__ __device__ void
-fwd_epilogue_qk_kk(int tmem_qk_addr,
-                   int idx_in_warpgroup,
-                   int sub_seq_len,
-                   float scale,
-                   float beta_row,
-                   __nv_bfloat16* qk_out_base,
-                   KK_SMEM_TENSOR& sKK) {
+fwd_epilogue_qk_kk(
+    int tmem_qk_addr,
+    int idx_in_warpgroup,
+    int sub_seq_len,
+    float scale,
+    float beta_row,
+    __nv_bfloat16* qk_out_base,
+    KK_SMEM_TENSOR& sKK) {
     if (idx_in_warpgroup < 64) {
         fwd_epilogue_t2r_qk<TileT>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, scale, qk_out_base);
     } else {
-        fwd_epilogue_t2r_kk<TileT, UseTF32Inverse, RoundingTF32>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, beta_row,
-                                                                 sKK);
+        fwd_epilogue_t2r_kk<TileT, UseTF32Inverse, RoundingTF32>(
+            tmem_qk_addr, idx_in_warpgroup, sub_seq_len, beta_row, sKK);
     }
 }
 

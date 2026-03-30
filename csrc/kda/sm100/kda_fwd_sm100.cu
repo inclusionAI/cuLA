@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "kda_fwd_common.cuh"
-#include "kda_fwd_intra_kernel_sm100.hpp"
-#include "kda_fwd_recomp_w_u_kernel_sm100.hpp"
+#include "kda/sm100/kda_fwd_common.cuh"
+#include "kda/sm100/kda_fwd_intra_kernel_sm100.hpp"
+#include "kda/sm100/kda_fwd_recomp_w_u_kernel_sm100.hpp"
 
 namespace kda::sm100 {
 

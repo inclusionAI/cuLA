@@ -30,7 +30,7 @@
 
 #pragma once
 
-#include "cute/config.hpp"
+#include <cute/config.hpp>
 
 namespace kda::sm90 {
 

@@ -14,10 +14,10 @@
 
 #pragma once
 
-#include "cute/tensor.hpp"
-#include "cutlass/cutlass.h"
-#include "cutlass/fast_math.h"
-#include "cutlass/kernel_hardware_info.h"
+#include <cute/tensor.hpp>
+#include <cutlass/cutlass.h>
+#include <cutlass/fast_math.h>
+#include <cutlass/kernel_hardware_info.h>
 
 // TODO: implement DynamicPersistentTileScheduler with atomic added tile_counter
 
