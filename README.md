@@ -16,6 +16,8 @@ This recurrence reduces the complexity from $O(N^2)$ (standard attention) to $O(
 
 **cuLA** provides hand-tuned CUDA implementations of these linear attention variants, targeting NVIDIA Blackwell (SM100) and Hopper (SM90) GPUs. It is designed as a submodule of [flash-linear-attention (FLA)](https://github.com/fla-org/flash-linear-attention), sharing the same interface — adopting cuLA requires only a one-line import change. For ease of maintenance, cuLA is currently developed as a standalone library; the end goal is for users to seamlessly access these kernels through FLA. Since FLA already has a kernel dispatch mechanism in place, integration will be ready soon.
 
+> **⚠️ Early Stage:** cuLA is in its early development phase. Many kernels still have significant room for optimization, and the API may evolve. We warmly welcome contributions from the community — whether it's performance tuning, new algorithm support, bug fixes, or architectural improvements. Every contribution helps push the boundaries of linear attention on modern GPUs!
+
 ## Installation
 
 cuLA supports both **Hopper (SM90)** and **Blackwell (SM100)** GPUs.
@@ -166,37 +168,39 @@ See [REPO_LAYOUT.md](REPO_LAYOUT.md) for the full directory structure and a summ
 ## Roadmap
 
 * [ ] Integrate into [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) via FLA's kernel dispatch mechanism
-* [ ] More fusions.
+* [ ] Polynomial approximation to mitigate the exponential bottleneck, as in [Flash-Attentiton-4](https://arxiv.org/abs/2603.05451).
+* [ ] Larger chunk size on SM100 for improved throughput.
+* [ ] Continuous optimization via agentic methods such as [AVO](https://arxiv.org/abs/2603.24517).
+* [ ] Support for more algorithms.
+* [ ] Small B/H/S optimizations.
 
 **Train**
 
-* [x] Modular KDA Forward (sm100, compatible with Kimi CP)
+* [x] Modular KDA Forward (SM100, compatible with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/KCP.md))
   * [x] kda chunk intra
   * [x] chunk gated delta h
   * [ ] recompute wu
   * [x] chunk fwd o
 
-* [ ] Modular GDN Forward / Backward Kernels (compatible with Kimi CP)
+* [ ] Modular GDN Forward / Backward Kernels (compatible with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/KCP.md))
 
-* [ ] More backward supports
+* [ ] Backward pass optimizations.
 
-* [ ] Kernel-level compute-communication overlapping CP linear attention kernels (via **nvshmem**)
+* [ ] Kernel-level compute-communication overlapping for CP linear attention kernels (via **nvshmem**)
 
 **Inference**
 
-* [x] Lightning prefill kernel (sm100)
+* [x] Lightning prefill kernel (SM100)
 
-* [x] Lightning decode kernel (sm90 & sm100)
+* [x] Lightning decode kernel (SM90 & SM100)
 
-* [x] Fused KDA prefill kernel (sm90)
+* [x] Fused KDA prefill kernel (SM90)
 
-* [ ] Fused KDA prefill kernel (sm100)
-
-* [ ] Small B/H optimizations
+* [ ] Fused KDA prefill kernel (SM100)
 
 * [ ] MTP support
 
-* [ ] More aggressive fusion of small neighbor kernels like cumsum for inference scenarios.
+* [ ] More aggressive fusion of small neighboring kernels like cumsum for inference scenarios.
 
 ## Acknowledgements
 
