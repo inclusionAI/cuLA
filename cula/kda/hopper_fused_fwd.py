@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
-import warnings
 
 import torch
 from einops import rearrange
@@ -24,28 +22,7 @@ from fla.ops.utils.constant import RCP_LN2
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 import cula.cudac as cula_cuda
-
-
-@functools.cache
-def _get_device_sm_count(device: torch.device) -> int:
-    return torch.cuda.get_device_properties(device).multi_processor_count
-
-
-_cache_buf = {}
-
-
-def _get_cache_buf(name: str, nbytes: int, device: torch.device) -> torch.Tensor:
-    key = (name, device)
-    buf = _cache_buf.get(key)
-    if buf is None or buf.size(0) < nbytes:
-        buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
-        _cache_buf[key] = buf
-    return buf
-
-
-@functools.cache
-def _prepare_uniform_cu_seqlens(batch_size: int, seqlen: int, device: torch.device) -> torch.Tensor:
-    return torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, device=device, dtype=torch.int32)
+from cula.utils import _get_cache_buf, get_device_sm_count, prepare_uniform_cu_seqlens
 
 
 class HopperChunkKDAFunction(torch.autograd.Function):
@@ -77,8 +54,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         batch_size, seq_len, num_heads, head_dim = q.shape
 
         if cu_seqlens is None:
-            cu_seqlens = _prepare_uniform_cu_seqlens(batch_size, seq_len, q.device)
-            warnings.warn("cu_seqlens is not provided and created on-the-fly, will face performance degradation!")
+            cu_seqlens = prepare_uniform_cu_seqlens(batch_size, seq_len, q.device, torch.int32)
 
         # set batch size to 1 after handling cu_seqlens
         if batch_size != 1:
@@ -121,7 +97,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         beta = beta.reshape(packed_seq, num_heads).contiguous()
 
         # workspace buffer for TMA Store O tensormap
-        sm_count = _get_device_sm_count(q.device)
+        sm_count = get_device_sm_count(q.device)
         workspace_size = sm_count * 128
         workspace_buffer = _get_cache_buf("hopper_kda_fwd_workspace", workspace_size, q.device)
 
@@ -155,7 +131,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
 
 
 @torch.compiler.disable
-def flash_kda_prefill_hopper(
+def cula_kda_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,

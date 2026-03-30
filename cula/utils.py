@@ -12,7 +12,6 @@ from collections.abc import Callable
 import cutlass
 import torch
 from cutlass import cute
-from fla.utils import tensor_cache
 
 # ---------------------------------------------------------------------------
 # Fast-math flag (read once at import time)
@@ -54,7 +53,7 @@ def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callabl
     """Return the appropriate ``flash_kda_prefill`` implementation for *device*.
 
     - sm100 (Blackwell) → cula.kda.blackwell_fused_fwd.flash_kda_prefill
-    - sm90  (Hopper)    → cula.kda.hopper_fused_fwd.flash_kda_prefill_hopper
+    - sm90  (Hopper)    → cula.kda.hopper_fused_fwd.cula_kda_prefill
 
     Args:
         device: CUDA device to query.  Defaults to the currently active device.
@@ -70,9 +69,9 @@ def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callabl
             "Please use a sm90a (Hopper) device or wait for future updates."
         )
     elif major == 9 and minor == 0:
-        from cula.kda.hopper_fused_fwd import flash_kda_prefill_hopper
+        from cula.kda.hopper_fused_fwd import cula_kda_prefill
 
-        return flash_kda_prefill_hopper
+        return cula_kda_prefill
     else:
         raise RuntimeError(
             f"Unsupported CUDA compute capability sm_{major}{minor}. Only sm90a (Hopper) and sm100a (Blackwell) are supported."
@@ -181,7 +180,24 @@ def print_tensor_partial(tensor: cute.Tensor, max_rows: int, max_cols: int):
     cute.printf("----------------------------------\n")
 
 
-@tensor_cache
+@functools.cache
 def prepare_uniform_cu_seqlens(batch_size: int, seqlen: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, device=device, dtype=dtype)
     return cu_seqlens
+
+
+@functools.cache
+def get_device_sm_count(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+_cache_buf = {}
+
+
+def _get_cache_buf(name: str, nbytes: int, device: torch.device) -> torch.Tensor:
+    key = (name, device)
+    buf = _cache_buf.get(key)
+    if buf is None or buf.size(0) < nbytes:
+        buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        _cache_buf[key] = buf
+    return buf

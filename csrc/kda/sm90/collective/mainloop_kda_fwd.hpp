@@ -1956,7 +1956,6 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             }
         };
 
-        // FIXME: worse perf maybe because WG sync after QK & KK?
         auto qk_and_kk_epi = [&](auto is_final_block_, auto B /*valid seqlen*/) INLINE_LAMBDA {
             using CopyOpS2R_Chunk = SM75_U32x4_LDSM_N;
             using CopyOpR2S_Chunk = SM90_U32x4_STSM_N;
@@ -2019,6 +2018,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             // kk_pipeline.producer_acquire(kk_smem_pipe_write);
 
             // SubChunk MMA for QK^T and KK^T for numerical stability
+            // FIXME: use g_half as anchor in the diagonal subchunk to align with FLA for smaller numerical differences
             qk_kk_subchunk_mma_and_store(blk);
             // wait for QK/KK ready
             cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup, KdaNamedBarriers::AuxMath);

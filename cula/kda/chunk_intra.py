@@ -14,7 +14,6 @@
 
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-import warnings
 
 import torch
 import triton
@@ -769,7 +768,6 @@ def chunk_kda_fwd_intra(
     if cu_seqlens is None:
         reset_cu_seqlens = True
         cu_seqlens = prepare_uniform_cu_seqlens(B, T, q.device, torch.int32)
-        warnings.warn("cu_seqlens is not provided and created on-the-fly, will face performance degradation!")
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)

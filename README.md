@@ -59,7 +59,7 @@ cuLA is a drop-in replacement for [FLA](https://github.com/fla-org/flash-linear-
 import torch
 from cula.kda.chunk import chunk_kda  # <-- one-line change from fla.ops.kda
 
-B, T, H, K, V = 2, 2048, 4, 128, 128
+B, T, H, K, V = 2, 2048, 32, 128, 128
 device = 'cuda'
 
 q = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -88,14 +88,18 @@ o, final_state = chunk_kda(
 do = torch.randn_like(o)
 o.backward(do)
 
-print(f'Output shape: {o.shape}')             # [2, 2048, 4, 128]
-print(f'Final state shape: {final_state.shape}')  # [2, 4, 128, 128]
+print(f'Output shape: {o.shape}')             # [2, 2048, 32, 128]
+print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 ```
 
 **Notes:**
 - `safe_gate=True` is required to leverage TensorCore acceleration.
 - `beta` and `initial_state` must be `float32`.
 - `cu_seqlens` (for variable-length sequences) must be `int32`.
+
+## Usage
+
+See [USAGE.md](USAGE.md) for detailed usage examples and notes.
 
 ## Benchmarks
 
