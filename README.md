@@ -209,7 +209,7 @@ If you find cuLA useful, please cite it using the metadata in our [`CITATION.cff
 ```bibtex
 @software{cula2026,
   title   = {cuLA: CUDA Linear Attention},
-  author  = {Chaofan Yu, Bowen Zeng, Hao Chen, Zhe Yang, Zhiqiang Zhang and Jun Zhou},
+  author  = {Chaofan Yu, Bowen Zeng, Hao Chen, Zhe Yang, Zhiqiang Zhang, Huan Li and Jun Zhou},
   year    = {2026},
   url     = {https://github.com/InclusionAI/cuLA}
 }
