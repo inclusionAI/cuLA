@@ -204,7 +204,7 @@ See [REPO_LAYOUT.md](REPO_LAYOUT.md) for the full directory structure and a summ
 
 ## Acknowledgements
 
-This project is inspired by [flash-linear-attention](https://github.com/fla-org/flash-linear-attention), [CUTLASS](https://github.com/NVIDIA/cutlass) and [CuTe DSL](https://github.com/NVIDIA/cutlass/tree/main/python/CuTeDSL). We thank [FLA-org](https://github.com/fla-org) and NVIDIA for their great work.
+This project is inspired by [flash-linear-attention](https://github.com/fla-org/flash-linear-attention), [CUTLASS](https://github.com/NVIDIA/cutlass), [CuTe DSL](https://github.com/NVIDIA/cutlass/tree/main/python/CuTeDSL), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Flash-Attention](https://github.com/dao-ailab/flash-attention), and [FlashMLA](https://github.com/deepseek-ai/FlashMLA). We thank [FLA-org](https://github.com/fla-org) and NVIDIA for their great work.
 
 ## Citation
 
