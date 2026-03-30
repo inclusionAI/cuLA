@@ -173,7 +173,7 @@ See [REPO_LAYOUT.md](REPO_LAYOUT.md) for the full directory structure and a summ
 
 * [ ] Integrate into [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) via FLA's kernel dispatch mechanism
 * [ ] Polynomial approximation to mitigate the exponential bottleneck, as in [Flash-Attentiton-4](https://arxiv.org/abs/2603.05451).
-* [ ] Larger chunk size on SM100 for improved throughput.
+* [ ] Larger chunk size and 2-CTA on SM100 for improved throughput.
 * [ ] Continuous optimization via agentic methods such as [AVO](https://arxiv.org/abs/2603.24517).
 * [ ] Support for more algorithms.
 * [ ] Small B/H/S optimizations.
