@@ -33,12 +33,12 @@
 namespace kda::sm90::collective {
 
 struct FlatSharedNamedBarriers {
-  static constexpr int AllMmaThreadsSync   = 0;
-  static constexpr int AllLdStThreadsSync  = 1;
-  static constexpr int MmaCooperativeStore = 2;
+    static constexpr int AllMmaThreadsSync = 0;
+    static constexpr int AllLdStThreadsSync = 1;
+    static constexpr int MmaCooperativeStore = 2;
 
-protected:
-  static constexpr int NumBarriersUsed = 4;
+   protected:
+    static constexpr int NumBarriersUsed = 4;
 };
 
-}
+}  // namespace kda::sm90::collective

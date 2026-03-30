@@ -15,13 +15,14 @@
 #pragma once
 
 #include <cute/tensor.hpp>
+
 #include <kerutils/kerutils.cuh>
 
 namespace kda::sm100 {
 
-using ku::nvbf16x4;
-using ku::float2_sub;
 using ku::float2_mul;
+using ku::float2_sub;
+using ku::nvbf16x4;
 using ku::store_128b;
 using namespace cute;
 
@@ -75,17 +76,16 @@ using namespace cute;
 //     inter(2,0): exp2(g_first_2 - g_0[x]) * K_0[x] → sKG_inter index 1
 //     inter(3,0): exp2(g_first_3 - g_0[x]) * K_0[x] → sKG_inter index 3
 template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_, bool UnifiedGRef = true>
-__forceinline__ __device__ void fwd_setup_kg_col0_4out(
-    G_TENSOR &sG, K_TENSOR &sK,
-    KG_TENSOR &sKG_inter, KG_TENSOR &sKG_intra,
-    int idx_in_warpgroup, int sub_seq_len) {
+__forceinline__ __device__ void
+fwd_setup_kg_col0_4out(
+    G_TENSOR& sG, K_TENSOR& sK, KG_TENSOR& sKG_inter, KG_TENSOR& sKG_intra, int idx_in_warpgroup, int sub_seq_len) {
     constexpr int intra_offset = UnifiedGRef ? 0 : 8;
     int y_base = idx_in_warpgroup % 8 * 4;
     // K data from sub_tile j=0
     int x = idx_in_warpgroup / 8 + 0 * 16;
-    // Loop over column chunks to cover full TileK width
-    // When TileK_=32: single iteration (y_iter=0). When TileK_=64: two iterations.
-    #pragma unroll
+// Loop over column chunks to cover full TileK width
+// When TileK_=32: single iteration (y_iter=0). When TileK_=64: two iterations.
+#pragma unroll
     for (int y_iter = 0; y_iter < TileK_; y_iter += 32) {
         int y = y_base + y_iter;
         // Load 4 g_ref values for this column chunk
@@ -104,8 +104,10 @@ __forceinline__ __device__ void fwd_setup_kg_col0_4out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_0_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_0_local)[1], g_b);
-                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                s1.x = exp2f(s1.x);
+                s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x);
+                s2.y = exp2f(s2.y);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -115,8 +117,10 @@ __forceinline__ __device__ void fwd_setup_kg_col0_4out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_1_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_1_local)[1], g_b);
-                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                s1.x = exp2f(s1.x);
+                s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x);
+                s2.y = exp2f(s2.y);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -126,8 +130,10 @@ __forceinline__ __device__ void fwd_setup_kg_col0_4out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[1], g_b);
-                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                s1.x = exp2f(s1.x);
+                s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x);
+                s2.y = exp2f(s2.y);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -137,8 +143,10 @@ __forceinline__ __device__ void fwd_setup_kg_col0_4out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[1], g_b);
-                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                s1.x = exp2f(s1.x);
+                s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x);
+                s2.y = exp2f(s2.y);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -160,15 +168,14 @@ __forceinline__ __device__ void fwd_setup_kg_col0_4out(
 //     inter(2,1): exp2(g_first_2 - g_1[x]) * K_1[x] → sKG_inter index 2
 //     inter(3,1): exp2(g_first_3 - g_1[x]) * K_1[x] → sKG_inter index 4
 template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_, bool UnifiedGRef = true>
-__forceinline__ __device__ void fwd_setup_kg_col1_3out(
-    G_TENSOR &sG, K_TENSOR &sK,
-    KG_TENSOR &sKG_inter, KG_TENSOR &sKG_intra,
-    int idx_in_warpgroup, int sub_seq_len) {
+__forceinline__ __device__ void
+fwd_setup_kg_col1_3out(
+    G_TENSOR& sG, K_TENSOR& sK, KG_TENSOR& sKG_inter, KG_TENSOR& sKG_intra, int idx_in_warpgroup, int sub_seq_len) {
     constexpr int intra_offset = UnifiedGRef ? 0 : 8;
     int y_base = idx_in_warpgroup % 8 * 4;
     // K data from sub_tile j=1
     int x = idx_in_warpgroup / 8 + 1 * 16;
-    #pragma unroll
+#pragma unroll
     for (int y_iter = 0; y_iter < TileK_; y_iter += 32) {
         int y = y_base + y_iter;
         // Load 3 g_ref values for this column chunk
@@ -186,8 +193,10 @@ __forceinline__ __device__ void fwd_setup_kg_col1_3out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_1_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_1_local)[1], g_b);
-                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                s1.x = exp2f(s1.x);
+                s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x);
+                s2.y = exp2f(s2.y);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -197,8 +206,10 @@ __forceinline__ __device__ void fwd_setup_kg_col1_3out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[1], g_b);
-                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                s1.x = exp2f(s1.x);
+                s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x);
+                s2.y = exp2f(s2.y);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -208,8 +219,10 @@ __forceinline__ __device__ void fwd_setup_kg_col1_3out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[1], g_b);
-                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                s1.x = exp2f(s1.x);
+                s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x);
+                s2.y = exp2f(s2.y);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -229,15 +242,14 @@ __forceinline__ __device__ void fwd_setup_kg_col1_3out(
 //     intra(2,2): exp2(g_half_2 - g_2[x]) * K_2[x]  → sKG_intra index 2
 //     inter(3,2): exp2(g_first_3 - g_2[x]) * K_2[x] → sKG_inter index 5
 template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_, bool UnifiedGRef = true>
-__forceinline__ __device__ void fwd_setup_kg_col2_2out(
-    G_TENSOR &sG, K_TENSOR &sK,
-    KG_TENSOR &sKG_inter, KG_TENSOR &sKG_intra,
-    int idx_in_warpgroup, int sub_seq_len) {
+__forceinline__ __device__ void
+fwd_setup_kg_col2_2out(
+    G_TENSOR& sG, K_TENSOR& sK, KG_TENSOR& sKG_inter, KG_TENSOR& sKG_intra, int idx_in_warpgroup, int sub_seq_len) {
     constexpr int intra_offset = UnifiedGRef ? 0 : 8;
     int y_base = idx_in_warpgroup % 8 * 4;
     // K data from sub_tile j=2
     int x = idx_in_warpgroup / 8 + 2 * 16;
-    #pragma unroll
+#pragma unroll
     for (int y_iter = 0; y_iter < TileK_; y_iter += 32) {
         int y = y_base + y_iter;
         // Load 2 g_ref values for this column chunk
@@ -254,8 +266,10 @@ __forceinline__ __device__ void fwd_setup_kg_col2_2out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[1], g_b);
-                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                s1.x = exp2f(s1.x);
+                s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x);
+                s2.y = exp2f(s2.y);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -265,8 +279,10 @@ __forceinline__ __device__ void fwd_setup_kg_col2_2out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[1], g_b);
-                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                s1.x = exp2f(s1.x);
+                s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x);
+                s2.y = exp2f(s2.y);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -284,15 +300,13 @@ __forceinline__ __device__ void fwd_setup_kg_col2_2out(
 //   Loads K_3 + G data once, computes:
 //     intra(3,3): exp2(g_half_3 - g_3[x]) * K_3[x]  → sKG_intra index 3
 template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_, bool UnifiedGRef = true>
-__forceinline__ __device__ void fwd_setup_kg_col3_1out(
-    G_TENSOR &sG, K_TENSOR &sK,
-    KG_TENSOR &sKG_intra,
-    int idx_in_warpgroup, int sub_seq_len) {
+__forceinline__ __device__ void
+fwd_setup_kg_col3_1out(G_TENSOR& sG, K_TENSOR& sK, KG_TENSOR& sKG_intra, int idx_in_warpgroup, int sub_seq_len) {
     constexpr int intra_offset = UnifiedGRef ? 0 : 8;
     int y_base = idx_in_warpgroup % 8 * 4;
     // K data from sub_tile j=3
     int x = idx_in_warpgroup / 8 + 3 * 16;
-    #pragma unroll
+#pragma unroll
     for (int y_iter = 0; y_iter < TileK_; y_iter += 32) {
         int y = y_base + y_iter;
         // Load 1 g_ref value for this column chunk
@@ -303,8 +317,10 @@ __forceinline__ __device__ void fwd_setup_kg_col3_1out(
             // intra(3,3): exp2(g_first_3 - g[x]) * K[x]
             float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[0], reinterpret_cast<float2*>(&g)[0]);
             float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[1], reinterpret_cast<float2*>(&g)[1]);
-            s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-            s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+            s1.x = exp2f(s1.x);
+            s1.y = exp2f(s1.y);
+            s2.x = exp2f(s2.x);
+            s2.y = exp2f(s2.y);
             float4 res;
             reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, __bfloat1622float2(k.a));
             reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, __bfloat1622float2(k.b));
@@ -318,23 +334,27 @@ __forceinline__ __device__ void fwd_setup_kg_col3_1out(
 
 // fwd_setup_A_inter_intra_all: fused inter+intra, single Vec (Q or K)
 template <int TileK, typename G_TENSOR, typename VEC_TENSOR>
-__forceinline__ __device__ void fwd_setup_A_inter_intra_all(
-    G_TENSOR &sG, VEC_TENSOR &sVec,
-    int idx_in_warpgroup, int sub_seq_len, int k_offset,
-    int tmem_addr_inter, int tmem_addr_intra) {
+__forceinline__ __device__ void
+fwd_setup_A_inter_intra_all(G_TENSOR& sG,
+                            VEC_TENSOR& sVec,
+                            int idx_in_warpgroup,
+                            int sub_seq_len,
+                            int k_offset,
+                            int tmem_addr_inter,
+                            int tmem_addr_intra) {
     int row = idx_in_warpgroup % 64;
     int sub_tile_i = row / 16;  // 0, 1, 2, or 3
     float res_inter[TileK];
     float res_intra[TileK];
     if (row < sub_seq_len) {
         int g_first_row = min(sub_tile_i * 16, sub_seq_len - 1);
-        int g_half_row  = min(sub_tile_i * 16 + 8, sub_seq_len - 1);
-        #pragma unroll
+        int g_half_row = min(sub_tile_i * 16 + 8, sub_seq_len - 1);
+#pragma unroll
         for (int i = 0; i < TileK / 4; ++i) {
             int y = i * 4 + k_offset;
             // Read g[row] and Vec[row] ONCE (shared between inter and intra)
-            float4 g     = *reinterpret_cast<float4*>(&sG(row, y));
-            nvbf16x4 v   = *reinterpret_cast<nvbf16x4*>(&sVec(row, y));
+            float4 g = *reinterpret_cast<float4*>(&sG(row, y));
+            nvbf16x4 v = *reinterpret_cast<nvbf16x4*>(&sVec(row, y));
             float2 va = __bfloat1622float2(v.a);
             float2 vb = __bfloat1622float2(v.b);
             float2 g_a = reinterpret_cast<float2*>(&g)[0];
@@ -344,8 +364,10 @@ __forceinline__ __device__ void fwd_setup_A_inter_intra_all(
                 float4 g_ref = *reinterpret_cast<float4*>(&sG(g_first_row, y));
                 float2 s1 = float2_sub(g_a, reinterpret_cast<float2*>(&g_ref)[0]);
                 float2 s2 = float2_sub(g_b, reinterpret_cast<float2*>(&g_ref)[1]);
-                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                s1.x = exp2f(s1.x);
+                s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x);
+                s2.y = exp2f(s2.y);
                 reinterpret_cast<float2*>(&res_inter[i * 4])[0] = float2_mul(s1, va);
                 reinterpret_cast<float2*>(&res_inter[i * 4])[1] = float2_mul(s2, vb);
             }
@@ -354,14 +376,16 @@ __forceinline__ __device__ void fwd_setup_A_inter_intra_all(
                 float4 g_ref = *reinterpret_cast<float4*>(&sG(g_half_row, y));
                 float2 s1 = float2_sub(g_a, reinterpret_cast<float2*>(&g_ref)[0]);
                 float2 s2 = float2_sub(g_b, reinterpret_cast<float2*>(&g_ref)[1]);
-                s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+                s1.x = exp2f(s1.x);
+                s1.y = exp2f(s1.y);
+                s2.x = exp2f(s2.x);
+                s2.y = exp2f(s2.y);
                 reinterpret_cast<float2*>(&res_intra[i * 4])[0] = float2_mul(s1, va);
                 reinterpret_cast<float2*>(&res_intra[i * 4])[1] = float2_mul(s2, vb);
             }
         }
     } else {
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < TileK; ++i) {
             res_inter[i] = 0.0f;
             res_intra[i] = 0.0f;
@@ -374,32 +398,33 @@ __forceinline__ __device__ void fwd_setup_A_inter_intra_all(
 // fwd_setup_A_inter_all: inter-only, single Vec (Q or K)
 // Only computes gated Vec with inter reference (g_first), skips intra entirely.
 template <int TileK, typename G_TENSOR, typename VEC_TENSOR>
-__forceinline__ __device__ void fwd_setup_A_inter_all(
-    G_TENSOR &sG, VEC_TENSOR &sVec,
-    int idx_in_warpgroup, int sub_seq_len, int k_offset,
-    int tmem_addr_inter) {
+__forceinline__ __device__ void
+fwd_setup_A_inter_all(
+    G_TENSOR& sG, VEC_TENSOR& sVec, int idx_in_warpgroup, int sub_seq_len, int k_offset, int tmem_addr_inter) {
     int row = idx_in_warpgroup % 64;
     int sub_tile_i = row / 16;  // 0, 1, 2, or 3
     float res_inter[TileK];
     if (row < sub_seq_len) {
         int g_first_row = min(sub_tile_i * 16, sub_seq_len - 1);
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < TileK / 4; ++i) {
             int y = i * 4 + k_offset;
-            float4 g     = *reinterpret_cast<float4*>(&sG(row, y));
-            nvbf16x4 v   = *reinterpret_cast<nvbf16x4*>(&sVec(row, y));
+            float4 g = *reinterpret_cast<float4*>(&sG(row, y));
+            nvbf16x4 v = *reinterpret_cast<nvbf16x4*>(&sVec(row, y));
             float2 va = __bfloat1622float2(v.a);
             float2 vb = __bfloat1622float2(v.b);
             float4 g_ref = *reinterpret_cast<float4*>(&sG(g_first_row, y));
             float2 s1 = float2_sub(reinterpret_cast<float2*>(&g)[0], reinterpret_cast<float2*>(&g_ref)[0]);
             float2 s2 = float2_sub(reinterpret_cast<float2*>(&g)[1], reinterpret_cast<float2*>(&g_ref)[1]);
-            s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
-            s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+            s1.x = exp2f(s1.x);
+            s1.y = exp2f(s1.y);
+            s2.x = exp2f(s2.x);
+            s2.y = exp2f(s2.y);
             reinterpret_cast<float2*>(&res_inter[i * 4])[0] = float2_mul(s1, va);
             reinterpret_cast<float2*>(&res_inter[i * 4])[1] = float2_mul(s2, vb);
         }
     } else {
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < TileK; ++i) {
             res_inter[i] = 0.0f;
         }
@@ -410,32 +435,39 @@ __forceinline__ __device__ void fwd_setup_A_inter_all(
 // fwd_setup_A_inter_all_QK: inter-only, combined Q + K
 // Threads 0-63 → gated Q (inter), Threads 64-127 → gated K (inter)
 template <int TileK, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
-__forceinline__ __device__ void fwd_setup_A_inter_all_QK(
-    G_TENSOR &sG, Q_TENSOR &sQ, K_TENSOR &sK,
-    int idx_in_warpgroup, int sub_seq_len, int k_offset,
-    int tmem_addr_inter) {
+__forceinline__ __device__ void
+fwd_setup_A_inter_all_QK(G_TENSOR& sG,
+                         Q_TENSOR& sQ,
+                         K_TENSOR& sK,
+                         int idx_in_warpgroup,
+                         int sub_seq_len,
+                         int k_offset,
+                         int tmem_addr_inter) {
     if (idx_in_warpgroup < 64) {
-        fwd_setup_A_inter_all<TileK>(sG, sQ, idx_in_warpgroup, sub_seq_len, k_offset,
-            tmem_addr_inter + k_offset);
+        fwd_setup_A_inter_all<TileK>(sG, sQ, idx_in_warpgroup, sub_seq_len, k_offset, tmem_addr_inter + k_offset);
     } else {
-        fwd_setup_A_inter_all<TileK>(sG, sK, idx_in_warpgroup, sub_seq_len, k_offset,
-            tmem_addr_inter + k_offset);
+        fwd_setup_A_inter_all<TileK>(sG, sK, idx_in_warpgroup, sub_seq_len, k_offset, tmem_addr_inter + k_offset);
     }
 }
 
 // fwd_setup_A_inter_intra_all_QK: fused inter+intra, combined Q + K
 // Threads 0-63 → gated Q (inter + intra), Threads 64-127 → gated K (inter + intra)
 template <int TileK, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
-__forceinline__ __device__ void fwd_setup_A_inter_intra_all_QK(
-    G_TENSOR &sG, Q_TENSOR &sQ, K_TENSOR &sK,
-    int idx_in_warpgroup, int sub_seq_len, int k_offset,
-    int tmem_addr_inter, int tmem_addr_intra) {
+__forceinline__ __device__ void
+fwd_setup_A_inter_intra_all_QK(G_TENSOR& sG,
+                               Q_TENSOR& sQ,
+                               K_TENSOR& sK,
+                               int idx_in_warpgroup,
+                               int sub_seq_len,
+                               int k_offset,
+                               int tmem_addr_inter,
+                               int tmem_addr_intra) {
     if (idx_in_warpgroup < 64) {
-        fwd_setup_A_inter_intra_all<TileK>(sG, sQ, idx_in_warpgroup, sub_seq_len, k_offset,
-            tmem_addr_inter + k_offset, tmem_addr_intra + k_offset);
+        fwd_setup_A_inter_intra_all<TileK>(sG, sQ, idx_in_warpgroup, sub_seq_len, k_offset, tmem_addr_inter + k_offset,
+                                           tmem_addr_intra + k_offset);
     } else {
-        fwd_setup_A_inter_intra_all<TileK>(sG, sK, idx_in_warpgroup, sub_seq_len, k_offset,
-            tmem_addr_inter + k_offset, tmem_addr_intra + k_offset);
+        fwd_setup_A_inter_intra_all<TileK>(sG, sK, idx_in_warpgroup, sub_seq_len, k_offset, tmem_addr_inter + k_offset,
+                                           tmem_addr_intra + k_offset);
     }
 }
 
@@ -494,9 +526,8 @@ __forceinline__ __device__ void fwd_setup_A_inter_intra_all_QK(
 // scale: per-element scaling factor (params.scale)
 // qk_out_base: global memory pointer for this thread's row output
 template <int TileT>
-__forceinline__ __device__ void fwd_epilogue_t2r_qk(
-    int tmem_qk_addr, int idx_in_warpgroup, int sub_seq_len,
-    float scale, __nv_bfloat16 *qk_out_base) {
+__forceinline__ __device__ void
+fwd_epilogue_t2r_qk(int tmem_qk_addr, int idx_in_warpgroup, int sub_seq_len, float scale, __nv_bfloat16* qk_out_base) {
     // T2R: read full row (TileT floats) from TMEM
     float res[TileT];
     ku::tcgen05_after_thread_sync();
@@ -511,7 +542,7 @@ __forceinline__ __device__ void fwd_epilogue_t2r_qk(
     //   - Zero out elements in the strictly upper triangle (j > row)
     //   - Zero out out-of-bounds columns (j >= sub_seq_len)
     int mask_limit = min(row, sub_seq_len - 1);  // last valid column
-    #pragma unroll
+#pragma unroll
     for (int j = 0; j < TileT; ++j) {
         if (j > mask_limit) {
             res[j] = 0.0f;
@@ -524,10 +555,10 @@ __forceinline__ __device__ void fwd_epilogue_t2r_qk(
     // Only write if this row is valid (row < sub_seq_len)
     // NOTE: we do not need write zeros here because this is a direct R2G copy, writing zero causes oob write
     if (row < sub_seq_len) {
-        #pragma unroll
+#pragma unroll
         for (int i = 0; i < TileT / 16; ++i) {
             ku::bf16x16 out;
-            #pragma unroll
+#pragma unroll
             for (int j = 0; j < 8; ++j) {
                 reinterpret_cast<__nv_bfloat162*>(&out)[j] =
                     __float22bfloat162_rn(reinterpret_cast<float2*>(&res[i * 16])[j]);
@@ -549,10 +580,8 @@ __forceinline__ __device__ void fwd_epilogue_t2r_qk(
 // beta_row: beta scaling factor for this thread's row (from beta_smem)
 // sKK: SMEM tensor for inverse warpgroup (fp16)
 template <int TileT, bool UseTF32Inverse, bool RoundingTF32, typename KK_SMEM_TENSOR>
-__forceinline__ __device__ void fwd_epilogue_t2r_kk(
-    int tmem_kk_addr, int idx_in_warpgroup, int sub_seq_len,
-    float beta_row,
-    KK_SMEM_TENSOR &sKK) {
+__forceinline__ __device__ void
+fwd_epilogue_t2r_kk(int tmem_kk_addr, int idx_in_warpgroup, int sub_seq_len, float beta_row, KK_SMEM_TENSOR& sKK) {
     // T2R: read full row (TileT floats) from TMEM
     float res[TileT];
     ku::tcgen05_after_thread_sync();
@@ -567,7 +596,7 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
     //   - Zero out elements in the strictly upper triangle (j > row)
     //   - Zero out out-of-bounds columns (j >= sub_seq_len)
     int mask_limit = min(row, sub_seq_len - 1);
-    #pragma unroll
+#pragma unroll
     for (int j = 0; j < TileT; ++j) {
         if (j > mask_limit) {
             res[j] = 0.0f;
@@ -577,8 +606,8 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
     }
 
     if (row < sub_seq_len) {
-        // R2S: convert to fp16 and write to SMEM for inverse warpgroup
-        #pragma unroll
+// R2S: convert to fp16 and write to SMEM for inverse warpgroup
+#pragma unroll
         for (int i = 0; i < TileT / 4; ++i) {
             // Convert 4 floats → 4 fp16 values, store as 2×half2
             float2 f01 = reinterpret_cast<float2*>(res)[i * 2];
@@ -586,7 +615,7 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
             if constexpr (!UseTF32Inverse) {
                 __half2 h01 = __float22half2_rn(f01);
                 __half2 h23 = __float22half2_rn(f23);
-                *reinterpret_cast<__half2*>(&sKK(row, i * 4))     = h01;
+                *reinterpret_cast<__half2*>(&sKK(row, i * 4)) = h01;
                 *reinterpret_cast<__half2*>(&sKK(row, i * 4 + 2)) = h23;
             } else {
                 if constexpr (RoundingTF32) {
@@ -595,15 +624,15 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
                     sKK(row, i * 4 + 2) = tfloat32_t(f23.x);
                     sKK(row, i * 4 + 3) = tfloat32_t(f23.y);
                 } else {
-                    *reinterpret_cast<float2*>(&sKK(row, i * 4))     = f01;
+                    *reinterpret_cast<float2*>(&sKK(row, i * 4)) = f01;
                     *reinterpret_cast<float2*>(&sKK(row, i * 4 + 2)) = f23;
                 }
             }
         }
     } else {
-        // NOTE: must write zeros to SMEM of invalid token postitions in the current chunk
-        // R2S zero
-        #pragma unroll
+// NOTE: must write zeros to SMEM of invalid token postitions in the current chunk
+// R2S zero
+#pragma unroll
         for (int i = 0; i < TileT; ++i) {
             if constexpr (!UseTF32Inverse) {
                 sKK(row, i) = half_t(0.0f);
@@ -630,16 +659,20 @@ __forceinline__ __device__ void fwd_epilogue_t2r_kk(
 // qk_out_base: global memory pointer for QK row output (bf16, lower threads only)
 // sKK: SMEM tensor for KK inverse (fp16, upper threads only)
 template <int TileT, bool UseTF32Inverse, bool RoundingTF32, typename KK_SMEM_TENSOR>
-__forceinline__ __device__ void fwd_epilogue_qk_kk(
-    int tmem_qk_addr, int idx_in_warpgroup, int sub_seq_len,
-    float scale, float beta_row, __nv_bfloat16 *qk_out_base,
-    KK_SMEM_TENSOR &sKK) {
+__forceinline__ __device__ void
+fwd_epilogue_qk_kk(int tmem_qk_addr,
+                   int idx_in_warpgroup,
+                   int sub_seq_len,
+                   float scale,
+                   float beta_row,
+                   __nv_bfloat16* qk_out_base,
+                   KK_SMEM_TENSOR& sKK) {
     if (idx_in_warpgroup < 64) {
         fwd_epilogue_t2r_qk<TileT>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, scale, qk_out_base);
     } else {
-        fwd_epilogue_t2r_kk<TileT, UseTF32Inverse, RoundingTF32>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, beta_row, sKK);
+        fwd_epilogue_t2r_kk<TileT, UseTF32Inverse, RoundingTF32>(tmem_qk_addr, idx_in_warpgroup, sub_seq_len, beta_row,
+                                                                 sKK);
     }
 }
 
-
-} // namespace kda::sm100
+}  // namespace kda::sm100

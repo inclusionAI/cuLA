@@ -15,13 +15,10 @@
 version: "2.0"
 
 stages:
-  - 环境变量准备
   - 前置校验
 
-
 jobs:
-
-  代码format检测:
+  python-format-check:
     stage: 前置校验
     component: python-ruff-check
     inputs:
@@ -42,3 +39,30 @@ jobs:
         # The Docker image already has all dependencies installed
         echo "=== Installed ruff version ==="
         ruff --version
+
+  cpp-format-check:
+    stage: 前置校验
+    component: shell-with-clone
+    inputs:
+      resourceClass: "S"
+      image: aone-base-global/flashla-dev:clang-format-15
+      script: |
+        set -o pipefail
+        cd ${CODE_WORKSPACE}
+        clang-format --version
+
+        format_output=$(find csrc -path csrc/cutlass -prune -o -path csrc/kerutils -prune -o \( -name '*.cu' -o -name '*.cuh' -o -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \) -print \
+          | xargs clang-format --dry-run --Werror 2>&1)
+        format_rc=$?
+
+        if [ $format_rc -ne 0 ]; then
+          web_output="<h3>检查失败 ❌</h3>"
+          web_output+="<p>请根据以下输出修复代码格式问题：</p>"
+          web_output+="<h4>clang-format</h4><pre>$format_output</pre>"
+          add_output webOutput "$web_output"
+          exit 1
+        else
+          web_output="<h3>检查通过 🎉</h3>"
+          web_output+="<p>所有 C++/CUDA 代码格式检查均已通过！</p>"
+          add_output webOutput "$web_output"
+        fi

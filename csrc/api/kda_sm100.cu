@@ -12,27 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <torch/python.h>
-#include "kda/sm100/kda_fwd_common.cuh"
 #include "cutlass/cutlass.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <torch/python.h>
 
-void ChunkKDAFwdIntra(
-    at::Tensor q,
-    at::Tensor k,
-    at::Tensor g,
-    at::Tensor beta,
-    at::Tensor cu_seqlens,
-    at::Tensor chunk_indices,
-    at::Tensor Aqk_out,
-    at::Tensor Akk_out,
-    at::Tensor tile_counter,
-    float scale,
-    int chunk_size,
-    bool use_tf32_inverse,
-    bool unified_gref) {
+#include "kda/sm100/kda_fwd_common.cuh"
 
+void
+ChunkKDAFwdIntra(at::Tensor q,
+                 at::Tensor k,
+                 at::Tensor g,
+                 at::Tensor beta,
+                 at::Tensor cu_seqlens,
+                 at::Tensor chunk_indices,
+                 at::Tensor Aqk_out,
+                 at::Tensor Akk_out,
+                 at::Tensor tile_counter,
+                 float scale,
+                 int chunk_size,
+                 bool use_tf32_inverse,
+                 bool unified_gref) {
     KDA_fwd_intra_params params;
     params.total_q_len = q.size(0) * q.size(1);
     params.b = cu_seqlens.size(0) - 1;
@@ -55,24 +55,24 @@ void ChunkKDAFwdIntra(
     int tile_num = chunk_indices.size(0);
     auto device_prop = at::cuda::getCurrentDeviceProperties();
     params.num_sm = device_prop->multiProcessorCount;
-    params.tile_scheduler_params = StaticPersistentTileScheduler::Params{tile_num, params.h, params.num_sm, (int*)tile_counter.data_ptr()};
+    params.tile_scheduler_params =
+        StaticPersistentTileScheduler::Params{tile_num, params.h, params.num_sm, (int*)tile_counter.data_ptr()};
 
     kda::sm100::run_kda_fwd_intra_sm100(params, at::cuda::getCurrentCUDAStream());
 }
 
-void ChunkKDAFwdRecompWU(
-    at::Tensor k,
-    at::Tensor v,
-    at::Tensor beta,
-    at::Tensor A,
-    at::Tensor g,
-    at::Tensor cu_seqlens,
-    at::Tensor chunk_indices,
-    at::Tensor w_out,
-    at::Tensor u_out,
-    at::Tensor kg_out,
-    int chunk_size
-) {
+void
+ChunkKDAFwdRecompWU(at::Tensor k,
+                    at::Tensor v,
+                    at::Tensor beta,
+                    at::Tensor A,
+                    at::Tensor g,
+                    at::Tensor cu_seqlens,
+                    at::Tensor chunk_indices,
+                    at::Tensor w_out,
+                    at::Tensor u_out,
+                    at::Tensor kg_out,
+                    int chunk_size) {
     KDA_fwd_recomp_w_u_params params;
     params.total_len = k.size(0) * k.size(1);
     params.b = cu_seqlens.size(0) - 1;

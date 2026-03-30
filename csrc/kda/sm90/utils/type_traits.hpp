@@ -30,9 +30,9 @@
 
 #pragma once
 
-#include <type_traits>
-
 #include "cutlass/numeric_types.h"
+
+#include <type_traits>
 
 namespace kda::sm90 {
 
@@ -48,13 +48,13 @@ template <typename T> using map_to_cutlass_t = typename map_to_cutlass<T>::type;
 
 template <typename... Ts>
 struct first_non_void {
-  static_assert(sizeof...(Ts) > 0, "all voids is not allowed");
-  using type = void;
+    static_assert(sizeof...(Ts) > 0, "all voids is not allowed");
+    using type = void;
 };
 
 template <typename T, typename... Ts>
 struct first_non_void<T, Ts...> {
-  using type = T;
+    using type = T;
 };
 
 template <typename... Ts>

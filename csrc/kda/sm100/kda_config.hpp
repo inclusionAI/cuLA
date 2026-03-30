@@ -17,7 +17,7 @@
 #include "tile_scheduler.hpp"
 
 struct KDA_fwd_intra_params {
-    using GmemShapeAkk  = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_kv, seqlen_kv, h)
+    using GmemShapeAkk = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_kv, seqlen_kv, h)
     using GmemStrideAkk = cute::Stride<int32_t, cute::_1, int32_t>;
 
     int total_q_len;
@@ -29,14 +29,14 @@ struct KDA_fwd_intra_params {
     bool use_tf32_inverse;
     bool unified_gref;
 
-    void *__restrict__ q_ptr;             //[b, t, h, d]
-    void *__restrict__ k_ptr;             //[b, t, h, d]
-    void *__restrict__ g_ptr;             //[b, t, h, d]
-    void *__restrict__ beta_ptr;          //[b, t, h]
-    void *__restrict__ Aqk_out_ptr;       //[b, t, h, BT]
-    void *__restrict__ Akk_out_ptr;       //[b, t, h, BT]
-    void *__restrict__ cu_seqlens_ptr;    //[b + 1]
-    void *__restrict__ chunk_indices_ptr; //[(b * t) / chunk_size, 2]
+    void* __restrict__ q_ptr;              //[b, t, h, d]
+    void* __restrict__ k_ptr;              //[b, t, h, d]
+    void* __restrict__ g_ptr;              //[b, t, h, d]
+    void* __restrict__ beta_ptr;           //[b, t, h]
+    void* __restrict__ Aqk_out_ptr;        //[b, t, h, BT]
+    void* __restrict__ Akk_out_ptr;        //[b, t, h, BT]
+    void* __restrict__ cu_seqlens_ptr;     //[b + 1]
+    void* __restrict__ chunk_indices_ptr;  //[(b * t) / chunk_size, 2]
 
     GmemShapeAkk shape_Akk;
     GmemStrideAkk stride_Akk;
@@ -47,7 +47,7 @@ struct KDA_fwd_intra_params {
 };
 
 struct KDA_fwd_recomp_w_u_params {
-    using GmemShapeWUKg  = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_kv, seqlen_kv, h)
+    using GmemShapeWUKg = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_kv, seqlen_kv, h)
     using GmemStrideWUKg = cute::Stride<int32_t, cute::_1, int32_t>;
 
     int total_len;
@@ -56,16 +56,16 @@ struct KDA_fwd_recomp_w_u_params {
     int d;
     int chunk_size;
 
-    void *__restrict__ k_ptr;             //[b, t, h, d]
-    void *__restrict__ v_ptr;             //[b, t, h, d]
-    void *__restrict__ beta_ptr;          //[b, t, h]
-    void *__restrict__ A_ptr;             //[b. t, h, BT]
-    void *__restrict__ g_ptr;             //[b, t, h, d]
-    void *__restrict__ cu_seqlens_ptr;    //[b + 1]
-    void *__restrict__ chunk_indices_ptr; //[(b * t) / chunk_size, 2]
-    void *__restrict__ w_out_ptr;         //[b, t, h, d]
-    void *__restrict__ u_out_ptr;         //[b, t, h, d]
-    void *__restrict__ kg_out_ptr;        //[b, t, h, d]
+    void* __restrict__ k_ptr;              //[b, t, h, d]
+    void* __restrict__ v_ptr;              //[b, t, h, d]
+    void* __restrict__ beta_ptr;           //[b, t, h]
+    void* __restrict__ A_ptr;              //[b. t, h, BT]
+    void* __restrict__ g_ptr;              //[b, t, h, d]
+    void* __restrict__ cu_seqlens_ptr;     //[b + 1]
+    void* __restrict__ chunk_indices_ptr;  //[(b * t) / chunk_size, 2]
+    void* __restrict__ w_out_ptr;          //[b, t, h, d]
+    void* __restrict__ u_out_ptr;          //[b, t, h, d]
+    void* __restrict__ kg_out_ptr;         //[b, t, h, d]
 
     GmemShapeWUKg shape_wukg;
     GmemStrideWUKg stride_wukg;
