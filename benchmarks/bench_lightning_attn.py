@@ -79,6 +79,32 @@ def compute_decay(H, layer_idx=12, num_layers=24):
     return (8 / H * (1 - layer_idx / num_layers)) * torch.arange(H, dtype=torch.float32, device=DEVICE)
 
 
+@torch.no_grad()
+def torch_naive_lightning_attn(Q, K, V, decay, scale=1.0, initial_state=None, output_final_state=False):
+    """Recurrent FP32 reference for lightning attention (simple_gla).
+
+    O(B*T*H*D^2) — exact ground truth, all computation in FP32.
+    """
+    B, T, H, D = Q.shape
+    q, k, v = Q.float(), K.float(), V.float()
+    decay_factor = torch.exp(-decay.float())  # [H]
+
+    S = (
+        initial_state.float().clone()
+        if initial_state is not None
+        else torch.zeros(B, H, D, D, dtype=torch.float32, device=Q.device)
+    )
+    O = torch.zeros(B, T, H, D, dtype=torch.float32, device=Q.device)
+
+    for t in range(T):
+        S = S * decay_factor[None, :, None, None]
+        S = S + torch.einsum("bhd,bhe->bhde", k[:, t], v[:, t])
+        O[:, t] = scale * torch.einsum("bhd,bhde->bhe", q[:, t], S)
+
+    ht = S if output_final_state else None
+    return O, ht
+
+
 # =============================================================================
 # Sequence length generators (for varlen)
 # =============================================================================
@@ -245,6 +271,8 @@ def benchmark_standard_config(B, T, H, D, layer_idx, num_layers, mode, warmup, i
     h0_fla = h0.clone() if h0 is not None else None
 
     result = {"B": B, "T": T, "H": H, "D": D, "mode": mode}
+    ht_fla = None
+    ht_cute = None
 
     # --- FLA ---
     try:
@@ -268,21 +296,36 @@ def benchmark_standard_config(B, T, H, D, layer_idx, num_layers, mode, warmup, i
         result["cutedsl_err"] = str(e)
         reset_cuda_error()
 
-    # --- Accuracy ---
-    if o_fla is not None and o_cute is not None:
-        diff_o = (o_fla - o_cute).abs()
-        result["o_max_diff"] = diff_o.max().item()
-        result["o_rel_err"] = result["o_max_diff"] / (o_fla.abs().max().item() + 1e-8)
-        if output_ht and ht_fla is not None:
-            diff_ht = (ht_fla - ht_cute).abs()
-            result["ht_max_diff"] = diff_ht.max().item()
-            result["ht_rel_err"] = result["ht_max_diff"] / (ht_fla.abs().max().item() + 1e-8)
+    # --- Naive FP32 reference ---
+    o_naive, ht_naive = torch_naive_lightning_attn(
+        Q,
+        K,
+        V,
+        decay,
+        scale=1.0,
+        initial_state=h0,
+        output_final_state=output_ht,
+    )
+
+    # --- Accuracy vs naive ---
+    for label, o_test, ht_test in [("fla", o_fla, ht_fla), ("cute", o_cute, ht_cute)]:
+        if o_test is not None:
+            diff = o_naive - o_test.float()
+            rms = o_naive.pow(2).mean().sqrt().item()
+            rmse = diff.pow(2).mean().sqrt().item()
+            result[f"{label}_o_rmse_ratio"] = rmse / (rms + 1e-8)
+            result[f"{label}_o_maxdiff"] = diff.abs().max().item()
+            if output_ht and ht_naive is not None and ht_test is not None:
+                diff_ht = ht_naive - ht_test.float()
+                ht_rms = ht_naive.pow(2).mean().sqrt().item()
+                ht_rmse = diff_ht.pow(2).mean().sqrt().item()
+                result[f"{label}_ht_rmse_ratio"] = ht_rmse / (ht_rms + 1e-8)
+            else:
+                result[f"{label}_ht_rmse_ratio"] = float("nan")
         else:
-            result["ht_max_diff"] = float("nan")
-            result["ht_rel_err"] = float("nan")
-    else:
-        for k in ("o_max_diff", "o_rel_err", "ht_max_diff", "ht_rel_err"):
-            result[k] = float("nan")
+            result[f"{label}_o_rmse_ratio"] = float("nan")
+            result[f"{label}_o_maxdiff"] = float("nan")
+            result[f"{label}_ht_rmse_ratio"] = float("nan")
 
     # --- Speedup ---
     fla_ok = _valid(result["fla_ms"])
@@ -348,11 +391,25 @@ def benchmark_varlen_config(N, seq_lens, H, D, warmup, iters, dist=""):
 
     # --- Accuracy: persistent vs non-persistent ---
     if O_p is not None and O_np is not None:
-        result["p_vs_np_O_diff"] = (O_p - O_np).abs().max().item()
-        result["p_vs_np_ht_diff"] = (sp_p - sp_np).abs().max().item()
+        diff_o = O_p.float() - O_np.float()
+        result["p_vs_np_O_diff"] = diff_o.abs().max().item()
+        o_rmse = diff_o.pow(2).mean().sqrt().item()
+        o_rms = O_p.float().pow(2).mean().sqrt().item()
+        result["p_vs_np_O_rmse"] = o_rmse
+        result["p_vs_np_O_rmse_ratio"] = o_rmse / (o_rms + 1e-8)
+        diff_ht = sp_p.float() - sp_np.float()
+        result["p_vs_np_ht_diff"] = diff_ht.abs().max().item()
+        ht_rmse = diff_ht.pow(2).mean().sqrt().item()
+        ht_rms = sp_p.float().pow(2).mean().sqrt().item()
+        result["p_vs_np_ht_rmse"] = ht_rmse
+        result["p_vs_np_ht_rmse_ratio"] = ht_rmse / (ht_rms + 1e-8)
     else:
         result["p_vs_np_O_diff"] = float("nan")
         result["p_vs_np_ht_diff"] = float("nan")
+        result["p_vs_np_O_rmse"] = float("nan")
+        result["p_vs_np_O_rmse_ratio"] = float("nan")
+        result["p_vs_np_ht_rmse"] = float("nan")
+        result["p_vs_np_ht_rmse_ratio"] = float("nan")
 
     # --- Speedups ---
     p_ms = result["persistent_ms"]
@@ -379,8 +436,8 @@ def print_standard_header():
     hdr = (
         f"{'Config':<28} {'Mode':<10} "
         f"{'FLA(ms)':>9} {'CuteDSL(ms)':>12} {'Speedup':>8} "
-        f"{'O_maxdiff':>10} {'O_rel%':>8} "
-        f"{'Ht_maxdiff':>11} {'Ht_rel%':>8}"
+        f"{'FLA_O_RMSE%':>12} {'Cute_O_RMSE%':>13} "
+        f"{'FLA_Ht_RMSE%':>13} {'Cute_Ht_RMSE%':>14}"
     )
     print(hdr)
     print("-" * len(hdr))
@@ -392,12 +449,12 @@ def print_standard_result(r):
     fla = f"{r['fla_ms']:.3f}" if _valid(r.get("fla_ms", float("nan"))) else "ERR"
     dsl = f"{r['cutedsl_ms']:.3f}" if _valid(r.get("cutedsl_ms", float("nan"))) else "ERR"
     sp = f"{r['speedup']:.2f}x" if _valid(r.get("speedup", float("nan"))) else "-"
-    omd = f"{r['o_max_diff']:.6f}" if not np.isnan(r.get("o_max_diff", float("nan"))) else "-"
-    orel = f"{r['o_rel_err'] * 100:.2f}%" if not np.isnan(r.get("o_rel_err", float("nan"))) else "-"
-    htmd = f"{r['ht_max_diff']:.6f}" if not np.isnan(r.get("ht_max_diff", float("nan"))) else "-"
-    htrel = f"{r['ht_rel_err'] * 100:.2f}%" if not np.isnan(r.get("ht_rel_err", float("nan"))) else "-"
+    fla_o = f"{r['fla_o_rmse_ratio'] * 100:.3f}%" if not np.isnan(r.get("fla_o_rmse_ratio", float("nan"))) else "-"
+    cute_o = f"{r['cute_o_rmse_ratio'] * 100:.3f}%" if not np.isnan(r.get("cute_o_rmse_ratio", float("nan"))) else "-"
+    fla_ht = f"{r['fla_ht_rmse_ratio'] * 100:.3f}%" if not np.isnan(r.get("fla_ht_rmse_ratio", float("nan"))) else "-"
+    cute_ht = f"{r['cute_ht_rmse_ratio'] * 100:.3f}%" if not np.isnan(r.get("cute_ht_rmse_ratio", float("nan"))) else "-"
 
-    print(f"{cfg:<28} {r['mode']:<10} {fla:>9} {dsl:>12} {sp:>8} {omd:>10} {orel:>8} {htmd:>11} {htrel:>8}")
+    print(f"{cfg:<28} {r['mode']:<10} {fla:>9} {dsl:>12} {sp:>8} {fla_o:>12} {cute_o:>13} {fla_ht:>13} {cute_ht:>14}")
     if r.get("fla_err"):
         print(f"  >> FLA error: {r['fla_err']}")
     if r.get("cutedsl_err"):
@@ -409,7 +466,7 @@ def print_varlen_header():
         f"{'Config':<24} {'Dist':<8} "
         f"{'Persist(ms)':>12} {'NonPer(ms)':>11} {'FLA_vl(ms)':>11} "
         f"{'P/NP':>6} {'P/FLAvl':>8} "
-        f"{'O diff':>10} {'ht diff':>10}"
+        f"{'O diff':>10} {'O_RMSE%':>9} {'ht diff':>10} {'ht_RMSE%':>10}"
     )
     print(hdr)
     print("-" * len(hdr))
@@ -427,9 +484,13 @@ def print_varlen_result(r):
     pvfla_vl = f"{r['p_vs_fla_vl_speedup']:.2f}x" if _valid(r.get("p_vs_fla_vl_speedup", float("nan"))) else "-"
 
     od = f"{r['p_vs_np_O_diff']:.1e}" if not np.isnan(r.get("p_vs_np_O_diff", float("nan"))) else "-"
+    ormse = f"{r['p_vs_np_O_rmse_ratio'] * 100:.3f}%" if not np.isnan(r.get("p_vs_np_O_rmse_ratio", float("nan"))) else "-"
     hd = f"{r['p_vs_np_ht_diff']:.1e}" if not np.isnan(r.get("p_vs_np_ht_diff", float("nan"))) else "-"
+    htrmse = f"{r['p_vs_np_ht_rmse_ratio'] * 100:.3f}%" if not np.isnan(r.get("p_vs_np_ht_rmse_ratio", float("nan"))) else "-"
 
-    print(f"{cfg:<24} {dist:<8} {p_ms:>12} {np_ms:>11} {fla_vl:>11} {pvnp:>6} {pvfla_vl:>8} {od:>10} {hd:>10}")
+    print(
+        f"{cfg:<24} {dist:<8} {p_ms:>12} {np_ms:>11} {fla_vl:>11} {pvnp:>6} {pvfla_vl:>8} {od:>10} {ormse:>9} {hd:>10} {htrmse:>10}"
+    )
     if r.get("persistent_err"):
         print(f"  >> Persistent error: {r['persistent_err']}")
     if r.get("nonpersistent_err"):
@@ -554,15 +615,32 @@ def run_benchmark_suite(args):
             od = [r["p_vs_np_O_diff"] for r in mode_r if not np.isnan(r.get("p_vs_np_O_diff", float("nan")))]
             if od:
                 print(f"    P vs NP O diff:         max={max(od):.2e}  (bit-exact={all(x == 0 for x in od)})")
+            ormse = [
+                r["p_vs_np_O_rmse_ratio"] * 100 for r in mode_r if not np.isnan(r.get("p_vs_np_O_rmse_ratio", float("nan")))
+            ]
+            if ormse:
+                print(f"    P vs NP O RMSE ratio:   avg={np.mean(ormse):.4f}%  max={np.max(ormse):.4f}%")
         else:
             speedups = [r["speedup"] for r in mode_r]
             print(f"\n  [{mode}]  ({len(mode_r)} configs)")
             print(
                 f"    Speedup (CuteDSL/FLA):  avg={np.mean(speedups):.2f}x  min={np.min(speedups):.2f}x  max={np.max(speedups):.2f}x"
             )
-            o_rels = [r["o_rel_err"] * 100 for r in mode_r if not np.isnan(r.get("o_rel_err", float("nan")))]
-            if o_rels:
-                print(f"    O rel err (%):          avg={np.mean(o_rels):.3f}  max={np.max(o_rels):.3f}")
+            for label, name in [("fla", "FLA"), ("cute", "CuteDSL")]:
+                o_rmses = [
+                    r[f"{label}_o_rmse_ratio"] * 100
+                    for r in mode_r
+                    if not np.isnan(r.get(f"{label}_o_rmse_ratio", float("nan")))
+                ]
+                if o_rmses:
+                    print(f"    {name} O RMSE% (vs naive):  avg={np.mean(o_rmses):.4f}  max={np.max(o_rmses):.4f}")
+                ht_rmses = [
+                    r[f"{label}_ht_rmse_ratio"] * 100
+                    for r in mode_r
+                    if not np.isnan(r.get(f"{label}_ht_rmse_ratio", float("nan")))
+                ]
+                if ht_rmses:
+                    print(f"    {name} Ht RMSE% (vs naive): avg={np.mean(ht_rmses):.4f}  max={np.max(ht_rmses):.4f}")
 
     # --- Plot ---
     if args.plot:
@@ -685,24 +763,42 @@ def generate_report(all_results, modes, args):
             else:
                 has_ht = mode == "h0_ht"
                 if has_ht:
-                    f.write("| Config | FLA(ms) | CuteDSL(ms) | Speedup | O_maxdiff | O_rel% | Ht_maxdiff | Ht_rel% |\n")
-                    f.write("|--------|---------|-------------|---------|-----------|--------|------------|--------|\n")
+                    f.write(
+                        "| Config | FLA(ms) | CuteDSL(ms) | Speedup | FLA_O_RMSE% | Cute_O_RMSE% | FLA_Ht_RMSE% | Cute_Ht_RMSE% |\n"
+                    )
+                    f.write(
+                        "|--------|---------|-------------|---------|-------------|--------------|--------------|---------------|\n"
+                    )
                 else:
-                    f.write("| Config | FLA(ms) | CuteDSL(ms) | Speedup | O_maxdiff | O_rel% |\n")
-                    f.write("|--------|---------|-------------|---------|-----------|--------|\n")
+                    f.write("| Config | FLA(ms) | CuteDSL(ms) | Speedup | FLA_O_RMSE% | Cute_O_RMSE% |\n")
+                    f.write("|--------|---------|-------------|---------|-------------|---------------|\n")
                 for r in mr:
                     cfg = f"B={r['B']},T={r['T']},H={r['H']}"
                     sp = f"{r['speedup']:.2f}x" if _valid(r.get("speedup", float("nan"))) else "-"
                     fla = f"{r['fla_ms']:.3f}" if _valid(r.get("fla_ms", float("nan"))) else "-"
                     dsl = f"{r['cutedsl_ms']:.3f}" if _valid(r.get("cutedsl_ms", float("nan"))) else "-"
-                    omd = f"{r['o_max_diff']:.6f}" if not np.isnan(r.get("o_max_diff", float("nan"))) else "-"
-                    orel = f"{r['o_rel_err'] * 100:.2f}%" if not np.isnan(r.get("o_rel_err", float("nan"))) else "-"
+                    fla_o = (
+                        f"{r['fla_o_rmse_ratio'] * 100:.3f}%" if not np.isnan(r.get("fla_o_rmse_ratio", float("nan"))) else "-"
+                    )
+                    cute_o = (
+                        f"{r['cute_o_rmse_ratio'] * 100:.3f}%"
+                        if not np.isnan(r.get("cute_o_rmse_ratio", float("nan")))
+                        else "-"
+                    )
                     if has_ht:
-                        htmd = f"{r['ht_max_diff']:.6f}" if not np.isnan(r.get("ht_max_diff", float("nan"))) else "-"
-                        htrel = f"{r['ht_rel_err'] * 100:.2f}%" if not np.isnan(r.get("ht_rel_err", float("nan"))) else "-"
-                        f.write(f"| {cfg} | {fla} | {dsl} | {sp} | {omd} | {orel} | {htmd} | {htrel} |\n")
+                        fla_ht = (
+                            f"{r['fla_ht_rmse_ratio'] * 100:.3f}%"
+                            if not np.isnan(r.get("fla_ht_rmse_ratio", float("nan")))
+                            else "-"
+                        )
+                        cute_ht = (
+                            f"{r['cute_ht_rmse_ratio'] * 100:.3f}%"
+                            if not np.isnan(r.get("cute_ht_rmse_ratio", float("nan")))
+                            else "-"
+                        )
+                        f.write(f"| {cfg} | {fla} | {dsl} | {sp} | {fla_o} | {cute_o} | {fla_ht} | {cute_ht} |\n")
                     else:
-                        f.write(f"| {cfg} | {fla} | {dsl} | {sp} | {omd} | {orel} |\n")
+                        f.write(f"| {cfg} | {fla} | {dsl} | {sp} | {fla_o} | {cute_o} |\n")
             f.write("\n")
 
         # Summary
@@ -724,6 +820,14 @@ def generate_report(all_results, modes, args):
                     f"- **{mode}**: avg {np.mean(speedups):.2f}x, "
                     f"min {np.min(speedups):.2f}x, max {np.max(speedups):.2f}x ({len(mr)} configs)\n"
                 )
+                for label, name in [("fla", "FLA"), ("cute", "CuteDSL")]:
+                    o_rmses = [
+                        r[f"{label}_o_rmse_ratio"] * 100
+                        for r in mr
+                        if not np.isnan(r.get(f"{label}_o_rmse_ratio", float("nan")))
+                    ]
+                    if o_rmses:
+                        f.write(f"  - {name} O RMSE% (vs naive): avg {np.mean(o_rmses):.4f}, max {np.max(o_rmses):.4f}\n")
         f.write("\n---\n*Generated by bench_lightning_attn.py*\n")
 
     print(f"\nReport saved to {path}")
