@@ -45,3 +45,32 @@ struct KDA_fwd_intra_params {
 
     int num_sm;
 };
+
+struct KDA_fwd_recomp_w_u_params {
+    using GmemShapeWUKg  = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_kv, seqlen_kv, h)
+    using GmemStrideWUKg = cute::Stride<int32_t, cute::_1, int32_t>;
+
+    int total_len;
+    int b;
+    int h;
+    int d;
+    int chunk_size;
+
+    void *__restrict__ k_ptr;             //[b, t, h, d]
+    void *__restrict__ v_ptr;             //[b, t, h, d]
+    void *__restrict__ beta_ptr;          //[b, t, h]
+    void *__restrict__ A_ptr;             //[b. t, h, BT]
+    void *__restrict__ g_ptr;             //[b, t, h, d]
+    void *__restrict__ cu_seqlens_ptr;    //[b + 1]
+    void *__restrict__ chunk_indices_ptr; //[(b * t) / chunk_size, 2]
+    void *__restrict__ w_out_ptr;         //[b, t, h, d]
+    void *__restrict__ u_out_ptr;         //[b, t, h, d]
+    void *__restrict__ kg_out_ptr;        //[b, t, h, d]
+
+    GmemShapeWUKg shape_wukg;
+    GmemStrideWUKg stride_wukg;
+
+    StaticPersistentTileScheduler::Params tile_scheduler_params;
+
+    int num_sm;
+};

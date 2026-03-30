@@ -59,3 +59,42 @@ void ChunkKDAFwdIntra(
 
     kda::sm100::run_kda_fwd_intra_sm100(params, at::cuda::getCurrentCUDAStream());
 }
+
+void ChunkKDAFwdRecompWU(
+    at::Tensor k,
+    at::Tensor v,
+    at::Tensor beta,
+    at::Tensor A,
+    at::Tensor g,
+    at::Tensor cu_seqlens,
+    at::Tensor chunk_indices,
+    at::Tensor w_out,
+    at::Tensor u_out,
+    at::Tensor kg_out,
+    int chunk_size
+) {
+    KDA_fwd_recomp_w_u_params params;
+    params.total_len = k.size(0) * k.size(1);
+    params.b = cu_seqlens.size(0) - 1;
+    params.h = k.size(2);
+    params.d = k.size(3);
+    params.chunk_size = chunk_size;
+    params.k_ptr = k.data_ptr();
+    params.v_ptr = v.data_ptr();
+    params.beta_ptr = beta.data_ptr();
+    params.A_ptr = A.data_ptr();
+    params.g_ptr = g.data_ptr();
+    params.cu_seqlens_ptr = cu_seqlens.data_ptr();
+    params.chunk_indices_ptr = chunk_indices.data_ptr();
+    params.w_out_ptr = w_out.data_ptr();
+    params.u_out_ptr = u_out.data_ptr();
+    params.kg_out_ptr = kg_out.data_ptr();
+    params.shape_wukg = cute::make_shape(params.total_len, params.d, params.h);
+    params.stride_wukg = cute::make_stride(params.d * params.h, cute::_1{}, params.d);
+    int tile_num = chunk_indices.size(0);
+    auto device_prop = at::cuda::getCurrentDeviceProperties();
+    params.num_sm = device_prop->multiProcessorCount;
+    params.tile_scheduler_params = StaticPersistentTileScheduler::Params{tile_num, params.h, params.num_sm, nullptr};
+
+    kda::sm100::run_kda_fwd_recomp_w_u_sm100(params, at::cuda::getCurrentCUDAStream());
+}

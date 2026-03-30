@@ -21,6 +21,9 @@ namespace kda::sm100 {
 // KDA forward kernels
 
 // KDA forward intra-chunk kernel
-void run_kda_fwd_intra_sm100(KDA_fwd_intra_params &config, cudaStream_t stream);
+void run_kda_fwd_intra_sm100(KDA_fwd_intra_params &params, cudaStream_t stream);
+
+// KDA forward recompute W & U kernel
+void run_kda_fwd_recomp_w_u_sm100(KDA_fwd_recomp_w_u_params &params, cudaStream_t stream);
 
 } // namespace kda::sm100

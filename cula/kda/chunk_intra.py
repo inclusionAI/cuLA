@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
+from fla.ops.kda.wy_fast import recompute_w_u_fwd
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2, gather
 from fla.utils import IS_GATHER_SUPPORTED, IS_TF32_SUPPORTED, autotune_cache_kwargs
@@ -789,30 +790,45 @@ def chunk_kda_fwd_intra(
     cula_cuda.chunk_kda_fwd_intra_cuda(
         q, k, gk, beta, cu_seqlens, chunk_indices, Aqk, Akk, tile_counter, scale, chunk_size, use_tf32_inverse, unified_gref
     )
-    # rearrange back
-    if B != 1:
-        q, k, gk, beta, Aqk, Akk = map(
-            lambda x: rearrange(x, "1 (b t) ... -> b t ...", b=B),
-            (q, k, gk, beta, Aqk, Akk),
+
+    # TODO: support cuda recompute_wu impl with disable_recompute=True
+    if disable_recompute:
+        # rearrange back
+        if B != 1:
+            q, k, gk, beta, Aqk, Akk = map(
+                lambda x: rearrange(x, "1 (b t) ... -> b t ...", b=B),
+                (q, k, gk, beta, Aqk, Akk),
+            )
+
+        if reset_cu_seqlens:
+            cu_seqlens = None
+
+        w, u, qg, kg = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=Akk,
+            q=q if disable_recompute else None,
+            gk=gk,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
         )
-    if reset_cu_seqlens:
-        cu_seqlens = None
+    else:
+        w = torch.empty_like(k)
+        u = torch.empty_like(v)
+        qg = None
+        kg = torch.empty_like(k) if gk is not None else None
+        if B != 1:
+            w, u, kg = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (w, u, kg))
 
-    # Use FLA Triton recompute_wu for numerical stability.
-    # CuTeDSL WGMMA bf16 matmul introduces precision differences in w/u
-    # that compound through the downstream pipeline causing NaN for some configs.
-    from fla.ops.kda.wy_fast import recompute_w_u_fwd
+        cula_cuda.recompute_w_u_cuda(k, v, beta, Akk, gk, cu_seqlens, chunk_indices, w, u, kg, chunk_size)
 
-    w, u, qg, kg = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=Akk,
-        q=q if disable_recompute else None,
-        gk=gk,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
+        # rearrange back
+        if B != 1:
+            w, u, kg, Aqk, Akk = map(
+                lambda x: rearrange(x, "1 (b t) ... -> b t ...", b=B),
+                (w, u, kg, Aqk, Akk),
+            )
 
     return w, u, qg, kg, Aqk, Akk
 
