@@ -30,7 +30,8 @@ void ChunkKDAFwdIntra(
     at::Tensor tile_counter,
     float scale,
     int chunk_size,
-    bool use_tf32_inverse);
+    bool use_tf32_inverse,
+    bool unified_gref);
 #endif
 
 #if defined(CULA_SM90A_ENABLED)

@@ -74,11 +74,12 @@ using namespace cute;
 //     inter(1,0): exp2(g_first_1 - g_0[x]) * K_0[x] → sKG_inter index 0
 //     inter(2,0): exp2(g_first_2 - g_0[x]) * K_0[x] → sKG_inter index 1
 //     inter(3,0): exp2(g_first_3 - g_0[x]) * K_0[x] → sKG_inter index 3
-template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_>
+template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_, bool UnifiedGRef = true>
 __forceinline__ __device__ void fwd_setup_kg_col0_4out(
     G_TENSOR &sG, K_TENSOR &sK,
     KG_TENSOR &sKG_inter, KG_TENSOR &sKG_intra,
     int idx_in_warpgroup, int sub_seq_len) {
+    constexpr int intra_offset = UnifiedGRef ? 0 : 8;
     int y_base = idx_in_warpgroup % 8 * 4;
     // K data from sub_tile j=0
     int x = idx_in_warpgroup / 8 + 0 * 16;
@@ -88,7 +89,7 @@ __forceinline__ __device__ void fwd_setup_kg_col0_4out(
     for (int y_iter = 0; y_iter < TileK_; y_iter += 32) {
         int y = y_base + y_iter;
         // Load 4 g_ref values for this column chunk
-        float4 g_half_0_local  = *reinterpret_cast<float4*>(&sG(min(0 * 16 + 8, sub_seq_len - 1), y));
+        float4 g_first_0_local = *reinterpret_cast<float4*>(&sG(min(0 * 16 + intra_offset, sub_seq_len - 1), y));
         float4 g_first_1_local = *reinterpret_cast<float4*>(&sG(min(1 * 16, sub_seq_len - 1), y));
         float4 g_first_2_local = *reinterpret_cast<float4*>(&sG(min(2 * 16, sub_seq_len - 1), y));
         float4 g_first_3_local = *reinterpret_cast<float4*>(&sG(min(3 * 16, sub_seq_len - 1), y));
@@ -99,10 +100,10 @@ __forceinline__ __device__ void fwd_setup_kg_col0_4out(
             float2 kf_b = __bfloat1622float2(k.b);
             float2 g_a = reinterpret_cast<float2*>(&g)[0];
             float2 g_b = reinterpret_cast<float2*>(&g)[1];
-            // intra(0,0): exp2(g_half_0 - g[x]) * K[x]
+            // intra(0,0): exp2(g_first_0 - g[x]) * K[x]
             {
-                float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_half_0_local)[0], g_a);
-                float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_half_0_local)[1], g_b);
+                float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_0_local)[0], g_a);
+                float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_0_local)[1], g_b);
                 s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
                 s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
                 float4 res;
@@ -158,11 +159,12 @@ __forceinline__ __device__ void fwd_setup_kg_col0_4out(
 //     intra(1,1): exp2(g_half_1 - g_1[x]) * K_1[x]  → sKG_intra index 1
 //     inter(2,1): exp2(g_first_2 - g_1[x]) * K_1[x] → sKG_inter index 2
 //     inter(3,1): exp2(g_first_3 - g_1[x]) * K_1[x] → sKG_inter index 4
-template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_>
+template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_, bool UnifiedGRef = true>
 __forceinline__ __device__ void fwd_setup_kg_col1_3out(
     G_TENSOR &sG, K_TENSOR &sK,
     KG_TENSOR &sKG_inter, KG_TENSOR &sKG_intra,
     int idx_in_warpgroup, int sub_seq_len) {
+    constexpr int intra_offset = UnifiedGRef ? 0 : 8;
     int y_base = idx_in_warpgroup % 8 * 4;
     // K data from sub_tile j=1
     int x = idx_in_warpgroup / 8 + 1 * 16;
@@ -170,7 +172,7 @@ __forceinline__ __device__ void fwd_setup_kg_col1_3out(
     for (int y_iter = 0; y_iter < TileK_; y_iter += 32) {
         int y = y_base + y_iter;
         // Load 3 g_ref values for this column chunk
-        float4 g_half_1_local  = *reinterpret_cast<float4*>(&sG(min(1 * 16 + 8, sub_seq_len - 1), y));
+        float4 g_first_1_local = *reinterpret_cast<float4*>(&sG(min(1 * 16 + intra_offset, sub_seq_len - 1), y));
         float4 g_first_2_local = *reinterpret_cast<float4*>(&sG(min(2 * 16, sub_seq_len - 1), y));
         float4 g_first_3_local = *reinterpret_cast<float4*>(&sG(min(3 * 16, sub_seq_len - 1), y));
         if (x < sub_seq_len) {
@@ -180,10 +182,10 @@ __forceinline__ __device__ void fwd_setup_kg_col1_3out(
             float2 kf_b = __bfloat1622float2(k.b);
             float2 g_a = reinterpret_cast<float2*>(&g)[0];
             float2 g_b = reinterpret_cast<float2*>(&g)[1];
-            // intra(1,1): exp2(g_half_1 - g[x]) * K[x]
+            // intra(1,1): exp2(g_first_1 - g[x]) * K[x]
             {
-                float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_half_1_local)[0], g_a);
-                float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_half_1_local)[1], g_b);
+                float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_1_local)[0], g_a);
+                float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_1_local)[1], g_b);
                 s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
                 s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
                 float4 res;
@@ -226,11 +228,12 @@ __forceinline__ __device__ void fwd_setup_kg_col1_3out(
 //   Loads K_2 + G data once, computes:
 //     intra(2,2): exp2(g_half_2 - g_2[x]) * K_2[x]  → sKG_intra index 2
 //     inter(3,2): exp2(g_first_3 - g_2[x]) * K_2[x] → sKG_inter index 5
-template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_>
+template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_, bool UnifiedGRef = true>
 __forceinline__ __device__ void fwd_setup_kg_col2_2out(
     G_TENSOR &sG, K_TENSOR &sK,
     KG_TENSOR &sKG_inter, KG_TENSOR &sKG_intra,
     int idx_in_warpgroup, int sub_seq_len) {
+    constexpr int intra_offset = UnifiedGRef ? 0 : 8;
     int y_base = idx_in_warpgroup % 8 * 4;
     // K data from sub_tile j=2
     int x = idx_in_warpgroup / 8 + 2 * 16;
@@ -238,7 +241,7 @@ __forceinline__ __device__ void fwd_setup_kg_col2_2out(
     for (int y_iter = 0; y_iter < TileK_; y_iter += 32) {
         int y = y_base + y_iter;
         // Load 2 g_ref values for this column chunk
-        float4 g_half_2_local  = *reinterpret_cast<float4*>(&sG(min(2 * 16 + 8, sub_seq_len - 1), y));
+        float4 g_first_2_local = *reinterpret_cast<float4*>(&sG(min(2 * 16 + intra_offset, sub_seq_len - 1), y));
         float4 g_first_3_local = *reinterpret_cast<float4*>(&sG(min(3 * 16, sub_seq_len - 1), y));
         if (x < sub_seq_len) {
             float4 g = *reinterpret_cast<float4*>(&sG(x, y));
@@ -247,10 +250,10 @@ __forceinline__ __device__ void fwd_setup_kg_col2_2out(
             float2 kf_b = __bfloat1622float2(k.b);
             float2 g_a = reinterpret_cast<float2*>(&g)[0];
             float2 g_b = reinterpret_cast<float2*>(&g)[1];
-            // intra(2,2): exp2(g_half_2 - g[x]) * K[x]
+            // intra(2,2): exp2(g_first_2 - g[x]) * K[x]
             {
-                float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_half_2_local)[0], g_a);
-                float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_half_2_local)[1], g_b);
+                float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[0], g_a);
+                float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[1], g_b);
                 s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
                 s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
                 float4 res;
@@ -280,11 +283,12 @@ __forceinline__ __device__ void fwd_setup_kg_col2_2out(
 // fwd_setup_kg_col3_1out: column j=3, 1 output (intra only)
 //   Loads K_3 + G data once, computes:
 //     intra(3,3): exp2(g_half_3 - g_3[x]) * K_3[x]  → sKG_intra index 3
-template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_>
+template <typename G_TENSOR, typename K_TENSOR, typename KG_TENSOR, int KG_OFFSET, int TileK_, bool UnifiedGRef = true>
 __forceinline__ __device__ void fwd_setup_kg_col3_1out(
     G_TENSOR &sG, K_TENSOR &sK,
     KG_TENSOR &sKG_intra,
     int idx_in_warpgroup, int sub_seq_len) {
+    constexpr int intra_offset = UnifiedGRef ? 0 : 8;
     int y_base = idx_in_warpgroup % 8 * 4;
     // K data from sub_tile j=3
     int x = idx_in_warpgroup / 8 + 3 * 16;
@@ -292,13 +296,13 @@ __forceinline__ __device__ void fwd_setup_kg_col3_1out(
     for (int y_iter = 0; y_iter < TileK_; y_iter += 32) {
         int y = y_base + y_iter;
         // Load 1 g_ref value for this column chunk
-        float4 g_half_3_local = *reinterpret_cast<float4*>(&sG(min(3 * 16 + 8, sub_seq_len - 1), y));
+        float4 g_first_3_local = *reinterpret_cast<float4*>(&sG(min(3 * 16 + intra_offset, sub_seq_len - 1), y));
         if (x < sub_seq_len) {
             float4 g = *reinterpret_cast<float4*>(&sG(x, y));
             nvbf16x4 k = *reinterpret_cast<nvbf16x4*>(&sK(x, y));
-            // intra(3,3): exp2(g_half_3 - g[x]) * K[x]
-            float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_half_3_local)[0], reinterpret_cast<float2*>(&g)[0]);
-            float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_half_3_local)[1], reinterpret_cast<float2*>(&g)[1]);
+            // intra(3,3): exp2(g_first_3 - g[x]) * K[x]
+            float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[0], reinterpret_cast<float2*>(&g)[0]);
+            float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[1], reinterpret_cast<float2*>(&g)[1]);
             s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
             s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
             float4 res;
@@ -365,6 +369,58 @@ __forceinline__ __device__ void fwd_setup_A_inter_intra_all(
     }
     ku::tmem_st_32dp32bNx<TileK>(tmem_addr_inter, res_inter);
     ku::tmem_st_32dp32bNx<TileK>(tmem_addr_intra, res_intra);
+}
+
+// fwd_setup_A_inter_all: inter-only, single Vec (Q or K)
+// Only computes gated Vec with inter reference (g_first), skips intra entirely.
+template <int TileK, typename G_TENSOR, typename VEC_TENSOR>
+__forceinline__ __device__ void fwd_setup_A_inter_all(
+    G_TENSOR &sG, VEC_TENSOR &sVec,
+    int idx_in_warpgroup, int sub_seq_len, int k_offset,
+    int tmem_addr_inter) {
+    int row = idx_in_warpgroup % 64;
+    int sub_tile_i = row / 16;  // 0, 1, 2, or 3
+    float res_inter[TileK];
+    if (row < sub_seq_len) {
+        int g_first_row = min(sub_tile_i * 16, sub_seq_len - 1);
+        #pragma unroll
+        for (int i = 0; i < TileK / 4; ++i) {
+            int y = i * 4 + k_offset;
+            float4 g     = *reinterpret_cast<float4*>(&sG(row, y));
+            nvbf16x4 v   = *reinterpret_cast<nvbf16x4*>(&sVec(row, y));
+            float2 va = __bfloat1622float2(v.a);
+            float2 vb = __bfloat1622float2(v.b);
+            float4 g_ref = *reinterpret_cast<float4*>(&sG(g_first_row, y));
+            float2 s1 = float2_sub(reinterpret_cast<float2*>(&g)[0], reinterpret_cast<float2*>(&g_ref)[0]);
+            float2 s2 = float2_sub(reinterpret_cast<float2*>(&g)[1], reinterpret_cast<float2*>(&g_ref)[1]);
+            s1.x = exp2f(s1.x); s1.y = exp2f(s1.y);
+            s2.x = exp2f(s2.x); s2.y = exp2f(s2.y);
+            reinterpret_cast<float2*>(&res_inter[i * 4])[0] = float2_mul(s1, va);
+            reinterpret_cast<float2*>(&res_inter[i * 4])[1] = float2_mul(s2, vb);
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < TileK; ++i) {
+            res_inter[i] = 0.0f;
+        }
+    }
+    ku::tmem_st_32dp32bNx<TileK>(tmem_addr_inter, res_inter);
+}
+
+// fwd_setup_A_inter_all_QK: inter-only, combined Q + K
+// Threads 0-63 → gated Q (inter), Threads 64-127 → gated K (inter)
+template <int TileK, typename G_TENSOR, typename Q_TENSOR, typename K_TENSOR>
+__forceinline__ __device__ void fwd_setup_A_inter_all_QK(
+    G_TENSOR &sG, Q_TENSOR &sQ, K_TENSOR &sK,
+    int idx_in_warpgroup, int sub_seq_len, int k_offset,
+    int tmem_addr_inter) {
+    if (idx_in_warpgroup < 64) {
+        fwd_setup_A_inter_all<TileK>(sG, sQ, idx_in_warpgroup, sub_seq_len, k_offset,
+            tmem_addr_inter + k_offset);
+    } else {
+        fwd_setup_A_inter_all<TileK>(sG, sK, idx_in_warpgroup, sub_seq_len, k_offset,
+            tmem_addr_inter + k_offset);
+    }
 }
 
 // fwd_setup_A_inter_intra_all_QK: fused inter+intra, combined Q + K

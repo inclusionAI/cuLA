@@ -43,7 +43,7 @@ struct KdaChunkFwdIntraSm100NamedBarriers {
 // constants, and the persistent loop bodies for each warp role.
 // The Kernel struct is templated on this Mainloop.
 // ===================================================================
-template <bool UseTF32Inverse_ = true, bool RoundingTF32_ = false>
+template <bool UseTF32Inverse_ = true, bool RoundingTF32_ = false, bool UnifiedGRef_ = true>
 struct KdaChunkFwdIntraMainloopSm100 {
 
     // ===================== Tile / Buffer Constants =====================
@@ -68,6 +68,10 @@ struct KdaChunkFwdIntraMainloopSm100 {
     // default to false, because FLA impl uses tl.dot directly which does not use rounding
     // ref: https://triton-lang.org/main/python-api/generated/triton.language.dot.html
     static constexpr bool RoundingTF32   = RoundingTF32_;
+    // When true, intra B-matrix uses g_first (=g[sub_tile_i*16]) instead of g_half (=g[sub_tile_i*16+8]).
+    // This makes inter and intra A-matrices identical, allowing the intra A-matrix to be skipped entirely.
+    // Saves 50% of A-matrix exp2f computation and one TMEM store per k-iteration.
+    static constexpr bool UnifiedGRef    = UnifiedGRef_;
 
     // double buffer in TMEM, overlap prologue A matrix with MMA
     enum class TmemAllocation : uint32_t {
@@ -118,14 +122,18 @@ struct KdaChunkFwdIntraMainloopSm100 {
         Shape<Int<TileT>, Int<TileT>>{}
     ));
 
-    // inv(KK) (tf32)
-    using SmemLayoutOutputTF32 = decltype(coalesce(tile_to_shape(
-        UMMA::Layout_K_SW128_Atom<ku::tf32>{},
-        Shape<Int<TileT>, Int<TileT>>{},
-        Step<_1, _2>{}
-    ), Shape<_1, _1>{}));
+    // inv(KK) (tf32) — padded row-major layout to avoid SMEM bank conflicts.
+    // With SW128 swizzle (SmemLayoutOutputTF32), row stride = 64*4 = 256 bytes,
+    // and (row*64) % 32 == 0 for all rows, causing 32-way bank conflicts when
+    // threads write/read the same column across different rows.
+    // Padded stride 68: bank(r,c) = (r*68+c) % 32 = (r*4+c) % 32, cycling
+    // through 8 banks per 8 rows → max 4-way conflict (8x better).
+    // Each row is 68*4 = 272 bytes, which is 16-byte aligned (128-bit).
+    // Extra SMEM per buffer: 4*64*4 = 1024 bytes (negligible).
+    using SmemLayoutInvKK_TF32_Padded = Layout<Shape<Int<TileT>, Int<TileT>>,
+                                               Stride<Int<TileT + 4>, _1>>;
 
-    using SmemLayoutInvKK = std::conditional_t<!UseTF32Inverse, SmemLayoutOutputFP16, SmemLayoutOutputTF32>;
+    using SmemLayoutInvKK = std::conditional_t<!UseTF32Inverse, SmemLayoutOutputFP16, SmemLayoutInvKK_TF32_Padded>;
 
     using TiledMMA_KDAqk_N16_MASK02 = decltype(make_tiled_mma(
         SM100_MMA_TF32_TS_MASK02<ku::tf32, ku::tf32, float, TileT, SubTileT, UMMA::Major::K, UMMA::Major::K>{}
@@ -367,14 +375,23 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 {
                     Tensor sQ = make_tensor(make_smem_ptr(shared_plan->q[buf_load_idx].data()), SmemLayoutInputBF16{});
 
-                    // Fused inter+intra A-matrix: reads sG and sQ/sK ONCE per iteration,
-                    // producing both QG_INTER and QG_INTRA in a single pass.
-                    // Saves ~33% of A-matrix SMEM reads vs two separate calls.
-                    fwd_setup_A_inter_intra_all_QK<HalfK>(
-                        sG, sQ, sK,
-                        idx_in_warpgroup, sub_seq_len, k_offset,
-                        static_cast<int>(TmemAllocation::QG_INTER) + buf_idx * 128,
-                        static_cast<int>(TmemAllocation::QG_INTRA) + buf_idx * 128);
+                    if constexpr (UnifiedGRef) {
+                        // Inter-only A-matrix: B-matrix intra also uses g_first reference,
+                        // so inter and intra A-matrices are identical. Only compute inter.
+                        // Saves 50% of A-matrix exp2f computation and one TMEM store.
+                        fwd_setup_A_inter_all_QK<HalfK>(
+                            sG, sQ, sK,
+                            idx_in_warpgroup, sub_seq_len, k_offset,
+                            static_cast<int>(TmemAllocation::QG_INTER) + buf_idx * 128);
+                    } else {
+                        // Fused inter+intra A-matrix: reads sG and sQ/sK ONCE per iteration,
+                        // producing both QG_INTER and QG_INTRA in a single pass.
+                        fwd_setup_A_inter_intra_all_QK<HalfK>(
+                            sG, sQ, sK,
+                            idx_in_warpgroup, sub_seq_len, k_offset,
+                            static_cast<int>(TmemAllocation::QG_INTER) + buf_idx * 128,
+                            static_cast<int>(TmemAllocation::QG_INTRA) + buf_idx * 128);
+                    }
 
                     // NOTE: TMEM fence (tcgen05.wait::st, blocking) deferred past B-matrix
                     // to overlap TMEM store latency with B-matrix SMEM computation.
@@ -399,25 +416,25 @@ struct KdaChunkFwdIntraMainloopSm100 {
                     if (wg_idx == 0) {
                         // ---- WG0: Column j=0 (4 outputs) ----
                         // intra(0,0) + inter(1,0) + inter(2,0) + inter(3,0)
-                        fwd_setup_kg_col0_4out<decltype(sG), decltype(sK), decltype(sKG_inter), kg_offset, TileK>(
+                        fwd_setup_kg_col0_4out<decltype(sG), decltype(sK), decltype(sKG_inter), kg_offset, TileK, UnifiedGRef>(
                             sG, sK, sKG_inter, sKG_intra,
                             idx_in_warpgroup, sub_seq_len);
 
                         // ---- WG0: Column j=3 (1 output) ----
                         // intra(3,3)
-                        fwd_setup_kg_col3_1out<decltype(sG), decltype(sK), decltype(sKG_intra), kg_offset, TileK>(
+                        fwd_setup_kg_col3_1out<decltype(sG), decltype(sK), decltype(sKG_intra), kg_offset, TileK, UnifiedGRef>(
                             sG, sK, sKG_intra,
                             idx_in_warpgroup, sub_seq_len);
                     } else {
                         // ---- WG1: Column j=1 (3 outputs) ----
                         // intra(1,1) + inter(2,1) + inter(3,1)
-                        fwd_setup_kg_col1_3out<decltype(sG), decltype(sK), decltype(sKG_inter), kg_offset, TileK>(
+                        fwd_setup_kg_col1_3out<decltype(sG), decltype(sK), decltype(sKG_inter), kg_offset, TileK, UnifiedGRef>(
                             sG, sK, sKG_inter, sKG_intra,
                             idx_in_warpgroup, sub_seq_len);
 
                         // ---- WG1: Column j=2 (2 outputs) ----
                         // intra(2,2) + inter(3,2)
-                        fwd_setup_kg_col2_2out<decltype(sG), decltype(sK), decltype(sKG_inter), kg_offset, TileK>(
+                        fwd_setup_kg_col2_2out<decltype(sG), decltype(sK), decltype(sKG_inter), kg_offset, TileK, UnifiedGRef>(
                             sG, sK, sKG_inter, sKG_intra,
                             idx_in_warpgroup, sub_seq_len);
                     }
@@ -609,31 +626,34 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
                 {
                     bool first_iter = (k_idx == 0);
+                    constexpr auto IntraA_02 = UnifiedGRef ? TmemAllocation::QG_INTER_02 : TmemAllocation::QG_INTRA_02;
+                    constexpr auto IntraA_13 = UnifiedGRef ? TmemAllocation::QG_INTER_13 : TmemAllocation::QG_INTRA_13;
+
                     Tensor tQ_0 = tile_mma_qk_n16_mask02.get_slice(_0{}).make_fragment_A(
                         partition_shape_A(tile_mma_qk_n16_mask02, Shape<Int<ChunkSize>, Int<TileK>>{})
                     );
-                    tQ_0.data() = uint32_t(TmemAllocation::QG_INTRA_02) + buf_idx * 128;
+                    tQ_0.data() = uint32_t(IntraA_02) + buf_idx * 128;
                     Tensor sKG_0 = make_tensor(make_smem_ptr(shared_plan->kg_all[buf_idx].intra[0].data()), SmemLayoutMatBTF32<1>{});
                     ku::utcmma_ts(tile_mma_qk_n16_mask02, tQ_0, sKG_0, tQK_00, first_iter);
 
                     Tensor tQ_1 = tile_mma_qk_n16_mask02.get_slice(_0{}).make_fragment_A(
                         partition_shape_A(tile_mma_qk_n16_mask02, Shape<Int<ChunkSize>, Int<TileK>>{})
                     );
-                    tQ_1.data() = uint32_t(TmemAllocation::QG_INTRA_13) + buf_idx * 128;
+                    tQ_1.data() = uint32_t(IntraA_13) + buf_idx * 128;
                     Tensor sKG_1 = make_tensor(make_smem_ptr(shared_plan->kg_all[buf_idx].intra[1].data()), SmemLayoutMatBTF32<1>{});
                     ku::utcmma_ts(tile_mma_qk_n16_mask02, tQ_1, sKG_1, tQK_11, first_iter);
 
                     Tensor tQ_2 = tile_mma_qk_n16_mask02.get_slice(_0{}).make_fragment_A(
                         partition_shape_A(tile_mma_qk_n16_mask02, Shape<Int<ChunkSize>, Int<TileK>>{})
                     );
-                    tQ_2.data() = uint32_t(TmemAllocation::QG_INTRA_02) + buf_idx * 128;
+                    tQ_2.data() = uint32_t(IntraA_02) + buf_idx * 128;
                     Tensor sKG_2 = make_tensor(make_smem_ptr(shared_plan->kg_all[buf_idx].intra[2].data()), SmemLayoutMatBTF32<1>{});
                     ku::utcmma_ts(tile_mma_qk_n16_mask13, tQ_2, sKG_2, tQK_22, first_iter);
 
                     Tensor tQ_3 = tile_mma_qk_n16_mask02.get_slice(_0{}).make_fragment_A(
                         partition_shape_A(tile_mma_qk_n16_mask02, Shape<Int<ChunkSize>, Int<TileK>>{})
                     );
-                    tQ_3.data() = uint32_t(TmemAllocation::QG_INTRA_13) + buf_idx * 128;
+                    tQ_3.data() = uint32_t(IntraA_13) + buf_idx * 128;
                     Tensor sKG_3 = make_tensor(make_smem_ptr(shared_plan->kg_all[buf_idx].intra[3].data()), SmemLayoutMatBTF32<1>{});
                     ku::utcmma_ts(tile_mma_qk_n16_mask13, tQ_3, sKG_3, tQK_33, first_iter);
 

@@ -833,6 +833,7 @@ class ChunkDeltaRuleFwdH:
             else:
                 num_iters = (total_work_units - block_idx_x + grid_dim_x - 1) // grid_dim_x
             # Pre-initialize variables reassigned inside persistent loop (CuTe DSL requirement)
+            work_idx = Int32(0)
             v_tile_idx = Int32(0)
             hidx = Int32(0)
             bidx = Int32(0)

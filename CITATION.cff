@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+- name: "Chaofan Yu"
+- name: "Bowen Zheng"
+- name: "Hao Chen"
+- name: "Zhe Yang"
+- name: "Zhiqiang Zhang"
+title: "cuLA: CUDA Linear Attention"
+version: 0.1
+date-released: 2026-03-28
+url: "https://github.com/InclusionAI/cuLA"
+license: Apache-2.0

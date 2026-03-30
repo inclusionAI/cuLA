@@ -295,13 +295,19 @@ struct KdaChunkFwdIntraKernelSm100 {
 };
 
 // ===================================================================
-// Default Kernel types: parameterized by UseTF32Inverse
+// Default Kernel types: parameterized by UseTF32Inverse × UnifiedGRef
 // ===================================================================
 using KdaChunkFwdIntraKernelSm100_TF32 =
-    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<true, false>>;
+    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<true, false, true>>;
 
 using KdaChunkFwdIntraKernelSm100_FP16 =
-    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<false, false>>;
+    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<false, false, true>>;
+
+using KdaChunkFwdIntraKernelSm100_TF32_GHalf =
+    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<true, false, false>>;
+
+using KdaChunkFwdIntraKernelSm100_FP16_GHalf =
+    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<false, false, false>>;
 
 // ===================================================================
 // __global__ kernel wrapper (free function — CUDA requires this)
@@ -375,13 +381,21 @@ inline void run_kda_fwd_intra_sm100_impl_dispatch(KDA_fwd_intra_params &params, 
 }
 
 // ===================================================================
-// Runtime dispatch based on params.use_tf32_inverse
+// Runtime dispatch based on params.use_tf32_inverse and params.unified_gref
 // ===================================================================
 inline void run_kda_fwd_intra_sm100_impl(KDA_fwd_intra_params &params, cudaStream_t stream) {
     if (params.use_tf32_inverse) {
-        run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_TF32>(params, stream);
+        if (params.unified_gref) {
+            run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_TF32>(params, stream);
+        } else {
+            run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_TF32_GHalf>(params, stream);
+        }
     } else {
-        run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_FP16>(params, stream);
+        if (params.unified_gref) {
+            run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_FP16>(params, stream);
+        } else {
+            run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_FP16_GHalf>(params, stream);
+        }
     }
 }
 

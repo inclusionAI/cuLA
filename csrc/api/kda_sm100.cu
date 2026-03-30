@@ -30,7 +30,8 @@ void ChunkKDAFwdIntra(
     at::Tensor tile_counter,
     float scale,
     int chunk_size,
-    bool use_tf32_inverse) {
+    bool use_tf32_inverse,
+    bool unified_gref) {
 
     KDA_fwd_intra_params params;
     params.total_q_len = q.size(0) * q.size(1);
@@ -40,6 +41,7 @@ void ChunkKDAFwdIntra(
     params.chunk_size = chunk_size;
     params.scale = scale;
     params.use_tf32_inverse = use_tf32_inverse;
+    params.unified_gref = unified_gref;
     params.q_ptr = q.data_ptr();
     params.k_ptr = k.data_ptr();
     params.g_ptr = g.data_ptr();

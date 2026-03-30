@@ -172,11 +172,12 @@ class ChunkGlaFwdO:
             self.h_stage = 2
             self.v_stage = 2
             self.a_stage = 2
-            # With occ=1 (65536 regs/CTA), we can give more registers to
-            # the store warp so it can hold the full O tile partition in
-            # registers (~128 regs for 256 bf16), enabling bulk SMEM→REG
-            # prefetch before GMEM writes.
-            # Budget: 4×32×208 + 4×32×168 = 48128 ≤ 65536 ✓
+            # With occ=1 (65536 regs/CTA), give CUDA warps maximum registers
+            # to eliminate register spilling (peak ~200 regs for dual-ACC
+            # T2R epilog: 2×64 fp32 + bf16 buffers + overhead).
+            # Store warp needs ~168 for bulk O tile prefetch (varlen).
+            # Budget: 4×32×256 + 4×32×168 = 54272 ≤ 65536 ✓
+            self.num_regs_cuda = 256
             self.num_regs_others = 168
         else:
             self.q_stage = 1
@@ -1289,17 +1290,24 @@ class ChunkGlaFwdO:
                 am_h.commit()
 
                 # ============ Dual-ACC Epilog: read both accumulators, combine ============
+                # Sequential T2R to reduce peak register pressure:
+                # Phase 1: read QH acc, fence, scale in-place (64 fp32 regs live)
+                # Phase 2: read AV acc, fence, add to scaled QH (128 fp32 regs briefly)
                 acc_h = acc_done_C.wait_and_advance()
 
                 # Read QH accumulator (qg@h) from TMEM → fp32 registers
                 cute.copy(tiled_t2r_acc, tTR_tAcc_qh[(None, None, None, 0)], tTR_rQG_fp32)
+                cute.arch.fence_view_async_tmem_load()
+                # Scale QH in-place while only 64 fp32 regs are live
+                tTR_rQG_fp32.store(tTR_rQG_fp32.load() * Float32(scale_f32))
+
                 # Read AV accumulator (am@v) from TMEM → fp32 registers
                 cute.copy(tiled_t2r_acc, tTR_tAcc_av[(None, None, None, 0)], tTR_rAV_fp32)
                 cute.arch.fence_view_async_tmem_load()
                 acc_h.release()
 
-                # o = scale*(qg@h) + am@v
-                tTR_rQG_fp32.store(tTR_rQG_fp32.load() * Float32(scale_f32) + tTR_rAV_fp32.load())
+                # o = scaled_qh + av
+                tTR_rQG_fp32.store(tTR_rQG_fp32.load() + tTR_rAV_fp32.load())
 
                 tTR_rAcc_bf16 = cute.make_rmem_tensor(tTR_rQG_fp32.shape, self.io_dtype)
                 tTR_rAcc_bf16.store(tTR_rQG_fp32.load().to(self.io_dtype))

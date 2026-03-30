@@ -202,6 +202,19 @@ See [REPO_LAYOUT.md](REPO_LAYOUT.md) for the full directory structure and a summ
 
 This project is inspired by [flash-linear-attention](https://github.com/fla-org/flash-linear-attention), [CUTLASS](https://github.com/NVIDIA/cutlass) and [CuTe DSL](https://github.com/NVIDIA/cutlass/tree/main/python/CuTeDSL). We thank [FLA-org](https://github.com/fla-org) and NVIDIA for their great work.
 
+## Citation
+
+If you find cuLA useful, please cite it using the metadata in our [`CITATION.cff`](CITATION.cff) file:
+
+```bibtex
+@software{cula2026,
+  title   = {cuLA: CUDA Linear Attention},
+  author  = {Chaofan Yu, Bowen Zeng, Hao Chen, Zhe Yang, Zhiqiang Zhang},
+  year    = {2026},
+  url     = {https://github.com/InclusionAI/cuLA}
+}
+```
+
 ## Contact
 
 If you're interested in an internship or job opportunity, feel free to reach out: **shuyan.ycf@antgroup.com**  / **chaofanyu@gmail.com**

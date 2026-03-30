@@ -20,7 +20,6 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
-from fla.ops.kda.wy_fast import recompute_w_u_fwd
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2, gather
 from fla.utils import IS_GATHER_SUPPORTED, IS_TF32_SUPPORTED, autotune_cache_kwargs
@@ -759,6 +758,7 @@ def chunk_kda_fwd_intra(
     safe_gate: bool = False,
     disable_recompute: bool = False,
     use_tf32_inverse: bool = True,
+    unified_gref: bool = False,  # Set True for ~5% extra perf (slightly lower precision)
 ):
     assert safe_gate, "Only safe_gate=True is supported in chunk_kda_fwd_intra for now"
     B, T, H, K = k.shape
@@ -787,7 +787,7 @@ def chunk_kda_fwd_intra(
         q, k, gk, beta, Aqk, Akk = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, gk, beta, Aqk, Akk))
     tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
     cula_cuda.chunk_kda_fwd_intra_cuda(
-        q, k, gk, beta, cu_seqlens, chunk_indices, Aqk, Akk, tile_counter, scale, chunk_size, use_tf32_inverse
+        q, k, gk, beta, cu_seqlens, chunk_indices, Aqk, Akk, tile_counter, scale, chunk_size, use_tf32_inverse, unified_gref
     )
     # rearrange back
     if B != 1:
@@ -797,6 +797,11 @@ def chunk_kda_fwd_intra(
         )
     if reset_cu_seqlens:
         cu_seqlens = None
+
+    # Use FLA Triton recompute_wu for numerical stability.
+    # CuTeDSL WGMMA bf16 matmul introduces precision differences in w/u
+    # that compound through the downstream pipeline causing NaN for some configs.
+    from fla.ops.kda.wy_fast import recompute_w_u_fwd
 
     w, u, qg, kg = recompute_w_u_fwd(
         k=k,
@@ -808,6 +813,7 @@ def chunk_kda_fwd_intra(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
+
     return w, u, qg, kg, Aqk, Akk
 
 

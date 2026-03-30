@@ -61,6 +61,7 @@ def chunk_kda_fwd(
     return_intermediate_states: bool = False,
     cp_context: FLACPContext | None = None,
     use_tf32_inverse: bool = True,
+    unified_gref: bool = False,  # Set True for ~5% extra perf (slightly lower precision)
 ):
     major, minor = get_device_sm_version(q.device)
     if major != 10 or minor != 0:
@@ -101,6 +102,7 @@ def chunk_kda_fwd(
         safe_gate=safe_gate,
         disable_recompute=disable_recompute,
         use_tf32_inverse=use_tf32_inverse,
+        unified_gref=unified_gref,
     )
 
     if cp_context is not None:
