@@ -71,6 +71,8 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64
 
+from cula.utils import assert_blackwell
+
 PRINT_DEBUG = False
 
 
@@ -104,8 +106,7 @@ class LinearAttentionChunkwise:
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         io_dtype: type[cutlass.Numeric] = cutlass.BFloat16,
     ):
-        cc = torch.cuda.get_device_capability()
-        assert cc[0] == 10 and cc[1] == 0, f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
+        assert_blackwell()
         self.chunk_size = chunk_size
         self.qk_acc_dtype = qk_acc_dtype
         self.kv_acc_dtype = kv_acc_dtype

@@ -68,6 +68,8 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64
 from fla.modules.l2norm import l2norm_fwd
 
+from cula.utils import assert_blackwell
+
 # Global debug switch - set to False to disable ALL print statements
 # When False, cutlass.const_expr(PRINT_DEBUG) will eliminate code at compile time
 PRINT_DEBUG = False
@@ -131,8 +133,7 @@ class KDAChunkwise:
         num_regs_subchunk: int = 192,
         num_regs_others: int = 64,  # Optimized: best config from comprehensive sweep
     ):
-        cc = torch.cuda.get_device_capability()
-        assert cc[0] == 10 and cc[1] == 0, f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
+        assert_blackwell()
         # make scale a constant
         self.scale = scale
         self.safe_gate = safe_gate

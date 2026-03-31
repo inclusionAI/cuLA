@@ -43,7 +43,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Int32, Int64
 
-from cula.utils import USE_FAST_MATH
+from cula.utils import USE_FAST_MATH, assert_blackwell
 
 
 def _make_coop_group(size: int):
@@ -65,8 +65,7 @@ class KDARecomputeWU:
         use_fast_math: bool = True,
     ):
         assert K == 128 and V == 128, f"K and V must both be 128, got K={K}, V={V}"
-        cc = torch.cuda.get_device_capability()
-        assert cc[0] == 10 and cc[1] == 0, f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
+        assert_blackwell()
         self.use_fast_math = use_fast_math
         self.K = K
         self.V = V

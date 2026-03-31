@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
-os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
 import importlib
 
 import torch
@@ -30,7 +27,7 @@ from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 
 from cula.kda.chunk_intra import chunk_kda_fwd_intra
-from cula.utils import get_device_sm_version
+from cula.utils import assert_blackwell
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
 _delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h")
@@ -63,13 +60,7 @@ def chunk_kda_fwd(
     use_tf32_inverse: bool = True,
     unified_gref: bool = False,  # Set True for ~5% extra perf (slightly lower precision)
 ):
-    major, minor = get_device_sm_version(q.device)
-    if major != 10 or minor != 0:
-        raise RuntimeError(
-            f"chunk_kda requires SM100 (Blackwell) GPUs, "
-            f"but the current device has compute capability sm_{major}{minor}. "
-            f"For SM90 (Hopper), use `get_kda_fused_fwd()` from cula.utils instead."
-        )
+    assert_blackwell(q.device)
 
     # Apply gate activation
     g_org = None

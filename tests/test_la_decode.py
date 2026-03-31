@@ -29,9 +29,6 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-import os
-
-os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
 
 from cula.lightning.la_decode import linear_attention_decode
 

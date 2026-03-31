@@ -44,12 +44,12 @@ import time
 import numpy as np
 
 os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
-os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
 os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 from fla.ops.simple_gla.chunk import chunk_simple_gla_fwd
 
 from cula.ops.lightning_attn import lightning_attn_fwd, lightning_attn_fwd_varlen

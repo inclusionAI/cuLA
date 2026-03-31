@@ -35,7 +35,7 @@ from cutlass.cutlass_dsl import T as _T
 from fla.ops.utils import prepare_chunk_indices, prepare_lens
 from fla.utils import tensor_cache
 
-from cula.utils import USE_FAST_MATH
+from cula.utils import USE_FAST_MATH, assert_blackwell
 
 
 # in FLA, cumsum returns int64 tensor by default
@@ -94,8 +94,7 @@ class ChunkDeltaRuleFwdH:
         assert head_dim_k == 128 and head_dim_v == 128, (
             f"head_dim_k and head_dim_v must both be 128, got head_dim_k={head_dim_k}, head_dim_v={head_dim_v}"
         )
-        cc = torch.cuda.get_device_capability()
-        assert cc[0] == 10 and cc[1] == 0, f"Only SM100 (Blackwell) is supported, got SM{cc[0]}{cc[1]}"
+        assert_blackwell()
         self.use_fast_math = use_fast_math
         self.chunk_size = chunk_size
         self.head_dim_k = head_dim_k

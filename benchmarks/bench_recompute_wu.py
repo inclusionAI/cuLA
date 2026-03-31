@@ -31,7 +31,6 @@ import argparse
 import os
 
 os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
-os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
 os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 
 import importlib

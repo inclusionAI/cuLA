@@ -14,15 +14,15 @@ $$S_i = S_{i-1} + \phi(k_i) v_i^T, \quad o_i = \phi(q_i)^T S_i$$
 
 This recurrence reduces the complexity from $O(N^2)$ (standard attention) to $O(N)$, making linear attention particularly attractive for long-sequence modeling in LLMs. Recent variants — such as [GLA](https://arxiv.org/abs/2312.06635), [KDA](http://arxiv.org/abs/2510.26692), [GDN](https://arxiv.org/abs/2412.06464), and [Lightning Attention](https://arxiv.org/abs/2405.17381) — further enhance expressiveness with gating, delta updates, and chunkwise decomposition.
 
-**cuLA** provides hand-tuned CUDA implementations of these linear attention variants, targeting NVIDIA Blackwell (SM100) and Hopper (SM90) GPUs. It is designed as a submodule of [flash-linear-attention (FLA)](https://github.com/fla-org/flash-linear-attention), sharing the same interface — adopting cuLA requires only a one-line import change. For ease of maintenance, cuLA is currently developed as a standalone library; the end goal is for users to seamlessly access these kernels through FLA. Since FLA already has a kernel dispatch mechanism in place, integration will be ready soon.
+**cuLA** provides hand-tuned CUDA implementations of these linear attention variants, targeting NVIDIA Blackwell (SM10X) and Hopper (SM90) GPUs. It is designed as a submodule of [flash-linear-attention (FLA)](https://github.com/fla-org/flash-linear-attention), sharing the same interface — adopting cuLA requires only a one-line import change. For ease of maintenance, cuLA is currently developed as a standalone library; the end goal is for users to seamlessly access these kernels through FLA. Since FLA already has a kernel dispatch mechanism in place, integration will be ready soon.
 
 > **⚠️ Early Stage:** cuLA is in its early development phase. Many kernels still have significant room for optimization, and the API may evolve. We warmly welcome contributions from the community — whether it's performance tuning, new algorithm support, bug fixes, or architectural improvements. Every contribution helps push the boundaries of linear attention on modern GPUs!
 
 ## Installation
 
-cuLA supports both **Hopper (SM90)** and **Blackwell (SM100)** GPUs.
+cuLA supports both **Hopper (SM90)** and **Blackwell (SM10X)** GPUs.
 
-> **Requirements (Hopper & Blackwell):** Python 3.12+, CUDA Toolkit 12.9+ (SM100a support), NVCC 12.9+, PyTorch 2.9.1+
+> **Requirements (Hopper & Blackwell):** Python 3.12+, CUDA Toolkit 12.9+ (SM10X support), NVCC 12.9+, PyTorch 2.9.1+
 
 > **Note:** The PyTorch CUDA version must match your system CUDA Toolkit version. Check with `nvcc --version` and `python -c "import torch; print(torch.version.cuda)"`.
 
@@ -51,7 +51,7 @@ pip install -e . --no-build-isolation
 
 ## Quick Start
 
-### KDA (Kimi Delta Attention) — Blackwell (SM100)
+### KDA (Kimi Delta Attention) — Blackwell (SM10X)
 
 cuLA is a drop-in replacement for [FLA](https://github.com/fla-org/flash-linear-attention) — just change the import:
 
@@ -103,11 +103,13 @@ See [USAGE.md](USAGE.md) for detailed usage examples and notes.
 
 ## Benchmarks
 
-Benchmarks run on a single **NVIDIA GB200/H200** GPU with **CUDA Toolkit 12.9**, **PyTorch 2.9.1**, **Triton 3.5.1**.
+Benchmarks run on a single **NVIDIA GB300/GB200/H200** GPU with **CUDA Toolkit 12.9**, **PyTorch 2.9.1**, **Triton 3.5.1**.
 
 FLA baseline: [flash-linear-attention v0.4.2](https://github.com/fla-org/flash-linear-attention/releases/tag/v0.4.2).
 
-**Blackwell (SM100)**
+**Blackwell (SM10X)**
+
+See [BENCHMARK_GB300.md](BENCHMARK_GB300.md) for detailed results.
 
 See [BENCHMARK_GB200.md](BENCHMARK_GB200.md) for detailed results.
  
@@ -116,15 +118,15 @@ See [BENCHMARK_GB200.md](BENCHMARK_GB200.md) for detailed results.
 See [BENCHMARK_H200.md](BENCHMARK_H200.md) for detailed results.
 
 **Highlights:**
-- **KDA Modular Forward (Blackwell):** **avg 1.32x** speedup on fixed-length, **avg 1.30x** on variable-length (18 configs, uniform/skewed/random).
+- **KDA Modular Forward (Blackwell):** **avg 1.45x** speedup on fixed-length, **avg 1.32x** on variable-length (18 configs, uniform/skewed/random).
 - **Lightning Attention Prefill (Blackwell):** up to **1.86x** speedup (B=2).
-- **Lightning Attention Varlen (Blackwell):** **avg 1.62x** speedup across 126 configs (uniform/skewed/random).
+- **Lightning Attention Varlen (Blackwell):** **avg 1.54x** speedup across 126 configs (uniform/skewed/random).
 - **KDA Fused Forward (Hopper):** **avg 1.52x** speedup across fixed-length and variable-length sequences.
 
 To regenerate benchmarks:
 
 ```bash
-# Blackwell (SM100)
+# Blackwell (SM10X)
 python benchmarks/generate_benchmark_md.py
 
 # Hopper (SM90)
@@ -173,14 +175,14 @@ See [REPO_LAYOUT.md](REPO_LAYOUT.md) for the full directory structure and a summ
 
 * [ ] Integrate into [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) via FLA's kernel dispatch mechanism
 * [ ] Polynomial approximation to mitigate the exponential bottleneck, as in [Flash-Attentiton-4](https://arxiv.org/abs/2603.05451).
-* [ ] Larger chunk size and 2-CTA on SM100 for improved throughput.
+* [ ] Larger chunk size and 2-CTA on SM10X for improved throughput.
 * [ ] Continuous optimization via agentic methods such as [AVO](https://arxiv.org/abs/2603.24517).
 * [ ] Support for more algorithms.
 * [ ] Small B/H/S optimizations.
 
 **Train**
 
-* [x] Modular KDA Forward (SM100, compatible with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/KCP.md))
+* [x] Modular KDA Forward (SM10X, compatible with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/KCP.md))
   * [x] kda chunk intra
   * [x] chunk gated delta h
   * [ ] recompute wu
@@ -194,13 +196,13 @@ See [REPO_LAYOUT.md](REPO_LAYOUT.md) for the full directory structure and a summ
 
 **Inference**
 
-* [x] Lightning prefill kernel (SM100)
+* [x] Lightning prefill kernel (SM10X)
 
-* [x] Lightning decode kernel (SM90 & SM100)
+* [x] Lightning decode kernel (SM90 & SM10X)
 
 * [x] Fused KDA prefill kernel (SM90)
 
-* [ ] Fused KDA prefill kernel (SM100)
+* [ ] Fused KDA prefill kernel (SM10X)
 
 * [ ] MTP support
 

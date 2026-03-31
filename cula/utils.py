@@ -49,11 +49,31 @@ def get_device_sm_version(device: torch.device | str | int | None = None) -> tup
     return prop.major, prop.minor
 
 
+def is_blackwell(device: torch.device | str | int | None = None) -> bool:
+    """Check whether *device* is a Blackwell-architecture GPU (SM100/SM103).
+
+    Returns ``True`` for SM100 (e.g. B200) and SM103 (e.g. B300).
+    """
+    major, minor = get_device_sm_version(device)
+    return major == 10 and minor in (0, 3)
+
+
+def assert_blackwell(device: torch.device | str | int | None = None) -> None:
+    """Assert that *device* is a Blackwell-architecture GPU (SM100/SM103).
+
+    Raises:
+        RuntimeError: If the device is not Blackwell.
+    """
+    major, minor = get_device_sm_version(device)
+    if not (major == 10 and minor in (0, 3)):
+        raise RuntimeError(f"Only Blackwell GPUs (SM100/SM103) are supported, got compute capability sm_{major}{minor}.")
+
+
 def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callable:
     """Return the appropriate ``flash_kda_prefill`` implementation for *device*.
 
-    - sm100 (Blackwell) → cula.kda.blackwell_fused_fwd.flash_kda_prefill
-    - sm90  (Hopper)    → cula.kda.hopper_fused_fwd.cula_kda_prefill
+    - sm100/sm103 (Blackwell) → cula.kda.blackwell_fused_fwd.flash_kda_prefill
+    - sm90  (Hopper)          → cula.kda.hopper_fused_fwd.cula_kda_prefill
 
     Args:
         device: CUDA device to query.  Defaults to the currently active device.
@@ -62,10 +82,10 @@ def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callabl
         RuntimeError: If the device architecture is not supported.
     """
     major, minor = get_device_sm_version(device)
-    if major == 10 and minor == 0:
+    if major == 10 and minor in (0, 3):
         # TODO
         raise NotImplementedError(
-            "The sm100a (Blackwell) implementation of fused prefill is not yet available. "
+            "The Blackwell implementation of fused prefill is not yet available. "
             "Please use a sm90a (Hopper) device or wait for future updates."
         )
     elif major == 9 and minor == 0:
@@ -74,7 +94,8 @@ def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callabl
         return cula_kda_prefill
     else:
         raise RuntimeError(
-            f"Unsupported CUDA compute capability sm_{major}{minor}. Only sm90a (Hopper) and sm100a (Blackwell) are supported."
+            f"Unsupported CUDA compute capability sm_{major}{minor}. "
+            f"Only sm90a (Hopper) and Blackwell (SM100/SM103) are supported."
         )
 
 

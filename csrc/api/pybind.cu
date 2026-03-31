@@ -17,7 +17,7 @@
 #include <torch/nn/functional.h>
 #include <torch/python.h>
 
-#if defined(CULA_SM100_ENABLED)
+#if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
 void
 ChunkKDAFwdIntra(
     at::Tensor q,
@@ -67,7 +67,7 @@ kda_fwd_prefill(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "cuLA";
-#if defined(CULA_SM100_ENABLED)
+#if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
     m.def("chunk_kda_fwd_intra_cuda", &ChunkKDAFwdIntra);
     m.def("recompute_w_u_cuda", &ChunkKDAFwdRecompWU);
 #endif
