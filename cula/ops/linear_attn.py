@@ -881,11 +881,6 @@ class LinearAttentionChunkwise:
         B, S, H, D = problem_size
         C = self.chunk_size
 
-        qk_tiled_mma.get_slice(0)
-        vp_tiled_mma.get_slice(0)
-        kv_tiled_mma.get_slice(0)
-        sq_tiled_mma.get_slice(0)
-
         # -------------------------------------------------------------
         # Make fragments for MMAs.
 

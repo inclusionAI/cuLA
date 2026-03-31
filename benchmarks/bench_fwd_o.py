@@ -234,7 +234,6 @@ def bench_varlen(configs):
 
     for seq_lens, H in configs:
         scale = K**-0.5
-        len(seq_lens)
         T_total = sum(seq_lens)
         cu_seqlens_list = [0]
         for sl in seq_lens:

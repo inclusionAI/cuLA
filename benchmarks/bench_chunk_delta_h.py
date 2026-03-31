@@ -105,7 +105,6 @@ def bench_non_varlen(configs):
     results = []
 
     for B, T, H, use_gk, use_h0, store_ht, save_vnew in configs:
-        T // BT
         torch.manual_seed(42)
         torch.cuda.empty_cache()
 
@@ -347,7 +346,6 @@ def bench_varlen(configs):
 
         min_l, max_l = min(seq_lens), max(seq_lens)
         avg_l = total_T // num_seqs
-        max_l / min_l
         tag = f"{num_seqs}seqs T={total_T} [{min_l}..{max_l}] avg={avg_l}"
 
         flags = []

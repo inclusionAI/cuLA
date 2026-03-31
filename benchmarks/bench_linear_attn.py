@@ -270,7 +270,6 @@ def test_fused_recurrent(
     v = torch.randn((B, T, H, D), dtype=dtype, device=device)
     decay = torch.randn(H, dtype=dtype, device=device)
     # h0 = torch.randn((B, H, D, D), dtype=torch.float, device=device)
-    torch.randn_like(v)
     # dht = torch.randn_like(h0)
 
     with torch.no_grad():

@@ -470,7 +470,6 @@ def test_varlen_multi_seq(seq_lens=None, H=4, D=128, C=64, decay_val=0.1, atol=5
 
     torch.manual_seed(42)
     T = sum(seq_lens)
-    len(seq_lens)
     cu_seqlens = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(seq_lens), 0).tolist()),
         dtype=torch.int32,
@@ -510,7 +509,6 @@ def test_varlen_with_initial_state(seq_lens=None, H=4, D=128, C=64, decay_val=0.
 
     torch.manual_seed(42)
     T = sum(seq_lens)
-    len(seq_lens)
     cu_seqlens = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(seq_lens), 0).tolist()),
         dtype=torch.int32,

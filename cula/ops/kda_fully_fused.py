@@ -4921,7 +4921,6 @@ class KDAChunkwise:
 
         # Each thread handles half a row (32 elements)
         # Thread layout: thread i handles row (i//2), columns [(i%2)*32 : (i%2+1)*32]
-        local_tidx // 2  # 0-63
         col_start = (local_tidx % 2) * 32  # Column offset: 0 or 32
 
         # Create copy atom for smem <-> rmem transfers (32 elements at once)

@@ -380,7 +380,6 @@ def run_correctness_tests():
 
 def run_benchmark(B=4, T=4096, H=64, K=128, V=128, num_iters=20):
     """Benchmark CuTe DSL vs FLA Triton."""
-    NT = (T + BT - 1) // BT
     print(f"\n=== Benchmark: B={B}, T={T}, H={H}, K={K}, V={V} ===")
 
     torch.manual_seed(42)
@@ -392,10 +391,6 @@ def run_benchmark(B=4, T=4096, H=64, K=128, V=128, num_iters=20):
     h0 = torch.randn(B, H, K, V, dtype=torch.float32, device=device) * 0.01
 
     # --- CuTe DSL ---
-    torch.zeros(B, NT, H, K, V, device=device, dtype=torch.bfloat16)
-    torch.zeros(B, T, H, V, device=device, dtype=torch.bfloat16)
-    torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
-
     # Warmup (triggers compilation)
     chunk_gated_delta_rule_fwd_h(
         k=k,

@@ -86,7 +86,6 @@ def fla_reference_chunk_fwd_h(
     for t in range(NT):
         start = t * BT
         end = min((t + 1) * BT, T)
-        end - start
 
         # Store h_out[t] = h (before update) - this matches FLA
         h_out[:, t] = h.to(k.dtype)
