@@ -253,8 +253,6 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                     int x_local = idx_in_wg / 8;     // 0..15
                     int y_base = idx_in_wg % 8 * 4;  // 0,4,8,...,28
 
-// TODO: 修改为首先load当前线程需要的所有K、G数据到reg中，然后先做exp(g)*k并store回sKmma
-// 通知MMA，再做exp(g_last-g)*k并store回sO
 #pragma unroll
                     for (int t_iter = 0; t_iter < TileT; t_iter += 16) {
                         int t = x_local + t_iter;

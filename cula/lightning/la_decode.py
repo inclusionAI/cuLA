@@ -115,7 +115,7 @@ def la_decode_kernel_small_batch_pretranspose(
     gSrc_batch = h0_source[(batch_idx, None, None)]  # (V, K)
     gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (batch_idx, None, 0))
 
-    # V 方向分 tiles
+    # split tiles in V-dimension
     gSrc = cute.local_tile(gSrc_batch, (TILE_V, TILE_K), (None, 0))  # (TILE_V, TILE_K, num_v_tiles)
 
     # Partition for load
@@ -258,7 +258,7 @@ def la_decode_kernel_big_batch_pretranspose(
     gSrc_batch = h0_source[(batch_idx, None, None)]  # (V, K)
     gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (batch_idx, None, 0))
 
-    # V 方向分 tiles
+    # split tiles in V-dimension
     gSrc = cute.local_tile(gSrc_batch, (TILE_V, TILE_K), (None, 0))  # (TILE_V, TILE_K, num_v_tiles)
 
     # Partition for load

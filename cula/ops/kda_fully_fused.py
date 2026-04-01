@@ -3583,10 +3583,9 @@ class KDAChunkwise:
                     tv_layout_mma_A = tQKrQ_1_0.layout
                     tv_layout_mma_B = tQKrKt_1_0.layout
 
-                    # g_i_j/q_i_j/k_i_j: 第i个subchunk的第j个head dim slice
+                    # g_i_j/q_i_j/k_i_j: the j-th head dim slice of the i-th subchunk
                     if local_tidx < 64:
                         # Q/K0@K0, Q/K3@K3, Q/K3@K0, Q/K3@K1, Q/K3@K2
-                        # TODO: Q/K0@K0, Q/K3@K3 in cuda core
                         # NOTE: tensor core MMA for safe gate with lower_bound >= -5
                         # Q/K0@K0
                         tQKrQK_0_0 = self.mma_sync_partition_c(
