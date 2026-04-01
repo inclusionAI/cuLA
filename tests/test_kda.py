@@ -23,7 +23,7 @@ from fla.ops.kda.gate import naive_kda_gate, naive_kda_lowerbound_gate
 from fla.ops.kda.naive import naive_recurrent_kda
 from fla.utils import assert_close, device
 
-from cula.kda.chunk import chunk_kda
+from cula.kda import chunk_kda
 
 
 @pytest.mark.parametrize(

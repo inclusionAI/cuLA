@@ -10,8 +10,8 @@ cuLA provides two KDA kernel implementations targeting different GPU architectur
 
 | Kernel | GPU | Import |
 |---|---|---|
-| Modular Forward | Blackwell (SM100) | `from cula.kda.chunk import chunk_kda` |
-| Fused Forward | Hopper (SM90) | `from cula.kda.hopper_fused_fwd import cula_kda_prefill` |
+| Modular Forward | Blackwell (SM100) | `from cula.kda import chunk_kda` |
+| Fused Forward | Hopper (SM90) | `from cula.kda import kda_prefill_hopper` |
 
 Both are drop-in replacements for [FLA](https://github.com/fla-org/flash-linear-attention)'s `chunk_kda` — just change the import.
 
@@ -31,7 +31,7 @@ The modular forward kernel replaces sub-kernels of KDA in FLA (chunk_intra, chun
 
 ```python
 import torch
-from cula.kda.chunk import chunk_kda
+from cula.kda import chunk_kda
 
 B, T, H, K, V = 2, 2048, 32, 128, 128
 device = 'cuda'
@@ -78,7 +78,7 @@ The fused forward kernel fuses intra-chunk attention, inter-chunk state propagat
 
 ```python
 import torch
-from cula.kda.hopper_fused_fwd import cula_kda_prefill
+from cula.kda import kda_prefill_hopper
 
 B, T, H, K, V = 2, 2048, 32, 128, 128
 device = 'cuda'
@@ -92,7 +92,7 @@ A_log = torch.randn(H, device=device, dtype=torch.float32) * 0.01
 dt_bias = torch.zeros(H * K, device=device, dtype=torch.float32)
 init_state = torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
 
-o, final_state = cula_kda_prefill(
+o, final_state = kda_prefill_hopper(
     q=q, k=k, v=v, g=g, beta=beta,
     A_log=A_log, dt_bias=dt_bias,
     initial_state=init_state,

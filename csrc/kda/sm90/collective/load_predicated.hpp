@@ -34,6 +34,7 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/pipeline/sm90_pipeline.hpp>
 
+#include "kda/sm90/utils/debug.hpp"
 #include "kda/sm90/utils/unused.hpp"
 
 namespace kda::sm90::collective {

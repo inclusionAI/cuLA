@@ -69,11 +69,22 @@ def assert_blackwell(device: torch.device | str | int | None = None) -> None:
         raise RuntimeError(f"Only Blackwell GPUs (SM100/SM103) are supported, got compute capability sm_{major}{minor}.")
 
 
-def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callable:
-    """Return the appropriate ``flash_kda_prefill`` implementation for *device*.
+def assert_hopper(device: torch.device | str | int | None = None) -> None:
+    """Assert that *device* is a Hopper-architecture GPU (SM90).
 
-    - sm100/sm103 (Blackwell) → cula.kda.blackwell_fused_fwd.flash_kda_prefill
-    - sm90  (Hopper)          → cula.kda.hopper_fused_fwd.cula_kda_prefill
+    Raises:
+        RuntimeError: If the device is not Hopper.
+    """
+    major, minor = get_device_sm_version(device)
+    if not (major == 9 and minor == 0):
+        raise RuntimeError(f"Only Hopper GPUs (SM90) are supported, got compute capability sm_{major}{minor}.")
+
+
+def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callable:
+    """Return the appropriate ``kda_prefill`` implementation for *device*.
+
+    - sm100/sm103 (Blackwell) → cula.kda.kda_prefill_blackwell (not yet available)
+    - sm90  (Hopper)          → cula.kda.kda_prefill_hopper
 
     Args:
         device: CUDA device to query.  Defaults to the currently active device.
@@ -89,9 +100,9 @@ def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callabl
             "Please use a sm90a (Hopper) device or wait for future updates."
         )
     elif major == 9 and minor == 0:
-        from cula.kda.hopper_fused_fwd import cula_kda_prefill
+        from cula.kda import kda_prefill_hopper
 
-        return cula_kda_prefill
+        return kda_prefill_hopper
     else:
         raise RuntimeError(
             f"Unsupported CUDA compute capability sm_{major}{minor}. "

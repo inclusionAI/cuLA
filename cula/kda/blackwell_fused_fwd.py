@@ -33,7 +33,7 @@ from fla.ops.utils.constant import RCP_LN2
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 from cula.ops.kda_fully_fused import KDAChunkwise
-from cula.utils import USE_FAST_MATH
+from cula.utils import USE_FAST_MATH, assert_blackwell
 
 # Global kernel cache
 compiled_kernel_cache = {}
@@ -340,6 +340,7 @@ def flash_kda_prefill(
         final_state (torch.Tensor):
             Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
     """
+    assert_blackwell()
     # initial_state is now supported
     assert cu_seqlens is None or q.shape[0] == 1, "For varlen, batch size must be 1. Flatten sequences first."
     # assert output_final_state == False, "output_final_state=True is not supported in cutedsl_kda_prefill yet."

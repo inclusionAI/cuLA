@@ -50,7 +50,7 @@ from benchmarks.utils import (
     prepare_safe_gate_inputs,
     set_seed,
 )
-from cula.kda.chunk import chunk_kda as cula_chunk_kda
+from cula.kda import chunk_kda as cula_chunk_kda
 
 # ============================================================
 # Constants

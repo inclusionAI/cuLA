@@ -12,3 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from cula.kda.chunk import chunk_kda
+from cula.kda.hopper_fused_fwd import cula_kda_prefill as kda_prefill_hopper
+
+__all__ = [
+    "chunk_kda",
+    "kda_prefill_hopper",
+]

@@ -38,6 +38,8 @@
 
 #include "kerutils/kerutils.cuh"
 
+#include "kda/sm90/utils/debug.hpp"
+
 namespace kda::sm90::collective {
 
 using ku::alignment_for_swizzle;

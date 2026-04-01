@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from fla.ops.kda.chunk import chunk_kda as fla_chunk_kda
 from fla.utils import assert_close, device
 
-from cula.kda.chunk import chunk_kda as cula_chunk_kda
+from cula.kda import chunk_kda as cula_chunk_kda
 
 
 @pytest.mark.parametrize(

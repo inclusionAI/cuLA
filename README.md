@@ -57,7 +57,7 @@ cuLA is a drop-in replacement for [FLA](https://github.com/fla-org/flash-linear-
 
 ```python
 import torch
-from cula.kda.chunk import chunk_kda  # <-- one-line change from fla.ops.kda
+from cula.kda import chunk_kda  # <-- one-line change from fla.ops.kda
 
 B, T, H, K, V = 2, 2048, 32, 128, 128
 device = 'cuda'
@@ -179,6 +179,7 @@ See [REPO_LAYOUT.md](REPO_LAYOUT.md) for the full directory structure and a summ
 * [ ] Continuous optimization via agentic methods such as [AVO](https://arxiv.org/abs/2603.24517).
 * [ ] Support for more algorithms.
 * [ ] Small B/H/S optimizations.
+* [ ] Support for BF16 beta input.
 
 **Train**
 

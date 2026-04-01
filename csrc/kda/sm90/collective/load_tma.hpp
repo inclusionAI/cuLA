@@ -34,6 +34,8 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/pipeline/sm90_pipeline.hpp>
 
+#include "kda/sm90/utils/debug.hpp"
+
 namespace kda::sm90::collective {
 
 using namespace cute;

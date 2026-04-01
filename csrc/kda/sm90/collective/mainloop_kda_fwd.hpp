@@ -25,6 +25,7 @@
 #include "kda/sm90/collective/named_barriers.hpp"
 #include "kda/sm90/collective/store_tma.hpp"
 #include "kda/sm90/kernel/options.hpp"
+#include "kda/sm90/utils/debug.hpp"
 #include "kda/sm90/utils/math_order_barrier.hpp"
 #include "kda/sm90/utils/unused.hpp"
 

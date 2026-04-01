@@ -22,7 +22,7 @@ from fla.ops.utils.constant import RCP_LN2
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 import cula.cudac as cula_cuda
-from cula.utils import _get_cache_buf, get_device_sm_count, prepare_uniform_cu_seqlens
+from cula.utils import _get_cache_buf, assert_hopper, get_device_sm_count, prepare_uniform_cu_seqlens
 
 
 class HopperChunkKDAFunction(torch.autograd.Function):
@@ -191,6 +191,7 @@ def cula_kda_prefill(
         final_state (torch.Tensor):
             Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
     """
+    assert_hopper()
     assert safe_gate, "Only support safe_gate=True."
     if cu_seqlens is not None:
         if q.shape[0] != 1:
