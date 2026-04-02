@@ -86,7 +86,7 @@ device = 'cuda'
 q = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16)
 k = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16)
 v = torch.randn(B, T, H, V, device=device, dtype=torch.bfloat16)
-g = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1
+g = torch.randn(B, T, H, K, device=device, dtype=torch.float32) * 0.1
 beta = torch.randn(B, T, H, device=device, dtype=torch.float32).sigmoid()
 A_log = torch.randn(H, device=device, dtype=torch.float32) * 0.01
 dt_bias = torch.zeros(H * K, device=device, dtype=torch.float32)
