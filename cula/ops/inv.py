@@ -777,7 +777,7 @@ class MatrixInverse64x64:
         # Get stage limit from environment variable (default: 99 for all stages)
         import os
 
-        stage_limit = int(os.environ.get("CULA_STAGE_LIMIT", os.environ.get("FLASHLA_STAGE_LIMIT", "99")))
+        stage_limit = int(os.environ.get("CULA_STAGE_LIMIT", "99"))
         self.compute_matrix_inverse_64x64(smat, stage_limit)
 
         # Synchronize all threads after computation
