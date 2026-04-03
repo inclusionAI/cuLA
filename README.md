@@ -228,6 +228,7 @@ If you're interested in an internship or job opportunity, feel free to reach out
 
 No CUDA experience is required as long as you're a quick learner.
 
-For Q&A and discussion, you can also join the cuLA discussion group:
+For Q&A and discussion, you can join us through:
 
-![cuLA discussion group](docs/cuLA-wechat.JPG)
+- **Slack:** [cuLA Slack Community](https://join.slack.com/t/cula-hq/shared_invite/zt-3uaacvm9y-xJwZyGueeKxZRYQlj7~hxw)
+- **WeChat:** [Click here to view the QR code](docs/cuLA-wechat.JPG)
