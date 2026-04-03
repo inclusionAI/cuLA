@@ -27,6 +27,7 @@ from cula.kda import chunk_kda as cula_chunk_kda
 pytestmark = pytest.mark.sm100_only
 
 
+@pytest.mark.parametrize("disable_recompute", [True, False], ids=["no_recomp", "recomp"])
 @pytest.mark.parametrize(
     (
         "B",
@@ -68,6 +69,7 @@ def test_safe_gate_chunk(
     use_gate_in_kernel: bool,
     safe_gate: bool,
     dtype: torch.dtype,
+    disable_recompute: bool,
 ):
     torch.manual_seed(42)
     q = torch.rand(B, T, H, D, dtype=dtype)
@@ -110,6 +112,7 @@ def test_safe_gate_chunk(
         use_gate_in_kernel=use_gate_in_kernel,
         safe_gate=safe_gate,
         lower_bound=lower_bound,
+        disable_recompute=disable_recompute,
     )
     ((ref * do).sum() + (ref_ht * dht).sum()).backward(retain_graph=True)
     if use_gate_in_kernel:
@@ -132,6 +135,7 @@ def test_safe_gate_chunk(
         use_gate_in_kernel=use_gate_in_kernel,
         safe_gate=safe_gate,
         lower_bound=lower_bound,
+        disable_recompute=disable_recompute,
     )
     ((tri * do).sum() + (tri_ht * dht).sum()).backward(retain_graph=True)
     if use_gate_in_kernel:
@@ -153,6 +157,7 @@ def test_safe_gate_chunk(
     assert_close("dh0", ref_dh0, tri_dh0, 0.008)
 
 
+@pytest.mark.parametrize("disable_recompute", [True, False], ids=["no_recomp", "recomp"])
 @pytest.mark.parametrize(
     ("H", "D", "mask_p", "cu_seqlens", "dtype", "safe_gate"),
     [
@@ -168,27 +173,7 @@ def test_safe_gate_chunk(
                 32,
                 128,
                 0,
-                [
-                    0,
-                    247,
-                    699,
-                    982,
-                    1688,
-                    1985,
-                    2383,
-                    3081,
-                    3526,
-                    3973,
-                    4096,
-                    4824,
-                    5101,
-                    5919,
-                    6426,
-                    7137,
-                    7392,
-                    7800,
-                    8192,
-                ],
+                [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192],
                 torch.bfloat16,
                 True,
             ),
@@ -196,26 +181,7 @@ def test_safe_gate_chunk(
                 32,
                 128,
                 0,
-                [
-                    0,
-                    652,
-                    1255,
-                    1600,
-                    2083,
-                    2345,
-                    2756,
-                    3172,
-                    3767,
-                    4096,
-                    4891,
-                    5236,
-                    5543,
-                    6255,
-                    6480,
-                    6947,
-                    7616,
-                    8192,
-                ],
+                [0, 652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236, 5543, 6255, 6480, 6947, 7616, 8192],
                 torch.bfloat16,
                 True,
             ),
@@ -223,25 +189,7 @@ def test_safe_gate_chunk(
                 32,
                 128,
                 0,
-                [
-                    0,
-                    315,
-                    973,
-                    1283,
-                    2162,
-                    2459,
-                    2678,
-                    2998,
-                    3781,
-                    4096,
-                    4503,
-                    5459,
-                    6318,
-                    6669,
-                    6979,
-                    7583,
-                    8192,
-                ],
+                [0, 315, 973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459, 6318, 6669, 6979, 7583, 8192],
                 torch.bfloat16,
                 True,
             ),
@@ -249,24 +197,7 @@ def test_safe_gate_chunk(
                 32,
                 128,
                 0,
-                [
-                    0,
-                    494,
-                    1004,
-                    1561,
-                    1908,
-                    2240,
-                    2849,
-                    3116,
-                    4096,
-                    4986,
-                    5626,
-                    6090,
-                    6718,
-                    7244,
-                    7870,
-                    8192,
-                ],
+                [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
                 torch.bfloat16,
                 True,
             ),
@@ -280,6 +211,7 @@ def test_safe_gate_chunk_varlen(
     cu_seqlens: list[int],
     dtype: torch.dtype,
     safe_gate: bool,
+    disable_recompute: bool,
 ):
     torch.manual_seed(42)
     cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
@@ -315,6 +247,7 @@ def test_safe_gate_chunk_varlen(
         cu_seqlens_cpu=cu_seqlens_cpu,
         safe_gate=safe_gate,
         lower_bound=-5.0 if safe_gate else None,
+        disable_recompute=disable_recompute,
     )
     ((tri * do).sum() + (tri_ht * dht).sum()).backward(retain_graph=True)
     tri_dq, tri_dk, tri_dv, tri_dg, tri_db, tri_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
@@ -332,6 +265,7 @@ def test_safe_gate_chunk_varlen(
         cu_seqlens_cpu=cu_seqlens_cpu,
         safe_gate=safe_gate,
         lower_bound=-5.0 if safe_gate else None,
+        disable_recompute=disable_recompute,
     )
     ((ref * do).sum() + (ref_ht * dht).sum()).backward(retain_graph=True)
     ref_dq, ref_dk, ref_dv, ref_dg, ref_db, ref_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
