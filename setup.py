@@ -203,7 +203,7 @@ ext_modules.append(
 )
 
 setup(
-    name="cula-kernels",
+    name="cuda-linear-attention",
     packages=find_packages(include=["cula", "cula.*"]),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
