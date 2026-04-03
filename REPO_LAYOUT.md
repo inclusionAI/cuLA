@@ -14,7 +14,6 @@ cuLA/
 │   ├── ops/                      # CuTe DSL kernel implementations
 │   │   ├── chunk_delta_h.py      # Chunk delta-H kernel
 │   │   ├── fwd_o.py              # Forward output kernel
-│   │   ├── recompute_wu.py       # Recompute WU kernel
 │   │   ├── lightning_attn.py     # Lightning Attention prefill kernel
 │   │   ├── linear_attn.py        # Generic linear attention kernel
 │   │   ├── kda_fully_fused_wip.py # WIP fully fused KDA kernel
@@ -54,7 +53,6 @@ cuLA/
 │   ├── bench_kda_chunk_intra.py  # KDA chunk intra benchmark
 │   ├── bench_chunk_delta_h.py    # Chunk delta-H benchmark
 │   ├── bench_fwd_o.py            # Forward output benchmark
-│   ├── bench_recompute_wu.py     # Recompute WU benchmark
 │   ├── bench_linear_attn.py      # Linear attention benchmark
 │   ├── generate_benchmark_md.py  # Auto-generate BENCHMARK_GB200.md (Blackwell)
 │   ├── generate_benchmark_hopper_md.py  # Auto-generate BENCHMARK_H200.md (Hopper)
