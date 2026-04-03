@@ -26,6 +26,7 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 import cula.cudac as cula_cuda
 from cula.kda.chunk_fwd import chunk_kda_fwd
+from cula.utils import prepare_uniform_cu_seqlens
 
 _BWD_INTRA_PATCHED = False
 
@@ -69,14 +70,8 @@ def _try_patch_bwd_intra_with_cuda_impl() -> None:
 
         # External CUDA kernel expects varlen metadata. Build fixed-length metadata when absent.
         if cu_seqlens is None:
-            bsz, seqlen = q.shape[0], q.shape[1]
-            cu_seqlens = torch.arange(
-                0,
-                (bsz + 1) * seqlen,
-                seqlen,
-                device=q.device,
-                dtype=torch.int32,
-            )
+            B, T = q.shape[0], q.shape[1]
+            cu_seqlens = prepare_uniform_cu_seqlens(B, T, q.device, torch.int32)
         if chunk_indices is None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
 
