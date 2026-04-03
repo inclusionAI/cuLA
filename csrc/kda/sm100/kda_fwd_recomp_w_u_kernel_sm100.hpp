@@ -78,8 +78,8 @@ struct KdaChunkFwdRecompWUKernelSm100 {
 
     // ===================== Kernel-only Constants =====================
     static constexpr int NumPrologueRegs = 208;  // WG0: element-wise + R2T Akk
-    static constexpr int NumEpilogueRegs = 208;  // WG1: T2R acc + R2G store + kg
-    static constexpr int NumLoadRegs = 88;       // WG2: TMA load + MMA + Aux
+    static constexpr int NumEpilogueRegs = 216;  // WG1: T2R acc + R2G store + kg
+    static constexpr int NumLoadRegs = 80;       // WG2: TMA load + MMA + Aux
 
     // ===================== Warp Roles =====================
     enum class WarpRole {
@@ -156,50 +156,51 @@ struct KdaChunkFwdRecompWUKernelSm100 {
             a_pipe_params.role = PipelineA::ThreadCategory::Consumer;
         }
 
-        // PipelineV: Load(producer) → Prologue(consumer, 128 threads)
-        // Only WG0 (Prologue) needs V for V_proc computation
+        // PipelineV: Load(producer) → Epilogue(consumer, 128 threads)
+        // WG1 (Epilogue) needs V for V_proc computation
         typename PipelineV::Params v_pipe_params;
         v_pipe_params.transaction_bytes = sizeof(bf16) * cosize_v<SmemLayoutInputBF16>;
         v_pipe_params.is_leader = lane_predicate && (role == WarpRole::Load);
-        v_pipe_params.num_consumers = NumPrologueThreads;
+        v_pipe_params.num_consumers = NumEpilogueThreads;
         if (role == WarpRole::Load) {
             v_pipe_params.role = PipelineV::ThreadCategory::Producer;
-        } else if (role == WarpRole::Prologue) {
+        } else if (role == WarpRole::Epilogue) {
             v_pipe_params.role = PipelineV::ThreadCategory::Consumer;
         }
 
-        // PipelineKG: Load(producer) → Prologue(128) + Epilogue(128) = 256 consumers
+        // PipelineKG: Load(producer) → Prologue(128) consumers
         // Merged K (bf16) + G (fp32) TMA copies share one barrier
+        // KG output is now computed in prologue, so only Prologue consumes KG
         typename PipelineKG::Params kg_pipe_params;
         kg_pipe_params.transaction_bytes =
             sizeof(bf16) * cosize_v<SmemLayoutInputBF16> + sizeof(float) * cosize_v<SmemLayoutInputFP32>;
         kg_pipe_params.is_leader = lane_predicate && (role == WarpRole::Load);
-        kg_pipe_params.num_consumers = NumPrologueThreads + NumEpilogueThreads;
+        kg_pipe_params.num_consumers = NumPrologueThreads;
         if (role == WarpRole::Load) {
             kg_pipe_params.role = PipelineKG::ThreadCategory::Producer;
-        } else if (role == WarpRole::Prologue || role == WarpRole::Epilogue) {
+        } else if (role == WarpRole::Prologue) {
             kg_pipe_params.role = PipelineKG::ThreadCategory::Consumer;
         }
 
-        // === Beta pipeline: LoadAux(producer, 64 threads) → Prologue(consumer, 128 threads) ===
-        // Only WG0 (Prologue) needs beta for K_proc and V_proc computation
+        // === Beta pipeline: LoadAux(producer, 64 threads) → Prologue+Epilogue(consumer, 256 threads) ===
+        // Both WG0 (Prologue) and WG1 (Epilogue) need beta
         typename PipelineBeta::Params beta_pipe_params;
         beta_pipe_params.producer_arv_count = NumLoadAuxThreads;
-        beta_pipe_params.consumer_arv_count = NumPrologueThreads;
+        beta_pipe_params.consumer_arv_count = NumPrologueThreads + NumEpilogueThreads;
         if (role == WarpRole::LoadAux) {
             beta_pipe_params.role = PipelineBeta::ThreadCategory::Producer;
-        } else if (role == WarpRole::Prologue) {
+        } else if (role == WarpRole::Prologue || role == WarpRole::Epilogue) {
             beta_pipe_params.role = PipelineBeta::ThreadCategory::Consumer;
         }
 
         // === Prologue → MMA pipelines ===
 
-        // PipelinePrologueReady: Prologue(producer, 128 threads) → Mma(consumer, 32 threads)
-        // Unified pipeline for both K and V prologue ready (used sequentially)
+        // PipelinePrologueReady: Prologue+Epilogue(producer, 256 threads) → Mma(consumer, 32 threads)
+        // Unified pipeline for both K and V prologue ready (co-produced by Prologue and Epilogue)
         typename PipelinePrologueReady::Params prologue_ready_pipe_params;
-        prologue_ready_pipe_params.producer_arv_count = NumPrologueThreads;
+        prologue_ready_pipe_params.producer_arv_count = NumPrologueThreads + NumEpilogueThreads;
         prologue_ready_pipe_params.consumer_arv_count = NumMmaThreads;
-        if (role == WarpRole::Prologue) {
+        if (role == WarpRole::Prologue || role == WarpRole::Epilogue) {
             prologue_ready_pipe_params.role = PipelinePrologueReady::ThreadCategory::Producer;
         } else if (role == WarpRole::Mma) {
             prologue_ready_pipe_params.role = PipelinePrologueReady::ThreadCategory::Consumer;
@@ -265,36 +266,40 @@ struct KdaChunkFwdRecompWUKernelSm100 {
         Mainloop mainloop;
 
         if (role == WarpRole::Prologue) {
-            // WG0 (warp 0-3, 128 threads): Element-wise K_proc/V_proc → signal MMA
+            // WG0 (warp 0-3, 128 threads): Element-wise K_proc → co-signal MMA, KG → GMEM
             cutlass::arch::warpgroup_reg_alloc<NumPrologueRegs>();
             mainloop.prologue_loop(
                 params,
                 tma_params,
                 shared_plan,
                 tile_scheduler,
-                // TMA pipelines (consumer): KG, V
+                // TMA pipelines (consumer): KG
                 kg_pipeline,
                 kg_pipe_state_read,
-                v_pipeline,
-                v_pipe_state_read,
                 // Beta pipeline (consumer)
                 beta_pipeline,
                 beta_pipe_state_read,
-                // Prologue -> MMA pipeline (producer)
+                // Prologue -> MMA pipeline (co-producer with Epilogue)
                 prologue_ready_pipeline,
                 prologue_ready_pipe_state_write);
 
         } else if (role == WarpRole::Epilogue) {
-            // WG1 (warp 4-7, 128 threads): kg element-wise + MMA result store w/u → GMEM
+            // WG1 (warp 4-7, 128 threads): V_proc → co-signal MMA, w/u store → GMEM
             cutlass::arch::warpgroup_reg_alloc<NumEpilogueRegs>();
             mainloop.epilogue_loop(
                 params,
                 tma_params,
                 shared_plan,
                 tile_scheduler,
-                // TMA pipeline (consumer): KG (for kg computation)
-                kg_pipeline,
-                kg_pipe_state_read,
+                // TMA pipeline (consumer): V
+                v_pipeline,
+                v_pipe_state_read,
+                // Beta pipeline (consumer)
+                beta_pipeline,
+                beta_pipe_state_read,
+                // Prologue -> MMA pipeline (co-producer with Prologue)
+                prologue_ready_pipeline,
+                prologue_ready_pipe_state_write,
                 // MMA -> Epilogue pipeline (consumer)
                 acc_done_pipeline,
                 acc_done_pipe_state_read);
