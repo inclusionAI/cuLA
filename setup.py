@@ -152,7 +152,10 @@ if not DISABLE_SM100 or not DISABLE_SM103:
     cuda_sources.extend(
         [
             "csrc/api/kda_sm100.cu",
+            "csrc/api/kda_bwd_sm100.cu",
             "csrc/kda/sm100/kda_fwd_sm100.cu",
+            "csrc/kda_bwd/sm100/kda_bwd_intra_sm100.cu",
+            "csrc/kda_bwd/sm100/kda_bwd_wy_dqkg_fused_sm100.cu",
         ]
     )
 if not DISABLE_SM90:

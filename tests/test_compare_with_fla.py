@@ -21,16 +21,19 @@ import argparse
 import pathlib
 import sys
 
+import pytest
 import torch
+
+pytestmark = pytest.mark.sm100_only
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack
+import cutlass.cute as cute  # noqa: E402
+import cutlass.torch as cutlass_torch  # noqa: E402
+from cutlass.cute.runtime import from_dlpack  # noqa: E402
 
 # Our implementation
-from cula.ops.chunk_delta_h import ChunkDeltaRuleFwdH
+from cula.ops.chunk_delta_h import ChunkDeltaRuleFwdH  # noqa: E402
 
 
 def fla_reference_chunk_fwd_h(

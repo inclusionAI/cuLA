@@ -27,7 +27,7 @@ from fla.utils import assert_close, device
 
 from cula.utils import get_kda_fused_fwd
 
-cula_kda_fused_fwd = get_kda_fused_fwd(device)
+pytestmark = pytest.mark.sm90_only
 
 
 @pytest.mark.parametrize(
@@ -60,7 +60,7 @@ cula_kda_fused_fwd = get_kda_fused_fwd(device)
         ]
     ],
 )
-def test_safe_gate_chunk(
+def test_safe_gate_chunk_sm90(
     B: int,
     T: int,
     H: int,
@@ -73,6 +73,8 @@ def test_safe_gate_chunk(
     dtype: torch.dtype,
 ):
     from fla.ops.kda.gate import naive_kda_lowerbound_gate
+
+    cula_kda_fused_fwd = get_kda_fused_fwd(device)
 
     torch.manual_seed(42)
     q = torch.rand(B, T, H, D, dtype=dtype)
@@ -194,7 +196,7 @@ def test_safe_gate_chunk(
         ]
     ],
 )
-def test_safe_gate_chunk_varlen(
+def test_safe_gate_chunk_varlen_sm90(
     H: int,
     D: int,
     mask_p: float,
@@ -202,6 +204,8 @@ def test_safe_gate_chunk_varlen(
     dtype: torch.dtype,
     safe_gate: bool,
 ):
+    cula_kda_fused_fwd = get_kda_fused_fwd(device)
+
     torch.manual_seed(42)
     cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
     cu_seqlens_cpu = cu_seqlens.cpu()

@@ -46,6 +46,51 @@ ChunkKDAFwdRecompWU(
     at::Tensor u_out,
     at::Tensor kg_out,
     int chunk_size);
+
+void
+ChunkKDABwdIntra(
+    at::Tensor q,
+    at::Tensor k,
+    at::Tensor g,
+    at::Tensor beta,
+    at::Tensor dAqk,
+    at::Tensor dAkk,
+    at::Tensor dq,
+    at::Tensor dk,
+    at::Tensor db,
+    at::Tensor dg,
+    at::Tensor cu_seqlens,
+    at::Tensor chunk_indices,
+    at::Tensor dq_out,
+    at::Tensor dk_out,
+    at::Tensor db_out,
+    at::Tensor dg_out,
+    at::Tensor tile_counter,
+    int chunk_size);
+
+void
+ChunkKDABwdWYDqkgFused(
+    at::Tensor q,
+    at::Tensor k,
+    at::Tensor v,
+    at::Tensor v_new,
+    at::Tensor g,
+    at::Tensor beta,
+    at::Tensor A,
+    at::Tensor h,
+    at::Tensor do_,
+    at::Tensor dh,
+    at::Tensor dv,
+    at::Tensor cu_seqlens,
+    at::Tensor chunk_indices,
+    at::Tensor dq_out,
+    at::Tensor dk_out,
+    at::Tensor dv_out,
+    at::Tensor db_out,
+    at::Tensor dg_out,
+    at::Tensor dA_out,
+    float scale,
+    int chunk_size);
 #endif
 
 #if defined(CULA_SM90A_ENABLED)
@@ -70,6 +115,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
     m.def("chunk_kda_fwd_intra_cuda", &ChunkKDAFwdIntra);
     m.def("recompute_w_u_cuda", &ChunkKDAFwdRecompWU);
+    m.def("chunk_kda_bwd_intra_cuda", &ChunkKDABwdIntra);
+    m.def("chunk_kda_bwd_wy_dqkg_fused_cuda", &ChunkKDABwdWYDqkgFused);
 #endif
 #if defined(CULA_SM90A_ENABLED)
     m.def("kda_fwd_prefill", &kda_fwd_prefill);

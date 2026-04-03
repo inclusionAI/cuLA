@@ -67,7 +67,6 @@ Kernel design (TMEM A-operand approach):
 """
 
 import argparse
-import sys
 
 import cutlass
 import cutlass.cute as cute
@@ -2070,7 +2069,6 @@ def main():
             print(f"  CuTe DSL T={bench_T}: {ms:.3f} ms")
 
             try:
-                sys.path.insert(0, "/ossfs/workspace/flash-linear-attention")
                 from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
 
                 for _ in range(10):

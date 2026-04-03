@@ -26,7 +26,10 @@ import pathlib
 import sys
 import warnings
 
+import pytest
 import torch
+
+pytestmark = pytest.mark.sm100_only
 
 # Suppress third-party deprecation warnings (e.g. torch.jit)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
