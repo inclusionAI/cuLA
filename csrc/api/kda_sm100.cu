@@ -74,7 +74,9 @@ ChunkKDAFwdRecompWU(
     at::Tensor w_out,
     at::Tensor u_out,
     at::Tensor kg_out,
-    int chunk_size) {
+    int chunk_size,
+    std::optional<at::Tensor> q,
+    std::optional<at::Tensor> qg_out) {
     KDA_fwd_recomp_w_u_params params;
     params.total_len = k.size(0) * k.size(1);
     params.b = cu_seqlens.size(0) - 1;
@@ -91,6 +93,9 @@ ChunkKDAFwdRecompWU(
     params.w_out_ptr = w_out.data_ptr();
     params.u_out_ptr = u_out.data_ptr();
     params.kg_out_ptr = kg_out.data_ptr();
+    params.store_qg = q.has_value() && qg_out.has_value();
+    params.q_ptr = params.store_qg ? q->data_ptr() : nullptr;
+    params.qg_out_ptr = params.store_qg ? qg_out->data_ptr() : nullptr;
     params.shape_wukg = cute::make_shape(params.total_len, params.d, params.h);
     params.stride_wukg = cute::make_stride(params.d * params.h, cute::_1{}, params.d);
     int tile_num = chunk_indices.size(0);

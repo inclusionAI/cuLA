@@ -101,6 +101,8 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     using PipelineK = cutlass::PipelineTmaAsync<StagesLoadStore>;
     // TMA load -> Compute (G)
     using PipelineG = cutlass::PipelineTmaAsync<StagesLoadStore>;
+    // TMA load -> Compute (Q, only used when StoreQG=true)
+    using PipelineQ = cutlass::PipelineTmaAsync<StagesLoadStore>;
     // Aux load -> Compute
     using PipelineBeta = cutlass::PipelineAsync<StagesA>;
 
@@ -146,6 +148,13 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     using CopyR2SAtom = Copy_Atom<SM90_U32x4_STSM_N, Element>;
 
     // ===================== Shared Memory Plan =====================
+    // Helper: conditionally include Q SMEM buffer (only when StoreQG=true)
+    struct QSmemBufferEnabled {
+        array_aligned<bf16, cosize_v<SmemLayoutInputBF16>> q[StagesLoadStore];
+    };
+    struct QSmemBufferDisabled {};  // empty, zero-cost
+    using QSmemBuffer = cute::conditional_t<StoreQG, QSmemBufferEnabled, QSmemBufferDisabled>;
+
     struct SharedMemoryPlan {
         // Akk, single buffer
         array_aligned<bf16, cosize_v<SmemLayoutInputAkkBF16>> akk[StagesA];  // 16KB
@@ -153,6 +162,8 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         array_aligned<bf16, cosize_v<SmemLayoutInputBF16>> k[StagesLoadStore];   // 32KB
         array_aligned<bf16, cosize_v<SmemLayoutInputBF16>> v[StagesLoadStore];   // 32KB
         array_aligned<float, cosize_v<SmemLayoutInputFP32>> g[StagesLoadStore];  // 64KB
+        // Q double buffer (only present when StoreQG=true)
+        QSmemBuffer q_buf;
         // MMA B-operand staging: K_proc/V_proc after prologue, [N=TileK, K=TileT] MN-major, double buffer
         array_aligned<bf16, cosize_v<SmemLayoutMatBBF16>> k_mma[StagesMma];  // 16KB
         array_aligned<bf16, cosize_v<SmemLayoutMatBBF16>> v_mma[StagesMma];  // 16KB
@@ -167,13 +178,21 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         alignas(16) typename PipelineK::SharedStorage pipe_k_storage;
         alignas(16) typename PipelineG::SharedStorage pipe_g_storage;
         alignas(16) typename PipelineV::SharedStorage pipe_v_storage;
+        alignas(16) typename PipelineQ::SharedStorage pipe_q_storage;  // Only meaningful when StoreQG=true
         alignas(16) typename PipelineBeta::SharedStorage pipe_beta_storage;
         alignas(16) typename PipelinePrologueReady::SharedStorage pipe_prologue_ready_storage;
         alignas(16) typename PipelineAccDone::SharedStorage pipe_acc_done_storage;
     };
 
     // ===================== TMA Params =====================
-    template <typename ShapeKVG, typename ShapeAkk, typename TMA_V, typename TMA_K, typename TMA_G, typename TMA_Akk>
+    template <
+        typename ShapeKVG,
+        typename ShapeAkk,
+        typename TMA_V,
+        typename TMA_K,
+        typename TMA_G,
+        typename TMA_Akk,
+        typename TMA_Q = int>
     struct TmaParams {
         ShapeKVG shape_kvg;
         ShapeAkk shape_Akk;
@@ -181,6 +200,7 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         TMA_K tma_k;
         TMA_G tma_g;
         TMA_Akk tma_akk;
+        TMA_Q tma_q{};  // Only meaningful when StoreQG=true; default-initialized
     };
 
     // ===================== Pipeline State Types =====================
@@ -188,6 +208,7 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     using PipelineStateK = cutlass::PipelineState<PipelineK::Stages>;
     using PipelineStateG = cutlass::PipelineState<PipelineG::Stages>;
     using PipelineStateV = cutlass::PipelineState<PipelineV::Stages>;
+    using PipelineStateQ = cutlass::PipelineState<PipelineQ::Stages>;
     using PipelineStateBeta = cutlass::PipelineState<PipelineBeta::Stages>;
     using PipelineStatePrologueReady = cutlass::PipelineState<PipelinePrologueReady::Stages>;
     using PipelineStateAccDone = cutlass::PipelineState<PipelineAccDone::Stages>;
@@ -211,6 +232,9 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         // Beta pipeline (consumer, 1×/WU)
         PipelineBeta& beta_pipeline,
         PipelineStateBeta& beta_pipe_state_read,
+        // TMA pipeline (consumer): Q (only used when StoreQG=true)
+        PipelineQ& q_pipeline,
+        PipelineStateQ& q_pipe_state_read,
         // Prologue -> MMA pipeline (co-producer with Epilogue)
         PipelinePrologueReady& prologue_ready_pipeline,
         PipelineStatePrologueReady& prologue_ready_pipe_state_write) {
@@ -462,6 +486,110 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                         /*Clear_OOB_MN=*/false,
                         /*Clear_OOB_K=*/false>(gmem_tiled_copy_O, tOsO, tOgKg, tOcO, tOpO, sub_seq_len);
                 }
+
+                // ---- Step 4 (StoreQG only): Compute QG = Q * exp2(G) → write to out → store to GMEM ----
+                if constexpr (StoreQG) {
+                    // Wait for Q data from TMA Load warp
+                    q_pipeline.consumer_wait(q_pipe_state_read);
+                    Tensor sQ = make_tensor(
+                        make_smem_ptr(shared_plan->q_buf.q[q_pipe_state_read.index()].data()), SmemLayoutInputBF16{});
+
+                    // Load Q with same 16x64 mapping as K
+                    bf16x8 q_reg[TileT / 16][TileK / 64];
+#pragma unroll
+                    for (int ti = 0; ti < TileT / 16; ++ti) {
+                        int t = x_local + ti * 16;
+#pragma unroll
+                        for (int k_yi = 0; k_yi < TileK / 64; ++k_yi) {
+                            int y = k_y_base + k_yi * 64;
+                            if (t < sub_seq_len) {
+                                q_reg[ti][k_yi] = *reinterpret_cast<bf16x8*>(&sQ(t, y));
+                            } else {
+                                q_reg[ti][k_yi].a01 = __float2bfloat162_rn(0.0f);
+                                q_reg[ti][k_yi].a23 = __float2bfloat162_rn(0.0f);
+                                q_reg[ti][k_yi].a45 = __float2bfloat162_rn(0.0f);
+                                q_reg[ti][k_yi].a67 = __float2bfloat162_rn(0.0f);
+                            }
+                        }
+                    }
+                    // Release Q SMEM back to Load warp
+                    q_pipeline.consumer_release(q_pipe_state_read);
+                    ++q_pipe_state_read;
+
+                    // Need NamedBarrier to ensure all 128 prologue threads finish previous sKG_out writes (from KG
+                    // store)
+                    cutlass::arch::NamedBarrier::arrive_and_wait(
+                        NumPrologueThreads, KdaChunkFwdRecompWUSm100NamedBarriers::PrologueCudaCore);
+
+                    // Compute QG = Q * exp2(G) and write to sKG_out (reuse output buffer)
+#pragma unroll
+                    for (int ti = 0; ti < TileT / 16; ++ti) {
+                        int t = x_local + ti * 16;
+#pragma unroll
+                        for (int k_yi = 0; k_yi < TileK / 64; ++k_yi) {
+                            int y = k_y_base + k_yi * 64;
+                            if (t < sub_seq_len) {
+                                // lo half (cols y..y+3)
+                                float2 qf_01 = __bfloat1622float2(q_reg[ti][k_yi].a01);
+                                float2 qf_23 = __bfloat1622float2(q_reg[ti][k_yi].a23);
+                                float2 g_01 = {exp2f(g_reg[ti][k_yi][0].x), exp2f(g_reg[ti][k_yi][0].y)};
+                                float2 g_23 = {exp2f(g_reg[ti][k_yi][0].z), exp2f(g_reg[ti][k_yi][0].w)};
+                                float2 res_01 = float2_mul(qf_01, g_01);
+                                float2 res_23 = float2_mul(qf_23, g_23);
+                                // hi half (cols y+4..y+7)
+                                float2 qf_45 = __bfloat1622float2(q_reg[ti][k_yi].a45);
+                                float2 qf_67 = __bfloat1622float2(q_reg[ti][k_yi].a67);
+                                float2 g_45 = {exp2f(g_reg[ti][k_yi][1].x), exp2f(g_reg[ti][k_yi][1].y)};
+                                float2 g_67 = {exp2f(g_reg[ti][k_yi][1].z), exp2f(g_reg[ti][k_yi][1].w)};
+                                float2 res_45 = float2_mul(qf_45, g_45);
+                                float2 res_67 = float2_mul(qf_67, g_67);
+                                // Single 128-bit store
+                                bf16x8 out;
+                                out.a01 = __float22bfloat162_rn(res_01);
+                                out.a23 = __float22bfloat162_rn(res_23);
+                                out.a45 = __float22bfloat162_rn(res_45);
+                                out.a67 = __float22bfloat162_rn(res_67);
+                                *reinterpret_cast<bf16x8*>(&sKG_out(t, y)) = out;
+                            } else {
+                                bf16x8 zero;
+                                zero.a01 = __float2bfloat162_rn(0.0f);
+                                zero.a23 = __float2bfloat162_rn(0.0f);
+                                zero.a45 = __float2bfloat162_rn(0.0f);
+                                zero.a67 = __float2bfloat162_rn(0.0f);
+                                *reinterpret_cast<bf16x8*>(&sKG_out(t, y)) = zero;
+                            }
+                        }
+                    }
+
+                    // Ensure all 128 prologue threads have finished writing QG to sKG_out
+                    cutlass::arch::NamedBarrier::arrive_and_wait(
+                        NumPrologueThreads, KdaChunkFwdRecompWUSm100NamedBarriers::PrologueCudaCore);
+
+                    // S2G: sKG_out → GMEM qg via GmemTiledCopyO + copy_pred
+                    {
+                        Tensor mQg = make_tensor(
+                            make_gmem_ptr(reinterpret_cast<Element*>(params.qg_out_ptr)),
+                            make_layout(params.shape_wukg, params.stride_wukg))(_, _, head_idx);
+                        Tensor gQg = local_tile(
+                            cute::domain_offset(make_coord(token_offset_cur, _0{}), mQg),
+                            Shape<Int<TileT>, Int<TileK>>{},
+                            make_coord(_0{}, _0{}));
+                        Tensor tOsO_qg = gmem_thr_copy_O.partition_S(sKG_out);
+                        Tensor tOgQg = gmem_thr_copy_O.partition_D(gQg);
+                        Tensor tOcO_qg =
+                            gmem_thr_copy_O.partition_D(make_identity_tensor(Shape<Int<TileT>, Int<TileK>>{}));
+                        Tensor tOpO_qg = make_tensor<bool>(make_shape(size<2>(tOcO_qg)));
+#pragma unroll
+                        for (int k = 0; k < size(tOpO_qg); ++k) {
+                            tOpO_qg(k) = get<1>(tOcO_qg(_0{}, _0{}, k)) < params.d;
+                        }
+                        ku::copy_pred<
+                            /*Is_even_MN=*/false,
+                            /*Is_even_K=*/false,
+                            /*Clear_OOB_MN=*/false,
+                            /*Clear_OOB_K=*/false>(gmem_tiled_copy_O, tOsO_qg, tOgQg, tOcO_qg, tOpO_qg, sub_seq_len);
+                    }
+                }  // end if constexpr (StoreQG)
             }
 
             // Release beta at end of WU
@@ -586,8 +714,6 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                 fence_view_async_shared();
                 prologue_ready_pipeline.producer_commit(prologue_ready_pipe_state_write);
                 ++prologue_ready_pipe_state_write;
-
-                // TODO: Store QG
 
                 // ---- w/u output: wait K-GEMM & V-GEMM acc → T2R → bf16 → R2G ----
                 // Split into 2 iterations of TileK/2 to reduce register pressure (avoid spill)
@@ -728,7 +854,7 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         const TmaParamsT& tma_params,
         SharedMemoryPlan* shared_plan,
         TileScheduler& tile_scheduler,
-        // TMA pipelines (producer): Akk, K, G, V
+        // TMA pipelines (producer): Akk, K, G, V, Q (Q only used when StoreQG=true)
         PipelineA& a_pipeline,
         PipelineStateA& a_pipe_state_write,
         PipelineK& k_pipeline,
@@ -736,7 +862,9 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         PipelineG& g_pipeline,
         PipelineStateG& g_pipe_state_write,
         PipelineV& v_pipeline,
-        PipelineStateV& v_pipe_state_write) {
+        PipelineStateV& v_pipe_state_write,
+        PipelineQ& q_pipeline,
+        PipelineStateQ& q_pipe_state_write) {
         if (cute::elect_one_sync()) {
             int* chunk_indices_ptr = (int*)params.chunk_indices_ptr;
             int* cu_seqlens_ptr = (int*)params.cu_seqlens_ptr;
@@ -764,6 +892,17 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                     make_coord(token_offset, _0{}, _0{}), tma_params.tma_g.get_tma_tensor(tma_params.shape_kvg));
                 Tensor mA = domain_offset(
                     make_coord(token_offset, _0{}, _0{}), tma_params.tma_akk.get_tma_tensor(tma_params.shape_Akk));
+
+                // Q GMEM tensor (only used when StoreQG=true)
+                [[maybe_unused]] auto mQ = [&]() {
+                    if constexpr (StoreQG) {
+                        return domain_offset(
+                            make_coord(token_offset, _0{}, _0{}),
+                            tma_params.tma_q.get_tma_tensor(tma_params.shape_kvg));
+                    } else {
+                        return 0;  // unused placeholder
+                    }
+                }();
 
                 // ============================================================
                 // Once per WU: TMA Akk[BT, BT] → sA
@@ -813,6 +952,19 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                     v_pipeline.producer_acquire(v_pipe_state_write);
                     ku::launch_tma_copy(tma_params.tma_v, gV, sV, *v_pipeline.producer_get_barrier(v_pipe_state_write));
                     ++v_pipe_state_write;
+
+                    // Q: Load → Compute (only when StoreQG=true)
+                    if constexpr (StoreQG) {
+                        Tensor sQ = make_tensor(
+                            make_smem_ptr(shared_plan->q_buf.q[q_pipe_state_write.index()].data()),
+                            SmemLayoutInputBF16{});
+                        Tensor gQ = local_tile(
+                            mQ(_, _, head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, i_k));
+                        q_pipeline.producer_acquire(q_pipe_state_write);
+                        ku::launch_tma_copy(
+                            tma_params.tma_q, gQ, sQ, *q_pipeline.producer_get_barrier(q_pipe_state_write));
+                        ++q_pipe_state_write;
+                    }
                 }
             }
         }

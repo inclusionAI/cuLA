@@ -790,7 +790,7 @@ def chunk_kda_fwd_intra(
     )
 
     # TODO: support cuda recompute_wu impl with disable_recompute=True
-    if disable_recompute:
+    if False:
         # rearrange back
         if B != 1:
             q, k, gk, beta, Aqk, Akk = map(
@@ -814,12 +814,16 @@ def chunk_kda_fwd_intra(
     else:
         w = torch.empty_like(k)
         u = torch.empty_like(v)
-        qg = None
+        qg = torch.empty_like(q) if disable_recompute else None
         kg = torch.empty_like(k) if gk is not None else None
         if B != 1:
             w, u, kg = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (w, u, kg))
+            if qg is not None:
+                qg = rearrange(qg, "b t ... -> 1 (b t) ...")
 
-        cula_cuda.recompute_w_u_cuda(k, v, beta, Akk, gk, cu_seqlens, chunk_indices, w, u, kg, chunk_size)
+        cula_cuda.recompute_w_u_cuda(
+            k, v, beta, Akk, gk, cu_seqlens, chunk_indices, w, u, kg, chunk_size, q if disable_recompute else None, qg
+        )
 
         # rearrange back
         if B != 1:
@@ -827,6 +831,8 @@ def chunk_kda_fwd_intra(
                 lambda x: rearrange(x, "1 (b t) ... -> b t ...", b=B),
                 (w, u, kg, Aqk, Akk),
             )
+            if qg is not None:
+                qg = rearrange(qg, "1 (b t) ... -> b t ...", b=B)
 
     return w, u, qg, kg, Aqk, Akk
 

@@ -45,7 +45,9 @@ ChunkKDAFwdRecompWU(
     at::Tensor w_out,
     at::Tensor u_out,
     at::Tensor kg_out,
-    int chunk_size);
+    int chunk_size,
+    std::optional<at::Tensor> q,
+    std::optional<at::Tensor> qg_out);
 #endif
 
 #if defined(CULA_SM90A_ENABLED)

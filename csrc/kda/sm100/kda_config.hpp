@@ -58,6 +58,7 @@ struct KDA_fwd_recomp_w_u_params {
 
     void* __restrict__ k_ptr;              //[b, t, h, d]
     void* __restrict__ v_ptr;              //[b, t, h, d]
+    void* __restrict__ q_ptr;              //[b, t, h, d]  (optional, for StoreQG)
     void* __restrict__ beta_ptr;           //[b, t, h]
     void* __restrict__ A_ptr;              //[b. t, h, BT]
     void* __restrict__ g_ptr;              //[b, t, h, d]
@@ -66,6 +67,9 @@ struct KDA_fwd_recomp_w_u_params {
     void* __restrict__ w_out_ptr;          //[b, t, h, d]
     void* __restrict__ u_out_ptr;          //[b, t, h, d]
     void* __restrict__ kg_out_ptr;         //[b, t, h, d]
+    void* __restrict__ qg_out_ptr;         //[b, t, h, d]  (optional, for StoreQG)
+
+    bool store_qg;
 
     GmemShapeWUKg shape_wukg;
     GmemStrideWUKg stride_wukg;

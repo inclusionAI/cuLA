@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 import os
 import pathlib
 import sys
@@ -37,6 +38,8 @@ TOTAL_LEN = 8192
 MIN_SEQ_LEN = 63
 VARIANCE = 1.0
 
+DISABLE_RECOMPUTE = False  # Whether to disable recompute (compute QG in forward)
+
 
 def accuracy_stats(a, b):
     """Compute RMSE, relative max diff, and mean absolute difference."""
@@ -59,7 +62,9 @@ def benchmark_chunk_intra_uniform():
     T_vals = [512, 1024, 4096, 8192, 16384, 32768]
 
     print("=" * 90)
-    print(f"  Uniform-Length ChunkIntra Benchmark: cuLA vs FLA Triton  B={B} H={H} D={D}")
+    print(
+        f"  Uniform-Length ChunkIntra Benchmark: cuLA vs FLA Triton  B={B} H={H} D={D}  disable_recompute={DISABLE_RECOMPUTE}"
+    )
     print("=" * 90)
     print(
         f"{'B':>4} {'T':>7} │ {'RMSE':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
@@ -84,6 +89,7 @@ def benchmark_chunk_intra_uniform():
             chunk_size=chunk_size,
             chunk_indices=chunk_indices,
             safe_gate=True,
+            disable_recompute=DISABLE_RECOMPUTE,
         )
         out_cula = cula_chunk_kda_fwd_intra(
             q=q,
@@ -96,6 +102,7 @@ def benchmark_chunk_intra_uniform():
             chunk_size=chunk_size,
             chunk_indices=chunk_indices,
             safe_gate=True,
+            disable_recompute=DISABLE_RECOMPUTE,
         )
         # Compare the first output tensor (o)
         o_fla = out_fla[0] if isinstance(out_fla, (tuple, list)) else out_fla
@@ -115,6 +122,7 @@ def benchmark_chunk_intra_uniform():
                 chunk_size=chunk_size,
                 chunk_indices=chunk_indices,
                 safe_gate=True,
+                disable_recompute=DISABLE_RECOMPUTE,
             ),
         )
         ms_cula = triton.testing.do_bench(
@@ -129,6 +137,7 @@ def benchmark_chunk_intra_uniform():
                 chunk_size=chunk_size,
                 chunk_indices=chunk_indices,
                 safe_gate=True,
+                disable_recompute=DISABLE_RECOMPUTE,
             ),
         )
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
@@ -150,7 +159,9 @@ def benchmark_chunk_intra_varlen():
 
     print()
     print("=" * 100)
-    print(f"  Varlen ChunkIntra Benchmark: cuLA vs FLA Triton  NUM_SEQS={NUM_SEQS} H={H} D={D}")
+    print(
+        f"  Varlen ChunkIntra Benchmark: cuLA vs FLA Triton  NUM_SEQS={NUM_SEQS} H={H} D={D}  disable_recompute={DISABLE_RECOMPUTE}"
+    )
     print("=" * 100)
     print(
         f"{'total_len':>10} │ {'RMSE':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
@@ -176,6 +187,7 @@ def benchmark_chunk_intra_varlen():
             chunk_size=chunk_size,
             chunk_indices=chunk_indices,
             safe_gate=True,
+            disable_recompute=DISABLE_RECOMPUTE,
         )
         out_cula = cula_chunk_kda_fwd_intra(
             q=q,
@@ -188,6 +200,7 @@ def benchmark_chunk_intra_varlen():
             chunk_size=chunk_size,
             chunk_indices=chunk_indices,
             safe_gate=True,
+            disable_recompute=DISABLE_RECOMPUTE,
         )
         o_fla = out_fla[0] if isinstance(out_fla, (tuple, list)) else out_fla
         o_cula = out_cula[0] if isinstance(out_cula, (tuple, list)) else out_cula
@@ -206,6 +219,7 @@ def benchmark_chunk_intra_varlen():
                 chunk_size=chunk_size,
                 chunk_indices=chunk_indices,
                 safe_gate=True,
+                disable_recompute=DISABLE_RECOMPUTE,
             ),
         )
         ms_cula = triton.testing.do_bench(
@@ -220,6 +234,7 @@ def benchmark_chunk_intra_varlen():
                 chunk_size=chunk_size,
                 chunk_indices=chunk_indices,
                 safe_gate=True,
+                disable_recompute=DISABLE_RECOMPUTE,
             ),
         )
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
@@ -232,5 +247,17 @@ def benchmark_chunk_intra_varlen():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="bench_kda_chunk_intra: cuLA vs FLA Triton for chunk_kda_fwd_intra")
+    parser.add_argument(
+        "--disable_recompute",
+        action="store_true",
+        help="Disable recompute in both FLA and cuLA (pre-compute QG)",
+    )
+    args = parser.parse_args()
+
+    if args.disable_recompute:
+        DISABLE_RECOMPUTE = True
+        print("[Disable recompute] pre-compute QG in forward")
+
     benchmark_chunk_intra_uniform()
     benchmark_chunk_intra_varlen()

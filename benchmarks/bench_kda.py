@@ -60,6 +60,7 @@ WARMUP = 10
 N_ITERS = 30
 NCU_MODE = False
 SANITIZER_MODE = False
+DISABLE_RECOMPUTE = False  # Whether to disable recompute (compute QG in forward)
 
 
 # ============================================================
@@ -113,6 +114,7 @@ def run_kda(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, low
         use_gate_in_kernel=True,
         safe_gate=True,
         lower_bound=lower_bound,
+        disable_recompute=DISABLE_RECOMPUTE,
     )
 
 
@@ -121,7 +123,7 @@ def run_kda(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, low
 # ============================================================
 def bench_fixed(configs):
     print("\n" + "=" * 100)
-    print(" Fixed-Length Benchmark: cuLA CuTe DSL vs FLA Triton")
+    print(f" Fixed-Length Benchmark: cuLA CuTe DSL vs FLA Triton  disable_recompute={DISABLE_RECOMPUTE}")
     print("=" * 100)
     results = []
 
@@ -194,7 +196,7 @@ def bench_fixed(configs):
 # ============================================================
 def bench_varlen(configs):
     print("\n" + "=" * 100)
-    print(" Varlen Benchmark: cuLA CuTe DSL vs FLA Triton")
+    print(f" Varlen Benchmark: cuLA CuTe DSL vs FLA Triton  disable_recompute={DISABLE_RECOMPUTE}")
     print("=" * 100)
     results = []
 
@@ -277,7 +279,7 @@ def print_report(fixed_results, varlen_results):
     print(f"\n\n{sep}")
     print("                       BENCHMARK REPORT: chunk_kda")
     print("                       cuLA CuTe DSL vs FLA Triton")
-    print(f"                       H={H}  D={D}  dtype=bf16  safe_gate=True")
+    print(f"                       H={H}  D={D}  dtype=bf16  safe_gate=True  disable_recompute={DISABLE_RECOMPUTE}")
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
     mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
@@ -338,15 +340,23 @@ def main():
         action="store_true",
         help="Sanitizer mode: warmup=1, iters=1 (avoid Triton memory leak under compute-sanitizer)",
     )
+    parser.add_argument(
+        "--disable_recompute",
+        action="store_true",
+        help="Disable recompute in both FLA and cuLA (pre-compute QG)",
+    )
     args = parser.parse_args()
 
-    global NCU_MODE, SANITIZER_MODE
+    global NCU_MODE, SANITIZER_MODE, DISABLE_RECOMPUTE
     if args.ncu:
         NCU_MODE = True
         print("[NCU mode] warmup=1, iters=1")
     if args.sanitizer:
         SANITIZER_MODE = True
         print("[Sanitizer mode] warmup=1, iters=1")
+    if args.disable_recompute:
+        DISABLE_RECOMPUTE = True
+        print("[Disable recompute] pre-compute QG in forward")
 
     fixed_configs = [
         # (B, T)
@@ -362,10 +372,15 @@ def main():
         (2, 16384),
     ]
 
+    # varlen_configs = build_varlen_configs(
+    #     num_seqs_list=(10, 20),
+    #     total_lens=(4096, 8192, 16384),
+    #     dists=("uniform", "random", "skewed"),
+    # )
     varlen_configs = build_varlen_configs(
-        num_seqs_list=(10, 20),
-        total_lens=(4096, 8192, 16384),
-        dists=("uniform", "random", "skewed"),
+        num_seqs_list=(10, ),
+        total_lens=(8192, ),
+        dists=("random", ),
     )
 
     fixed_res, varlen_res = [], []
