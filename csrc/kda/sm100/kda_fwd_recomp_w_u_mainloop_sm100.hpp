@@ -46,6 +46,7 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     static constexpr int StagesLoadStore = 2;  // increase to 2, greater perf
     static constexpr int StagesA = 2;          // increase to 2, greater perf
     static constexpr int StagesMma = 1;
+    static constexpr int StagesQ = 1;
 
     static constexpr bool StoreQG = StoreQG_;
 
@@ -102,7 +103,7 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     // TMA load -> Compute (G)
     using PipelineG = cutlass::PipelineTmaAsync<StagesLoadStore>;
     // TMA load -> Compute (Q, only used when StoreQG=true)
-    using PipelineQ = cutlass::PipelineTmaAsync<StagesLoadStore>;
+    using PipelineQ = cutlass::PipelineTmaAsync<StagesQ>;
     // Aux load -> Compute
     using PipelineBeta = cutlass::PipelineAsync<StagesA>;
 
@@ -150,7 +151,7 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     // ===================== Shared Memory Plan =====================
     // Helper: conditionally include Q SMEM buffer (only when StoreQG=true)
     struct QSmemBufferEnabled {
-        array_aligned<bf16, cosize_v<SmemLayoutInputBF16>> q[StagesLoadStore];
+        array_aligned<bf16, cosize_v<SmemLayoutInputBF16>> q[StagesQ];
     };
     struct QSmemBufferDisabled {};  // empty, zero-cost
     using QSmemBuffer = cute::conditional_t<StoreQG, QSmemBufferEnabled, QSmemBufferDisabled>;
