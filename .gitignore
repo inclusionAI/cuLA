@@ -24,4 +24,6 @@ benchmark_results
 
 tmp
 
-.claude/settings.jsoncula/_version.py
+.claude/settings.json
+cula/_version.py
+
