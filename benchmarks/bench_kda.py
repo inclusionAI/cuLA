@@ -372,15 +372,10 @@ def main():
         (2, 16384),
     ]
 
-    # varlen_configs = build_varlen_configs(
-    #     num_seqs_list=(10, 20),
-    #     total_lens=(4096, 8192, 16384),
-    #     dists=("uniform", "random", "skewed"),
-    # )
     varlen_configs = build_varlen_configs(
-        num_seqs_list=(10, ),
-        total_lens=(8192, ),
-        dists=("random", ),
+        num_seqs_list=(10, 20),
+        total_lens=(4096, 8192, 16384),
+        dists=("uniform", "random", "skewed"),
     )
 
     fixed_res, varlen_res = [], []
