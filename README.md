@@ -90,7 +90,8 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 
 **Notes:**
 - `safe_gate=True` is required to leverage TensorCore acceleration.
-- `beta` and `initial_state` must be `float32`.
+- `beta` accepts both `float32` and `bfloat16`; it is automatically cast internally as required by each kernel path.
+- `initial_state` must be `float32`.
 - `cu_seqlens` (for variable-length sequences) must be `int32`.
 
 ## Usage

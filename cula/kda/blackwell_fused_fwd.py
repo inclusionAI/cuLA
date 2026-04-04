@@ -124,6 +124,9 @@ class ChunkKDAFunction(torch.autograd.Function):
         k_cute = from_dlpack(k.detach())
         v_cute = from_dlpack(v.detach())
         g_cute = from_dlpack(g.detach())
+        # Kernel uses io_dtype=BFloat16; cast beta to bf16 if needed
+        if beta.dtype != torch.bfloat16:
+            beta = beta.to(torch.bfloat16)
         beta_cute = from_dlpack(beta.detach())
 
         # FIXME: support return final_states
@@ -373,6 +376,8 @@ def flash_kda_prefill(
     assert beta.shape == q.shape[:3], "beta must be of shape (batch size, seq len, num of head)."
     assert v.shape == (*q.shape[:3], v.shape[-1]), "v must be of shape (batch size, seq len, num of head, head dim)."
     assert q.dtype == k.dtype == v.dtype == torch.bfloat16, "q, k, v must be in bfloat16."
+    if beta.dtype != torch.bfloat16:
+        beta = beta.to(torch.bfloat16)
     if scale is None:
         scale = k.shape[-1] ** -0.5
     o, final_state = ChunkKDAFunction.apply(

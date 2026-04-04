@@ -54,6 +54,9 @@ pytestmark = pytest.mark.sm100_only
             (4, 1024, 4, 128, 1, 0, True, False, True, torch.bfloat16),
             (2, 1500, 4, 128, 10, 0, False, True, True, torch.bfloat16),
             (4, 2048, 8, 128, 1, 0, False, True, True, torch.bfloat16),
+            # bf16 beta tests
+            (2, 512, 4, 128, 1, 0, False, False, True, torch.bfloat16),
+            (2, 512, 4, 128, 1, 0, False, True, True, torch.bfloat16),
         ]
     ],
 )
@@ -87,7 +90,9 @@ def test_safe_gate_chunk(
     else:
         lower_bound = None
 
-    beta = torch.randn(B, T, H, dtype=torch.float32).sigmoid()
+    # Alternate between float32 and bfloat16 beta to test both paths
+    beta_dtype = torch.bfloat16 if B == 2 and T == 512 else torch.float32
+    beta = torch.randn(B, T, H, dtype=beta_dtype).sigmoid()
     h0 = torch.randn(B, H, D, D, dtype=torch.float32)
     if use_gate_in_kernel:
         A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(True), (A_log, dt_bias))

@@ -94,7 +94,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         k = k.reshape(packed_seq, num_heads, head_dim).contiguous()
         v = v.reshape(packed_seq, num_heads, head_dim).contiguous()
         g = g.reshape(packed_seq, num_heads, head_dim).contiguous()
-        beta = beta.reshape(packed_seq, num_heads).contiguous()
+        beta = beta.reshape(packed_seq, num_heads).to(torch.float32).contiguous()
 
         # workspace buffer for TMA Store O tensormap
         sm_count = get_device_sm_count(q.device)

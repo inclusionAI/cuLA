@@ -383,6 +383,8 @@ def chunk_kda(
     assert k.shape[-1] <= 256, "Currently we only support key headdim <=256 for KDA :-("
     assert beta.shape == q.shape[:3], "beta must be of shape (batch size, seq len, num of head)."
     assert v.shape == (*q.shape[:3], v.shape[-1]), "v must be of shape (batch size, seq len, num of head, head dim)."
+    if beta.dtype == torch.bfloat16:
+        beta = beta.float()
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
