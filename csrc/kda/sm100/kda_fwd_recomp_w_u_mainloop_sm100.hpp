@@ -314,7 +314,7 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                         }
                     }
                 }
-                // Release K and G SMEM back to Load warp (done reading K, G)
+                // Release K SMEM back to Load warp (done reading K)
                 k_pipeline.consumer_release(k_pipe_state_read);
                 ++k_pipe_state_read;
 
