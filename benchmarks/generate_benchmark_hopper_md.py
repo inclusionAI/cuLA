@@ -55,11 +55,13 @@ BENCHMARK_MD_DEFAULT = "BENCHMARK_H200.md"
 # ============================================================
 
 
-def run_kda_fused_fwd_benchmarks():
+def run_kda_fused_fwd_benchmarks(has_init_state: bool = False):
     """Run bench_kda_fused_fwd.main() with programmatic args and return (fixed, varlen) results."""
     print("\n>>> Running KDA Fused Forward benchmarks (via bench_kda_fused_fwd.main)...")
     orig_argv = sys.argv
     sys.argv = ["bench_kda_fused_fwd.py", "--mode", "both"]
+    if has_init_state:
+        sys.argv.append("--init_state")
     try:
         fixed_res, varlen_res = kda_fused_fwd_main()
     finally:
@@ -143,6 +145,11 @@ def main():
         help="Output markdown filename (relative to project root). Default: BENCHMARK_H200.md",
     )
     parser.add_argument("--save-cache", type=str, default=None, help="Save benchmark results to JSON for future --cache use.")
+    parser.add_argument(
+        "--init_state",
+        action="store_true",
+        help="Use non-zero initial state (default: False)",
+    )
     args = parser.parse_args()
 
     env = get_env_info()
@@ -154,7 +161,7 @@ def main():
         kda_fused_fixed = data["kda_fused_fixed"]
         kda_fused_varlen = data["kda_fused_varlen"]
     else:
-        kda_fused_fixed, kda_fused_varlen = run_kda_fused_fwd_benchmarks()
+        kda_fused_fixed, kda_fused_varlen = run_kda_fused_fwd_benchmarks(has_init_state=args.init_state)
 
         if args.save_cache:
             cache_path = Path(args.save_cache)
