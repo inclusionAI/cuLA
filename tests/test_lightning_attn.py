@@ -306,7 +306,7 @@ def test_initial_and_final_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, at
     K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
-    h0 = torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
+    h0 = torch.randn(B, H, D, D, device="cuda", dtype=torch.float32).transpose(-1, -2).contiguous().transpose(-1, -2) * 0.01
 
     O_ref, ht_ref = pytorch_reference(
         Q,
@@ -395,7 +395,7 @@ def test_against_fla_with_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, ato
     Q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    h0 = torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
+    h0 = torch.randn(B, H, D, D, device="cuda", dtype=torch.float32).transpose(-1, -2).contiguous().transpose(-1, -2) * 0.01
 
     decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
     g_gamma = -decay
@@ -525,7 +525,7 @@ def test_varlen_with_initial_state(seq_lens=None, H=4, D=128, C=64, decay_val=0.
 
     # State pool with 3 slots, use indices [2, 0]
     pool_size = 3
-    state_pool = torch.randn(pool_size, H, D, D, dtype=torch.float32, device="cuda") * 0.01
+    state_pool = torch.randn(pool_size, H, D, D, dtype=torch.float32, device="cuda").transpose(-1, -2).contiguous().transpose(-1, -2) * 0.01
     indices = torch.tensor([2, 0], dtype=torch.int32, device="cuda")
 
     O_var, sp = run_cute_kernel_varlen(
@@ -589,8 +589,7 @@ def test_varlen_against_pytorch_ref(
     K = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     V = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
-
-    state_pool = torch.randn(N, H, D, D, dtype=torch.float32, device="cuda") * 0.01
+    state_pool = torch.randn(N, H, D, D, dtype=torch.float32, device="cuda").transpose(-1, -2).contiguous().transpose(-1, -2) * 0.01
 
     O_var, sp = run_cute_kernel_varlen(
         Q,
