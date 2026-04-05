@@ -98,6 +98,8 @@ ChunkKDAFwdRecompWU(
     TORCH_CHECK(
         has_q == has_qg_out, "ChunkKDAFwdRecompWU: q and qg_out must either both be provided or both be omitted.");
     params.store_qg = has_q && has_qg_out;
+    params.q_ptr = params.store_qg ? q->data_ptr() : nullptr;
+    params.qg_out_ptr = params.store_qg ? qg_out->data_ptr() : nullptr;
     params.shape_wukg = cute::make_shape(params.total_len, params.d, params.h);
     params.stride_wukg = cute::make_stride(params.d * params.h, cute::_1{}, params.d);
     int tile_num = chunk_indices.size(0);
