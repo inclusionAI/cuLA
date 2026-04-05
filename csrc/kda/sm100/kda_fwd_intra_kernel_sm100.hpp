@@ -370,6 +370,7 @@ run_kda_fwd_intra_sm100_impl_dispatch(KDA_fwd_intra_params& params, cudaStream_t
     dim3 grid_dim(Kernel::TileScheduler::get_grid_shape(params.tile_scheduler_params));
     dim3 block_dim(Kernel::NumTotalThreads, 1, 1);
     kernel_fn<<<grid_dim, block_dim, smem_size, stream>>>(params, tma_params);
+    CHECK_CUDA_KERNEL_LAUNCH();
 }
 
 // ===================================================================

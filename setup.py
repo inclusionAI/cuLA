@@ -197,7 +197,6 @@ ext_modules.append(
             Path(this_dir) / "csrc" / "kerutils" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
-            "/usr/local/cuda/include/cccl",
         ],
     )
 )
