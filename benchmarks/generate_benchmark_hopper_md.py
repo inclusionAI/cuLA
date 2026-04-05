@@ -74,7 +74,7 @@ def run_kda_fused_fwd_benchmarks(has_init_state: bool = False):
 # ============================================================
 
 
-def format_benchmark_md(env, kda_fused_fixed, kda_fused_varlen):
+def format_benchmark_md(env, kda_fused_fixed, kda_fused_varlen, has_init_state: bool = False):
     lines = []
     w = lines.append
 
@@ -122,7 +122,8 @@ def format_benchmark_md(env, kda_fused_fixed, kda_fused_varlen):
 
     w("To reproduce:\n")
     w("```bash")
-    w("python benchmarks/bench_kda_fused_fwd.py --mode both")
+    init_state_flag = " --init_state" if has_init_state else ""
+    w(f"python benchmarks/bench_kda_fused_fwd.py --mode both{init_state_flag}")
     w("```\n")
 
     return "\n".join(lines)
@@ -192,7 +193,7 @@ def main():
                 )
             print(f"Cached results to {cache_path}")
 
-    md = format_benchmark_md(env, kda_fused_fixed, kda_fused_varlen)
+    md = format_benchmark_md(env, kda_fused_fixed, kda_fused_varlen, has_init_state=args.init_state)
 
     output_path = ROOT / (args.output if args.output else BENCHMARK_MD_DEFAULT)
     output_path.write_text(md)
