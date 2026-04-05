@@ -908,7 +908,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
             auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, ElementAlpha>{}, kv_tiled_mma);
             auto thr_copy_kv = tiled_copy_kv.get_thread_slice(thread_idx);
-            // transposed store state
+            // transposed load state
             auto tKVgKV = thr_copy_kv.partition_S(select_tensor<1, 0>(gKV));
             copy(tiled_copy_kv, tKVgKV, tKVrKV);
         };
