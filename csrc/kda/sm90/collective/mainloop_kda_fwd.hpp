@@ -905,18 +905,11 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 make_gmem_ptr(params.ptr_input_state),
                 make_layout(make_shape(Int<HeadSizeQK>{}, Int<HeadSizeV>{}, num_state_heads, problem_size.num_seqs)))(
                 _, _, state_head_idx, seq_idx);  // (KDim, VDim), K-contiguous
-            // NOTE: load S in transposed GMEM
-            // because in GDN's equation, S = NewV^T @ K, while in KDA, S = K^T @ NewV
-            auto gKV_trans = make_tensor(
-                make_gmem_ptr(gKV.data()),
-                make_layout(
-                    make_shape(get<1>(gKV.layout().shape()), get<0>(gKV.layout().shape())),
-                    make_stride(get<1>(gKV.layout().stride()), get<0>(gKV.layout().stride()))));
 
-            auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, Element>{}, kv_tiled_mma);
+            auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, ElementAlpha>{}, kv_tiled_mma);
             auto thr_copy_kv = tiled_copy_kv.get_thread_slice(thread_idx);
-
-            auto tKVgKV = thr_copy_kv.partition_S(select_tensor<1, 0>(gKV_trans));
+            // transposed store state
+            auto tKVgKV = thr_copy_kv.partition_S(select_tensor<1, 0>(gKV));
             copy(tiled_copy_kv, tKVgKV, tKVrKV);
         };
 
@@ -928,18 +921,11 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 make_gmem_ptr(params.ptr_output_state),
                 make_layout(make_shape(Int<HeadSizeQK>{}, Int<HeadSizeV>{}, num_state_heads, problem_size.num_seqs)))(
                 _, _, state_head_idx, seq_idx);  // (KDim, VDim), K-contiguous
-            // NOTE: store S in transposed GMEM
-            // because in GDN's equation, S = NewV^T @ K, while in KDA, S = K^T @ NewV
-            auto gKV_trans = make_tensor(
-                make_gmem_ptr(gKV.data()),
-                make_layout(
-                    make_shape(get<1>(gKV.layout().shape()), get<0>(gKV.layout().shape())),
-                    make_stride(get<1>(gKV.layout().stride()), get<0>(gKV.layout().stride()))));
 
-            auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, Element>{}, kv_tiled_mma);
+            auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, ElementAlpha>{}, kv_tiled_mma);
             auto thr_copy_kv = tiled_copy_kv.get_thread_slice(thread_idx);
-
-            auto tKVgKV = thr_copy_kv.partition_D(select_tensor<1, 0>(gKV_trans));
+            // transposed store state
+            auto tKVgKV = thr_copy_kv.partition_D(select_tensor<1, 0>(gKV));
             copy(tiled_copy_kv, tKVrKV, tKVgKV);
         };
 

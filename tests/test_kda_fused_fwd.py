@@ -98,9 +98,11 @@ def test_safe_gate_chunk(
 
     beta = torch.randn(B, T, H, dtype=torch.float32).sigmoid()
     h0 = torch.randn(B, H, D, D, dtype=torch.float32)
+    # NOTE: for inference scenarios, we only use transposed state layout for better decoding performance
+    h0_vk = h0.transpose(-1, -2).contiguous()
     if use_gate_in_kernel:
-        A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(True), (A_log, dt_bias))
-    q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(True), (q, k, v, g, beta, h0))
+        A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(False), (A_log, dt_bias))
+    q, k, v, g, beta, h0, h0_vk = map(lambda x: x.to(device).requires_grad_(False), (q, k, v, g, beta, h0, h0_vk))
 
     ref, ref_ht = naive_recurrent_kda(
         q=F.normalize(q.clone(), p=2, dim=-1),
@@ -128,6 +130,23 @@ def test_safe_gate_chunk(
         lower_bound=lower_bound,
     )
 
+    ref_fla_trans, ref_ht_fla_trans = fla_chunk_kda(
+        q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
+        k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        A_log=(A_log.clone() if use_gate_in_kernel else None),
+        dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
+        initial_state=h0_vk.clone(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+        transpose_state_layout=True,
+    )
+
     tri, tri_ht = cula_kda_fused_fwd(
         q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
         k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),
@@ -136,7 +155,7 @@ def test_safe_gate_chunk(
         beta=beta.clone(),
         A_log=(A_log.clone() if use_gate_in_kernel else None),
         dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-        initial_state=h0.clone(),
+        initial_state=h0_vk.clone(),
         output_final_state=True,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_gate_in_kernel=use_gate_in_kernel,
@@ -145,9 +164,11 @@ def test_safe_gate_chunk(
     )
 
     assert_close("o", ref, tri, 0.005)
-    assert_close("ht", ref_ht, tri_ht, 0.005)
+    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
     assert_close("o", ref_fla, tri, 0.005)
-    assert_close("ht", ref_ht_fla, tri_ht, 0.005)
+    assert_close("ht", ref_ht_fla, tri_ht.transpose(-1, -2), 0.005)
+    assert_close("o", ref_fla_trans, tri, 0.005)
+    assert_close("ht", ref_ht_fla_trans, tri_ht, 0.005)
 
 
 @pytest.mark.parametrize(
@@ -223,10 +244,10 @@ def test_safe_gate_chunk_varlen(
 
     beta = torch.randn(1, T, H, dtype=torch.float32).sigmoid()
     h0 = torch.randn((N, H, D, D), dtype=torch.float32)
+    # NOTE: for inference scenarios, we only use transposed state layout for better decoding performance
+    h0_vk = h0.transpose(-1, -2).contiguous()
 
-    q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(), (q, k, v, g, beta, h0))
-    torch.randn_like(v)
-    torch.rand_like(h0)
+    q, k, v, g, beta, h0, h0_vk = map(lambda x: x.to(device).requires_grad_(False), (q, k, v, g, beta, h0, h0_vk))
 
     tri, tri_ht = cula_kda_fused_fwd(
         q=F.normalize(q.clone(), p=2, dim=-1),
@@ -234,7 +255,7 @@ def test_safe_gate_chunk_varlen(
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),
-        initial_state=h0.clone(),
+        initial_state=h0_vk.clone(),
         output_final_state=True,
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
@@ -256,6 +277,21 @@ def test_safe_gate_chunk_varlen(
         lower_bound=-5.0 if safe_gate else None,
     )
 
+    ref_fla_trans, ref_ht_fla_trans = fla_chunk_kda(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        initial_state=h0_vk.clone(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        safe_gate=safe_gate,
+        lower_bound=-5.0 if safe_gate else None,
+        transpose_state_layout=True,
+    )
+
     ref = []
     ref_ht = []
     for i in range(N):
@@ -274,6 +310,8 @@ def test_safe_gate_chunk_varlen(
     ref_ht = torch.cat(ref_ht, 0)
 
     assert_close("o", ref, tri, 0.005)
-    assert_close("ht", ref_ht, tri_ht, 0.005)
+    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
     assert_close("o", ref_fla, tri, 0.005)
-    assert_close("ht", ref_ht_fla, tri_ht, 0.005)
+    assert_close("ht", ref_ht_fla, tri_ht.transpose(-1, -2), 0.005)
+    assert_close("o", ref_fla_trans, tri, 0.005)
+    assert_close("ht", ref_ht_fla_trans, tri_ht, 0.005)
