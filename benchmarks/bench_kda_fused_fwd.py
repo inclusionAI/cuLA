@@ -298,7 +298,7 @@ def print_report(fixed_results, varlen_results):
     print(f"\n\n{sep}")
     print("                  BENCHMARK REPORT: cula_kda_fused_fwd (fully-fused)")
     print(f"                  cuLA {_SM_TAG} fully-fused vs FLA Triton")
-    print(f"                  H={H}  D={D}  dtype=bf16  safe_gate=True  use_gate_in_kernel=True")
+    print(f"                  H={H}  D={D}  dtype=bf16  safe_gate=True  has_init_state={HAS_INIT_STATE}")
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
     mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
