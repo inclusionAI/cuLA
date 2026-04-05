@@ -317,6 +317,19 @@ using KdaChunkFwdIntraKernelSm100_TF32_GHalf =
 using KdaChunkFwdIntraKernelSm100_FP16_GHalf =
     KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<false, false, false>>;
 
+// BetaBF16 variants: same as above but load beta from bf16 GMEM
+using KdaChunkFwdIntraKernelSm100_TF32_BetaBF16 =
+    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<true, false, true, __nv_bfloat16>>;
+
+using KdaChunkFwdIntraKernelSm100_FP16_BetaBF16 =
+    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<false, false, true, __nv_bfloat16>>;
+
+using KdaChunkFwdIntraKernelSm100_TF32_GHalf_BetaBF16 =
+    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<true, false, false, __nv_bfloat16>>;
+
+using KdaChunkFwdIntraKernelSm100_FP16_GHalf_BetaBF16 =
+    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<false, false, false, __nv_bfloat16>>;
+
 // ===================================================================
 // __global__ kernel wrapper (free function — CUDA requires this)
 // ===================================================================
@@ -378,17 +391,33 @@ run_kda_fwd_intra_sm100_impl_dispatch(KDA_fwd_intra_params& params, cudaStream_t
 // ===================================================================
 inline void
 run_kda_fwd_intra_sm100_impl(KDA_fwd_intra_params& params, cudaStream_t stream) {
-    if (params.use_tf32_inverse) {
-        if (params.unified_gref) {
-            run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_TF32>(params, stream);
+    if (params.is_beta_bf16) {
+        if (params.use_tf32_inverse) {
+            if (params.unified_gref) {
+                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_TF32_BetaBF16>(params, stream);
+            } else {
+                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_TF32_GHalf_BetaBF16>(params, stream);
+            }
         } else {
-            run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_TF32_GHalf>(params, stream);
+            if (params.unified_gref) {
+                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_FP16_BetaBF16>(params, stream);
+            } else {
+                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_FP16_GHalf_BetaBF16>(params, stream);
+            }
         }
     } else {
-        if (params.unified_gref) {
-            run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_FP16>(params, stream);
+        if (params.use_tf32_inverse) {
+            if (params.unified_gref) {
+                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_TF32>(params, stream);
+            } else {
+                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_TF32_GHalf>(params, stream);
+            }
         } else {
-            run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_FP16_GHalf>(params, stream);
+            if (params.unified_gref) {
+                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_FP16>(params, stream);
+            } else {
+                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_FP16_GHalf>(params, stream);
+            }
         }
     }
 }

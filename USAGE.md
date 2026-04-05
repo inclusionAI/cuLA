@@ -18,7 +18,7 @@ Both are drop-in replacements for [FLA](https://github.com/fla-org/flash-linear-
 **General Notes**
 
 - **`safe_gate=True`** is required to leverage TensorCore (M=16) acceleration.
-- **`beta`** and **`initial_state`** must be **`float32`**.
+- **`beta`** must be **`float32`** or **`bfloat16`**; **`initial_state`** must be **`float32`**.
 - **`cu_seqlens`** (for variable-length sequences) must be **`int32`**.
 
 ---

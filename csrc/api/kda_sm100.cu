@@ -43,6 +43,9 @@ ChunkKDAFwdIntra(
     params.scale = scale;
     params.use_tf32_inverse = use_tf32_inverse;
     params.unified_gref = unified_gref;
+    TORCH_CHECK(beta.dtype() == torch::kFloat32 || beta.dtype() == torch::kBFloat16,
+                "beta must be float32 or bfloat16, got ", beta.dtype());
+    params.is_beta_bf16 = (beta.dtype() == torch::kBFloat16);
     params.q_ptr = q.data_ptr();
     params.k_ptr = k.data_ptr();
     params.g_ptr = g.data_ptr();
@@ -83,6 +86,9 @@ ChunkKDAFwdRecompWU(
     params.h = k.size(2);
     params.d = k.size(3);
     params.chunk_size = chunk_size;
+    TORCH_CHECK(beta.dtype() == torch::kFloat32 || beta.dtype() == torch::kBFloat16,
+                "beta must be float32 or bfloat16, got ", beta.dtype());
+    params.is_beta_bf16 = (beta.dtype() == torch::kBFloat16);
     params.k_ptr = k.data_ptr();
     params.v_ptr = v.data_ptr();
     params.beta_ptr = beta.data_ptr();

@@ -412,6 +412,12 @@ struct KdaChunkFwdRecompWUKernelSm100 {
 using KdaChunkFwdRecompWUKernelSm100Default = KdaChunkFwdRecompWUKernelSm100<KdaChunkFwdRecompWUMainloopSm100<false>>;
 using KdaChunkFwdRecompWUKernelSm100StoreQG = KdaChunkFwdRecompWUKernelSm100<KdaChunkFwdRecompWUMainloopSm100<true>>;
 
+// BetaBF16 variants: loads beta from bf16 GMEM
+using KdaChunkFwdRecompWUKernelSm100Default_BetaBF16 =
+    KdaChunkFwdRecompWUKernelSm100<KdaChunkFwdRecompWUMainloopSm100<false, __nv_bfloat16>>;
+using KdaChunkFwdRecompWUKernelSm100StoreQG_BetaBF16 =
+    KdaChunkFwdRecompWUKernelSm100<KdaChunkFwdRecompWUMainloopSm100<true, __nv_bfloat16>>;
+
 // ===================================================================
 // __global__ kernel wrapper (free function — CUDA requires this)
 // ===================================================================
@@ -492,9 +498,17 @@ run_kda_fwd_recomp_w_u_sm100_impl_dispatch(KDA_fwd_recomp_w_u_params& params, cu
 inline void
 run_kda_fwd_recomp_w_u_sm100_impl(KDA_fwd_recomp_w_u_params& params, cudaStream_t stream) {
     if (params.store_qg) {
-        run_kda_fwd_recomp_w_u_sm100_impl_dispatch<KdaChunkFwdRecompWUKernelSm100StoreQG>(params, stream);
+        if (params.is_beta_bf16) {
+            run_kda_fwd_recomp_w_u_sm100_impl_dispatch<KdaChunkFwdRecompWUKernelSm100StoreQG_BetaBF16>(params, stream);
+        } else {
+            run_kda_fwd_recomp_w_u_sm100_impl_dispatch<KdaChunkFwdRecompWUKernelSm100StoreQG>(params, stream);
+        }
     } else {
-        run_kda_fwd_recomp_w_u_sm100_impl_dispatch<KdaChunkFwdRecompWUKernelSm100Default>(params, stream);
+        if (params.is_beta_bf16) {
+            run_kda_fwd_recomp_w_u_sm100_impl_dispatch<KdaChunkFwdRecompWUKernelSm100Default_BetaBF16>(params, stream);
+        } else {
+            run_kda_fwd_recomp_w_u_sm100_impl_dispatch<KdaChunkFwdRecompWUKernelSm100Default>(params, stream);
+        }
     }
 }
 

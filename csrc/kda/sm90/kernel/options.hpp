@@ -81,6 +81,7 @@ enum class Tag {
     kNeedsBeta,           // delta rule
     kInitStateFromInput,  // if true, initialize state by reading global memory instead of zero initialization.
     kSafeGate,            // KDA
+    kElementBetaGmem,     // GMEM element type for beta (default float, can be bf16)
 };
 
 }  // namespace kda::sm90::kernel

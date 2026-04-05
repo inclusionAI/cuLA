@@ -76,7 +76,6 @@ kda_fwd_prefill(
 
     // Extract optional pointers
     float const* alpha_ptr = nullptr;
-    float const* beta_ptr = nullptr;
     float const* input_state_ptr = nullptr;
 
     if (alpha_.has_value()) {
@@ -90,11 +89,11 @@ kda_fwd_prefill(
     }
     if (beta_.has_value()) {
         auto& beta = beta_.value();
-        TORCH_CHECK(beta.dtype() == torch::kFloat32, "beta must be float32");
+        TORCH_CHECK(beta.dtype() == torch::kFloat32 || beta.dtype() == torch::kBFloat16,
+                    "beta must be float32 or bfloat16, got ", beta.dtype());
         TORCH_CHECK(beta.is_contiguous(), "beta must be contiguous");
         TORCH_CHECK(
             beta.size(0) == packed_seq && beta.size(1) == num_heads, "beta shape must be [packed_seq, num_heads]");
-        beta_ptr = beta.data_ptr<float>();
     }
     if (input_state_.has_value()) {
         auto& input_state = input_state_.value();
@@ -114,25 +113,50 @@ kda_fwd_prefill(
     using bf16 = cute::bfloat16_t;
     using Sm90 = cutlass::arch::Sm90;
 
-    kda::sm90::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float>(
-        stream,
-        reinterpret_cast<bf16*>(output.data_ptr()),
-        output_state.data_ptr<float>(),
-        reinterpret_cast<bf16 const*>(q.data_ptr()),
-        reinterpret_cast<bf16 const*>(k.data_ptr()),
-        reinterpret_cast<bf16 const*>(v.data_ptr()),
-        input_state_ptr,
-        alpha_ptr,
-        beta_ptr,
-        cu_seqlens.data_ptr<int32_t>(),
-        workspace_buffer.data_ptr<uint8_t>(),
-        static_cast<int32_t>(num_seqs),
-        static_cast<int32_t>(num_heads),
-        static_cast<int32_t>(head_size),
-        static_cast<int64_t>(packed_seq),
-        scale,
-        safe_gate,
-        static_cast<int32_t>(sm_count));
+    bool beta_is_bf16 = beta_.has_value() && beta_.value().dtype() == torch::kBFloat16;
+
+    if (beta_is_bf16) {
+        kda::sm90::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float, bf16>(
+            stream,
+            reinterpret_cast<bf16*>(output.data_ptr()),
+            output_state.data_ptr<float>(),
+            reinterpret_cast<bf16 const*>(q.data_ptr()),
+            reinterpret_cast<bf16 const*>(k.data_ptr()),
+            reinterpret_cast<bf16 const*>(v.data_ptr()),
+            input_state_ptr,
+            alpha_ptr,
+            reinterpret_cast<bf16 const*>(beta_.value().data_ptr()),
+            cu_seqlens.data_ptr<int32_t>(),
+            workspace_buffer.data_ptr<uint8_t>(),
+            static_cast<int32_t>(num_seqs),
+            static_cast<int32_t>(num_heads),
+            static_cast<int32_t>(head_size),
+            static_cast<int64_t>(packed_seq),
+            scale,
+            safe_gate,
+            static_cast<int32_t>(sm_count));
+    } else {
+        float const* beta_ptr = beta_.has_value() ? beta_.value().data_ptr<float>() : nullptr;
+        kda::sm90::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float, float>(
+            stream,
+            reinterpret_cast<bf16*>(output.data_ptr()),
+            output_state.data_ptr<float>(),
+            reinterpret_cast<bf16 const*>(q.data_ptr()),
+            reinterpret_cast<bf16 const*>(k.data_ptr()),
+            reinterpret_cast<bf16 const*>(v.data_ptr()),
+            input_state_ptr,
+            alpha_ptr,
+            beta_ptr,
+            cu_seqlens.data_ptr<int32_t>(),
+            workspace_buffer.data_ptr<uint8_t>(),
+            static_cast<int32_t>(num_seqs),
+            static_cast<int32_t>(num_heads),
+            static_cast<int32_t>(head_size),
+            static_cast<int64_t>(packed_seq),
+            scale,
+            safe_gate,
+            static_cast<int32_t>(sm_count));
+    }
 
     return {output, output_state};
 }

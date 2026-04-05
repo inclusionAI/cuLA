@@ -32,7 +32,8 @@ template <
     typename ArchTag,
     typename TO,
     typename TQKV,
-    typename TState>
+    typename TState,
+    typename TBeta = float>
 void
 launch_kda_fwd_prefill_kernel_gbai(
     cudaStream_t stream,
@@ -43,7 +44,7 @@ launch_kda_fwd_prefill_kernel_gbai(
     TQKV const* v,
     TState const* input_state,
     float const* alpha,
-    float const* beta,
+    TBeta const* beta,
     int32_t const* cu_seqlens,
     uint8_t* workspace_buffer,
     int32_t num_seqs,
@@ -57,7 +58,8 @@ template <
     typename ArchTag,  // TODO: hide this
     typename TO,
     typename TQKV,
-    typename TState>
+    typename TState,
+    typename TBeta>
 void
 launch_kda_fwd_prefill_kernel(
     cudaStream_t stream,
@@ -68,7 +70,7 @@ launch_kda_fwd_prefill_kernel(
     TQKV const* v,
     TState const* input_state,
     float const* alpha,
-    float const* beta,
+    TBeta const* beta,
     int32_t const* cu_seqlens,
     uint8_t* workspace_buffer,
     int32_t num_seqs,
@@ -120,8 +122,9 @@ launch_kda_fwd_prefill_kernel(
 
 using bf16 = cute::bfloat16_t;
 
+// TBeta=float (default)
 template void
-launch_kda_fwd_prefill_kernel<cutlass::arch::Sm90, bf16, bf16, float>(
+launch_kda_fwd_prefill_kernel<cutlass::arch::Sm90, bf16, bf16, float, float>(
     cudaStream_t stream,
     bf16* output,
     float* state,
@@ -131,6 +134,28 @@ launch_kda_fwd_prefill_kernel<cutlass::arch::Sm90, bf16, bf16, float>(
     float const* input_state,
     float const* alpha,
     float const* beta,
+    int32_t const* cu_seqlens,
+    uint8_t* workspace_buffer,
+    int32_t num_seqs,
+    int32_t num_heads,
+    int32_t head_size,
+    int64_t total_seqlen,
+    float scale,
+    bool safe_gate,
+    int32_t sm_count);
+
+// TBeta=bf16
+template void
+launch_kda_fwd_prefill_kernel<cutlass::arch::Sm90, bf16, bf16, float, bf16>(
+    cudaStream_t stream,
+    bf16* output,
+    float* state,
+    bf16 const* q,
+    bf16 const* k,
+    bf16 const* v,
+    float const* input_state,
+    float const* alpha,
+    bf16 const* beta,
     int32_t const* cu_seqlens,
     uint8_t* workspace_buffer,
     int32_t num_seqs,

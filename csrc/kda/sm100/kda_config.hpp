@@ -28,6 +28,7 @@ struct KDA_fwd_intra_params {
     float scale;
     bool use_tf32_inverse;
     bool unified_gref;
+    bool is_beta_bf16;
 
     void* __restrict__ q_ptr;              //[b, t, h, d]
     void* __restrict__ k_ptr;              //[b, t, h, d]
@@ -55,6 +56,7 @@ struct KDA_fwd_recomp_w_u_params {
     int h;
     int d;
     int chunk_size;
+    bool is_beta_bf16;
 
     void* __restrict__ k_ptr;              //[b, t, h, d]
     void* __restrict__ v_ptr;              //[b, t, h, d]
