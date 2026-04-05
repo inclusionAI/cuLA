@@ -25,11 +25,9 @@ os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1")) 
 
 from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_intra
 from fla.ops.kda.wy_fast import recompute_w_u_fwd as fla_recompute_w_u_fwd
-from fla.ops.utils.index import prepare_chunk_indices
 
 import cula.cudac as cula_cuda
 from benchmarks.utils import SEED, exclusive_cumsum, generate_random_seq_lens, prepare_intra_inputs
-from cula.utils import prepare_uniform_cu_seqlens
 
 # Constant params
 B, H, D = 2, 64, 128
@@ -81,16 +79,7 @@ def prepare_recompute_wu_inputs(B, T, H, D, device, cu_seqlens=None, chunk_size=
         disable_recompute=False,
     )
 
-    # Prepare cu_seqlens_int32 and chunk_indices_int32 for cuLA (requires int32)
-    cu_seqlens_int32 = cu_seqlens.to(torch.int32) if cu_seqlens is not None else None
-    chunk_indices_int32 = chunk_indices.to(torch.int32) if chunk_indices is not None else None
-
-    if cu_seqlens_int32 is None:
-        cu_seqlens_int32 = prepare_uniform_cu_seqlens(q.shape[0], T, device, torch.int32)
-    if chunk_indices_int32 is None:
-        chunk_indices_int32 = prepare_chunk_indices(cu_seqlens_int32, chunk_size)
-
-    return q, k, v, g, beta, Akk, cu_seqlens, chunk_indices, cu_seqlens_int32, chunk_indices_int32
+    return q, k, v, g, beta, Akk, cu_seqlens, chunk_indices
 
 
 def run_fla_recompute_wu(k, v, beta, Akk, q, gk, cu_seqlens, chunk_indices, disable_recompute):
@@ -142,16 +131,16 @@ def benchmark_recompute_wu_uniform():
         seq_lens = [T] * B
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-        q, k, v, g, beta, Akk, cu_seqlens_fla, chunk_indices_fla, cu_seqlens_int32, chunk_indices_int32 = (
-            prepare_recompute_wu_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens, chunk_size=chunk_size)
+        q, k, v, g, beta, Akk, cu_seqlens, chunk_indices = prepare_recompute_wu_inputs(
+            B, T, H, D, device, cu_seqlens=cu_seqlens, chunk_size=chunk_size
         )
 
         # Accuracy: run once and compare
         w_fla, u_fla, qg_fla, kg_fla = run_fla_recompute_wu(
-            k, v, beta, Akk, q, g, cu_seqlens_fla, chunk_indices_fla, DISABLE_RECOMPUTE
+            k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, DISABLE_RECOMPUTE
         )
         w_cula, u_cula, qg_cula, kg_cula = run_cula_recompute_wu(
-            k, v, beta, Akk, q, g, cu_seqlens_int32, chunk_indices_int32, chunk_size, DISABLE_RECOMPUTE
+            k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, chunk_size, DISABLE_RECOMPUTE
         )
 
         # Compare w, u, qg, kg
@@ -171,12 +160,10 @@ def benchmark_recompute_wu_uniform():
 
         # Performance
         ms_fla = triton.testing.do_bench(
-            lambda: run_fla_recompute_wu(k, v, beta, Akk, q, g, cu_seqlens_fla, chunk_indices_fla, DISABLE_RECOMPUTE),
+            lambda: run_fla_recompute_wu(k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, DISABLE_RECOMPUTE),
         )
         ms_cula = triton.testing.do_bench(
-            lambda: run_cula_recompute_wu(
-                k, v, beta, Akk, q, g, cu_seqlens_int32, chunk_indices_int32, chunk_size, DISABLE_RECOMPUTE
-            ),
+            lambda: run_cula_recompute_wu(k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, chunk_size, DISABLE_RECOMPUTE),
         )
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
@@ -211,16 +198,16 @@ def benchmark_recompute_wu_varlen():
         T = total_len
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-        q, k, v, g, beta, Akk, cu_seqlens_fla, chunk_indices_fla, cu_seqlens_int32, chunk_indices_int32 = (
-            prepare_recompute_wu_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens, chunk_size=chunk_size)
+        q, k, v, g, beta, Akk, cu_seqlens, chunk_indices = prepare_recompute_wu_inputs(
+            1, T, H, D, device, cu_seqlens=cu_seqlens, chunk_size=chunk_size
         )
 
         # Accuracy
         w_fla, u_fla, qg_fla, kg_fla = run_fla_recompute_wu(
-            k, v, beta, Akk, q, g, cu_seqlens_fla, chunk_indices_fla, DISABLE_RECOMPUTE
+            k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, DISABLE_RECOMPUTE
         )
         w_cula, u_cula, qg_cula, kg_cula = run_cula_recompute_wu(
-            k, v, beta, Akk, q, g, cu_seqlens_int32, chunk_indices_int32, chunk_size, DISABLE_RECOMPUTE
+            k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, chunk_size, DISABLE_RECOMPUTE
         )
 
         # Compare w, u, qg, kg
@@ -240,12 +227,10 @@ def benchmark_recompute_wu_varlen():
 
         # Performance
         ms_fla = triton.testing.do_bench(
-            lambda: run_fla_recompute_wu(k, v, beta, Akk, q, g, cu_seqlens_fla, chunk_indices_fla, DISABLE_RECOMPUTE),
+            lambda: run_fla_recompute_wu(k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, DISABLE_RECOMPUTE),
         )
         ms_cula = triton.testing.do_bench(
-            lambda: run_cula_recompute_wu(
-                k, v, beta, Akk, q, g, cu_seqlens_int32, chunk_indices_int32, chunk_size, DISABLE_RECOMPUTE
-            ),
+            lambda: run_cula_recompute_wu(k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, chunk_size, DISABLE_RECOMPUTE),
         )
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
