@@ -410,10 +410,9 @@ class LinearAttentionChunkwiseDecay:
         # and the parameter is eliminated at compile time via const_expr guards.
         # For varlen: state pool is [pool_size, H, D, D]. We use B (=N) as the
         # pool dimension — strides are correct regardless of actual pool_size.
-        fstate_layout = cute.make_layout(
-            (D, D, (H, B)),
-            stride=(1, D, (D * D, D * D * H)),
-        )
+        fstate_layout = cute.make_layout((D, D, (H, B)),
+                                         stride=(D, 1, (D * D, D * D * H)),
+                                         )
         if cutlass.const_expr(self.has_initial_state):
             initial_state = cute.make_tensor(initial_state_in.iterator, fstate_layout)
         else:
@@ -1703,8 +1702,8 @@ class LinearAttentionChunkwiseDecay:
                 # -------------- Initial State Loading (h0) ----------------
                 if cutlass.const_expr(self.has_initial_state):
                     gState_h0 = initial_state[None, None, (hidx, state_idx)]
-                    gRow_h0 = cute.make_tensor(gState_h0.iterator + local_tidx, cute.make_layout(_D, stride=_D))
-                    cute.autovec_copy(gRow_h0, init_flat)
+                    gCol_h0 = cute.make_tensor(gState_h0.iterator + local_tidx * _D, cute.make_layout(_D, stride=1))
+                    cute.autovec_copy(gCol_h0, init_flat)
 
                     # Store raw h0 as BF16 to kv16 TMEM for SQ MMA at idx=0
                     tmem_store_rAccKVAsBF16.store(tTR_rKV.load().to(self.io_dtype))
@@ -1877,10 +1876,10 @@ class LinearAttentionChunkwiseDecay:
                         gState_ht = initial_state[None, None, (hidx, state_idx)]
                     else:
                         gState_ht = final_state[None, None, (hidx, state_idx)]
-                    gRow_ht = cute.make_tensor(gState_ht.iterator + local_tidx, cute.make_layout(_D, stride=_D))
-
+                  
+                    gCol_ht = cute.make_tensor(gState_ht.iterator + local_tidx * _D, cute.make_layout(_D, stride=1))
                     out_flat = cute.make_tensor(tTR_rKV.iterator, layout=cute.make_layout(_D))
-                    cute.autovec_copy(out_flat, gRow_ht)
+                    cute.autovec_copy(out_flat, gCol_ht)
 
                 # Advance k_stage_offset by number of chunks in this WU
                 # so next WU's k_stage_idx stays in sync with the K pipeline.
@@ -2895,7 +2894,7 @@ def lightning_attn_fwd(
         V: (B, S, H, D) bf16 value
         decay: (H,) f32 per-head decay coefficients
         scale: attention scale factor (default: 1.0)
-        initial_state: (B, H, D, D) f32 initial state or None
+        initial_state: (B, H, D, D) f32 initial state in BHVK layout or None
         output_final_state: whether to output final state
         chunk_size: chunk size (default: 64)
 
@@ -2917,7 +2916,7 @@ def lightning_attn_fwd(
     )
 
     if output_final_state:
-        ht = torch.zeros(B, H, D, D, dtype=torch.float32, device=Q.device)
+        ht = torch.zeros(B, H, D, D, dtype=torch.float32, device=Q.device).transpose(-1,-2)
     else:
         ht = None
 
@@ -3111,7 +3110,7 @@ def lightning_attn_fwd_varlen(
         decay: (H,) f32 per-head decay coefficients
         cu_seqlens: (N+1,) int32 cumulative sequence lengths
         scale: attention scale factor (default: 1.0)
-        state_pool: (pool_size, H, D, D) f32 state pool, or None
+       state_pool: (pool_size, H, D, D) f32 state pool in BHVK layout, or None
             If None, a zero state pool is allocated with pool_size=N.
             States are updated in-place (INPLACE_UPDATE).
         initial_state_indices: (N,) int32 indices into state_pool per sequence.
@@ -3127,7 +3126,7 @@ def lightning_attn_fwd_varlen(
 
     # Allocate state pool if not provided
     if state_pool is None:
-        state_pool = torch.zeros(N, H, D, D, dtype=torch.float32, device=Q.device)
+        state_pool = torch.zeros(N, H, D, D, dtype=torch.float32, device=Q.device).transpose(-1,-2)
 
     # Default indices: identity mapping
     if initial_state_indices is None:
