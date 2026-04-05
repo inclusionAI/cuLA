@@ -82,7 +82,7 @@ def test_bf16_beta_sm100_fixed(B, T, H, D, use_gate_in_kernel):
         initial_state=h0.clone(), output_final_state=True,
         use_gate_in_kernel=use_gate_in_kernel, safe_gate=True, lower_bound=-5.0,
     )
-    ((o_fp32 * do).sum() + (ht_fp32 * dht).sum()).backward(retain_graph=True)
+    ((o_fp32 * do).sum() + (ht_fp32 * dht).sum()).backward()
     if use_gate_in_kernel:
         fp32_dA, A_log.grad = A_log.grad.clone(), None
         fp32_dbias, dt_bias.grad = dt_bias.grad.clone(), None
@@ -104,7 +104,7 @@ def test_bf16_beta_sm100_fixed(B, T, H, D, use_gate_in_kernel):
         initial_state=h0.clone(), output_final_state=True,
         use_gate_in_kernel=use_gate_in_kernel, safe_gate=True, lower_bound=-5.0,
     )
-    ((o_bf16 * do).sum() + (ht_bf16 * dht).sum()).backward(retain_graph=True)
+    ((o_bf16 * do).sum() + (ht_bf16 * dht).sum()).backward()
     bf16_dq, bf16_dk, bf16_dv = q.grad, k.grad, v.grad
     bf16_dg, bf16_dh0 = g.grad, h0.grad
     bf16_db = beta_bf16.grad
@@ -174,7 +174,7 @@ def test_bf16_beta_sm100_varlen(H, D, cu_seqlens):
         cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu,
         safe_gate=True, lower_bound=-5.0,
     )
-    ((o_fp32 * do).sum() + (ht_fp32 * dht).sum()).backward(retain_graph=True)
+    ((o_fp32 * do).sum() + (ht_fp32 * dht).sum()).backward()
     fp32_dq, q.grad = q.grad.clone(), None
     fp32_dk, k.grad = k.grad.clone(), None
     fp32_dv, v.grad = v.grad.clone(), None
@@ -190,7 +190,7 @@ def test_bf16_beta_sm100_varlen(H, D, cu_seqlens):
         cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu,
         safe_gate=True, lower_bound=-5.0,
     )
-    ((o_bf16 * do).sum() + (ht_bf16 * dht).sum()).backward(retain_graph=True)
+    ((o_bf16 * do).sum() + (ht_bf16 * dht).sum()).backward()
     bf16_dq, bf16_dk, bf16_dv = q.grad, k.grad, v.grad
     bf16_dg, bf16_dh0 = g.grad, h0.grad
     bf16_db = beta_bf16.grad
