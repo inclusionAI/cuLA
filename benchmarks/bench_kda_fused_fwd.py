@@ -68,8 +68,8 @@ cula_kda_fused_fwd = get_kda_fused_fwd(_device)
 # Constants
 # ============================================================
 H, D = 64, 128
-WARMUP = 10
-N_ITERS = 30
+WARMUP = 25
+N_ITERS = 100
 NCU_MODE = False
 SANITIZER_MODE = False
 HAS_INIT_STATE = False
@@ -126,6 +126,7 @@ def run_fla(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, low
         use_gate_in_kernel=True,
         safe_gate=True,
         lower_bound=lower_bound,
+        transpose_state_layout=True,
     )
 
 
