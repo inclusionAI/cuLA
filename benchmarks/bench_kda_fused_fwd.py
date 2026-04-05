@@ -72,6 +72,7 @@ WARMUP = 10
 N_ITERS = 30
 NCU_MODE = False
 SANITIZER_MODE = False
+HAS_INIT_STATE = False
 
 
 # ============================================================
@@ -165,7 +166,7 @@ def bench_fixed(configs):
         seq_lens = [T] * B
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-        inputs = prepare_safe_gate_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens)
+        inputs = prepare_safe_gate_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens, has_init_state=HAS_INIT_STATE)
         q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
         A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
         scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
@@ -232,7 +233,7 @@ def bench_varlen(configs):
         T = total_len
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-        inputs = prepare_safe_gate_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens)
+        inputs = prepare_safe_gate_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens, has_init_state=HAS_INIT_STATE)
         q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
         A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
         scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
@@ -361,15 +362,23 @@ def main():
         action="store_true",
         help="Sanitizer mode: warmup=1, iters=1",
     )
+    parser.add_argument(
+        "--init_state",
+        action="store_true",
+        help="Use non-zero initial state (default: False)",
+    )
     args = parser.parse_args()
 
-    global NCU_MODE, SANITIZER_MODE
+    global NCU_MODE, SANITIZER_MODE, HAS_INIT_STATE
     if args.ncu:
         NCU_MODE = True
         print("[NCU mode] warmup=1, iters=1")
     if args.sanitizer:
         SANITIZER_MODE = True
         print("[Sanitizer mode] warmup=1, iters=1")
+    if args.init_state:
+        HAS_INIT_STATE = True
+        print("[init_state] using non-zero initial state")
 
     print(
         f"[Device] {torch.cuda.get_device_name(0)}  compute capability {_SM_TAG}  →  using {cula_kda_fused_fwd.__module__}.{cula_kda_fused_fwd.__name__}"
