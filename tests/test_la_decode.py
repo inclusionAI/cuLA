@@ -76,7 +76,7 @@ def make_inputs(B, H, D, device="cuda", seed=42):
     q = torch.randn(B, H, D, device=device, dtype=torch.bfloat16)
     k = torch.randn(B, H, D, device=device, dtype=torch.bfloat16)
     v = torch.randn(B, H, D, device=device, dtype=torch.bfloat16)
-    state = torch.randn(B, H, D, D, device=device, dtype=torch.float32).transpose(-1, -2).contiguous().transpose(-1, -2) * 0.01
+    state = torch.randn(B, H, D, D, device=device, dtype=torch.float32) * 0.01
     return q, k, v, state
 
 
