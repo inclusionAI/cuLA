@@ -2916,7 +2916,7 @@ def lightning_attn_fwd(
     )
 
     if output_final_state:
-        ht = torch.zeros(B, H, D, D, dtype=torch.float32, device=Q.device).transpose(-1,-2)
+        ht = torch.zeros(B, H, D, D, dtype=torch.float32, device=Q.device)
     else:
         ht = None
 
