@@ -3126,7 +3126,7 @@ def lightning_attn_fwd_varlen(
 
     # Allocate state pool if not provided
     if state_pool is None:
-        state_pool = torch.zeros(N, H, D, D, dtype=torch.float32, device=Q.device).transpose(-1,-2)
+        state_pool = torch.zeros(N, H, D, D, dtype=torch.float32, device=Q.device)
 
     # Default indices: identity mapping
     if initial_state_indices is None:
