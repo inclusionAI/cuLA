@@ -306,7 +306,7 @@ def test_initial_and_final_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, at
     K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
-    h0 = torch.randn(B, H, D, D, device="cuda", dtype=torch.float32).transpose(-1, -2).contiguous().transpose(-1, -2) * 0.01
+    h0 = torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
 
     O_ref, ht_ref = pytorch_reference(
         Q,
