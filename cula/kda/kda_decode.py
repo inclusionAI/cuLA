@@ -1223,11 +1223,17 @@ def _get_jit_functions():
     return _jit_functions
 
 
-def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode):
-    """Get or compile the KDA kernel for given dimensions."""
+def _get_compiled_kernel(
+    N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode,
+    scale, use_qk_l2norm, softplus_beta, softplus_threshold,
+):
+    """Get or compile the KDA kernel for given dimensions and Constexpr values."""
     global _compiled_kernels
 
-    key = (N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode)
+    key = (
+        N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode,
+        scale, use_qk_l2norm, softplus_beta, softplus_threshold,
+    )
     if key in _compiled_kernels:
         return _compiled_kernels[key]
 
@@ -1286,9 +1292,9 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
         h0_source_tensor,
         h0_indices_tensor,
         o_tensor,
-        softplus_beta=1.0,
-        softplus_threshold=20.0,
-        scale=K**-0.5,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        scale=scale,
         B=1 if is_varlen_decode else N,
         T=N if is_varlen_decode else 1,
         H=H,
@@ -1296,7 +1302,7 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
         V=V,
         HV=HV,
         use_initial_state=True,
-        use_qk_l2norm=True,
+        use_qk_l2norm=use_qk_l2norm,
         stream=stream,
     )
 
@@ -1496,7 +1502,9 @@ def kda_decode(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compiled_kernel = _get_compiled_kernel(
-        N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode
+        N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode,
+        scale=scale, use_qk_l2norm=use_qk_l2norm_in_kernel,
+        softplus_beta=softplus_beta, softplus_threshold=softplus_threshold,
     )
 
     compiled_kernel(
