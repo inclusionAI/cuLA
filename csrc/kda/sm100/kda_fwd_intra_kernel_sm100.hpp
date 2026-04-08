@@ -305,32 +305,6 @@ struct KdaChunkFwdIntraKernelSm100 {
 };
 
 // ===================================================================
-// Default Kernel types: parameterized by UseTF32Inverse × UnifiedGRef
-// ===================================================================
-using KdaChunkFwdIntraKernelSm100_TF32 = KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<true, false, true>>;
-
-using KdaChunkFwdIntraKernelSm100_FP16 = KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<false, false, true>>;
-
-using KdaChunkFwdIntraKernelSm100_TF32_GHalf =
-    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<true, false, false>>;
-
-using KdaChunkFwdIntraKernelSm100_FP16_GHalf =
-    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<false, false, false>>;
-
-// BetaBF16 variants: same as above but load beta from bf16 GMEM
-using KdaChunkFwdIntraKernelSm100_TF32_BetaBF16 =
-    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<true, false, true, __nv_bfloat16>>;
-
-using KdaChunkFwdIntraKernelSm100_FP16_BetaBF16 =
-    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<false, false, true, __nv_bfloat16>>;
-
-using KdaChunkFwdIntraKernelSm100_TF32_GHalf_BetaBF16 =
-    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<true, false, false, __nv_bfloat16>>;
-
-using KdaChunkFwdIntraKernelSm100_FP16_GHalf_BetaBF16 =
-    KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<false, false, false, __nv_bfloat16>>;
-
-// ===================================================================
 // __global__ kernel wrapper (free function — CUDA requires this)
 // ===================================================================
 template <typename KernelT, typename TmaParamsT>
@@ -387,39 +361,19 @@ run_kda_fwd_intra_sm100_impl_dispatch(KDA_fwd_intra_params& params, cudaStream_t
 }
 
 // ===================================================================
-// Runtime dispatch based on params.use_tf32_inverse and params.unified_gref
+// Runtime dispatch based on params.use_tf32_inverse, params.unified_gref, params.is_beta_bf16
 // ===================================================================
 inline void
 run_kda_fwd_intra_sm100_impl(KDA_fwd_intra_params& params, cudaStream_t stream) {
-    if (params.is_beta_bf16) {
-        if (params.use_tf32_inverse) {
-            if (params.unified_gref) {
-                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_TF32_BetaBF16>(params, stream);
-            } else {
-                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_TF32_GHalf_BetaBF16>(params, stream);
-            }
-        } else {
-            if (params.unified_gref) {
-                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_FP16_BetaBF16>(params, stream);
-            } else {
-                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_FP16_GHalf_BetaBF16>(params, stream);
-            }
-        }
-    } else {
-        if (params.use_tf32_inverse) {
-            if (params.unified_gref) {
-                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_TF32>(params, stream);
-            } else {
-                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_TF32_GHalf>(params, stream);
-            }
-        } else {
-            if (params.unified_gref) {
-                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_FP16>(params, stream);
-            } else {
-                run_kda_fwd_intra_sm100_impl_dispatch<KdaChunkFwdIntraKernelSm100_FP16_GHalf>(params, stream);
-            }
-        }
-    }
+    BETA_TYPE_SWITCH(params.is_beta_bf16, BetaType, [&] {
+        BOOL_SWITCH(params.use_tf32_inverse, kUseTF32Inverse, [&] {
+            BOOL_SWITCH(params.unified_gref, kUnifiedGRef, [&] {
+                using Kernel = KdaChunkFwdIntraKernelSm100<
+                    KdaChunkFwdIntraMainloopSm100<kUseTF32Inverse, /*RoundingTF32=*/false, kUnifiedGRef, BetaType>>;
+                run_kda_fwd_intra_sm100_impl_dispatch<Kernel>(params, stream);
+            });
+        });
+    });
 }
 
 }  // namespace kda::sm100
