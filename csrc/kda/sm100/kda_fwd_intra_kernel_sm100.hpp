@@ -368,6 +368,7 @@ run_kda_fwd_intra_sm100_impl(KDA_fwd_intra_params& params, cudaStream_t stream) 
     BETA_TYPE_SWITCH(params.is_beta_bf16, BetaType, [&] {
         BOOL_SWITCH(params.use_tf32_inverse, kUseTF32Inverse, [&] {
             BOOL_SWITCH(params.unified_gref, kUnifiedGRef, [&] {
+                // Currently we hardcode RoundingTF32=false to align with FLA implementation, the precision is enough
                 using Kernel = KdaChunkFwdIntraKernelSm100<
                     KdaChunkFwdIntraMainloopSm100<kUseTF32Inverse, /*RoundingTF32=*/false, kUnifiedGRef, BetaType>>;
                 run_kda_fwd_intra_sm100_impl_dispatch<Kernel>(params, stream);
