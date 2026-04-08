@@ -33,7 +33,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from cula.kda.kda_decode import kda_decode
+from cula.kda import kda_decode
 
 
 # ---------------------------------------------------------------------------
