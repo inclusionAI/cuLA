@@ -70,13 +70,11 @@ pytestmark = pytest.mark.sm100_only
             # --- use_qk_l2norm_in_kernel ---
             (4, 1024, 4, 128, 1, 0, True, False, True, torch.bfloat16),
             # --- use_gate_in_kernel (A_log / dt_bias fused) ---
-            # TODO: use_gate_in_kernel=True produces NaN in current WIP kernel, xfail until fixed
             (2, 1500, 4, 128, 10, 0, False, True, True, torch.bfloat16),
             (4, 2048, 8, 128, 1, 0, False, True, True, torch.bfloat16),
             # --- pipeline stress: multi-chunk sequences ---
             (2, 256, 4, 128, 1, 0, False, False, True, torch.bfloat16),
             (2, 2048, 4, 128, 1, 0, False, False, True, torch.bfloat16),
-            # TODO: use_gate_in_kernel=True, xfail until fixed
             (1, 4096, 4, 128, 1, 0, False, True, True, torch.bfloat16),
         ]
     ],
@@ -94,11 +92,6 @@ def test_safe_gate_chunk(
     dtype: torch.dtype,
 ):
     from fla.ops.kda.gate import naive_kda_lowerbound_gate
-
-    # TODO: use_gate_in_kernel=True produces NaN in current WIP kernel
-    # Remove xfail once fused gate path is implemented in kda_fully_fused_wip.py
-    if use_gate_in_kernel:
-        pytest.xfail("use_gate_in_kernel=True not yet implemented in WIP kernel (produces NaN)")
 
     torch.manual_seed(42)
     q = torch.rand(B, T, H, D, dtype=dtype)
@@ -176,10 +169,8 @@ def test_safe_gate_chunk(
 
     assert_close("o", ref, tri, 0.005)
     assert_close("o (vs fla)", ref_fla, tri, 0.005)
-    # TODO: output_final_state not yet implemented in WIP kernel (garbage values)
-    # Remove xfail once final state write is implemented in kda_fully_fused_wip.py
-    # assert_close("ht", ref_ht, tri_ht, 0.005)
-    # assert_close("ht (vs fla)", ref_ht_fla, tri_ht, 0.005)
+    assert_close("ht", ref_ht, tri_ht, 0.005)
+    assert_close("ht (vs fla)", ref_ht_fla, tri_ht, 0.005)
 
 
 # ============================================================
@@ -301,7 +292,5 @@ def test_safe_gate_chunk_varlen(
 
     assert_close("o", ref, tri, 0.005)
     assert_close("o (vs fla)", ref_fla, tri, 0.005)
-    # TODO: output_final_state not yet implemented in WIP kernel (garbage values)
-    # Remove xfail once final state write is implemented in kda_fully_fused_wip.py
-    # assert_close("ht", ref_ht, tri_ht, 0.005)
-    # assert_close("ht (vs fla)", ref_ht_fla, tri_ht, 0.005)
+    assert_close("ht", ref_ht, tri_ht, 0.005)
+    assert_close("ht (vs fla)", ref_ht_fla, tri_ht, 0.005)

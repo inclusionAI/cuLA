@@ -126,14 +126,14 @@ class ChunkKDAFunction(torch.autograd.Function):
         g_cute = from_dlpack(g.detach())
         beta_cute = from_dlpack(beta.detach())
 
-        # FIXME: support return final_states
         o = torch.empty_like(q)
         o_cute = from_dlpack(o.detach())
 
         stream = cutlass_torch.default_stream()
 
         has_initial_state = initial_state is not None
-        cache_key = (has_initial_state, output_final_state, safe_gate, is_varlen, scale, chunk_size, D, USE_FAST_MATH)
+        g_dtype = g.dtype  # must be in cache_key: g_dtype affects SMEM layout and TMA atom
+        cache_key = (has_initial_state, output_final_state, safe_gate, is_varlen, scale, chunk_size, D, USE_FAST_MATH, g_dtype)
 
         # Prepare cu_seqlens as int32 for kernel
         if is_varlen:
