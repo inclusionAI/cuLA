@@ -220,6 +220,7 @@ def cula_kda_prefill(
     assert q.shape == k.shape == g.shape, "q, k, g must have the same shape."
     assert beta.shape == q.shape[:3], "beta must be of shape (batch size, seq len, num of head)."
     assert v.shape == (*q.shape[:3], v.shape[-1]), "v must be of shape (batch size, seq len, num of head, head dim)."
+    assert q.shape[-1] == k.shape[-1] == v.shape[-1] == 128, "Only support head dim of 128 for inputs."
     if scale is None:
         scale = k.shape[-1] ** -0.5
     o, final_state = HopperChunkKDAFunction.apply(

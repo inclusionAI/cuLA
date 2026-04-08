@@ -27,6 +27,7 @@ from cula.kda import chunk_kda as cula_chunk_kda
 pytestmark = pytest.mark.sm100_only
 
 
+@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
 @pytest.mark.parametrize("disable_recompute", [True, False], ids=["no_recomp", "recomp"])
 @pytest.mark.parametrize(
     (
@@ -70,6 +71,7 @@ def test_safe_gate_chunk(
     safe_gate: bool,
     dtype: torch.dtype,
     disable_recompute: bool,
+    beta_dtype: torch.dtype,
 ):
     torch.manual_seed(42)
     q = torch.rand(B, T, H, D, dtype=dtype)
@@ -89,7 +91,7 @@ def test_safe_gate_chunk(
     else:
         lower_bound = None
 
-    beta = torch.randn(B, T, H, dtype=torch.float32).sigmoid()
+    beta = torch.randn(B, T, H, dtype=torch.float32).sigmoid().to(beta_dtype)
     h0 = torch.randn(B, H, D, D, dtype=torch.float32)
     if use_gate_in_kernel:
         A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(True), (A_log, dt_bias))
@@ -157,6 +159,7 @@ def test_safe_gate_chunk(
     assert_close("dh0", ref_dh0, tri_dh0, 0.008)
 
 
+@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
 @pytest.mark.parametrize("disable_recompute", [True, False], ids=["no_recomp", "recomp"])
 @pytest.mark.parametrize(
     ("H", "D", "mask_p", "cu_seqlens", "dtype", "safe_gate"),
@@ -212,6 +215,7 @@ def test_safe_gate_chunk_varlen(
     dtype: torch.dtype,
     safe_gate: bool,
     disable_recompute: bool,
+    beta_dtype: torch.dtype,
 ):
     torch.manual_seed(42)
     cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
@@ -228,7 +232,7 @@ def test_safe_gate_chunk_varlen(
     if safe_gate:
         g = g.clamp(-5, 0)
 
-    beta = torch.randn(1, T, H, dtype=torch.float32).sigmoid()
+    beta = torch.randn(1, T, H, dtype=torch.float32).sigmoid().to(beta_dtype)
     h0 = torch.randn((N, H, D, D), dtype=torch.float32)
 
     q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(), (q, k, v, g, beta, h0))

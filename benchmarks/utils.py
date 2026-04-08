@@ -270,7 +270,7 @@ def prepare_safe_gate_inputs(
     q = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
     k = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
     v = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    g = torch.randn(batch_size, T, H, D, dtype=torch.float, device=device).requires_grad_(False)
+    g = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
     beta = torch.randn(batch_size, T, H, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
 
     A_log = torch.randn(H, dtype=torch.float, device=device).requires_grad_(False)
@@ -316,7 +316,7 @@ def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_siz
     q = torch.randn(batch_size, T, H, D, dtype=dtype, device=device)
     k = torch.randn(batch_size, T, H, D, dtype=dtype, device=device)
     v = torch.randn(batch_size, T, H, D, dtype=dtype, device=device)
-    g_raw = torch.randn(batch_size, T, H, D, dtype=torch.float, device=device)
+    g_raw = torch.randn(batch_size, T, H, D, dtype=dtype, device=device)
     beta = torch.randn(batch_size, T, H, dtype=torch.float, device=device).sigmoid()
 
     # l2norm q, k
