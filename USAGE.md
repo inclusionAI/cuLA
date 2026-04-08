@@ -39,8 +39,8 @@ device = 'cuda'
 q = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16, requires_grad=True)
 k = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16, requires_grad=True)
 v = torch.randn(B, T, H, V, device=device, dtype=torch.bfloat16, requires_grad=True)
-g = torch.randn(B, T, H, K, device=device, dtype=torch.float32) * 0.1
-beta = torch.randn(B, T, H, device=device, dtype=torch.float32).sigmoid()
+g = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1
+beta = torch.randn(B, T, H, device=device, dtype=torch.bfloat16).sigmoid()
 A_log = torch.randn(H, device=device, dtype=torch.float32) * 0.01
 dt_bias = torch.zeros(H * K, device=device, dtype=torch.float32)
 init_state = torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
@@ -86,8 +86,8 @@ device = 'cuda'
 q = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16)
 k = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16)
 v = torch.randn(B, T, H, V, device=device, dtype=torch.bfloat16)
-g = torch.randn(B, T, H, K, device=device, dtype=torch.float32) * 0.1
-beta = torch.randn(B, T, H, device=device, dtype=torch.float32).sigmoid()
+g = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1
+beta = torch.randn(B, T, H, device=device, dtype=torch.bfloat16).sigmoid()
 A_log = torch.randn(H, device=device, dtype=torch.float32) * 0.01
 dt_bias = torch.zeros(H * K, device=device, dtype=torch.float32)
 init_state = torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
