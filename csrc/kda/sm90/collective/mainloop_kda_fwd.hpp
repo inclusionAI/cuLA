@@ -74,7 +74,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     using ElementAccumulatorKV = ElementAccumulatorKV_;
     using ElementO = Element;
     using ElementAlpha = float;
-    using ElementBeta = float;  // SMEM + compute stays fp32
+    using ElementBeta = float;                                                     // SMEM + compute stays fp32
     using ElementBetaGmem = find_option_t<Tag::kElementBetaGmem, float, Options>;  // GMEM type (float or bf16)
     using ElementGatedMMA = cutlass::tfloat32_t;
 
@@ -645,8 +645,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         // fuse post inverse diag(beta) into diagonal of IKK
         // auto collective_load = LoadBeta{params.beta_ptr, params.beta_layout, /*oob_value=*/1.0f, pipeline,
         // storage.smem_beta};
-        auto collective_load =
-            LoadBeta{params.beta_ptr, params.beta_layout, /*oob_value=*/ElementBetaGmem(0), pipeline, storage.smem_beta};
+        auto collective_load = LoadBeta{
+            params.beta_ptr, params.beta_layout, /*oob_value=*/ElementBetaGmem(0), pipeline, storage.smem_beta};
         auto src_dst = collective_load.partition_SD(problem_size, tile_shape, work_desc);
 
         CUTE_NO_UNROLL
