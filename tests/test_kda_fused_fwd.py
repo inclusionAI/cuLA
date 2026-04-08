@@ -315,3 +315,144 @@ def test_safe_gate_chunk_varlen(
     assert_close("ht", ref_ht_fla, tri_ht.transpose(-1, -2), 0.005)
     assert_close("o", ref_fla_trans, tri, 0.005)
     assert_close("ht", ref_ht_fla_trans, tri_ht, 0.005)
+
+
+@pytest.mark.parametrize(
+    (
+        "B",
+        "T",
+        "H",
+        "D",
+        "gate_logit_normalizer",
+        "mask_p",
+        "use_qk_l2norm_in_kernel",
+        "use_gate_in_kernel",
+        "safe_gate",
+        "dtype",
+    ),
+    [
+        pytest.param(
+            *test,
+            id="B{}-T{}-H{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-{}".format(*test),
+        )
+        for test in [
+            (1, 63, 32, 128, 1, 0, False, True, True, torch.bfloat16),
+            (2, 62, 32, 128, 1, 0, False, True, True, torch.bfloat16),
+            (2, 55, 32, 128, 1, 0.5, False, True, True, torch.bfloat16),
+            (3, 50, 32, 128, 0.1, 0, False, True, True, torch.bfloat16),
+            (4, 43, 32, 128, 1, 0, False, True, True, torch.bfloat16),
+            (4, 25, 32, 128, 1, 0, True, True, True, torch.bfloat16),
+            (2, 18, 32, 128, 10, 0, False, True, True, torch.bfloat16),
+            (4, 59, 32, 128, 1, 0, False, True, True, torch.bfloat16),
+        ]
+    ],
+)
+def test_safe_gate_chunk_small_seq(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    gate_logit_normalizer: float,
+    mask_p: float,
+    use_qk_l2norm_in_kernel: bool,
+    use_gate_in_kernel: bool,
+    safe_gate: bool,
+    dtype: torch.dtype,
+):
+    from fla.ops.kda.gate import naive_kda_lowerbound_gate
+
+    cula_kda_fused_fwd = get_kda_fused_fwd(device)
+
+    torch.manual_seed(42)
+    q = torch.rand(B, T, H, D, dtype=dtype)
+    k = torch.rand(B, T, H, D, dtype=dtype)
+    v = torch.rand(B, T, H, D, dtype=dtype)
+    g = torch.randn(B, T, H, D, dtype=torch.float if not use_gate_in_kernel else dtype)
+    if use_gate_in_kernel:
+        A_log = torch.randn(H, dtype=torch.float)
+        dt_bias = torch.randn(H * D, dtype=torch.float)
+    else:
+        g = F.logsigmoid(g) / gate_logit_normalizer
+        g = g * (torch.rand_like(g) > mask_p)
+    if safe_gate:
+        lower_bound = -5.0
+        if not use_gate_in_kernel:
+            g = g.clamp(-5, 0)
+        naive_kda_gate_fn = naive_kda_lowerbound_gate
+    else:
+        lower_bound = None
+        naive_kda_gate_fn = naive_kda_gate
+
+    beta = torch.randn(B, T, H, dtype=torch.float32).sigmoid()
+    h0 = torch.randn(B, H, D, D, dtype=torch.float32)
+    # NOTE: for inference scenarios, we only use transposed state layout for better decoding performance
+    h0_vk = h0.transpose(-1, -2).contiguous()
+    if use_gate_in_kernel:
+        A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(False), (A_log, dt_bias))
+    q, k, v, g, beta, h0, h0_vk = map(lambda x: x.to(device).requires_grad_(False), (q, k, v, g, beta, h0, h0_vk))
+
+    ref, ref_ht = naive_recurrent_kda(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        g=(naive_kda_gate_fn(g, A_log, dt_bias) if use_gate_in_kernel else g.clone()),
+        beta=beta.clone(),
+        initial_state=h0.clone(),
+        output_final_state=True,
+    )
+
+    ref_fla, ref_ht_fla = fla_chunk_kda(
+        q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
+        k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        A_log=(A_log.clone() if use_gate_in_kernel else None),
+        dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
+        initial_state=h0.clone(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+    )
+
+    ref_fla_trans, ref_ht_fla_trans = fla_chunk_kda(
+        q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
+        k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        A_log=(A_log.clone() if use_gate_in_kernel else None),
+        dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
+        initial_state=h0_vk.clone(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+        transpose_state_layout=True,
+    )
+
+    tri, tri_ht = cula_kda_fused_fwd(
+        q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
+        k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        A_log=(A_log.clone() if use_gate_in_kernel else None),
+        dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
+        initial_state=h0_vk.clone(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+    )
+
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
+    assert_close("o", ref_fla, tri, 0.005)
+    assert_close("ht", ref_ht_fla, tri_ht.transpose(-1, -2), 0.005)
+    assert_close("o", ref_fla_trans, tri, 0.005)
+    assert_close("ht", ref_ht_fla_trans, tri_ht, 0.005)
