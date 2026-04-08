@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/cuLA-logo.png" alt="cuLA Logo" width="200">
+
 # cuLA — CUDA Linear Attention
 
 **High-performance CUDA kernels for linear attention variants, written in [CuTe DSL](https://github.com/NVIDIA/cutlass/tree/main/python/CuTeDSL) and CUTLASS C++.**
