@@ -30,6 +30,7 @@ from cula.utils import get_kda_fused_fwd
 pytestmark = pytest.mark.sm90_only
 
 
+@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
 @pytest.mark.parametrize(
     (
         "B",
@@ -71,6 +72,7 @@ def test_safe_gate_chunk(
     use_gate_in_kernel: bool,
     safe_gate: bool,
     dtype: torch.dtype,
+    beta_dtype: torch.dtype,
 ):
     from fla.ops.kda.gate import naive_kda_lowerbound_gate
 
@@ -96,7 +98,7 @@ def test_safe_gate_chunk(
         lower_bound = None
         naive_kda_gate_fn = naive_kda_gate
 
-    beta = torch.randn(B, T, H, dtype=torch.float32).sigmoid()
+    beta = torch.randn(B, T, H, dtype=torch.float32).sigmoid().to(beta_dtype)
     h0 = torch.randn(B, H, D, D, dtype=torch.float32)
     # NOTE: for inference scenarios, we only use transposed state layout for better decoding performance
     h0_vk = h0.transpose(-1, -2).contiguous()
@@ -171,6 +173,7 @@ def test_safe_gate_chunk(
     assert_close("ht", ref_ht_fla_trans, tri_ht, 0.005)
 
 
+@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
 @pytest.mark.parametrize(
     ("H", "D", "mask_p", "cu_seqlens", "dtype", "safe_gate"),
     [
@@ -224,6 +227,7 @@ def test_safe_gate_chunk_varlen(
     cu_seqlens: list[int],
     dtype: torch.dtype,
     safe_gate: bool,
+    beta_dtype: torch.dtype,
 ):
     cula_kda_fused_fwd = get_kda_fused_fwd(device)
 
@@ -242,7 +246,7 @@ def test_safe_gate_chunk_varlen(
     if safe_gate:
         g = g.clamp(-5, 0)
 
-    beta = torch.randn(1, T, H, dtype=torch.float32).sigmoid()
+    beta = torch.randn(1, T, H, dtype=torch.float32).sigmoid().to(beta_dtype)
     h0 = torch.randn((N, H, D, D), dtype=torch.float32)
     # NOTE: for inference scenarios, we only use transposed state layout for better decoding performance
     h0_vk = h0.transpose(-1, -2).contiguous()
