@@ -10,7 +10,7 @@
 
 ## 🚀 Pull Request Checklist
 
-Thank you for contributing to FlashInfer! Before we review your pull request, please make sure the following items are complete.
+Thank you for contributing to cuLA! Before we review your pull request, please make sure the following items are complete.
 
 ### ✅ Pre-commit Checks
 
