@@ -49,6 +49,7 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     static constexpr int StagesQ = 1;
 
     static constexpr bool StoreQG = StoreQG_;
+    using ElementBeta = ElementBeta_;
 
     // TODO: double buffer for TMEM acc
     enum class TmemAllocation : uint32_t {
@@ -1008,7 +1009,7 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
             if (thread_idx < TileT) {
                 float beta_val =
                     (thread_idx < sub_seq_len)
-                        ? float(reinterpret_cast<ElementBeta_*>(
+                        ? float(reinterpret_cast<ElementBeta*>(
                               params.beta_ptr)[(token_offset + tile_idx * TileT + thread_idx) * params.h + head_idx])
                         : float(0);
                 shared_plan->beta_smem[beta_pipe_state_write.index()][thread_idx] = beta_val;

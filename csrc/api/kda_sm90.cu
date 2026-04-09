@@ -89,8 +89,10 @@ kda_fwd_prefill(
     }
     if (beta_.has_value()) {
         auto& beta = beta_.value();
-        TORCH_CHECK(beta.dtype() == torch::kFloat32 || beta.dtype() == torch::kBFloat16,
-                    "beta must be float32 or bfloat16, got ", beta.dtype());
+        TORCH_CHECK(
+            beta.dtype() == torch::kFloat32 || beta.dtype() == torch::kBFloat16,
+            "beta must be float32 or bfloat16, got ",
+            beta.dtype());
         TORCH_CHECK(beta.is_contiguous(), "beta must be contiguous");
         TORCH_CHECK(
             beta.size(0) == packed_seq && beta.size(1) == num_heads, "beta shape must be [packed_seq, num_heads]");

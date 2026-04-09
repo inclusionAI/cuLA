@@ -44,7 +44,11 @@ struct KdaChunkFwdIntraSm100NamedBarriers {
 // constants, and the persistent loop bodies for each warp role.
 // The Kernel struct is templated on this Mainloop.
 // ===================================================================
-template <bool UseTF32Inverse_ = true, bool RoundingTF32_ = false, bool UnifiedGRef_ = false, typename ElementBeta_ = float>
+template <
+    bool UseTF32Inverse_ = true,
+    bool RoundingTF32_ = false,
+    bool UnifiedGRef_ = false,
+    typename ElementBeta_ = float>
 struct KdaChunkFwdIntraMainloopSm100 {
     // ===================== Tile / Buffer Constants =====================
     static constexpr int SubTileT = 16;
@@ -72,6 +76,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
     // This makes inter and intra A-matrices identical, allowing the intra A-matrix to be skipped entirely.
     // Saves 50% of A-matrix exp2f computation and one TMEM store per k-iteration.
     static constexpr bool UnifiedGRef = UnifiedGRef_;
+    using ElementBeta = ElementBeta_;
 
     // double buffer in TMEM, overlap prologue A matrix with MMA
     enum class TmemAllocation : uint32_t {
@@ -890,7 +895,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
             if (thread_idx < TileT) {
                 shared_plan->beta_smem[beta_pipe_state_write.index()][thread_idx] =
                     (thread_idx < sub_seq_len)
-                        ? float(reinterpret_cast<ElementBeta_*>(
+                        ? float(reinterpret_cast<ElementBeta*>(
                               params.beta_ptr)[(token_offset + tile_idx * TileT + thread_idx) * params.h + head_idx])
                         : float(0);
             }
