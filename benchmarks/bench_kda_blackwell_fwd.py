@@ -68,7 +68,10 @@ _major, _minor = get_device_sm_version(_device)
 _SM_TAG = f"sm{_major}{_minor}"
 
 if _major < 10:
-    print(f"[WARNING] This benchmark is designed for SM100 (Blackwell). Current GPU: {_SM_TAG}")
+    raise RuntimeError(
+        f"This benchmark requires an SM100/SM10x (Blackwell) GPU because it calls "
+        f"flash_kda_prefill(), which only supports Blackwell. Current GPU: {_SM_TAG}"
+    )
 
 # ============================================================
 # Constants
@@ -352,9 +355,7 @@ def print_report(fixed_results, varlen_results):
 # Main
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(
-        description="bench_kda_blackwell_fwd: Blackwell fully-fused KDA forward vs FLA Triton"
-    )
+    parser = argparse.ArgumentParser(description="bench_kda_blackwell_fwd: Blackwell fully-fused KDA forward vs FLA Triton")
     parser.add_argument(
         "--mode",
         type=str,
