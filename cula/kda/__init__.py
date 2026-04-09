@@ -1,24 +1,45 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
 
-from cula.kda.chunk import chunk_kda
-from cula.kda.hopper_fused_fwd import cula_kda_prefill as kda_prefill_hopper
-from cula.ops.kda_decode import fused_sigmoid_gating_delta_rule_update, kda_decode
+import importlib
 
-__all__ = [
-    "chunk_kda",
-    "kda_decode",
-    "fused_sigmoid_gating_delta_rule_update",
-    "kda_prefill_hopper",
-]
+_PUBLIC_API = {
+    "chunk_kda": "cula.kda.chunk",
+    "kda_prefill_hopper": "cula.kda.hopper_fused_fwd",
+    "kda_decode": "cula.ops.kda_decode",
+    "fused_sigmoid_gating_delta_rule_update": "cula.ops.kda_decode",
+}
+
+# Reverse map: module -> list of (attr, public_name)
+_MODULE_ATTRS = {
+    "cula.kda.chunk": [("chunk_kda", "chunk_kda")],
+    "cula.kda.hopper_fused_fwd": [("cula_kda_prefill", "kda_prefill_hopper")],
+    "cula.ops.kda_decode": [
+        ("kda_decode", "kda_decode"),
+        ("fused_sigmoid_gating_delta_rule_update", "fused_sigmoid_gating_delta_rule_update"),
+    ],
+}
+
+
+def __getattr__(name: str):
+    """Lazy-load kda submodules only when accessed."""
+    if name in _PUBLIC_API:
+        module_path = _PUBLIC_API[name]
+        try:
+            mod = importlib.import_module(module_path)
+        except ImportError:
+            raise ImportError(
+                f"cula.kda requires flash-linear-attention. "
+                f"Install with: pip install cuda-linear-attention[fla]"
+            ) from None
+        # Get the actual attribute name in the module
+        for mod_path, attrs in _MODULE_ATTRS.items():
+            if mod_path == module_path:
+                for attr_name, public_name in attrs:
+                    if public_name == name:
+                        return getattr(mod, attr_name)
+        return getattr(mod, name)
+    raise AttributeError(f"module 'cula.kda' has no attribute {name!r}")
+
+
+__all__ = list(_PUBLIC_API.keys())

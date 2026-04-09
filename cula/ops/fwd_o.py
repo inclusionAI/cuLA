@@ -77,9 +77,7 @@ import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Float32, Int32, Int64
-from fla.ops.utils import prepare_chunk_indices
-
-from cula.utils import USE_FAST_MATH, assert_blackwell
+from cula.utils import USE_FAST_MATH, assert_blackwell, prepare_chunk_indices
 
 PRINT_DEBUG = False
 PRINT_SMEM_DEBUG = False  # Print SMEM contents after TMA loads for non-aligned varlen debug
