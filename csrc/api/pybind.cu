@@ -65,6 +65,21 @@ kda_fwd_prefill(
     torch::Tensor workspace_buffer,
     float scale,
     bool safe_gate);
+
+std::tuple<torch::Tensor, torch::Tensor>
+gdn_fwd_prefill(
+    std::optional<torch::Tensor> output_,
+    std::optional<torch::Tensor> output_state_,
+    torch::Tensor const& q,
+    torch::Tensor const& k,
+    torch::Tensor const& v,
+    std::optional<torch::Tensor> input_state_,
+    std::optional<torch::Tensor> alpha_,
+    std::optional<torch::Tensor> beta_,
+    torch::Tensor const& cu_seqlens,
+    torch::Tensor workspace_buffer,
+    float scale,
+    bool safe_gate);
 #endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -75,5 +90,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #endif
 #if defined(CULA_SM90A_ENABLED)
     m.def("kda_fwd_prefill", &kda_fwd_prefill);
+    m.def("gdn_fwd_prefill", &gdn_fwd_prefill);
 #endif
 }
