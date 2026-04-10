@@ -37,7 +37,8 @@ template <
     typename ArchTag,
     typename TO,
     typename TQKV,
-    typename TState>
+    typename TState,
+    typename TBeta = float>
 void
 launch_kda_fwd_prefill_kernel_gbai(
     cudaStream_t stream,
@@ -48,7 +49,7 @@ launch_kda_fwd_prefill_kernel_gbai(
     TQKV const* v,
     TState const* input_state,
     float const* alpha,
-    float const* beta,
+    TBeta const* beta,
     int32_t const* cu_seqlens,
     uint8_t* workspace_buffer,
     int32_t num_seqs,
@@ -77,14 +78,16 @@ launch_kda_fwd_prefill_kernel_gbai(
         using NeedsAlphaType = std::conditional_t<NeedsAlpha, cute::true_type, cute::false_type>;
         using InitStateType = std::conditional_t<InitStateFromInput, cute::true_type, cute::false_type>;
         using Options = decltype(add_option(
-            Option<Tag::kSafeGate, SafeGateType>{},
+            Option<Tag::kElementBetaGmem, TBeta>{},
             add_option(
-                Option<Tag::kInitStateFromInput, InitStateType>{},
+                Option<Tag::kSafeGate, SafeGateType>{},
                 add_option(
-                    Option<Tag::kNeedsAlpha, NeedsAlphaType>{},
+                    Option<Tag::kInitStateFromInput, InitStateType>{},
                     add_option(
-                        Option<Tag::kNeedsBeta, NeedsBetaType>{},
-                        add_option(Option<Tag::kIsDeltaRule, cute::true_type>{}, DefaultOptions{}))))));
+                        Option<Tag::kNeedsAlpha, NeedsAlphaType>{},
+                        add_option(
+                            Option<Tag::kNeedsBeta, NeedsBetaType>{},
+                            add_option(Option<Tag::kIsDeltaRule, cute::true_type>{}, DefaultOptions{})))))));
 
         using TileShape = Shape<_64, _64, _128>;
         using Scheduler = cutlass::gemm::KernelTmaWarpSpecializedCooperative;

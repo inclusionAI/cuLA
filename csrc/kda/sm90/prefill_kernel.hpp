@@ -24,7 +24,8 @@ template <
     typename ArchTag,  // TODO: hide this
     typename TO,
     typename TQKV,
-    typename TState>
+    typename TState,
+    typename TBeta = float>
 void
 launch_kda_fwd_prefill_kernel(
     cudaStream_t stream,
@@ -35,7 +36,7 @@ launch_kda_fwd_prefill_kernel(
     TQKV const* v,
     TState const* input_state,
     float const* alpha,
-    float const* beta,
+    TBeta const* beta,
     int32_t const* cu_seqlens,
     uint8_t* workspace_buffer,
     int32_t num_seqs,

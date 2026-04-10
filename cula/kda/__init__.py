@@ -14,8 +14,10 @@
 
 from cula.kda.chunk import chunk_kda
 from cula.kda.hopper_fused_fwd import cula_kda_prefill as kda_prefill_hopper
+from cula.kda.kda_decode import kda_decode
 
 __all__ = [
     "chunk_kda",
+    "kda_decode",
     "kda_prefill_hopper",
 ]

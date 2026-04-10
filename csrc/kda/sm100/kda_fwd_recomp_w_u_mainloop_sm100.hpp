@@ -18,6 +18,7 @@ namespace kda::sm100 {
 
 using cutlass::arch::fence_view_async_shared;
 using ku::bf16;
+using ku::bf16x8;
 using ku::float2_mul;
 using ku::nvbf16x4;
 using ku::store_256b;
@@ -34,6 +35,7 @@ struct KdaChunkFwdRecompWUSm100NamedBarriers {
 // constants, and the persistent loop bodies for each warp role.
 // The Kernel struct is templated on this Mainloop.
 // ===================================================================
+template <bool StoreQG_ = false, typename ElementBeta_ = float>
 struct KdaChunkFwdRecompWUMainloopSm100 {
     // ===================== Tile / Buffer Constants =====================
     static constexpr int TileT = 64;
@@ -44,6 +46,9 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     static constexpr int StagesLoadStore = 2;  // increase to 2, greater perf
     static constexpr int StagesA = 2;          // increase to 2, greater perf
     static constexpr int StagesMma = 1;
+    static constexpr int StagesQ = 1;
+
+    static constexpr bool StoreQG = StoreQG_;
 
     // TODO: double buffer for TMEM acc
     enum class TmemAllocation : uint32_t {
@@ -93,8 +98,12 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     using PipelineA = cutlass::PipelineTmaAsync<StagesA>;
     // TMA load -> Compute (merged prologue+epilogue)
     using PipelineV = cutlass::PipelineTmaAsync<StagesLoadStore>;
-    // TMA load -> Compute (merged K+G, two TMA copies share one barrier)
-    using PipelineKG = cutlass::PipelineTmaAsync<StagesLoadStore>;
+    // TMA load -> Compute (K)
+    using PipelineK = cutlass::PipelineTmaAsync<StagesLoadStore>;
+    // TMA load -> Compute (G)
+    using PipelineG = cutlass::PipelineTmaAsync<StagesLoadStore>;
+    // TMA load -> Compute (Q, only used when StoreQG=true)
+    using PipelineQ = cutlass::PipelineTmaAsync<StagesQ>;
     // Aux load -> Compute
     using PipelineBeta = cutlass::PipelineAsync<StagesA>;
 
@@ -118,10 +127,11 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     static constexpr int NumPrologueThreads = cutlass::NumThreadsPerWarpGroup;   // 128 threads (WG0, warp 0-3)
     static constexpr int NumEpilogueThreads = cutlass::NumThreadsPerWarpGroup;   // 128 threads (WG1, warp 4-7)
     static_assert(
-        NumEpilogueThreads % kGmemThreadsPerRow == 0, "NumEpilogueThreads must be a multiple of kGmemThreadsPerRow");
-    // Layout of Epilogue threads for GMEM store, named GmemLayoutAtom
+        cutlass::NumThreadsPerWarpGroup % kGmemThreadsPerRow == 0,
+        "Store thread counts must be a multiple of kGmemThreadsPerRow");
+    // Layout of Prologue threads for GMEM store, named GmemLayoutAtom
     using GmemLayoutAtom = Layout<
-        Shape<Int<NumEpilogueThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
+        Shape<Int<cutlass::NumThreadsPerWarpGroup / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
         Stride<Int<kGmemThreadsPerRow>, _1>>;
     using GmemTileCopyAtomO = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
     using GmemTiledCopyO = decltype(make_tiled_copy(
@@ -139,6 +149,13 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     using CopyR2SAtom = Copy_Atom<SM90_U32x4_STSM_N, Element>;
 
     // ===================== Shared Memory Plan =====================
+    // Helper: conditionally include Q SMEM buffer (only when StoreQG=true)
+    struct QSmemBufferEnabled {
+        array_aligned<bf16, cosize_v<SmemLayoutInputBF16>> q[StagesQ];
+    };
+    struct QSmemBufferDisabled {};  // empty, zero-cost
+    using QSmemBuffer = cute::conditional_t<StoreQG, QSmemBufferEnabled, QSmemBufferDisabled>;
+
     struct SharedMemoryPlan {
         // Akk, single buffer
         array_aligned<bf16, cosize_v<SmemLayoutInputAkkBF16>> akk[StagesA];  // 16KB
@@ -146,6 +163,8 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         array_aligned<bf16, cosize_v<SmemLayoutInputBF16>> k[StagesLoadStore];   // 32KB
         array_aligned<bf16, cosize_v<SmemLayoutInputBF16>> v[StagesLoadStore];   // 32KB
         array_aligned<float, cosize_v<SmemLayoutInputFP32>> g[StagesLoadStore];  // 64KB
+        // Q double buffer (only present when StoreQG=true)
+        QSmemBuffer q_buf;
         // MMA B-operand staging: K_proc/V_proc after prologue, [N=TileK, K=TileT] MN-major, double buffer
         array_aligned<bf16, cosize_v<SmemLayoutMatBBF16>> k_mma[StagesMma];  // 16KB
         array_aligned<bf16, cosize_v<SmemLayoutMatBBF16>> v_mma[StagesMma];  // 16KB
@@ -157,15 +176,24 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
 
         // Pipeline shared storage
         alignas(16) typename PipelineA::SharedStorage pipe_a_storage;
-        alignas(16) typename PipelineKG::SharedStorage pipe_kg_storage;
+        alignas(16) typename PipelineK::SharedStorage pipe_k_storage;
+        alignas(16) typename PipelineG::SharedStorage pipe_g_storage;
         alignas(16) typename PipelineV::SharedStorage pipe_v_storage;
+        alignas(16) typename PipelineQ::SharedStorage pipe_q_storage;  // Only meaningful when StoreQG=true
         alignas(16) typename PipelineBeta::SharedStorage pipe_beta_storage;
         alignas(16) typename PipelinePrologueReady::SharedStorage pipe_prologue_ready_storage;
         alignas(16) typename PipelineAccDone::SharedStorage pipe_acc_done_storage;
     };
 
     // ===================== TMA Params =====================
-    template <typename ShapeKVG, typename ShapeAkk, typename TMA_V, typename TMA_K, typename TMA_G, typename TMA_Akk>
+    template <
+        typename ShapeKVG,
+        typename ShapeAkk,
+        typename TMA_V,
+        typename TMA_K,
+        typename TMA_G,
+        typename TMA_Akk,
+        typename TMA_Q = int>
     struct TmaParams {
         ShapeKVG shape_kvg;
         ShapeAkk shape_Akk;
@@ -173,19 +201,22 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         TMA_K tma_k;
         TMA_G tma_g;
         TMA_Akk tma_akk;
+        TMA_Q tma_q{};  // Only meaningful when StoreQG=true; default-initialized
     };
 
     // ===================== Pipeline State Types =====================
     using PipelineStateA = cutlass::PipelineState<PipelineA::Stages>;
-    using PipelineStateKG = cutlass::PipelineState<PipelineKG::Stages>;
+    using PipelineStateK = cutlass::PipelineState<PipelineK::Stages>;
+    using PipelineStateG = cutlass::PipelineState<PipelineG::Stages>;
     using PipelineStateV = cutlass::PipelineState<PipelineV::Stages>;
+    using PipelineStateQ = cutlass::PipelineState<PipelineQ::Stages>;
     using PipelineStateBeta = cutlass::PipelineState<PipelineBeta::Stages>;
     using PipelineStatePrologueReady = cutlass::PipelineState<PipelinePrologueReady::Stages>;
     using PipelineStateAccDone = cutlass::PipelineState<PipelineAccDone::Stages>;
 
     // ===================================================================
     // WG0: Prologue persistent loop (warp 0-3, 128 threads, 1 WG)
-    // Element-wise K_proc/V_proc computation → signal MMA
+    // Element-wise K_proc computation → co-signal MMA (with Epilogue), then KG output → GMEM
     // ===================================================================
     template <typename TmaParamsT>
     CUTLASS_DEVICE void
@@ -194,15 +225,18 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         const TmaParamsT& tma_params,
         SharedMemoryPlan* shared_plan,
         TileScheduler& tile_scheduler,
-        // TMA pipelines (consumer): KG (merged K+G), V
-        PipelineKG& kg_pipeline,
-        PipelineStateKG& kg_pipe_state_read,
-        PipelineV& v_pipeline,
-        PipelineStateV& v_pipe_state_read,
+        // TMA pipelines (consumer): K, G (separate pipelines)
+        PipelineK& k_pipeline,
+        PipelineStateK& k_pipe_state_read,
+        PipelineG& g_pipeline,
+        PipelineStateG& g_pipe_state_read,
         // Beta pipeline (consumer, 1×/WU)
         PipelineBeta& beta_pipeline,
         PipelineStateBeta& beta_pipe_state_read,
-        // Prologue -> MMA pipeline (producer, used for both K and V sequentially)
+        // TMA pipeline (consumer): Q (only used when StoreQG=true)
+        PipelineQ& q_pipeline,
+        PipelineStateQ& q_pipe_state_read,
+        // Prologue -> MMA pipeline (co-producer with Epilogue)
         PipelinePrologueReady& prologue_ready_pipeline,
         PipelineStatePrologueReady& prologue_ready_pipe_state_write) {
         // === PERSISTENT PROLOGUE LOOP (WG0, 128 threads) ===
@@ -210,190 +244,9 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         int* chunk_indices_ptr = (int*)params.chunk_indices_ptr;
         int* cu_seqlens_ptr = (int*)params.cu_seqlens_ptr;
 
-        CUTE_NO_UNROLL
-        for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
-            int tid = tile_scheduler.get_current_tile_id();
-            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
-            int batch_idx = get<0>(blk_coord);
-            int head_idx = get<1>(blk_coord);
-            int tile_idx = get<2>(blk_coord);
-            int seq_len = cu_seqlens_ptr[batch_idx + 1] - cu_seqlens_ptr[batch_idx];
-            int sub_seq_len = min(TileT, seq_len - tile_idx * TileT);
-
-            // ============================================================
-            // Once per WU: Wait for beta
-            // ============================================================
-            beta_pipeline.consumer_wait(beta_pipe_state_read);
-            fence_view_async_shared();
-
-            // ============================================================
-            // Per i_k iteration: K_proc, V_proc element-wise → signal MMA
-            // ============================================================
-            CUTE_NO_UNROLL
-            for (int i_k = 0; i_k < NumKIters; ++i_k) {
-                // Wait for K, V, G data from TMA Load warp
-                kg_pipeline.consumer_wait(kg_pipe_state_read);
-
-                Tensor sK = make_tensor(
-                    make_smem_ptr(shared_plan->k[kg_pipe_state_read.index()].data()), SmemLayoutInputBF16{});
-                Tensor sG = make_tensor(
-                    make_smem_ptr(shared_plan->g[kg_pipe_state_read.index()].data()), SmemLayoutInputFP32{});
-
-                // ---- K_proc: K * beta * exp2(G) → R2S → k_mma ----
-                prologue_ready_pipeline.producer_acquire(prologue_ready_pipe_state_write);
-                int buf_idx = prologue_ready_pipe_state_write.index();
-                Tensor sK_dst = make_tensor(make_smem_ptr(shared_plan->k_mma[buf_idx].data()), SmemLayoutMatBBF16{});
-                {
-                    // 128 threads cooperate using setup_kg-style thread mapping:
-                    //   x_local = idx_in_wg / 8  → row within 16-row group (0..15)
-                    //   y_base  = idx_in_wg % 8 * 4 → column group base (0,4,..,28)
-                    // Each thread processes float4 (4 floats) + nvbf16x4 (4 bf16) per iteration.
-                    // Nested loops over t_iter (row tiles: 0,16,32,48) and y_iter (col chunks: 0,32,64,96)
-                    // cover the full [TileT=64, TileK=128] tile.
-                    int x_local = idx_in_wg / 8;     // 0..15
-                    int y_base = idx_in_wg % 8 * 4;  // 0,4,8,...,28
-
-#pragma unroll
-                    for (int t_iter = 0; t_iter < TileT; t_iter += 16) {
-                        int t = x_local + t_iter;
-                        float beta_val = shared_plan->beta_smem[beta_pipe_state_read.index()][t];
-                        float2 beta2 = {beta_val, beta_val};
-
-#pragma unroll
-                        for (int y_iter = 0; y_iter < TileK; y_iter += 32) {
-                            int y = y_base + y_iter;
-                            if (t < sub_seq_len) {
-                                float4 g = *reinterpret_cast<float4*>(&sG(t, y));
-                                nvbf16x4 k = *reinterpret_cast<nvbf16x4*>(&sK(t, y));
-                                float2 kf_a = __bfloat1622float2(k.a);
-                                float2 kf_b = __bfloat1622float2(k.b);
-                                float2 g_a = {exp2f(g.x), exp2f(g.y)};
-                                float2 g_b = {exp2f(g.z), exp2f(g.w)};
-                                float2 res_a = float2_mul(float2_mul(kf_a, beta2), g_a);
-                                float2 res_b = float2_mul(float2_mul(kf_b, beta2), g_b);
-                                nvbf16x4 out;
-                                out.a = __float22bfloat162_rn(res_a);
-                                out.b = __float22bfloat162_rn(res_b);
-                                *reinterpret_cast<nvbf16x4*>(&sK_dst(y, t)) = out;
-                            } else {
-                                nvbf16x4 zero;
-                                zero.a = __float2bfloat162_rn(0.0f);
-                                zero.b = __float2bfloat162_rn(0.0f);
-                                *reinterpret_cast<nvbf16x4*>(&sK_dst(y, t)) = zero;
-                            }
-                        }
-                    }
-                }
-
-                v_pipeline.consumer_wait(v_pipe_state_read);
-                Tensor sV =
-                    make_tensor(make_smem_ptr(shared_plan->v[v_pipe_state_read.index()].data()), SmemLayoutInputBF16{});
-                // ---- V_proc: V * beta → R2S → v_mma ----
-                Tensor sV_dst = make_tensor(make_smem_ptr(shared_plan->v_mma[buf_idx].data()), SmemLayoutMatBBF16{});
-                {
-                    // Same thread mapping as K_proc:
-                    //   x_local = idx_in_wg / 8  → row within 16-row group (0..15)
-                    //   y_base  = idx_in_wg % 8 * 4 → column group base (0,4,..,28)
-                    int x_local = idx_in_wg / 8;
-                    int y_base = idx_in_wg % 8 * 4;
-
-#pragma unroll
-                    for (int t_iter = 0; t_iter < TileT; t_iter += 16) {
-                        int t = x_local + t_iter;
-                        float beta_val = shared_plan->beta_smem[beta_pipe_state_read.index()][t];
-                        float2 beta2 = {beta_val, beta_val};
-
-#pragma unroll
-                        for (int y_iter = 0; y_iter < TileK; y_iter += 32) {
-                            int y = y_base + y_iter;
-                            if (t < sub_seq_len) {
-                                nvbf16x4 v = *reinterpret_cast<nvbf16x4*>(&sV(t, y));
-                                float2 vf_a = __bfloat1622float2(v.a);
-                                float2 vf_b = __bfloat1622float2(v.b);
-                                float2 res_a = float2_mul(vf_a, beta2);
-                                float2 res_b = float2_mul(vf_b, beta2);
-                                nvbf16x4 out;
-                                out.a = __float22bfloat162_rn(res_a);
-                                out.b = __float22bfloat162_rn(res_b);
-                                *reinterpret_cast<nvbf16x4*>(&sV_dst(y, t)) = out;
-                            } else {
-                                nvbf16x4 zero;
-                                zero.a = __float2bfloat162_rn(0.0f);
-                                zero.b = __float2bfloat162_rn(0.0f);
-                                *reinterpret_cast<nvbf16x4*>(&sV_dst(y, t)) = zero;
-                            }
-                        }
-                    }
-                }
-
-                // Tensor sK_dst_kmajor = make_tensor(make_smem_ptr(shared_plan->k_mma[buf_idx].data()),
-                // SmemLayoutInputBF16{});
-                // =====DEBUG=======
-                // cutlass::arch::NamedBarrier::arrive_and_wait(NumPrologueThreads,
-                // KdaChunkFwdRecompWUSm100NamedBarriers::PrologueCudaCore); if (idx_in_wg == 0) {
-                //     printf("sK_dst\n");
-                //     cute::print_tensor(sK_dst);
-                //     printf("sK_dst_kmajor\n");
-                //     cute::print_tensor(sK_dst_kmajor);
-                // }
-
-                fence_view_async_shared();
-                prologue_ready_pipeline.producer_commit(prologue_ready_pipe_state_write);
-                ++prologue_ready_pipe_state_write;
-
-                kg_pipeline.consumer_release(kg_pipe_state_read);
-                ++kg_pipe_state_read;
-                // TODO: add store QG for disable_recompute=true
-                // Release V, KG SMEM back to Load warp (prologue is done with them)
-                v_pipeline.consumer_release(v_pipe_state_read);
-                ++v_pipe_state_read;
-            }
-
-            // Release beta at end of WU
-            beta_pipeline.consumer_release(beta_pipe_state_read);
-            ++beta_pipe_state_read;
-        }
-    }
-
-    // ===================================================================
-    // WG1: Epilogue persistent loop (warp 4-7, 128 threads, 1 WG)
-    // kg element-wise + MMA result store (w, u) → GMEM
-    // ===================================================================
-    template <typename TmaParamsT>
-    CUTLASS_DEVICE void
-    epilogue_loop(
-        const KDA_fwd_recomp_w_u_params& params,
-        const TmaParamsT& tma_params,
-        SharedMemoryPlan* shared_plan,
-        TileScheduler& tile_scheduler,
-        // TMA pipeline (consumer): KG (merged K+G, for kg computation)
-        PipelineKG& kg_pipeline,
-        PipelineStateKG& kg_pipe_state_read,
-        // MMA -> Epilogue pipeline (consumer, used for both W and U sequentially)
-        PipelineAccDone& acc_done_pipeline,
-        PipelineStateAccDone& acc_done_pipe_state_read) {
-        // === PERSISTENT EPILOGUE LOOP (WG1, 128 threads) ===
-        // idx_in_wg: 0..127 within this warp group
-        int idx_in_wg = threadIdx.x % NumEpilogueThreads;  // 0..127
-        int* chunk_indices_ptr = (int*)params.chunk_indices_ptr;
-        int* cu_seqlens_ptr = (int*)params.cu_seqlens_ptr;
-
-        // Setup autovec GMEM store tiled copy (for epilogue S2G)
+        // Setup autovec GMEM store tiled copy (for KG S2G)
         GmemTiledCopyO gmem_tiled_copy_O;
         auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(idx_in_wg);
-
-        // S2R & R2S exp(g_last-g)*k
-        auto tiledmma_s2r = TiledMma_S2R{};
-        auto thr_mma_s2r = tiledmma_s2r.get_thread_slice(idx_in_wg);
-        auto tiled_load_k = make_tiled_copy_A(CopyS2RAtom{}, thr_mma_s2r);
-        auto thr_load_k = tiled_load_k.get_thread_slice(idx_in_wg);
-        auto tiled_load_g = make_tiled_copy_A(CopyGAtom{}, thr_mma_s2r);
-        auto thr_load_g = tiled_load_g.get_thread_slice(idx_in_wg);
-        auto tiled_store_k = make_tiled_copy_A(CopyR2SAtom{}, thr_mma_s2r);
-        auto thr_store_k = tiled_store_k.get_thread_slice(idx_in_wg);
-
-        auto cMk = make_identity_tensor(select<0, 2>(TileShape_S2R{}));
-        auto tKcMk = thr_mma_s2r.partition_A(cMk);
 
         CUTE_NO_UNROLL
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
@@ -407,111 +260,466 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
             int sub_seq_len = min(TileT, seq_len - tile_idx * TileT);
             int token_offset_cur = token_offset + tile_idx * TileT;
 
-            // GMEM output tensors (sliced by head)
-            Tensor mKg = make_tensor(
-                make_gmem_ptr(reinterpret_cast<Element*>(params.kg_out_ptr)),
-                make_layout(params.shape_wukg, params.stride_wukg))(_, _, head_idx);
-            Tensor mW = make_tensor(
-                make_gmem_ptr(reinterpret_cast<Element*>(params.w_out_ptr)),
-                make_layout(params.shape_wukg, params.stride_wukg))(_, _, head_idx);
-            Tensor mU = make_tensor(
-                make_gmem_ptr(reinterpret_cast<Element*>(params.u_out_ptr)),
-                make_layout(params.shape_wukg, params.stride_wukg))(_, _, head_idx);
+            // ============================================================
+            // Once per WU: Wait for beta
+            // ============================================================
+            beta_pipeline.consumer_wait(beta_pipe_state_read);
+            fence_view_async_shared();
 
             // ============================================================
-            // Per i_k iteration: kg compute, then wait w/u from MMA
+            // Per i_k iteration: K_proc element-wise → co-signal MMA, then KG → GMEM
             // ============================================================
             CUTE_NO_UNROLL
             for (int i_k = 0; i_k < NumKIters; ++i_k) {
-                // Wait for K, G data from TMA Load warp (needed for kg)
-                kg_pipeline.consumer_wait(kg_pipe_state_read);
-                int buf_idx = kg_pipe_state_read.index();
+                // Wait for K data from TMA Load warp
+                k_pipeline.consumer_wait(k_pipe_state_read);
 
-                Tensor sK = make_tensor(make_smem_ptr(shared_plan->k[buf_idx].data()), SmemLayoutInputBF16{});
-                Tensor sG = make_tensor(make_smem_ptr(shared_plan->g[buf_idx].data()), SmemLayoutInputFP32{});
+                Tensor sK =
+                    make_tensor(make_smem_ptr(shared_plan->k[k_pipe_state_read.index()].data()), SmemLayoutInputBF16{});
 
-                // ---- kg output: kg = K * exp2(g_last - G) ----
-                Tensor sO = make_tensor(make_smem_ptr(shared_plan->out[0].data()), SmemLayoutOutputBF16{});
-                // Ensure all 128 epilogue threads have finished writing sO
-                cutlass::arch::NamedBarrier::arrive_and_wait(
-                    NumEpilogueThreads, KdaChunkFwdRecompWUSm100NamedBarriers::EpilogueCudaCore);
-                {
-                    auto tKrK = thr_mma_s2r.partition_fragment_A(sK);
-                    // S2R g, compute g'=exp2(g_last - g)
-                    auto tKrG = make_fragment_like<float>(tKrK);
-                    auto tKsG = thr_mma_s2r.partition_A(sG);
-                    copy(CopyGAtom{}, tKsG, tKrG);
+                Tensor sKG_out = make_tensor(make_smem_ptr(shared_plan->out[0].data()), SmemLayoutOutputBF16{});
 
-                    for_each(make_int_sequence<size(tKcMk)>{}, [&](auto i) {
-                        auto coord = tKcMk(i);
-                        auto [s, t] = coord;
-                        auto g = tKrG(i);
-                        auto g_last = sG(sub_seq_len - 1, t);
-                        if (s < sub_seq_len) {
-                            tKrG(i) = exp2f(g_last - g);
-                        } else {
-                            tKrG(i) = 0.0f;
-                        }
-                    });
-                    // S2R k, compute kg = k*g'
-                    auto tKsK = thr_load_k.partition_S(sK);
-                    auto tKrK_cv = thr_load_k.retile_D(tKrK);
-                    copy(tiled_load_k, tKsK, tKrK_cv);
+                // ---- Step 1: Load K/G from SMEM to RMEM ----
+                // K uses 16x64 thread mapping with bf16x8 (128-bit) loads to reduce bank conflict and uncoalesced
+                // shared accesses:
+                //   x_local = idx_in_wg / 8  → row within 16-row group (0..15)
+                //   k_y_base = idx_in_wg % 8 * 8 → column group base (0,8,16,...,56)
+                //   Each thread loads bf16x8 (8 bf16 = 128 bits) per iteration.
+                //   Inner loop: TileK/64 = 2 column iterations (stride 64)
+                // G uses same 16x64 column mapping as K (k_y_base), but loads two float4 (lo+hi)
+                //   per iteration to keep K/G columns aligned for register-only computation.
+                int x_local = idx_in_wg / 8;       // 0..15
+                int k_y_base = idx_in_wg % 8 * 8;  // 0,8,16,...,56  (16x64 mapping)
 
-                    cute::transform(tKrK, tKrG, tKrK, [&](auto k, auto g) { return Element(float(k) * g); });
+                // K registers: [row_iters][col_iters], each bf16x8 = 8 bf16 = 128 bits
+                bf16x8 k_reg[TileT / 16][TileK / 64];
+                // G registers: [row_iters][col_iters][lo/hi], each float4 = 4 floats
+                // g_reg[ti][k_yi][0] = lo half (cols y..y+3), g_reg[ti][k_yi][1] = hi half (cols y+4..y+7)
+                float4 g_reg[TileT / 16][TileK / 64][2];
 
-                    // R2S kg
-                    auto tKsK_out = thr_store_k.partition_D(sO);
-                    auto tKrK_out_cv = thr_store_k.retile_S(tKrK);
-                    copy(tiled_store_k, tKrK_out_cv, tKsK_out);
-                }
-
-                // Ensure all 128 epilogue threads have finished writing sO
-                cutlass::arch::NamedBarrier::arrive_and_wait(
-                    NumEpilogueThreads, KdaChunkFwdRecompWUSm100NamedBarriers::EpilogueCudaCore);
-                // if (idx_in_wg == 0) {
-                //     printf("sO: exp(g_last-g)*K\n");
-                //     cute::print_tensor(sO);
-                // }
-                // cutlass::arch::NamedBarrier::arrive_and_wait(NumEpilogueThreads,
-                // KdaChunkFwdRecompWUSm100NamedBarriers::EpilogueCudaCore);
-
-                // S2G: sO → GMEM kg
-                Tensor gKg = local_tile(
-                    cute::domain_offset(make_coord(token_offset_cur, _0{}), mKg),
-                    Shape<Int<TileT>, Int<TileK>>{},
-                    make_coord(_0{}, _0{}));
-                Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
-                Tensor tOgKg = gmem_thr_copy_O.partition_D(gKg);
-                Tensor tOcO = gmem_thr_copy_O.partition_D(make_identity_tensor(Shape<Int<TileT>, Int<TileK>>{}));
-                Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOcO)));
+                // Load K with 16x64 mapping using bf16x8 (128-bit) loads
 #pragma unroll
-                for (int k = 0; k < size(tOpO); ++k) {
-                    tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < params.d;
+                for (int ti = 0; ti < TileT / 16; ++ti) {
+                    int t = x_local + ti * 16;
+#pragma unroll
+                    for (int k_yi = 0; k_yi < TileK / 64; ++k_yi) {
+                        int y = k_y_base + k_yi * 64;
+                        if (t < sub_seq_len) {
+                            k_reg[ti][k_yi] = *reinterpret_cast<bf16x8*>(&sK(t, y));
+                        } else {
+                            k_reg[ti][k_yi].a01 = __float2bfloat162_rn(0.0f);
+                            k_reg[ti][k_yi].a23 = __float2bfloat162_rn(0.0f);
+                            k_reg[ti][k_yi].a45 = __float2bfloat162_rn(0.0f);
+                            k_reg[ti][k_yi].a67 = __float2bfloat162_rn(0.0f);
+                        }
+                    }
                 }
-                ku::copy_pred<
-                    /*Is_even_MN=*/false,
-                    /*Is_even_K=*/false,
-                    /*Clear_OOB_MN=*/false,
-                    /*Clear_OOB_K=*/false>(gmem_tiled_copy_O, tOsO, tOgKg, tOcO, tOpO, sub_seq_len);
+                // Release K SMEM back to Load warp (done reading K)
+                k_pipeline.consumer_release(k_pipe_state_read);
+                ++k_pipe_state_read;
 
-                // Release KG SMEM after kg computation
-                // ---- w output: wait K-GEMM acc → T2R → bf16 → R2G ----
-                // ---- u output: wait V-GEMM acc → T2R → bf16 → R2G ----
-                kg_pipeline.consumer_release(kg_pipe_state_read);
-                ++kg_pipe_state_read;
+                g_pipeline.consumer_wait(g_pipe_state_read);
+                Tensor sG =
+                    make_tensor(make_smem_ptr(shared_plan->g[g_pipe_state_read.index()].data()), SmemLayoutInputFP32{});
+                // Load G with same 16x64 column mapping as K (two float4 per iteration)
+#pragma unroll
+                for (int ti = 0; ti < TileT / 16; ++ti) {
+                    int t = x_local + ti * 16;
+#pragma unroll
+                    for (int k_yi = 0; k_yi < TileK / 64; ++k_yi) {
+                        int y = k_y_base + k_yi * 64;
+                        if (t < sub_seq_len) {
+                            g_reg[ti][k_yi][0] = *reinterpret_cast<float4*>(&sG(t, y));
+                            g_reg[ti][k_yi][1] = *reinterpret_cast<float4*>(&sG(t, y + 4));
+                        } else {
+                            g_reg[ti][k_yi][0] = {0.0f, 0.0f, 0.0f, 0.0f};
+                            g_reg[ti][k_yi][1] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        }
+                    }
+                }
 
+                // ---- Step 2: Compute K_proc = K * beta * exp2(G) → write to k_mma (MN-major) → signal MMA ----
+                // Co-acquire prologue_ready with Epilogue (both WGs must acquire before MMA can consume)
+                // Deferred to here so that K/G SMEM→RMEM loads can overlap with MMA consuming previous k_mma
+                prologue_ready_pipeline.producer_acquire(prologue_ready_pipe_state_write);
+                int buf_idx = prologue_ready_pipe_state_write.index();
+                Tensor sK_dst = make_tensor(make_smem_ptr(shared_plan->k_mma[buf_idx].data()), SmemLayoutMatBBF16{});
+
+                // K and G registers are column-aligned; compute all 8 bf16 elements and store as bf16x8 (128-bit)
+                {
+#pragma unroll
+                    for (int ti = 0; ti < TileT / 16; ++ti) {
+                        int t = x_local + ti * 16;
+                        float beta_val = shared_plan->beta_smem[beta_pipe_state_read.index()][t];
+                        float2 beta2 = {beta_val, beta_val};
+
+#pragma unroll
+                        for (int k_yi = 0; k_yi < TileK / 64; ++k_yi) {
+                            int y = k_y_base + k_yi * 64;
+                            if (t < sub_seq_len) {
+                                // lo half (cols y..y+3): k_reg a01, a23 + g_reg lo
+                                float2 kf_01 = __bfloat1622float2(k_reg[ti][k_yi].a01);
+                                float2 kf_23 = __bfloat1622float2(k_reg[ti][k_yi].a23);
+                                float2 g_01 = {exp2f(g_reg[ti][k_yi][0].x), exp2f(g_reg[ti][k_yi][0].y)};
+                                float2 g_23 = {exp2f(g_reg[ti][k_yi][0].z), exp2f(g_reg[ti][k_yi][0].w)};
+                                float2 res_01 = float2_mul(float2_mul(kf_01, beta2), g_01);
+                                float2 res_23 = float2_mul(float2_mul(kf_23, beta2), g_23);
+                                // hi half (cols y+4..y+7): k_reg a45, a67 + g_reg hi
+                                float2 kf_45 = __bfloat1622float2(k_reg[ti][k_yi].a45);
+                                float2 kf_67 = __bfloat1622float2(k_reg[ti][k_yi].a67);
+                                float2 g_45 = {exp2f(g_reg[ti][k_yi][1].x), exp2f(g_reg[ti][k_yi][1].y)};
+                                float2 g_67 = {exp2f(g_reg[ti][k_yi][1].z), exp2f(g_reg[ti][k_yi][1].w)};
+                                float2 res_45 = float2_mul(float2_mul(kf_45, beta2), g_45);
+                                float2 res_67 = float2_mul(float2_mul(kf_67, beta2), g_67);
+                                // Single 128-bit store
+                                bf16x8 out;
+                                out.a01 = __float22bfloat162_rn(res_01);
+                                out.a23 = __float22bfloat162_rn(res_23);
+                                out.a45 = __float22bfloat162_rn(res_45);
+                                out.a67 = __float22bfloat162_rn(res_67);
+                                *reinterpret_cast<bf16x8*>(&sK_dst(y, t)) = out;
+                            } else {
+                                bf16x8 zero;
+                                zero.a01 = __float2bfloat162_rn(0.0f);
+                                zero.a23 = __float2bfloat162_rn(0.0f);
+                                zero.a45 = __float2bfloat162_rn(0.0f);
+                                zero.a67 = __float2bfloat162_rn(0.0f);
+                                *reinterpret_cast<bf16x8*>(&sK_dst(y, t)) = zero;
+                            }
+                        }
+                    }
+                }
+
+                fence_view_async_shared();
+                prologue_ready_pipeline.producer_commit(prologue_ready_pipe_state_write);
+                ++prologue_ready_pipe_state_write;
+
+                // ---- Step 3: Compute KG = K * exp2(g_last - G) → write to out (K-major) → store to GMEM ----
+                // Load g_last from SMEM into registers (only need last valid row)
+                float4 g_last_reg[TileK / 64][2];
+#pragma unroll
+                for (int k_yi = 0; k_yi < TileK / 64; ++k_yi) {
+                    int y = k_y_base + k_yi * 64;
+                    g_last_reg[k_yi][0] = *reinterpret_cast<float4*>(&sG(sub_seq_len - 1, y));
+                    g_last_reg[k_yi][1] = *reinterpret_cast<float4*>(&sG(sub_seq_len - 1, y + 4));
+                }
+
+                g_pipeline.consumer_release(g_pipe_state_read);
+                ++g_pipe_state_read;
+
+                // Need NamedBarrier to ensure all 128 prologue threads finish previous sKG_out writes
+                cutlass::arch::NamedBarrier::arrive_and_wait(
+                    NumPrologueThreads, KdaChunkFwdRecompWUSm100NamedBarriers::PrologueCudaCore);
+
+                // Compute KG using k_reg, g_reg, and g_last_reg (all from registers)
+                // Compute all 8 bf16 elements and store as bf16x8 (128-bit)
+#pragma unroll
+                for (int ti = 0; ti < TileT / 16; ++ti) {
+                    int t = x_local + ti * 16;
+#pragma unroll
+                    for (int k_yi = 0; k_yi < TileK / 64; ++k_yi) {
+                        int y = k_y_base + k_yi * 64;
+                        if (t < sub_seq_len) {
+                            // lo half (cols y..y+3): k_reg a01, a23
+                            float2 kf_01 = __bfloat1622float2(k_reg[ti][k_yi].a01);
+                            float2 kf_23 = __bfloat1622float2(k_reg[ti][k_yi].a23);
+                            float2 gd_01 = {
+                                exp2f(g_last_reg[k_yi][0].x - g_reg[ti][k_yi][0].x),
+                                exp2f(g_last_reg[k_yi][0].y - g_reg[ti][k_yi][0].y)};
+                            float2 gd_23 = {
+                                exp2f(g_last_reg[k_yi][0].z - g_reg[ti][k_yi][0].z),
+                                exp2f(g_last_reg[k_yi][0].w - g_reg[ti][k_yi][0].w)};
+                            float2 res_01 = float2_mul(kf_01, gd_01);
+                            float2 res_23 = float2_mul(kf_23, gd_23);
+                            // hi half (cols y+4..y+7): k_reg a45, a67
+                            float2 kf_45 = __bfloat1622float2(k_reg[ti][k_yi].a45);
+                            float2 kf_67 = __bfloat1622float2(k_reg[ti][k_yi].a67);
+                            float2 gd_45 = {
+                                exp2f(g_last_reg[k_yi][1].x - g_reg[ti][k_yi][1].x),
+                                exp2f(g_last_reg[k_yi][1].y - g_reg[ti][k_yi][1].y)};
+                            float2 gd_67 = {
+                                exp2f(g_last_reg[k_yi][1].z - g_reg[ti][k_yi][1].z),
+                                exp2f(g_last_reg[k_yi][1].w - g_reg[ti][k_yi][1].w)};
+                            float2 res_45 = float2_mul(kf_45, gd_45);
+                            float2 res_67 = float2_mul(kf_67, gd_67);
+                            // Single 128-bit store
+                            bf16x8 out;
+                            out.a01 = __float22bfloat162_rn(res_01);
+                            out.a23 = __float22bfloat162_rn(res_23);
+                            out.a45 = __float22bfloat162_rn(res_45);
+                            out.a67 = __float22bfloat162_rn(res_67);
+                            *reinterpret_cast<bf16x8*>(&sKG_out(t, y)) = out;
+                        } else {
+                            bf16x8 zero;
+                            zero.a01 = __float2bfloat162_rn(0.0f);
+                            zero.a23 = __float2bfloat162_rn(0.0f);
+                            zero.a45 = __float2bfloat162_rn(0.0f);
+                            zero.a67 = __float2bfloat162_rn(0.0f);
+                            *reinterpret_cast<bf16x8*>(&sKG_out(t, y)) = zero;
+                        }
+                    }
+                }
+
+                // Ensure all 128 prologue threads have finished writing sKG_out
+                cutlass::arch::NamedBarrier::arrive_and_wait(
+                    NumPrologueThreads, KdaChunkFwdRecompWUSm100NamedBarriers::PrologueCudaCore);
+
+                // S2G: sKG_out → GMEM kg via GmemTiledCopyO + copy_pred
+                {
+                    Tensor mKg = make_tensor(
+                        make_gmem_ptr(reinterpret_cast<Element*>(params.kg_out_ptr)),
+                        make_layout(params.shape_wukg, params.stride_wukg))(_, _, head_idx);
+                    Tensor gKg = local_tile(
+                        cute::domain_offset(make_coord(token_offset_cur, _0{}), mKg),
+                        Shape<Int<TileT>, Int<TileK>>{},
+                        make_coord(_0{}, _0{}));
+                    Tensor tOsO = gmem_thr_copy_O.partition_S(sKG_out);
+                    Tensor tOgKg = gmem_thr_copy_O.partition_D(gKg);
+                    Tensor tOcO = gmem_thr_copy_O.partition_D(make_identity_tensor(Shape<Int<TileT>, Int<TileK>>{}));
+                    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOcO)));
+#pragma unroll
+                    for (int k = 0; k < size(tOpO); ++k) {
+                        tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < params.d;
+                    }
+                    ku::copy_pred<
+                        /*Is_even_MN=*/false,
+                        /*Is_even_K=*/false,
+                        /*Clear_OOB_MN=*/false,
+                        /*Clear_OOB_K=*/false>(gmem_tiled_copy_O, tOsO, tOgKg, tOcO, tOpO, sub_seq_len);
+                }
+
+                // ---- Step 4 (StoreQG only): Compute QG = Q * exp2(G) → write to out → store to GMEM ----
+                if constexpr (StoreQG) {
+                    // Wait for Q data from TMA Load warp
+                    q_pipeline.consumer_wait(q_pipe_state_read);
+                    Tensor sQ = make_tensor(
+                        make_smem_ptr(shared_plan->q_buf.q[q_pipe_state_read.index()].data()), SmemLayoutInputBF16{});
+
+                    // Load Q with same 16x64 mapping as K
+                    bf16x8 q_reg[TileT / 16][TileK / 64];
+#pragma unroll
+                    for (int ti = 0; ti < TileT / 16; ++ti) {
+                        int t = x_local + ti * 16;
+#pragma unroll
+                        for (int k_yi = 0; k_yi < TileK / 64; ++k_yi) {
+                            int y = k_y_base + k_yi * 64;
+                            if (t < sub_seq_len) {
+                                q_reg[ti][k_yi] = *reinterpret_cast<bf16x8*>(&sQ(t, y));
+                            } else {
+                                q_reg[ti][k_yi].a01 = __float2bfloat162_rn(0.0f);
+                                q_reg[ti][k_yi].a23 = __float2bfloat162_rn(0.0f);
+                                q_reg[ti][k_yi].a45 = __float2bfloat162_rn(0.0f);
+                                q_reg[ti][k_yi].a67 = __float2bfloat162_rn(0.0f);
+                            }
+                        }
+                    }
+                    // Release Q SMEM back to Load warp
+                    q_pipeline.consumer_release(q_pipe_state_read);
+                    ++q_pipe_state_read;
+
+                    // Need NamedBarrier to ensure all 128 prologue threads finish previous sKG_out writes (from KG
+                    // store)
+                    cutlass::arch::NamedBarrier::arrive_and_wait(
+                        NumPrologueThreads, KdaChunkFwdRecompWUSm100NamedBarriers::PrologueCudaCore);
+
+                    // Compute QG = Q * exp2(G) and write to sKG_out (reuse output buffer)
+#pragma unroll
+                    for (int ti = 0; ti < TileT / 16; ++ti) {
+                        int t = x_local + ti * 16;
+#pragma unroll
+                        for (int k_yi = 0; k_yi < TileK / 64; ++k_yi) {
+                            int y = k_y_base + k_yi * 64;
+                            if (t < sub_seq_len) {
+                                // lo half (cols y..y+3)
+                                float2 qf_01 = __bfloat1622float2(q_reg[ti][k_yi].a01);
+                                float2 qf_23 = __bfloat1622float2(q_reg[ti][k_yi].a23);
+                                float2 g_01 = {exp2f(g_reg[ti][k_yi][0].x), exp2f(g_reg[ti][k_yi][0].y)};
+                                float2 g_23 = {exp2f(g_reg[ti][k_yi][0].z), exp2f(g_reg[ti][k_yi][0].w)};
+                                float2 res_01 = float2_mul(qf_01, g_01);
+                                float2 res_23 = float2_mul(qf_23, g_23);
+                                // hi half (cols y+4..y+7)
+                                float2 qf_45 = __bfloat1622float2(q_reg[ti][k_yi].a45);
+                                float2 qf_67 = __bfloat1622float2(q_reg[ti][k_yi].a67);
+                                float2 g_45 = {exp2f(g_reg[ti][k_yi][1].x), exp2f(g_reg[ti][k_yi][1].y)};
+                                float2 g_67 = {exp2f(g_reg[ti][k_yi][1].z), exp2f(g_reg[ti][k_yi][1].w)};
+                                float2 res_45 = float2_mul(qf_45, g_45);
+                                float2 res_67 = float2_mul(qf_67, g_67);
+                                // Single 128-bit store
+                                bf16x8 out;
+                                out.a01 = __float22bfloat162_rn(res_01);
+                                out.a23 = __float22bfloat162_rn(res_23);
+                                out.a45 = __float22bfloat162_rn(res_45);
+                                out.a67 = __float22bfloat162_rn(res_67);
+                                *reinterpret_cast<bf16x8*>(&sKG_out(t, y)) = out;
+                            } else {
+                                bf16x8 zero;
+                                zero.a01 = __float2bfloat162_rn(0.0f);
+                                zero.a23 = __float2bfloat162_rn(0.0f);
+                                zero.a45 = __float2bfloat162_rn(0.0f);
+                                zero.a67 = __float2bfloat162_rn(0.0f);
+                                *reinterpret_cast<bf16x8*>(&sKG_out(t, y)) = zero;
+                            }
+                        }
+                    }
+
+                    // Ensure all 128 prologue threads have finished writing QG to sKG_out
+                    cutlass::arch::NamedBarrier::arrive_and_wait(
+                        NumPrologueThreads, KdaChunkFwdRecompWUSm100NamedBarriers::PrologueCudaCore);
+
+                    // S2G: sKG_out → GMEM qg via GmemTiledCopyO + copy_pred
+                    {
+                        Tensor mQg = make_tensor(
+                            make_gmem_ptr(reinterpret_cast<Element*>(params.qg_out_ptr)),
+                            make_layout(params.shape_wukg, params.stride_wukg))(_, _, head_idx);
+                        Tensor gQg = local_tile(
+                            cute::domain_offset(make_coord(token_offset_cur, _0{}), mQg),
+                            Shape<Int<TileT>, Int<TileK>>{},
+                            make_coord(_0{}, _0{}));
+                        Tensor tOsO_qg = gmem_thr_copy_O.partition_S(sKG_out);
+                        Tensor tOgQg = gmem_thr_copy_O.partition_D(gQg);
+                        Tensor tOcO_qg =
+                            gmem_thr_copy_O.partition_D(make_identity_tensor(Shape<Int<TileT>, Int<TileK>>{}));
+                        Tensor tOpO_qg = make_tensor<bool>(make_shape(size<2>(tOcO_qg)));
+#pragma unroll
+                        for (int k = 0; k < size(tOpO_qg); ++k) {
+                            tOpO_qg(k) = get<1>(tOcO_qg(_0{}, _0{}, k)) < params.d;
+                        }
+                        ku::copy_pred<
+                            /*Is_even_MN=*/false,
+                            /*Is_even_K=*/false,
+                            /*Clear_OOB_MN=*/false,
+                            /*Clear_OOB_K=*/false>(gmem_tiled_copy_O, tOsO_qg, tOgQg, tOcO_qg, tOpO_qg, sub_seq_len);
+                    }
+                }  // end if constexpr (StoreQG)
+            }
+
+            // Release beta at end of WU
+            beta_pipeline.consumer_release(beta_pipe_state_read);
+            ++beta_pipe_state_read;
+        }
+    }
+
+    // ===================================================================
+    // WG1: Epilogue persistent loop (warp 4-7, 128 threads, 1 WG)
+    // V_proc computation → co-signal MMA (with Prologue), then W/U store → GMEM
+    // ===================================================================
+    template <typename TmaParamsT>
+    CUTLASS_DEVICE void
+    epilogue_loop(
+        const KDA_fwd_recomp_w_u_params& params,
+        const TmaParamsT& tma_params,
+        SharedMemoryPlan* shared_plan,
+        TileScheduler& tile_scheduler,
+        // TMA pipeline (consumer): V
+        PipelineV& v_pipeline,
+        PipelineStateV& v_pipe_state_read,
+        // Beta pipeline (consumer, 1×/WU)
+        PipelineBeta& beta_pipeline,
+        PipelineStateBeta& beta_pipe_state_read,
+        // Prologue -> MMA pipeline (co-producer with Prologue)
+        PipelinePrologueReady& prologue_ready_pipeline,
+        PipelineStatePrologueReady& prologue_ready_pipe_state_write,
+        // MMA -> Epilogue pipeline (consumer, used for both W and U sequentially)
+        PipelineAccDone& acc_done_pipeline,
+        PipelineStateAccDone& acc_done_pipe_state_read) {
+        // === PERSISTENT EPILOGUE LOOP (WG1, 128 threads) ===
+        // idx_in_wg: 0..127 within this warp group
+        int idx_in_wg = threadIdx.x % NumEpilogueThreads;  // 0..127
+        int* chunk_indices_ptr = (int*)params.chunk_indices_ptr;
+        int* cu_seqlens_ptr = (int*)params.cu_seqlens_ptr;
+
+        CUTE_NO_UNROLL
+        for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
+            int tid = tile_scheduler.get_current_tile_id();
+            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
+            int batch_idx = get<0>(blk_coord);
+            int head_idx = get<1>(blk_coord);
+            int tile_idx = get<2>(blk_coord);
+            int token_offset = cu_seqlens_ptr[batch_idx];
+            int seq_len = cu_seqlens_ptr[batch_idx + 1] - cu_seqlens_ptr[batch_idx];
+            int sub_seq_len = min(TileT, seq_len - tile_idx * TileT);
+            int token_offset_cur = token_offset + tile_idx * TileT;
+
+            // ============================================================
+            // Once per WU: Wait for beta
+            // ============================================================
+            beta_pipeline.consumer_wait(beta_pipe_state_read);
+            fence_view_async_shared();
+
+            // ============================================================
+            // Per i_k iteration: V_proc → co-signal MMA, then wait w/u → store to GMEM
+            // ============================================================
+            CUTE_NO_UNROLL
+            for (int i_k = 0; i_k < NumKIters; ++i_k) {
+                // Wait for V data from TMA Load warp
+                v_pipeline.consumer_wait(v_pipe_state_read);
+                Tensor sV =
+                    make_tensor(make_smem_ptr(shared_plan->v[v_pipe_state_read.index()].data()), SmemLayoutInputBF16{});
+
+                // Co-acquire prologue_ready with Prologue (both WGs must acquire before MMA can consume)
+                prologue_ready_pipeline.producer_acquire(prologue_ready_pipe_state_write);
+                int buf_idx = prologue_ready_pipe_state_write.index();
+
+                // ---- V_proc: V * beta → R2S → v_mma (MN-major) ----
+                // Uses 16x64 thread mapping with bf16x8 (128-bit) loads/stores, same as K
+                Tensor sV_dst = make_tensor(make_smem_ptr(shared_plan->v_mma[buf_idx].data()), SmemLayoutMatBBF16{});
+                {
+                    int x_local = idx_in_wg / 8;     // 0..15
+                    int y_base = idx_in_wg % 8 * 8;  // 0,8,16,...,56  (16x64 mapping)
+
+#pragma unroll
+                    for (int t_iter = 0; t_iter < TileT; t_iter += 16) {
+                        int t = x_local + t_iter;
+                        float beta_val = shared_plan->beta_smem[beta_pipe_state_read.index()][t];
+                        float2 beta2 = {beta_val, beta_val};
+
+#pragma unroll
+                        for (int y_iter = 0; y_iter < TileK; y_iter += 64) {
+                            int y = y_base + y_iter;
+                            if (t < sub_seq_len) {
+                                bf16x8 v = *reinterpret_cast<bf16x8*>(&sV(t, y));
+                                // lo half (cols y..y+3)
+                                float2 vf_01 = __bfloat1622float2(v.a01);
+                                float2 vf_23 = __bfloat1622float2(v.a23);
+                                float2 res_01 = float2_mul(vf_01, beta2);
+                                float2 res_23 = float2_mul(vf_23, beta2);
+                                // hi half (cols y+4..y+7)
+                                float2 vf_45 = __bfloat1622float2(v.a45);
+                                float2 vf_67 = __bfloat1622float2(v.a67);
+                                float2 res_45 = float2_mul(vf_45, beta2);
+                                float2 res_67 = float2_mul(vf_67, beta2);
+                                // Single 128-bit store
+                                bf16x8 out;
+                                out.a01 = __float22bfloat162_rn(res_01);
+                                out.a23 = __float22bfloat162_rn(res_23);
+                                out.a45 = __float22bfloat162_rn(res_45);
+                                out.a67 = __float22bfloat162_rn(res_67);
+                                *reinterpret_cast<bf16x8*>(&sV_dst(y, t)) = out;
+                            } else {
+                                bf16x8 zero;
+                                zero.a01 = __float2bfloat162_rn(0.0f);
+                                zero.a23 = __float2bfloat162_rn(0.0f);
+                                zero.a45 = __float2bfloat162_rn(0.0f);
+                                zero.a67 = __float2bfloat162_rn(0.0f);
+                                *reinterpret_cast<bf16x8*>(&sV_dst(y, t)) = zero;
+                            }
+                        }
+                    }
+                }
+
+                // Release V SMEM back to Load warp (done reading sV, all in sV_dst now)
+                v_pipeline.consumer_release(v_pipe_state_read);
+                ++v_pipe_state_read;
+
+                // Co-commit prologue_ready with Prologue → MMA can now consume k_mma + v_mma
+                fence_view_async_shared();
+                prologue_ready_pipeline.producer_commit(prologue_ready_pipe_state_write);
+                ++prologue_ready_pipe_state_write;
+
+                // ---- w/u output: wait K-GEMM & V-GEMM acc → T2R → bf16 → R2G ----
+                // Split into 2 iterations of TileK/2 to reduce register pressure (avoid spill)
                 acc_done_pipeline.consumer_wait(acc_done_pipe_state_read);
                 int buf_mma_idx = acc_done_pipe_state_read.index();
-                // TODO: use other tmem ld to load 64x128 W/U acc, and then direct R2G, remove reg spill
-                float res[TileK];
-                ku::tcgen05_after_thread_sync();
-                ku::tmem_ld_32dp32bNx<TileK>(uint32_t(TmemAllocation::W) + buf_mma_idx * 256, res);
-                cutlass::arch::fence_view_async_tmem_load();
-                ku::tcgen05_before_thread_sync();
-
-                acc_done_pipeline.consumer_release(acc_done_pipe_state_read);
-                ++acc_done_pipe_state_read;
 
                 int acc_idx = (idx_in_wg / 16) & 1;
                 __nv_bfloat16* out_ptr_base =
@@ -527,22 +735,38 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                 __nv_bfloat16* out_row_base =
                     out_ptr_base + (token_offset_cur + row) * params.d * params.h + head_idx * params.d;
 
-                // Convert float acc to bf16 and store to GMEM via store_256b
-                // store_256b writes 16 bf16 values (256 bits) per call
-                // TileK / 16 iterations to cover the full row
-                if (row < sub_seq_len) {
+                constexpr int HalfK = TileK / 2;
+
+                ku::tcgen05_after_thread_sync();
 #pragma unroll
-                    for (int i = 0; i < TileK / 16; ++i) {
-                        ku::bf16x16 out;
+                for (int half = 0; half < 2; ++half) {
+                    float res_half[HalfK];
+                    ku::tmem_ld_32dp32bNx<HalfK>(
+                        uint32_t(TmemAllocation::W) + buf_mma_idx * 256 + half * HalfK, res_half);
+                    cutlass::arch::fence_view_async_tmem_load();
+
+                    if (row < sub_seq_len) {
 #pragma unroll
-                        for (int j = 0; j < 8; ++j) {
-                            reinterpret_cast<__nv_bfloat162*>(&out)[j] =
-                                __float22bfloat162_rn(reinterpret_cast<float2*>(&res[i * 16])[j]);
+                        for (int i = 0; i < HalfK / 16; ++i) {
+                            ku::bf16x16 out;
+#pragma unroll
+                            for (int j = 0; j < 8; ++j) {
+                                reinterpret_cast<__nv_bfloat162*>(&out)[j] =
+                                    __float22bfloat162_rn(reinterpret_cast<float2*>(&res_half[i * 16])[j]);
+                            }
+                            store_256b(&out, out_row_base + half * HalfK + i * 16);
                         }
-                        store_256b(&out, out_row_base + i * 16);
                     }
                 }
+                ku::tcgen05_before_thread_sync();
+
+                acc_done_pipeline.consumer_release(acc_done_pipe_state_read);
+                ++acc_done_pipe_state_read;
             }
+
+            // Release beta at end of WU
+            beta_pipeline.consumer_release(beta_pipe_state_read);
+            ++beta_pipe_state_read;
         }
     }
 
@@ -631,13 +855,17 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         const TmaParamsT& tma_params,
         SharedMemoryPlan* shared_plan,
         TileScheduler& tile_scheduler,
-        // TMA pipelines (producer): Akk, KG (merged K+G), V
+        // TMA pipelines (producer): Akk, K, G, V, Q (Q only used when StoreQG=true)
         PipelineA& a_pipeline,
         PipelineStateA& a_pipe_state_write,
-        PipelineKG& kg_pipeline,
-        PipelineStateKG& kg_pipe_state_write,
+        PipelineK& k_pipeline,
+        PipelineStateK& k_pipe_state_write,
+        PipelineG& g_pipeline,
+        PipelineStateG& g_pipe_state_write,
         PipelineV& v_pipeline,
-        PipelineStateV& v_pipe_state_write) {
+        PipelineStateV& v_pipe_state_write,
+        PipelineQ& q_pipeline,
+        PipelineStateQ& q_pipe_state_write) {
         if (cute::elect_one_sync()) {
             int* chunk_indices_ptr = (int*)params.chunk_indices_ptr;
             int* cu_seqlens_ptr = (int*)params.cu_seqlens_ptr;
@@ -666,6 +894,17 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                 Tensor mA = domain_offset(
                     make_coord(token_offset, _0{}, _0{}), tma_params.tma_akk.get_tma_tensor(tma_params.shape_Akk));
 
+                // Q GMEM tensor (only used when StoreQG=true)
+                [[maybe_unused]] auto mQ = [&]() {
+                    if constexpr (StoreQG) {
+                        return domain_offset(
+                            make_coord(token_offset, _0{}, _0{}),
+                            tma_params.tma_q.get_tma_tensor(tma_params.shape_kvg));
+                    } else {
+                        return 0;  // unused placeholder
+                    }
+                }();
+
                 // ============================================================
                 // Once per WU: TMA Akk[BT, BT] → sA
                 // ============================================================
@@ -681,17 +920,17 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                 }
 
                 // ============================================================
-                // Per i_k: TMA K+G, V → sK, sG, sV (double-buffered)
-                // K and G share one pipeline barrier (merged KG pipeline)
+                // Per i_k: TMA K, G, V → sK, sG, sV (double-buffered)
+                // K and G have separate pipelines
                 // ============================================================
                 CUTE_NO_UNROLL
                 for (int i_k = 0; i_k < NumKIters; ++i_k) {
                     Tensor sK = make_tensor(
-                        make_smem_ptr(shared_plan->k[kg_pipe_state_write.index()].data()), SmemLayoutInputBF16{});
+                        make_smem_ptr(shared_plan->k[k_pipe_state_write.index()].data()), SmemLayoutInputBF16{});
                     Tensor sV = make_tensor(
                         make_smem_ptr(shared_plan->v[v_pipe_state_write.index()].data()), SmemLayoutInputBF16{});
                     Tensor sG = make_tensor(
-                        make_smem_ptr(shared_plan->g[kg_pipe_state_write.index()].data()), SmemLayoutInputFP32{});
+                        make_smem_ptr(shared_plan->g[g_pipe_state_write.index()].data()), SmemLayoutInputFP32{});
 
                     Tensor gK = local_tile(
                         mK(_, _, head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, i_k));
@@ -700,17 +939,33 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                     Tensor gG = local_tile(
                         mG(_, _, head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, i_k));
 
-                    // KG: Load K and G on the same barrier → Compute
-                    kg_pipeline.producer_acquire(kg_pipe_state_write);
-                    auto& kg_barrier = *kg_pipeline.producer_get_barrier(kg_pipe_state_write);
-                    ku::launch_tma_copy(tma_params.tma_k, gK, sK, kg_barrier);
-                    ku::launch_tma_copy(tma_params.tma_g, gG, sG, kg_barrier);
-                    ++kg_pipe_state_write;
+                    // K: Load → Compute
+                    k_pipeline.producer_acquire(k_pipe_state_write);
+                    ku::launch_tma_copy(tma_params.tma_k, gK, sK, *k_pipeline.producer_get_barrier(k_pipe_state_write));
+                    ++k_pipe_state_write;
+
+                    // G: Load → Compute
+                    g_pipeline.producer_acquire(g_pipe_state_write);
+                    ku::launch_tma_copy(tma_params.tma_g, gG, sG, *g_pipeline.producer_get_barrier(g_pipe_state_write));
+                    ++g_pipe_state_write;
 
                     // V: Load → Compute
                     v_pipeline.producer_acquire(v_pipe_state_write);
                     ku::launch_tma_copy(tma_params.tma_v, gV, sV, *v_pipeline.producer_get_barrier(v_pipe_state_write));
                     ++v_pipe_state_write;
+
+                    // Q: Load → Compute (only when StoreQG=true)
+                    if constexpr (StoreQG) {
+                        Tensor sQ = make_tensor(
+                            make_smem_ptr(shared_plan->q_buf.q[q_pipe_state_write.index()].data()),
+                            SmemLayoutInputBF16{});
+                        Tensor gQ = local_tile(
+                            mQ(_, _, head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, i_k));
+                        q_pipeline.producer_acquire(q_pipe_state_write);
+                        ku::launch_tma_copy(
+                            tma_params.tma_q, gQ, sQ, *q_pipeline.producer_get_barrier(q_pipe_state_write));
+                        ++q_pipe_state_write;
+                    }
                 }
             }
         }
@@ -753,8 +1008,8 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
             if (thread_idx < TileT) {
                 float beta_val =
                     (thread_idx < sub_seq_len)
-                        ? reinterpret_cast<float*>(
-                              params.beta_ptr)[(token_offset + tile_idx * TileT + thread_idx) * params.h + head_idx]
+                        ? float(reinterpret_cast<ElementBeta_*>(
+                              params.beta_ptr)[(token_offset + tile_idx * TileT + thread_idx) * params.h + head_idx])
                         : float(0);
                 shared_plan->beta_smem[beta_pipe_state_write.index()][thread_idx] = beta_val;
             }

@@ -74,8 +74,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     using ElementAccumulatorKV = ElementAccumulatorKV_;
     using ElementO = Element;
     using ElementAlpha = float;
-    // TODO: support bf16 beta
-    using ElementBeta = float;
+    using ElementBeta = float;                                                     // SMEM + compute stays fp32
+    using ElementBetaGmem = find_option_t<Tag::kElementBetaGmem, float, Options>;  // GMEM type (float or bf16)
     using ElementGatedMMA = cutlass::tfloat32_t;
 
     using TileShape = TileShape_;
@@ -459,7 +459,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     using LoadBeta = CollectiveLoadVector<
         LoadKindVector::kBeta,
         MainloopBetaPipeline,
-        ElementBeta,
+        ElementBetaGmem,
         GmemLayoutBeta,
         ElementBeta,
         SmemLayoutBeta,
@@ -474,7 +474,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     float*        ptr_output_state; // layout fixed (kdim, vdim, num_heads, num_seqs):LayoutLeft{}
     float const*  ptr_input_state;
     float scale;
-    ElementBeta const* beta_ptr;  GmemStrideBeta beta_stride;
+    ElementBetaGmem const* beta_ptr;  GmemStrideBeta beta_stride;
   };  // clang-format on
 
     struct Params {
@@ -489,7 +489,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         float* ptr_output_state;
         float const* ptr_input_state;
 
-        ElementBeta const* beta_ptr;
+        ElementBetaGmem const* beta_ptr;
         GmemLayoutBeta beta_layout;
     };
 
@@ -645,8 +645,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         // fuse post inverse diag(beta) into diagonal of IKK
         // auto collective_load = LoadBeta{params.beta_ptr, params.beta_layout, /*oob_value=*/1.0f, pipeline,
         // storage.smem_beta};
-        auto collective_load =
-            LoadBeta{params.beta_ptr, params.beta_layout, /*oob_value=*/0.0f, pipeline, storage.smem_beta};
+        auto collective_load = LoadBeta{
+            params.beta_ptr, params.beta_layout, /*oob_value=*/ElementBetaGmem(0), pipeline, storage.smem_beta};
         auto src_dst = collective_load.partition_SD(problem_size, tile_shape, work_desc);
 
         CUTE_NO_UNROLL
@@ -905,18 +905,11 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 make_gmem_ptr(params.ptr_input_state),
                 make_layout(make_shape(Int<HeadSizeQK>{}, Int<HeadSizeV>{}, num_state_heads, problem_size.num_seqs)))(
                 _, _, state_head_idx, seq_idx);  // (KDim, VDim), K-contiguous
-            // NOTE: load S in transposed GMEM
-            // because in GDN's equation, S = NewV^T @ K, while in KDA, S = K^T @ NewV
-            auto gKV_trans = make_tensor(
-                make_gmem_ptr(gKV.data()),
-                make_layout(
-                    make_shape(get<1>(gKV.layout().shape()), get<0>(gKV.layout().shape())),
-                    make_stride(get<1>(gKV.layout().stride()), get<0>(gKV.layout().stride()))));
 
-            auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, Element>{}, kv_tiled_mma);
+            auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, ElementAlpha>{}, kv_tiled_mma);
             auto thr_copy_kv = tiled_copy_kv.get_thread_slice(thread_idx);
-
-            auto tKVgKV = thr_copy_kv.partition_S(select_tensor<1, 0>(gKV_trans));
+            // transposed load state
+            auto tKVgKV = thr_copy_kv.partition_S(select_tensor<1, 0>(gKV));
             copy(tiled_copy_kv, tKVgKV, tKVrKV);
         };
 
@@ -928,18 +921,11 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 make_gmem_ptr(params.ptr_output_state),
                 make_layout(make_shape(Int<HeadSizeQK>{}, Int<HeadSizeV>{}, num_state_heads, problem_size.num_seqs)))(
                 _, _, state_head_idx, seq_idx);  // (KDim, VDim), K-contiguous
-            // NOTE: store S in transposed GMEM
-            // because in GDN's equation, S = NewV^T @ K, while in KDA, S = K^T @ NewV
-            auto gKV_trans = make_tensor(
-                make_gmem_ptr(gKV.data()),
-                make_layout(
-                    make_shape(get<1>(gKV.layout().shape()), get<0>(gKV.layout().shape())),
-                    make_stride(get<1>(gKV.layout().stride()), get<0>(gKV.layout().stride()))));
 
-            auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, Element>{}, kv_tiled_mma);
+            auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, ElementAlpha>{}, kv_tiled_mma);
             auto thr_copy_kv = tiled_copy_kv.get_thread_slice(thread_idx);
-
-            auto tKVgKV = thr_copy_kv.partition_D(select_tensor<1, 0>(gKV_trans));
+            // transposed store state
+            auto tKVgKV = thr_copy_kv.partition_D(select_tensor<1, 0>(gKV));
             copy(tiled_copy_kv, tKVrKV, tKVgKV);
         };
 

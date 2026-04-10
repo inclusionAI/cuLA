@@ -18,8 +18,6 @@
 import torch
 import triton
 import triton.language as tl
-from einops import rearrange
-from fla.ops.kda.wy_fast import recompute_w_u_fwd
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2, gather
 from fla.utils import IS_GATHER_SUPPORTED, IS_TF32_SUPPORTED, autotune_cache_kwargs
@@ -764,15 +762,12 @@ def chunk_kda_fwd_intra(
     B, T, H, K = k.shape
     BT = chunk_size
 
-    reset_cu_seqlens = False
     if cu_seqlens is None:
-        reset_cu_seqlens = True
         cu_seqlens = prepare_uniform_cu_seqlens(B, T, q.device, torch.int32)
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
 
-    # assert cu_seqlens is not None and chunk_indices is not None, "cu_seqlens and chunk_indices must be provided for cuda impl"
     # NOTE: inside kernel we use int32 for cu_seqlens
     assert cu_seqlens.dtype == torch.int32 and chunk_indices.dtype == torch.int32, (
         "cu_seqlens and chunk_indices must be int32 for cuda impl"
@@ -781,52 +776,19 @@ def chunk_kda_fwd_intra(
     Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
     Akk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
 
-    # set batch dimension to 1
-    if B != 1:
-        q, k, gk, beta, Aqk, Akk = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, gk, beta, Aqk, Akk))
     tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
     cula_cuda.chunk_kda_fwd_intra_cuda(
         q, k, gk, beta, cu_seqlens, chunk_indices, Aqk, Akk, tile_counter, scale, chunk_size, use_tf32_inverse, unified_gref
     )
 
-    # TODO: support cuda recompute_wu impl with disable_recompute=True
-    if disable_recompute:
-        # rearrange back
-        if B != 1:
-            q, k, gk, beta, Aqk, Akk = map(
-                lambda x: rearrange(x, "1 (b t) ... -> b t ...", b=B),
-                (q, k, gk, beta, Aqk, Akk),
-            )
+    w = torch.empty_like(k)
+    u = torch.empty_like(v)
+    qg = torch.empty_like(q) if disable_recompute else None
+    kg = torch.empty_like(k) if gk is not None else None
 
-        if reset_cu_seqlens:
-            cu_seqlens = None
-
-        w, u, qg, kg = recompute_w_u_fwd(
-            k=k,
-            v=v,
-            beta=beta,
-            A=Akk,
-            q=q if disable_recompute else None,
-            gk=gk,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-        )
-    else:
-        w = torch.empty_like(k)
-        u = torch.empty_like(v)
-        qg = None
-        kg = torch.empty_like(k) if gk is not None else None
-        if B != 1:
-            w, u, kg = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (w, u, kg))
-
-        cula_cuda.recompute_w_u_cuda(k, v, beta, Akk, gk, cu_seqlens, chunk_indices, w, u, kg, chunk_size)
-
-        # rearrange back
-        if B != 1:
-            w, u, kg, Aqk, Akk = map(
-                lambda x: rearrange(x, "1 (b t) ... -> b t ...", b=B),
-                (w, u, kg, Aqk, Akk),
-            )
+    cula_cuda.recompute_w_u_cuda(
+        k, v, beta, Akk, gk, cu_seqlens, chunk_indices, w, u, kg, chunk_size, q if disable_recompute else None, qg
+    )
 
     return w, u, qg, kg, Aqk, Akk
 
