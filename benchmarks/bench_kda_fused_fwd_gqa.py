@@ -69,11 +69,15 @@ _SM_TAG = f"sm{_major}{_minor}"
 cula_kda_fused_fwd = get_kda_fused_fwd(_device)
 
 # ============================================================
-# Constants — Qwen3.5-A3B Gated DeltaNet shape by default
+# Constants — Qwen3.5 Gated DeltaNet shapes
 # ============================================================
-H = 32        # linear_num_value_heads (= state head count, grid dim)
-HK = 16       # linear_num_key_heads   (Q and K share this)
-D = 128       # head_k_dim == head_v_dim
+# Each entry is (model_tag, num_heads, num_k_heads, head_dim). num_heads is
+# the V / state head count (= grid dim). num_k_heads is Q and K's shared
+# physical head count. k_group_size = num_heads / num_k_heads.
+MODEL_CONFIGS = [
+    ("Qwen3.5-35B-A3B",   32, 16, 128),  # k_group_size = 2
+    ("Qwen3.5-122B-A10B", 64, 16, 128),  # k_group_size = 4
+]
 WARMUP = 25
 N_ITERS = 100
 NCU_MODE = False
@@ -189,9 +193,10 @@ def run_fla_expanded(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seq
 # ============================================================
 # Fixed-length benchmark
 # ============================================================
-def bench_fixed(configs):
+def bench_fixed(configs, model_tag, H, HK, D):
     print("\n" + "=" * 120)
-    print(f" Fixed-Length GQA Benchmark: cuLA fully-fused ({_SM_TAG}) native GQA vs MHA-expanded paths")
+    print(f" Fixed-Length GQA Benchmark [{model_tag}]: cuLA fully-fused ({_SM_TAG}) native GQA vs MHA-expanded paths")
+    print(f" H={H}  HK={HK}  k_group_size={H // HK}  D={D}")
     print("=" * 120)
     results = []
 
@@ -265,9 +270,10 @@ def bench_fixed(configs):
 # ============================================================
 # Varlen benchmark
 # ============================================================
-def bench_varlen(configs):
+def bench_varlen(configs, model_tag, H, HK, D):
     print("\n" + "=" * 120)
-    print(f" Varlen GQA Benchmark: cuLA fully-fused ({_SM_TAG}) native GQA vs MHA-expanded paths")
+    print(f" Varlen GQA Benchmark [{model_tag}]: cuLA fully-fused ({_SM_TAG}) native GQA vs MHA-expanded paths")
+    print(f" H={H}  HK={HK}  k_group_size={H // HK}  D={D}")
     print("=" * 120)
     results = []
 
@@ -345,12 +351,12 @@ def bench_varlen(configs):
 # ============================================================
 # Report
 # ============================================================
-def print_report(fixed_results, varlen_results):
+def print_report(fixed_results, varlen_results, model_tag, H, HK, D):
     sep = "=" * 120
     print(f"\n\n{sep}")
-    print("                 BENCHMARK REPORT: cula_kda_fused_fwd multi-value GQA")
+    print(f"                 BENCHMARK REPORT [{model_tag}]: cula_kda_fused_fwd multi-value GQA")
     print(f"                 cuLA {_SM_TAG} native GQA  vs  cuLA MHA + host expand  vs  FLA Triton + host expand")
-    print(f"                 H={H}  HK={HK}  D={D}  dtype=bf16  safe_gate=True  has_init_state={HAS_INIT_STATE}")
+    print(f"                 H={H}  HK={HK}  k_group_size={H // HK}  D={D}  dtype=bf16  safe_gate=True  has_init_state={HAS_INIT_STATE}")
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
     mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
@@ -460,17 +466,20 @@ def main():
         dists=("uniform", "random", "skewed"),
     )
 
-    fixed_res, varlen_res = [], []
+    all_results = []
+    for model_tag, H, HK, D in MODEL_CONFIGS:
+        fixed_res, varlen_res = [], []
 
-    if args.mode in ("fixed", "both"):
-        fixed_res = bench_fixed(fixed_configs)
+        if args.mode in ("fixed", "both"):
+            fixed_res = bench_fixed(fixed_configs, model_tag, H, HK, D)
 
-    if args.mode in ("varlen", "both"):
-        varlen_res = bench_varlen(varlen_configs)
+        if args.mode in ("varlen", "both"):
+            varlen_res = bench_varlen(varlen_configs, model_tag, H, HK, D)
 
-    print_report(fixed_res, varlen_res)
+        print_report(fixed_res, varlen_res, model_tag, H, HK, D)
+        all_results.append((model_tag, fixed_res, varlen_res))
 
-    return fixed_res, varlen_res
+    return all_results
 
 
 if __name__ == "__main__":
