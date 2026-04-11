@@ -173,6 +173,101 @@ def test_safe_gate_chunk(
     assert_close("ht", ref_ht_fla_trans, tri_ht, 0.005)
 
 
+# ─── Multi-Value GQA tests ─────────────────────────────────────────────
+#
+# KDA's "multi-value" flavor: Q and K share a single physical head count
+# (num_k_heads) while V (and state, alpha/g, beta, O) use the larger
+# num_heads. `num_heads / num_k_heads` consecutive state heads share one
+# physical Q/K head. This matches e.g. Qwen3.5-A3B Gated DeltaNet
+# (linear_num_key_heads=16, linear_num_value_heads=32).
+#
+# Equivalence check: running the GQA kernel on (Q=[T,num_k_heads,D],
+# K=[T,num_k_heads,D], V=[T,num_heads,D]) must produce the same output as
+# running the existing MHA kernel on Q and K expanded via repeat_interleave
+# to [T,num_heads,D]. The rest of the setup (g, beta, state) is identical
+# in both paths — they are already per-state-head.
+
+
+@pytest.mark.parametrize(
+    ("B", "T", "num_heads", "num_k_heads", "D", "use_qk_l2norm_in_kernel", "dtype"),
+    [
+        pytest.param(
+            *test,
+            id="B{}-T{}-H{}-Hk{}-D{}-l2norm{}-{}".format(*test),
+        )
+        for test in [
+            # Qwen3.5-A3B DeltaNet shape
+            (1, 128, 32, 16, 128, False, torch.bfloat16),
+            (2, 256, 32, 16, 128, False, torch.bfloat16),
+            (2, 1024, 32, 16, 128, True, torch.bfloat16),
+            (1, 2048, 32, 16, 128, False, torch.bfloat16),
+            # Other plausible GQA ratios
+            (2, 512, 16, 8, 128, False, torch.bfloat16),
+            (2, 512, 32, 8, 128, False, torch.bfloat16),  # k_group_size=4
+        ]
+    ],
+)
+def test_multi_value_gqa(
+    B: int,
+    T: int,
+    num_heads: int,
+    num_k_heads: int,
+    D: int,
+    use_qk_l2norm_in_kernel: bool,
+    dtype: torch.dtype,
+):
+    """GQA output must match MHA output on repeat_interleave'd Q/K."""
+    assert num_heads % num_k_heads == 0, "num_heads must be a multiple of num_k_heads"
+    k_group_size = num_heads // num_k_heads
+
+    cula_kda_fused_fwd = get_kda_fused_fwd(device)
+
+    torch.manual_seed(42)
+    # GQA-shaped inputs
+    q_gqa = torch.rand(B, T, num_k_heads, D, dtype=dtype)
+    k_gqa = torch.rand(B, T, num_k_heads, D, dtype=dtype)
+    v = torch.rand(B, T, num_heads, D, dtype=dtype)
+    # g and beta are per state/V head in both paths
+    g = F.logsigmoid(torch.randn(B, T, num_heads, D, dtype=torch.float)).clamp(-5, 0)
+    beta = torch.randn(B, T, num_heads, dtype=torch.float32).sigmoid().to(torch.float32)
+    h0 = torch.randn(B, num_heads, D, D, dtype=torch.float32)
+    h0_vk = h0.transpose(-1, -2).contiguous()
+
+    q_gqa, k_gqa, v, g, beta, h0_vk = map(
+        lambda x: x.to(device).requires_grad_(False),
+        (q_gqa, k_gqa, v, g, beta, h0_vk),
+    )
+
+    # MHA reference: repeat Q and K heads to num_heads so they match V. The
+    # MHA kernel then runs the same math on a strictly-larger tensor and the
+    # result per state head should be bit-equivalent to the GQA path.
+    q_mha_ref = q_gqa.repeat_interleave(k_group_size, dim=2)
+    k_mha_ref = k_gqa.repeat_interleave(k_group_size, dim=2)
+
+    def call_fused(q, k):
+        q_in = F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone()
+        k_in = F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone()
+        return cula_kda_fused_fwd(
+            q=q_in,
+            k=k_in,
+            v=v.clone(),
+            g=g.clone(),
+            beta=beta.clone(),
+            initial_state=h0_vk.clone(),
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=False,
+            safe_gate=True,
+            lower_bound=-5.0,
+        )
+
+    o_gqa, ht_gqa = call_fused(q_gqa, k_gqa)
+    o_mha, ht_mha = call_fused(q_mha_ref, k_mha_ref)
+
+    assert_close("o (gqa vs mha-repeat)", o_mha, o_gqa, 0.005)
+    assert_close("ht (gqa vs mha-repeat)", ht_mha, ht_gqa, 0.005)
+
+
 @pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
 @pytest.mark.parametrize(
     ("H", "D", "mask_p", "cu_seqlens", "dtype", "safe_gate"),

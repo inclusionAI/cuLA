@@ -52,7 +52,8 @@ launch_kda_fwd_prefill_kernel_gbai(
     int32_t head_size,
     int64_t total_seqlen,
     float scale,
-    int32_t sm_count);
+    int32_t sm_count,
+    int32_t num_k_heads = 0);
 
 template <
     typename ArchTag,  // TODO: hide this
@@ -79,7 +80,8 @@ launch_kda_fwd_prefill_kernel(
     int64_t total_seqlen,
     float scale,
     bool safe_gate,
-    int32_t sm_count = 0) {
+    int32_t sm_count = 0,
+    int32_t num_k_heads = 0) {
     bool needs_beta = beta != nullptr;
     bool needs_alpha = alpha != nullptr;
     bool init_state = input_state != nullptr;
@@ -102,7 +104,8 @@ launch_kda_fwd_prefill_kernel(
         head_size,                                                                               \
         total_seqlen,                                                                            \
         scale,                                                                                   \
-        sm_count);
+        sm_count,                                                                                \
+        num_k_heads);
     if (init_state) {
         if (needs_beta && needs_alpha && safe_gate) {
             LAUNCH(true, true, true, true);
@@ -142,7 +145,8 @@ launch_kda_fwd_prefill_kernel<cutlass::arch::Sm90, bf16, bf16, float, float>(
     int64_t total_seqlen,
     float scale,
     bool safe_gate,
-    int32_t sm_count);
+    int32_t sm_count,
+    int32_t num_k_heads);
 
 // TBeta=bf16
 template void
@@ -164,6 +168,7 @@ launch_kda_fwd_prefill_kernel<cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     int64_t total_seqlen,
     float scale,
     bool safe_gate,
-    int32_t sm_count);
+    int32_t sm_count,
+    int32_t num_k_heads);
 
 }  // namespace kda::sm90

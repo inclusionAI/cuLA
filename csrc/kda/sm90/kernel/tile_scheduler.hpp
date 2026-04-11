@@ -25,7 +25,10 @@ using namespace cute;
 struct WorkDesc {
     // coord
     int32_t seq_idx;
-    int32_t head_idx;
+    int32_t head_idx;          // state/V head index in [0, num_heads)
+    int32_t k_group_size = 1;  // num_heads / num_k_heads. Q and K share the
+                               // same physical head = head_idx / k_group_size.
+                               // k_group_size == 1 is plain MHA.
     int64_t tok_offset;  // offset to the start of the start
 
     // shape
@@ -40,13 +43,17 @@ struct WorkDesc {
         return seq_idx >= 0 && seq_idx < params.num_seqs;
     }
 
+    // Q and K share one physical head count in KDA. In the "multi-value"
+    // flavor (Qwen3.5-style), k_group_size > 1 state heads share each
+    // physical Q/K head; in plain MHA k_group_size == 1 and every state head
+    // gets its own Q and K head.
     CUTE_DEVICE int32_t
     q_head_idx() const {
-        return head_idx;
+        return head_idx / k_group_size;
     }
     CUTE_DEVICE int32_t
     k_head_idx() const {
-        return head_idx;
+        return head_idx / k_group_size;
     }
     CUTE_DEVICE int32_t
     v_head_idx() const {
@@ -69,6 +76,7 @@ struct IndividualTileScheduler {
         dim3 grid;
         int32_t num_seqs;
         int32_t num_heads;
+        int32_t k_group_size;  // num_heads / num_k_heads (>=1, ==1 for MHA)
     };
 
     bool scheduled = false;  // a once flag
@@ -86,17 +94,26 @@ struct IndividualTileScheduler {
         TileShape const& tile_shape) {
         dim3 grid(0, 1, 1);
         grid.x = problem_size.num_seqs * problem_size.num_heads;
+        // num_k_heads == 0 means "same as num_heads" (MHA). The host wrapper
+        // can leave num_k_heads unset and the kernel behaves exactly as before.
+        int32_t effective_num_k_heads =
+            problem_size.num_k_heads > 0 ? problem_size.num_k_heads : problem_size.num_heads;
+        int32_t k_group_size = problem_size.num_heads / effective_num_k_heads;
         DPRINTF(
-            "to_underlying_arguments: grid:{.x:%d, .y:%d, .z:%d}, num_seqs:%d, num_heads:%d\n",
+            "to_underlying_arguments: grid:{.x:%d, .y:%d, .z:%d}, num_seqs:%d, "
+            "num_heads:%d, num_k_heads:%d, k_group_size:%d\n",
             grid.x,
             grid.y,
             grid.z,
             problem_size.num_seqs,
-            problem_size.num_heads);
+            problem_size.num_heads,
+            effective_num_k_heads,
+            k_group_size);
         return {
             .grid = grid,
             .num_seqs = problem_size.num_seqs,
             .num_heads = problem_size.num_heads,
+            .k_group_size = k_group_size,
         };
     }
 
@@ -130,6 +147,7 @@ struct IndividualTileScheduler {
         return {
             .seq_idx = seq_idx,
             .head_idx = head_idx,
+            .k_group_size = params.k_group_size,
             .tok_offset = s,
             .seq_len = seq_len,
         };

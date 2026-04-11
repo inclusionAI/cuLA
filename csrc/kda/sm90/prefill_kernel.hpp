@@ -45,6 +45,16 @@ launch_kda_fwd_prefill_kernel(
     int64_t total_seqlen,
     float scale,
     bool safe_gate,
-    int32_t sm_count = 0);
+    int32_t sm_count = 0,
+    /// Number of physical Q/K heads. Q and K always share one head count in
+    /// KDA because they interact in the Q*K^T matmul. When 0 (default) or
+    /// equal to num_heads the kernel runs as plain MHA. When num_heads >
+    /// num_k_heads and num_heads % num_k_heads == 0, the kernel runs as KDA's
+    /// "multi-value" attention flavor: k_group_size = num_heads / num_k_heads
+    /// V/state heads share each physical Q/K head. Q and K tensors are
+    /// expected to be laid out as [total_seqlen, num_k_heads, head_size]; V
+    /// and O keep the [total_seqlen, num_heads, head_size] layout. This
+    /// matches e.g. Qwen3.5-A3B's Gated DeltaNet.
+    int32_t num_k_heads = 0);
 
 }  // namespace kda::sm90

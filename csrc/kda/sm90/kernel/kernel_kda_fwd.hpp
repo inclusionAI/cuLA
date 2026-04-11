@@ -135,8 +135,18 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
         int32_t const* cu_seqlens;
         int64_t total_seqlen;
         int32_t num_seqs;
-        int32_t num_heads;  // Q, K, V, O all share the same head count in KDA
+        int32_t num_heads;  // Number of V heads, state heads, grid dim.
+                            // Also the head count for O, alpha, and beta.
         int32_t head_size;  // d
+        int32_t num_k_heads = 0;
+        // Number of Q/K heads (Q and K always share a head count in KDA because
+        // they interact in the Q*K^T matmul). When num_k_heads == num_heads (or
+        // 0, the default), the kernel behaves as plain MHA. When num_heads >
+        // num_k_heads and num_heads % num_k_heads == 0, the kernel runs as
+        // "multi-value" attention: k_group_size = num_heads / num_k_heads
+        // V/state heads share each physical Q/K head. This matches e.g.
+        // Qwen3.5-A3B's Gated DeltaNet (linear_num_key_heads=16,
+        // linear_num_value_heads=32).
     };
     using ProblemShape = VarlenProblemShape;
 

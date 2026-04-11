@@ -35,24 +35,41 @@ kda_fwd_prefill(
     torch::Tensor workspace_buffer,
     float scale,
     bool safe_gate) {
-    // Q, K, V: [packed_seq, H, D] (already packed by Python layer)
+    // Layouts:
+    //   Q: [packed_seq, num_k_heads, head_size]
+    //   K: [packed_seq, num_k_heads, head_size]
+    //   V: [packed_seq, num_heads,   head_size]
+    // In plain MHA num_k_heads == num_heads. In KDA's "multi-value"
+    // flavor (e.g. Qwen3.5 Gated DeltaNet) num_k_heads < num_heads and
+    // k_group_size = num_heads / num_k_heads state heads share each
+    // physical Q/K head. Output O and state always use num_heads.
     auto packed_seq = q.size(0);
-    auto num_heads = q.size(1);
+    auto num_k_heads = q.size(1);
+    auto num_heads = v.size(1);
     auto head_size = q.size(2);
     auto num_seqs = cu_seqlens.size(0) - 1;
 
-    // KDA constraint: all head counts must be the same
-    TORCH_CHECK(num_heads == k.size(1), "KDA requires num_q_heads == num_k_heads, got ", num_heads, " vs ", k.size(1));
-    TORCH_CHECK(num_heads == v.size(1), "KDA requires num_q_heads == num_v_heads, got ", num_heads, " vs ", v.size(1));
-    TORCH_CHECK(head_size == v.size(2), "KDA requires Q and V head dim to match, got ", head_size, " vs ", v.size(2));
+    // Q and K share a head count in KDA (they meet in Q*K^T).
+    TORCH_CHECK(num_k_heads == k.size(1),
+                "KDA requires q.size(1) == k.size(1), got ", num_k_heads, " vs ", k.size(1));
+    // V's head dim must match Q/K (same hidden per-head projection width).
+    TORCH_CHECK(head_size == k.size(2),
+                "KDA requires q and k head dim to match, got ", head_size, " vs ", k.size(2));
+    TORCH_CHECK(head_size == v.size(2),
+                "KDA requires q and v head dim to match, got ", head_size, " vs ", v.size(2));
+    // num_heads must be a multiple of num_k_heads so k_group_size is integer.
+    TORCH_CHECK(num_heads % num_k_heads == 0,
+                "KDA requires num_heads % num_k_heads == 0 (num_heads=",
+                num_heads, ", num_k_heads=", num_k_heads, ")");
 
-    // Allocate output if not provided
+    // Allocate output if not provided. Shape is [packed_seq, num_heads, head_size]
+    // because O carries one value-stream per state/V head.
     torch::Tensor output = output_.has_value() ? output_.value()
                                                : torch::empty(
                                                      {packed_seq, num_heads, head_size},
                                                      torch::TensorOptions().dtype(q.dtype()).device(q.device()));
 
-    // Allocate output state if not provided
+    // State has one [head_size, head_size] K×V matrix per state head.
     torch::Tensor output_state = output_state_.has_value()
                                      ? output_state_.value()
                                      : torch::zeros(
@@ -136,7 +153,8 @@ kda_fwd_prefill(
             static_cast<int64_t>(packed_seq),
             scale,
             safe_gate,
-            static_cast<int32_t>(sm_count));
+            static_cast<int32_t>(sm_count),
+            static_cast<int32_t>(num_k_heads));
     } else {
         float const* beta_ptr = beta_.has_value() ? beta_.value().data_ptr<float>() : nullptr;
         kda::sm90::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float, float>(
@@ -157,7 +175,8 @@ kda_fwd_prefill(
             static_cast<int64_t>(packed_seq),
             scale,
             safe_gate,
-            static_cast<int32_t>(sm_count));
+            static_cast<int32_t>(sm_count),
+            static_cast<int32_t>(num_k_heads));
     }
 
     return {output, output_state};

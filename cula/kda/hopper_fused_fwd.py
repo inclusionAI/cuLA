@@ -49,9 +49,17 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         chunk_indices: torch.IntTensor | None = None,
     ):
         chunk_size = 64
-        assert q.shape[-2] == v.shape[-2] == k.shape[-2], "Number of heads must be the same for q, k, v."
+        # KDA: Q and K always share a physical head count. V (and state,
+        # alpha/g, beta, O) use num_heads which may be larger — the
+        # "multi-value" flavor. When num_k_heads == num_heads this is MHA.
+        assert q.shape[-2] == k.shape[-2], "q and k must have the same head count"
+        assert q.shape[-1] == k.shape[-1] == v.shape[-1], "q, k, v must share head dim"
+        num_heads = v.shape[-2]
+        num_k_heads = q.shape[-2]
+        assert num_heads % num_k_heads == 0, \
+            f"num_heads ({num_heads}) must be a multiple of num_k_heads ({num_k_heads})"
 
-        batch_size, seq_len, num_heads, head_dim = q.shape
+        batch_size, seq_len, _, head_dim = v.shape
 
         if cu_seqlens is None:
             cu_seqlens = prepare_uniform_cu_seqlens(batch_size, seq_len, q.device, torch.int32)
@@ -88,10 +96,14 @@ class HopperChunkKDAFunction(torch.autograd.Function):
             q, q_rstd = l2norm_fwd(q)
             k, k_rstd = l2norm_fwd(k)
 
-        # reshape to packed [T, H, K] for the C++ kernel
+        # reshape to packed layouts for the C++ kernel:
+        #   Q, K  -> [T, num_k_heads, head_dim]
+        #   V     -> [T, num_heads,   head_dim]
+        #   g     -> [T, num_heads,   head_dim]   (alpha, per state head)
+        #   beta  -> [T, num_heads]                (per state head)
         packed_seq = batch_size * seq_len
-        q = q.reshape(packed_seq, num_heads, head_dim).contiguous()
-        k = k.reshape(packed_seq, num_heads, head_dim).contiguous()
+        q = q.reshape(packed_seq, num_k_heads, head_dim).contiguous()
+        k = k.reshape(packed_seq, num_k_heads, head_dim).contiguous()
         v = v.reshape(packed_seq, num_heads, head_dim).contiguous()
         g = g.reshape(packed_seq, num_heads, head_dim).contiguous()
         beta = beta.reshape(packed_seq, num_heads).contiguous()
@@ -151,25 +163,36 @@ def cula_kda_prefill(
     r"""
     Hopper (SM90) fully-fused KDA forward prefill using CUTLASS TMA warp-specialized kernel.
 
+    Supports both plain multi-head attention (MHA) and KDA's "multi-value"
+    grouped variant, where Q and K share `num_k_heads` physical heads and V
+    (together with the recurrent state, `g`, `beta`, and output) has the
+    larger `num_heads`. `num_heads` must be a multiple of `num_k_heads`;
+    each group of `num_heads / num_k_heads` consecutive state heads shares
+    one physical Q/K head. `num_k_heads == num_heads` is MHA, which is the
+    default when Q/V have the same head count.
+
     Args:
         q (torch.Tensor):
-            queries of shape `[B, T, H, K]`.
+            queries of shape `[B, T, num_k_heads, head_dim]`.
         k (torch.Tensor):
-            keys of shape `[B, T, H, K]`.
+            keys of shape `[B, T, num_k_heads, head_dim]`.
         v (torch.Tensor):
-            values of shape `[B, T, H, V]`.
+            values of shape `[B, T, num_heads, head_dim]`.
         g (torch.Tensor):
-            (forget) gating tensor (in log space!) of shape `[B, T, H, K]`.
+            (forget) gating tensor (in log space!) of shape
+            `[B, T, num_heads, head_dim]` — per state head.
         beta (torch.Tensor):
-            betas of shape `[B, T, H]`.
+            betas of shape `[B, T, num_heads]` — per state head.
         scale (Optional[float]):
             Scale factor for the KDA attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[N, H, K, V]` for `N` input sequences.
+            Initial state of shape `[N, num_heads, head_dim, head_dim]` for
+            `N` input sequences — one state matrix per state head.
             Default: `None`.
         output_final_state (Optional[bool]):
-            Whether to output the final state of shape `[N, H, K, V]`. Default: `False`.
+            Whether to output the final state of shape
+            `[N, num_heads, head_dim, head_dim]`. Default: `False`.
         use_qk_l2norm_in_kernel (bool):
             Whether to apply L2norm to the q,k tensor internally. Default: `False`.
         use_gate_in_kernel (bool):
@@ -217,12 +240,22 @@ def cula_kda_prefill(
             if not (-5 <= lower_bound < 0):
                 raise ValueError(f"`lower_bound` must be in the safe range [-5, 0), got {lower_bound}.")
 
-    assert q.shape == k.shape == g.shape, "q, k, g must have the same shape."
-    assert beta.shape == q.shape[:3], "beta must be of shape (batch size, seq len, num of head)."
-    assert v.shape == (*q.shape[:3], v.shape[-1]), "v must be of shape (batch size, seq len, num of head, head dim)."
+    # Shapes:
+    #   q, k: [B, T, num_k_heads, head_dim]  (Q and K share num_k_heads)
+    #   v:    [B, T, num_heads,   head_dim]  (num_heads is also state head count)
+    #   g:    [B, T, num_heads,   head_dim]  (per state/V head)
+    #   beta: [B, T, num_heads]              (per state/V head)
+    # num_k_heads == num_heads is plain MHA. num_k_heads < num_heads with
+    # num_heads % num_k_heads == 0 is the "multi-value" GQA flavor.
+    assert q.shape == k.shape, "q and k must have the same shape."
+    assert q.shape[:2] == v.shape[:2], "q and v must share (batch_size, seq_len)."
+    assert v.shape[:3] == g.shape[:3], "v and g must share (batch_size, seq_len, num_heads)."
+    assert beta.shape == v.shape[:3], "beta must be of shape (batch size, seq len, num_heads)."
     assert q.dtype == k.dtype == v.dtype == torch.bfloat16, "q, k, v must be in bfloat16."
     assert beta.dtype == torch.bfloat16 or beta.dtype == torch.float32, "beta must be in bfloat16 or float32."
     assert q.shape[-1] == k.shape[-1] == v.shape[-1] == 128, "Currently we only support head dim of 128 for KDA"
+    assert v.shape[-2] % q.shape[-2] == 0, \
+        f"num_heads (v.shape[-2]={v.shape[-2]}) must be divisible by num_k_heads (q.shape[-2]={q.shape[-2]})"
     if scale is None:
         scale = k.shape[-1] ** -0.5
     o, final_state = HopperChunkKDAFunction.apply(

@@ -57,7 +57,8 @@ launch_kda_fwd_prefill_kernel_gbai(
     int32_t head_size,
     int64_t total_seqlen,
     float scale,
-    int32_t sm_count) {
+    int32_t sm_count,
+    int32_t num_k_heads = 0) {
 #if defined(CULA_SM90A_ENABLED)
     constexpr bool HopperSupported = true;
 #else
@@ -104,9 +105,15 @@ launch_kda_fwd_prefill_kernel_gbai(
             Options>::Kernel>;
         using Arguments = typename Operation::Arguments;
 
-        // NOTE: LayoutQ/K/V in (seq, head_size, (b,h)) coordinate semantics
-
-        int32_t tok_stride = num_heads * head_size;
+        // NOTE: LayoutQ/K/V in (seq, head_size, (b,h)) coordinate semantics.
+        //
+        // KDA's "multi-value" GQA flavor: Q and K share a single physical
+        // head count (num_k_heads), while V matches num_heads (the state/grid
+        // head count). When num_k_heads==0 (default) or ==num_heads, the
+        // kernel runs as plain MHA and nothing visible to the caller changes.
+        int32_t effective_num_k_heads = num_k_heads > 0 ? num_k_heads : num_heads;
+        int32_t tok_stride_qk = effective_num_k_heads * head_size;  // Q, K
+        int32_t tok_stride_v = num_heads * head_size;               // V, O, alpha
         int32_t head_stride = head_size;
 
         Operation op;
@@ -118,15 +125,16 @@ launch_kda_fwd_prefill_kernel_gbai(
                     .num_seqs = num_seqs,
                     .num_heads = num_heads,
                     .head_size = head_size,
+                    .num_k_heads = effective_num_k_heads,
                 },
             .mainloop =
                 {
                     // clang-format off
-                .ptr_Q = (T*)q,      .dQ = {tok_stride, _1{}, head_stride},
-                .ptr_K = (T*)k,      .dK = {tok_stride, _1{}, head_stride},
-                .ptr_V = (T*)v,      .dV = {tok_stride, _1{}, head_stride},
-                .ptr_O = (T*)output, .dO = {tok_stride, _1{}, head_stride},
-                .ptr_Alpha = alpha,  .dAlpha = {tok_stride, _1{}, head_stride},
+                .ptr_Q = (T*)q,      .dQ = {tok_stride_qk, _1{}, head_stride},
+                .ptr_K = (T*)k,      .dK = {tok_stride_qk, _1{}, head_stride},
+                .ptr_V = (T*)v,      .dV = {tok_stride_v,  _1{}, head_stride},
+                .ptr_O = (T*)output, .dO = {tok_stride_v,  _1{}, head_stride},
+                .ptr_Alpha = alpha,  .dAlpha = {tok_stride_v, _1{}, head_stride},
                 .ptr_output_state = (float*)output_state,
                 .ptr_input_state  = (float*)input_state,
                 .scale = scale,

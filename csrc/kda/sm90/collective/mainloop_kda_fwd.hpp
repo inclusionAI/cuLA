@@ -505,16 +505,27 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         int64_t s = problem_size.total_seqlen;
         int64_t t = problem_size.total_seqlen;
         int32_t d = problem_size.head_size;
+        // num_k_heads == 0 means "same as num_heads" (plain MHA). Q and K
+        // physical heads always share a single count in KDA.
+        int32_t num_k_heads = problem_size.num_k_heads > 0
+            ? problem_size.num_k_heads
+            : problem_size.num_heads;
 
+        // Q TMA (operand A of QK^T). Q has num_k_heads along its head axis
+        // (Q shares its physical head count with K in KDA). The K operand
+        // constructed here is a dummy whose TMA is thrown away — only
+        // params_qk.tma_load_a for Q is read out below, so passing
+        // num_k_heads as L here is correct for the live TMA.
         auto params_qk = CollectiveMmaQK::to_underlying_arguments(
-            make_shape(s, t, d, problem_size.num_heads),
+            make_shape(s, t, d, num_k_heads),
             typename CollectiveMmaQK::Arguments{
                 args.ptr_Q, args.dQ, args.ptr_K, args.dK,  // never used, dummy
             },
             /*workspace=*/nullptr);
 
+        // K TMA (operand B of this collective). num_k_heads along L.
         auto params_kv_k = CollectiveMmaKV_G2S::to_underlying_arguments(
-            make_shape(d, d, s, problem_size.num_heads),
+            make_shape(d, d, s, num_k_heads),
             typename CollectiveMmaKV_G2S::Arguments{
                 args.ptr_V,
                 select<1, 0, 2>(args.dV),  // not used
@@ -523,6 +534,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             },
             /*workspace=*/nullptr);
 
+        // Alpha is per state/V head — uses num_heads along the head axis.
         auto alpha_shape = make_shape(s, d, problem_size.num_heads);
         auto alpha_stride = make_stride(
             get<0>(args.dAlpha),  // seqlen stride
@@ -537,6 +549,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             select<1, 2>(TileShapeQK{}),
             size<0>(ClusterShape{}));
 
+        // V TMA (operand A of this collective). V has num_heads along L —
+        // in KDA V matches the state/grid head count, NOT the Q/K count.
         auto params_kv_v = CollectiveMmaKV_G2S::to_underlying_arguments(
             make_shape(d, d, s, problem_size.num_heads),
             typename CollectiveMmaKV_G2S::Arguments{
