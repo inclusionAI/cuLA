@@ -304,8 +304,16 @@ def prepare_safe_gate_inputs(
 
 
 def prepare_safe_gate_inputs_gqa(
-    batch_size, T, num_heads, num_k_heads, D, device,
-    cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED, has_init_state=False,
+    batch_size,
+    T,
+    num_heads,
+    num_k_heads,
+    D,
+    device,
+    cu_seqlens=None,
+    chunk_size=CHUNK_SIZE,
+    seed=SEED,
+    has_init_state=False,
 ):
     """Prepare inputs for the "multi-value" GQA flavor of safe_gate KDA.
 
@@ -317,8 +325,7 @@ def prepare_safe_gate_inputs_gqa(
     ``repeat_interleave`` so MHA-only kernels can be run against the same
     logical inputs.
     """
-    assert num_heads % num_k_heads == 0, \
-        f"num_heads ({num_heads}) must be a multiple of num_k_heads ({num_k_heads})"
+    assert num_heads % num_k_heads == 0, f"num_heads ({num_heads}) must be a multiple of num_k_heads ({num_k_heads})"
     dtype = torch.bfloat16
     scale = D ** (-0.5)
     set_seed(seed)

@@ -56,8 +56,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         assert q.shape[-1] == k.shape[-1] == v.shape[-1], "q, k, v must share head dim"
         num_heads = v.shape[-2]
         num_k_heads = q.shape[-2]
-        assert num_heads % num_k_heads == 0, \
-            f"num_heads ({num_heads}) must be a multiple of num_k_heads ({num_k_heads})"
+        assert num_heads % num_k_heads == 0, f"num_heads ({num_heads}) must be a multiple of num_k_heads ({num_k_heads})"
 
         batch_size, seq_len, _, head_dim = v.shape
 
@@ -254,8 +253,9 @@ def cula_kda_prefill(
     assert q.dtype == k.dtype == v.dtype == torch.bfloat16, "q, k, v must be in bfloat16."
     assert beta.dtype == torch.bfloat16 or beta.dtype == torch.float32, "beta must be in bfloat16 or float32."
     assert q.shape[-1] == k.shape[-1] == v.shape[-1] == 128, "Currently we only support head dim of 128 for KDA"
-    assert v.shape[-2] % q.shape[-2] == 0, \
+    assert v.shape[-2] % q.shape[-2] == 0, (
         f"num_heads (v.shape[-2]={v.shape[-2]}) must be divisible by num_k_heads (q.shape[-2]={q.shape[-2]})"
+    )
     if scale is None:
         scale = k.shape[-1] ** -0.5
     o, final_state = HopperChunkKDAFunction.apply(

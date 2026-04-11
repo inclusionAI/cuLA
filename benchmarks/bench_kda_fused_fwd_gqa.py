@@ -75,7 +75,7 @@ cula_kda_fused_fwd = get_kda_fused_fwd(_device)
 # the V / state head count (= grid dim). num_k_heads is Q and K's shared
 # physical head count. k_group_size = num_heads / num_k_heads.
 MODEL_CONFIGS = [
-    ("Qwen3.5-35B-A3B",   32, 16, 128),  # k_group_size = 2
+    ("Qwen3.5-35B-A3B", 32, 16, 128),  # k_group_size = 2
     ("Qwen3.5-122B-A10B", 64, 16, 128),  # k_group_size = 4
 ]
 WARMUP = 25
@@ -210,16 +210,31 @@ def bench_fixed(configs, model_tag, H, HK, D):
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
         inputs = prepare_safe_gate_inputs_gqa(
-            B, T, H, HK, D, device, cu_seqlens=cu_seqlens, has_init_state=HAS_INIT_STATE,
+            B,
+            T,
+            H,
+            HK,
+            D,
+            device,
+            cu_seqlens=cu_seqlens,
+            has_init_state=HAS_INIT_STATE,
         )
         q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
         A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
         scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
 
         gqa_kwargs = dict(
-            q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-            A_log=A_log, dt_bias=dt_bias, init_state=init_state,
-            cu_seqlens=cu_seqlens, lower_bound=lower_bound,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            init_state=init_state,
+            cu_seqlens=cu_seqlens,
+            lower_bound=lower_bound,
         )
         expanded_kwargs = dict(
             **gqa_kwargs,
@@ -287,16 +302,31 @@ def bench_varlen(configs, model_tag, H, HK, D):
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
         inputs = prepare_safe_gate_inputs_gqa(
-            1, T, H, HK, D, device, cu_seqlens=cu_seqlens, has_init_state=HAS_INIT_STATE,
+            1,
+            T,
+            H,
+            HK,
+            D,
+            device,
+            cu_seqlens=cu_seqlens,
+            has_init_state=HAS_INIT_STATE,
         )
         q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
         A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
         scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
 
         gqa_kwargs = dict(
-            q=q, k=k, v=v, g=g, beta=beta, scale=scale,
-            A_log=A_log, dt_bias=dt_bias, init_state=init_state,
-            cu_seqlens=cu_seqlens, lower_bound=lower_bound,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            init_state=init_state,
+            cu_seqlens=cu_seqlens,
+            lower_bound=lower_bound,
         )
         expanded_kwargs = dict(
             **gqa_kwargs,
@@ -356,7 +386,9 @@ def print_report(fixed_results, varlen_results, model_tag, H, HK, D):
     print(f"\n\n{sep}")
     print(f"                 BENCHMARK REPORT [{model_tag}]: cula_kda_fused_fwd multi-value GQA")
     print(f"                 cuLA {_SM_TAG} native GQA  vs  cuLA MHA + host expand  vs  FLA Triton + host expand")
-    print(f"                 H={H}  HK={HK}  k_group_size={H // HK}  D={D}  dtype=bf16  safe_gate=True  has_init_state={HAS_INIT_STATE}")
+    print(
+        f"                 H={H}  HK={HK}  k_group_size={H // HK}  D={D}  dtype=bf16  safe_gate=True  has_init_state={HAS_INIT_STATE}"
+    )
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
     mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")

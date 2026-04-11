@@ -89,9 +89,7 @@ struct CollectiveLoadTma {
         // treated as num_k_heads == num_heads (plain MHA) by the host side,
         // but we guard again here for safety on device paths that may bypass
         // the scheduler wiring.
-        int32_t num_k_heads = problem_size.num_k_heads > 0
-            ? problem_size.num_k_heads
-            : problem_size.num_heads;
+        int32_t num_k_heads = problem_size.num_k_heads > 0 ? problem_size.num_k_heads : problem_size.num_heads;
         Tensor g = [&] {
             if constexpr (kind == LoadKind::kQ) {
                 DPRINTF0_W(
@@ -122,7 +120,7 @@ struct CollectiveLoadTma {
                 Tensor m_varlen_head = tma_load.get_tma_tensor(make_shape(
                     problem_size.total_seqlen,
                     problem_size.head_size,
-                    problem_size.num_heads));  // alpha has num_heads along head axis
+                    problem_size.num_heads));                                   // alpha has num_heads along head axis
                 Tensor m_varlen = m_varlen_head(_, _, work_desc.o_head_idx());  // slice per state head
                 Tensor m_offset = domain_offset(
                     make_coord(work_desc.tok_offset, _0{}),

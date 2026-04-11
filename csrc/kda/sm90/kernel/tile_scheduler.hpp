@@ -29,7 +29,7 @@ struct WorkDesc {
     int32_t k_group_size = 1;  // num_heads / num_k_heads. Q and K share the
                                // same physical head = head_idx / k_group_size.
                                // k_group_size == 1 is plain MHA.
-    int64_t tok_offset;  // offset to the start of the start
+    int64_t tok_offset;        // offset to the start of the start
 
     // shape
     int64_t seq_len;

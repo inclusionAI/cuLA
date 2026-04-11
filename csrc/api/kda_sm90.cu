@@ -50,17 +50,18 @@ kda_fwd_prefill(
     auto num_seqs = cu_seqlens.size(0) - 1;
 
     // Q and K share a head count in KDA (they meet in Q*K^T).
-    TORCH_CHECK(num_k_heads == k.size(1),
-                "KDA requires q.size(1) == k.size(1), got ", num_k_heads, " vs ", k.size(1));
+    TORCH_CHECK(num_k_heads == k.size(1), "KDA requires q.size(1) == k.size(1), got ", num_k_heads, " vs ", k.size(1));
     // V's head dim must match Q/K (same hidden per-head projection width).
-    TORCH_CHECK(head_size == k.size(2),
-                "KDA requires q and k head dim to match, got ", head_size, " vs ", k.size(2));
-    TORCH_CHECK(head_size == v.size(2),
-                "KDA requires q and v head dim to match, got ", head_size, " vs ", v.size(2));
+    TORCH_CHECK(head_size == k.size(2), "KDA requires q and k head dim to match, got ", head_size, " vs ", k.size(2));
+    TORCH_CHECK(head_size == v.size(2), "KDA requires q and v head dim to match, got ", head_size, " vs ", v.size(2));
     // num_heads must be a multiple of num_k_heads so k_group_size is integer.
-    TORCH_CHECK(num_heads % num_k_heads == 0,
-                "KDA requires num_heads % num_k_heads == 0 (num_heads=",
-                num_heads, ", num_k_heads=", num_k_heads, ")");
+    TORCH_CHECK(
+        num_heads % num_k_heads == 0,
+        "KDA requires num_heads % num_k_heads == 0 (num_heads=",
+        num_heads,
+        ", num_k_heads=",
+        num_k_heads,
+        ")");
 
     // Allocate output if not provided. Shape is [packed_seq, num_heads, head_size]
     // because O carries one value-stream per state/V head.
