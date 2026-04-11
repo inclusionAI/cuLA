@@ -319,11 +319,10 @@ def prepare_safe_gate_inputs_gqa(
 
     Q and K use ``num_k_heads`` physical heads while V, g, beta, and state
     use the larger ``num_heads`` (= num_value_heads = state heads). This
-    matches Qwen3.5-A3B Gated DeltaNet.
-
-    Also returns host-expanded Q and K (``q_exp``, ``k_exp``) under
-    ``repeat_interleave`` so MHA-only kernels can be run against the same
-    logical inputs.
+    matches Qwen3.5-A3B Gated DeltaNet. Callers that need to compare
+    against an MHA-only kernel are expected to ``repeat_interleave`` Q and
+    K on their side — this helper intentionally does not pre-materialise
+    the expansion so the cost stays visible in their timed block.
     """
     assert num_heads % num_k_heads == 0, f"num_heads ({num_heads}) must be a multiple of num_k_heads ({num_k_heads})"
     dtype = torch.bfloat16
@@ -342,12 +341,6 @@ def prepare_safe_gate_inputs_gqa(
     if batch_size != 1:
         q, k, v, g, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g, beta))
 
-    # Host-expanded Q/K, matching V's head count. This is what users have to
-    # construct today to call a MHA-only fused KDA prefill kernel.
-    k_group_size = num_heads // num_k_heads
-    q_exp = q.repeat_interleave(k_group_size, dim=2).contiguous()
-    k_exp = k.repeat_interleave(k_group_size, dim=2).contiguous()
-
     chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
 
     init_state = None
@@ -358,8 +351,6 @@ def prepare_safe_gate_inputs_gqa(
     return dict(
         q=q,
         k=k,
-        q_exp=q_exp,
-        k_exp=k_exp,
         v=v,
         g=g,
         beta=beta,

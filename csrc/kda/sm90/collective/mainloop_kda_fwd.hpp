@@ -505,9 +505,11 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         int64_t s = problem_size.total_seqlen;
         int64_t t = problem_size.total_seqlen;
         int32_t d = problem_size.head_size;
-        // num_k_heads == 0 means "same as num_heads" (plain MHA). Q and K
-        // physical heads always share a single count in KDA.
-        int32_t num_k_heads = problem_size.num_k_heads > 0 ? problem_size.num_k_heads : problem_size.num_heads;
+        // Q and K physical heads always share a single count in KDA. The
+        // host entry point normalises a sentinel 0 to `num_heads` before
+        // constructing the launcher Arguments, so `problem_size.num_k_heads`
+        // is guaranteed positive here (== num_heads in plain MHA).
+        int32_t num_k_heads = problem_size.num_k_heads;
 
         // Q TMA (operand A of QK^T). Q has num_k_heads along its head axis
         // (Q shares its physical head count with K in KDA). The K operand

@@ -94,11 +94,11 @@ struct IndividualTileScheduler {
         TileShape const& tile_shape) {
         dim3 grid(0, 1, 1);
         grid.x = problem_size.num_seqs * problem_size.num_heads;
-        // num_k_heads == 0 means "same as num_heads" (MHA). The host wrapper
-        // can leave num_k_heads unset and the kernel behaves exactly as before.
-        int32_t effective_num_k_heads =
-            problem_size.num_k_heads > 0 ? problem_size.num_k_heads : problem_size.num_heads;
-        int32_t k_group_size = problem_size.num_heads / effective_num_k_heads;
+        // The host entry point normalises a sentinel num_k_heads==0 to
+        // `num_heads` before building the launcher Arguments, so
+        // `problem_size.num_k_heads` is guaranteed positive here (== num_heads
+        // in plain MHA). Dividing is therefore always safe.
+        int32_t k_group_size = problem_size.num_heads / problem_size.num_k_heads;
         DPRINTF(
             "to_underlying_arguments: grid:{.x:%d, .y:%d, .z:%d}, num_seqs:%d, "
             "num_heads:%d, num_k_heads:%d, k_group_size:%d\n",
@@ -107,7 +107,7 @@ struct IndividualTileScheduler {
             grid.z,
             problem_size.num_seqs,
             problem_size.num_heads,
-            effective_num_k_heads,
+            problem_size.num_k_heads,
             k_group_size);
         return {
             .grid = grid,

@@ -188,6 +188,7 @@ def test_safe_gate_chunk(
 # in both paths — they are already per-state-head.
 
 
+@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
 @pytest.mark.parametrize(
     ("B", "T", "num_heads", "num_k_heads", "D", "use_qk_l2norm_in_kernel", "dtype"),
     [
@@ -215,6 +216,7 @@ def test_multi_value_gqa(
     D: int,
     use_qk_l2norm_in_kernel: bool,
     dtype: torch.dtype,
+    beta_dtype: torch.dtype,
 ):
     """GQA output must match MHA output on repeat_interleave'd Q/K."""
     assert num_heads % num_k_heads == 0, "num_heads must be a multiple of num_k_heads"
@@ -229,7 +231,7 @@ def test_multi_value_gqa(
     v = torch.rand(B, T, num_heads, D, dtype=dtype)
     # g and beta are per state/V head in both paths
     g = F.logsigmoid(torch.randn(B, T, num_heads, D, dtype=torch.float)).clamp(-5, 0)
-    beta = torch.randn(B, T, num_heads, dtype=torch.float32).sigmoid().to(torch.float32)
+    beta = torch.randn(B, T, num_heads, dtype=torch.float32).sigmoid().to(beta_dtype)
     h0 = torch.randn(B, num_heads, D, D, dtype=torch.float32)
     h0_vk = h0.transpose(-1, -2).contiguous()
 

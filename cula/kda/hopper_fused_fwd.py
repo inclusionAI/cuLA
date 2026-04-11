@@ -248,7 +248,9 @@ def cula_kda_prefill(
     # num_heads % num_k_heads == 0 is the "multi-value" GQA flavor.
     assert q.shape == k.shape, "q and k must have the same shape."
     assert q.shape[:2] == v.shape[:2], "q and v must share (batch_size, seq_len)."
-    assert v.shape[:3] == g.shape[:3], "v and g must share (batch_size, seq_len, num_heads)."
+    # g is per state/V head with shape [B, T, num_heads, head_dim] — same as v
+    # because KDA pins head_k_dim == head_v_dim.
+    assert v.shape == g.shape, "v and g must have the same shape."
     assert beta.shape == v.shape[:3], "beta must be of shape (batch size, seq len, num_heads)."
     assert q.dtype == k.dtype == v.dtype == torch.bfloat16, "q, k, v must be in bfloat16."
     assert beta.dtype == torch.bfloat16 or beta.dtype == torch.float32, "beta must be in bfloat16 or float32."

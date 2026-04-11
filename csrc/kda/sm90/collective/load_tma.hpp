@@ -85,11 +85,11 @@ struct CollectiveLoadTma {
         constexpr auto HeadSize = decltype(get<2>(tile_shape))::value;
 
         // KDA's multi-value flavor: Q and K share num_k_heads physical heads
-        // while V (and state/alpha/beta) use num_heads. num_k_heads == 0 is
-        // treated as num_k_heads == num_heads (plain MHA) by the host side,
-        // but we guard again here for safety on device paths that may bypass
-        // the scheduler wiring.
-        int32_t num_k_heads = problem_size.num_k_heads > 0 ? problem_size.num_k_heads : problem_size.num_heads;
+        // while V (and state/alpha/beta) use num_heads. The host entry point
+        // already normalises a sentinel 0 to `num_heads` before packing the
+        // launcher Arguments, so `problem_size.num_k_heads` is guaranteed
+        // positive here (== num_heads in plain MHA).
+        int32_t num_k_heads = problem_size.num_k_heads;
         Tensor g = [&] {
             if constexpr (kind == LoadKind::kQ) {
                 DPRINTF0_W(
