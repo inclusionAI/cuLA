@@ -303,6 +303,69 @@ def prepare_safe_gate_inputs(
     )
 
 
+def prepare_safe_gate_inputs_gqa(
+    batch_size, T, num_heads, num_k_heads, D, device,
+    cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED, has_init_state=False,
+):
+    """Prepare inputs for the "multi-value" GQA flavor of safe_gate KDA.
+
+    Q and K use ``num_k_heads`` physical heads while V, g, beta, and state
+    use the larger ``num_heads`` (= num_value_heads = state heads). This
+    matches Qwen3.5-A3B Gated DeltaNet.
+
+    Also returns host-expanded Q and K (``q_exp``, ``k_exp``) under
+    ``repeat_interleave`` so MHA-only kernels can be run against the same
+    logical inputs.
+    """
+    assert num_heads % num_k_heads == 0, \
+        f"num_heads ({num_heads}) must be a multiple of num_k_heads ({num_k_heads})"
+    dtype = torch.bfloat16
+    scale = D ** (-0.5)
+    set_seed(seed)
+
+    q = torch.randn(batch_size, T, num_k_heads, D, dtype=dtype, device=device).requires_grad_(False)
+    k = torch.randn(batch_size, T, num_k_heads, D, dtype=dtype, device=device).requires_grad_(False)
+    v = torch.randn(batch_size, T, num_heads, D, dtype=dtype, device=device).requires_grad_(False)
+    g = torch.randn(batch_size, T, num_heads, D, dtype=dtype, device=device).requires_grad_(False)
+    beta = torch.randn(batch_size, T, num_heads, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
+
+    A_log = torch.randn(num_heads, dtype=torch.float, device=device).requires_grad_(False)
+    dt_bias = torch.randn(num_heads * D, dtype=torch.float, device=device).requires_grad_(False)
+
+    if batch_size != 1:
+        q, k, v, g, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g, beta))
+
+    # Host-expanded Q/K, matching V's head count. This is what users have to
+    # construct today to call a MHA-only fused KDA prefill kernel.
+    k_group_size = num_heads // num_k_heads
+    q_exp = q.repeat_interleave(k_group_size, dim=2).contiguous()
+    k_exp = k.repeat_interleave(k_group_size, dim=2).contiguous()
+
+    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
+
+    init_state = None
+    if has_init_state:
+        num_seqs = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else batch_size
+        init_state = torch.randn(num_seqs, num_heads, D, D, dtype=torch.float, device=device).requires_grad_(False)
+
+    return dict(
+        q=q,
+        k=k,
+        q_exp=q_exp,
+        k_exp=k_exp,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        init_state=init_state,
+        lower_bound=-5.0,
+    )
+
+
 def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED):
     """Prepare preprocessed inputs ready for chunk_kda_fwd_intra.
 
