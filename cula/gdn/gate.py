@@ -2,14 +2,14 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-
+from fla.ops.utils.index import prepare_chunk_indices
 from fla.ops.utils.op import exp
 from fla.ops.utils.softplus import softplus
-from fla.ops.utils.index import prepare_chunk_indices
 from fla.utils import autotune_cache_kwargs, input_guard
 
 BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [4, 8, 16, 32]
+
 
 def naive_gdn_gate(
     g: torch.Tensor,
@@ -33,12 +33,12 @@ def naive_gdn_gate(
     Returns:
         Output tensor of shape `[..., H]` .
     """
-    H = g.shape[-1]
     g = g.float()
     if dt_bias is not None:
         g = g + dt_bias
     g = (-A_log.float().exp() * F.softplus(g.float())).to(output_dtype)
     return g
+
 
 # naive gdn lowerbound method based off of fla.ops.kda.gate
 def naive_gdn_lowerbound_gate(
@@ -46,30 +46,29 @@ def naive_gdn_lowerbound_gate(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor | None = None,
     lower_bound: float = -5.0,
-    output_dtype: torch.dtype = torch.float32
+    output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    num_heads = g.shape[-1]
     g = g.float()
     if dt_bias is not None:
         g = g + dt_bias
     g = lower_bound * F.sigmoid(A_log.exp() * g)
     return g.to(output_dtype)
 
-@triton.heuristics({
-    "HAS_BIAS": lambda args: args["dt_bias"] is not None,
-    'HAS_SCALE': lambda args: args['scale'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-    'USE_LOWER_BOUND': lambda args: args['lower_bound'] is not None,
-})
+
+@triton.heuristics(
+    {
+        "HAS_BIAS": lambda args: args["dt_bias"] is not None,
+        "HAS_SCALE": lambda args: args["scale"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
+    }
+)
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps)
-        for num_warps in [2, 4, 8]
-    ],
-    key=['H', 'BT', 'IS_VARLEN', 'REVERSE'],
+    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [2, 4, 8]],
+    key=["H", "BT", "IS_VARLEN", "REVERSE"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def gdn_gate_chunk_cumsum_scalar_kernel(
     s,
     A_log,
@@ -97,9 +96,8 @@ def gdn_gate_chunk_cumsum_scalar_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
 
-
-    p_s = tl.make_block_ptr(s + bos*H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-    p_o = tl.make_block_ptr(o + bos*H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
+    p_s = tl.make_block_ptr(s + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
+    p_o = tl.make_block_ptr(o + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     # [BT]
     b_s = tl.load(p_s, boundary_check=(0)).to(tl.float32)
 
@@ -149,8 +147,11 @@ def gdn_gate_chunk_cumsum_lowerbound(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     assert chunk_size == 2 ** (chunk_size.bit_length() - 1), "chunk_size must be a power of 2"
 
-    g_org, g = g, torch.empty_like(g, dtype = output_dtype or g.dtype)
-    def grid(meta): return (NT, B * H)
+    g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
+
+    def grid(meta):
+        return (NT, B * H)
+
     gdn_gate_chunk_cumsum_scalar_kernel[grid](
         s=g_org,
         A_log=A_log,

@@ -14,7 +14,4 @@
 
 from cula.gdn.hopper_fused_fwd import cula_gdn_prefill as gdn_prefill_hopper
 
-__all__ = [
-    "gdn_prefill_hopper"
-]
-
+__all__ = ["gdn_prefill_hopper"]

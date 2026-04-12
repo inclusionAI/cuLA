@@ -14,18 +14,17 @@
 
 import torch
 from einops import rearrange
-
 from fla.modules.l2norm import l2norm_fwd
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 import cula.cudac as cula_cuda
-from cula.utils import _get_cache_buf, assert_hopper, get_device_sm_count, prepare_uniform_cu_seqlens
 from cula.gdn.gate import gdn_gate_chunk_cumsum_lowerbound
+from cula.utils import _get_cache_buf, assert_hopper, get_device_sm_count, prepare_uniform_cu_seqlens
+
 
 class HopperChunkGDNFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     @autocast_custom_fwd
@@ -40,13 +39,13 @@ class HopperChunkGDNFunction(torch.autograd.Function):
         dt_bias: torch.Tensor,
         scale: float,
         initial_state: torch.Tensor,
-        output_final_state : bool = False,
-        use_qk_l2norm_in_kernel : bool = False,
-        use_gate_in_kernel : bool = False,
-        safe_gate : bool = False,
-        lower_bound : float | None = None,
-        cu_seqlens : torch.IntTensor | None = None,
-        chunk_indices : torch.IntTensor | None = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        use_gate_in_kernel: bool = False,
+        safe_gate: bool = False,
+        lower_bound: float | None = None,
+        cu_seqlens: torch.IntTensor | None = None,
+        chunk_indices: torch.IntTensor | None = None,
     ):
         chunk_size = 64
         assert q.shape[-2] == v.shape[-2] == k.shape[-2], "Number of heads must be the same across q, k, v"
@@ -55,11 +54,11 @@ class HopperChunkGDNFunction(torch.autograd.Function):
 
         if cu_seqlens is None:
             cu_seqlens = prepare_uniform_cu_seqlens(batch_size, seq_len, q.device, torch.int32)
-        
+
         # after setting up cu_seqlens, set batch size to 1
         if batch_size != 1:
-            q, k, v, g, beta = map(lambda x : rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g, beta))
-        
+            q, k, v, g, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g, beta))
+
         # compute gate inside kernel
         if use_gate_in_kernel:
             if safe_gate:
@@ -72,15 +71,11 @@ class HopperChunkGDNFunction(torch.autograd.Function):
                 scale=RCP_LN2,
                 cu_seqlens=cu_seqlens,
                 chunk_indices=chunk_indices,
-                lower_bound=lower_bound
+                lower_bound=lower_bound,
             )
         else:
             g = chunk_local_cumsum(
-                g=g,
-                chunk_size=chunk_size,
-                scale=RCP_LN2,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices
+                g=g, chunk_size=chunk_size, scale=RCP_LN2, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
             )
 
         q_rstd, k_rstd = None, None
@@ -116,15 +111,13 @@ class HopperChunkGDNFunction(torch.autograd.Function):
             scale,
             safe_gate,
         )
-        o = rearrange(o, "(b t) h d -> b t h d", b = batch_size)
+        o = rearrange(o, "(b t) h d -> b t h d", b=batch_size)
         return o.to(q.dtype), final_state
-    
+
     @staticmethod
     @input_guard
     @autocast_custom_bwd
-    def backward(
-        ctx, do, dht
-    ):
+    def backward(ctx, do, dht):
         raise NotImplementedError("Backward pass not implemented yet")
 
 

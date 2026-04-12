@@ -280,8 +280,6 @@ struct FlatKernelTmaWarpSpecializedGdnFwd {
         v_pipeline_params.is_leader = lane_predicate && (ldst_warp_role == LdStWarpRole::LoadQKV);
         v_pipeline_params.num_consumers = NumStateMathThreads;
 
-        
-
         OPipelineParams o_pipeline_params;
         o_pipeline_params.producer_arv_count = NumStateMathThreads;
         o_pipeline_params.consumer_arv_count = cutlass::NumThreadsPerWarp;
@@ -297,7 +295,8 @@ struct FlatKernelTmaWarpSpecializedGdnFwd {
         AlphaPipelineParams alpha_pipeline_params;
         if constexpr (NeedsAlpha) {
             alpha_pipeline_params.producer_arv_count = cutlass::NumThreadsPerWarp;
-            alpha_pipeline_params.consumer_arv_count = NumAuxMathThreads + NumStateMathThreads + cutlass::NumThreadsPerWarp;
+            alpha_pipeline_params.consumer_arv_count =
+                NumAuxMathThreads + NumStateMathThreads + cutlass::NumThreadsPerWarp;
         }
 
         AlphaLastPipelineParams alpha_last_pipeline_params;

@@ -210,7 +210,7 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
     //     make_shape(
     //         shape<1>(TileShapeQK{}),
     //         Int<StagesAlpha::value>{})));                     // (blk_kv), (64)
-    
+
     // using GmemTiledCopyAlpha = cute::SM90_TMA_LOAD;
     // using TMA_Alpha = decltype(make_tma_copy(
     //     GmemTiledCopyAlpha{},
@@ -298,7 +298,7 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
         ElementO,
         ElementAccumulatorO,
         /*Smem*/ ElementO,
-        decltype(select<1, 0, 2>(LayoutO{})), // creates mn-major atom in store_tma.hpp
+        decltype(select<1, 0, 2>(LayoutO{})),  // creates mn-major atom in store_tma.hpp
         StagesO::value>;
 
     // layout for compute
@@ -309,7 +309,6 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
     using KVSmemLayoutK = SmemLayoutK_DS;
     using KVSmemLayoutV = SmemLayoutV_DS;
     using QKScaledSmemLayoutKt = SmemLayoutQ_K_Scaled_DS;
-
 
     // layout for compute output
     using SmemLayoutQK = decltype(tile_to_shape(
@@ -372,8 +371,8 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
     using GmemStrideBeta = Stride<int64_t, int32_t>;
     using GmemLayoutBeta = Layout<Shape<int64_t, int32_t>, GmemStrideBeta>;  // (seq, head)
 
-    using GmemShapeAlpha = Shape<int64_t, int32_t>;  // (seqlen_k, h)
-    using GmemStrideAlpha = Stride<int64_t, int32_t>; // TODO: depends on gate cumsum output, so we won't hardset to 1
+    using GmemShapeAlpha = Shape<int64_t, int32_t>;    // (seqlen_k, h)
+    using GmemStrideAlpha = Stride<int64_t, int32_t>;  // TODO: depends on gate cumsum output, so we won't hardset to 1
     using GmemLayoutAlpha = Layout<GmemShapeAlpha, GmemStrideAlpha>;
 
     // only store the last Alpha value, either end of chunk or end of sequence
@@ -455,16 +454,16 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
     using LoadK = CollectiveLoadTma<LoadKind::kK, MainloopKPipeline, Element, KVSmemLayoutK, TMA_K>;
     using LoadV = CollectiveLoadTma<LoadKind::kV, MainloopVPipeline, Element, KVSmemLayoutV, TMA_V>;
     // using LoadAlpha =
-        // CollectiveLoadTma<LoadKind::kAlpha, MainloopAlphaPipeline, ElementAlpha, QKQSmemLayoutAlpha, TMA_Alpha>;
+    // CollectiveLoadTma<LoadKind::kAlpha, MainloopAlphaPipeline, ElementAlpha, QKQSmemLayoutAlpha, TMA_Alpha>;
     using LoadAlpha = CollectiveLoadVector<
-        LoadKindVector::kAlpha, 
-        MainloopAlphaPipeline, 
+        LoadKindVector::kAlpha,
+        MainloopAlphaPipeline,
         ElementAlpha,
-        GmemLayoutAlpha, 
-        ElementAlpha, 
+        GmemLayoutAlpha,
+        ElementAlpha,
         SmemLayoutAlpha,
-        AlphaProcessor
-        >;
+        AlphaProcessor,
+        /*UseCPCopy=*/std::is_same_v<ElementAlpha, float>>;
 
     using LoadBeta = CollectiveLoadVector<
         LoadKindVector::kBeta,
@@ -473,7 +472,8 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
         GmemLayoutBeta,
         ElementBeta,
         SmemLayoutBeta,
-        BetaProcessor>;
+        BetaProcessor,
+        /*UseCPCopy=*/std::is_same_v<ElementBeta, float>>;
 
     struct Arguments {  // clang-format off
     Element const* ptr_Q; LayoutQ dQ;
@@ -499,7 +499,7 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
         float* ptr_output_state;
         float const* ptr_input_state;
 
-        ElementAlpha const * alpha_ptr;
+        ElementAlpha const* alpha_ptr;
         GmemLayoutAlpha alpha_layout;
         ElementBeta const* beta_ptr;
         GmemLayoutBeta beta_layout;
@@ -643,7 +643,7 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
             LoadBeta{params.beta_ptr, params.beta_layout, /*oob_value=*/0.0f, beta_pipeline, storage.smem_beta};
         // oob fill value for alpha is -INFINITY because of exp2f(alpha)
         auto alpha_collective_load =
-            LoadAlpha {params.alpha_ptr, params.alpha_layout, /*oob_value=*/0.0f, alpha_pipeline, storage.smem_alpha};
+            LoadAlpha{params.alpha_ptr, params.alpha_layout, /*oob_value=*/0.0f, alpha_pipeline, storage.smem_alpha};
         auto beta_src_dst = beta_collective_load.partition_SD(problem_size, tile_shape, work_desc);
         auto alpha_src_dst = alpha_collective_load.partition_SD(problem_size, tile_shape, work_desc);
 
@@ -820,7 +820,7 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
         auto const& cMkk = cMqk;
         auto tKKcMkk = kk_thr_mma.partition_C(cMkk);
 
-        // S@K  (-S K^T  +  V^T) - K and T 
+        // S@K  (-S K^T  +  V^T) - K and T
         auto sk_tiled_mma = TiledMmaSK{};
         auto sk_thr_mma = sk_tiled_mma.get_thread_slice(thread_idx);
 
@@ -945,9 +945,7 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
 
         auto s_decay = [&](auto& tKVrKV, auto const& alpha_last_smem_pipe_read) INLINE_LAMBDA {
             auto alpha_last_curr = AlphaLast(0, alpha_last_smem_pipe_read.index());
-            for_each(make_int_sequence<size(tKVcS)>{}, [&](auto i) {
-                tKVrKV(i) *= exp2f(alpha_last_curr);
-            });
+            for_each(make_int_sequence<size(tKVcS)>{}, [&](auto i) { tKVrKV(i) *= exp2f(alpha_last_curr); });
         };
 
         auto o1_epi = [&](auto& tOrO1) INLINE_LAMBDA {
@@ -1052,14 +1050,12 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
                         qk_thr_mma_rs_quar.partition_fragment_A(sKqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
                     auto tArA = make_fragment_like<ElementAlpha>(tQKrQ_wg);
 
-                    auto sA_cur = sAlpha_slice(_, _0{});
-                    #pragma unroll
+#pragma unroll
                     for (int v = 0; v < size(tArA); v++) {
-                        tArA(v) = sA_cur(get<0>(tQcMq_quar(v)));
+                        tArA(v) = sAlpha_slice((get<0>(tQcMq_quar(v))), _0{});
                     }
                     cute::transform(tArA, [](auto g) { return exp2f(g); });
                     for (int s = 0; s < 2; ++s) {
-
                         // S2R Q
                         auto sQqk_cur = sQqk_slice(_, _, _0{}, make_coord(s, wg_idx));
                         auto tQKsQ_cur = thr_load_qk_quar.partition_S(sQqk_cur);
@@ -1268,7 +1264,6 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
             if constexpr (!is_first_block) {
                 s_decay(tKVrKV, alpha_last_smem_pipe_read);
             }
-            
 
             // synchronize 2 WGs before rewriting sQ_K_scaled
             cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, GdnNamedBarriers::StateMath);
@@ -1281,12 +1276,10 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
                 // Allocate K/Alpha register fragments once (reused across slices)
                 auto tQKrK_wg = qk_thr_mma_rs_quar.partition_fragment_A(sKqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
                 auto tArA_wg = make_fragment_like<ElementAlpha>(tQKrK_wg);
-
-                auto sA_cur = sAlpha_slice(_, _0{});
-                // Dummy tensor to enable broadcast of alpha values across a row
-                #pragma unroll
+// Dummy tensor to enable broadcast of alpha values across a row
+#pragma unroll
                 for (int v = 0; v < size(tArA_wg); v++) {
-                    tArA_wg(v) = sA_cur(get<0>(tQcMq_quar(v)));
+                    tArA_wg(v) = sAlpha_slice(get<0>(tQcMq_quar(v)), _0{});
                 }
                 auto alpha_last = sAlast_curr(0);
                 for (int s = 0; s < 2; ++s) {
@@ -1302,7 +1295,7 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
                         auto [seq, _] = coord;
                         auto alpha = tArA_wg(i);
                         auto k = tQKrK_wg(i);
-                        auto k_scaled = Element(exp2f(alpha_last - alpha) * float(k)); 
+                        auto k_scaled = Element(exp2f(alpha_last - alpha) * float(k));
                         tQKrK_wg(i) = k_scaled;
                         if constexpr (is_final_block) {
                             if (seq >= B) {
@@ -1466,7 +1459,7 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
 
             // Alpha S2R: load in BF16 MMA layout so gating happens before the layout shuffle,
             // reducing register pressure (alpha can be freed before the shuffle).
-            // BF16-layout alpha copies for operand A and B (for element-wise gating)            
+            // BF16-layout alpha copies for operand A and B (for element-wise gating)
             auto alpha_Q_bf16_tiled_copy = make_tiled_copy_A(CopyAlphaAtom{}, tiledmma_bf16_subchunk);
             auto alpha_Kt_bf16_tiled_copy = make_tiled_copy_B(CopyAlphaAtom{}, tiledmma_bf16_subchunk);
             // Q/K S2R: LDSM copies using BF16 MMA layout for efficient ldmatrix loads
@@ -1498,7 +1491,7 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
             constexpr auto tiler_subchunk_beta = Shape<_16>{};
             auto sQqk_curr = sQqk(_, _, q_smem_pipe_read.index());
             auto sKqk_curr = sKqk(_, _, k_smem_pipe_read.index());
-            auto sAlpha_curr = Alpha(_, alpha_smem_pipe_read.index()); // (_64)
+            auto sAlpha_curr = Alpha(_, alpha_smem_pipe_read.index());  // (_64)
             Tensor sBeta_curr = Beta(_, beta_smem_pipe_read.index());
 
             // (_16,(_32,_1),_4,(_2,_2)):(_64,(_1,_0),_1024,(_32,_4096))
@@ -1539,14 +1532,12 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
             // layout)
             auto s2r_compute_subchunk_operandA = [&](auto r_, int j, int j0, int j1) INLINE_LAMBDA {
                 // S2R g_r_j in BF16 MMA operand A layout (single load)
-                Tensor sAlpha_r = sAlpha_slice(_, r_);
                 Tensor tArA_r = make_fragment_like<ElementAlpha>(tv_layout_bf16_mma_A);
-                // unrolled loop for explicit copy instead of using Cutlass copy
-                #pragma unroll
-                for (int v = 0 ; v < size(tArA_r); v++) {
-                    tArA_r(v) = sAlpha_r(get<0>(tQKaMqk_subchunk(v)));
+// unrolled loop for explicit copy instead of using Cutlass copy
+#pragma unroll
+                for (int v = 0; v < size(tArA_r); v++) {
+                    tArA_r(v) = sAlpha_slice(get<0>(tQKaMqk_subchunk(v)), r_);
                 }
-                
 
                 // Derive g_first (alpha[row=0, :]) from tArA_r_j via warp shuffle,
                 // directly into operand B layout (8 values instead of 16).
@@ -1562,8 +1553,8 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
                 // so g_first for index 4j+{0,2} = frag_B(2j), for 4j+{1,3} = frag_B(2j+1).
                 CUTE_UNROLL
                 for (int k = 0; k < 4; k++) {
-                    auto gf_lo = tArAfirst_r_j_kt(2 * k);                      // g_first at K = 2*t0
-                    auto gf_hi = tArAfirst_r_j_kt(2 * k + 1);                  // g_first at K = 2*t0+1
+                    auto gf_lo = tArAfirst_r_j_kt(2 * k);                  // g_first at K = 2*t0
+                    auto gf_hi = tArAfirst_r_j_kt(2 * k + 1);              // g_first at K = 2*t0+1
                     tArA_r(4 * k + 0) = exp2f(tArA_r(4 * k + 0) - gf_lo);  // v0=0, v1=0
                     tArA_r(4 * k + 1) = exp2f(tArA_r(4 * k + 1) - gf_hi);  // v0=1, v1=0
                     tArA_r(4 * k + 2) = exp2f(tArA_r(4 * k + 2) - gf_lo);  // v0=0, v1=1
@@ -1581,8 +1572,7 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
                 copy(Q_tiled_copy, tQKsQ_r_j, tQKrQ_r_j_bf16_cv);
                 // gate: Q * exp2(g - g_first) in BF16 MMA layout, producing float
                 Tensor tQKrQ_r_j_float = make_fragment_like<float>(tv_layout_bf16_mma_A);
-                cute::transform(
-                    tQKrQ_r_j_bf16, tArA_r, tQKrQ_r_j_float, [&](auto q, auto g) { return float(q) * g; });
+                cute::transform(tQKrQ_r_j_bf16, tArA_r, tQKrQ_r_j_float, [&](auto q, auto g) { return float(q) * g; });
                 // convert BF16 MMA layout → TF32 MMA layout in-place via warp shuffles
                 convert_bf16_to_tf32_operandA_layout(tQKrQ_r_j_float, local_thread_idx);
                 // NOTE: triton tl.dot also lets MMA hardware for truncation
@@ -1595,8 +1585,7 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
                 Tensor tQKrK_r_j_bf16_cv = Q_thr_copy.retile_D(tQKrK_r_j_bf16);
                 copy(Q_tiled_copy, tQKsK_r_j, tQKrK_r_j_bf16_cv);
                 Tensor tQKrK_r_j_float = make_fragment_like<float>(tv_layout_bf16_mma_A);
-                cute::transform(
-                    tQKrK_r_j_bf16, tArA_r, tQKrK_r_j_float, [&](auto k, auto g) { return float(k) * g; });
+                cute::transform(tQKrK_r_j_bf16, tArA_r, tQKrK_r_j_float, [&](auto k, auto g) { return float(k) * g; });
                 // convert BF16 MMA layout → TF32 MMA layout in-place via warp shuffles
                 convert_bf16_to_tf32_operandA_layout(tQKrK_r_j_float, local_thread_idx);
                 auto tQKrK_r_j = recast<ElementGatedMMA>(tQKrK_r_j_float);
@@ -1614,7 +1603,7 @@ struct FlatMainloopTmaWarpSpecializedGdnFwd {
                     // S2R g_c_j in BF16 MMA operand B layout
                     Tensor sAlpha_c = sAlpha_slice(_, c_);
                     Tensor tArA_c = make_fragment_like<ElementAlpha>(tv_layout_bf16_mma_B);
-                    #pragma unroll
+#pragma unroll
                     for (int v = 0; v < size(tArA_c); v++) {
                         tArA_c(v) = sAlpha_c(get<0>(tQKbMqk_subchunk(v)));
                     }

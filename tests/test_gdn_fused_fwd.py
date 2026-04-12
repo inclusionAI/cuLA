@@ -16,15 +16,16 @@
 
 # Adapted from flash-linear-attention: https://github.com/fla-org/flash-linear-attention/blob/main/tests/ops/test_kda.py
 
+"Comparing SM90 GDN Fused Prefill Kernel with FLA implementation"
 
 import pytest
 import torch
 import torch.nn.functional as F
-from fla.ops.gated_delta_rule import naive_recurrent_gated_delta_rule, chunk_gated_delta_rule
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule, naive_recurrent_gated_delta_rule
 from fla.utils import assert_close, device
 
-from cula.utils import get_gdn_fused_fwd
 from cula.gdn.gate import naive_gdn_gate
+from cula.utils import get_gdn_fused_fwd
 
 pytestmark = pytest.mark.sm90_only
 
@@ -273,7 +274,11 @@ def test_safe_gate_chunk_varlen(
     ref = []
     ref_ht = []
     for i in range(N):
-        g_slice = naive_gdn_gate_fn(g[:, cu_seqlens[i] : cu_seqlens[i + 1]], A_log, dt_bias) if use_gate_in_kernel else g[:, cu_seqlens[i] : cu_seqlens[i + 1]]
+        g_slice = (
+            naive_gdn_gate_fn(g[:, cu_seqlens[i] : cu_seqlens[i + 1]], A_log, dt_bias)
+            if use_gate_in_kernel
+            else g[:, cu_seqlens[i] : cu_seqlens[i + 1]]
+        )
         ref_i, ref_ht_i = naive_recurrent_gated_delta_rule(
             q=F.normalize(q[:, cu_seqlens[i] : cu_seqlens[i + 1]], p=2, dim=-1),
             k=k[:, cu_seqlens[i] : cu_seqlens[i + 1]],

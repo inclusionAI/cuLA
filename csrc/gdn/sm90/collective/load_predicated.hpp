@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include <cute/arch/copy_sm80.hpp>
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
 #include <cutlass/pipeline/sm90_pipeline.hpp>
@@ -79,7 +80,8 @@ template <
     class GmemLayout,
     class ElementDst,
     class SmemLayout,
-    class VectorProcessor_ = Unused>
+    class VectorProcessor_ = Unused,
+    bool UseCPCopy = false>
 struct CollectiveLoadVector {
     using SharedStorage = cute::array_aligned<ElementDst, cute::cosize_v<SmemLayout>>;
     using PipelineState = typename cutlass::PipelineState<Pipeline::Stages>;
@@ -144,17 +146,8 @@ struct CollectiveLoadVector {
     template <bool IsTail, class SrcDst>
     CUTE_DEVICE void
     step(SrcDst const& src_dst, int src_iter, PipelineState& dst_pipe, int num_iters, VectorProcessor processor = {}) {
-        auto src = get<0>(src_dst);
-        auto dst = get<1>(src_dst);
-
-        auto regs = make_fragment_like<ElementSrc>(take<0, 2>(shape(dst)));
-        if constexpr (!IsTail) {
-            copy(src(_, _, src_iter), regs);
-        } else {
-            auto mask = get<2>(src_dst);
-            fill(regs, src_oob_value_);
-            copy_if(mask, src(_, _, src_iter), regs);
-        }
+        auto& src = get<0>(src_dst);
+        auto& dst = get<1>(src_dst);
 
         int dst_pipe_idx = dst_pipe.index();
 
@@ -162,10 +155,33 @@ struct CollectiveLoadVector {
         pipeline_.producer_acquire(dst_pipe);
         cutlass::arch::fence_view_async_shared();
 
-        if constexpr (rank_v<SmemLayout> == 3) {
-            copy(regs, dst(_, _, _0{}, dst_pipe_idx));
+        auto dst_slice = [&]() -> decltype(auto) {
+            if constexpr (rank_v<SmemLayout> == 3) {
+                return dst(_, _, _0{}, dst_pipe_idx);
+            } else {
+                return dst(_, _, dst_pipe_idx);
+            }
+        }();
+
+        if constexpr (!IsTail && UseCPCopy) {
+            // Hot path: copy directly gmem→smem via cp.async, no register intermediate.
+            // This avoids the per-iteration register pressure from the fragment allocation.
+            using AsyncCopy = Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<ElementSrc>, ElementSrc>;
+            copy(AsyncCopy{}, src(_, _, src_iter), dst_slice);
+            cp_async_fence();
+            cp_async_wait<0>();
         } else {
-            copy(regs, dst(_, _, dst_pipe_idx));
+            // Either the tail path (called once, needs predicated fill) or UseCPCopy=false
+            // (register intermediate path).
+            auto regs = make_fragment_like<ElementSrc>(take<0, 2>(shape(dst)));
+            if constexpr (IsTail) {
+                auto mask = get<2>(src_dst);
+                fill(regs, src_oob_value_);
+                copy_if(mask, src(_, _, src_iter), regs);
+            } else {
+                copy(src(_, _, src_iter), regs);
+            }
+            copy(regs, dst_slice);
         }
 
         Tensor s = make_tensor(make_smem_ptr(storage_.data()), SmemLayout{});
