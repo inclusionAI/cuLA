@@ -33,22 +33,22 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from cula.kda import kda_decode
+from cula.kda import kda_decode, fused_sigmoid_gating_delta_rule_update
 
 
 # ---------------------------------------------------------------------------
 # PyTorch reference
 # ---------------------------------------------------------------------------
 def torch_kda_decode_ref(
-    q,          # (N, H, K) float32
-    k,          # (N, H, K) float32   (H here is the query/key head count)
-    v,          # (N, HV, V) float32
-    a,          # (N, HV, K) float32
-    b,          # (N, HV) float32
-    A_log,      # (HV,) float32
-    dt_bias,    # (HV, K) float32
-    state,      # (N, HV, V, K) float32
-    scale,      # float
+    q,  # (N, H, K) float32
+    k,  # (N, H, K) float32   (H here is the query/key head count)
+    v,  # (N, HV, V) float32
+    a,  # (N, HV, K) float32
+    b,  # (N, HV) float32
+    A_log,  # (HV,) float32
+    dt_bias,  # (HV, K) float32
+    state,  # (N, HV, V, K) float32
+    scale,  # float
     use_l2norm=True,
     softplus_beta=1.0,
     softplus_threshold=20.0,
@@ -126,13 +126,13 @@ def run_kda_decode_dense(q, k, v, a, b, A_log, dt_bias, state, scale):
     HV, V = v.shape[1], v.shape[2]
 
     # Reshape to dense layout: (N, 1, H, K), etc.
-    q_4d = q.unsqueeze(1).contiguous()                # (N, 1, H, K)
-    k_4d = k.unsqueeze(1).contiguous()                # (N, 1, H, K) — note: H not HV for k
-    v_4d = v.unsqueeze(1).contiguous()                # (N, 1, HV, V)
-    a_4d = a.unsqueeze(1).contiguous()                # (N, 1, HV, K)
-    b_3d = b.unsqueeze(1).contiguous()                # (N, 1, HV)
+    q_4d = q.unsqueeze(1).contiguous()  # (N, 1, H, K)
+    k_4d = k.unsqueeze(1).contiguous()  # (N, 1, H, K) — note: H not HV for k
+    v_4d = v.unsqueeze(1).contiguous()  # (N, 1, HV, V)
+    a_4d = a.unsqueeze(1).contiguous()  # (N, 1, HV, K)
+    b_3d = b.unsqueeze(1).contiguous()  # (N, 1, HV)
 
-    state_source = state.clone().contiguous()          # (N, HV, V, K)
+    state_source = state.clone().contiguous()  # (N, HV, V, K)
     indices = torch.arange(N, device=q.device, dtype=torch.int32)
 
     o = kda_decode(
@@ -158,13 +158,13 @@ def run_kda_decode_varlen(q, k, v, a, b, A_log, dt_bias, state, scale):
     HV, V = v.shape[1], v.shape[2]
 
     # Reshape to varlen layout: (1, N, H, K), etc.
-    q_4d = q.unsqueeze(0).contiguous()                # (1, N, H, K)
-    k_4d = k.unsqueeze(0).contiguous()                # (1, N, H, K)
-    v_4d = v.unsqueeze(0).contiguous()                # (1, N, HV, V)
-    a_3d = a.contiguous()                             # (N, HV, K) — varlen uses 3D
-    b_2d = b.contiguous()                             # (N, HV) — varlen uses 2D
+    q_4d = q.unsqueeze(0).contiguous()  # (1, N, H, K)
+    k_4d = k.unsqueeze(0).contiguous()  # (1, N, H, K)
+    v_4d = v.unsqueeze(0).contiguous()  # (1, N, HV, V)
+    a_3d = a.contiguous()  # (N, HV, K) — varlen uses 3D
+    b_2d = b.contiguous()  # (N, HV) — varlen uses 2D
 
-    state_source = state.clone().contiguous()          # (N, HV, V, K)
+    state_source = state.clone().contiguous()  # (N, HV, V, K)
     indices = torch.arange(N, device=q.device, dtype=torch.int32)
     cu_seqlens = torch.arange(N + 1, device=q.device, dtype=torch.int32)
 
@@ -192,10 +192,34 @@ def _assert_close(name, ref, actual, atol=3e-2, rtol=2e-2):
     max_diff = diff.max().item()
     mean_diff = diff.mean().item()
     ok = torch.allclose(ref.float(), actual.float(), atol=atol, rtol=rtol)
-    assert ok, (
-        f"{name}: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}, "
-        f"atol={atol}, rtol={rtol}"
+    assert ok, f"{name}: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}, atol={atol}, rtol={rtol}"
+
+
+def run_kda_decode_triton_compatible(q, k, v, a, b, A_log, dt_bias, state_kv, scale, fused_fn=None):
+    """Run the Triton-compatible cuLA decode API using AInfer-style inputs."""
+    N = q.shape[0]
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    out = q.new_empty(N, 1, v.shape[1], v.shape[2], dtype=torch.bfloat16)
+    fused_fn = fused_sigmoid_gating_delta_rule_update if fused_fn is None else fused_fn
+    o = fused_fn(
+        A_log=A_log,
+        a=a.reshape(N, 1, -1).to(torch.bfloat16),
+        dt_bias=dt_bias,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q.unsqueeze(1).to(torch.bfloat16),
+        k=k.unsqueeze(1).to(torch.bfloat16),
+        v=v.unsqueeze(1).to(torch.bfloat16),
+        b=b.unsqueeze(1).to(torch.bfloat16),
+        initial_state_source=state_kv,
+        initial_state_indices=indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=None,
+        is_kda=True,
+        out=out,
     )
+    return o.squeeze(1), state_kv.permute(0, 1, 3, 2).contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -210,13 +234,28 @@ def test_kda_decode_dense(N, H, HV):
 
     # Reference (fp32)
     o_ref, state_ref = torch_kda_decode_ref(
-        q.float(), k.float(), v.float(), a, b.float(),
-        A_log, dt_bias, state.clone(), scale,
+        q.float(),
+        k.float(),
+        v.float(),
+        a,
+        b.float(),
+        A_log,
+        dt_bias,
+        state.clone(),
+        scale,
     )
 
     # Kernel
     o_kernel, state_kernel = run_kda_decode_dense(
-        q, k, v, a, b, A_log, dt_bias, state, scale,
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        scale,
     )
 
     _assert_close("output", o_ref, o_kernel.float())
@@ -235,13 +274,28 @@ def test_kda_decode_varlen(N, H, HV):
 
     # Reference (fp32)
     o_ref, state_ref = torch_kda_decode_ref(
-        q.float(), k.float(), v.float(), a, b.float(),
-        A_log, dt_bias, state.clone(), scale,
+        q.float(),
+        k.float(),
+        v.float(),
+        a,
+        b.float(),
+        A_log,
+        dt_bias,
+        state.clone(),
+        scale,
     )
 
     # Kernel
     o_kernel, state_kernel = run_kda_decode_varlen(
-        q, k, v, a, b, A_log, dt_bias, state, scale,
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        scale,
     )
 
     _assert_close("output", o_ref, o_kernel.float())
@@ -258,12 +312,27 @@ def test_kda_decode_large_v(N):
     q, k, v, a, b, A_log, dt_bias, state = make_inputs(N, H, HV, K, V)
 
     o_ref, state_ref = torch_kda_decode_ref(
-        q.float(), k.float(), v.float(), a, b.float(),
-        A_log, dt_bias, state.clone(), scale,
+        q.float(),
+        k.float(),
+        v.float(),
+        a,
+        b.float(),
+        A_log,
+        dt_bias,
+        state.clone(),
+        scale,
     )
 
     o_kernel, state_kernel = run_kda_decode_dense(
-        q, k, v, a, b, A_log, dt_bias, state, scale,
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        scale,
     )
 
     _assert_close("output", o_ref, o_kernel.float())
@@ -280,16 +349,141 @@ def test_kda_decode_zero_state():
     state = torch.zeros(N, HV, V, K, device="cuda", dtype=torch.float32)
 
     o_ref, state_ref = torch_kda_decode_ref(
-        q.float(), k.float(), v.float(), a, b.float(),
-        A_log, dt_bias, state.clone(), scale,
+        q.float(),
+        k.float(),
+        v.float(),
+        a,
+        b.float(),
+        A_log,
+        dt_bias,
+        state.clone(),
+        scale,
     )
 
     o_kernel, state_kernel = run_kda_decode_dense(
-        q, k, v, a, b, A_log, dt_bias, state, scale,
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        scale,
     )
 
     _assert_close("output", o_ref, o_kernel.float())
     _assert_close("state", state_ref, state_kernel)
+
+
+def test_kda_decode_layout_defaults_to_vk():
+    N, H, HV, K, V = 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state_vk = make_inputs(N, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_decode_ref(
+        q.float(),
+        k.float(),
+        v.float(),
+        a,
+        b.float(),
+        A_log,
+        dt_bias,
+        state_vk.clone(),
+        scale,
+    )
+
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    out = q.new_empty(N, 1, HV, V, dtype=torch.bfloat16)
+    state_default = state_vk.clone().contiguous()
+    state_v_last = state_vk.permute(0, 1, 3, 2).contiguous()
+
+    o_default = fused_sigmoid_gating_delta_rule_update(
+        A_log=A_log,
+        a=a.reshape(N, 1, -1).to(torch.bfloat16),
+        dt_bias=dt_bias,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q.unsqueeze(1).to(torch.bfloat16),
+        k=k.unsqueeze(1).to(torch.bfloat16),
+        v=v.unsqueeze(1).to(torch.bfloat16),
+        b=b.unsqueeze(1).to(torch.bfloat16),
+        initial_state_source=state_default,
+        initial_state_indices=indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        is_kda=True,
+        out=out,
+    )
+
+    o_v_last = fused_sigmoid_gating_delta_rule_update(
+        A_log=A_log,
+        a=a.reshape(N, 1, -1).to(torch.bfloat16),
+        dt_bias=dt_bias,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q.unsqueeze(1).to(torch.bfloat16),
+        k=k.unsqueeze(1).to(torch.bfloat16),
+        v=v.unsqueeze(1).to(torch.bfloat16),
+        b=b.unsqueeze(1).to(torch.bfloat16),
+        initial_state_source=state_v_last,
+        initial_state_indices=indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        is_kda=True,
+        state_layout="kv",
+    )
+
+    _assert_close("default-vk output", o_ref, o_default.squeeze(1).float())
+    _assert_close("default-vk state", state_ref, state_default)
+    _assert_close("kv output", o_ref, o_v_last.squeeze(1).float())
+    _assert_close("kv state", state_ref, state_v_last.permute(0, 1, 3, 2).contiguous())
+
+
+def test_kda_decode_layout_mismatch_raises():
+    N, H, HV, K, V = 4, 8, 16, 128, 256
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state_vk = make_inputs(N, H, HV, K, V)
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    state_kv = state_vk.permute(0, 1, 3, 2).contiguous()
+
+    with pytest.raises(ValueError, match="State layout mismatch"):
+        fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            a=a.reshape(N, 1, -1).to(torch.bfloat16),
+            dt_bias=dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q.unsqueeze(1).to(torch.bfloat16),
+            k=k.unsqueeze(1).to(torch.bfloat16),
+            v=v.unsqueeze(1).to(torch.bfloat16),
+            b=b.unsqueeze(1).to(torch.bfloat16),
+            initial_state_source=state_kv,
+            initial_state_indices=indices,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+            is_kda=True,
+            state_layout="vk",
+        )
+
+    with pytest.raises(ValueError, match="State layout mismatch"):
+        fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            a=a.reshape(N, 1, -1).to(torch.bfloat16),
+            dt_bias=dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q.unsqueeze(1).to(torch.bfloat16),
+            k=k.unsqueeze(1).to(torch.bfloat16),
+            v=v.unsqueeze(1).to(torch.bfloat16),
+            b=b.unsqueeze(1).to(torch.bfloat16),
+            initial_state_source=state_vk,
+            initial_state_indices=indices,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+            is_kda=True,
+            state_layout="kv",
+        )
 
 
 if __name__ == "__main__":
