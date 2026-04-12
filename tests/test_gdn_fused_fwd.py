@@ -100,12 +100,11 @@ def test_safe_gate_chunk(
     if use_gate_in_kernel:
         A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(True), (A_log, dt_bias))
     q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(True), (q, k, v, g, beta, h0))
-
     ref, ref_ht = naive_recurrent_gated_delta_rule(
         q=F.normalize(q.clone(), p=2, dim=-1),
         k=F.normalize(k.clone(), p=2, dim=-1),
         v=v.clone(),
-        g=(naive_gdn_gate_fn(g, A_log, dt_bias) if use_gate_in_kernel else g.clone()),
+        g=(naive_gdn_gate_fn(g.clone(), A_log, dt_bias) if use_gate_in_kernel else g.clone()),
         beta=beta.clone(),
         initial_state=h0.clone(),
         output_final_state=True,
@@ -138,11 +137,10 @@ def test_safe_gate_chunk(
         safe_gate=safe_gate,
         lower_bound=lower_bound,
     )
-
-    assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
-    assert_close("o", ref_fla, tri, 0.005)
     assert_close("ht", ref_ht_fla, tri_ht, 0.005)
+    assert_close("o", ref, tri, 0.005)
+    assert_close("o", ref_fla, tri, 0.005)
 
 
 @pytest.mark.parametrize(

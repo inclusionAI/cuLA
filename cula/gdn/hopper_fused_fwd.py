@@ -74,10 +74,7 @@ class HopperChunkGDNFunction(torch.autograd.Function):
                 chunk_indices=chunk_indices,
                 lower_bound=lower_bound
             )
-            torch.cuda.synchronize()  # DEBUG: surface errors from gdn_gate_chunk_cumsum_lowerbound
-
         else:
-            print("launching FLA chunk local cumsum")
             g = chunk_local_cumsum(
                 g=g,
                 chunk_size=chunk_size,
@@ -85,7 +82,6 @@ class HopperChunkGDNFunction(torch.autograd.Function):
                 cu_seqlens=cu_seqlens,
                 chunk_indices=chunk_indices
             )
-            torch.cuda.synchronize()  # DEBUG: surface errors from chunk_local_cumsum
 
         q_rstd, k_rstd = None, None
         if use_qk_l2norm_in_kernel:
@@ -106,7 +102,6 @@ class HopperChunkGDNFunction(torch.autograd.Function):
 
         # call the C++ kernel
         # Signature:gdn_fwd_prefill(output_, output_state_, q, k, v, input_state_, alpha_, beta_, cu_seqlens, workspace, scale, safe_gate)
-        print("launching prefill kernel cpp")
         o, final_state = cula_cuda.gdn_fwd_prefill(
             None,  # output_ (auto-allocate)
             None,  # output_state_ (auto-allocate)
@@ -121,11 +116,6 @@ class HopperChunkGDNFunction(torch.autograd.Function):
             scale,
             safe_gate,
         )
-        torch.cuda.synchronize()  # DEBUG: surface errors from gdn_fwd_prefill kernel
-        print(f"DEBUG: o has nan={o.isnan().any().item()}, shape={o.shape}, dtype={o.dtype}")
-        print(f"DEBUG: final_state has nan={final_state.isnan().any().item()}, shape={final_state.shape}")
-        print(f"DEBUG: o[:3]={o.flatten()[:8].tolist()}")
-
         o = rearrange(o, "(b t) h d -> b t h d", b = batch_size)
         return o.to(q.dtype), final_state
     
