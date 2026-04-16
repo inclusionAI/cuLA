@@ -19,8 +19,7 @@ import importlib
 import torch
 import triton
 import triton.language as tl
-
-from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
+from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu
 from fla.ops.cp import FLACPContext
 from fla.ops.cp.chunk_delta_h import (
     chunk_gated_delta_rule_bwd_dhu_pre_process,
@@ -44,23 +43,23 @@ _delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h")
 chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
 
 BK_LIST = [32, 64] if check_shared_mem() else [16, 32]
-BV_LIST = [64, 128] if check_shared_mem('ampere') else [16, 32]
+BV_LIST = [64, 128] if check_shared_mem("ampere") else [16, 32]
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 
 
-@triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages) for num_warps in NUM_WARPS for num_stages in [2, 3, 4]
     ],
-    key=['H', 'K', 'V', 'BT', 'BK', 'BV'],
+    key=["H", "K", "V", "BT", "BK", "BV"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def chunk_kda_bwd_kernel_dAv(
     q,
     k,
@@ -98,7 +97,7 @@ def chunk_kda_bwd_kernel_dAv(
     dv += (bos * H + i_h) * V
     dA += (bos * H + i_h) * BT
 
-    p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (BT, T), (1, H*BT), (0, i_t * BT), (BT, BT), (0, 1))
+    p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (BT, T), (1, H * BT), (0, i_t * BT), (BT, BT), (0, 1))
     b_A = tl.load(p_A, boundary_check=(0, 1))
 
     o_t = i_t * BT + tl.arange(0, BT)
@@ -108,9 +107,9 @@ def chunk_kda_bwd_kernel_dAv(
 
     b_dA = tl.zeros([BT, BT], dtype=tl.float32)
     for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(v, (V, T), (1, H*V), (i_v * BV, i_t * BT), (BV, BT), (0, 1))
-        p_do = tl.make_block_ptr(do, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        p_dv = tl.make_block_ptr(dv, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        p_v = tl.make_block_ptr(v, (V, T), (1, H * V), (i_v * BV, i_t * BT), (BV, BT), (0, 1))
+        p_do = tl.make_block_ptr(do, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        p_dv = tl.make_block_ptr(dv, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         # [BV, BT]
         b_v = tl.load(p_v, boundary_check=(0, 1))
         # [BT, BV]
@@ -121,26 +120,28 @@ def chunk_kda_bwd_kernel_dAv(
         b_dv = tl.dot(b_A.to(b_do.dtype), b_do)
         tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
 
-    p_dA = tl.make_block_ptr(dA, (T, BT), (H*BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    b_dA = tl.where(o_t[:, None] >= o_t, b_dA * scale, 0.)
+    p_dA = tl.make_block_ptr(dA, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    b_dA = tl.where(o_t[:, None] >= o_t, b_dA * scale, 0.0)
     tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
 @triton.autotune(
     configs=[
-        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for BK in BK_LIST
         for BV in BV_LIST
         for num_warps in NUM_WARPS
         for num_stages in [2, 3, 4]
     ],
-    key=['BT', 'TRANSPOSE_STATE'],
+    key=["BT", "TRANSPOSE_STATE"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def chunk_kda_bwd_kernel_wy_dqkg_fused(
     q,
     k,
@@ -188,7 +189,7 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
 
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
-    m_last = (o_t == min(T, i_t * BT + BT) - 1)
+    m_last = o_t == min(T, i_t * BT + BT) - 1
 
     q += (bos * H + i_h) * K
     k += (bos * H + i_h) * K
@@ -197,9 +198,9 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
     g += (bos * H + i_h) * K
     beta += bos * H + i_h
     A += (bos * H + i_h) * BT
-    h += (i_tg * H + i_h) * K*V
+    h += (i_tg * H + i_h) * K * V
     do += (bos * H + i_h) * V
-    dh += (i_tg * H + i_h) * K*V
+    dh += (i_tg * H + i_h) * K * V
     dq += (bos * H + i_h) * K
     dk += (bos * H + i_h) * K
     dv += (bos * H + i_h) * V
@@ -221,12 +222,12 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
         o_k = i_k * BK + tl.arange(0, BK)
         m_k = o_k < K
 
-        p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_g = tl.make_block_ptr(g, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_g = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
 
-        p_gn = g + (min(T, i_t * BT + BT) - 1).to(tl.int64) * H*K + o_k
+        p_gn = g + (min(T, i_t * BT + BT) - 1).to(tl.int64) * H * K + o_k
         b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)
 
         b_dq = tl.zeros([BT, BK], dtype=tl.float32)
@@ -235,15 +236,15 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
         b_dgk = tl.zeros([BK], dtype=tl.float32)
 
         for i_v in range(tl.cdiv(V, BV)):
-            p_v_new = tl.make_block_ptr(v_new, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-            p_do = tl.make_block_ptr(do, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+            p_v_new = tl.make_block_ptr(v_new, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+            p_do = tl.make_block_ptr(do, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
             if TRANSPOSE_STATE:
                 p_h = tl.make_block_ptr(h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
                 p_dh = tl.make_block_ptr(dh, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
             else:
                 p_h = tl.make_block_ptr(h, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
                 p_dh = tl.make_block_ptr(dh, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
-            p_dv = tl.make_block_ptr(dv, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+            p_dv = tl.make_block_ptr(dv, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
             # [BT, BV]
             b_v_new = tl.load(p_v_new, boundary_check=(0, 1))
             b_do = tl.load(p_do, boundary_check=(0, 1))
@@ -259,8 +260,8 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
             b_dw += tl.dot(b_dv.to(b_v_new.dtype), b_h.to(b_v_new.dtype))
             tl.debug_barrier()  # DO NOT REMOVE THIS LINE!
             if i_k == 0:
-                p_v = tl.make_block_ptr(v, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-                p_dv2 = tl.make_block_ptr(dv2, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+                p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+                p_dv2 = tl.make_block_ptr(dv2, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
 
                 b_v = tl.load(p_v, boundary_check=(0, 1))
 
@@ -286,16 +287,16 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
         b_dkgb = tl.dot(b_A, b_dw)
         b_db += tl.sum(b_dkgb * b_kg, 1)
 
-        p_q = tl.make_block_ptr(q, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_q = tl.load(p_q, boundary_check=(0, 1))
         b_kdk = b_k * b_dk
         b_dgk += tl.sum(b_kdk, axis=0)
         b_dg = b_q * b_dq - b_kdk + m_last[:, None] * b_dgk + b_kg * b_dkgb * b_beta[:, None]
         b_dk = b_dk + b_dkgb * b_gb
 
-        p_dq = tl.make_block_ptr(dq, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_dk = tl.make_block_ptr(dk, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_dg = tl.make_block_ptr(dg, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_dq = tl.make_block_ptr(dq, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_dk = tl.make_block_ptr(dk, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_dg = tl.make_block_ptr(dg, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
         tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
         tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), boundary_check=(0, 1))
@@ -328,7 +329,7 @@ def chunk_kda_bwd_dAv(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     # H100 can have larger block size
-    if check_shared_mem('hopper', k.device.index):
+    if check_shared_mem("hopper", k.device.index):
         CONST_TILING = 128
     elif check_shared_mem:
         CONST_TILING = 64
@@ -466,7 +467,7 @@ def chunk_kda_bwd(
                 chunk_size=chunk_size,
                 cu_seqlens=cu_seqlens,
                 chunk_indices=chunk_indices,
-                lower_bound=lower_bound
+                lower_bound=lower_bound,
             )
         reset_cu_seqlens = False
         if cu_seqlens is None:
@@ -478,9 +479,7 @@ def chunk_kda_bwd(
         u = torch.empty_like(v)
         qg = torch.empty_like(q) if q is not None else None
         kg = torch.empty_like(k) if g is not None else None
-        cula_cuda.recompute_w_u_cuda(
-            k, v, beta, Akk, g, cu_seqlens, chunk_indices, w, u, kg, chunk_size, q, qg
-        )
+        cula_cuda.recompute_w_u_cuda(k, v, beta, Akk, g, cu_seqlens, chunk_indices, w, u, kg, chunk_size, q, qg)
         if cp_context is not None:
             # Restore the full initial_state tensor from the compressed version.
             # Only the first sequence's state is non-zero as it's the only one that could be cross-rank.
@@ -588,7 +587,7 @@ def chunk_kda_bwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
-        safe_gate=safe_gate
+        safe_gate=safe_gate,
     )
 
     dA, dbias = None, None
@@ -600,12 +599,6 @@ def chunk_kda_bwd(
         chunk_indices=chunk_indices,
     )
     if use_gate_in_kernel:
-        dg, dA, dbias = kda_gate_bwd(
-            g=g_org,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            dyg=dg,
-            lower_bound=lower_bound
-        )
+        dg, dA, dbias = kda_gate_bwd(g=g_org, A_log=A_log, dt_bias=dt_bias, dyg=dg, lower_bound=lower_bound)
 
     return dq, dk, dv, db, dg, dh0, dA, dbias

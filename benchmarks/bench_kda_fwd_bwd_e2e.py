@@ -51,9 +51,9 @@ from benchmarks.utils import (
     SEED,
     build_varlen_configs,
     exclusive_cumsum,
+    generate_random_seq_lens,
     prepare_safe_gate_inputs,
     set_seed,
-    generate_random_seq_lens,
 )
 from cula.kda import chunk_kda as cula_chunk_kda
 
@@ -203,10 +203,19 @@ def check_determinism(num_seqs=5, T=512, iters=20):
     dht = torch.randn_like(init_state)
 
     common = dict(
-        q=q, k=k, v=v, g=g, beta=beta,
-        scale=scale, A_log=A_log, dt_bias=dt_bias,
-        init_state=init_state, cu_seqlens=cu_seqlens,
-        lower_bound=lower_bound, do=do, dht=dht,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        init_state=init_state,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+        do=do,
+        dht=dht,
     )
 
     ref = run_kda_e2e_with_grads(**common, fn=cula_chunk_kda)
