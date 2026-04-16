@@ -331,7 +331,7 @@ def chunk_kda_bwd_dAv(
     # H100 can have larger block size
     if check_shared_mem("hopper", k.device.index):
         CONST_TILING = 128
-    elif check_shared_mem:
+    elif check_shared_mem():
         CONST_TILING = 64
     else:
         CONST_TILING = 32
