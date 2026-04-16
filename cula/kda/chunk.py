@@ -18,10 +18,10 @@
 import torch
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.ops.cp import FLACPContext
-from fla.ops.kda.chunk_bwd import chunk_kda_bwd
 from fla.ops.utils.index import prepare_chunk_indices
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
+from cula.kda.chunk_bwd import chunk_kda_bwd
 from cula.kda.chunk_fwd import chunk_kda_fwd
 
 
