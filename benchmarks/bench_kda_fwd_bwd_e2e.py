@@ -53,6 +53,7 @@ from benchmarks.utils import (
     exclusive_cumsum,
     prepare_safe_gate_inputs,
     set_seed,
+    generate_random_seq_lens,
 )
 from cula.kda import chunk_kda as cula_chunk_kda
 
@@ -179,6 +180,41 @@ def run_kda_e2e_with_grads(q, k, v, g, beta, scale, A_log, dt_bias, init_state, 
         dbeta=b_c.grad,
         dh0=h_c.grad,
     )
+
+
+# ============================================================
+# Determinism check
+# ============================================================
+def check_determinism(num_seqs=5, T=512, iters=20):
+    """Verify that cuLA chunk_kda produces identical outputs across repeated runs."""
+    device = torch.device("cuda")
+    set_seed(SEED)
+
+    seq_lens = generate_random_seq_lens(num_seqs, T, 63, seed=SEED)
+    cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
+
+    inputs = prepare_safe_gate_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens, has_init_state=True)
+    q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
+    A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
+    scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
+
+    set_seed(SEED + 1)
+    do = torch.randn_like(v)
+    dht = torch.randn_like(init_state)
+
+    common = dict(
+        q=q, k=k, v=v, g=g, beta=beta,
+        scale=scale, A_log=A_log, dt_bias=dt_bias,
+        init_state=init_state, cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound, do=do, dht=dht,
+    )
+
+    ref = run_kda_e2e_with_grads(**common, fn=cula_chunk_kda)
+    for i in range(iters):
+        out = run_kda_e2e_with_grads(**common, fn=cula_chunk_kda)
+        for name in ("o", "ht", "dq", "dk", "dv", "dg", "dbeta", "dh0"):
+            assert torch.equal(out[name], ref[name]), f"[determinism] cuLA {name} mismatch at iter {i}"
+    return True
 
 
 # ============================================================
@@ -514,6 +550,11 @@ def main():
         action="store_true",
         help="Disable recompute in both FLA and cuLA (pre-compute QG)",
     )
+    parser.add_argument(
+        "--check_determinism",
+        action="store_true",
+        help="Run determinism check: verify cuLA produces identical outputs across repeated runs",
+    )
     args = parser.parse_args()
 
     global NCU_MODE, SANITIZER_MODE, DISABLE_RECOMPUTE, PHASE
@@ -527,6 +568,15 @@ def main():
         DISABLE_RECOMPUTE = True
         print("[Disable recompute] pre-compute QG in forward")
     PHASE = args.phase
+
+    if args.check_determinism:
+        det_configs = [(5, 1024), (10, 4096), (10, 8192), (10, 16384)]
+        print("\n[Determinism Check] cuLA chunk_kda E2E ...")
+        for num_seqs, T in det_configs:
+            result = check_determinism(num_seqs=num_seqs, T=T, iters=20)
+            print(f"  num_seqs={num_seqs}  T={T:5d}  iters=20  {'PASS' if result else 'FAIL'}")
+        print("[Determinism Check] All passed.\n")
+        return
 
     fixed_configs = [
         # (B, T)
