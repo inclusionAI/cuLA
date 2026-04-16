@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/cuLA-logo.png" alt="cuLA Logo" width="200">
+<img src="docs/cuLA-logo.png" alt="cuLA Logo" width="600">
 
 # cuLA — CUDA Linear Attention
 
