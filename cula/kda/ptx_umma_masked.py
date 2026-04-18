@@ -20,9 +20,17 @@ TS (TMEM A, SMEM B):
     tcgen05.mma.cta_group::1.kind::tf32  [tmem_c], [tmem_a], desc_b,
                                           desc_val, {m0,m1,m2,m3}, p;
 
-WS (weight-stationary, SMEM A, SMEM B):
+WS_SS (weight-stationary, SMEM A, SMEM B):
     tcgen05.mma.ws.cta_group::1.kind::tf32  [tmem_c], desc_a, desc_b,
-                                             desc_val, p, 0;
+                                             desc_val, p;
+    tcgen05.mma.ws.cta_group::1.kind::f16   [tmem_c], desc_a, desc_b,
+                                             desc_val, p;
+
+WS_TS (weight-stationary, TMEM A, SMEM B):
+    tcgen05.mma.ws.cta_group::1.kind::tf32  [tmem_c], [tmem_a], desc_b,
+                                             desc_val, p;
+    tcgen05.mma.ws.cta_group::1.kind::f16   [tmem_c], [tmem_a], desc_b,
+                                             desc_val, p;
 
 ----------------------------------------------------------------------
 Disable-output-lane mask layout (4 × uint32 = 128 bits)
@@ -58,7 +66,10 @@ Low-level primitives (pass mask words explicitly):
                   mask0, mask1, mask2, mask3)
     tcgen05mma_ts(tmem_a, desc_b, tmem_c, desc_val, scale_out,
                   mask0, mask1, mask2, mask3)
-    tcgen05mma_ws_ss(desc_a, desc_b, tmem_c, desc_val, scale_out)
+    tcgen05mma_ws_ss_tf32(desc_a, desc_b, tmem_c, desc_val, scale_out)
+    tcgen05mma_ws_ts_tf32(tmem_a, desc_b, tmem_c, desc_val, scale_out)
+    tcgen05mma_ws_ss_f16(desc_a, desc_b, tmem_c, desc_val, scale_out)
+    tcgen05mma_ws_ts_f16(tmem_a, desc_b, tmem_c, desc_val, scale_out)
 
 Named convenience wrappers (pre-set masks, pass only MMA operands):
     tcgen05mma_ss_no_mask / tcgen05mma_ss_mask0 / …mask1 / …mask2 / …mask3
@@ -73,7 +84,10 @@ __all__ = [
     # low-level primitives
     "tcgen05mma_ss",
     "tcgen05mma_ts",
-    "tcgen05mma_ws_ss",
+    "tcgen05mma_ws_ss_tf32",
+    "tcgen05mma_ws_ts_tf32",
+    "tcgen05mma_ws_ss_f16",
+    "tcgen05mma_ws_ts_f16",
     # SS named wrappers
     "tcgen05mma_ss_no_mask",
     "tcgen05mma_ss_mask0",
@@ -495,11 +509,11 @@ def tcgen05mma_ts(
 
 
 # ---------------------------------------------------------------------------
-# tcgen05mma_ws_ss  —  weight-stationary, SMEM A, SMEM B
+# tcgen05mma_ws_ss_tf32  —  weight-stationary, SMEM A, SMEM B, kind::tf32
 # ---------------------------------------------------------------------------
 
 @cute.jit
-def tcgen05mma_ws_ss(
+def tcgen05mma_ws_ss_tf32(
     desc_a:    Tcgen05SmemDescriptor,
     desc_b:    Tcgen05SmemDescriptor,
     tmem_c:    int,
@@ -508,8 +522,8 @@ def tcgen05mma_ws_ss(
 ):
     """Issue ``tcgen05.mma.ws.cta_group::1.kind::tf32`` (weight-stationary form).
 
-    This variant does NOT take a ``disable-output-lane`` mask; the mask
-    operand is the integer literal ``0``.
+    This variant does NOT take a ``disable-output-lane`` mask; the
+    optional ``zero-column-mask-desc`` operand is omitted.
 
     Args:
         desc_a:    64-bit SMEM descriptor for matrix A.
@@ -523,7 +537,7 @@ def tcgen05mma_ws_ss(
         ".reg .pred p;\n"
         "setp.ne.b32 p, $4, 0;\n"
         "tcgen05.mma.ws.cta_group::1.kind::tf32 "
-        "[$0], $1, $2, $3, p, 0;\n"
+        "[$0], $1, $2, $3, p;\n"
         "}"
     )
 
@@ -550,6 +564,202 @@ def tcgen05mma_ws_ss(
     _do(
         cutlass.Int32(tmem_c),
         desc_a.desc_i64[0],
+        desc_b.desc_i64[0],
+        cutlass.Int32(desc_val),
+        cutlass.Int32(scale_out),
+    )
+
+
+# ---------------------------------------------------------------------------
+# tcgen05mma_ws_ss_f16  —  weight-stationary, SMEM A, SMEM B, kind::f16
+# ---------------------------------------------------------------------------
+
+@cute.jit
+def tcgen05mma_ws_ss_f16(
+    desc_a:    Tcgen05SmemDescriptor,
+    desc_b:    Tcgen05SmemDescriptor,
+    tmem_c:    int,
+    desc_val:  int,
+    scale_out: int,
+):
+    """Issue ``tcgen05.mma.ws.cta_group::1.kind::f16`` (weight-stationary form).
+
+    Same as the tf32 variant but uses ``.kind::f16`` for half-precision
+    input types (f16 / bf16).  K dimension is 16 instead of 8.
+
+    This variant does NOT take a ``disable-output-lane`` mask; the
+    optional ``zero-column-mask-desc`` operand is omitted.
+
+    Args:
+        desc_a:    64-bit SMEM descriptor for matrix A.
+        desc_b:    64-bit SMEM descriptor for matrix B.
+        tmem_c:    TMEM base address (uint32) for accumulators C/D.
+        desc_val:  High 32 bits of the UMMA instruction descriptor (idescE>>32).
+        scale_out: 1 → accumulate, 0 → overwrite.
+    """
+    asm_str = (
+        "{\n"
+        ".reg .pred p;\n"
+        "setp.ne.b32 p, $4, 0;\n"
+        "tcgen05.mma.ws.cta_group::1.kind::f16 "
+        "[$0], $1, $2, $3, p;\n"
+        "}"
+    )
+
+    @dsl_user_op
+    def _do(c_val, da_val, db_val, dv_val, sc_val, *, loc=None, ip=None):
+        llvm.inline_asm(
+            None,
+            [
+                _ir(c_val,  loc, ip),
+                _ir(da_val, loc, ip),
+                _ir(db_val, loc, ip),
+                _ir(dv_val, loc, ip),
+                _ir(sc_val, loc, ip),
+            ],
+            asm_str,
+            "r,l,l,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+
+    _do(
+        cutlass.Int32(tmem_c),
+        desc_a.desc_i64[0],
+        desc_b.desc_i64[0],
+        cutlass.Int32(desc_val),
+        cutlass.Int32(scale_out),
+    )
+
+
+# ---------------------------------------------------------------------------
+# tcgen05mma_ws_ts_tf32  —  weight-stationary, TMEM A, SMEM B, kind::tf32
+# ---------------------------------------------------------------------------
+
+@cute.jit
+def tcgen05mma_ws_ts_tf32(
+    tmem_a:    int,
+    desc_b:    Tcgen05SmemDescriptor,
+    tmem_c:    int,
+    desc_val:  int,
+    scale_out: int,
+):
+    """Issue ``tcgen05.mma.ws.cta_group::1.kind::tf32`` with TMEM A (weight-stationary).
+
+    Matrix A is read from TMEM via indirect addressing ``[tmem_a]``.
+    Matrix B is read from SMEM via descriptor.
+    This variant does NOT take a ``disable-output-lane`` mask; the
+    optional ``zero-column-mask-desc`` operand is omitted.
+
+    Args:
+        tmem_a:    TMEM base address (uint32) for matrix A.
+        desc_b:    64-bit SMEM descriptor for matrix B.
+        tmem_c:    TMEM base address (uint32) for accumulators C/D.
+        desc_val:  High 32 bits of the UMMA instruction descriptor (idescE>>32).
+        scale_out: 1 → accumulate, 0 → overwrite.
+    """
+    asm_str = (
+        "{\n"
+        ".reg .pred p;\n"
+        "setp.ne.b32 p, $4, 0;\n"
+        "tcgen05.mma.ws.cta_group::1.kind::tf32 "
+        "[$0], [$1], $2, $3, p;\n"
+        "}"
+    )
+
+    @dsl_user_op
+    def _do(c_val, a_val, db_val, dv_val, sc_val, *, loc=None, ip=None):
+        llvm.inline_asm(
+            None,
+            [
+                _ir(c_val,  loc, ip),
+                _ir(a_val,  loc, ip),
+                _ir(db_val, loc, ip),
+                _ir(dv_val, loc, ip),
+                _ir(sc_val, loc, ip),
+            ],
+            asm_str,
+            "r,r,l,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+
+    _do(
+        cutlass.Int32(tmem_c),
+        cutlass.Int32(tmem_a),
+        desc_b.desc_i64[0],
+        cutlass.Int32(desc_val),
+        cutlass.Int32(scale_out),
+    )
+
+
+# ---------------------------------------------------------------------------
+# tcgen05mma_ws_ts_f16  —  weight-stationary, TMEM A, SMEM B, kind::f16
+# ---------------------------------------------------------------------------
+
+@cute.jit
+def tcgen05mma_ws_ts_f16(
+    tmem_a:    int,
+    desc_b:    Tcgen05SmemDescriptor,
+    tmem_c:    int,
+    desc_val:  int,
+    scale_out: int,
+):
+    """Issue ``tcgen05.mma.ws.cta_group::1.kind::f16`` with TMEM A (weight-stationary).
+
+    Same as the tf32 variant but uses ``.kind::f16`` for half-precision
+    input types (f16 / bf16).  K dimension is 16 instead of 8.
+
+    Matrix A is read from TMEM via indirect addressing ``[tmem_a]``.
+    Matrix B is read from SMEM via descriptor.
+    This variant does NOT take a ``disable-output-lane`` mask; the
+    optional ``zero-column-mask-desc`` operand is omitted.
+
+    Args:
+        tmem_a:    TMEM base address (uint32) for matrix A.
+        desc_b:    64-bit SMEM descriptor for matrix B.
+        tmem_c:    TMEM base address (uint32) for accumulators C/D.
+        desc_val:  High 32 bits of the UMMA instruction descriptor (idescE>>32).
+        scale_out: 1 → accumulate, 0 → overwrite.
+    """
+    asm_str = (
+        "{\n"
+        ".reg .pred p;\n"
+        "setp.ne.b32 p, $4, 0;\n"
+        "tcgen05.mma.ws.cta_group::1.kind::f16 "
+        "[$0], [$1], $2, $3, p;\n"
+        "}"
+    )
+
+    @dsl_user_op
+    def _do(c_val, a_val, db_val, dv_val, sc_val, *, loc=None, ip=None):
+        llvm.inline_asm(
+            None,
+            [
+                _ir(c_val,  loc, ip),
+                _ir(a_val,  loc, ip),
+                _ir(db_val, loc, ip),
+                _ir(dv_val, loc, ip),
+                _ir(sc_val, loc, ip),
+            ],
+            asm_str,
+            "r,r,l,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+
+    _do(
+        cutlass.Int32(tmem_c),
+        cutlass.Int32(tmem_a),
         desc_b.desc_i64[0],
         cutlass.Int32(desc_val),
         cutlass.Int32(scale_out),
