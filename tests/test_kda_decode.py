@@ -196,7 +196,7 @@ def _assert_close(name, ref, actual, atol=3e-2, rtol=2e-2):
 
 
 def run_kda_decode_triton_compatible(q, k, v, a, b, A_log, dt_bias, state_kv, scale, fused_fn=None):
-    """Run the Triton-compatible cuLA decode API using AInfer-style inputs."""
+    """Run the Triton-compatible cuLA decode API."""
     N = q.shape[0]
     indices = torch.arange(N, device=q.device, dtype=torch.int32)
     out = q.new_empty(N, 1, v.shape[1], v.shape[2], dtype=torch.bfloat16)
