@@ -14,7 +14,7 @@
 
 from cula.kda.chunk import chunk_kda
 from cula.kda.hopper_fused_fwd import cula_kda_prefill as kda_prefill_hopper
-from cula.kda.kda_decode import fused_sigmoid_gating_delta_rule_update, kda_decode
+from cula.ops.kda_decode import fused_sigmoid_gating_delta_rule_update, kda_decode
 
 __all__ = [
     "chunk_kda",

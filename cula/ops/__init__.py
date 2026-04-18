@@ -12,3 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from cula.ops.kda_decode import fused_sigmoid_gating_delta_rule_update, kda_decode
+
+__all__ = [
+    "kda_decode",
+    "fused_sigmoid_gating_delta_rule_update",
+]
+
