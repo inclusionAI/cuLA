@@ -30,7 +30,7 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 
-from cula.lightning.la_decode import linear_attention_decode
+from cula.ops.la_decode import linear_attention_decode
 
 try:
     from fla.ops.common.fused_recurrent import fused_recurrent_fwd

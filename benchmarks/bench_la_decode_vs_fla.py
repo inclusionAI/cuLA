@@ -55,7 +55,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from fla.ops.common.fused_recurrent import fused_recurrent_fwd, fused_recurrent_fwd_kernel
 
-from cula.lightning.la_decode import _get_compiled_kernel, linear_attention_decode
+from cula.ops.la_decode import _get_compiled_kernel, linear_attention_decode
 from cula.utils import USE_FAST_MATH
 
 
