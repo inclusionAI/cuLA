@@ -269,6 +269,7 @@ def benchmark_standard_config(B, T, H, D, layer_idx, num_layers, mode, warmup, i
     output_ht = mode == "h0_ht"
     h0 = torch.randn(B, H, D, D, dtype=torch.float32, device=DEVICE) * 0.01 if has_h0 else None
     h0_fla = h0.clone() if h0 is not None else None
+    h0_cute = h0.transpose(-1, -2).contiguous() if h0 is not None else None  # BHVK for CuTe
 
     result = {"B": B, "T": T, "H": H, "D": D, "mode": mode}
     ht_fla = None
@@ -286,7 +287,7 @@ def benchmark_standard_config(B, T, H, D, layer_idx, num_layers, mode, warmup, i
 
     # --- CuteDSL ---
     try:
-        o_cute, ht_cute, cute_ms, compile_ms = run_cutedsl(Q, K, V, decay, h0, output_ht, warmup, iters)
+        o_cute, ht_cute, cute_ms, compile_ms = run_cutedsl(Q, K, V, decay, h0_cute, output_ht, warmup, iters)
         result["cutedsl_ms"] = cute_ms
         result["compile_ms"] = compile_ms
     except Exception as e:
@@ -316,7 +317,9 @@ def benchmark_standard_config(B, T, H, D, layer_idx, num_layers, mode, warmup, i
             result[f"{label}_o_rmse_ratio"] = rmse / (rms + 1e-8)
             result[f"{label}_o_maxdiff"] = diff.abs().max().item()
             if output_ht and ht_naive is not None and ht_test is not None:
-                diff_ht = ht_naive - ht_test.float()
+                # CuTe kernel outputs BHVK state; transpose to BHKV for comparison
+                ht_cmp = ht_test.transpose(-1, -2).float() if label == "cute" else ht_test.float()
+                diff_ht = ht_naive - ht_cmp
                 ht_rms = ht_naive.pow(2).mean().sqrt().item()
                 ht_rmse = diff_ht.pow(2).mean().sqrt().item()
                 result[f"{label}_ht_rmse_ratio"] = ht_rmse / (ht_rms + 1e-8)
