@@ -225,6 +225,8 @@ def test_vs_fla(B):
     assert rmse / (max_ref + 1e-8) < 0.005, f"B={B}: vs fla mismatch, rel_rmse={rmse / (max_ref + 1e-8):.6f}"
 
     # ---------------------------------------------------------------------------
+
+
 # End-to-End Prefill -> Decode Test
 # ---------------------------------------------------------------------------
 def test_prefill_decode_e2e():
@@ -241,9 +243,7 @@ def test_prefill_decode_e2e():
     v_pre = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
 
     # 1. Run Prefill (Generates BHVK ht)
-    _, ht = lightning_attn_fwd(
-        q_pre, k_pre, v_pre, decay_scales, scale=scale, output_final_state=True
-    )
+    _, ht = lightning_attn_fwd(q_pre, k_pre, v_pre, decay_scales, scale=scale, output_final_state=True)
 
     # Dummy decode tokens
     q_dec = torch.randn(B, H, D, device="cuda", dtype=torch.bfloat16)
@@ -259,5 +259,7 @@ def test_prefill_decode_e2e():
     rmse = torch.sqrt(torch.mean((out_dec.float() - out_ref.float()) ** 2)).item()
     max_ref = torch.abs(out_ref.float()).max().item()
     assert rmse / (max_ref + 1e-8) < 0.01, "E2E Output mismatch"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
