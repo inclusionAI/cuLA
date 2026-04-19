@@ -35,7 +35,7 @@ from cutlass.cute.arch import (
 )
 import cutlass.utils.blackwell_helpers as sm100_utils
 
-from cula.kda.ptx_umma_masked import (
+from cula.ops.ptx_umma_ext import (
     Tcgen05SmemDescriptor,
     tcgen05mma_ss_no_mask,
     tcgen05mma_ss_mask0,

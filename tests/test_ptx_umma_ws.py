@@ -35,19 +35,16 @@ from cutlass.cute.arch import (
 )
 import cutlass.utils.blackwell_helpers as sm100_utils
 
-from cula.kda.ptx_umma_masked import (
+from cula.ops.ptx_umma_ext import (
     Tcgen05SmemDescriptor,
     tcgen05mma_ws_ss_tf32,
-    tcgen05mma_ws_ts_tf32,
     tcgen05mma_ws_ss_f16,
-    tcgen05mma_ws_ts_f16,
 )
-from cula.ops.tmem_copy import tcgen05_ld_32x32b, tcgen05_st_32x32b
+from cula.ops.intrinsics_sm100 import tcgen05_ld_32x32b, tcgen05_st_32x32b, store_256b
 
 M_DIM, N_DIM = 64, 64
 K_DIM_TF32 = 8   # kind::tf32  → K=8
 K_DIM_F16  = 16  # kind::f16   → K≥16
-TMEM_COLS  = 32  # MN=(64×64) MMA → 128 lanes, 32 columns
 
 # Instruction descriptor for M=64, N=64, TF32, dense, TransposeB=1
 # Bits: M>>4=4 at [24:28], N>>3=8 at [17:22], TransposeB at [16],
@@ -70,6 +67,8 @@ class _WsSsTf32Kernel:
     @cute.kernel
     def kernel(self, A_in: cute.Tensor, B_in: cute.Tensor, C_out: cute.Tensor):
         M, N, K = M_DIM, N_DIM, K_DIM_TF32
+        ACC_NUM_COLS = 32
+        NUM_COLS = ACC_NUM_COLS
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -78,12 +77,12 @@ class _WsSsTf32Kernel:
         tmem_hold_ptr = smem.allocate(Int32)
         mbar_ptr      = smem.allocate(Int64, byte_alignment=8)
 
+        # --- SMEM layouts via sm100_utils (handles swizzle correctly for TF32) ---
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             TFloat32, tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.MN,
             Float32, tcgen05.CtaGroup.ONE, (M, N),
         )
         mma_tiler = (M, N, K)
-
         a_smem_layout = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler, TFloat32, 1)
         b_smem_layout = sm100_utils.make_smem_layout_b(tiled_mma, mma_tiler, TFloat32, 1)
         bufferA = smem.allocate_tensor(
@@ -101,7 +100,7 @@ class _WsSsTf32Kernel:
             mbarrier_init(mbar_ptr, 1)
         mbarrier_init_fence()
 
-        # Load A (M-major → swizzled SMEM) and B (row-major → swizzled SMEM)
+        # Load A (row-major input → K-major swizzled SMEM) and B
         gA_flat = cute.make_tensor(A_in.iterator, cute.make_layout(M * K))
         gB_flat = cute.make_tensor(B_in.iterator, cute.make_layout(K * N))
 
@@ -115,22 +114,19 @@ class _WsSsTf32Kernel:
             bufB_s0[idx] = gB_flat[idx]
         sync_threads()
 
-        # TMEM allocation
+        # --- TMEM allocation ---
         alloc_bar = pipeline.NamedBarrier(barrier_id=2, num_threads=128)
         tmem = utils.TmemAllocator(
             tmem_hold_ptr, barrier_for_retrieve=alloc_bar, allocator_warp_id=0,
         )
-        tmem.allocate(TMEM_COLS)
+        tmem.allocate(NUM_COLS)
         tmem.wait_for_alloc()
         tmem_ptr_f32 = tmem.retrieve_ptr(Float32)
 
-        acc_shape        = tiled_mma.partition_shape_C((M, N))
-        acc_shape_staged = cute.append(acc_shape, 1)
-        tCtAcc           = cute.make_tensor(tmem_ptr_f32, tiled_mma.make_fragment_C(acc_shape_staged).layout)
         tmem_col_buf     = cute.make_tensor(tmem_hold_ptr, cute.make_layout(1))
         tmem_col         = tmem_col_buf[0]
 
-        # Build descriptors
+        # Build SMEM descriptors (rank-2 vec_mode layout required)
         desc_a_i64 = smem_descriptor_to_int(make_umma_smem_desc(bufA_s0.iterator, bufA_s0.layout, "k"))
         desc_b_i64 = smem_descriptor_to_int(make_umma_smem_desc(bufB_s0.iterator, bufB_s0.layout, "mn"))
         desc_a = Tcgen05SmemDescriptor(desc_a_i64)
@@ -144,27 +140,23 @@ class _WsSsTf32Kernel:
         mbarrier_wait(mbar_ptr, 0)
         sync_threads()
 
-        # T2R → R2G
-        t2r_atom    = cute.make_copy_atom(tcgen05.Ld16x256bOp(Repetition(4), Pack.NONE), Float32)
-        fake_smem   = cute.make_tensor(cute.make_ptr(Float32, 0, cute.AddressSpace.smem),
-                                       cute.make_layout((M, N)))
-        tCtAcc_flat = tCtAcc[((None, None), 0, 0, None)]
-        tiled_t2r   = tcgen05.make_tmem_copy(t2r_atom, tCtAcc_flat[(None, None, 0)])
-        thr_t2r     = tiled_t2r.get_slice(tidx)
-        tTR_tAcc    = thr_t2r.partition_S(tCtAcc_flat)
-        tTR_sDummy  = thr_t2r.partition_D(fake_smem)
-        tTR_rAcc    = cute.make_rmem_tensor(tTR_sDummy.shape, Float32)
-
-        cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, 0)], tTR_rAcc)
+        # T2R via tcgen05_ld_32x32b
+        regs = tcgen05_ld_32x32b(ACC_NUM_COLS, tmem_col)
         cute.arch.fence_view_async_tmem_load()
 
-        gC     = cute.make_tensor(C_out.iterator, cute.make_layout((M, N), stride=(N, 1)))
-        tTR_gC = thr_t2r.partition_D(gC)
-        cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32), tTR_rAcc, tTR_gC)
+        # R2G via store_256b (4 × 256-bit stores per thread)
+        # Layout E (column-major warp order):
+        #   warp0->(M0,N0), warp1->(M1,N0), warp2->(M0,N1), warp3->(M1,N1)
+        lane_idx = tidx % 32
+        row      = (warp_idx %  2) * 32 + lane_idx
+        col_base = (warp_idx // 2) * 32
+        base_addr = (C_out.iterator + row * N + col_base).toint()
+        for chunk in cutlass.range_constexpr(ACC_NUM_COLS // 8):
+            store_256b(base_addr + chunk * 32, regs[chunk * 8 : chunk * 8 + 8])
 
         sync_threads()
         tmem.relinquish_alloc_permit()
-        tmem.free(tmem_ptr_f32, TMEM_COLS)
+        tmem.free(tmem_ptr_f32, NUM_COLS)
 
     @cute.jit
     def _launch(self, A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, stream):
@@ -213,6 +205,9 @@ class _WsTsTf32Kernel:
     @cute.kernel
     def kernel(self, A_in: cute.Tensor, B_in: cute.Tensor, C_out: cute.Tensor):
         M, N, K = M_DIM, N_DIM, K_DIM_TF32
+        ACC_NUM_COLS = 32
+        OPA_NUM_COLS = 4 # for (M,K)=(64,8), each warp processes 4 columns
+        NUM_COLS = OPA_NUM_COLS + ACC_NUM_COLS
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -267,110 +262,12 @@ class _WsTsTf32Kernel:
             bufB_s0[idx] = gB_flat[idx]
         sync_threads()
 
-        # --- Allocate TMEM: need space for A (MxK in TMEM) + C (MxN in TMEM) ---
-        # A in TMEM needs K=8 columns (tf32), C needs N=64 columns
-        # Total TMEM columns = K + N = 8 + 64 = 72, but must be aligned;
-        # allocate 128 columns to be safe
-        total_tmem_cols = 128
-        alloc_bar = pipeline.NamedBarrier(barrier_id=2, num_threads=128)
-        tmem = utils.TmemAllocator(
-            tmem_hold_ptr, barrier_for_retrieve=alloc_bar, allocator_warp_id=0,
-        )
-        tmem.allocate(total_tmem_cols)
-        tmem.wait_for_alloc()
-        tmem_ptr_f32 = tmem.retrieve_ptr(Float32)
-
-        tmem_col_buf = cute.make_tensor(tmem_hold_ptr, cute.make_layout(1))
-        tmem_base    = tmem_col_buf[0]
-
-        # TMEM A region starts at tmem_base (offset 0)
-        # TMEM C region starts at tmem_base + TMEM_COLS (offset 64)
-        tmem_a_col = tmem_base
-        tmem_c_col = tmem_base + TMEM_COLS
-
-        # --- Populate TMEM A via S2T copy ---
-        # Get the TMEM A layout from the TS tiled_mma
-        a_tmem_layout = sm100_utils.make_smem_layout_a(ts_tiled_mma, mma_tiler, TFloat32, 1)
-        tCrA_fake = ts_tiled_mma.make_fragment_A(a_tmem_layout.outer.shape)
-        tmem_a_ptr = cute.recast_ptr(tmem_ptr_f32, dtype=tCrA_fake.element_type)
-        tCrA = cute.make_tensor(tmem_a_ptr, tCrA_fake.layout)
-
-        # Build S2T copy to move A from SMEM → TMEM
-        copy_atom_s2t = cute.make_copy_atom(
-            tcgen05.Cp128x256bOp(tcgen05.CtaGroup.ONE), TFloat32,
-        )
-        tiled_copy_s2t = tcgen05.make_s2t_copy(copy_atom_s2t, tCrA[(None, None, None, 0)])
-        thr_copy_s2t = tiled_copy_s2t.get_slice(0)
-        tCsA_s2t_ = thr_copy_s2t.partition_S(bufA_s0)
-        tCsA_s2t = tcgen05.get_s2t_smem_desc_tensor(tiled_copy_s2t, tCsA_s2t_)
-        tCtA_s2t = thr_copy_s2t.partition_D(tCrA[(None, None, None, 0)])
-
-        # Execute S2T copy (single-thread semantics)
-        if warp_idx == cutlass.Int32(0):
-            with elect_one():
-                cute.copy(tiled_copy_s2t, tCsA_s2t, tCtA_s2t)
-                tcgen05.commit(mbar_ptr, cta_group=tcgen05.CtaGroup.ONE)
-        mbarrier_wait(mbar_ptr, 0)
-        sync_threads()
-
-        # Re-arm mbar
-        if tidx == cutlass.Int32(0):
-            mbarrier_init(mbar_ptr, 1)
-        mbarrier_init_fence()
-
-        # --- Build C accumulator in second TMEM region ---
-        # We need tmem_ptr offset by TMEM_COLS for the C region
-        acc_shape        = ts_tiled_mma.partition_shape_C((M, N))
-        acc_shape_staged = cute.append(acc_shape, 1)
-        tmem_c_ptr_f32   = tmem_ptr_f32 + TMEM_COLS
-        tCtAcc = cute.make_tensor(tmem_c_ptr_f32, ts_tiled_mma.make_fragment_C(acc_shape_staged).layout)
-
-        # Build B descriptor
-        desc_b_i64 = smem_descriptor_to_int(make_umma_smem_desc(bufB_s0.iterator, bufB_s0.layout, "mn"))
-        desc_b = Tcgen05SmemDescriptor(desc_b_i64)
-
-        # --- Issue WS TS MMA ---
-        if warp_idx == cutlass.Int32(0):
-            tcgen05mma_ws_ts_tf32(tmem_a_col, desc_b, tmem_c_col, IDESC_TF32_M64_N64, 0)
-            with elect_one():
-                tcgen05.commit(mbar_ptr, cta_group=tcgen05.CtaGroup.ONE)
-        mbarrier_wait(mbar_ptr, 0)
-        sync_threads()
-
-        # --- T2R → R2G ---
-        t2r_atom    = cute.make_copy_atom(tcgen05.Ld16x256bOp(Repetition(8), Pack.NONE), Float32)
-        fake_smem   = cute.make_tensor(cute.make_ptr(Float32, 0, cute.AddressSpace.smem),
-                                       cute.make_layout((M, N)))
-        tCtAcc_flat = tCtAcc[((None, None), 0, 0, None)]
-        tiled_t2r   = tcgen05.make_tmem_copy(t2r_atom, tCtAcc_flat[(None, None, 0)])
-        thr_t2r     = tiled_t2r.get_slice(tidx)
-        tTR_tAcc    = thr_t2r.partition_S(tCtAcc_flat)
-        tTR_sDummy  = thr_t2r.partition_D(fake_smem)
-        tTR_rAcc    = cute.make_rmem_tensor(tTR_sDummy.shape, Float32)
-
-        cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, 0)], tTR_rAcc)
-        cute.arch.fence_view_async_tmem_load()
-
-        gC     = cute.make_tensor(C_out.iterator, cute.make_layout((M, N), stride=(N, 1)))
-        tTR_gC = thr_t2r.partition_D(gC)
-        cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32), tTR_rAcc, tTR_gC)
-
-        sync_threads()
-        tmem.relinquish_alloc_permit()
-        tmem.free(tmem_ptr_f32, total_tmem_cols)
-
     @cute.jit
     def _launch(self, A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, stream):
         self.kernel(A, B, C).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
 
     def run(self, A_cpu, B_cpu):
-        A_gpu = A_cpu.contiguous().float().cuda()
-        B_gpu = B_cpu.contiguous().float().cuda()
-        C_gpu = torch.zeros(M_DIM, N_DIM, dtype=torch.float32, device="cuda")
-        stream = cutlass_torch.default_stream()
-        self._launch(from_dlpack(A_gpu), from_dlpack(B_gpu), from_dlpack(C_gpu), stream)
-        torch.cuda.synchronize()
-        return C_gpu.cpu()
+        raise NotImplementedError("TODO: implement this test following the pattern of _WsSsTf32Kernel, but with the two-step approach described in the docstring")
 
 
 # =====================================================================
@@ -381,6 +278,8 @@ class _WsSsF16Kernel:
     @cute.kernel
     def kernel(self, A_in: cute.Tensor, B_in: cute.Tensor, C_out: cute.Tensor):
         M, N, K = M_DIM, N_DIM, K_DIM_F16
+        ACC_NUM_COLS = 32
+        NUM_COLS = ACC_NUM_COLS
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -442,7 +341,7 @@ class _WsSsF16Kernel:
         tmem = utils.TmemAllocator(
             tmem_hold_ptr, barrier_for_retrieve=alloc_bar, allocator_warp_id=0,
         )
-        tmem.allocate(TMEM_COLS)
+        tmem.allocate(NUM_COLS)
         tmem.wait_for_alloc()
         tmem_ptr_f32 = tmem.retrieve_ptr(Float32)
 
@@ -470,9 +369,7 @@ class _WsSsF16Kernel:
         # Layout: warp0->(M0,N0), warp1->(M0,N1), warp2->(M1,N0), warp3->(M1,N1)
         # for 64x64 Acc, each warp process 32x32, with 128 lanes in TMEM all used
 
-        # TODO: R2G: direct st.global, following _store_256b in C++
-        NUM_COLS = 32
-        regs = tcgen05_ld_32x32b(NUM_COLS, tmem_col)
+        regs = tcgen05_ld_32x32b(ACC_NUM_COLS, tmem_col)
         cute.arch.fence_view_async_tmem_load()
 
         # Debug print: thread 0, first 4 register values
@@ -480,20 +377,23 @@ class _WsSsF16Kernel:
         #     cute.printf("[T2R] tid=0, regs[0..3] = %f, %f, %f, %f",
         #                 regs[0], regs[1], regs[2], regs[3])
 
-        # Write loaded regs to global memory for correctness check
+        # R2G via store_256b (4 × 256-bit stores per thread)
         # Layout E (column-major warp order):
         #   warp0->(M0,N0), warp1->(M1,N0), warp2->(M0,N1), warp3->(M1,N1)
         # in each warp, each thread process one row, T0->[0, 0:31], T1->[1, 0:31], ..., T31->[31, 0:31]
         lane_idx = tidx % 32
         row      = (warp_idx %  2) * 32 + lane_idx   # M0 or M1
         col_base = (warp_idx // 2) * 32               # N0 or N1
-        gC_flat  = cute.make_tensor(C_out.iterator, cute.make_layout(M * N))
-        for col in cutlass.range_constexpr(NUM_COLS):
-            gC_flat[row * N + col_base + col] = regs[col]
+        # 32 regs = 4 chunks of 8 FP32 each (256 bits)
+        # store_256b needs a raw i64 address → use iterator.toint() + byte offset
+        base_addr = (C_out.iterator + row * N + col_base).toint()
+        for chunk in cutlass.range_constexpr(ACC_NUM_COLS // 8):
+            # byte offset: chunk * 8 elements * 4 bytes/element
+            store_256b(base_addr + chunk * 32, regs[chunk * 8 : chunk * 8 + 8])
 
         sync_threads()
         tmem.relinquish_alloc_permit()
-        tmem.free(tmem_ptr_f32, TMEM_COLS)
+        tmem.free(tmem_ptr_f32, NUM_COLS)
 
     @cute.jit
     def _launch(self, A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, stream):
@@ -530,146 +430,13 @@ class _WsTsF16Kernel:
         tmem_hold_ptr = smem.allocate(Int32)
         mbar_ptr      = smem.allocate(Int64, byte_alignment=8)
 
-        # --- Build TS tiled_mma (A from TMEM) ---
-        ts_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            Float16, tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.MN,
-            Float32, tcgen05.CtaGroup.ONE, (M, N),
-            a_source=tcgen05.OperandSource.TMEM,
-        )
-        mma_tiler = (M, N, K)
-
-        # --- SMEM for A (needed to populate TMEM A via S2T copy) and B ---
-        ss_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            Float16, tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.MN,
-            Float32, tcgen05.CtaGroup.ONE, (M, N),
-        )
-        a_smem_layout = sm100_utils.make_smem_layout_a(ss_tiled_mma, mma_tiler, Float16, 1)
-        b_smem_layout = sm100_utils.make_smem_layout_b(ss_tiled_mma, mma_tiler, Float16, 1)
-
-        bufferA = smem.allocate_tensor(
-            element_type=Float16, layout=a_smem_layout.outer,
-            byte_alignment=128, swizzle=a_smem_layout.inner,
-        )
-        bufferB = smem.allocate_tensor(
-            element_type=Float16, layout=b_smem_layout.outer,
-            byte_alignment=128, swizzle=b_smem_layout.inner,
-        )
-        bufA_s0 = bufferA[(None, None, None, 0)]
-        bufB_s0 = bufferB[(None, None, None, 0)]
-
-        if tidx == cutlass.Int32(0):
-            mbarrier_init(mbar_ptr, 1)
-        mbarrier_init_fence()
-
-        # Load A and B into SMEM
-        gA_flat = cute.make_tensor(A_in.iterator, cute.make_layout(M * K))
-        gB_flat = cute.make_tensor(B_in.iterator, cute.make_layout(K * N))
-
-        for step in cutlass.range(M * K // 128, unroll_full=False):
-            smem_idx = tidx + step * 128
-            m = smem_idx % M
-            k = smem_idx // M
-            bufA_s0[smem_idx] = gA_flat[m * K + k]
-        for step in cutlass.range(K * N // 128, unroll_full=False):
-            idx = tidx + step * 128
-            bufB_s0[idx] = gB_flat[idx]
-        sync_threads()
-
-        # --- Allocate TMEM: A (MxK in TMEM) + C (MxN in TMEM) ---
-        total_tmem_cols = 128
-        alloc_bar = pipeline.NamedBarrier(barrier_id=2, num_threads=128)
-        tmem = utils.TmemAllocator(
-            tmem_hold_ptr, barrier_for_retrieve=alloc_bar, allocator_warp_id=0,
-        )
-        tmem.allocate(total_tmem_cols)
-        tmem.wait_for_alloc()
-        tmem_ptr_f32 = tmem.retrieve_ptr(Float32)
-
-        tmem_col_buf = cute.make_tensor(tmem_hold_ptr, cute.make_layout(1))
-        tmem_base    = tmem_col_buf[0]
-
-        tmem_a_col = tmem_base
-        tmem_c_col = tmem_base + TMEM_COLS
-
-        # --- Populate TMEM A via S2T copy ---
-        a_tmem_layout = sm100_utils.make_smem_layout_a(ts_tiled_mma, mma_tiler, Float16, 1)
-        tCrA_fake = ts_tiled_mma.make_fragment_A(a_tmem_layout.outer.shape)
-        tmem_a_ptr = cute.recast_ptr(tmem_ptr_f32, dtype=tCrA_fake.element_type)
-        tCrA = cute.make_tensor(tmem_a_ptr, tCrA_fake.layout)
-
-        copy_atom_s2t = cute.make_copy_atom(
-            tcgen05.Cp128x256bOp(tcgen05.CtaGroup.ONE), Float16,
-        )
-        tiled_copy_s2t = tcgen05.make_s2t_copy(copy_atom_s2t, tCrA[(None, None, None, 0)])
-        thr_copy_s2t = tiled_copy_s2t.get_slice(0)
-        tCsA_s2t_ = thr_copy_s2t.partition_S(bufA_s0)
-        tCsA_s2t = tcgen05.get_s2t_smem_desc_tensor(tiled_copy_s2t, tCsA_s2t_)
-        tCtA_s2t = thr_copy_s2t.partition_D(tCrA[(None, None, None, 0)])
-
-        if warp_idx == cutlass.Int32(0):
-            with elect_one():
-                cute.copy(tiled_copy_s2t, tCsA_s2t, tCtA_s2t)
-                tcgen05.commit(mbar_ptr, cta_group=tcgen05.CtaGroup.ONE)
-        mbarrier_wait(mbar_ptr, 0)
-        sync_threads()
-
-        # Re-arm mbar
-        if tidx == cutlass.Int32(0):
-            mbarrier_init(mbar_ptr, 1)
-        mbarrier_init_fence()
-
-        # --- Build C accumulator in second TMEM region ---
-        acc_shape        = ts_tiled_mma.partition_shape_C((M, N))
-        acc_shape_staged = cute.append(acc_shape, 1)
-        tmem_c_ptr_f32   = tmem_ptr_f32 + TMEM_COLS
-        tCtAcc = cute.make_tensor(tmem_c_ptr_f32, ts_tiled_mma.make_fragment_C(acc_shape_staged).layout)
-
-        # Build B descriptor
-        desc_b_i64 = smem_descriptor_to_int(make_umma_smem_desc(bufB_s0.iterator, bufB_s0.layout, "mn"))
-        desc_b = Tcgen05SmemDescriptor(desc_b_i64)
-
-        # --- Issue WS TS MMA ---
-        if warp_idx == cutlass.Int32(0):
-            tcgen05mma_ws_ts_f16(tmem_a_col, desc_b, tmem_c_col, IDESC_F16_M64_N64, 0)
-            with elect_one():
-                tcgen05.commit(mbar_ptr, cta_group=tcgen05.CtaGroup.ONE)
-        mbarrier_wait(mbar_ptr, 0)
-        sync_threads()
-
-        # --- T2R → R2G ---
-        t2r_atom    = cute.make_copy_atom(tcgen05.Ld16x256bOp(Repetition(8), Pack.NONE), Float32)
-        fake_smem   = cute.make_tensor(cute.make_ptr(Float32, 0, cute.AddressSpace.smem),
-                                       cute.make_layout((M, N)))
-        tCtAcc_flat = tCtAcc[((None, None), 0, 0, None)]
-        tiled_t2r   = tcgen05.make_tmem_copy(t2r_atom, tCtAcc_flat[(None, None, 0)])
-        thr_t2r     = tiled_t2r.get_slice(tidx)
-        tTR_tAcc    = thr_t2r.partition_S(tCtAcc_flat)
-        tTR_sDummy  = thr_t2r.partition_D(fake_smem)
-        tTR_rAcc    = cute.make_rmem_tensor(tTR_sDummy.shape, Float32)
-
-        cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, 0)], tTR_rAcc)
-        cute.arch.fence_view_async_tmem_load()
-
-        gC     = cute.make_tensor(C_out.iterator, cute.make_layout((M, N), stride=(N, 1)))
-        tTR_gC = thr_t2r.partition_D(gC)
-        cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32), tTR_rAcc, tTR_gC)
-
-        sync_threads()
-        tmem.relinquish_alloc_permit()
-        tmem.free(tmem_ptr_f32, total_tmem_cols)
 
     @cute.jit
     def _launch(self, A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, stream):
         self.kernel(A, B, C).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
 
     def run(self, A_cpu, B_cpu):
-        A_gpu = A_cpu.contiguous().half().cuda()
-        B_gpu = B_cpu.contiguous().half().cuda()
-        C_gpu = torch.zeros(M_DIM, N_DIM, dtype=torch.float32, device="cuda")
-        stream = cutlass_torch.default_stream()
-        self._launch(from_dlpack(A_gpu), from_dlpack(B_gpu), from_dlpack(C_gpu), stream)
-        torch.cuda.synchronize()
-        return C_gpu.cpu()
+        raise NotImplementedError("TODO: implement this test following the pattern of _WsTsTf32Kernel, but with F16 data and using tcgen05mma_ws_ts_f16 instruction")
 
 
 # =====================================================================
@@ -693,7 +460,7 @@ def test_ws_ss_tf32():
     assert rel < 0.02, f"FAIL: rel={rel:.4f}"
     print("  PASSED")
 
-
+# TODO
 def test_ws_ts_tf32():
     print("\n=== Test 2: tcgen05mma_ws_ts_tf32 (weight-stationary, TMEM A × SMEM B, tf32) ===")
     torch.manual_seed(42)
@@ -729,7 +496,7 @@ def test_ws_ss_f16():
     assert rel < 0.02, f"FAIL: rel={rel:.4f}"
     print("  PASSED")
 
-
+# TODO
 def test_ws_ts_f16():
     print("\n=== Test 4: tcgen05mma_ws_ts_f16 (weight-stationary, TMEM A × SMEM B, f16) ===")
     torch.manual_seed(42)
@@ -749,8 +516,6 @@ def test_ws_ts_f16():
 
 
 if __name__ == "__main__":
-    # test_ws_ss_tf32()
-    # test_ws_ts_tf32()
+    test_ws_ss_tf32()
     test_ws_ss_f16()
-    # test_ws_ts_f16()
     print("\n=== All tests passed! ===")

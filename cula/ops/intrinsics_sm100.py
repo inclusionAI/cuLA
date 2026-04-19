@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# TODO: add tcgen05.cp for S2T, st.global (same as store_256b in C++) for direct R2G
+
 """Inline-PTX wrappers for ``tcgen05.ld`` / ``tcgen05.st`` (SM100 Blackwell).
 
 Provides low-level, CuteDSL-compatible helpers that move data between
@@ -44,6 +46,7 @@ Usage inside a ``@cute.kernel`` or ``@cute.jit`` function::
 __all__ = [
     "tcgen05_ld_32x32b",
     "tcgen05_st_32x32b",
+    "store_256b",
 ]
 
 import cutlass
@@ -51,9 +54,7 @@ import cutlass.cute as cute
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir import ir as _ir_mod
 from cutlass.cutlass_dsl import dsl_user_op
-from cutlass.cute.typing import Float32, Int32
-
-_VALID_NUM = frozenset({1, 2, 4, 8, 16, 32, 64, 128})
+from cutlass.cute.typing import Int32
 
 
 def _to_ir(val, loc=None, ip=None):
@@ -171,3 +172,53 @@ def tcgen05_st_32x32b(num: int, taddr: int, values):
         )
 
     _do(Int32(taddr), *values)
+
+
+# ---------------------------------------------------------------------------
+# st.global.L1::no_allocate.v8.f32  (256-bit direct R2G store)
+# ---------------------------------------------------------------------------
+
+_STORE_256B_ASM = (
+    "st.global.L1::no_allocate.v8.f32 [$0], "
+    "{$1, $2, $3, $4, $5, $6, $7, $8};"
+)
+_STORE_256B_CONSTRAINTS = "l,f,f,f,f,f,f,f,f"
+
+
+@cute.jit
+def store_256b(gmem_ptr, values):
+    """Store 256 bits (8 × FP32) to global memory, bypassing L1 allocation.
+
+    Issues ``st.global.L1::no_allocate.v8.f32``.
+
+    Parameters
+    ----------
+    gmem_ptr : pointer
+        Global-memory destination address (must be 32-byte aligned).
+    values : list
+        Exactly 8 CuteDSL ``Float32`` scalars to store.
+    """
+
+    @dsl_user_op
+    def _do(addr, s0, s1, s2, s3, s4, s5, s6, s7, *, loc=None, ip=None):
+        operands = [
+            _to_ir(addr, loc, ip),
+            _to_ir(s0, loc, ip), _to_ir(s1, loc, ip),
+            _to_ir(s2, loc, ip), _to_ir(s3, loc, ip),
+            _to_ir(s4, loc, ip), _to_ir(s5, loc, ip),
+            _to_ir(s6, loc, ip), _to_ir(s7, loc, ip),
+        ]
+        llvm.inline_asm(
+            _ir_mod.Type.parse("!llvm.void"),
+            operands,
+            _STORE_256B_ASM,
+            _STORE_256B_CONSTRAINTS,
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+
+    _do(gmem_ptr, values[0], values[1], values[2], values[3],
+        values[4], values[5], values[6], values[7])
