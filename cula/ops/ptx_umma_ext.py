@@ -1,13 +1,17 @@
-"""SM100 (Blackwell) masked UMMA instruction wrappers for tcgen05 MMA.
+"""CuteDSL UMMA extension wrappers for SM100 (Blackwell) ``tcgen05.mma``.
 
-CuteDSL's high-level cute.gemm() / make_tiled_mma() API does not expose the
-128-bit ``disable-output-lane`` mask operand of ``tcgen05.mma``.  This module
-implements every variant needed by the KDA backward kernel.
+CuteDSL's high-level ``cute.gemm()`` / ``make_tiled_mma()`` API does not
+expose all ``tcgen05.mma`` instruction variants.  This module provides
+low-level wrappers for the two categories currently needed:
 
-The SS and TS forms use the native ``nvvm.tcgen05_mma`` MLIR op with the
-``write_disable_mask`` parameter (vector<4xi32>).  The WS form retains
-``llvm.inline_asm`` because the native ``nvvm.tcgen05_mma_ws`` op does not
-accept a ``write_disable_mask`` parameter.
+1. **Masked MMA** – SS and TS forms with the 128-bit ``disable-output-lane``
+   mask operand (``{m0, m1, m2, m3}``).  Implemented via the native
+   ``nvvm.tcgen05_mma`` MLIR op with its ``write_disable_mask`` parameter
+   (``vector<4xi32>``).
+
+2. **Weight-stationary (WS) MMA** – ``tcgen05.mma.ws`` SS / TS forms for
+   both ``kind::tf32`` and ``kind::f16``.  Implemented via
+   ``llvm.inline_asm``.
 
 ----------------------------------------------------------------------
 PTX instruction forms

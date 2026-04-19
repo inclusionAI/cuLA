@@ -78,13 +78,15 @@ class _WsSsTf32Kernel:
         mbar_ptr      = smem.allocate(Int64, byte_alignment=8)
 
         # --- SMEM layouts via sm100_utils (handles swizzle correctly for TF32) ---
-        tiled_mma = sm100_utils.make_trivial_tiled_mma(
+        # NOTE: we use non-ws mode TiledMMA for creating smem layout in a easy way,
+        # because smem layouts of ws mode and non-ws mode are the same 
+        non_ws_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             TFloat32, tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.MN,
             Float32, tcgen05.CtaGroup.ONE, (M, N),
         )
         mma_tiler = (M, N, K)
-        a_smem_layout = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler, TFloat32, 1)
-        b_smem_layout = sm100_utils.make_smem_layout_b(tiled_mma, mma_tiler, TFloat32, 1)
+        a_smem_layout = sm100_utils.make_smem_layout_a(non_ws_tiled_mma, mma_tiler, TFloat32, 1)
+        b_smem_layout = sm100_utils.make_smem_layout_b(non_ws_tiled_mma, mma_tiler, TFloat32, 1)
         bufferA = smem.allocate_tensor(
             element_type=TFloat32, layout=a_smem_layout.outer,
             byte_alignment=128, swizzle=a_smem_layout.inner,
@@ -178,30 +180,9 @@ class _WsSsTf32Kernel:
 
 class _WsTsTf32Kernel:
     """Two-step test:
-      Step 1: SS MMA → tmem_acc  (A_smem × I_smem → tmem_acc)
-              where I_smem is identity-like matrix so tmem_acc ≈ A data.
-      Step 2: WS TS MMA → tmem_c  (tmem_acc as A × B_smem → tmem_c)
-      Result should match: A × B  (within TF32 precision).
-
-    Actually, a simpler approach: we allocate two TMEM regions.
-      - Region 0 (tmem_a_region): populate with A via SS MMA (A × I → A)
+      - Region 0 (tmem_a_region): populate A into TMEM via S2T copy
       - Region 1 (tmem_c_region): result of WS TS MMA (tmem_a × B → C)
-
-    For the identity trick: we compute A_tf32 × I_tf32 with an 8×8 identity.
-    Since kind::tf32 with M=64,N=64,K=8:
-      - Step 1 SS: A(64×8) × I(8×64) → tmem region 0 (64×64, FP32)
-      - Step 2 WS_TS: tmem_region0(64×K') × B(K'×64) → tmem region 1
-
-    Wait — WS TS MMA reads A from TMEM. The TMEM A layout must match what
-    the MMA instruction expects. For TS mode, A is in TMEM and is read as
-    the MxK tile. The accumulator layout (MxN) is NOT the same as the A
-    layout (MxK). So we cannot simply reuse the accumulator of an SS MMA
-    as the A operand.
-
-    Better approach: use R2T store to write known A values into TMEM with
-    the correct layout, then WS TS MMA reads from that region.
     """
-
     @cute.kernel
     def kernel(self, A_in: cute.Tensor, B_in: cute.Tensor, C_out: cute.Tensor):
         M, N, K = M_DIM, N_DIM, K_DIM_TF32
@@ -215,52 +196,6 @@ class _WsTsTf32Kernel:
         smem          = utils.SmemAllocator()
         tmem_hold_ptr = smem.allocate(Int32)
         mbar_ptr      = smem.allocate(Int64, byte_alignment=8)
-
-        # --- Build TS tiled_mma (A from TMEM) ---
-        ts_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            TFloat32, tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.MN,
-            Float32, tcgen05.CtaGroup.ONE, (M, N),
-            a_source=tcgen05.OperandSource.TMEM,
-        )
-        mma_tiler = (M, N, K)
-
-        # --- SMEM for A (needed to populate TMEM A via S2T copy) and B ---
-        # We use the SS tiled_mma layout for A SMEM (since we need to build descriptors for A too)
-        ss_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            TFloat32, tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.MN,
-            Float32, tcgen05.CtaGroup.ONE, (M, N),
-        )
-        a_smem_layout = sm100_utils.make_smem_layout_a(ss_tiled_mma, mma_tiler, TFloat32, 1)
-        b_smem_layout = sm100_utils.make_smem_layout_b(ss_tiled_mma, mma_tiler, TFloat32, 1)
-
-        bufferA = smem.allocate_tensor(
-            element_type=TFloat32, layout=a_smem_layout.outer,
-            byte_alignment=128, swizzle=a_smem_layout.inner,
-        )
-        bufferB = smem.allocate_tensor(
-            element_type=TFloat32, layout=b_smem_layout.outer,
-            byte_alignment=128, swizzle=b_smem_layout.inner,
-        )
-        bufA_s0 = bufferA[(None, None, None, 0)]
-        bufB_s0 = bufferB[(None, None, None, 0)]
-
-        if tidx == cutlass.Int32(0):
-            mbarrier_init(mbar_ptr, 1)
-        mbarrier_init_fence()
-
-        # Load A and B into SMEM
-        gA_flat = cute.make_tensor(A_in.iterator, cute.make_layout(M * K))
-        gB_flat = cute.make_tensor(B_in.iterator, cute.make_layout(K * N))
-
-        for step in cutlass.range(M * K // 128, unroll_full=False):
-            smem_idx = tidx + step * 128
-            m = smem_idx % M
-            k = smem_idx // M
-            bufA_s0[smem_idx] = gA_flat[m * K + k]
-        for step in cutlass.range(K * N // 128, unroll_full=False):
-            idx = tidx + step * 128
-            bufB_s0[idx] = gB_flat[idx]
-        sync_threads()
 
     @cute.jit
     def _launch(self, A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, stream):
@@ -289,30 +224,28 @@ class _WsSsF16Kernel:
         tmem_hold_ptr = smem.allocate(Int32)
         mbar_ptr      = smem.allocate(Int64, byte_alignment=8)
 
-        # --- Manual SMEM layouts (no sm100_utils dependency since no tcgen05.mma.ws support) ---
+        # Create MMA SMEM Layouts
+        # NOTE: we use non-ws mode TiledMMA for creating smem layout in a easy way,
+        # because smem layouts of ws mode and non-ws mode are the same 
+        mma_tiler = (M, N, K)
+        non_ws_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            Float16, tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.MN,
+            Float32, tcgen05.CtaGroup.ONE, (M, N),
+        )
+        a_smem_layout = sm100_utils.make_smem_layout_a(non_ws_tiled_mma, mma_tiler, Float16, 1)
+        b_smem_layout = sm100_utils.make_smem_layout_b(non_ws_tiled_mma, mma_tiler, Float16, 1)
         # A: K-major, F16, (M, K)=(64, 16)
         # K=16 F16 = 32 bytes → Swizzle S<1,4,3> (SW32)
-        # Nested first mode ((M, K), ...) gives rank-2 vec_mode for make_umma_smem_desc
-        sw_a = cute.make_swizzle(1, 4, 3)
-        outer_a = cute.make_layout(
-            ((M, K), 1, 1, num_stages),
-            stride=((K, 1), M * K, M * K, M * K),
-        )
         bufferA = smem.allocate_tensor(
-            element_type=Float16, layout=outer_a,
-            byte_alignment=128, swizzle=sw_a,
+            element_type=Float16, layout=a_smem_layout.outer,
+            byte_alignment=128, swizzle=a_smem_layout.inner,
         )
 
         # B: MN-major, F16, (N, K)=(64, 16)
         # N=64 F16 = 128 bytes → Swizzle S<3,4,3> (SW128)
-        sw_b = cute.make_swizzle(3, 4, 3)
-        outer_b = cute.make_layout(
-            ((N, K), 1, 1, num_stages),
-            stride=((1, N), N * K, N * K, N * K),
-        )
         bufferB = smem.allocate_tensor(
-            element_type=Float16, layout=outer_b,
-            byte_alignment=128, swizzle=sw_b,
+            element_type=Float16, layout=b_smem_layout.outer,
+            byte_alignment=128, swizzle=b_smem_layout.inner,
         )
 
         bufA_s0 = bufferA[(None, None, None, 0)]
@@ -460,25 +393,6 @@ def test_ws_ss_tf32():
     assert rel < 0.02, f"FAIL: rel={rel:.4f}"
     print("  PASSED")
 
-# TODO
-def test_ws_ts_tf32():
-    print("\n=== Test 2: tcgen05mma_ws_ts_tf32 (weight-stationary, TMEM A × SMEM B, tf32) ===")
-    torch.manual_seed(42)
-    A = torch.randn(M_DIM, K_DIM_TF32)
-    B = torch.randn(K_DIM_TF32, N_DIM)
-    ref = torch.mm(A, B)
-    got = _WsTsTf32Kernel().run(A, B)
-    err = (got - ref).abs()
-    rel = err.max().item() / (ref.abs().max().item() + 1e-8)
-    max_idx = err.argmax().item()
-    mi, mj = max_idx // N_DIM, max_idx % N_DIM
-    print(f"  got[0,:4]={got[0,:4].tolist()}")
-    print(f"  ref[0,:4]={ref[0,:4].tolist()}")
-    print(f"  max_rel_err={rel:.4f}  at ({mi},{mj}): got={got[mi,mj]:.6f} ref={ref[mi,mj]:.6f}")
-    assert rel < 0.02, f"FAIL: rel={rel:.4f}"
-    print("  PASSED")
-
-
 def test_ws_ss_f16():
     print("\n=== Test 3: tcgen05mma_ws_ss_f16 (weight-stationary, SMEM A × SMEM B, f16) ===")
     torch.manual_seed(42)
@@ -495,25 +409,6 @@ def test_ws_ss_f16():
     print(f"  max_rel_err={rel:.4f}  at ({mi},{mj}): got={got[mi,mj]:.6f} ref={ref[mi,mj]:.6f}")
     assert rel < 0.02, f"FAIL: rel={rel:.4f}"
     print("  PASSED")
-
-# TODO
-def test_ws_ts_f16():
-    print("\n=== Test 4: tcgen05mma_ws_ts_f16 (weight-stationary, TMEM A × SMEM B, f16) ===")
-    torch.manual_seed(42)
-    A = torch.randn(M_DIM, K_DIM_F16)
-    B = torch.randn(K_DIM_F16, N_DIM)
-    ref = torch.mm(A, B)
-    got = _WsTsF16Kernel().run(A, B)
-    err = (got - ref).abs()
-    rel = err.max().item() / (ref.abs().max().item() + 1e-8)
-    max_idx = err.argmax().item()
-    mi, mj = max_idx // N_DIM, max_idx % N_DIM
-    print(f"  got[0,:4]={got[0,:4].tolist()}")
-    print(f"  ref[0,:4]={ref[0,:4].tolist()}")
-    print(f"  max_rel_err={rel:.4f}  at ({mi},{mj}): got={got[mi,mj]:.6f} ref={ref[mi,mj]:.6f}")
-    assert rel < 0.02, f"FAIL: rel={rel:.4f}"
-    print("  PASSED")
-
 
 if __name__ == "__main__":
     test_ws_ss_tf32()
