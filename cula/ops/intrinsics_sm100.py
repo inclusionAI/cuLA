@@ -49,12 +49,11 @@ __all__ = [
     "store_256b",
 ]
 
-import cutlass
 import cutlass.cute as cute
-from cutlass._mlir.dialects import llvm
 from cutlass._mlir import ir as _ir_mod
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.typing import Int32
+from cutlass.cutlass_dsl import dsl_user_op
 
 
 def _to_ir(val, loc=None, ip=None):
@@ -65,6 +64,7 @@ def _to_ir(val, loc=None, ip=None):
 # ---------------------------------------------------------------------------
 # tcgen05.ld.sync.aligned.32x32b.xN.b32
 # ---------------------------------------------------------------------------
+
 
 def _build_ld_asm(num: int) -> str:
     """Return the inline-asm string for ``tcgen05.ld.sync.aligned.32x32b.xN.b32``."""
@@ -98,9 +98,7 @@ def tcgen05_ld_32x32b(num: int, taddr: int):
     @dsl_user_op
     def _do(addr_val, *, loc=None, ip=None):
         f32_ty = _ir_mod.F32Type.get()
-        res_ty = _ir_mod.Type.parse(
-            f"!llvm.struct<({', '.join(['f32'] * num)})>"
-        )
+        res_ty = _ir_mod.Type.parse(f"!llvm.struct<({', '.join(['f32'] * num)})>")
         result = llvm.inline_asm(
             res_ty,
             [_to_ir(addr_val, loc, ip)],
@@ -112,10 +110,7 @@ def tcgen05_ld_32x32b(num: int, taddr: int):
             loc=loc,
             ip=ip,
         )
-        return [
-            llvm.extractvalue(f32_ty, result, [i], loc=loc, ip=ip)
-            for i in range(num)
-        ]
+        return [llvm.extractvalue(f32_ty, result, [i], loc=loc, ip=ip) for i in range(num)]
 
     return _do(Int32(taddr))
 
@@ -123,6 +118,7 @@ def tcgen05_ld_32x32b(num: int, taddr: int):
 # ---------------------------------------------------------------------------
 # tcgen05.st.sync.aligned.32x32b.xN.b32
 # ---------------------------------------------------------------------------
+
 
 def _build_st_asm(num: int) -> str:
     """Return the inline-asm string for ``tcgen05.st.sync.aligned.32x32b.xN.b32``."""
@@ -156,9 +152,7 @@ def tcgen05_st_32x32b(num: int, taddr: int, values):
 
     @dsl_user_op
     def _do(addr_val, *data_vals, loc=None, ip=None):
-        operands = [_to_ir(addr_val, loc, ip)] + [
-            _to_ir(v, loc, ip) for v in data_vals
-        ]
+        operands = [_to_ir(addr_val, loc, ip)] + [_to_ir(v, loc, ip) for v in data_vals]
         llvm.inline_asm(
             _ir_mod.Type.parse("!llvm.void"),
             operands,
@@ -178,10 +172,7 @@ def tcgen05_st_32x32b(num: int, taddr: int, values):
 # st.global.L1::no_allocate.v8.f32  (256-bit direct R2G store)
 # ---------------------------------------------------------------------------
 
-_STORE_256B_ASM = (
-    "st.global.L1::no_allocate.v8.f32 [$0], "
-    "{$1, $2, $3, $4, $5, $6, $7, $8};"
-)
+_STORE_256B_ASM = "st.global.L1::no_allocate.v8.f32 [$0], {$1, $2, $3, $4, $5, $6, $7, $8};"
 _STORE_256B_CONSTRAINTS = "l,f,f,f,f,f,f,f,f"
 
 
@@ -203,10 +194,14 @@ def store_256b(gmem_ptr, values):
     def _do(addr, s0, s1, s2, s3, s4, s5, s6, s7, *, loc=None, ip=None):
         operands = [
             _to_ir(addr, loc, ip),
-            _to_ir(s0, loc, ip), _to_ir(s1, loc, ip),
-            _to_ir(s2, loc, ip), _to_ir(s3, loc, ip),
-            _to_ir(s4, loc, ip), _to_ir(s5, loc, ip),
-            _to_ir(s6, loc, ip), _to_ir(s7, loc, ip),
+            _to_ir(s0, loc, ip),
+            _to_ir(s1, loc, ip),
+            _to_ir(s2, loc, ip),
+            _to_ir(s3, loc, ip),
+            _to_ir(s4, loc, ip),
+            _to_ir(s5, loc, ip),
+            _to_ir(s6, loc, ip),
+            _to_ir(s7, loc, ip),
         ]
         llvm.inline_asm(
             _ir_mod.Type.parse("!llvm.void"),
@@ -220,5 +215,4 @@ def store_256b(gmem_ptr, values):
             ip=ip,
         )
 
-    _do(gmem_ptr, values[0], values[1], values[2], values[3],
-        values[4], values[5], values[6], values[7])
+    _do(gmem_ptr, values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7])
