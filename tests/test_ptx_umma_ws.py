@@ -49,6 +49,8 @@ from cula.ops.intrinsics_sm100 import (
     tcgen05_ld_32x32b,
 )
 from cula.ops.ptx_umma_ext import (
+    CollectorBBuffer,
+    CollectorOp,
     Tcgen05SmemDescriptor,
     tcgen05mma_ws_ss_f16,
     tcgen05mma_ws_ss_tf32,
@@ -388,6 +390,118 @@ class _WsTsF16Kernel:
 
 
 # =====================================================================
+# Test 5: tcgen05mma_ws_ss_tf32 with explicit collector_b_buffer/collector_op
+# =====================================================================
+
+
+class _WsSsTf32CollectorKernel:
+    """Same as _WsSsTf32Kernel but passes collector_b_buffer=B0, collector_op=DISCARD."""
+
+    @cute.kernel
+    def kernel(self, A_in: cute.Tensor, B_in: cute.Tensor, C_out: cute.Tensor):
+        M, N, K = M_DIM, N_DIM, K_DIM_TF32
+        ACC_NUM_COLS = 32
+        NUM_COLS = ACC_NUM_COLS
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.warp_idx()
+        warp_idx = cute.arch.make_warp_uniform(warp_idx)
+
+        smem = utils.SmemAllocator()
+        tmem_hold_ptr = smem.allocate(Int32)
+        mbar_ptr = smem.allocate(Int64, byte_alignment=8)
+
+        non_ws_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            TFloat32,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.MN,
+            Float32,
+            tcgen05.CtaGroup.ONE,
+            (M, N),
+        )
+        mma_tiler = (M, N, K)
+        a_smem_layout = sm100_utils.make_smem_layout_a(non_ws_tiled_mma, mma_tiler, TFloat32, 1)
+        b_smem_layout = sm100_utils.make_smem_layout_b(non_ws_tiled_mma, mma_tiler, TFloat32, 1)
+        bufferA = smem.allocate_tensor(
+            element_type=TFloat32, layout=a_smem_layout.outer, byte_alignment=128, swizzle=a_smem_layout.inner
+        )
+        bufferB = smem.allocate_tensor(
+            element_type=TFloat32, layout=b_smem_layout.outer, byte_alignment=128, swizzle=b_smem_layout.inner
+        )
+        bufA_s0 = bufferA[(None, None, None, 0)]
+        bufB_s0 = bufferB[(None, None, None, 0)]
+
+        if tidx == cutlass.Int32(0):
+            mbarrier_init(mbar_ptr, 1)
+        mbarrier_init_fence()
+
+        gA_flat = cute.make_tensor(A_in.iterator, cute.make_layout(M * K))
+        gB_flat = cute.make_tensor(B_in.iterator, cute.make_layout(K * N))
+        for step in cutlass.range(M * K // 128, unroll_full=False):
+            smem_idx = tidx + step * 128
+            m = smem_idx % M
+            k = smem_idx // M
+            bufA_s0[smem_idx] = gA_flat[m * K + k]
+        for step in cutlass.range(K * N // 128, unroll_full=False):
+            idx = tidx + step * 128
+            bufB_s0[idx] = gB_flat[idx]
+        sync_threads()
+
+        alloc_bar = pipeline.NamedBarrier(barrier_id=2, num_threads=128)
+        tmem = utils.TmemAllocator(tmem_hold_ptr, barrier_for_retrieve=alloc_bar, allocator_warp_id=0)
+        tmem.allocate(NUM_COLS)
+        tmem.wait_for_alloc()
+        tmem_ptr_f32 = tmem.retrieve_ptr(Float32)
+        tmem_col_buf = cute.make_tensor(tmem_hold_ptr, cute.make_layout(1))
+        tmem_col = tmem_col_buf[0]
+
+        desc_a_i64 = smem_descriptor_to_int(make_umma_smem_desc(bufA_s0.iterator, bufA_s0.layout, "k"))
+        desc_b_i64 = smem_descriptor_to_int(make_umma_smem_desc(bufB_s0.iterator, bufB_s0.layout, "mn"))
+        desc_a = Tcgen05SmemDescriptor(desc_a_i64)
+        desc_b = Tcgen05SmemDescriptor(desc_b_i64)
+
+        if warp_idx == cutlass.Int32(0):
+            tcgen05mma_ws_ss_tf32(
+                desc_a,
+                desc_b,
+                tmem_col,
+                IDESC_TF32_M64_N64,
+                0,
+                collector_b_buffer=CollectorBBuffer.B0,
+                collector_op=CollectorOp.DISCARD,
+            )
+            with elect_one():
+                tcgen05.commit(mbar_ptr, cta_group=tcgen05.CtaGroup.ONE)
+        mbarrier_wait(mbar_ptr, 0)
+        sync_threads()
+
+        vec_i32 = tcgen05_ld_32x32b(NUM_COLS, tmem_col)
+        cute.arch.fence_view_async_tmem_load()
+        lane_idx = tidx % 32
+        row = (warp_idx % 2) * 32 + lane_idx
+        col_base = (warp_idx // 2) * 32
+        base_addr = (C_out.iterator + row * N + col_base).toint()
+        for chunk in cutlass.range_constexpr(ACC_NUM_COLS // 8):
+            store_256b(base_addr + chunk * 32, subvec(vec_i32, chunk * 8, 8))
+
+        sync_threads()
+        tmem.relinquish_alloc_permit()
+        tmem.free(tmem_ptr_f32, NUM_COLS)
+
+    @cute.jit
+    def _launch(self, A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, stream):
+        self.kernel(A, B, C).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
+
+    def run(self, A_cpu, B_cpu):
+        A_gpu = A_cpu.contiguous().float().cuda()
+        B_gpu = B_cpu.contiguous().float().cuda()
+        C_gpu = torch.zeros(M_DIM, N_DIM, dtype=torch.float32, device="cuda")
+        stream = cutlass_torch.default_stream()
+        self._launch(from_dlpack(A_gpu), from_dlpack(B_gpu), from_dlpack(C_gpu), stream)
+        torch.cuda.synchronize()
+        return C_gpu.cpu()
+
+
+# =====================================================================
 # Test functions
 # =====================================================================
 
@@ -428,7 +542,27 @@ def test_ws_ss_f16():
     print("  PASSED")
 
 
+def test_ws_ss_tf32_collector():
+    """Explicit collector_b_buffer=B0, collector_op=DISCARD should match default."""
+    print("\n=== Test 5: tcgen05mma_ws_ss_tf32 + collector (B0::DISCARD) ===")
+    torch.manual_seed(42)
+    A = torch.randn(M_DIM, K_DIM_TF32)
+    B = torch.randn(K_DIM_TF32, N_DIM)
+    ref = torch.mm(A, B)
+    got = _WsSsTf32CollectorKernel().run(A, B)
+    err = (got - ref).abs()
+    rel = err.max().item() / (ref.abs().max().item() + 1e-8)
+    max_idx = err.argmax().item()
+    mi, mj = max_idx // N_DIM, max_idx % N_DIM
+    print(f"  got[0,:4]={got[0, :4].tolist()}")
+    print(f"  ref[0,:4]={ref[0, :4].tolist()}")
+    print(f"  max_rel_err={rel:.4f}  at ({mi},{mj}): got={got[mi, mj]:.6f} ref={ref[mi, mj]:.6f}")
+    assert rel < 0.02, f"FAIL: rel={rel:.4f}"
+    print("  PASSED")
+
+
 if __name__ == "__main__":
     test_ws_ss_tf32()
     test_ws_ss_f16()
+    test_ws_ss_tf32_collector()
     print("\n=== All tests passed! ===")

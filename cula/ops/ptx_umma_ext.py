@@ -106,6 +106,9 @@ __all__ = [
     "tcgen05mma_ts_mask3",
     "tcgen05mma_ts_mask02",
     "tcgen05mma_ts_mask13",
+    # collector enums (re-exported for convenience)
+    "CollectorBBuffer",
+    "CollectorOp",
 ]
 
 import cutlass
@@ -115,6 +118,10 @@ from cutlass._mlir.dialects import arith as _arith
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cutlass_dsl import dsl_user_op
+
+# Re-export collector enums for caller convenience.
+CollectorBBuffer = _nvvm.Tcgen05MMACollectorBBuffer
+CollectorOp = _nvvm.Tcgen05MMACollectorOp
 
 # ---------------------------------------------------------------------------
 # Mask constants (4 × uint32).  0 = ACTIVE, 0xFFFFFFFF = DISABLED.
@@ -514,6 +521,8 @@ def tcgen05mma_ws_ss_tf32(
     tmem_c: int,
     desc_val: int,
     scale_out: int,
+    collector_b_buffer=None,
+    collector_op=None,
 ):
     """Issue ``tcgen05.mma.ws.cta_group::1.kind::tf32`` (weight-stationary form).
 
@@ -526,6 +535,10 @@ def tcgen05mma_ws_ss_tf32(
         tmem_c:    TMEM base address (uint32) for accumulators C/D.
         desc_val:  High 32 bits of the UMMA instruction descriptor (idescE>>32).
         scale_out: 1 → accumulate, 0 → overwrite.
+        collector_b_buffer: Optional ``CollectorBBuffer`` enum (B0–B3).
+                            Defaults to None (hardware default: ``b0::discard``).
+        collector_op: Optional ``CollectorOp`` enum (FILL/USE/LASTUSE/DISCARD).
+                      Defaults to None (hardware default: discard).
     """
 
     @dsl_user_op
@@ -548,6 +561,8 @@ def tcgen05mma_ws_ss_tf32(
             b=db_ir,
             idesc=dv_ir,
             enable_input_d=enable_d,
+            collector_b_buffer=collector_b_buffer,
+            collector_op=collector_op,
             loc=loc,
             ip=ip,
         )
@@ -573,6 +588,8 @@ def tcgen05mma_ws_ss_f16(
     tmem_c: int,
     desc_val: int,
     scale_out: int,
+    collector_b_buffer=None,
+    collector_op=None,
 ):
     """Issue ``tcgen05.mma.ws.cta_group::1.kind::f16`` (weight-stationary form).
 
@@ -588,6 +605,10 @@ def tcgen05mma_ws_ss_f16(
         tmem_c:    TMEM base address (uint32) for accumulators C/D.
         desc_val:  High 32 bits of the UMMA instruction descriptor (idescE>>32).
         scale_out: 1 → accumulate, 0 → overwrite.
+        collector_b_buffer: Optional ``CollectorBBuffer`` enum (B0–B3).
+                            Defaults to None (hardware default: ``b0::discard``).
+        collector_op: Optional ``CollectorOp`` enum (FILL/USE/LASTUSE/DISCARD).
+                      Defaults to None (hardware default: discard).
     """
 
     @dsl_user_op
@@ -610,6 +631,8 @@ def tcgen05mma_ws_ss_f16(
             b=db_ir,
             idesc=dv_ir,
             enable_input_d=enable_d,
+            collector_b_buffer=collector_b_buffer,
+            collector_op=collector_op,
             loc=loc,
             ip=ip,
         )
@@ -635,6 +658,8 @@ def tcgen05mma_ws_ts_tf32(
     tmem_c: int,
     desc_val: int,
     scale_out: int,
+    collector_b_buffer=None,
+    collector_op=None,
 ):
     """Issue ``tcgen05.mma.ws.cta_group::1.kind::tf32`` with TMEM A (weight-stationary).
 
@@ -649,6 +674,10 @@ def tcgen05mma_ws_ts_tf32(
         tmem_c:    TMEM base address (uint32) for accumulators C/D.
         desc_val:  High 32 bits of the UMMA instruction descriptor (idescE>>32).
         scale_out: 1 → accumulate, 0 → overwrite.
+        collector_b_buffer: Optional ``CollectorBBuffer`` enum (B0–B3).
+                            Defaults to None (hardware default: ``b0::discard``).
+        collector_op: Optional ``CollectorOp`` enum (FILL/USE/LASTUSE/DISCARD).
+                      Defaults to None (hardware default: discard).
     """
 
     @dsl_user_op
@@ -672,6 +701,8 @@ def tcgen05mma_ws_ts_tf32(
             b=db_ir,
             idesc=dv_ir,
             enable_input_d=enable_d,
+            collector_b_buffer=collector_b_buffer,
+            collector_op=collector_op,
             loc=loc,
             ip=ip,
         )
@@ -697,6 +728,8 @@ def tcgen05mma_ws_ts_f16(
     tmem_c: int,
     desc_val: int,
     scale_out: int,
+    collector_b_buffer=None,
+    collector_op=None,
 ):
     """Issue ``tcgen05.mma.ws.cta_group::1.kind::f16`` with TMEM A (weight-stationary).
 
@@ -714,6 +747,10 @@ def tcgen05mma_ws_ts_f16(
         tmem_c:    TMEM base address (uint32) for accumulators C/D.
         desc_val:  High 32 bits of the UMMA instruction descriptor (idescE>>32).
         scale_out: 1 → accumulate, 0 → overwrite.
+        collector_b_buffer: Optional ``CollectorBBuffer`` enum (B0–B3).
+                            Defaults to None (hardware default: ``b0::discard``).
+        collector_op: Optional ``CollectorOp`` enum (FILL/USE/LASTUSE/DISCARD).
+                      Defaults to None (hardware default: discard).
     """
 
     @dsl_user_op
@@ -737,6 +774,8 @@ def tcgen05mma_ws_ts_f16(
             b=db_ir,
             idesc=dv_ir,
             enable_input_d=enable_d,
+            collector_b_buffer=collector_b_buffer,
+            collector_op=collector_op,
             loc=loc,
             ip=ip,
         )
