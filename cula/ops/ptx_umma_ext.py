@@ -527,24 +527,27 @@ def tcgen05mma_ws_ss_tf32(
         desc_val:  High 32 bits of the UMMA instruction descriptor (idescE>>32).
         scale_out: 1 → accumulate, 0 → overwrite.
     """
-    asm_str = "{\n.reg .pred p;\nsetp.ne.b32 p, $4, 0;\ntcgen05.mma.ws.cta_group::1.kind::tf32 [$0], $1, $2, $3, p;\n}"
 
     @dsl_user_op
     def _do(c_val, da_val, db_val, dv_val, sc_val, *, loc=None, ip=None):
-        llvm.inline_asm(
-            None,
-            [
-                _ir(c_val, loc, ip),
-                _ir(da_val, loc, ip),
-                _ir(db_val, loc, ip),
-                _ir(dv_val, loc, ip),
-                _ir(sc_val, loc, ip),
-            ],
-            asm_str,
-            "r,l,l,r,r",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
+        ptr6_ty = llvm.PointerType.get(address_space=6)
+        i1_ty = ir.IntegerType.get_signless(1)
+
+        c_ir = _ir(c_val, loc, ip)
+        d_ptr = llvm.inttoptr(ptr6_ty, c_ir, loc=loc, ip=ip)
+        da_ir = _ir(da_val, loc, ip)
+        db_ir = _ir(db_val, loc, ip)
+        dv_ir = _ir(dv_val, loc, ip)
+        sc_ir = _ir(sc_val, loc, ip)
+        enable_d = _arith.trunci(i1_ty, sc_ir, loc=loc, ip=ip)
+
+        _nvvm.tcgen05_mma_ws(
+            mma_kind=_nvvm.Tcgen05MMAKind.TF32,
+            d=d_ptr,
+            a=da_ir,
+            b=db_ir,
+            idesc=dv_ir,
+            enable_input_d=enable_d,
             loc=loc,
             ip=ip,
         )
@@ -586,24 +589,27 @@ def tcgen05mma_ws_ss_f16(
         desc_val:  High 32 bits of the UMMA instruction descriptor (idescE>>32).
         scale_out: 1 → accumulate, 0 → overwrite.
     """
-    asm_str = "{\n.reg .pred p;\nsetp.ne.b32 p, $4, 0;\ntcgen05.mma.ws.cta_group::1.kind::f16 [$0], $1, $2, $3, p;\n}"
 
     @dsl_user_op
     def _do(c_val, da_val, db_val, dv_val, sc_val, *, loc=None, ip=None):
-        llvm.inline_asm(
-            None,
-            [
-                _ir(c_val, loc, ip),
-                _ir(da_val, loc, ip),
-                _ir(db_val, loc, ip),
-                _ir(dv_val, loc, ip),
-                _ir(sc_val, loc, ip),
-            ],
-            asm_str,
-            "r,l,l,r,r",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
+        ptr6_ty = llvm.PointerType.get(address_space=6)
+        i1_ty = ir.IntegerType.get_signless(1)
+
+        c_ir = _ir(c_val, loc, ip)
+        d_ptr = llvm.inttoptr(ptr6_ty, c_ir, loc=loc, ip=ip)
+        da_ir = _ir(da_val, loc, ip)
+        db_ir = _ir(db_val, loc, ip)
+        dv_ir = _ir(dv_val, loc, ip)
+        sc_ir = _ir(sc_val, loc, ip)
+        enable_d = _arith.trunci(i1_ty, sc_ir, loc=loc, ip=ip)
+
+        _nvvm.tcgen05_mma_ws(
+            mma_kind=_nvvm.Tcgen05MMAKind.F16,
+            d=d_ptr,
+            a=da_ir,
+            b=db_ir,
+            idesc=dv_ir,
+            enable_input_d=enable_d,
             loc=loc,
             ip=ip,
         )
@@ -644,24 +650,28 @@ def tcgen05mma_ws_ts_tf32(
         desc_val:  High 32 bits of the UMMA instruction descriptor (idescE>>32).
         scale_out: 1 → accumulate, 0 → overwrite.
     """
-    asm_str = "{\n.reg .pred p;\nsetp.ne.b32 p, $4, 0;\ntcgen05.mma.ws.cta_group::1.kind::tf32 [$0], [$1], $2, $3, p;\n}"
 
     @dsl_user_op
     def _do(c_val, a_val, db_val, dv_val, sc_val, *, loc=None, ip=None):
-        llvm.inline_asm(
-            None,
-            [
-                _ir(c_val, loc, ip),
-                _ir(a_val, loc, ip),
-                _ir(db_val, loc, ip),
-                _ir(dv_val, loc, ip),
-                _ir(sc_val, loc, ip),
-            ],
-            asm_str,
-            "r,r,l,r,r",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
+        ptr6_ty = llvm.PointerType.get(address_space=6)
+        i1_ty = ir.IntegerType.get_signless(1)
+
+        c_ir = _ir(c_val, loc, ip)
+        d_ptr = llvm.inttoptr(ptr6_ty, c_ir, loc=loc, ip=ip)
+        a_ir = _ir(a_val, loc, ip)
+        a_ptr = llvm.inttoptr(ptr6_ty, a_ir, loc=loc, ip=ip)
+        db_ir = _ir(db_val, loc, ip)
+        dv_ir = _ir(dv_val, loc, ip)
+        sc_ir = _ir(sc_val, loc, ip)
+        enable_d = _arith.trunci(i1_ty, sc_ir, loc=loc, ip=ip)
+
+        _nvvm.tcgen05_mma_ws(
+            mma_kind=_nvvm.Tcgen05MMAKind.TF32,
+            d=d_ptr,
+            a=a_ptr,
+            b=db_ir,
+            idesc=dv_ir,
+            enable_input_d=enable_d,
             loc=loc,
             ip=ip,
         )
@@ -705,24 +715,28 @@ def tcgen05mma_ws_ts_f16(
         desc_val:  High 32 bits of the UMMA instruction descriptor (idescE>>32).
         scale_out: 1 → accumulate, 0 → overwrite.
     """
-    asm_str = "{\n.reg .pred p;\nsetp.ne.b32 p, $4, 0;\ntcgen05.mma.ws.cta_group::1.kind::f16 [$0], [$1], $2, $3, p;\n}"
 
     @dsl_user_op
     def _do(c_val, a_val, db_val, dv_val, sc_val, *, loc=None, ip=None):
-        llvm.inline_asm(
-            None,
-            [
-                _ir(c_val, loc, ip),
-                _ir(a_val, loc, ip),
-                _ir(db_val, loc, ip),
-                _ir(dv_val, loc, ip),
-                _ir(sc_val, loc, ip),
-            ],
-            asm_str,
-            "r,r,l,r,r",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
+        ptr6_ty = llvm.PointerType.get(address_space=6)
+        i1_ty = ir.IntegerType.get_signless(1)
+
+        c_ir = _ir(c_val, loc, ip)
+        d_ptr = llvm.inttoptr(ptr6_ty, c_ir, loc=loc, ip=ip)
+        a_ir = _ir(a_val, loc, ip)
+        a_ptr = llvm.inttoptr(ptr6_ty, a_ir, loc=loc, ip=ip)
+        db_ir = _ir(db_val, loc, ip)
+        dv_ir = _ir(dv_val, loc, ip)
+        sc_ir = _ir(sc_val, loc, ip)
+        enable_d = _arith.trunci(i1_ty, sc_ir, loc=loc, ip=ip)
+
+        _nvvm.tcgen05_mma_ws(
+            mma_kind=_nvvm.Tcgen05MMAKind.F16,
+            d=d_ptr,
+            a=a_ptr,
+            b=db_ir,
+            idesc=dv_ir,
+            enable_input_d=enable_d,
             loc=loc,
             ip=ip,
         )

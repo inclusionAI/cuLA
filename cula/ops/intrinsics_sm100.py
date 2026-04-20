@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# TODO: add tcgen05.cp for S2T, st.global (same as store_256b in C++) for direct R2G
+# TODO: add tcgen05.cp for S2T
 
-"""Inline-PTX wrappers for ``tcgen05.ld`` / ``tcgen05.st`` (SM100 Blackwell).
+"""NVVM wrappers for ``tcgen05.ld`` / ``tcgen05.st`` (SM100 Blackwell).
 
 Provides low-level, CuteDSL-compatible helpers that move data between
-Tensor Memory (TMEM) and registers via the ``tcgen05.ld.sync.aligned``
-and ``tcgen05.st.sync.aligned`` PTX instructions with the ``.32x32b``
+Tensor Memory (TMEM) and registers via the native ``nvvm.tcgen05.ld``
+and ``nvvm.tcgen05.st`` MLIR ops (lowered from the ``tcgen05.ld.sync.aligned``
+and ``tcgen05.st.sync.aligned`` PTX instructions) with the ``.32x32b``
 shape qualifier.
 
 PTX reference
@@ -26,7 +27,7 @@ PTX reference
     tcgen05.ld.sync.aligned.32x32b.xN.b32  {r0, ..., rN-1}, [taddr];
     tcgen05.st.sync.aligned.32x32b.xN.b32  [taddr], {r0, ..., rN-1};
 
-where ``N ∈ {1, 2, 4, 8, 16, 32, 64, 128}`` and each ``r`` is a 32-bit
+where ``N ∈ {2, 4, 8, 16, 32, 64, 128}`` and each ``r`` is a 32-bit
 register.  ``taddr`` encodes both the TMEM column index (bits [15:0])
 and the lane index (bits [31:16]).
 
@@ -34,24 +35,42 @@ See https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions
 
 Usage inside a ``@cute.kernel`` or ``@cute.jit`` function::
 
-    from cula.ops.tmem_copy import tcgen05_ld_32x32b, tcgen05_st_32x32b
+    from cula.ops.intrinsics_sm100 import (
+        tcgen05_ld_32x32b, tcgen05_st_32x32b,
+        reinterpret_cast, subvec, store_256b,
+    )
+    from cutlass.cute.typing import Float32, Int32
 
-    # Load 4 × 32-bit values from TMEM into a list of 4 CuteDSL scalars
-    vals = tcgen05_ld_32x32b(4, taddr)
+    # Load 32 × 32-bit values from TMEM → opaque vector<32 x i32>
+    vec_i32 = tcgen05_ld_32x32b(32, taddr)
 
-    # Store 4 × 32-bit values from registers into TMEM
-    tcgen05_st_32x32b(4, taddr, vals)
+    # Zero-cost reinterpret as f32 (single vector.bitcast, no instructions)
+    vec_f32 = reinterpret_cast(vec_i32, Int32, 32, Float32)
+
+    # Store to global via store_256b (4 × 256-bit stores)
+    # store_256b takes vector<8 x i32>, so reinterpret back and slice
+    vec_i32_back = reinterpret_cast(vec_f32, Float32, 32, Int32)
+    for chunk in range(4):  # 32 / 8 = 4 chunks
+        store_256b(gmem_addr + chunk * 32, subvec(vec_i32_back, chunk * 8, 8))
+
+    # Store back to TMEM
+    tcgen05_st_32x32b(32, taddr, vec_i32_back)
 """
 
 __all__ = [
     "tcgen05_ld_32x32b",
     "tcgen05_st_32x32b",
+    "reinterpret_cast",
+    "subvec",
     "store_256b",
 ]
 
 import cutlass.cute as cute
 from cutlass._mlir import ir as _ir_mod
+from cutlass._mlir.dialects import arith as _arith
 from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import nvvm as _nvvm
+from cutlass._mlir.dialects import vector as _vector
 from cutlass.cute.typing import Int32
 from cutlass.cutlass_dsl import dsl_user_op
 
@@ -62,28 +81,19 @@ def _to_ir(val, loc=None, ip=None):
 
 
 # ---------------------------------------------------------------------------
-# tcgen05.ld.sync.aligned.32x32b.xN.b32
+# tcgen05.ld.sync.aligned.32x32b.xN.b32  (via nvvm.tcgen05.ld)
 # ---------------------------------------------------------------------------
-
-
-def _build_ld_asm(num: int) -> str:
-    """Return the inline-asm string for ``tcgen05.ld.sync.aligned.32x32b.xN.b32``."""
-    regs = ", ".join(f"${i}" for i in range(num))
-    return f"tcgen05.ld.sync.aligned.32x32b.x{num}.b32 {{{regs}}}, [${num}];"
-
-
-def _build_ld_constraints(num: int) -> str:
-    """Return the inline-asm constraint string for the ld instruction."""
-    out = ",".join(["=f"] * num)
-    return f"{out},r"
 
 
 @cute.jit
 def tcgen05_ld_32x32b(num: int, taddr: int):
-    """Load *num* × 32-bit values from TMEM → registers (FP32).
+    """Load *num* × 32-bit values from TMEM → an opaque ``vector<N x i32>``.
 
-    ``num`` must be a **compile-time constant** in {1, 2, 4, 8, 16, 32, 64, 128}.
-    Returns a Python ``list`` of CuteDSL ``Float32`` scalars (length *num*).
+    ``num`` must be a **compile-time constant** in {2, 4, 8, 16, 32, 64, 128}.
+    Returns a single opaque MLIR vector value (``vector<num x i32>``).
+
+    Use :func:`reinterpret_cast` to reinterpret the element type (zero-cost),
+    and :func:`subvec` to slice a contiguous sub-vector.
 
     Parameters
     ----------
@@ -92,51 +102,35 @@ def tcgen05_ld_32x32b(num: int, taddr: int):
     taddr : int
         TMEM address (bits [31:16] = lane, bits [15:0] = column).
     """
-    asm_str = _build_ld_asm(num)
-    constraints = _build_ld_constraints(num)
 
     @dsl_user_op
     def _do(addr_val, *, loc=None, ip=None):
-        f32_ty = _ir_mod.F32Type.get()
-        res_ty = _ir_mod.Type.parse(f"!llvm.struct<({', '.join(['f32'] * num)})>")
-        result = llvm.inline_asm(
-            res_ty,
-            [_to_ir(addr_val, loc, ip)],
-            asm_str,
-            constraints,
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
+        i32_ty = _ir_mod.IntegerType.get_signless(32)
+        ptr6_ty = llvm.PointerType.get(address_space=6)
+        tmem_ptr = llvm.inttoptr(ptr6_ty, _to_ir(addr_val, loc, ip), loc=loc, ip=ip)
+        vec_i32_ty = _ir_mod.VectorType.get([num], i32_ty)
+        return _nvvm.tcgen05_ld(
+            res=vec_i32_ty,
+            shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
+            num=num,
+            tmem_addr=tmem_ptr,
             loc=loc,
             ip=ip,
         )
-        return [llvm.extractvalue(f32_ty, result, [i], loc=loc, ip=ip) for i in range(num)]
 
     return _do(Int32(taddr))
 
 
 # ---------------------------------------------------------------------------
-# tcgen05.st.sync.aligned.32x32b.xN.b32
+# tcgen05.st.sync.aligned.32x32b.xN.b32  (via nvvm.tcgen05.st)
 # ---------------------------------------------------------------------------
 
 
-def _build_st_asm(num: int) -> str:
-    """Return the inline-asm string for ``tcgen05.st.sync.aligned.32x32b.xN.b32``."""
-    regs = ", ".join(f"${i + 1}" for i in range(num))
-    return f"tcgen05.st.sync.aligned.32x32b.x{num}.b32 [${0}], {{{regs}}};"
-
-
-def _build_st_constraints(num: int) -> str:
-    """Return the inline-asm constraint string for the st instruction."""
-    ins = ",".join(["f"] * num)
-    return f"r,{ins}"
-
-
 @cute.jit
-def tcgen05_st_32x32b(num: int, taddr: int, values):
-    """Store *num* × 32-bit values from registers → TMEM.
+def tcgen05_st_32x32b(num: int, taddr: int, vec):
+    """Store *num* × 32-bit values from an opaque vector → TMEM.
 
-    ``num`` must be a **compile-time constant** in {1, 2, 4, 8, 16, 32, 64, 128}.
+    ``num`` must be a **compile-time constant** in {2, 4, 8, 16, 32, 64, 128}.
 
     Parameters
     ----------
@@ -144,28 +138,115 @@ def tcgen05_st_32x32b(num: int, taddr: int, values):
         Number of 32-bit registers to store.  Must be a compile-time constant.
     taddr : int
         TMEM address (bits [31:16] = lane, bits [15:0] = column).
-    values : list
-        A sequence of *num* CuteDSL scalar values (e.g. ``Float32``).
+    vec : opaque vector
+        An opaque ``vector<num x i32>`` value (from :func:`tcgen05_ld_32x32b`
+        or :func:`reinterpret_cast`).
     """
-    asm_str = _build_st_asm(num)
-    constraints = _build_st_constraints(num)
 
     @dsl_user_op
-    def _do(addr_val, *data_vals, loc=None, ip=None):
-        operands = [_to_ir(addr_val, loc, ip)] + [_to_ir(v, loc, ip) for v in data_vals]
-        llvm.inline_asm(
-            _ir_mod.Type.parse("!llvm.void"),
-            operands,
-            asm_str,
-            constraints,
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
+    def _do(addr_val, vec_val, *, loc=None, ip=None):
+        ptr6_ty = llvm.PointerType.get(address_space=6)
+        tmem_ptr = llvm.inttoptr(ptr6_ty, _to_ir(addr_val, loc, ip), loc=loc, ip=ip)
+        _nvvm.tcgen05_st(
+            shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
+            num=num,
+            tmem_addr=tmem_ptr,
+            r=_to_ir(vec_val, loc, ip),
             loc=loc,
             ip=ip,
         )
 
-    _do(Int32(taddr), *values)
+    _do(Int32(taddr), vec)
+
+
+# ---------------------------------------------------------------------------
+# reinterpret_cast  (zero-cost vector.bitcast)
+# ---------------------------------------------------------------------------
+
+
+@cute.jit
+def reinterpret_cast(vec, src_type, src_num, tgt_type):
+    """Zero-cost reinterpret of a vector's element type (single ``vector.bitcast``).
+
+    Analogous to C++ ``reinterpret_cast``: no instructions emitted, just
+    re-labels the bits.  The total bit-width is preserved:
+    ``src_num * src_type.width == tgt_num * tgt_type.width``.
+
+    Parameters
+    ----------
+    vec : opaque vector
+        Source vector (e.g. ``vector<N x i32>`` from :func:`tcgen05_ld_32x32b`).
+    src_type : CuTeDSL type
+        Element type of *vec* (e.g. ``Int32``).
+    src_num : int
+        Number of elements in *vec* (compile-time constant).
+    tgt_type : CuTeDSL type
+        Desired element type (e.g. ``Float32``, ``BFloat16``, ``Float16``).
+
+    Returns
+    -------
+    opaque vector
+        ``vector<M x tgt_type>`` where ``M = src_num * src_type.width // tgt_type.width``.
+
+    Examples
+    --------
+    ::
+
+        vec_i32  = tcgen05_ld_32x32b(8, taddr)                     # vector<8 x i32>
+        vec_f32  = reinterpret_cast(vec_i32, Int32, 8, Float32)    # vector<8 x f32>
+        vec_bf16 = reinterpret_cast(vec_i32, Int32, 8, BFloat16)   # vector<16 x bf16>
+        vec_back = reinterpret_cast(vec_bf16, BFloat16, 16, Int32) # vector<8 x i32>
+    """
+    tgt_num = src_num * src_type.width // tgt_type.width
+
+    @dsl_user_op
+    def _do(v, *, loc=None, ip=None):
+        tgt_vec_ty = _ir_mod.VectorType.get([tgt_num], tgt_type.mlir_type)
+        return _vector.bitcast(tgt_vec_ty, _to_ir(v, loc, ip), loc=loc, ip=ip)
+
+    return _do(vec)
+
+
+# ---------------------------------------------------------------------------
+# subvec  (extract a contiguous sub-vector)
+# ---------------------------------------------------------------------------
+
+
+@cute.jit
+def subvec(vec, offset, size):
+    """Extract a contiguous sub-vector (``vector.extract_strided_slice``).
+
+    Parameters
+    ----------
+    vec : opaque vector
+        Source vector.
+    offset : int
+        Starting element index (compile-time constant).
+    size : int
+        Number of elements to extract (compile-time constant).
+
+    Returns
+    -------
+    opaque vector
+        ``vector<size x elem_type>``.
+    """
+
+    @dsl_user_op
+    def _do(v, *, loc=None, ip=None):
+        ir_v = _to_ir(v, loc, ip)
+        elem_ty = _ir_mod.VectorType(ir_v.type).element_type
+        res_ty = _ir_mod.VectorType.get([size], elem_ty)
+        return _vector.extract_strided_slice(
+            res_ty,
+            ir_v,
+            offsets=[offset],
+            sizes=[size],
+            strides=[1],
+            loc=loc,
+            ip=ip,
+        )
+
+    return _do(vec)
 
 
 # ---------------------------------------------------------------------------
@@ -173,36 +254,38 @@ def tcgen05_st_32x32b(num: int, taddr: int, values):
 # ---------------------------------------------------------------------------
 
 _STORE_256B_ASM = "st.global.L1::no_allocate.v8.f32 [$0], {$1, $2, $3, $4, $5, $6, $7, $8};"
-_STORE_256B_CONSTRAINTS = "l,f,f,f,f,f,f,f,f"
+_STORE_256B_CONSTRAINTS = "l,r,r,r,r,r,r,r,r"
 
 
 @cute.jit
-def store_256b(gmem_ptr, values):
-    """Store 256 bits (8 × FP32) to global memory, bypassing L1 allocation.
+def store_256b(gmem_ptr, vec):
+    """Store 256 bits (8 × 32-bit) to global memory, bypassing L1 allocation.
 
-    Issues ``st.global.L1::no_allocate.v8.f32``.
+    Issues ``st.global.L1::no_allocate.v8.f32`` with ``"r"`` (integer register)
+    constraints — type-agnostic, just like C++ ``reinterpret_cast<uint32_t*>``.
 
     Parameters
     ----------
     gmem_ptr : pointer
         Global-memory destination address (must be 32-byte aligned).
-    values : list
-        Exactly 8 CuteDSL ``Float32`` scalars to store.
+    vec : opaque vector
+        A ``vector<8 x i32>`` (use :func:`subvec` to slice from a larger vector).
     """
 
     @dsl_user_op
-    def _do(addr, s0, s1, s2, s3, s4, s5, s6, s7, *, loc=None, ip=None):
-        operands = [
-            _to_ir(addr, loc, ip),
-            _to_ir(s0, loc, ip),
-            _to_ir(s1, loc, ip),
-            _to_ir(s2, loc, ip),
-            _to_ir(s3, loc, ip),
-            _to_ir(s4, loc, ip),
-            _to_ir(s5, loc, ip),
-            _to_ir(s6, loc, ip),
-            _to_ir(s7, loc, ip),
+    def _do(addr, v, *, loc=None, ip=None):
+        i32_ty = _ir_mod.IntegerType.get_signless(32)
+        ir_v = _to_ir(v, loc, ip)
+        elems = [
+            _vector.extractelement(
+                ir_v,
+                position=_arith.constant(i32_ty, i, loc=loc, ip=ip),
+                loc=loc,
+                ip=ip,
+            )
+            for i in range(8)
         ]
+        operands = [_to_ir(addr, loc, ip)] + elems
         llvm.inline_asm(
             _ir_mod.Type.parse("!llvm.void"),
             operands,
@@ -215,4 +298,4 @@ def store_256b(gmem_ptr, values):
             ip=ip,
         )
 
-    _do(gmem_ptr, values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7])
+    _do(gmem_ptr, vec)

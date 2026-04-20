@@ -43,7 +43,11 @@ from cutlass.cute.nvgpu.tcgen05 import (
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float16, Float32, Int32, Int64, TFloat32
 
-from cula.ops.intrinsics_sm100 import store_256b, tcgen05_ld_32x32b
+from cula.ops.intrinsics_sm100 import (
+    store_256b,
+    subvec,
+    tcgen05_ld_32x32b,
+)
 from cula.ops.ptx_umma_ext import (
     Tcgen05SmemDescriptor,
     tcgen05mma_ws_ss_f16,
@@ -161,8 +165,8 @@ class _WsSsTf32Kernel:
         mbarrier_wait(mbar_ptr, 0)
         sync_threads()
 
-        # T2R via tcgen05_ld_32x32b
-        regs = tcgen05_ld_32x32b(ACC_NUM_COLS, tmem_col)
+        # T2R → R2G: tcgen05_ld directly into store_256b (type-agnostic, like C++ reinterpret_cast)
+        vec_i32 = tcgen05_ld_32x32b(ACC_NUM_COLS, tmem_col)
         cute.arch.fence_view_async_tmem_load()
 
         # R2G via store_256b (4 × 256-bit stores per thread)
@@ -173,7 +177,7 @@ class _WsSsTf32Kernel:
         col_base = (warp_idx // 2) * 32
         base_addr = (C_out.iterator + row * N + col_base).toint()
         for chunk in cutlass.range_constexpr(ACC_NUM_COLS // 8):
-            store_256b(base_addr + chunk * 32, regs[chunk * 8 : chunk * 8 + 8])
+            store_256b(base_addr + chunk * 32, subvec(vec_i32, chunk * 8, 8))
 
         sync_threads()
         tmem.relinquish_alloc_permit()
@@ -325,13 +329,8 @@ class _WsSsF16Kernel:
         # Layout: warp0->(M0,N0), warp1->(M0,N1), warp2->(M1,N0), warp3->(M1,N1)
         # for 64x64 Acc, each warp process 32x32, with 128 lanes in TMEM all used
 
-        regs = tcgen05_ld_32x32b(ACC_NUM_COLS, tmem_col)
+        vec_i32 = tcgen05_ld_32x32b(ACC_NUM_COLS, tmem_col)
         cute.arch.fence_view_async_tmem_load()
-
-        # Debug print: thread 0, first 4 register values
-        # if tidx == cutlass.Int32(0):
-        #     cute.printf("[T2R] tid=0, regs[0..3] = %f, %f, %f, %f",
-        #                 regs[0], regs[1], regs[2], regs[3])
 
         # R2G via store_256b (4 × 256-bit stores per thread)
         # Layout E (column-major warp order):
@@ -340,12 +339,10 @@ class _WsSsF16Kernel:
         lane_idx = tidx % 32
         row = (warp_idx % 2) * 32 + lane_idx  # M0 or M1
         col_base = (warp_idx // 2) * 32  # N0 or N1
-        # 32 regs = 4 chunks of 8 FP32 each (256 bits)
-        # store_256b needs a raw i64 address → use iterator.toint() + byte offset
+        # 32 regs = 4 chunks of 8 × 32-bit each (256 bits)
         base_addr = (C_out.iterator + row * N + col_base).toint()
         for chunk in cutlass.range_constexpr(ACC_NUM_COLS // 8):
-            # byte offset: chunk * 8 elements * 4 bytes/element
-            store_256b(base_addr + chunk * 32, regs[chunk * 8 : chunk * 8 + 8])
+            store_256b(base_addr + chunk * 32, subvec(vec_i32, chunk * 8, 8))
 
         sync_threads()
         tmem.relinquish_alloc_permit()
