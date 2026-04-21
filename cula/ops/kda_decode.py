@@ -114,6 +114,7 @@ def _get_cached_dispatch_bundle(
         _get_cached_cute_tensor(o, leading_dim=o.ndim - 1),
     )
 
+
 def _select_small_blocks_per_state(N: int, H: int, HV: int, V: int) -> int:
     del HV
     num_v_tiles_small = V // TILE_V_SMALL
@@ -245,7 +246,7 @@ def _try_fast_dense_decode(
         N4_DENSE_SMALL_HV_PARALLEL_HEAD_THRESHOLD if N <= 4 else DENSE_SMALL_HV_PARALLEL_HEAD_THRESHOLD
     )
     dense_small_hv_parallel = (
-        use_small_batch and H <= dense_small_hv_parallel_head_threshold and N <= DENSE_SMALL_HV_PARALLEL_MAX_N
+        use_small_batch and dense_small_hv_parallel_head_threshold >= H and N <= DENSE_SMALL_HV_PARALLEL_MAX_N
     )
     num_blocks_per_state_small = _select_small_blocks_per_state(N, H, HV, V)
 
@@ -1938,7 +1939,7 @@ def kda_decode(
     dense_small_hv_parallel = (
         use_small_batch
         and (not is_varlen_decode)
-        and H <= dense_small_hv_parallel_head_threshold
+        and dense_small_hv_parallel_head_threshold >= H
         and N <= DENSE_SMALL_HV_PARALLEL_MAX_N
     )
 
@@ -1962,12 +1963,16 @@ def kda_decode(
         pool_size = h0_source.shape[0]
         if state_layout == "kv":
             if h0_source.shape[2:] != (K, V):
-                raise ValueError(f"State layout mismatch for state_layout='kv': got {h0_source.shape}, expected (..., {HV}, {K}, {V})")
+                raise ValueError(
+                    f"State layout mismatch for state_layout='kv': got {h0_source.shape}, expected (..., {HV}, {K}, {V})"
+                )
             state_layout_is_kv = True
             fast_path = True
         else:
             if h0_source.shape[2:] != (V, K):
-                raise ValueError(f"State layout mismatch for state_layout='vk': got {h0_source.shape}, expected (..., {HV}, {V}, {K})")
+                raise ValueError(
+                    f"State layout mismatch for state_layout='vk': got {h0_source.shape}, expected (..., {HV}, {V}, {K})"
+                )
             fast_path = True
 
     if fast_path:

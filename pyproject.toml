@@ -85,6 +85,8 @@ force-sort-within-sections = false
 # TODO: fix undefined names (exp_g, chunk_kda_bwd_dqkwg) — WIP code
 "cula/kda/kda_fully_fused_wip.py" = ["F821"]
 "cula/kda/blackwell_fused_fwd.py" = ["F821"]
+# Ignore unused variable warnings in tests (often intentional for clarity)
+"tests/*" = ["F841"]
 
 [tool.setuptools_scm]
 # write generated version into package for runtime access

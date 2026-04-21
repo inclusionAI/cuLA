@@ -256,12 +256,14 @@ def tensor_cache(fn):
             return fn(*args, **kwargs)
         if last_args is not None and last_kwargs is not None:
             if len(args) == len(last_args) and len(kwargs) == len(last_kwargs):
-                if (all(a is b for a, b in zip(args, last_args, strict=False))
-                        and all(k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items())):
+                if all(a is b for a, b in zip(args, last_args, strict=False)) and all(
+                    k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items()
+                ):
                     return last_result
         result = fn(*args, **kwargs)
         last_args, last_kwargs, last_result = args, kwargs, result
         return result
+
     return wrapper
 
 
@@ -282,9 +284,11 @@ def prepare_chunk_indices(
     cu_seqlens_cpu: torch.LongTensor | None = None,
 ) -> torch.LongTensor:
     import triton  # already available as a transitive dep of cutlass-dsl
+
     if cu_seqlens_cpu is not None:
-        indices = torch.cat([torch.arange(n, device=cu_seqlens.device)
-                            for n in triton.cdiv(prepare_lens(cu_seqlens_cpu), chunk_size).tolist()])
+        indices = torch.cat(
+            [torch.arange(n, device=cu_seqlens.device) for n in triton.cdiv(prepare_lens(cu_seqlens_cpu), chunk_size).tolist()]
+        )
         return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
     indices = torch.cat([torch.arange(n) for n in triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()])
     return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
