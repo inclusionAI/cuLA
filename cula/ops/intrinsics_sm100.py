@@ -12,16 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# TODO: add tcgen05.cp for S2T
-
-"""NVVM wrappers for ``tcgen05.ld`` / ``tcgen05.st`` (SM100 Blackwell).
+"""NVVM wrappers for SM100 (Blackwell) Tensor Memory intrinsics.
 
 Provides low-level, CuteDSL-compatible helpers that move data between
-Tensor Memory (TMEM) and registers via the native ``nvvm.tcgen05.ld``
-and ``nvvm.tcgen05.st`` MLIR ops (lowered from the ``tcgen05.ld.sync.aligned``
-and ``tcgen05.st.sync.aligned`` PTX instructions) with the ``.32x32b``
-shape qualifier.
+Tensor Memory (TMEM) and registers / shared memory via the native
+``nvvm.tcgen05.*`` MLIR ops.
 
+**T2R / R2T** – ``tcgen05.ld`` / ``tcgen05.st`` with ``.32x32b`` shape.
+**S2T**       – ``tcgen05.cp`` with ``.128x256b`` shape (SMEM → TMEM)
 PTX reference
 -------------
     tcgen05.ld.sync.aligned.32x32b.xN.b32  {r0, ..., rN-1}, [taddr];
@@ -60,6 +58,7 @@ Usage inside a ``@cute.kernel`` or ``@cute.jit`` function::
 __all__ = [
     "tcgen05_ld_32x32b",
     "tcgen05_st_32x32b",
+    "tcgen05_cp_128x256b",
     "reinterpret_cast",
     "subvec",
     "store_256b",
@@ -299,3 +298,49 @@ def store_256b(gmem_ptr, vec):
         )
 
     _do(gmem_ptr, vec)
+
+
+# ---------------------------------------------------------------------------
+# tcgen05.cp.cta_group::1.128x256b  (via nvvm.tcgen05.cp)
+# ---------------------------------------------------------------------------
+
+
+@cute.jit
+def tcgen05_cp_128x256b(taddr: int, smem_desc):
+    """Async copy SMEM → TMEM with shape ``128x256b`` (``cta_group::1``).
+
+    Issues ``tcgen05.cp.cta_group::1.128x256b  [taddr], s-desc;``
+    via the native ``nvvm.tcgen05.cp`` MLIR op.
+
+    The instruction copies a 128-row × 256-bit tile from shared memory
+    (described by *smem_desc*) into Tensor Memory at *taddr*.  The copy
+    is **asynchronous** — use ``tcgen05.commit`` + ``mbarrier.wait`` to
+    synchronize.
+
+    PTX reference
+    -------------
+        tcgen05.cp.cta_group::1.128x256b  [taddr], s-desc;
+
+    Parameters
+    ----------
+    taddr : int
+        TMEM destination address (uint32, passed as ``!llvm.ptr<6>``).
+    smem_desc : i64
+        64-bit SMEM matrix descriptor (same format as ``tcgen05.mma``
+        descriptors — see ``Tcgen05SmemDescriptor``).
+    """
+
+    @dsl_user_op
+    def _do(addr_val, desc_val, *, loc=None, ip=None):
+        ptr6_ty = llvm.PointerType.get(address_space=6)
+        tmem_ptr = llvm.inttoptr(ptr6_ty, _to_ir(addr_val, loc, ip), loc=loc, ip=ip)
+        _nvvm.tcgen05_cp(
+            shape=_nvvm.Tcgen05CpShape.SHAPE_128x256b,
+            taddr=tmem_ptr,
+            smem_desc=_to_ir(desc_val, loc, ip),
+            cta_group=_nvvm.Tcgen05GroupKind.CTA_1,
+            loc=loc,
+            ip=ip,
+        )
+
+    _do(Int32(taddr), smem_desc)

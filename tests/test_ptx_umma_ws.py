@@ -41,11 +41,14 @@ from cutlass.cute.nvgpu.tcgen05 import (
     smem_descriptor_to_int,
 )
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import Float16, Float32, Int32, Int64, TFloat32
 
 from cula.ops.intrinsics_sm100 import (
     store_256b,
     subvec,
+    tcgen05_cp_128x256b,
+    reinterpret_cast,
     tcgen05_ld_32x32b,
 )
 from cula.ops.ptx_umma_ext import (
@@ -57,8 +60,14 @@ from cula.ops.ptx_umma_ext import (
 )
 
 M_DIM, N_DIM = 64, 64
-K_DIM_TF32 = 8  # kind::tf32  → K=8
-K_DIM_F16 = 16  # kind::f16   → K≥16
+K_DIM_TF32 = 8  # kind::tf32  → K>=8, tile size
+A_K_STEP_BYTES_TF32 = M_DIM * 8 * 4 # smem offset for each K-atom in operand A
+B_K_STEP_BYTES_TF32 = N_DIM * 8 * 4 # smem offset for each K-atom in operand B
+K_DIM_F16 = 128  # default after sweep
+# NOTE: per-K-atom byte offsets are derived from the SMEM layout at runtime
+# (see _WsSsF16Kernel) so K_DIM_F16 can be any multiple of 16. The layout's
+# k_iter mode becomes hierarchical at K≥128 (e.g. (4, K/64):(16, 4096) for A),
+# which the layout-based offset computation handles transparently.
 
 # Instruction descriptor for M=64, N=64, TF32, dense, TransposeB=1
 # Bits: M>>4=4 at [24:28], N>>3=8 at [17:22], TransposeB at [16],
@@ -82,7 +91,7 @@ class _WsSsTf32Kernel:
     @cute.kernel
     def kernel(self, A_in: cute.Tensor, B_in: cute.Tensor, C_out: cute.Tensor):
         M, N, K = M_DIM, N_DIM, K_DIM_TF32
-        ACC_NUM_COLS = 32
+        ACC_NUM_COLS = N // 2
         NUM_COLS = ACC_NUM_COLS
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
@@ -156,13 +165,17 @@ class _WsSsTf32Kernel:
         # Build SMEM descriptors (rank-2 vec_mode layout required)
         desc_a_i64 = smem_descriptor_to_int(make_umma_smem_desc(bufA_s0.iterator, bufA_s0.layout, "k"))
         desc_b_i64 = smem_descriptor_to_int(make_umma_smem_desc(bufB_s0.iterator, bufB_s0.layout, "mn"))
-        desc_a = Tcgen05SmemDescriptor(desc_a_i64)
-        desc_b = Tcgen05SmemDescriptor(desc_b_i64)
+        desc_a_base = Tcgen05SmemDescriptor(desc_a_i64)
+        desc_b_base = Tcgen05SmemDescriptor(desc_b_i64)
 
         # Issue WS SS MMA  (scale_out=0 → D = A*B, not accumulate)
         if warp_idx == cutlass.Int32(0):
-            tcgen05mma_ws_ss_tf32(desc_a, desc_b, tmem_col, IDESC_TF32_M64_N64, 0)
             with elect_one():
+                for ks in cutlass.range_constexpr(K // 8):
+                    scale = 0 if ks == 0 else 1
+                    desc_a = desc_a_base + (ks * A_K_STEP_BYTES_TF32)
+                    desc_b = desc_b_base + (ks * B_K_STEP_BYTES_TF32)
+                    tcgen05mma_ws_ss_tf32(desc_a, desc_b, tmem_col, IDESC_TF32_M64_N64, scale)
                 tcgen05.commit(mbar_ptr, cta_group=tcgen05.CtaGroup.ONE)
         mbarrier_wait(mbar_ptr, 0)
         sync_threads()
@@ -170,6 +183,17 @@ class _WsSsTf32Kernel:
         # T2R → R2G: tcgen05_ld directly into store_256b (type-agnostic, like C++ reinterpret_cast)
         vec_i32 = tcgen05_ld_32x32b(ACC_NUM_COLS, tmem_col)
         cute.arch.fence_view_async_tmem_load()
+        
+        # 1. reinterpret_cast to f32 (zero-cost bitcast)
+        # vec_f32 = reinterpret_cast(vec_i32, Int32, ACC_NUM_COLS, Float32)
+
+        # 2. TensorSSA wrap → .to(BFloat16) (real CUDA core CVT)
+        # regs = TensorSSA(vec_f32, (ACC_NUM_COLS,), Float32)
+
+        # Debug print: thread 0, first 4 register values
+        # if tidx == cutlass.Int32(0):
+        #     cute.printf("[T2R] tid=0, regs[0..3] = %f, %f, %f, %f",
+        #                 regs[0], regs[1], regs[2], regs[3])
 
         # R2G via store_256b (4 × 256-bit stores per thread)
         # Layout E (column-major warp order):
@@ -190,6 +214,7 @@ class _WsSsTf32Kernel:
         self.kernel(A, B, C).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
 
     def run(self, A_cpu, B_cpu):
+        assert K_DIM_TF32 == 8, "TODO: support larger K-dimension"
         A_gpu = A_cpu.contiguous().float().cuda()
         B_gpu = B_cpu.contiguous().float().cuda()
         C_gpu = torch.zeros(M_DIM, N_DIM, dtype=torch.float32, device="cuda")
@@ -233,7 +258,7 @@ class _WsSsF16Kernel:
     @cute.kernel
     def kernel(self, A_in: cute.Tensor, B_in: cute.Tensor, C_out: cute.Tensor):
         M, N, K = M_DIM, N_DIM, K_DIM_F16
-        ACC_NUM_COLS = 32
+        ACC_NUM_COLS = N // 2
         NUM_COLS = ACC_NUM_COLS
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
@@ -313,13 +338,30 @@ class _WsSsF16Kernel:
         # Build SMEM descriptors (rank-2 vec_mode layout required)
         desc_a_i64 = smem_descriptor_to_int(make_umma_smem_desc(bufA_s0.iterator, bufA_s0.layout, "k"))
         desc_b_i64 = smem_descriptor_to_int(make_umma_smem_desc(bufB_s0.iterator, bufB_s0.layout, "mn"))
-        desc_a = Tcgen05SmemDescriptor(desc_a_i64)
-        desc_b = Tcgen05SmemDescriptor(desc_b_i64)
+        desc_a_base = Tcgen05SmemDescriptor(desc_a_i64)
+        desc_b_base = Tcgen05SmemDescriptor(desc_b_i64)
+
+        # Per-K-atom byte offsets are derived from the (unswizzled) outer layout
+        # so we transparently handle every K size:
+        #   K∈{16,32,64}        → A k_iter is single-mode, uniform stride
+        #   K≥128               → A k_iter is hierarchical e.g. (4,K/64):(16,4096)
+        #   B is always uniform stride=1024 elem
+        # Coord ((0,0), 0, ks, 0) into outer layout gives the linear elem offset
+        # of the ks-th MMA-K atom; * sizeof(elem) → byte offset to add to desc.
+        ELEM_BYTES_F16 = Float16.width // 8
+        a_outer = a_smem_layout.outer
+        b_outer = b_smem_layout.outer
 
         # Issue WS SS MMA  (scale_out=0 → D = A*B, not accumulate)
         if warp_idx == cutlass.Int32(0):
-            tcgen05mma_ws_ss_f16(desc_a, desc_b, tmem_col, IDESC_F16_M64_N64, 0)
             with elect_one():
+                for ks in cutlass.range_constexpr(K // 16):
+                    scale = 0 if ks == 0 else 1
+                    a_off = cute.crd2idx(((0, 0), 0, ks, 0), a_outer) * ELEM_BYTES_F16
+                    b_off = cute.crd2idx(((0, 0), 0, ks, 0), b_outer) * ELEM_BYTES_F16
+                    desc_a = desc_a_base + a_off
+                    desc_b = desc_b_base + b_off
+                    tcgen05mma_ws_ss_f16(desc_a, desc_b, tmem_col, IDESC_F16_M64_N64, scale)
                 tcgen05.commit(mbar_ptr, cta_group=tcgen05.CtaGroup.ONE)
         mbarrier_wait(mbar_ptr, 0)
         sync_threads()
@@ -333,6 +375,18 @@ class _WsSsF16Kernel:
 
         vec_i32 = tcgen05_ld_32x32b(ACC_NUM_COLS, tmem_col)
         cute.arch.fence_view_async_tmem_load()
+
+        # =======DEBUG========
+        # # 1. reinterpret_cast to f32 (zero-cost bitcast)
+        # vec_f32 = reinterpret_cast(vec_i32, Int32, ACC_NUM_COLS, Float32)
+
+        # # 2. TensorSSA wrap → .to(BFloat16) (real CUDA core CVT)
+        # regs = TensorSSA(vec_f32, (ACC_NUM_COLS,), Float32)
+
+        # # Debug print: thread 0, first 4 register values
+        # if tidx == cutlass.Int32(0):
+        #     cute.printf("[T2R] tid=0, regs[0..3] = %f, %f, %f, %f",
+        #                 regs[0], regs[1], regs[2], regs[3])
 
         # R2G via store_256b (4 × 256-bit stores per thread)
         # Layout E (column-major warp order):
@@ -399,8 +453,8 @@ class _WsSsTf32CollectorKernel:
 
     @cute.kernel
     def kernel(self, A_in: cute.Tensor, B_in: cute.Tensor, C_out: cute.Tensor):
-        M, N, K = M_DIM, N_DIM, K_DIM_TF32
-        ACC_NUM_COLS = 32
+        M, N, K = M_DIM, N_DIM, 8 # default K with 8
+        ACC_NUM_COLS = N // 2
         NUM_COLS = ACC_NUM_COLS
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
