@@ -236,7 +236,9 @@ def _get_cache_buf(name: str, nbytes: int, device: torch.device) -> torch.Tensor
 
 
 # ---------------------------------------------------------------------------
-# Tensor cache (internalized from fla.utils)
+# Tensor cache
+# Adapted from: https://github.com/fla-org/flash-linear-attention/blob/main/fla/utils.py
+# Original copyright: 2024 The FLA Authors (same Apache 2.0 license)
 # ---------------------------------------------------------------------------
 _CULA_DISABLE_TENSOR_CACHE: bool = os.getenv("CULA_DISABLE_TENSOR_CACHE", "0") == "1"
 
@@ -264,7 +266,9 @@ def tensor_cache(fn):
 
 
 # ---------------------------------------------------------------------------
-# Sequence-length helpers (internalized from fla.ops.utils.index)
+# Sequence-length helpers
+# Adapted from: https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/utils/index.py
+# Original copyright: 2024 The FLA Authors (same Apache 2.0 license)
 # ---------------------------------------------------------------------------
 @tensor_cache
 def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
