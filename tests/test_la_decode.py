@@ -83,13 +83,9 @@ def make_inputs(B, H, D, device="cuda", seed=42):
 def run_la_decode(q, k, v, state_4d, decay_scales, scale):
     """Run la_decode with proper state layout conversion."""
     B, H, D, _ = state_4d.shape
-    # la_decode state layout: [B*H, V, K] (pretransposed)
-    state_cute = (
-        state_4d.clone()
-        .permute(0, 1, 3, 2)  # [B, H, V, K]
-        .reshape(B * H, D, D)
-        .contiguous()
-    )
+    # la_decode kernel expects BHVK layout: [B*H, V, K]
+    # Reference/test state is BHKV: [B, H, K, V] → transpose to BHVK
+    state_cute = state_4d.clone().transpose(-1, -2).contiguous().reshape(B * H, D, D)
     out = torch.zeros(B, H, D, device=q.device, dtype=torch.bfloat16)
     s_offsets = torch.arange(B, device=q.device, dtype=torch.int32)
 
@@ -111,8 +107,8 @@ def run_la_decode(q, k, v, state_4d, decay_scales, scale):
         K_SPLIT_DIM=D,
         V_SPLIT_DIM=D,
     )
-    # Convert state back to [B, H, K, V]
-    state_out = state_cute.reshape(B, H, D, D).permute(0, 1, 3, 2).contiguous()
+    # Convert output state back from BHVK to BHKV for comparison
+    state_out = state_cute.reshape(B, H, D, D).transpose(-1, -2).contiguous()
     return out, state_out
 
 
@@ -229,6 +225,45 @@ def test_vs_fla(B):
     rmse = torch.sqrt(torch.mean((o_cute.float() - o_fla.float()) ** 2)).item()
     max_ref = torch.abs(o_fla.float()).max().item()
     assert rmse / (max_ref + 1e-8) < 0.005, f"B={B}: vs fla mismatch, rel_rmse={rmse / (max_ref + 1e-8):.6f}"
+
+    # ---------------------------------------------------------------------------
+
+
+# End-to-End Prefill -> Decode Test
+# ---------------------------------------------------------------------------
+def test_prefill_decode_e2e():
+    """Verify prefill output state passes directly into decode without transpose."""
+    from cula.ops.lightning_attn import lightning_attn_fwd
+
+    B, S, H, D = 2, 64, 8, 128
+    scale = D**-0.5
+    decay_scales = 0.5 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+
+    # Dummy prefill tokens
+    q_pre = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    k_pre = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    v_pre = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+
+    # 1. Run Prefill (Generates BHVK ht)
+    _, ht = lightning_attn_fwd(q_pre, k_pre, v_pre, decay_scales, scale=scale, output_final_state=True)
+
+    # Prefill outputs BHVK; convert to BHKV for reference and run_la_decode helper
+    ht_kv = ht.transpose(-1, -2).contiguous()
+
+    # Dummy decode tokens
+    q_dec = torch.randn(B, H, D, device="cuda", dtype=torch.bfloat16)
+    k_dec = torch.randn(B, H, D, device="cuda", dtype=torch.bfloat16)
+    v_dec = torch.randn(B, H, D, device="cuda", dtype=torch.bfloat16)
+
+    # 2. Run Decode (run_la_decode handles BHKV→BHVK internally)
+    out_dec, state_new = run_la_decode(q_dec, k_dec, v_dec, ht_kv, decay_scales, scale)
+
+    # 3. Check against PyTorch reference (BHKV state)
+    out_ref, state_new_ref = torch_la_decode_ref(q_dec, k_dec, v_dec, ht_kv, decay_scales, scale)
+
+    rmse = torch.sqrt(torch.mean((out_dec.float() - out_ref.float()) ** 2)).item()
+    max_ref = torch.abs(out_ref.float()).max().item()
+    assert rmse / (max_ref + 1e-8) < 0.01, "E2E Output mismatch"
 
 
 if __name__ == "__main__":

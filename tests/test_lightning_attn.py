@@ -307,6 +307,7 @@ def test_initial_and_final_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, at
     V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
     h0 = torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
+    h0_vk = h0.transpose(-1, -2).contiguous()  # BHVK for CuTe kernel
 
     O_ref, ht_ref = pytorch_reference(
         Q,
@@ -325,14 +326,14 @@ def test_initial_and_final_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, at
         V,
         decay,
         chunk_size=C,
-        initial_state=h0.clone(),
+        initial_state=h0_vk.clone(),
         output_final_state=True,
     )
 
     p1 = _compare("output", O_cute, O_ref_bf16, atol=atol, rtol=rtol, verbose=verbose)
     p2 = True
     if ht_ref is not None and ht_cute is not None:
-        p2 = _compare("state", ht_cute, ht_ref, atol=atol, rtol=rtol, verbose=verbose)
+        p2 = _compare("state", ht_cute.transpose(-1, -2), ht_ref, atol=atol, rtol=rtol, verbose=verbose)
 
     passed = p1 and p2
     print(f"  {'✓ PASSED' if passed else '✗ FAILED'}")
@@ -396,11 +397,12 @@ def test_against_fla_with_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, ato
     K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     h0 = torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
+    h0_vk = h0.transpose(-1, -2).contiguous()  # BHVK for CuTe kernel
 
     decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
     g_gamma = -decay
 
-    # FLA
+    # FLA (expects BHKV state)
     O_fla, ht_fla = chunk_simple_gla(
         Q,
         K,
@@ -412,7 +414,7 @@ def test_against_fla_with_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, ato
         head_first=False,
     )
 
-    # Ours
+    # Ours (expects BHVK state)
     O_cute, ht_cute = run_cute_kernel(
         Q,
         K,
@@ -420,14 +422,14 @@ def test_against_fla_with_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, ato
         decay,
         scale=1.0,
         chunk_size=C,
-        initial_state=h0.clone(),
+        initial_state=h0_vk.clone(),
         output_final_state=True,
     )
 
     p1 = _compare("output", O_cute, O_fla, atol=atol, rtol=rtol, verbose=verbose)
     p2 = True
     if ht_fla is not None and ht_cute is not None:
-        p2 = _compare("state", ht_cute, ht_fla, atol=atol, rtol=rtol, verbose=verbose)
+        p2 = _compare("state", ht_cute.transpose(-1, -2), ht_fla, atol=atol, rtol=rtol, verbose=verbose)
 
     passed = p1 and p2
     print(f"  {'✓ PASSED' if passed else '✗ FAILED'}")
@@ -523,9 +525,9 @@ def test_varlen_with_initial_state(seq_lens=None, H=4, D=128, C=64, decay_val=0.
     V = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
 
-    # State pool with 3 slots, use indices [2, 0]
+    # State pool with 3 slots, use indices [2, 0] — BHVK layout for CuTe
     pool_size = 3
-    state_pool = torch.randn(pool_size, H, D, D, dtype=torch.float32, device="cuda") * 0.01
+    state_pool = torch.randn(pool_size, H, D, D, dtype=torch.float32, device="cuda").transpose(-1, -2).contiguous() * 0.01
     indices = torch.tensor([2, 0], dtype=torch.int32, device="cuda")
 
     O_var, sp = run_cute_kernel_varlen(
@@ -591,6 +593,7 @@ def test_varlen_against_pytorch_ref(
     decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
 
     state_pool = torch.randn(N, H, D, D, dtype=torch.float32, device="cuda") * 0.01
+    state_pool_vk = state_pool.transpose(-1, -2).contiguous()  # BHVK for CuTe
 
     O_var, sp = run_cute_kernel_varlen(
         Q,
@@ -599,7 +602,7 @@ def test_varlen_against_pytorch_ref(
         decay,
         cu_seqlens,
         chunk_size=C,
-        state_pool=state_pool.clone(),
+        state_pool=state_pool_vk.clone(),
     )
 
     all_pass = True
@@ -609,7 +612,7 @@ def test_varlen_against_pytorch_ref(
         Qi = Q[:, bos:eos].contiguous()
         Ki = K[:, bos:eos].contiguous()
         Vi = V[:, bos:eos].contiguous()
-        h0_i = state_pool[i : i + 1].clone()
+        h0_i = state_pool[i : i + 1].clone()  # BHKV for pytorch_reference
 
         O_ref_i, ht_ref_i = pytorch_reference(
             Qi,
@@ -624,7 +627,7 @@ def test_varlen_against_pytorch_ref(
         O_ref_bf16 = O_ref_i.to(torch.bfloat16)
 
         po = _compare(f"O[{i}]", O_var[:, bos:eos], O_ref_bf16, atol=atol, rtol=rtol, verbose=verbose)
-        ps = _compare(f"ht[{i}]", sp[i], ht_ref_i, atol=atol, rtol=rtol, verbose=verbose)
+        ps = _compare(f"ht[{i}]", sp[i].transpose(-1, -2), ht_ref_i, atol=atol, rtol=rtol, verbose=verbose)
         all_pass = all_pass and po and ps
 
     print(f"  {'✓ PASSED' if all_pass else '✗ FAILED'}")
