@@ -319,3 +319,170 @@ def test_safe_gate_chunk_varlen(
     assert_close("ht", ref_ht_fla, tri_ht.transpose(-1, -2), 0.005)
     assert_close("o", ref_fla_trans, tri, 0.005)
     assert_close("ht", ref_ht_fla_trans, tri_ht, 0.005)
+
+
+# ============================================================
+# FlashKDA tests
+# ============================================================
+
+@pytest.mark.parametrize(
+    ("B", "T", "H", "D"),
+    [
+        pytest.param(*test, id="B{}-T{}-H{}-D{}".format(*test))
+        for test in [
+            # Aligned with test_safe_gate_chunk (use_gate_in_kernel=True cases)
+            (2, 1500, 4,  128),
+            (4, 2048, 8,  128),
+        ]
+    ],
+)
+def test_flashkda_chunk(B: int, T: int, H: int, D: int):
+    """Compare FlashKDA CUTLASS kernel vs FLA chunk_kda on fixed-length inputs.
+
+    FlashKDA applies sigmoid to beta internally, so we pass raw (pre-sigmoid) bf16
+    beta to FlashKDA and post-sigmoid beta to FLA chunk_kda.
+    FlashKDA state layout: standard KV [N, H, D, D] in bfloat16.
+    FLA state layout:      standard KV [N, H, D, D] in float32 (transpose_state_layout=False).
+    """
+    import flash_kda
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    LOWER_BOUND = -5.0
+    scale = float(D) ** (-0.5)
+
+    q = F.normalize(torch.randn(B, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype).to(device)
+    k = F.normalize(torch.randn(B, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype).to(device)
+    v = torch.randn(B, T, H, D, dtype=dtype, device=device)
+    g = torch.randn(B, T, H, D, dtype=dtype, device=device)
+
+    # beta: raw bfloat16 logits — FlashKDA applies sigmoid internally
+    beta = torch.randn(B, T, H, dtype=dtype, device=device)
+    # upstream hasn't implemented use_beta_sigmoid_in_kernel; pass post-sigmoid beta to FLA explicitly
+    beta_activated = torch.sigmoid(beta.float()).to(dtype)
+
+    A_log   = torch.rand(H,    dtype=torch.float32, device=device)
+    dt_bias = torch.rand(H, D, dtype=torch.float32, device=device)
+    h0      = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+
+    # --- FlashKDA: bf16 state, raw beta, KV layout ---
+    h0_bf16        = h0.to(dtype).clone()
+    final_state_fk = torch.zeros_like(h0_bf16)
+    out_fk         = torch.zeros(B, T, H, D, dtype=dtype, device=device)
+    flash_kda.fwd(
+        q, k, v, g, beta, scale, out_fk,
+        A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+        initial_state=h0_bf16.clone(), final_state=final_state_fk,
+    )
+    torch.cuda.synchronize()
+
+    # --- FLA chunk_kda: fp32 state, post-sigmoid beta, KV layout (transpose_state_layout=False) ---
+    ref_o, ref_ht = fla_chunk_kda(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta_activated.clone(),
+        scale=scale,
+        A_log=A_log.clone(),
+        dt_bias=dt_bias.clone(),
+        initial_state=h0.clone(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        safe_gate=True,
+        lower_bound=LOWER_BOUND,
+        transpose_state_layout=True,
+    )
+
+    assert_close("o",  ref_o,  out_fk,                 0.005)
+    assert_close("ht", ref_ht, final_state_fk.float(),  0.01, warning=True)
+
+
+@pytest.mark.parametrize(
+    ("H", "D", "cu_seqlens"),
+    [
+        pytest.param(*test, id="H{}-D{}-cu_seqlens{}".format(*test))
+        for test in [
+            # Aligned with test_safe_gate_chunk_varlen
+            (4,  128, [0, 15]),
+            (4,  128, [0, 256, 500, 1000]),
+            (4,  128, [0, 15, 100, 300, 1200, 2000]),
+            (4,  128, [0, 100, 300, 1200, 3000, 4096]),
+            (32, 128, [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192]),
+            (32, 128, [0, 652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236, 5543, 6255, 6480, 6947, 7616, 8192]),
+            (32, 128, [0, 315, 973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459, 6318, 6669, 6979, 7583, 8192]),
+            (32, 128, [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192]),
+        ]
+    ],
+)
+def test_flashkda_chunk_varlen(H: int, D: int, cu_seqlens: list):
+    """Compare FlashKDA CUTLASS kernel vs FLA chunk_kda on variable-length inputs.
+
+    FlashKDA applies sigmoid to beta internally, so we pass raw (pre-sigmoid) bf16
+    beta to FlashKDA and post-sigmoid beta to FLA chunk_kda.
+    FlashKDA cu_seqlens: torch.long.  FLA cu_seqlens: torch.int32.
+    FlashKDA state: bfloat16 KV layout.  FLA state: float32 KV layout.
+    """
+    import flash_kda
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    LOWER_BOUND = -5.0
+    scale = float(D) ** (-0.5)
+
+    # FlashKDA uses long; FLA uses int32
+    cu_seqlens_long = torch.tensor(cu_seqlens, dtype=torch.long,  device=device)
+    cu_seqlens_i32  = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+
+    T_total = cu_seqlens[-1]
+    N       = len(cu_seqlens) - 1
+
+    q = F.normalize(torch.randn(1, T_total, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype).to(device)
+    k = F.normalize(torch.randn(1, T_total, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype).to(device)
+    v = torch.randn(1, T_total, H, D, dtype=dtype, device=device)
+    g = torch.randn(1, T_total, H, D, dtype=dtype, device=device)
+
+    # beta: raw bfloat16 logits — FlashKDA applies sigmoid internally
+    beta = torch.randn(1, T_total, H, dtype=dtype, device=device)
+    # upstream hasn't implemented use_beta_sigmoid_in_kernel; pass post-sigmoid beta to FLA explicitly
+    beta_activated = torch.sigmoid(beta.float()).to(dtype)
+
+    A_log   = torch.rand(H,    dtype=torch.float32, device=device)
+    dt_bias = torch.rand(H, D, dtype=torch.float32, device=device)
+    h0      = torch.randn(N, H, D, D, dtype=torch.float32, device=device)
+
+    # --- FlashKDA: bf16 state, raw beta, KV layout, long cu_seqlens ---
+    h0_bf16        = h0.to(dtype).clone()
+    final_state_fk = torch.zeros_like(h0_bf16)
+    out_fk         = torch.zeros(1, T_total, H, D, dtype=dtype, device=device)
+    flash_kda.fwd(
+        q, k, v, g, beta, scale, out_fk,
+        A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
+        initial_state=h0_bf16.clone(), final_state=final_state_fk,
+        cu_seqlens=cu_seqlens_long,
+    )
+    torch.cuda.synchronize()
+
+    # --- FLA chunk_kda: fp32 state, post-sigmoid beta, KV layout, int32 cu_seqlens ---
+    ref_o, ref_ht = fla_chunk_kda(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta_activated.clone(),
+        scale=scale,
+        A_log=A_log.clone(),
+        dt_bias=dt_bias.clone(),
+        initial_state=h0.clone(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        safe_gate=True,
+        lower_bound=LOWER_BOUND,
+        cu_seqlens=cu_seqlens_i32,
+        transpose_state_layout=True,
+    )
+
+    assert_close("o",  ref_o,  out_fk,                 0.005)
+    assert_close("ht", ref_ht, final_state_fk.float(),  0.01, warning=True)
