@@ -19,10 +19,10 @@ This file implements a fused CUDA kernel using CUTLASS CuTe DSL for executing
 Linear Attention updates during decode phase. Simplified compared to GDN.
 
 Architecture Design:
-- Uses TMA (Tensor Memory Accelerator) for efficient Global Memory → Shared Memory transfers
-- Employs 2-stage pipeline to overlap loading and computation, hiding memory latency
-- Each block uses 128 threads (4 warps), with each warp processing one matrix row
-- Tile size: 8x128 (TILE_V x TILE_K)
+- Uses cp.async for efficient Global Memory → Shared Memory transfers
+- Employs N-stage pipeline to overlap loading and computation, hiding memory latency
+- Per-path config (sweep-tuned on GB200): small path uses TILE_V=4 / 4 warps,
+  big path uses TILE_V=32 / 8 warps; both run with NUM_STAGES=3.
 
 Computation Flow:
 1. Warp 0 handles TMA prefetch, loading data from GMEM to SMEM
@@ -50,13 +50,23 @@ from cula.utils import USE_FAST_MATH
 # ============================================================================
 # Global configuration
 # ============================================================================
-TILE_V = 8
+# Per-path tile / pipeline / warp configuration was sweep-tuned on GB200.
+# Small path (B <= 32, grid expanded by NUM_BLOCKS_PER_STATE):
+#   smaller TILE_V keeps the grid wide, deeper NUM_STAGES hides cp.async latency.
+# Big path (B > 32, grid = B*H):
+#   larger TILE_V amortizes per-warp setup, 8 warps fill issue slots, deeper stages help.
+TILE_V_SMALL = 4
+TILE_V_BIG = 32
 TILE_K = 128
-NUM_STAGES = 2
-NUM_THREADS_BIG = 128  # 4 warps for big-batch path (B > 32)
-NUM_THREADS_SMALL = 128  # 4 warps; sweep showed 8 warps regresses by ~12% at B=32
-# after constexpr/LDS/v_src refactor reduced LDS latency
+NUM_STAGES_SMALL = 3
+NUM_STAGES_BIG = 3
+NUM_THREADS_BIG = 256  # 8 warps for big-batch path (B > 32)
+NUM_THREADS_SMALL = 128  # 4 warps for small-batch path (B <= 32)
 NUM_BLOCKS_PER_STATE = 8
+
+# Backward-compat aliases (still referenced in some places).
+TILE_V = TILE_V_SMALL
+NUM_STAGES = NUM_STAGES_SMALL
 
 
 @cute.kernel
@@ -79,6 +89,8 @@ def la_decode_kernel_small_batch_pretranspose(
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
     NUM_WARPS: cutlass.Constexpr[int] = 4,
+    TILE_V: cutlass.Constexpr[int] = 8,
+    NUM_STAGES: cutlass.Constexpr[int] = 2,
 ):
     """Each block uses pipeline to load one batch and vectorized writeback"""
 
@@ -178,8 +190,11 @@ def la_decode_kernel_small_batch_pretranspose(
             cute.arch.cp_async_commit_group()
 
         # Step 3: Compute using data from current stage
+        # v_grp selects which r_v[] entry holds this v_tiles' v values.
+        # r_v has vec_size=4 entries each holding 32 V positions; so each
+        # entry covers (32 / TILE_V) consecutive v_tiles. (e.g. TILE_V=8 -> 4)
         v_src = cutlass.Float32(0.0)
-        v_grp = v_tiles // 4
+        v_grp = v_tiles // (32 // TILE_V)
         if v_grp == 0:
             v_src = r_v[0]
         elif v_grp == 1:
@@ -241,6 +256,8 @@ def la_decode_kernel_big_batch_pretranspose(
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
     NUM_WARPS: cutlass.Constexpr[int] = 4,
+    TILE_V: cutlass.Constexpr[int] = 8,
+    NUM_STAGES: cutlass.Constexpr[int] = 2,
 ):
     """Each block uses pipeline to load one batch and vectorized writeback"""
 
@@ -338,8 +355,9 @@ def la_decode_kernel_big_batch_pretranspose(
             cute.arch.cp_async_commit_group()
 
         # Step 3: Compute using data from current stage
+        # v_grp selects which r_v[] entry holds this v_tiles' v values.
         v_src = cutlass.Float32(0.0)
-        v_grp = v_tiles // 4
+        v_grp = v_tiles // (32 // TILE_V)
         if v_grp == 0:
             v_src = r_v[0]
         elif v_grp == 1:
@@ -423,22 +441,19 @@ def run_la_decode_kernel_big_batch_pretranspose(
 
     tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
 
-    num_v_tiles = cute.ceil_div(v_dim, TILE_V)
+    num_v_tiles = cute.ceil_div(v_dim, TILE_V_BIG)
 
     vec_size = TILE_K // 32  # Each thread in a warp processes this many elements (always 4 for TILE_K=128)
 
-    # print(f"Batched CP.ASYNC Load + Store (bypass L1 cache)")
-    # print(f"  {batch_size} batches x {v_dim}x{k_dim} matrices")
-    # print(f"  Tile: {TILE_V}x{TILE_K}, {num_v_tiles} tiles/batch")
-    # print(f"  Threads: {NUM_THREADS} ({NUM_THREADS // 32} warps), vec_size: {vec_size}")
-    # print(f"  Total: {total_data_mb:.1f} MB\n")
-
     # Create SMEM layout (row-major: v-row major, k-contiguous)
-    smem_layout_staged = cute.make_layout((TILE_V, TILE_K, NUM_STAGES), stride=(TILE_K, 1, TILE_V * TILE_K))
+    smem_layout_staged = cute.make_layout(
+        (TILE_V_BIG, TILE_K, NUM_STAGES_BIG),
+        stride=(TILE_K, 1, TILE_V_BIG * TILE_K),
+    )
 
-    # sData: TILE_V * TILE_K * NUM_STAGES * 4 bytes (Float32), cosize unchanged with XOR swizzle
+    # sData: TILE_V_BIG * TILE_K * NUM_STAGES_BIG * 4 bytes (Float32)
     # sOutput: V * 2 bytes (BFloat16)
-    smem_bytes = 4 * TILE_V * TILE_K * NUM_STAGES + 2 * v_dim + 32
+    smem_bytes = 4 * TILE_V_BIG * TILE_K * NUM_STAGES_BIG + 2 * v_dim + 32
 
     la_decode_kernel_big_batch_pretranspose(
         tiled_copy_load,
@@ -459,6 +474,8 @@ def run_la_decode_kernel_big_batch_pretranspose(
         K,
         V,
         NUM_WARPS_BIG,
+        TILE_V_BIG,
+        NUM_STAGES_BIG,
     ).launch(
         grid=(batch_size, 1, 1),
         block=[NUM_THREADS_BIG, 1, 1],
@@ -508,16 +525,19 @@ def run_la_decode_kernel_small_batch_pretranspose(
 
     tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
 
-    num_v_tiles = cute.ceil_div(v_dim, TILE_V)
+    num_v_tiles = cute.ceil_div(v_dim, TILE_V_SMALL)
 
     vec_size = TILE_K // 32  # Each thread in a warp processes this many elements (always 4 for TILE_K=128)
 
     # Create SMEM layout (row-major: v-row major, k-contiguous)
-    smem_layout_staged = cute.make_layout((TILE_V, TILE_K, NUM_STAGES), stride=(TILE_K, 1, TILE_V * TILE_K))
+    smem_layout_staged = cute.make_layout(
+        (TILE_V_SMALL, TILE_K, NUM_STAGES_SMALL),
+        stride=(TILE_K, 1, TILE_V_SMALL * TILE_K),
+    )
 
-    # sData: TILE_V * TILE_K * NUM_STAGES * 4 bytes (Float32), cosize unchanged with XOR swizzle
-    # sOutput: TILE_V * 2 bytes (BFloat16)
-    smem_bytes = 4 * TILE_V * TILE_K * NUM_STAGES + 2 * v_dim + 32
+    # sData: TILE_V_SMALL * TILE_K * NUM_STAGES_SMALL * 4 bytes (Float32)
+    # sOutput: V * 2 bytes (BFloat16)
+    smem_bytes = 4 * TILE_V_SMALL * TILE_K * NUM_STAGES_SMALL + 2 * v_dim + 32
 
     la_decode_kernel_small_batch_pretranspose(
         tiled_copy_load,
@@ -538,6 +558,8 @@ def run_la_decode_kernel_small_batch_pretranspose(
         K,
         V,
         NUM_WARPS_SMALL,
+        TILE_V_SMALL,
+        NUM_STAGES_SMALL,
     ).launch(
         grid=(batch_size * NUM_BLOCKS_PER_STATE, 1, 1),
         block=[NUM_THREADS_SMALL, 1, 1],
