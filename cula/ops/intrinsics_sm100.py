@@ -73,6 +73,8 @@ from cutlass._mlir.dialects import vector as _vector
 from cutlass.cute.typing import Int32
 from cutlass.cutlass_dsl import dsl_user_op
 
+from cula.ops.ptx_umma_ext import Tcgen05SmemDescriptor
+
 
 def _to_ir(val, loc=None, ip=None):
     """Extract raw MLIR IR value from a CuteDSL wrapper."""
@@ -306,7 +308,7 @@ def store_256b(gmem_ptr, vec):
 
 
 @cute.jit
-def tcgen05_cp_128x256b(taddr: int, smem_desc):
+def tcgen05_cp_128x256b(taddr: int, smem_desc: Tcgen05SmemDescriptor):
     """Async copy SMEM → TMEM with shape ``128x256b`` (``cta_group::1``).
 
     Issues ``tcgen05.cp.cta_group::1.128x256b  [taddr], s-desc;``
@@ -325,7 +327,7 @@ def tcgen05_cp_128x256b(taddr: int, smem_desc):
     ----------
     taddr : int
         TMEM destination address (uint32, passed as ``!llvm.ptr<6>``).
-    smem_desc : i64
+    smem_desc : Tcgen05SmemDescriptor
         64-bit SMEM matrix descriptor (same format as ``tcgen05.mma``
         descriptors — see ``Tcgen05SmemDescriptor``).
     """
@@ -343,4 +345,4 @@ def tcgen05_cp_128x256b(taddr: int, smem_desc):
             ip=ip,
         )
 
-    _do(Int32(taddr), smem_desc)
+    _do(Int32(taddr), smem_desc.desc_i64[0])

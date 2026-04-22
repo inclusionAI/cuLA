@@ -60,6 +60,7 @@ from cula.ops.ptx_umma_ext import (
 )
 
 M_DIM, N_DIM = 64, 64
+# TODO: support arbitrary K
 K_DIM_TF32 = 8  # kind::tf32  → K>=8, tile size
 A_K_STEP_BYTES_TF32 = M_DIM * 8 * 4 # smem offset for each K-atom in operand A
 B_K_STEP_BYTES_TF32 = N_DIM * 8 * 4 # smem offset for each K-atom in operand B
@@ -228,7 +229,7 @@ class _WsSsTf32Kernel:
 # Test 2: tcgen05mma_ws_ts_tf32  (weight-stationary, TMEM A, SMEM B, tf32)
 # =====================================================================
 
-
+# TODO
 class _WsTsTf32Kernel:
     """Two-step test:
     - Region 0 (tmem_a_region): populate A into TMEM via S2T copy
@@ -282,8 +283,6 @@ class _WsSsF16Kernel:
         )
         a_smem_layout = sm100_utils.make_smem_layout_a(non_ws_tiled_mma, mma_tiler, Float16, 1)
         b_smem_layout = sm100_utils.make_smem_layout_b(non_ws_tiled_mma, mma_tiler, Float16, 1)
-        # A: K-major, F16, (M, K)=(64, 16)
-        # K=16 F16 = 32 bytes → Swizzle S<1,4,3> (SW32)
         bufferA = smem.allocate_tensor(
             element_type=Float16,
             layout=a_smem_layout.outer,
@@ -291,8 +290,6 @@ class _WsSsF16Kernel:
             swizzle=a_smem_layout.inner,
         )
 
-        # B: MN-major, F16, (N, K)=(64, 16)
-        # N=64 F16 = 128 bytes → Swizzle S<3,4,3> (SW128)
         bufferB = smem.allocate_tensor(
             element_type=Float16,
             layout=b_smem_layout.outer,
@@ -393,8 +390,8 @@ class _WsSsF16Kernel:
         #   warp0->(M0,N0), warp1->(M1,N0), warp2->(M0,N1), warp3->(M1,N1)
         # in each warp, each thread process one row, T0->[0, 0:31], T1->[1, 0:31], ..., T31->[31, 0:31]
         lane_idx = tidx % 32
-        row = (warp_idx % 2) * 32 + lane_idx  # M0 or M1
-        col_base = (warp_idx // 2) * 32  # N0 or N1
+        row = (warp_idx % 2) * M // 2 + lane_idx  # M0 or M1
+        col_base = (warp_idx // 2) * ACC_NUM_COLS  # N0 or N1
         # 32 regs = 4 chunks of 8 × 32-bit each (256 bits)
         base_addr = (C_out.iterator + row * N + col_base).toint()
         for chunk in cutlass.range_constexpr(ACC_NUM_COLS // 8):
@@ -531,8 +528,8 @@ class _WsSsTf32CollectorKernel:
         vec_i32 = tcgen05_ld_32x32b(NUM_COLS, tmem_col)
         cute.arch.fence_view_async_tmem_load()
         lane_idx = tidx % 32
-        row = (warp_idx % 2) * 32 + lane_idx
-        col_base = (warp_idx // 2) * 32
+        row = (warp_idx % 2) * M // 2 + lane_idx
+        col_base = (warp_idx // 2) * ACC_NUM_COLS
         base_addr = (C_out.iterator + row * N + col_base).toint()
         for chunk in cutlass.range_constexpr(ACC_NUM_COLS // 8):
             store_256b(base_addr + chunk * 32, subvec(vec_i32, chunk * 8, 8))
