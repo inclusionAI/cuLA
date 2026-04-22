@@ -82,6 +82,12 @@ assert IDESC_TF32_M64_N64 == 0x4110910
 IDESC_F16_M64_N64 = (4 << 24) | (8 << 17) | (1 << 16) | (0 << 10) | (0 << 7) | (1 << 4)
 assert IDESC_F16_M64_N64 == 0x4110010
 
+# Instruction descriptor for M=64, N=128, F16, dense, TransposeB=1
+# Bits: M>>4=4 at [24:28], N>>3=16 at [17:22], TransposeB at [16],
+#       btype=f16(0) at [10:12], atype=f16(0) at [7:9], dtype=f32(1) at [4:5]
+IDESC_F16_M64_N128 = (4 << 24) | (16 << 17) | (1 << 16) | (0 << 10) | (0 << 7) | (1 << 4)
+assert IDESC_F16_M64_N128 == 0x4210010
+
 
 # =====================================================================
 # Test 1: tcgen05mma_ws_ss_tf32  (weight-stationary, SMEM A, SMEM B, tf32)
@@ -256,9 +262,21 @@ class _WsTsTf32Kernel:
 
 
 class _WsSsF16Kernel:
+    def __init__(self, M: int, N: int, K: int):
+        self.M = M
+        self.N = N
+        self.K = K
+        if N == 64:
+            self.idesc = IDESC_F16_M64_N64
+        elif N == 128:
+            self.idesc = IDESC_F16_M64_N128
+        else:
+            raise ValueError(f"Unsupported N={N} for F16 IDESC (expected 64 or 128)")
+
     @cute.kernel
     def kernel(self, A_in: cute.Tensor, B_in: cute.Tensor, C_out: cute.Tensor):
-        M, N, K = M_DIM, N_DIM, K_DIM_F16
+        M, N, K = self.M, self.N, self.K
+        idesc = self.idesc
         ACC_NUM_COLS = N // 2
         NUM_COLS = ACC_NUM_COLS
         tidx, _, _ = cute.arch.thread_idx()
@@ -358,7 +376,7 @@ class _WsSsF16Kernel:
                     b_off = cute.crd2idx(((0, 0), 0, ks, 0), b_outer) * ELEM_BYTES_F16
                     desc_a = desc_a_base + a_off
                     desc_b = desc_b_base + b_off
-                    tcgen05mma_ws_ss_f16(desc_a, desc_b, tmem_col, IDESC_F16_M64_N64, scale)
+                    tcgen05mma_ws_ss_f16(desc_a, desc_b, tmem_col, idesc, scale)
                 tcgen05.commit(mbar_ptr, cta_group=tcgen05.CtaGroup.ONE)
         mbarrier_wait(mbar_ptr, 0)
         sync_threads()
@@ -406,9 +424,10 @@ class _WsSsF16Kernel:
         self.kernel(A, B, C).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
 
     def run(self, A_cpu, B_cpu):
+        M, N = self.M, self.N
         A_gpu = A_cpu.contiguous().half().cuda()
         B_gpu = B_cpu.contiguous().half().cuda()
-        C_gpu = torch.zeros(M_DIM, N_DIM, dtype=torch.float32, device="cuda")
+        C_gpu = torch.zeros(M, N, dtype=torch.float32, device="cuda")
         stream = cutlass_torch.default_stream()
         self._launch(from_dlpack(A_gpu), from_dlpack(B_gpu), from_dlpack(C_gpu), stream)
         torch.cuda.synchronize()
@@ -420,6 +439,7 @@ class _WsSsF16Kernel:
 # =====================================================================
 
 
+# TODO: support S2T with tcgen05.cp
 class _WsTsF16Kernel:
     """Two-step test (same strategy as _WsTsTf32Kernel but with kind::f16):
     - Region 0 (tmem_a_region): populate A into TMEM via S2T copy
@@ -511,16 +531,16 @@ class _WsSsTf32CollectorKernel:
         desc_b = Tcgen05SmemDescriptor(desc_b_i64)
 
         if warp_idx == cutlass.Int32(0):
-            tcgen05mma_ws_ss_tf32(
-                desc_a,
-                desc_b,
-                tmem_col,
-                IDESC_TF32_M64_N64,
-                0,
-                collector_b_buffer=CollectorBBuffer.B0,
-                collector_op=CollectorOp.DISCARD,
-            )
             with elect_one():
+                tcgen05mma_ws_ss_tf32(
+                    desc_a,
+                    desc_b,
+                    tmem_col,
+                    IDESC_TF32_M64_N64,
+                    0,
+                    collector_b_buffer=CollectorBBuffer.B0,
+                    collector_op=CollectorOp.DISCARD,
+                )
                 tcgen05.commit(mbar_ptr, cta_group=tcgen05.CtaGroup.ONE)
         mbarrier_wait(mbar_ptr, 0)
         sync_threads()
@@ -578,19 +598,22 @@ def test_ws_ss_tf32():
 def test_ws_ss_f16():
     print("\n=== Test 3: tcgen05mma_ws_ss_f16 (weight-stationary, SMEM A × SMEM B, f16) ===")
     torch.manual_seed(42)
-    A = torch.randn(M_DIM, K_DIM_F16)
-    B = torch.randn(K_DIM_F16, N_DIM)
-    ref = torch.mm(A, B)
-    got = _WsSsF16Kernel().run(A, B)
-    err = (got - ref).abs()
-    rel = err.max().item() / (ref.abs().max().item() + 1e-8)
-    max_idx = err.argmax().item()
-    mi, mj = max_idx // N_DIM, max_idx % N_DIM
-    print(f"  got[0,:4]={got[0, :4].tolist()}")
-    print(f"  ref[0,:4]={ref[0, :4].tolist()}")
-    print(f"  max_rel_err={rel:.4f}  at ({mi},{mj}): got={got[mi, mj]:.6f} ref={ref[mi, mj]:.6f}")
-    assert rel < 0.02, f"FAIL: rel={rel:.4f}"
-    print("  PASSED")
+    for N in [64, 128]:
+        for K in [64, 128]:
+            print(f"  --- N={N}, K={K} ---")
+            A = torch.randn(M_DIM, K)
+            B = torch.randn(K, N)
+            ref = torch.mm(A, B)
+            got = _WsSsF16Kernel(M_DIM, N, K).run(A, B)
+            err = (got - ref).abs()
+            rel = err.max().item() / (ref.abs().max().item() + 1e-8)
+            max_idx = err.argmax().item()
+            mi, mj = max_idx // N, max_idx % N
+            print(f"  got[0,:4]={got[0, :4].tolist()}")
+            print(f"  ref[0,:4]={ref[0, :4].tolist()}")
+            print(f"  max_rel_err={rel:.4f}  at ({mi},{mj}): got={got[mi, mj]:.6f} ref={ref[mi, mj]:.6f}")
+            assert rel < 0.02, f"FAIL N={N}, K={K}: rel={rel:.4f}"
+            print(f"  PASSED (N={N}, K={K})")
 
 
 def test_ws_ss_tf32_collector():
