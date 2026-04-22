@@ -33,7 +33,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from cula.kda import kda_decode, fused_sigmoid_gating_delta_rule_update
+from cula.kda import fused_sigmoid_gating_delta_rule_update, kda_decode
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +123,6 @@ def make_inputs(N, H, HV, K, V, device="cuda", seed=42):
 def run_kda_decode_dense(q, k, v, a, b, A_log, dt_bias, state, scale):
     """Run kda_decode in dense layout: (N, 1, H/HV, dim)."""
     N, H, K = q.shape
-    HV, V = v.shape[1], v.shape[2]
 
     # Reshape to dense layout: (N, 1, H, K), etc.
     q_4d = q.unsqueeze(1).contiguous()  # (N, 1, H, K)
@@ -155,7 +154,6 @@ def run_kda_decode_dense(q, k, v, a, b, A_log, dt_bias, state, scale):
 def run_kda_decode_varlen(q, k, v, a, b, A_log, dt_bias, state, scale):
     """Run kda_decode in varlen layout: (1, N, H/HV, dim)."""
     N, H, K = q.shape
-    HV, V = v.shape[1], v.shape[2]
 
     # Reshape to varlen layout: (1, N, H, K), etc.
     q_4d = q.unsqueeze(0).contiguous()  # (1, N, H, K)

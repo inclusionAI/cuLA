@@ -165,7 +165,7 @@ def write_markdown_report(args, gpu_name: str, sections: list[tuple[int, int, li
     def summary(vals):
         if not vals:
             return "n/a"
-        return f"avg={sum(vals)/len(vals):.2f}x, min={min(vals):.2f}x, max={max(vals):.2f}x"
+        return f"avg={sum(vals) / len(vals):.2f}x, min={min(vals):.2f}x, max={max(vals):.2f}x"
 
     lines = []
     lines.append("# Benchmark Results - KDA Decode")
@@ -340,9 +340,15 @@ def run_config(N, H, HV, K, V, warmup, rep, ncu_mode):
         state_bench_fla_v_last.copy_(state_init_v_last)
 
     with torch.no_grad():
-        t_cula_v_last = benchmark_fn(lambda: call_cula_v_last(state_bench_cula_v_last), setup_fn=setup_cula_v_last, warmup=w, rep=r)
-        t_cula_k_last = benchmark_fn(lambda: call_cula_k_last(state_bench_cula_k_last), setup_fn=setup_cula_k_last, warmup=w, rep=r)
-        t_fla_v_last = benchmark_fn(lambda: call_fla_v_last(state_bench_fla_v_last), setup_fn=setup_fla_v_last, warmup=w, rep=r)
+        t_cula_v_last = benchmark_fn(
+            lambda: call_cula_v_last(state_bench_cula_v_last), setup_fn=setup_cula_v_last, warmup=w, rep=r
+        )
+        t_cula_k_last = benchmark_fn(
+            lambda: call_cula_k_last(state_bench_cula_k_last), setup_fn=setup_cula_k_last, warmup=w, rep=r
+        )
+        t_fla_v_last = benchmark_fn(
+            lambda: call_fla_v_last(state_bench_fla_v_last), setup_fn=setup_fla_v_last, warmup=w, rep=r
+        )
 
     return {
         "N": N,
@@ -421,10 +427,7 @@ def main():
             )
 
         print()
-        hdr_out = (
-            f"{'N':>5} | {'cuLA v out RMSE':>16} | {'rel':>10} | "
-            f"{'cuLA k out RMSE':>16} | {'rel':>10}"
-        )
+        hdr_out = f"{'N':>5} | {'cuLA v out RMSE':>16} | {'rel':>10} | {'cuLA k out RMSE':>16} | {'rel':>10}"
         print(hdr_out)
         print("-" * len(hdr_out))
         for res in results:
@@ -434,10 +437,7 @@ def main():
             )
 
         print()
-        hdr_state = (
-            f"{'N':>5} | {'cuLA v state RMSE':>18} | {'rel':>10} | "
-            f"{'cuLA k state RMSE':>18} | {'rel':>10}"
-        )
+        hdr_state = f"{'N':>5} | {'cuLA v state RMSE':>18} | {'rel':>10} | {'cuLA k state RMSE':>18} | {'rel':>10}"
         print(hdr_state)
         print("-" * len(hdr_state))
         for res in results:
