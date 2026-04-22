@@ -15,31 +15,41 @@ All descriptor values are computed via make_umma_smem_desc / smem_descriptor_to_
 (proven correct in test_umma_ptx_jit.py). Wrapped in Tcgen05SmemDescriptor for API
 compatibility with ptx_umma_masked.py convenience wrappers.
 """
-import sys, pathlib
+
+import pathlib
+import sys
+
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
-import torch
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Float32, TFloat32, Int32, Int64
+import cutlass.utils as utils
+import cutlass.utils.blackwell_helpers as sm100_utils
+import torch
+from cutlass.cute.arch import (
+    elect_one,
+    mbarrier_init,
+    mbarrier_init_fence,
+    mbarrier_wait,
+    sync_threads,
+)
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.nvgpu.tcgen05 import (
-    Repetition, Pack, make_umma_smem_desc, smem_descriptor_to_int,
+    Pack,
+    Repetition,
+    make_umma_smem_desc,
+    smem_descriptor_to_int,
 )
-from cutlass.cute.arch import (
-    mbarrier_init, mbarrier_init_fence, mbarrier_wait, sync_threads, elect_one,
-)
-import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.typing import Float32, Int32, Int64, TFloat32
 
-from cula.kda.ptx_umma_masked import (
+from cula.ops.ptx_umma_ext import (
     Tcgen05SmemDescriptor,
-    tcgen05mma_ss_no_mask,
     tcgen05mma_ss_mask0,
     tcgen05mma_ss_mask1,
+    tcgen05mma_ss_no_mask,
 )
 
 M_DIM, N_DIM, K_DIM = 64, 64, 8
@@ -61,7 +71,7 @@ class _Kernel:
             Phase 1 - full no-mask MMA with A_in used as A_zero (passed by caller as zeros),
                       scale_out=0 → zeroes TMEM for all rows.
             Phase 2 - masked MMA using B column from B_in (same B, new A from A_in second half).
-        
+
         To keep the interface simple, for mask tests A_in is [A_zero (64×8) || A_real (64×8)]
         concatenated to shape (128, 8). Phase 1 loads rows [0:64], phase 2 loads rows [64:128].
         """
@@ -70,14 +80,18 @@ class _Kernel:
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
-        smem          = utils.SmemAllocator()
+        smem = utils.SmemAllocator()
         tmem_hold_ptr = smem.allocate(Int32)
-        mbar_ptr      = smem.allocate(Int64, byte_alignment=8)
+        mbar_ptr = smem.allocate(Int64, byte_alignment=8)
 
         # Build tiled_mma to get correct SMEM layout
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            TFloat32, tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.MN,
-            Float32, tcgen05.CtaGroup.ONE, (M, N),
+            TFloat32,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.MN,
+            Float32,
+            tcgen05.CtaGroup.ONE,
+            (M, N),
         )
         mma_tiler = (M, N, K)
 
@@ -85,12 +99,16 @@ class _Kernel:
         a_smem_layout = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler, TFloat32, 1)
         b_smem_layout = sm100_utils.make_smem_layout_b(tiled_mma, mma_tiler, TFloat32, 1)
         bufferA = smem.allocate_tensor(
-            element_type=TFloat32, layout=a_smem_layout.outer,
-            byte_alignment=128, swizzle=a_smem_layout.inner,
+            element_type=TFloat32,
+            layout=a_smem_layout.outer,
+            byte_alignment=128,
+            swizzle=a_smem_layout.inner,
         )
         bufferB = smem.allocate_tensor(
-            element_type=TFloat32, layout=b_smem_layout.outer,
-            byte_alignment=128, swizzle=b_smem_layout.inner,
+            element_type=TFloat32,
+            layout=b_smem_layout.outer,
+            byte_alignment=128,
+            swizzle=b_smem_layout.inner,
         )
         bufA_s0 = bufferA[(None, None, None, 0)]
         bufB_s0 = bufferB[(None, None, None, 0)]
@@ -115,25 +133,27 @@ class _Kernel:
         sync_threads()
 
         # TMEM allocation
-        alloc_bar    = pipeline.NamedBarrier(barrier_id=2, num_threads=128)
-        tmem         = utils.TmemAllocator(
-            tmem_hold_ptr, barrier_for_retrieve=alloc_bar, allocator_warp_id=0,
+        alloc_bar = pipeline.NamedBarrier(barrier_id=2, num_threads=128)
+        tmem = utils.TmemAllocator(
+            tmem_hold_ptr,
+            barrier_for_retrieve=alloc_bar,
+            allocator_warp_id=0,
         )
         tmem.allocate(TMEM_COLS)
         tmem.wait_for_alloc()
         tmem_ptr_f32 = tmem.retrieve_ptr(Float32)
 
-        acc_shape        = tiled_mma.partition_shape_C((M, N))
+        acc_shape = tiled_mma.partition_shape_C((M, N))
         acc_shape_staged = cute.append(acc_shape, 1)
-        tCtAcc           = cute.make_tensor(tmem_ptr_f32, tiled_mma.make_fragment_C(acc_shape_staged).layout)
-        tmem_col_buf     = cute.make_tensor(tmem_hold_ptr, cute.make_layout(1))
-        tmem_col         = tmem_col_buf[0]
+        tCtAcc = cute.make_tensor(tmem_ptr_f32, tiled_mma.make_fragment_C(acc_shape_staged).layout)
+        tmem_col_buf = cute.make_tensor(tmem_hold_ptr, cute.make_layout(1))
+        tmem_col = tmem_col_buf[0]
 
         # Build descriptors
         desc_a_i64 = smem_descriptor_to_int(make_umma_smem_desc(bufA_s0.iterator, bufA_s0.layout, "k"))
         desc_b_i64 = smem_descriptor_to_int(make_umma_smem_desc(bufB_s0.iterator, bufB_s0.layout, "mn"))
-        desc_a     = Tcgen05SmemDescriptor(desc_a_i64)
-        desc_b     = Tcgen05SmemDescriptor(desc_b_i64)
+        desc_a = Tcgen05SmemDescriptor(desc_a_i64)
+        desc_b = Tcgen05SmemDescriptor(desc_b_i64)
 
         if cutlass.const_expr(self.mask_mode != "none"):
             # Phase 1: Load A_zero (first M rows of gA_all = all zeros), no_mask MMA → zero TMEM
@@ -141,7 +161,7 @@ class _Kernel:
                 smem_idx = tidx + step * 128
                 m = smem_idx % M_DIM
                 k = smem_idx // M_DIM
-                bufA_s0[smem_idx] = gA_all[m * K_DIM + k]   # row_offset=0
+                bufA_s0[smem_idx] = gA_all[m * K_DIM + k]  # row_offset=0
             sync_threads()
             if warp_idx == cutlass.Int32(0):
                 tcgen05mma_ss_no_mask(desc_a, desc_b, tmem_col, IDESC_M64_N64, 0)
@@ -159,7 +179,7 @@ class _Kernel:
                 smem_idx = tidx + step * 128
                 m = smem_idx % M_DIM
                 k = smem_idx // M_DIM
-                bufA_s0[smem_idx] = gA_all[(M_DIM + m) * K_DIM + k]   # row_offset=M
+                bufA_s0[smem_idx] = gA_all[(M_DIM + m) * K_DIM + k]  # row_offset=M
             sync_threads()
             if warp_idx == cutlass.Int32(0):
                 if cutlass.const_expr(self.mask_mode == "mask0"):
@@ -186,22 +206,21 @@ class _Kernel:
             sync_threads()
 
         # T2R: TMEM → RMEM
-        t2r_atom    = cute.make_copy_atom(tcgen05.Ld16x256bOp(Repetition(8), Pack.NONE), Float32)
-        fake_smem   = cute.make_tensor(cute.make_ptr(Float32, 0, cute.AddressSpace.smem),
-                                       cute.make_layout((M, N)))
+        t2r_atom = cute.make_copy_atom(tcgen05.Ld16x256bOp(Repetition(8), Pack.NONE), Float32)
+        fake_smem = cute.make_tensor(cute.make_ptr(Float32, 0, cute.AddressSpace.smem), cute.make_layout((M, N)))
         tCtAcc_flat = tCtAcc[((None, None), 0, 0, None)]
-        tiled_t2r   = tcgen05.make_tmem_copy(t2r_atom, tCtAcc_flat[(None, None, 0)])
-        thr_t2r     = tiled_t2r.get_slice(tidx)
-        tTR_tAcc    = thr_t2r.partition_S(tCtAcc_flat)
-        tTR_sDummy  = thr_t2r.partition_D(fake_smem)
-        tTR_rAcc    = cute.make_rmem_tensor(tTR_sDummy.shape, Float32)
+        tiled_t2r = tcgen05.make_tmem_copy(t2r_atom, tCtAcc_flat[(None, None, 0)])
+        thr_t2r = tiled_t2r.get_slice(tidx)
+        tTR_tAcc = thr_t2r.partition_S(tCtAcc_flat)
+        tTR_sDummy = thr_t2r.partition_D(fake_smem)
+        tTR_rAcc = cute.make_rmem_tensor(tTR_sDummy.shape, Float32)
 
         cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, 0)], tTR_rAcc)
         cute.arch.fence_view_async_tmem_load()
 
         # R2G: RMEM → GMEM (row-major)
-        gC      = cute.make_tensor(C_out.iterator, cute.make_layout((M, N), stride=(N, 1)))
-        tTR_gC  = thr_t2r.partition_D(gC)
+        gC = cute.make_tensor(C_out.iterator, cute.make_layout((M, N), stride=(N, 1)))
+        tTR_gC = thr_t2r.partition_D(gC)
         cute.copy(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32), tTR_rAcc, tTR_gC)
 
         sync_threads()
@@ -234,8 +253,8 @@ def test_ss_no_mask():
     ref = torch.mm(A, B)
     got = _Kernel("none").run(A, B)
     rel = (got - ref).abs().max().item() / (ref.abs().max().item() + 1e-8)
-    print(f"  got[0,:4]={got[0,:4].tolist()}")
-    print(f"  ref[0,:4]={ref[0,:4].tolist()}")
+    print(f"  got[0,:4]={got[0, :4].tolist()}")
+    print(f"  ref[0,:4]={ref[0, :4].tolist()}")
     print(f"  max_rel_err={rel:.4f}")
     assert rel < 0.02, f"FAIL: rel={rel:.4f}"
     print("  PASSED")
@@ -261,11 +280,11 @@ def test_ss_mask0():
 
     # SS_MASK0 = (0, 0xFF..., 0, 0xFF...) → mask words 1,3 disable rows 16-31 and 48-63
     # Active: rows 0-15 and 32-47, Disabled: rows 16-31 and 48-63
-    active_rows  = list(range(0, 16)) + list(range(32, 48))
-    masked_rows  = list(range(16, 32)) + list(range(48, 64))
+    active_rows = list(range(0, 16)) + list(range(32, 48))
+    masked_rows = list(range(16, 32)) + list(range(48, 64))
 
     rel_active = (got[active_rows] - ref[active_rows]).abs().max().item() / (ref[active_rows].abs().max().item() + 1e-8)
-    zero_max   = got[masked_rows].abs().max().item()
+    zero_max = got[masked_rows].abs().max().item()
 
     print(f"  active rows 0-15,32-47: max_rel_err={rel_active:.4f}  (expect <0.02)")
     print(f"  masked rows 16-31,48-63: max_abs={zero_max:.4f}  (expect 0.0)")
@@ -288,7 +307,7 @@ def test_ss_mask1():
     masked_rows = list(range(0, 16)) + list(range(32, 48))
 
     rel_active = (got[active_rows] - ref[active_rows]).abs().max().item() / (ref[active_rows].abs().max().item() + 1e-8)
-    zero_max   = got[masked_rows].abs().max().item()
+    zero_max = got[masked_rows].abs().max().item()
 
     print(f"  active rows 16-31,48-63: max_rel_err={rel_active:.4f}  (expect <0.02)")
     print(f"  masked rows 0-15,32-47: max_abs={zero_max:.4f}  (expect 0.0)")
