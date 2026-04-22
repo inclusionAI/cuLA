@@ -22,7 +22,6 @@ python benchmarks/bench_cula_flashkda.py --mode varlen
 ## Notes
 
 > **N1 — Accuracy metric (`err_ratio`) here is cuLA vs FlashKDA, not vs FLA reference.**
-> For cuLA/FlashKDA accuracy relative to the FLA `chunk_kda` ground truth, see [ACCURACY_CULA_VS_FLASHKDA.md](ACCURACY_CULA_VS_FLASHKDA.md).
 
 > **N2 — State dtype.**
 > Both cuLA and FlashKDA use **float32** for initial and final states in this benchmark. Currently the benchmark runs with `has_init_state=False` (both kernels receive `None`); pass `--init_state` to test with non-zero initial states.
@@ -126,4 +125,3 @@ The gap narrows as T increases (0.49x at T=512 → ~0.75x at T≥4096 for B=2).
 ### Accuracy
 
 - err_ratio between cuLA and FlashKDA outputs: **~0.0055** (uniform across all configs, independent of T, B, distribution)
-- This is consistent with the findings in [ACCURACY_CULA_VS_FLASHKDA.md](ACCURACY_CULA_VS_FLASHKDA.md): cuLA err_ratio vs FLA ≈ 0.0031, FlashKDA err_ratio vs FLA ≈ 0.0048 → combined divergence ≈ 0.005–0.006.
