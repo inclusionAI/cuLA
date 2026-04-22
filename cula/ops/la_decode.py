@@ -54,7 +54,8 @@ TILE_V = 8
 TILE_K = 128
 NUM_STAGES = 2
 NUM_THREADS_BIG = 128  # 4 warps for big-batch path (B > 32)
-NUM_THREADS_SMALL = 256  # 8 warps for small-batch path (B <= 32)
+NUM_THREADS_SMALL = 128  # 4 warps; sweep showed 8 warps regresses by ~12% at B=32
+# after constexpr/LDS/v_src refactor reduced LDS latency
 NUM_BLOCKS_PER_STATE = 8
 
 
