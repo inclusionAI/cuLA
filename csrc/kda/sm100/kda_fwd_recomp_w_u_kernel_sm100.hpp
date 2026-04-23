@@ -88,11 +88,11 @@ struct KdaChunkFwdRecompWUKernelSm100 {
     static constexpr int NumLoadAuxThreads = 64;                                // warp 10-11
 
     // ===================== Kernel-only Constants =====================
-    static constexpr int NumPrologueRegs = 208;  // WG0: element-wise + R2T Akk
-    static constexpr int NumEpilogueRegs = 216;  // WG1: T2R acc + R2G store + kg
-    static constexpr int NumLoadRegs = 80;       // WG2: TMA load + MMA + Aux
-
     static constexpr bool StoreQG = Mainloop::StoreQG;
+
+    static constexpr int NumPrologueRegs = StoreQG ? 232 : 224;  // WG0: element-wise + R2T Akk
+    static constexpr int NumEpilogueRegs = StoreQG ? 192 : 200;  // WG1: T2R acc + R2G store + kg
+    static constexpr int NumLoadRegs = 80;                       // WG2: TMA load + MMA + Aux
 
     // ===================== Warp Roles =====================
     enum class WarpRole {

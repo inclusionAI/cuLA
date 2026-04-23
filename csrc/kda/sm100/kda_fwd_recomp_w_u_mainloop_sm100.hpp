@@ -51,7 +51,7 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     static constexpr bool StoreQG = StoreQG_;
     using ElementBeta = ElementBeta_;
 
-    // TODO: double buffer for TMEM acc
+    // TODO: try optimization with tcgen05.mma.ws
     enum class TmemAllocation : uint32_t {
         W = 0,               // W, acc, single buffer, [0, 64],
         U = W + 16 * 65536,  // U, acc, [0, 64] +lane16
@@ -736,26 +736,26 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                 __nv_bfloat16* out_row_base =
                     out_ptr_base + (token_offset_cur + row) * params.d * params.h + head_idx * params.d;
 
-                constexpr int HalfK = TileK / 2;
+                constexpr int QuarK = TileK / 4;
 
                 ku::tcgen05_after_thread_sync();
 #pragma unroll
-                for (int half = 0; half < 2; ++half) {
-                    float res_half[HalfK];
-                    ku::tmem_ld_32dp32bNx<HalfK>(
-                        uint32_t(TmemAllocation::W) + buf_mma_idx * 256 + half * HalfK, res_half);
+                for (int quar = 0; quar < 4; ++quar) {
+                    float res_quar[QuarK];
+                    ku::tmem_ld_32dp32bNx<QuarK>(
+                        uint32_t(TmemAllocation::W) + buf_mma_idx * 256 + quar * QuarK, res_quar);
                     cutlass::arch::fence_view_async_tmem_load();
 
                     if (row < sub_seq_len) {
 #pragma unroll
-                        for (int i = 0; i < HalfK / 16; ++i) {
+                        for (int i = 0; i < QuarK / 16; ++i) {
                             ku::bf16x16 out;
 #pragma unroll
                             for (int j = 0; j < 8; ++j) {
                                 reinterpret_cast<__nv_bfloat162*>(&out)[j] =
-                                    __float22bfloat162_rn(reinterpret_cast<float2*>(&res_half[i * 16])[j]);
+                                    __float22bfloat162_rn(reinterpret_cast<float2*>(&res_quar[i * 16])[j]);
                             }
-                            store_256b(&out, out_row_base + half * HalfK + i * 16);
+                            store_256b(&out, out_row_base + quar * QuarK + i * 16);
                         }
                     }
                 }
