@@ -90,9 +90,15 @@ struct KdaChunkFwdRecompWUKernelSm100 {
     // ===================== Kernel-only Constants =====================
     static constexpr bool StoreQG = Mainloop::StoreQG;
 
+    // NOTE: NVCC 12.9 and 13.0 have performance diffs on the same register config based on our testing
+#if CUDA_VERSION_CHECK >= 13000
     static constexpr int NumPrologueRegs = StoreQG ? 232 : 224;  // WG0: element-wise + R2T Akk
     static constexpr int NumEpilogueRegs = StoreQG ? 192 : 200;  // WG1: T2R acc + R2G store + kg
-    static constexpr int NumLoadRegs = 80;                       // WG2: TMA load + MMA + Aux
+#else
+    static constexpr int NumPrologueRegs = StoreQG ? 216 : 224;  // WG0: element-wise + R2T Akk
+    static constexpr int NumEpilogueRegs = StoreQG ? 208 : 200;  // WG1: T2R acc + R2G store + kg
+#endif
+    static constexpr int NumLoadRegs = 80;  // WG2: TMA load + MMA + Aux
 
     // ===================== Warp Roles =====================
     enum class WarpRole {

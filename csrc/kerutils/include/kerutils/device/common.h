@@ -92,3 +92,7 @@ static_assert(false, "kerutils doesn't support SM architectures below SM80");
 #define KERUTILS_ENABLE_SM100
 #define KERUTILS_ENABLE_SM100A
 #endif
+
+#ifndef CUDA_VERSION_CHECK
+#define CUDA_VERSION_CHECK (__CUDACC_VER_MAJOR__ * 1000 + __CUDACC_VER_MINOR__ * 10)
+#endif
