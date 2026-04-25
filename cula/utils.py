@@ -110,6 +110,36 @@ def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callabl
         )
 
 
+def get_gdn_fused_fwd(device: torch.device | str | int | None = None) -> Callable:
+    """Return the appropriate ``gdn_prefill`` implementation for *device*.
+
+    - sm100/sm103 (Blackwell) → cula.gdn.gdn_prefill_blackwell (not yet available)
+    - sm90  (Hopper)          → cula.gdn.gdn_prefill_hopper
+
+    Args:
+        device: CUDA device to query.  Defaults to the currently active device.
+
+    Raises:
+        RuntimeError: If the device architecture is not supported.
+    """
+    major, minor = get_device_sm_version(device)
+    if major == 10 and minor in (0, 3):
+        # TODO
+        raise NotImplementedError(
+            "The Blackwell implementation of fused prefill is not yet available. "
+            "Please use a sm90a (Hopper) device or wait for future updates."
+        )
+    elif major == 9 and minor == 0:
+        from cula.gdn import gdn_prefill_hopper
+
+        return gdn_prefill_hopper
+    else:
+        raise RuntimeError(
+            f"Unsupported CUDA compute capability sm_{major}{minor}. "
+            f"Only sm90a (Hopper) and Blackwell (SM100/SM103) are supported."
+        )
+
+
 @cute.jit
 def print_tensor_2d(tensor: cute.Tensor):
     """
