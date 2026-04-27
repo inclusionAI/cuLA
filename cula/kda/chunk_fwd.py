@@ -59,6 +59,7 @@ def chunk_kda_fwd(
     cp_context: FLACPContext | None = None,
     use_tf32_inverse: bool = True,
     unified_gref: bool = False,  # Set True for ~5% extra perf (slightly lower precision)
+    chunk_offsets: torch.IntTensor | None = None,
 ):
     assert_blackwell(q.device)
 
@@ -117,6 +118,7 @@ def chunk_kda_fwd(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
     )
 
     if cp_context is not None:

@@ -2001,6 +2001,7 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     persistent: bool = True,
+    chunk_offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     ChunkDeltaRuleFwdH forward pass — FLA-compatible API.
@@ -2039,7 +2040,9 @@ def chunk_gated_delta_rule_fwd_h(
     if cu_seqlens is None:
         N, NT, chunk_offsets = B, (T + BT - 1) // BT, None
     else:
-        N, NT, chunk_offsets = len(cu_seqlens) - 1, len(chunk_indices), prepare_chunk_offsets_i32(cu_seqlens, BT)
+        N, NT = len(cu_seqlens) - 1, len(chunk_indices)
+        if chunk_offsets is None:
+            chunk_offsets = prepare_chunk_offsets_i32(cu_seqlens, BT)
     assert K_dim == 128, "current kernel only supports 128."
     total_nt = B * NT
 
