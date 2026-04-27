@@ -233,3 +233,62 @@ def _get_cache_buf(name: str, nbytes: int, device: torch.device) -> torch.Tensor
         buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
         _cache_buf[key] = buf
     return buf
+
+
+# ---------------------------------------------------------------------------
+# Tensor cache
+# Adapted from: https://github.com/fla-org/flash-linear-attention/blob/main/fla/utils.py
+# Original copyright: 2024 The FLA Authors (same Apache 2.0 license)
+# ---------------------------------------------------------------------------
+_CULA_DISABLE_TENSOR_CACHE: bool = os.getenv("CULA_DISABLE_TENSOR_CACHE", "0") == "1"
+
+
+def tensor_cache(fn):
+    """Single-entry cache for functions with tensor inputs (identity-based)."""
+    last_args = None
+    last_kwargs = None
+    last_result = None
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        nonlocal last_args, last_kwargs, last_result
+        if _CULA_DISABLE_TENSOR_CACHE:
+            return fn(*args, **kwargs)
+        if last_args is not None and last_kwargs is not None:
+            if len(args) == len(last_args) and len(kwargs) == len(last_kwargs):
+                if all(a is b for a, b in zip(args, last_args, strict=False)) and all(
+                    k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items()
+                ):
+                    return last_result
+        result = fn(*args, **kwargs)
+        last_args, last_kwargs, last_result = args, kwargs, result
+        return result
+
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# Sequence-length helpers
+# Adapted from: https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/utils/index.py
+# Original copyright: 2024 The FLA Authors (same Apache 2.0 license)
+# ---------------------------------------------------------------------------
+@tensor_cache
+def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
+    return torch.diff(cu_seqlens)
+
+
+@tensor_cache
+def prepare_chunk_indices(
+    cu_seqlens: torch.LongTensor,
+    chunk_size: int,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
+) -> torch.LongTensor:
+    import triton  # already available as a transitive dep of cutlass-dsl
+
+    if cu_seqlens_cpu is not None:
+        indices = torch.cat(
+            [torch.arange(n, device=cu_seqlens.device) for n in triton.cdiv(prepare_lens(cu_seqlens_cpu), chunk_size).tolist()]
+        )
+        return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
+    indices = torch.cat([torch.arange(n) for n in triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()])
+    return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)

@@ -17,6 +17,9 @@ dependencies = [
 license = "Apache-2.0"
 
 [project.optional-dependencies]
+fla = [
+    "flash-linear-attention>=0.5",
+]
 dev = [
     "pytest",
     "matplotlib",
@@ -80,8 +83,10 @@ force-sort-within-sections = false
 "__init__.py" = ["F401"]
 "cula/_version.py" = ["UP007"]
 # TODO: fix undefined names (exp_g, chunk_kda_bwd_dqkwg) — WIP code
-"cula/ops/kda_fully_fused_wip.py" = ["F821"]
+"cula/kda/kda_fully_fused_wip.py" = ["F821"]
 "cula/kda/blackwell_fused_fwd.py" = ["F821"]
+# Ignore unused variable warnings in tests (often intentional for clarity)
+"tests/*" = ["F841"]
 
 [tool.setuptools_scm]
 # write generated version into package for runtime access
