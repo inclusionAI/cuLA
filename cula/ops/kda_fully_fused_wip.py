@@ -2576,7 +2576,10 @@ class KDAChunkwise:
                                         if index_q == Constant.C - 1:
                                             sG_last[index_k + k_offset, g_stage_idx] = tQrG_persists[half_idx][i]
                                 else:
-                                    if index_q == Constant.C - 1:
+                                    # non-varlen: tail chunk needs g of last valid token
+                                    tail_len_q = seq_len % C
+                                    last_valid_q = (tail_len_q - 1) if (idx == final_blk and tail_len_q != 0) else (Constant.C - 1)
+                                    if index_q == last_valid_q:
                                         sG_last[index_k + k_offset, g_stage_idx] = tQrG_persists[half_idx][i]
 
                             # exp(g) half in-place — persists for K gating reuse
@@ -2628,7 +2631,10 @@ class KDAChunkwise:
                                         if index_q == Constant.C - 1:
                                             sG_last[index_k + k_offset, g_stage_idx] = tQrG_persists[half_idx][i]
                                 else:
-                                    if index_q == Constant.C - 1:
+                                    # non-varlen: tail chunk needs g of last valid token
+                                    tail_len_q = seq_len % C
+                                    last_valid_q = (tail_len_q - 1) if (idx == final_blk and tail_len_q != 0) else (Constant.C - 1)
+                                    if index_q == last_valid_q:
                                         sG_last[index_k + k_offset, g_stage_idx] = tQrG_persists[half_idx][i]
 
                     # ====================================================
@@ -2822,12 +2828,20 @@ class KDAChunkwise:
                         tQrK_half_cv = thr_load_qk_half.retile(tQrK_half)
                         cute.copy(tiled_load_qk_half, tQsK_h[half_idx][None, None, None, k_stage_idx], tQrK_half_cv)
 
-                        # Zero K half for invalid positions (varlen only)
+                        # Zero K half for invalid positions (varlen and non-varlen tail chunks)
                         if cutlass.const_expr(self.is_varlen):
                             if valid_len_chunk < C:
                                 for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
                                     index_q, index_k = index_transform_half(*tQcMq_half[i])
                                     if index_q >= valid_len_chunk:
+                                        tQrK_half[i] = self.k_dtype(0.0)
+                        else:
+                            # non-varlen: mask padding in tail chunk (seq_len % C != 0)
+                            tail_len_k = seq_len % C
+                            if idx == final_blk and tail_len_k != 0:
+                                for i in cutlass.range_constexpr(cute.size(tQcMq_half)):
+                                    index_q, index_k = index_transform_half(*tQcMq_half[i])
+                                    if index_q >= tail_len_k:
                                         tQrK_half[i] = self.k_dtype(0.0)
 
                         # K^T gating: exp(g_last - g) * K
@@ -3099,14 +3113,19 @@ class KDAChunkwise:
 
                     # ------------------------------------------------------------
                     # NOTE: Save exp(g) of last VALID row to rG_last for state update in next chunk
-                    # For full chunks, directly use C-1; only loop for partial chunks (varlen only)
+                    # For full chunks, directly use C-1; for partial tail chunks use actual last token.
                     if cutlass.const_expr(self.is_varlen):
                         if valid_len_chunk < C:
                             rG_last = exp_g[valid_len_chunk - 1]
                         else:
                             rG_last = exp_g[Constant.C - 1]
                     else:
-                        rG_last = exp_g[Constant.C - 1]
+                        # non-varlen: tail chunk may be partial (seq_len % C != 0)
+                        tail_len = seq_len % C  # 0 means full chunk
+                        if idx == final_blk and tail_len != 0:
+                            rG_last = exp_g[tail_len - 1]
+                        else:
+                            rG_last = exp_g[Constant.C - 1]
                     # NOTE: each thread save one element
                     sG_last[local_tidx, g_stage_idx] = rG_last
 

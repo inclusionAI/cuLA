@@ -126,7 +126,6 @@ class ChunkKDAFunction(torch.autograd.Function):
         g_cute = from_dlpack(g.detach())
         beta_cute = from_dlpack(beta.detach())
 
-        # FIXME: support return final_states
         o = torch.empty_like(q)
         o_cute = from_dlpack(o.detach())
 
