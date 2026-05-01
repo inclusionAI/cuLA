@@ -95,7 +95,7 @@ struct CollectiveLoadTma {
                 Tensor m_varlen_head = tma_load.get_tma_tensor(make_shape(
                     problem_size.total_seqlen,
                     problem_size.head_size,
-                    problem_size.num_heads));  // global view to the packed varlen sequence
+                    problem_size.num_qk_heads));  // global view to the packed varlen sequence
                 Tensor m_varlen = m_varlen_head(_, _, work_desc.q_head_idx());  // slice into current head_idx
                 Tensor m_offset = domain_offset(
                     make_coord(work_desc.tok_offset, _0{}),
@@ -108,13 +108,13 @@ struct CollectiveLoadTma {
                     "slice view GMEM %s: seq_idx:%d head_idx:%d tok_offset:%lld\n",
                     to_string(kind),
                     work_desc.seq_idx,
-                    work_desc.q_head_idx(),
+                    work_desc.o_head_idx(),
                     work_desc.tok_offset);
                 Tensor m_varlen_head = tma_load.get_tma_tensor(make_shape(
                     problem_size.total_seqlen,
                     problem_size.head_size,
-                    problem_size.num_heads));  // global view to the packed varlen sequence
-                Tensor m_varlen = m_varlen_head(_, _, work_desc.q_head_idx());  // slice into current head_idx
+                    problem_size.num_v_heads));  // global view to the packed varlen sequence
+                Tensor m_varlen = m_varlen_head(_, _, work_desc.o_head_idx());  // slice into current head_idx
                 Tensor m_offset = domain_offset(
                     make_coord(work_desc.tok_offset, _0{}),
                     m_varlen);  // offset to start of the current sequence
@@ -132,7 +132,8 @@ struct CollectiveLoadTma {
                 Tensor m_varlen_head = tma_load.get_tma_tensor(make_shape(
                     problem_size.head_size,
                     problem_size.total_seqlen,
-                    problem_size.num_heads));                     // global view to the packed varlen sequence
+                    kind == LoadKind::kK ? problem_size.num_qk_heads
+                                         : problem_size.num_v_heads));  // global view to the packed varlen sequence
                 Tensor m_varlen = m_varlen_head(_, _, head_idx);  // slice into current head_idx
                 Tensor m_offset = domain_offset(
                     make_coord(_0{}, work_desc.tok_offset),

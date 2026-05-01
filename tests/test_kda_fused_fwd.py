@@ -20,6 +20,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from fla.ops.kda import fused_recurrent_kda
 from fla.ops import chunk_kda as fla_chunk_kda
 from fla.ops.kda.gate import naive_kda_gate
 from fla.ops.kda.naive import naive_recurrent_kda
@@ -28,6 +29,150 @@ from fla.utils import assert_close, device
 from cula.utils import get_kda_fused_fwd
 
 pytestmark = pytest.mark.sm90_only
+
+
+@pytest.mark.parametrize("use_gate_in_kernel", [False, True], ids=["precomputed_gate", "gate_in_kernel"])
+def test_safe_gate_chunk_gva(use_gate_in_kernel: bool):
+    from fla.ops.kda.gate import naive_kda_lowerbound_gate
+
+    cula_kda_fused_fwd = get_kda_fused_fwd(device)
+
+    torch.manual_seed(42)
+    B, T, H, HV, D = 2, 130, 2, 4, 128
+    dtype = torch.bfloat16
+    lower_bound = -5.0
+
+    q = torch.rand(B, T, H, D, dtype=dtype)
+    k = torch.rand(B, T, H, D, dtype=dtype)
+    v = torch.rand(B, T, HV, D, dtype=dtype)
+    g = torch.randn(B, T, HV, D, dtype=dtype if use_gate_in_kernel else torch.float32)
+    if use_gate_in_kernel:
+        A_log = torch.randn(HV, dtype=torch.float32)
+        dt_bias = torch.randn(HV * D, dtype=torch.float32)
+        g_ref = naive_kda_lowerbound_gate(g.float(), A_log, dt_bias, lower_bound=lower_bound)
+    else:
+        A_log, dt_bias = None, None
+        g = F.logsigmoid(g.float()).clamp(lower_bound, 0)
+        g_ref = g
+
+    beta = torch.randn(B, T, HV, dtype=torch.float32).sigmoid().to(torch.bfloat16)
+    h0 = torch.randn(B, HV, D, D, dtype=torch.float32)
+    h0_vk = h0.transpose(-1, -2).contiguous()
+
+    tensors = (q, k, v, g, beta, h0, h0_vk)
+    q, k, v, g, beta, h0, h0_vk = map(lambda x: x.to(device).requires_grad_(False), tensors)
+    g_ref = g_ref.to(device).requires_grad_(False)
+    if use_gate_in_kernel:
+        A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(False), (A_log, dt_bias))
+
+    q_norm = F.normalize(q.clone(), p=2, dim=-1)
+    k_norm = F.normalize(k.clone(), p=2, dim=-1)
+
+    ref, ref_ht = fused_recurrent_kda(
+        q=q_norm.clone(),
+        k=k_norm.clone(),
+        v=v.clone(),
+        g=g_ref.clone(),
+        beta=beta.clone(),
+        initial_state=h0.clone(),
+        output_final_state=True,
+    )
+    ref_trans, ref_ht_trans = fused_recurrent_kda(
+        q=q_norm.clone(),
+        k=k_norm.clone(),
+        v=v.clone(),
+        g=g_ref.clone(),
+        beta=beta.clone(),
+        initial_state=h0_vk.clone(),
+        output_final_state=True,
+        transpose_state_layout=True,
+    )
+
+    tri, tri_ht = cula_kda_fused_fwd(
+        q=q_norm.clone(),
+        k=k_norm.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        A_log=(A_log.clone() if use_gate_in_kernel else None),
+        dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
+        initial_state=h0_vk.clone(),
+        output_final_state=True,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=True,
+        lower_bound=lower_bound,
+    )
+
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
+    assert_close("o", ref_trans, tri, 0.005)
+    assert_close("ht", ref_ht_trans, tri_ht, 0.005)
+
+
+def test_safe_gate_chunk_gva_varlen():
+    cula_kda_fused_fwd = get_kda_fused_fwd(device)
+
+    torch.manual_seed(42)
+    H, HV, D = 2, 4, 128
+    dtype = torch.bfloat16
+    cu_seqlens = torch.tensor([0, 63, 130], dtype=torch.int32, device=device)
+    T = int(cu_seqlens[-1].item())
+    N = len(cu_seqlens) - 1
+
+    q = torch.rand(1, T, H, D, dtype=dtype)
+    k = torch.rand(1, T, H, D, dtype=dtype)
+    v = torch.rand(1, T, HV, D, dtype=dtype)
+    g = F.logsigmoid(torch.randn(1, T, HV, D, dtype=torch.float32)).clamp(-5, 0)
+    beta = torch.randn(1, T, HV, dtype=torch.float32).sigmoid().to(torch.bfloat16)
+    h0 = torch.randn(N, HV, D, D, dtype=torch.float32)
+    h0_vk = h0.transpose(-1, -2).contiguous()
+
+    q, k, v, g, beta, h0, h0_vk = map(
+        lambda x: x.to(device).requires_grad_(False), (q, k, v, g, beta, h0, h0_vk)
+    )
+
+    q_norm = F.normalize(q.clone(), p=2, dim=-1)
+    k_norm = F.normalize(k.clone(), p=2, dim=-1)
+
+    ref, ref_ht = fused_recurrent_kda(
+        q=q_norm.clone(),
+        k=k_norm.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        initial_state=h0.clone(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+    )
+    ref_trans, ref_ht_trans = fused_recurrent_kda(
+        q=q_norm.clone(),
+        k=k_norm.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        initial_state=h0_vk.clone(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        transpose_state_layout=True,
+    )
+
+    tri, tri_ht = cula_kda_fused_fwd(
+        q=q_norm.clone(),
+        k=k_norm.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        initial_state=h0_vk.clone(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        safe_gate=True,
+        lower_bound=-5.0,
+    )
+
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
+    assert_close("o", ref_trans, tri, 0.005)
+    assert_close("ht", ref_ht_trans, tri_ht, 0.005)
 
 
 @pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])

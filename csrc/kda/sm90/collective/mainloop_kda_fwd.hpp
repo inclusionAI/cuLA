@@ -471,7 +471,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     Element const* ptr_V; LayoutV dV;
     Element*       ptr_O; LayoutO dO;
     float   const* ptr_Alpha; LayoutAlpha dAlpha;
-    float*        ptr_output_state; // layout fixed (kdim, vdim, num_heads, num_seqs):LayoutLeft{}
+    float*        ptr_output_state; // layout fixed (kdim, vdim, num_v_heads, num_seqs):LayoutLeft{}
     float const*  ptr_input_state;
     float scale;
     ElementBetaGmem const* beta_ptr;  GmemStrideBeta beta_stride;
@@ -507,14 +507,14 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         int32_t d = problem_size.head_size;
 
         auto params_qk = CollectiveMmaQK::to_underlying_arguments(
-            make_shape(s, t, d, problem_size.num_heads),
+            make_shape(s, t, d, problem_size.num_qk_heads),
             typename CollectiveMmaQK::Arguments{
                 args.ptr_Q, args.dQ, args.ptr_K, args.dK,  // never used, dummy
             },
             /*workspace=*/nullptr);
 
         auto params_kv_k = CollectiveMmaKV_G2S::to_underlying_arguments(
-            make_shape(d, d, s, problem_size.num_heads),
+            make_shape(d, d, s, problem_size.num_qk_heads),
             typename CollectiveMmaKV_G2S::Arguments{
                 args.ptr_V,
                 select<1, 0, 2>(args.dV),  // not used
@@ -523,7 +523,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             },
             /*workspace=*/nullptr);
 
-        auto alpha_shape = make_shape(s, d, problem_size.num_heads);
+        auto alpha_shape = make_shape(s, d, problem_size.num_v_heads);
         auto alpha_stride = make_stride(
             get<0>(args.dAlpha),  // seqlen stride
             get<1>(args.dAlpha),  // head_dim stride
@@ -538,7 +538,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             size<0>(ClusterShape{}));
 
         auto params_kv_v = CollectiveMmaKV_G2S::to_underlying_arguments(
-            make_shape(d, d, s, problem_size.num_heads),
+            make_shape(d, d, s, problem_size.num_v_heads),
             typename CollectiveMmaKV_G2S::Arguments{
                 args.ptr_V,
                 select<1, 0, 2>(args.dV),  // used as G2S for V
@@ -548,8 +548,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             /*workspace=*/nullptr);
 
         auto params_o = CollectiveStoreO::to_underlying_arguments(
-            make_shape(d, s, d, problem_size.num_heads),  // in O1
-            // make_shape(d, s, s, problem_size.num_heads),  // in O2
+            make_shape(d, s, d, problem_size.num_v_heads),  // in O1
+            // make_shape(d, s, s, problem_size.num_v_heads),  // in O2
             typename CollectiveStoreO::Arguments{args.ptr_O, select<1, 0, 2>(args.dO), workspace},
             workspace);
 
@@ -567,7 +567,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
             // TODO: refactor all name to varname_vartype
             .beta_ptr = args.beta_ptr,
-            .beta_layout = make_layout(make_shape(s, problem_size.num_heads), args.beta_stride),
+            .beta_layout = make_layout(make_shape(s, problem_size.num_v_heads), args.beta_stride),
         };
     }
 
@@ -899,7 +899,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
         auto kv_load = [&](auto& tKVrKV) INLINE_LAMBDA {
             DPRINTF0_WG("[%d,%d,%d,%d]>> load tKVgKV -> tKVrKV\n", seq_idx, q_head_idx, k_head_idx, v_head_idx);
-            int num_state_heads = problem_size.num_heads;
+            int num_state_heads = problem_size.num_v_heads;
             int state_head_idx = work_desc.o_head_idx();
             auto gKV = make_tensor(
                 make_gmem_ptr(params.ptr_input_state),
@@ -915,7 +915,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
         auto kv_store = [&]() INLINE_LAMBDA {  // tKVrKV is carried over whole mainloop
             DPRINTF0_WG("[%d,%d,%d,%d]>> save tKVrKV -> tKVgKV\n", seq_idx, q_head_idx, k_head_idx, v_head_idx);
-            int num_state_heads = problem_size.num_heads;
+            int num_state_heads = problem_size.num_v_heads;
             int state_head_idx = work_desc.o_head_idx();
             auto gKV = make_tensor(
                 make_gmem_ptr(params.ptr_output_state),
