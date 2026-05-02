@@ -21,7 +21,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 from fla.ops import chunk_kda as fla_chunk_kda
-from fla.ops.kda import fused_recurrent_kda
 from fla.ops.kda.gate import naive_kda_gate
 from fla.ops.kda.naive import naive_recurrent_kda
 from fla.utils import assert_close, device
@@ -111,78 +110,56 @@ def test_safe_gate_chunk(
         A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(False), (A_log, dt_bias))
     q, k, v, g, beta, h0, h0_vk = map(lambda x: x.to(device).requires_grad_(False), (q, k, v, g, beta, h0, h0_vk))
 
-    q_norm = F.normalize(q.clone(), p=2, dim=-1)
-    k_norm = F.normalize(k.clone(), p=2, dim=-1)
+    heads_per_group = HV // H
+    q_ref = q.repeat_interleave(heads_per_group, dim=2)
+    k_ref = k.repeat_interleave(heads_per_group, dim=2)
 
-    if H == HV:
-        ref, ref_ht = naive_recurrent_kda(
-            q=q_norm,
-            k=k_norm,
-            v=v.clone(),
-            g=(naive_kda_gate_fn(g, A_log, dt_bias) if use_gate_in_kernel else g.clone()),
-            beta=beta.clone(),
-            initial_state=h0.clone(),
-            output_final_state=True,
-        )
+    ref, ref_ht = naive_recurrent_kda(
+        q=F.normalize(q_ref.clone(), p=2, dim=-1),
+        k=F.normalize(k_ref.clone(), p=2, dim=-1),
+        v=v.clone(),
+        g=(naive_kda_gate_fn(g, A_log, dt_bias) if use_gate_in_kernel else g.clone()),
+        beta=beta.clone(),
+        initial_state=h0.clone(),
+        output_final_state=True,
+    )
 
-        ref_fla, ref_ht_fla = fla_chunk_kda(
-            q=q_norm if not use_qk_l2norm_in_kernel else q.clone(),
-            k=k_norm if not use_qk_l2norm_in_kernel else k.clone(),
-            v=v.clone(),
-            g=g.clone(),
-            beta=beta.clone(),
-            A_log=(A_log.clone() if use_gate_in_kernel else None),
-            dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-            initial_state=h0.clone(),
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            use_gate_in_kernel=use_gate_in_kernel,
-            safe_gate=safe_gate,
-            lower_bound=lower_bound,
-        )
+    ref_fla, ref_ht_fla = fla_chunk_kda(
+        q=F.normalize(q_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q_ref.clone(),
+        k=F.normalize(k_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k_ref.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        A_log=(A_log.clone() if use_gate_in_kernel else None),
+        dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
+        initial_state=h0.clone(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+    )
 
-        ref_fla_trans, ref_ht_fla_trans = fla_chunk_kda(
-            q=q_norm if not use_qk_l2norm_in_kernel else q.clone(),
-            k=k_norm if not use_qk_l2norm_in_kernel else k.clone(),
-            v=v.clone(),
-            g=g.clone(),
-            beta=beta.clone(),
-            A_log=(A_log.clone() if use_gate_in_kernel else None),
-            dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-            initial_state=h0_vk.clone(),
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            use_gate_in_kernel=use_gate_in_kernel,
-            safe_gate=safe_gate,
-            lower_bound=lower_bound,
-            transpose_state_layout=True,
-        )
-    else:
-        g_ref = naive_kda_gate_fn(g, A_log, dt_bias) if use_gate_in_kernel else g.clone()
-        ref, ref_ht = fused_recurrent_kda(
-            q=q_norm,
-            k=k_norm,
-            v=v.clone(),
-            g=g_ref,
-            beta=beta.clone(),
-            initial_state=h0.clone(),
-            output_final_state=True,
-        )
-        ref_fla, ref_ht_fla = ref, ref_ht
-        ref_fla_trans, ref_ht_fla_trans = fused_recurrent_kda(
-            q=q_norm,
-            k=k_norm,
-            v=v.clone(),
-            g=g_ref,
-            beta=beta.clone(),
-            initial_state=h0_vk.clone(),
-            output_final_state=True,
-            transpose_state_layout=True,
-        )
+    ref_fla_trans, ref_ht_fla_trans = fla_chunk_kda(
+        q=F.normalize(q_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q_ref.clone(),
+        k=F.normalize(k_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k_ref.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        A_log=(A_log.clone() if use_gate_in_kernel else None),
+        dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
+        initial_state=h0_vk.clone(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+        transpose_state_layout=True,
+    )
 
     tri, tri_ht = cula_kda_fused_fwd(
-        q=q_norm if not use_qk_l2norm_in_kernel else q.clone(),
-        k=k_norm if not use_qk_l2norm_in_kernel else k.clone(),
+        q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
+        k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),
@@ -289,6 +266,9 @@ def test_safe_gate_chunk_varlen(
     h0_vk = h0.transpose(-1, -2).contiguous()
 
     q, k, v, g, beta, h0, h0_vk = map(lambda x: x.to(device).requires_grad_(False), (q, k, v, g, beta, h0, h0_vk))
+    heads_per_group = HV // H
+    q_ref = q.repeat_interleave(heads_per_group, dim=2)
+    k_ref = k.repeat_interleave(heads_per_group, dim=2)
 
     tri, tri_ht = cula_kda_fused_fwd(
         q=F.normalize(q.clone(), p=2, dim=-1),
@@ -304,76 +284,51 @@ def test_safe_gate_chunk_varlen(
         lower_bound=-5.0 if safe_gate else None,
     )
 
-    q_norm = F.normalize(q.clone(), p=2, dim=-1)
-    if H == HV:
-        ref_fla, ref_ht_fla = fla_chunk_kda(
-            q=q_norm,
-            k=k.clone(),
-            v=v.clone(),
-            g=g.clone(),
-            beta=beta.clone(),
-            initial_state=h0.clone(),
-            output_final_state=True,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_cpu=cu_seqlens_cpu,
-            safe_gate=safe_gate,
-            lower_bound=-5.0 if safe_gate else None,
-        )
+    ref_fla, ref_ht_fla = fla_chunk_kda(
+        q=F.normalize(q_ref.clone(), p=2, dim=-1),
+        k=k_ref.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        initial_state=h0.clone(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        safe_gate=safe_gate,
+        lower_bound=-5.0 if safe_gate else None,
+    )
 
-        ref_fla_trans, ref_ht_fla_trans = fla_chunk_kda(
-            q=q_norm,
-            k=k.clone(),
-            v=v.clone(),
-            g=g.clone(),
-            beta=beta.clone(),
-            initial_state=h0_vk.clone(),
-            output_final_state=True,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_cpu=cu_seqlens_cpu,
-            safe_gate=safe_gate,
-            lower_bound=-5.0 if safe_gate else None,
-            transpose_state_layout=True,
-        )
+    ref_fla_trans, ref_ht_fla_trans = fla_chunk_kda(
+        q=F.normalize(q_ref.clone(), p=2, dim=-1),
+        k=k_ref.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        initial_state=h0_vk.clone(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        safe_gate=safe_gate,
+        lower_bound=-5.0 if safe_gate else None,
+        transpose_state_layout=True,
+    )
 
-        ref = []
-        ref_ht = []
-        for i in range(N):
-            ref_i, ref_ht_i = naive_recurrent_kda(
-                q=F.normalize(q[:, cu_seqlens[i] : cu_seqlens[i + 1]], p=2, dim=-1),
-                k=k[:, cu_seqlens[i] : cu_seqlens[i + 1]],
-                v=v[:, cu_seqlens[i] : cu_seqlens[i + 1]],
-                beta=beta[:, cu_seqlens[i] : cu_seqlens[i + 1]],
-                g=g[:, cu_seqlens[i] : cu_seqlens[i + 1]],
-                initial_state=h0[i],
-                output_final_state=True,
-            )
-            ref.append(ref_i)
-            ref_ht.append(ref_ht_i)
-        ref = torch.cat(ref, 1)
-        ref_ht = torch.cat(ref_ht, 0)
-    else:
-        ref, ref_ht = fused_recurrent_kda(
-            q=q_norm,
-            k=k.clone(),
-            v=v.clone(),
-            g=g.clone(),
-            beta=beta.clone(),
-            initial_state=h0.clone(),
+    ref = []
+    ref_ht = []
+    for i in range(N):
+        ref_i, ref_ht_i = naive_recurrent_kda(
+            q=F.normalize(q_ref[:, cu_seqlens[i] : cu_seqlens[i + 1]], p=2, dim=-1),
+            k=k_ref[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            v=v[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            beta=beta[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            g=g[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            initial_state=h0[i],
             output_final_state=True,
-            cu_seqlens=cu_seqlens,
         )
-        ref_fla, ref_ht_fla = ref, ref_ht
-        ref_fla_trans, ref_ht_fla_trans = fused_recurrent_kda(
-            q=q_norm,
-            k=k.clone(),
-            v=v.clone(),
-            g=g.clone(),
-            beta=beta.clone(),
-            initial_state=h0_vk.clone(),
-            output_final_state=True,
-            cu_seqlens=cu_seqlens,
-            transpose_state_layout=True,
-        )
+        ref.append(ref_i)
+        ref_ht.append(ref_ht_i)
+    ref = torch.cat(ref, 1)
+    ref_ht = torch.cat(ref_ht, 0)
 
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
