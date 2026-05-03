@@ -26,7 +26,7 @@ struct WorkDesc {
     // coord
     int32_t seq_idx;
     int32_t qk_head_idx;
-    int32_t value_head_idx;
+    int32_t head_idx;
     int64_t tok_offset;  // offset to the start of the start
 
     // shape
@@ -51,11 +51,11 @@ struct WorkDesc {
     }
     CUTE_DEVICE int32_t
     v_head_idx() const {
-        return value_head_idx;
+        return head_idx;
     }
     CUTE_DEVICE int32_t
     o_head_idx() const {
-        return value_head_idx;
+        return head_idx;
     }
 
     // compatible interface, for work without ChunkWiseParallel, chunk_len equals to seq_len
@@ -111,9 +111,9 @@ struct IndividualTileScheduler {
     CUTE_DEVICE WorkDesc
     get_next_work(Params params, ProblemSize const& problem_size) {
         int32_t seq_idx = blockIdx.x / params.num_v_heads;
-        int32_t value_head_idx = blockIdx.x % params.num_v_heads;
+        int32_t head_idx = blockIdx.x % params.num_v_heads;
         int32_t heads_per_group = problem_size.num_v_heads / problem_size.num_qk_heads;
-        int32_t qk_head_idx = value_head_idx / heads_per_group;
+        int32_t qk_head_idx = head_idx / heads_per_group;
 
         int32_t s = problem_size.cu_seqlens[seq_idx];
         int32_t e = problem_size.cu_seqlens[seq_idx + 1];
@@ -124,10 +124,10 @@ struct IndividualTileScheduler {
         } else {
             scheduled = true;
             DPRINTF0_W(
-                "get_next_work: this_work={seq_idx:%d qk_head_idx:%d value_head_idx:%d tok_offset:%lld seq_len:%lld}\n",
+                "get_next_work: this_work={seq_idx:%d qk_head_idx:%d head_idx:%d tok_offset:%lld seq_len:%lld}\n",
                 seq_idx,
                 qk_head_idx,
-                value_head_idx,
+                head_idx,
                 s,
                 seq_len);
         }
@@ -135,7 +135,7 @@ struct IndividualTileScheduler {
         return {
             .seq_idx = seq_idx,
             .qk_head_idx = qk_head_idx,
-            .value_head_idx = value_head_idx,
+            .head_idx = head_idx,
             .tok_offset = s,
             .seq_len = seq_len,
         };
