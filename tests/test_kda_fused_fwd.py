@@ -51,10 +51,9 @@ pytestmark = pytest.mark.sm90_only
     [
         pytest.param(
             *test,
-            id=(
-                "B{}-T{}-H{}-HV{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}"
-                "-init{}-outstate{}-deterministic{}-{}"
-            ).format(*test),
+            id=("B{}-T{}-H{}-HV{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-init{}-outstate{}-deterministic{}-{}").format(
+                *test
+            ),
         )
         for test in [
             (1, 63, 1, 1, 128, 1, 0, False, False, True, True, True, False, torch.bfloat16),

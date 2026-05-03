@@ -134,7 +134,7 @@ struct CollectiveLoadTma {
                     problem_size.total_seqlen,
                     kind == LoadKind::kK ? problem_size.num_qk_heads
                                          : problem_size.num_v_heads));  // global view to the packed varlen sequence
-                Tensor m_varlen = m_varlen_head(_, _, head_idx);  // slice into current head_idx
+                Tensor m_varlen = m_varlen_head(_, _, head_idx);        // slice into current head_idx
                 Tensor m_offset = domain_offset(
                     make_coord(_0{}, work_desc.tok_offset),
                     m_varlen);  // offset to start of the current sequence

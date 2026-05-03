@@ -43,11 +43,7 @@ kda_fwd_prefill(
     auto num_seqs = cu_seqlens.size(0) - 1;
 
     TORCH_CHECK(
-        num_qk_heads == k.size(1),
-        "KDA requires num_q_heads == num_k_heads, got ",
-        num_qk_heads,
-        " vs ",
-        k.size(1));
+        num_qk_heads == k.size(1), "KDA requires num_q_heads == num_k_heads, got ", num_qk_heads, " vs ", k.size(1));
     TORCH_CHECK(
         num_v_heads % num_qk_heads == 0,
         "KDA GVA requires num_v_heads to be divisible by num_qk_heads, got ",
@@ -105,16 +101,15 @@ kda_fwd_prefill(
             beta.dtype());
         TORCH_CHECK(beta.is_contiguous(), "beta must be contiguous");
         TORCH_CHECK(
-            beta.size(0) == packed_seq && beta.size(1) == num_v_heads,
-            "beta shape must be [packed_seq, num_v_heads]");
+            beta.size(0) == packed_seq && beta.size(1) == num_v_heads, "beta shape must be [packed_seq, num_v_heads]");
     }
     if (input_state_.has_value()) {
         auto& input_state = input_state_.value();
         TORCH_CHECK(input_state.dtype() == torch::kFloat32, "input_state must be float32");
         TORCH_CHECK(input_state.is_contiguous(), "input_state must be contiguous");
         TORCH_CHECK(
-            input_state.size(0) == num_seqs && input_state.size(1) == num_v_heads &&
-                input_state.size(2) == head_size && input_state.size(3) == head_size,
+            input_state.size(0) == num_seqs && input_state.size(1) == num_v_heads && input_state.size(2) == head_size &&
+                input_state.size(3) == head_size,
             "input_state shape must be [num_seqs, num_v_heads, head_size, head_size]");
         input_state_ptr = input_state.data_ptr<float>();
     }
