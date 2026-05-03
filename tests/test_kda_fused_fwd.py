@@ -109,7 +109,7 @@ def test_safe_gate_chunk(
         q[:, :, 0, 0] = 1
         q[:, :, 1, 1] = 1
         k[:, :, 0, 0] = 1
-        k[:, :, 1, 1] = 1
+        k[:, :, 1, 0] = 1
         for i in range(HV):
             v[:, :, i] = i + 1
     if use_gate_in_kernel:
