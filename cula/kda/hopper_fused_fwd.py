@@ -226,15 +226,11 @@ def cula_kda_prefill(
     num_v_heads = v.shape[-2]
     assert q.shape == k.shape, "q and k must have the same shape."
     assert q.shape[:2] == v.shape[:2] == g.shape[:2], "q, k, v, g must share batch and sequence dimensions."
-    assert num_v_heads % num_qk_heads == 0, (
-        f"num_v_heads ({num_v_heads}) must be divisible by num_qk_heads ({num_qk_heads})."
-    )
+    assert num_v_heads % num_qk_heads == 0, f"num_v_heads ({num_v_heads}) must be divisible by num_qk_heads ({num_qk_heads})."
     assert g.shape == (batch_size, seq_len, num_v_heads, head_dim), (
         "g must be of shape (batch size, seq len, num_v_heads, head dim)."
     )
-    assert beta.shape == (batch_size, seq_len, num_v_heads), (
-        "beta must be of shape (batch size, seq len, num_v_heads)."
-    )
+    assert beta.shape == (batch_size, seq_len, num_v_heads), "beta must be of shape (batch size, seq len, num_v_heads)."
     assert v.shape == (batch_size, seq_len, num_v_heads, head_dim), (
         "v must be of shape (batch size, seq len, num_v_heads, head dim)."
     )
