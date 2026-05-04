@@ -121,7 +121,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         # reshape back
         o = rearrange(o, "(b t) h d -> b t h d", b=batch_size)
 
-        return o.to(q.dtype), final_state
+        return o.to(q.dtype), final_state if output_final_state else None
 
     @staticmethod
     @input_guard
