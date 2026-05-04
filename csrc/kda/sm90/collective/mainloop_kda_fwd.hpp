@@ -1369,7 +1369,9 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 /*is_first_block_=*/cute::false_type{},
                 /*is_final_block_=*/cute::true_type{});
         }
-        kv_store();
+        if (params.ptr_output_state != nullptr) {
+            kv_store();
+        }
     }
 
     template <class ProblemShape, class WorkDesc>

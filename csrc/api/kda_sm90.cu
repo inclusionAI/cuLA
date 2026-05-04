@@ -21,7 +21,7 @@
 
 using OptionalTensor = std::optional<torch::Tensor>;
 
-std::tuple<torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, OptionalTensor>
 kda_fwd_prefill(
     OptionalTensor output_,
     OptionalTensor output_state_,
@@ -34,6 +34,7 @@ kda_fwd_prefill(
     torch::Tensor const& cu_seqlens,
     torch::Tensor workspace_buffer,
     float scale,
+    bool output_final_state,
     bool safe_gate) {
     // Q, K, V: [packed_seq, H, D] (already packed by Python layer)
     auto packed_seq = q.size(0);
@@ -52,12 +53,12 @@ kda_fwd_prefill(
                                                      {packed_seq, num_heads, head_size},
                                                      torch::TensorOptions().dtype(q.dtype()).device(q.device()));
 
-    // Allocate output state if not provided
-    torch::Tensor output_state = output_state_.has_value()
-                                     ? output_state_.value()
-                                     : torch::zeros(
-                                           {num_seqs, num_heads, head_size, head_size},
-                                           torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+    OptionalTensor output_state = output_state_;
+    if (!output_state.has_value() && output_final_state) {
+        output_state = torch::zeros(
+            {num_seqs, num_heads, head_size, head_size},
+            torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+    }
 
     // Validate dtypes
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
@@ -70,7 +71,10 @@ kda_fwd_prefill(
     TORCH_CHECK(k.is_contiguous(), "k must be contiguous");
     TORCH_CHECK(v.is_contiguous(), "v must be contiguous");
     TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
-    TORCH_CHECK(output_state.is_contiguous(), "output_state must be contiguous");
+    if (output_state.has_value()) {
+        TORCH_CHECK(output_state->dtype() == torch::kFloat32, "output_state must be float32");
+        TORCH_CHECK(output_state->is_contiguous(), "output_state must be contiguous");
+    }
     TORCH_CHECK(cu_seqlens.is_contiguous(), "cu_seqlens must be contiguous");
     TORCH_CHECK(workspace_buffer.is_contiguous(), "workspace_buffer must be contiguous");
 
@@ -87,6 +91,8 @@ kda_fwd_prefill(
             "alpha shape must be [packed_seq, num_heads, head_size]");
         alpha_ptr = alpha.data_ptr<float>();
     }
+
+    float* output_state_ptr = output_state.has_value() ? output_state->data_ptr<float>() : nullptr;
     if (beta_.has_value()) {
         auto& beta = beta_.value();
         TORCH_CHECK(
@@ -121,7 +127,7 @@ kda_fwd_prefill(
         kda::sm90::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float, bf16>(
             stream,
             reinterpret_cast<bf16*>(output.data_ptr()),
-            output_state.data_ptr<float>(),
+            output_state_ptr,
             reinterpret_cast<bf16 const*>(q.data_ptr()),
             reinterpret_cast<bf16 const*>(k.data_ptr()),
             reinterpret_cast<bf16 const*>(v.data_ptr()),
@@ -142,7 +148,7 @@ kda_fwd_prefill(
         kda::sm90::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float, float>(
             stream,
             reinterpret_cast<bf16*>(output.data_ptr()),
-            output_state.data_ptr<float>(),
+            output_state_ptr,
             reinterpret_cast<bf16 const*>(q.data_ptr()),
             reinterpret_cast<bf16 const*>(k.data_ptr()),
             reinterpret_cast<bf16 const*>(v.data_ptr()),

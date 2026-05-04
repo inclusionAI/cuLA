@@ -173,6 +173,53 @@ def test_safe_gate_chunk(
     assert_close("ht", ref_ht_fla_trans, tri_ht, 0.005)
 
 
+def test_safe_gate_chunk_no_final_state():
+    cula_kda_fused_fwd = get_kda_fused_fwd(device)
+
+    B, T, H, D = 1, 63, 1, 128
+    dtype = torch.bfloat16
+
+    torch.manual_seed(42)
+    q = torch.rand(B, T, H, D, dtype=dtype, device=device)
+    k = torch.rand(B, T, H, D, dtype=dtype, device=device)
+    v = torch.rand(B, T, H, D, dtype=dtype, device=device)
+    g = F.logsigmoid(torch.randn(B, T, H, D, dtype=torch.float32, device=device)).clamp(-5, 0)
+    beta = torch.randn(B, T, H, dtype=torch.float32, device=device).sigmoid()
+    h0 = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+    h0_vk = h0.transpose(-1, -2).contiguous()
+
+    q = F.normalize(q, p=2, dim=-1)
+    k = F.normalize(k, p=2, dim=-1)
+
+    tri_no_state, tri_ht_no_state = cula_kda_fused_fwd(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        initial_state=h0_vk.clone(),
+        output_final_state=False,
+        safe_gate=True,
+        lower_bound=-5.0,
+    )
+
+    tri_with_state, tri_ht_with_state = cula_kda_fused_fwd(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        initial_state=h0_vk.clone(),
+        output_final_state=True,
+        safe_gate=True,
+        lower_bound=-5.0,
+    )
+
+    assert tri_ht_no_state is None
+    assert tri_ht_with_state is not None
+    assert_close("o", tri_with_state, tri_no_state, 0.005)
+
+
 @pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
 @pytest.mark.parametrize(
     ("H", "D", "mask_p", "cu_seqlens", "dtype", "safe_gate"),
