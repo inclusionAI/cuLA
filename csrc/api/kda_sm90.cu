@@ -53,11 +53,16 @@ kda_fwd_prefill(
                                                      {packed_seq, num_heads, head_size},
                                                      torch::TensorOptions().dtype(q.dtype()).device(q.device()));
 
-    OptionalTensor output_state = output_state_;
-    if (!output_state.has_value() && output_final_state) {
-        output_state = torch::zeros(
-            {num_seqs, num_heads, head_size, head_size},
-            torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+    // output_final_state controls the API side effect. If it is false, ignore
+    // even an explicitly provided output_state_ buffer so the kernel skips the
+    // final-state store.
+    OptionalTensor output_state = std::nullopt;
+    if (output_final_state) {
+        output_state = output_state_.has_value()
+                           ? output_state_.value()
+                           : torch::zeros(
+                                 {num_seqs, num_heads, head_size, head_size},
+                                 torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
     }
 
     // Validate dtypes
