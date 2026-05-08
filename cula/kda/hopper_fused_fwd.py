@@ -102,7 +102,8 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         workspace_buffer = _get_cache_buf("hopper_kda_fwd_workspace", workspace_size, q.device)
 
         # call the C++ kernel
-        # Signature: kda_fwd_prefill(output_, output_state_, q, k, v, input_state_, alpha_, beta_, cu_seqlens, workspace, scale, safe_gate)
+        # Signature: kda_fwd_prefill(output_, output_state_, q, k, v, input_state_, alpha_, beta_, cu_seqlens,
+        #                            workspace, scale, output_final_state, safe_gate)
         o, final_state = cula_cuda.kda_fwd_prefill(
             None,  # output_ (auto-allocate)
             None,  # output_state_ (auto-allocate)
@@ -115,13 +116,14 @@ class HopperChunkKDAFunction(torch.autograd.Function):
             cu_seqlens,
             workspace_buffer,
             scale,
+            output_final_state,
             safe_gate,
         )
 
         # reshape back
         o = rearrange(o, "(b t) h d -> b t h d", b=batch_size)
 
-        return o.to(q.dtype), final_state if output_final_state else None
+        return o.to(q.dtype), final_state
 
     @staticmethod
     @input_guard
