@@ -107,7 +107,7 @@ FLA baseline: [flash-linear-attention v0.5.0](https://github.com/fla-org/flash-l
 
 **Blackwell (SM10X)**
 
-See [BENCHMARK_GB200.md](BENCHMARK_GB200_CUDA_130.md) tested with CUDA 13.0 for detailed results.
+See [BENCHMARK_GB200_CUDA_130.md](BENCHMARK_GB200_CUDA_130.md) tested with CUDA 13.0 for detailed results.
  
 **Hopper (SM90)**
 
