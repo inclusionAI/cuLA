@@ -363,7 +363,7 @@ def test_against_fla(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, atol=5e-3, rto
     g_gamma = -decay
 
     # FLA reference (scale=1.0 to match our kernel)
-    O_fla, _ = chunk_simple_gla(Q, K, V, g_gamma=g_gamma, scale=1.0, head_first=False)
+    O_fla, _ = chunk_simple_gla(Q, K, V, g_gamma=g_gamma, scale=1.0)
 
     # Our kernel
     O_cute, _ = run_cute_kernel(Q, K, V, decay, scale=1.0, chunk_size=C)
@@ -411,7 +411,6 @@ def test_against_fla_with_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, ato
         scale=1.0,
         initial_state=h0.clone(),
         output_final_state=True,
-        head_first=False,
     )
 
     # Ours (expects BHVK state)
