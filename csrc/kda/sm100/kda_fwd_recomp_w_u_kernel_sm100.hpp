@@ -171,7 +171,7 @@ struct KdaChunkFwdRecompWUKernelSm100 {
         typename PipelineA::Params a_pipe_params;
         a_pipe_params.transaction_bytes = sizeof(bf16) * cosize_v<SmemLayoutInputAkkBF16>;
         a_pipe_params.is_leader = lane_predicate && (role == WarpRole::Load);
-        a_pipe_params.num_consumers = cutlass::NumThreadsPerWarp;
+        a_pipe_params.num_consumers = 1;
         if (role == WarpRole::Load) {
             a_pipe_params.role = PipelineA::ThreadCategory::Producer;
         } else if (role == WarpRole::Mma) {
@@ -236,11 +236,13 @@ struct KdaChunkFwdRecompWUKernelSm100 {
 
         // === Prologue → MMA pipelines ===
 
-        // PipelinePrologueReady: Prologue+Epilogue(producer, 256 threads) → Mma(consumer, 32 threads)
-        // Unified pipeline for both K and V prologue ready (co-produced by Prologue and Epilogue)
+        // PipelinePrologueReady: Prologue+Epilogue(producer, 256 threads) → Mma(consumer, umma_arrive)
+        // Unified pipeline for both K and V prologue ready (co-produced by Prologue and Epilogue).
+        // Consumer side uses umma_arrive (tcgen05.commit::mbarrier::arrive), which internally
+        // elects exactly one thread, so consumer_arv_count must be 1.
         typename PipelinePrologueReady::Params prologue_ready_pipe_params;
         prologue_ready_pipe_params.producer_arv_count = NumPrologueThreads + NumEpilogueThreads;
-        prologue_ready_pipe_params.consumer_arv_count = NumMmaThreads;
+        prologue_ready_pipe_params.consumer_arv_count = 1;  // umma_arrive elects one thread
         if (role == WarpRole::Prologue || role == WarpRole::Epilogue) {
             prologue_ready_pipe_params.role = PipelinePrologueReady::ThreadCategory::Producer;
         } else if (role == WarpRole::Mma) {
@@ -276,7 +278,7 @@ struct KdaChunkFwdRecompWUKernelSm100 {
             /*InitBarriers*/ cute::true_type{});
 
         PipelinePrologueReady prologue_ready_pipeline(
-            shared_plan->pipe_prologue_ready_storage, prologue_ready_pipe_params, /*InitBarriers*/ cute::true_type{});
+            shared_plan->pipe_prologue_ready_storage, prologue_ready_pipe_params, ClusterShape{});
 
         PipelineAccDone acc_done_pipeline(shared_plan->pipe_acc_done_storage, acc_done_pipe_params, ClusterShape{});
 

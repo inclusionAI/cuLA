@@ -155,7 +155,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
     using PipelineQKGInterReady = cutlass::PipelineUmmaConsumerAsync<StagesMma>;
 
-    using PipelineQKDone = cutlass::PipelineAsync<StagesAcc>;
+    using PipelineQKDone = cutlass::PipelineUmmaAsync<StagesAcc>;
 
     using PipelineKKInvReady = cutlass::PipelineAsync<StagesAcc>;
 
@@ -221,7 +221,6 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
         alignas(16) typename PipelineKKInvReady::SharedStorage pipe_kk_inv_storage;
 
-        // TODO: support bf16 beta
         alignas(16) float beta_smem[StagesAcc][TileT];
         array_aligned<uint32_t, 1> tmem_start_addr;
     };

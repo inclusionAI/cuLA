@@ -95,8 +95,9 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         SM100_MMA_F16BF16_SS<bf16, bf16, float, TileT, TileK, UMMA::Major::K, UMMA::Major::MN>{}));
 
     // ===================== Pipeline Types =====================
+    using ClusterShape = Shape<_1, _1, _1>;
     // TMA load -> MMA (Akk)
-    using PipelineA = cutlass::PipelineTmaAsync<StagesA>;
+    using PipelineA = cutlass::PipelineTmaUmmaAsync<StagesA, ClusterShape>;
     // TMA load -> Compute (merged prologue+epilogue)
     using PipelineV = cutlass::PipelineTmaAsync<StagesLoadStore>;
     // TMA load -> Compute (K)
@@ -109,7 +110,9 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     using PipelineBeta = cutlass::PipelineAsync<StagesA>;
 
     // Unified pipeline: Compute -> MMA (K/V prologue ready share one pipeline, used sequentially)
-    using PipelinePrologueReady = cutlass::PipelineAsync<StagesMma>;
+    // NOTE: must be PipelineUmmaConsumerAsync so that the MMA warp's consumer_release
+    // issues tcgen05.commit::mbarrier::arrive (umma_arrive).
+    using PipelinePrologueReady = cutlass::PipelineUmmaConsumerAsync<StagesMma>;
     // Unified pipeline: MMA -> Compute (W/U acc done share one pipeline, used sequentially)
     using PipelineAccDone = cutlass::PipelineUmmaAsync<StagesMma>;
 
