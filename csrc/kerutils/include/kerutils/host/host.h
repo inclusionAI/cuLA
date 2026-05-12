@@ -45,6 +45,7 @@
 #include <cuda_runtime_api.h>
 
 #include "kerutils/common/common.h"
+#include "kerutils/common/static_switch.h"
 
 namespace kerutils {
 

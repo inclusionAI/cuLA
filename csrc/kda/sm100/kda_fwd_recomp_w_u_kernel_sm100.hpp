@@ -88,11 +88,17 @@ struct KdaChunkFwdRecompWUKernelSm100 {
     static constexpr int NumLoadAuxThreads = 64;                                // warp 10-11
 
     // ===================== Kernel-only Constants =====================
-    static constexpr int NumPrologueRegs = 208;  // WG0: element-wise + R2T Akk
-    static constexpr int NumEpilogueRegs = 216;  // WG1: T2R acc + R2G store + kg
-    static constexpr int NumLoadRegs = 80;       // WG2: TMA load + MMA + Aux
-
     static constexpr bool StoreQG = Mainloop::StoreQG;
+
+    // NOTE: NVCC 12.9 and 13.0 have performance diffs on the same register config based on our testing
+#if CUDA_VERSION_CHECK >= 13000
+    static constexpr int NumPrologueRegs = StoreQG ? 232 : 224;  // WG0: element-wise + R2T Akk
+    static constexpr int NumEpilogueRegs = StoreQG ? 192 : 200;  // WG1: T2R acc + R2G store + kg
+#else
+    static constexpr int NumPrologueRegs = StoreQG ? 216 : 224;  // WG0: element-wise + R2T Akk
+    static constexpr int NumEpilogueRegs = StoreQG ? 208 : 200;  // WG1: T2R acc + R2G store + kg
+#endif
+    static constexpr int NumLoadRegs = 80;  // WG2: TMA load + MMA + Aux
 
     // ===================== Warp Roles =====================
     enum class WarpRole {
@@ -165,7 +171,7 @@ struct KdaChunkFwdRecompWUKernelSm100 {
         typename PipelineA::Params a_pipe_params;
         a_pipe_params.transaction_bytes = sizeof(bf16) * cosize_v<SmemLayoutInputAkkBF16>;
         a_pipe_params.is_leader = lane_predicate && (role == WarpRole::Load);
-        a_pipe_params.num_consumers = cutlass::NumThreadsPerWarp;
+        a_pipe_params.num_consumers = 1;
         if (role == WarpRole::Load) {
             a_pipe_params.role = PipelineA::ThreadCategory::Producer;
         } else if (role == WarpRole::Mma) {
@@ -230,11 +236,13 @@ struct KdaChunkFwdRecompWUKernelSm100 {
 
         // === Prologue → MMA pipelines ===
 
-        // PipelinePrologueReady: Prologue+Epilogue(producer, 256 threads) → Mma(consumer, 32 threads)
-        // Unified pipeline for both K and V prologue ready (co-produced by Prologue and Epilogue)
+        // PipelinePrologueReady: Prologue+Epilogue(producer, 256 threads) → Mma(consumer, umma_arrive)
+        // Unified pipeline for both K and V prologue ready (co-produced by Prologue and Epilogue).
+        // Consumer side uses umma_arrive (tcgen05.commit::mbarrier::arrive), which internally
+        // elects exactly one thread, so consumer_arv_count must be 1.
         typename PipelinePrologueReady::Params prologue_ready_pipe_params;
         prologue_ready_pipe_params.producer_arv_count = NumPrologueThreads + NumEpilogueThreads;
-        prologue_ready_pipe_params.consumer_arv_count = NumMmaThreads;
+        prologue_ready_pipe_params.consumer_arv_count = 1;  // umma_arrive elects one thread
         if (role == WarpRole::Prologue || role == WarpRole::Epilogue) {
             prologue_ready_pipe_params.role = PipelinePrologueReady::ThreadCategory::Producer;
         } else if (role == WarpRole::Mma) {
@@ -270,7 +278,7 @@ struct KdaChunkFwdRecompWUKernelSm100 {
             /*InitBarriers*/ cute::true_type{});
 
         PipelinePrologueReady prologue_ready_pipeline(
-            shared_plan->pipe_prologue_ready_storage, prologue_ready_pipe_params, /*InitBarriers*/ cute::true_type{});
+            shared_plan->pipe_prologue_ready_storage, prologue_ready_pipe_params, ClusterShape{});
 
         PipelineAccDone acc_done_pipeline(shared_plan->pipe_acc_done_storage, acc_done_pipe_params, ClusterShape{});
 
@@ -407,18 +415,6 @@ struct KdaChunkFwdRecompWUKernelSm100 {
 };
 
 // ===================================================================
-// Default Kernel type: uses the self-contained mainloop
-// ===================================================================
-using KdaChunkFwdRecompWUKernelSm100Default = KdaChunkFwdRecompWUKernelSm100<KdaChunkFwdRecompWUMainloopSm100<false>>;
-using KdaChunkFwdRecompWUKernelSm100StoreQG = KdaChunkFwdRecompWUKernelSm100<KdaChunkFwdRecompWUMainloopSm100<true>>;
-
-// BetaBF16 variants: loads beta from bf16 GMEM
-using KdaChunkFwdRecompWUKernelSm100Default_BetaBF16 =
-    KdaChunkFwdRecompWUKernelSm100<KdaChunkFwdRecompWUMainloopSm100<false, __nv_bfloat16>>;
-using KdaChunkFwdRecompWUKernelSm100StoreQG_BetaBF16 =
-    KdaChunkFwdRecompWUKernelSm100<KdaChunkFwdRecompWUMainloopSm100<true, __nv_bfloat16>>;
-
-// ===================================================================
 // __global__ kernel wrapper (free function — CUDA requires this)
 // ===================================================================
 template <typename KernelT, typename TmaParamsT>
@@ -497,19 +493,12 @@ run_kda_fwd_recomp_w_u_sm100_impl_dispatch(KDA_fwd_recomp_w_u_params& params, cu
 
 inline void
 run_kda_fwd_recomp_w_u_sm100_impl(KDA_fwd_recomp_w_u_params& params, cudaStream_t stream) {
-    if (params.store_qg) {
-        if (params.is_beta_bf16) {
-            run_kda_fwd_recomp_w_u_sm100_impl_dispatch<KdaChunkFwdRecompWUKernelSm100StoreQG_BetaBF16>(params, stream);
-        } else {
-            run_kda_fwd_recomp_w_u_sm100_impl_dispatch<KdaChunkFwdRecompWUKernelSm100StoreQG>(params, stream);
-        }
-    } else {
-        if (params.is_beta_bf16) {
-            run_kda_fwd_recomp_w_u_sm100_impl_dispatch<KdaChunkFwdRecompWUKernelSm100Default_BetaBF16>(params, stream);
-        } else {
-            run_kda_fwd_recomp_w_u_sm100_impl_dispatch<KdaChunkFwdRecompWUKernelSm100Default>(params, stream);
-        }
-    }
+    BETA_TYPE_SWITCH(params.is_beta_bf16, BetaType, [&] {
+        BOOL_SWITCH(params.store_qg, kStoreQG, [&] {
+            using Kernel = KdaChunkFwdRecompWUKernelSm100<KdaChunkFwdRecompWUMainloopSm100<kStoreQG, BetaType>>;
+            run_kda_fwd_recomp_w_u_sm100_impl_dispatch<Kernel>(params, stream);
+        });
+    });
 }
 
 }  // namespace kda::sm100

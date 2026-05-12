@@ -76,6 +76,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
     // This makes inter and intra A-matrices identical, allowing the intra A-matrix to be skipped entirely.
     // Saves 50% of A-matrix exp2f computation and one TMEM store per k-iteration.
     static constexpr bool UnifiedGRef = UnifiedGRef_;
+    using ElementBeta = ElementBeta_;
 
     // double buffer in TMEM, overlap prologue A matrix with MMA
     enum class TmemAllocation : uint32_t {
@@ -154,7 +155,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
     using PipelineQKGInterReady = cutlass::PipelineUmmaConsumerAsync<StagesMma>;
 
-    using PipelineQKDone = cutlass::PipelineAsync<StagesAcc>;
+    using PipelineQKDone = cutlass::PipelineUmmaAsync<StagesAcc>;
 
     using PipelineKKInvReady = cutlass::PipelineAsync<StagesAcc>;
 
@@ -220,7 +221,6 @@ struct KdaChunkFwdIntraMainloopSm100 {
 
         alignas(16) typename PipelineKKInvReady::SharedStorage pipe_kk_inv_storage;
 
-        // TODO: support bf16 beta
         alignas(16) float beta_smem[StagesAcc][TileT];
         array_aligned<uint32_t, 1> tmem_start_addr;
     };
@@ -894,7 +894,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
             if (thread_idx < TileT) {
                 shared_plan->beta_smem[beta_pipe_state_write.index()][thread_idx] =
                     (thread_idx < sub_seq_len)
-                        ? float(reinterpret_cast<ElementBeta_*>(
+                        ? float(reinterpret_cast<ElementBeta*>(
                               params.beta_ptr)[(token_offset + tile_idx * TileT + thread_idx) * params.h + head_idx])
                         : float(0);
             }

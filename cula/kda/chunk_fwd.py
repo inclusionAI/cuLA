@@ -15,8 +15,7 @@
 import importlib
 
 import torch
-
-# from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from fla.ops.cp import FLACPContext
 from fla.ops.cp.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h_pre_process,
@@ -30,8 +29,8 @@ from cula.kda.chunk_intra import chunk_kda_fwd_intra
 from cula.utils import assert_blackwell
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
-_delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h")
-chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
+# _delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h")
+# chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
 _fwd_o_mod = importlib.import_module("cula.ops.fwd_o")
 chunk_gla_fwd_o = _fwd_o_mod.chunk_gla_fwd_o
 
@@ -118,7 +117,8 @@ def chunk_kda_fwd(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        chunk_offsets=chunk_offsets,
+        # chunk_offsets=chunk_offsets,
+        use_exp2=True,  # for FLA impl
     )
 
     if cp_context is not None:
