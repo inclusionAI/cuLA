@@ -425,7 +425,7 @@ def main():
     fixed_res, varlen_res = [], []
 
     if not (args.ncu or args.sanitizer):
-        check_determinism(H=H, iters=100)
+        check_determinism(H=H, iters=10000)
 
     if args.mode in ("fixed", "both"):
         fixed_res = bench_fixed(fixed_configs)
