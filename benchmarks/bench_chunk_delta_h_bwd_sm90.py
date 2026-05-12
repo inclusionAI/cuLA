@@ -3,11 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Benchmark the SM90 CuTe DSL bwd_dhu prototype against FLA Triton.
+Benchmark the SM90 CuTe DSL WGMMA bwd_dhu path against FLA Triton.
 
 Current kernel scope:
   - non-varlen
-  - K in {64, 128, 256}, BT=64
+  - K in {64, 128, 256}, BT=64, BV=64
   - state layout [B, NT, H, K, V]
   - optional gk/dht/h0
 
@@ -78,7 +78,9 @@ def main():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
         raise RuntimeError("This benchmark requires an SM90/Hopper GPU.")
     if args.T % 64 != 0:
-        raise ValueError("Use T as a multiple of 64 for this prototype benchmark.")
+        raise ValueError("Use T as a multiple of 64 for this benchmark.")
+    if args.V % 64 != 0:
+        raise ValueError("Use V as a multiple of 64 for the SM90 WGMMA path.")
 
     q, k, w, do, dv, gk, dht, h0 = make_inputs(args)
     scale = args.K**-0.5

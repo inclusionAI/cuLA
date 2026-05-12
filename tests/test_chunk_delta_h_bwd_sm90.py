@@ -2,7 +2,7 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Correctness tests for the SM90 CuTe DSL bwd_dhu prototype."""
+"""Correctness tests for the SM90 CuTe DSL WGMMA bwd_dhu path."""
 
 import os
 import sys
@@ -92,7 +92,7 @@ def _run_case(B, T, H, K, V, use_gk=False, use_dht=False, use_h0=False, use_exp2
 
 
 @pytest.mark.parametrize("T", [64, 128])
-@pytest.mark.parametrize("V", [32, 64])
+@pytest.mark.parametrize("V", [64, 128])
 def test_bwd_dhu_no_gating(T, V):
     _run_case(B=1, T=T, H=1, K=64, V=V)
 
