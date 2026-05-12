@@ -19,7 +19,7 @@ This is the first Hopper tensor-core path:
   - fixed chunk size BT=64
   - BV=64, matching cula/ops/chunk_delta_h.py
   - non-varlen tensors [B, T, H, D]
-  - non-transposed state layout [B, NT, H, K, V]
+  - state layout [B, NT, H, K, V] or [B, NT, H, V, K]
   - non-persistent scheduling
 
 The recurrence is the Triton bwd_dhu recurrence:
@@ -45,7 +45,8 @@ import cutlass.utils.hopper_helpers as sm90_utils
 import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Float32, Int64
+from cutlass.cute.typing import Float32, Int32, Int64
+from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
 
 from cula.utils import USE_FAST_MATH, assert_hopper
 
@@ -63,13 +64,18 @@ class ChunkDeltaRuleBwdDHUSm90:
         self,
         batch_size: int,
         seq_len: int,
+        num_sequences: int,
+        total_chunks: int,
         num_heads: int,
         head_dim_k: int,
         head_dim_v: int,
+        is_varlen: bool,
+        use_g: bool,
         use_gk: bool,
         use_dht: bool,
         use_dh0: bool,
         use_exp2: bool,
+        transpose_state_layout: bool,
         scale: float,
         use_fast_math: bool = True,
     ):
@@ -77,13 +83,18 @@ class ChunkDeltaRuleBwdDHUSm90:
         assert head_dim_v % BV == 0, f"SM90 bwd_dhu tensor-core path requires V to be a multiple of {BV}, got {head_dim_v}"
         self.B = batch_size
         self.T = seq_len
+        self.N = num_sequences
+        self.NT = total_chunks
         self.H = num_heads
         self.K = head_dim_k
         self.V = head_dim_v
+        self.is_varlen = is_varlen
+        self.use_g = use_g
         self.use_gk = use_gk
         self.use_dht = use_dht
         self.use_dh0 = use_dh0
         self.use_exp2 = use_exp2
+        self.transpose_state_layout = transpose_state_layout
         self.scale = scale
         self.use_fast_math = use_fast_math
 
@@ -106,6 +117,7 @@ class ChunkDeltaRuleBwdDHUSm90:
         q_in: cute.Tensor,
         k_in: cute.Tensor,
         w_in: cute.Tensor,
+        g_in: cute.Tensor,
         gk_in: cute.Tensor,
         dht_in: cute.Tensor,
         dh0_in: cute.Tensor,
@@ -113,11 +125,14 @@ class ChunkDeltaRuleBwdDHUSm90:
         dh_in: cute.Tensor,
         dv_in: cute.Tensor,
         dv2_in: cute.Tensor,
+        cu_seqlens_in: cute.Tensor,
+        chunk_offsets_in: cute.Tensor,
         stream: cuda.CUstream,
     ):
         q_ptr = q_in.iterator
         k_ptr = k_in.iterator
         w_ptr = w_in.iterator
+        g_ptr = g_in.iterator
         gk_ptr = gk_in.iterator
         dht_ptr = dht_in.iterator
         dh0_ptr = dh0_in.iterator
@@ -125,8 +140,10 @@ class ChunkDeltaRuleBwdDHUSm90:
         dh_ptr = dh_in.iterator
         dv_ptr = dv_in.iterator
         dv2_ptr = dv2_in.iterator
+        cu_seqlens_ptr = cu_seqlens_in.iterator
+        chunk_offsets_ptr = chunk_offsets_in.iterator
 
-        NT = (self.T + self.BT - 1) // self.BT
+        NT_total = self.NT
 
         q_layout = cute.make_layout(
             (self.B, self.T, self.H, self.K),
@@ -144,28 +161,54 @@ class ChunkDeltaRuleBwdDHUSm90:
         dv = cute.make_tensor(dv_ptr, v_layout)
         dv2 = cute.make_tensor(dv2_ptr, v_layout)
 
+        g_layout = cute.make_layout(
+            (self.B, self.T, self.H),
+            stride=(self.T * self.H, self.H, 1),
+        )
+        g = cute.make_tensor(g_ptr, g_layout)
+
         gk_layout = cute.make_layout(
             (self.B, self.T, self.H, self.K),
             stride=(self.T * self.H * self.K, self.H * self.K, self.K, 1),
         )
         gk = cute.make_tensor(gk_ptr, gk_layout)
+        cu_seqlens = cute.make_tensor(cu_seqlens_ptr, cute.make_layout((self.N + 1,)))
+        chunk_offsets = cute.make_tensor(chunk_offsets_ptr, cute.make_layout((self.N + 1,)))
 
-        state_layout = cute.make_layout(
-            (self.B, NT, self.H, self.K, self.V),
-            stride=(
-                NT * self.H * self.K * self.V,
-                self.H * self.K * self.V,
-                self.K * self.V,
-                self.V,
-                1,
-            ),
-        )
+        if cutlass.const_expr(self.transpose_state_layout):
+            state_layout = cute.make_layout(
+                (self.B, NT_total, self.H, self.V, self.K),
+                stride=(
+                    NT_total * self.H * self.K * self.V,
+                    self.H * self.K * self.V,
+                    self.K * self.V,
+                    self.K,
+                    1,
+                ),
+            )
+        else:
+            state_layout = cute.make_layout(
+                (self.B, NT_total, self.H, self.K, self.V),
+                stride=(
+                    NT_total * self.H * self.K * self.V,
+                    self.H * self.K * self.V,
+                    self.K * self.V,
+                    self.V,
+                    1,
+                ),
+            )
         dh = cute.make_tensor(dh_ptr, state_layout)
 
-        final_layout = cute.make_layout(
-            (self.B, self.H, self.K, self.V),
-            stride=(self.H * self.K * self.V, self.K * self.V, self.V, 1),
-        )
+        if cutlass.const_expr(self.transpose_state_layout):
+            final_layout = cute.make_layout(
+                (self.N, self.H, self.V, self.K),
+                stride=(self.H * self.K * self.V, self.K * self.V, self.K, 1),
+            )
+        else:
+            final_layout = cute.make_layout(
+                (self.N, self.H, self.K, self.V),
+                stride=(self.H * self.K * self.V, self.K * self.V, self.V, 1),
+            )
         dht = cute.make_tensor(dht_ptr, final_layout)
         dh0 = cute.make_tensor(dh0_ptr, final_layout)
 
@@ -312,6 +355,7 @@ class ChunkDeltaRuleBwdDHUSm90:
             q,
             k,
             w,
+            g,
             gk,
             dht,
             dh0,
@@ -319,6 +363,8 @@ class ChunkDeltaRuleBwdDHUSm90:
             dh,
             dv,
             dv2,
+            cu_seqlens,
+            chunk_offsets,
             tiled_mma,
             update_tiled_mma,
             a_smem_layout_staged,
@@ -338,7 +384,7 @@ class ChunkDeltaRuleBwdDHUSm90:
             tma_atom_dv2,
             tma_tensor_dv2,
         ).launch(
-            grid=[cute.ceil_div(self.V, self.BV), self.B * self.H, 1],
+            grid=[cute.ceil_div(self.V, self.BV), self.N * self.H, 1],
             block=[self.num_threads, 1, 1],
             cluster=self.cluster_shape_mnk,
             stream=stream,
@@ -351,6 +397,7 @@ class ChunkDeltaRuleBwdDHUSm90:
         q: cute.Tensor,
         k: cute.Tensor,
         w: cute.Tensor,
+        g: cute.Tensor,
         gk: cute.Tensor,
         dht: cute.Tensor,
         dh0: cute.Tensor,
@@ -358,6 +405,8 @@ class ChunkDeltaRuleBwdDHUSm90:
         dh: cute.Tensor,
         dv: cute.Tensor,
         dv2: cute.Tensor,
+        cu_seqlens: cute.Tensor,
+        chunk_offsets: cute.Tensor,
         tiled_mma: cute.TiledMma,
         update_tiled_mma: cute.TiledMma,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -380,10 +429,22 @@ class ChunkDeltaRuleBwdDHUSm90:
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         i_v_tile, i_bh, _ = cute.arch.block_idx()
-        i_b = i_bh // self.H
-        i_h = i_bh - i_b * self.H
-        v_base = i_v_tile * self.BV
+        i_n = i_bh // self.H
+        i_h = i_bh - i_n * self.H
+        data_b = i_n
+        state_b = i_n
+        seq_start = Int32(0)
+        seq_len = self.T
         NT = (self.T + self.BT - 1) // self.BT
+        chunk_base = Int32(0)
+        if cutlass.const_expr(self.is_varlen):
+            data_b = Int32(0)
+            state_b = Int32(0)
+            seq_start = cu_seqlens[i_n]
+            seq_len = cu_seqlens[i_n + 1] - seq_start
+            NT = (seq_len + self.BT - 1) // self.BT
+            chunk_base = chunk_offsets[i_n]
+        v_base = i_v_tile * self.BV
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -446,17 +507,38 @@ class ChunkDeltaRuleBwdDHUSm90:
         acc_qdo = update_thr_mma.make_fragment_C(update_thr_mma.partition_shape_C((BV, self.K)))
         acc_wdv = update_thr_mma.make_fragment_C(update_thr_mma.partition_shape_C((BV, self.K)))
 
-        _, bSG_sK, bSG_gK = self._epilog_partition(tma_atom_k, tma_tensor_k[None, None, (i_h, i_b)], (self.BT, self.K), sA)
+        if cutlass.const_expr(self.is_varlen):
+            tma_tensor_k_use = cute.domain_offset((seq_start, 0, (0, 0)), tma_tensor_k)
+            tma_tensor_dv_use = cute.domain_offset((0, seq_start, (0, 0)), tma_tensor_dv)
+            tma_tensor_do_use = cute.domain_offset((0, seq_start, (0, 0)), tma_tensor_do)
+            tma_tensor_q_use = cute.domain_offset((0, seq_start, (0, 0)), tma_tensor_q)
+            tma_tensor_w_use = cute.domain_offset((0, seq_start, (0, 0)), tma_tensor_w)
+            tma_tensor_dv2_use = cute.domain_offset((0, seq_start, (0, 0)), tma_tensor_dv2)
+        else:
+            tma_tensor_k_use = tma_tensor_k
+            tma_tensor_dv_use = tma_tensor_dv
+            tma_tensor_do_use = tma_tensor_do
+            tma_tensor_q_use = tma_tensor_q
+            tma_tensor_w_use = tma_tensor_w
+            tma_tensor_dv2_use = tma_tensor_dv2
+
+        _, bSG_sK, bSG_gK = self._epilog_partition(
+            tma_atom_k, tma_tensor_k_use[None, None, (i_h, data_b)], (self.BT, self.K), sA
+        )
         _, bSG_sDv, bSG_gDv = self._epilog_partition(
-            tma_atom_dv, tma_tensor_dv[None, None, (i_h, i_b)], (self.BV, self.BT), sDv2T
+            tma_atom_dv, tma_tensor_dv_use[None, None, (i_h, data_b)], (self.BV, self.BT), sDv2T
         )
         _, bSG_sDo, bSG_gDo = self._epilog_partition(
-            tma_atom_do, tma_tensor_do[None, None, (i_h, i_b)], (self.BV, self.BT), sUA
+            tma_atom_do, tma_tensor_do_use[None, None, (i_h, data_b)], (self.BV, self.BT), sUA
         )
-        _, bSG_sQ, bSG_gQ = self._epilog_partition(tma_atom_q, tma_tensor_q[None, None, (i_h, i_b)], (self.K, self.BT), sUB)
-        _, bSG_sW, bSG_gW = self._epilog_partition(tma_atom_w, tma_tensor_w[None, None, (i_h, i_b)], (self.K, self.BT), sUB)
+        _, bSG_sQ, bSG_gQ = self._epilog_partition(
+            tma_atom_q, tma_tensor_q_use[None, None, (i_h, data_b)], (self.K, self.BT), sUB
+        )
+        _, bSG_sW, bSG_gW = self._epilog_partition(
+            tma_atom_w, tma_tensor_w_use[None, None, (i_h, data_b)], (self.K, self.BT), sUB
+        )
         _, bSG_sDv2, bSG_gDv2 = self._epilog_partition(
-            tma_atom_dv2, tma_tensor_dv2[None, None, (i_h, i_b)], (self.BV, self.BT), sDv2T
+            tma_atom_dv2, tma_tensor_dv2_use[None, None, (i_h, data_b)], (self.BV, self.BT), sDv2T
         )
 
         # Initialize carried dh state.
@@ -465,20 +547,34 @@ class ChunkDeltaRuleBwdDHUSm90:
             v_idx = v_base + v_rel
             init = Float32(0.0)
             if cutlass.const_expr(self.use_dht):
-                init = dht[i_b, i_h, k_idx, v_idx].to(self.acc_dtype)
+                if cutlass.const_expr(self.transpose_state_layout):
+                    init = dht[i_n, i_h, v_idx, k_idx].to(self.acc_dtype)
+                else:
+                    init = dht[i_n, i_h, k_idx, v_idx].to(self.acc_dtype)
             rState[ei] = init
 
-        for chunk_rev in cutlass.range_constexpr(NT):
+        for chunk_rev in cutlass.range(0, NT, unroll=0):
             i_t = NT - 1 - chunk_rev
             chunk_start = i_t * self.BT
-            chunk_end = cutlass.min(chunk_start + self.BT, self.T)
+            chunk_end = cutlass.min(chunk_start + self.BT, seq_len)
             last_idx = chunk_end - 1
+            g_last = Float32(0.0)
+            g_last_exp = Float32(1.0)
+            if cutlass.const_expr(self.use_g):
+                g_last = g[data_b, seq_start + last_idx, i_h].to(self.acc_dtype)
+                if cutlass.const_expr(self.use_exp2):
+                    g_last_exp = cute.exp2(g_last, fastmath=self.use_fast_math)
+                else:
+                    g_last_exp = cute.exp(g_last, fastmath=self.use_fast_math)
 
             # Store dh before applying this chunk's reverse update.
             for ei in cutlass.range(cute.size(rState), unroll_full=True):
                 v_rel, k_idx = tUcState[ei]
                 v_idx = v_base + v_rel
-                dh[i_b, i_t, i_h, k_idx, v_idx] = rState[ei].to(dh.element_type)
+                if cutlass.const_expr(self.transpose_state_layout):
+                    dh[state_b, chunk_base + i_t, i_h, v_idx, k_idx] = rState[ei].to(dh.element_type)
+                else:
+                    dh[state_b, chunk_base + i_t, i_h, k_idx, v_idx] = rState[ei].to(dh.element_type)
             cute.arch.sync_threads()
 
             # dv2 = dv + K @ dh.
@@ -523,8 +619,16 @@ class ChunkDeltaRuleBwdDHUSm90:
                 t_idx = chunk_start + t_rel
                 v_idx = v_base + v_rel
                 out = Float32(0.0)
-                if t_idx < self.T:
-                    out = acc_dv[ei] + sDv2T[v_rel, t_rel, 0].to(self.acc_dtype)
+                if t_idx < seq_len:
+                    out = acc_dv[ei]
+                    if cutlass.const_expr(self.use_g):
+                        g_cur = g[data_b, seq_start + t_idx, i_h].to(self.acc_dtype)
+                        if cutlass.const_expr(self.use_exp2):
+                            g_decay = cute.exp2(g_last - g_cur, fastmath=self.use_fast_math)
+                        else:
+                            g_decay = cute.exp(g_last - g_cur, fastmath=self.use_fast_math)
+                        out = out * g_decay
+                    out = out + sDv2T[v_rel, t_rel, 0].to(self.acc_dtype)
                 sDv2T[v_rel, t_rel, 0] = out.to(self.io_dtype)
             cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.sync_threads()
@@ -534,16 +638,19 @@ class ChunkDeltaRuleBwdDHUSm90:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
             cute.arch.sync_threads()
 
-            # Apply gk decay after dv2, before accumulating QO - WV into dh.
+            # Apply state decay after dv2, before accumulating QO - WV into dh.
+            if cutlass.const_expr(self.use_g):
+                for ei in cutlass.range(cute.size(rState), unroll_full=True):
+                    rState[ei] = rState[ei] * g_last_exp
             if cutlass.const_expr(self.use_gk):
                 for ei in cutlass.range(cute.size(rState), unroll_full=True):
                     v_rel, k_idx = tUcState[ei]
-                    gk_last = gk[i_b, last_idx, i_h, k_idx].to(self.acc_dtype)
+                    gk_last = gk[data_b, seq_start + last_idx, i_h, k_idx].to(self.acc_dtype)
                     if cutlass.const_expr(self.use_exp2):
-                        scale = cute.exp2(gk_last, fastmath=self.use_fast_math)
+                        k_decay = cute.exp2(gk_last, fastmath=self.use_fast_math)
                     else:
-                        scale = cute.exp(gk_last, fastmath=self.use_fast_math)
-                    rState[ei] = rState[ei] * scale
+                        k_decay = cute.exp(gk_last, fastmath=self.use_fast_math)
+                    rState[ei] = rState[ei] * k_decay
 
             # dh += scale * do^T @ q - dv2^T @ w.
             if warp_idx == 0:
@@ -552,6 +659,24 @@ class ChunkDeltaRuleBwdDHUSm90:
                 cute.copy(tma_atom_q, bSG_gQ[(None, 0, i_t)], bSG_sQ[None, qdo_h.index], tma_bar_ptr=qdo_h.barrier)
             qdo_wait = load_qdo_C.wait_and_advance()
             cute.arch.sync_threads()
+
+            if cutlass.const_expr(self.use_g):
+                linear_q = tidx
+                while linear_q < self.K * self.BT:
+                    k_rel = linear_q // self.BT
+                    t_rel = linear_q - k_rel * self.BT
+                    t_idx = chunk_start + t_rel
+                    q_scaled = Float32(0.0)
+                    if t_idx < seq_len:
+                        g_cur = g[data_b, seq_start + t_idx, i_h].to(self.acc_dtype)
+                        if cutlass.const_expr(self.use_exp2):
+                            g_exp = cute.exp2(g_cur, fastmath=self.use_fast_math)
+                        else:
+                            g_exp = cute.exp(g_cur, fastmath=self.use_fast_math)
+                        q_scaled = sUB[k_rel, t_rel, 0].to(self.acc_dtype) * g_exp
+                    sUB[k_rel, t_rel, 0] = q_scaled.to(self.io_dtype)
+                    linear_q += self.num_threads
+                cute.arch.sync_threads()
 
             acc_qdo.fill(0.0)
             cute.nvgpu.warpgroup.fence()
@@ -606,7 +731,10 @@ class ChunkDeltaRuleBwdDHUSm90:
             for ei in cutlass.range(cute.size(rState), unroll_full=True):
                 v_rel, k_idx = tUcState[ei]
                 v_idx = v_base + v_rel
-                dh0[i_b, i_h, k_idx, v_idx] = rState[ei]
+                if cutlass.const_expr(self.transpose_state_layout):
+                    dh0[i_n, i_h, v_idx, k_idx] = rState[ei]
+                else:
+                    dh0[i_n, i_h, k_idx, v_idx] = rState[ei]
 
     @cute.jit
     def _epilog_partition(self, atom, gC_mnl, epi_tile, sC):
@@ -631,25 +759,35 @@ def _as_cute(tensor: torch.Tensor):
 def _compile_bwd_dhu_sm90(
     B: int,
     T: int,
+    N: int,
+    NT: int,
     H: int,
     K: int,
     V: int,
+    is_varlen: bool,
+    use_g: bool,
     use_gk: bool,
     use_dht: bool,
     use_dh0: bool,
     use_exp2: bool,
+    transpose_state_layout: bool,
     scale: float,
 ):
     kernel = ChunkDeltaRuleBwdDHUSm90(
         batch_size=B,
         seq_len=T,
+        num_sequences=N,
+        total_chunks=NT,
         num_heads=H,
         head_dim_k=K,
         head_dim_v=V,
+        is_varlen=is_varlen,
+        use_g=use_g,
         use_gk=use_gk,
         use_dht=use_dht,
         use_dh0=use_dh0,
         use_exp2=use_exp2,
+        transpose_state_layout=transpose_state_layout,
         scale=scale,
         use_fast_math=USE_FAST_MATH,
     )
@@ -660,10 +798,18 @@ def _compile_bwd_dhu_sm90(
     do_fake = torch.empty(B, T, H, V, device="cuda", dtype=torch.bfloat16)
     dv_fake = torch.empty_like(do_fake)
     dv2_fake = torch.empty_like(do_fake)
+    g_fake = torch.empty(B, T, H, device="cuda", dtype=torch.float32)
     gk_fake = torch.empty(B, T, H, K, device="cuda", dtype=torch.float32)
-    dht_fake = torch.empty(B, H, K, V, device="cuda", dtype=torch.float32)
-    dh0_fake = torch.empty_like(dht_fake)
-    dh_fake = torch.empty(B, math.ceil(T / BT), H, K, V, device="cuda", dtype=torch.bfloat16)
+    if transpose_state_layout:
+        dht_fake = torch.empty(N, H, V, K, device="cuda", dtype=torch.float32)
+        dh0_fake = torch.empty_like(dht_fake)
+        dh_fake = torch.empty(B, NT, H, V, K, device="cuda", dtype=torch.bfloat16)
+    else:
+        dht_fake = torch.empty(N, H, K, V, device="cuda", dtype=torch.float32)
+        dh0_fake = torch.empty_like(dht_fake)
+        dh_fake = torch.empty(B, NT, H, K, V, device="cuda", dtype=torch.bfloat16)
+    cu_fake = torch.empty(N + 1, device="cuda", dtype=torch.int32)
+    offsets_fake = torch.empty(N + 1, device="cuda", dtype=torch.int32)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     return cute.compile(
@@ -671,6 +817,7 @@ def _compile_bwd_dhu_sm90(
         _as_cute(q_fake),
         _as_cute(k_fake),
         _as_cute(w_fake),
+        _as_cute(g_fake),
         _as_cute(gk_fake),
         _as_cute(dht_fake),
         _as_cute(dh0_fake),
@@ -678,6 +825,8 @@ def _compile_bwd_dhu_sm90(
         _as_cute(dh_fake),
         _as_cute(dv_fake),
         _as_cute(dv2_fake),
+        _as_cute(cu_fake),
+        _as_cute(offsets_fake),
         stream=stream,
         options="--enable-tvm-ffi",
     )
@@ -701,19 +850,15 @@ def chunk_gated_delta_rule_bwd_dhu_sm90(
     transpose_state_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """FLA-compatible wrapper for the SM90 WGMMA bwd_dhu path."""
-    del chunk_indices
     assert_hopper(q.device)
-    if cu_seqlens is not None:
-        raise NotImplementedError("SM90 bwd_dhu currently only supports non-varlen tensors.")
-    if transpose_state_layout:
-        raise NotImplementedError("SM90 bwd_dhu currently only supports [B, NT, H, K, V] state layout.")
-    if g is not None:
-        raise NotImplementedError("SM90 bwd_dhu currently supports gk gating, not scalar g gating.")
     if chunk_size != BT:
         raise NotImplementedError(f"SM90 bwd_dhu only supports chunk_size={BT}.")
 
     B, T, H, K = q.shape
     V = do.shape[-1]
+    is_varlen = cu_seqlens is not None
+    if is_varlen and B != 1:
+        raise ValueError("varlen mode expects packed inputs with shape [1, total_T, H, D].")
     if K not in (64, 128, 256):
         raise NotImplementedError(f"SM90 bwd_dhu only supports K in {{64, 128, 256}}, got K={K}.")
     if V % BV != 0:
@@ -726,36 +871,70 @@ def chunk_gated_delta_rule_bwd_dhu_sm90(
         raise ValueError("q, k, and w must be contiguous.")
     if not do.is_contiguous() or not dv.is_contiguous():
         raise ValueError("do and dv must be contiguous.")
+    if h0 is not None and (h0.dtype != torch.float32 or not h0.is_contiguous()):
+        raise ValueError("h0 must be contiguous float32.")
+    if cu_seqlens is not None and (cu_seqlens.device != q.device or not cu_seqlens.is_contiguous()):
+        raise ValueError("cu_seqlens must be contiguous and on the same CUDA device as q.")
+    if chunk_indices is not None and (chunk_indices.device != q.device or not chunk_indices.is_contiguous()):
+        raise ValueError("chunk_indices must be contiguous and on the same CUDA device as q.")
 
-    NT = math.ceil(T / BT)
+    if is_varlen:
+        if chunk_indices is None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+        N = len(cu_seqlens) - 1
+        NT = len(chunk_indices)
+        chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT).int()
+        cu_seqlens_arg = cu_seqlens.int() if cu_seqlens.dtype != torch.int32 else cu_seqlens
+    else:
+        N = B
+        NT = math.ceil(T / BT)
+        cu_seqlens_arg = torch.arange(B + 1, device=q.device, dtype=torch.int32) * T
+        chunk_offsets = torch.arange(B + 1, device=q.device, dtype=torch.int32) * NT
     scale_value = 1.0 if scale is None else float(scale)
 
-    dh = q.new_empty(B, NT, H, K, V)
-    dh0 = torch.empty(B, H, K, V, device=q.device, dtype=torch.float32) if h0 is not None else None
+    state_shape = (N, H, V, K) if transpose_state_layout else (N, H, K, V)
+    dh = q.new_empty(B, NT, H, V, K) if transpose_state_layout else q.new_empty(B, NT, H, K, V)
+    dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
     dv2 = torch.empty_like(dv)
 
+    g_arg = g if g is not None else torch.empty(B, T, H, device=q.device, dtype=torch.float32)
     gk_arg = gk if gk is not None else torch.empty(B, T, H, K, device=q.device, dtype=torch.float32)
-    dht_arg = dht if dht is not None else torch.empty(B, H, K, V, device=q.device, dtype=torch.float32)
-    dh0_arg = dh0 if dh0 is not None else torch.empty(B, H, K, V, device=q.device, dtype=torch.float32)
+    dht_arg = dht if dht is not None else torch.empty(state_shape, device=q.device, dtype=torch.float32)
+    dh0_arg = dh0 if dh0 is not None else torch.empty(state_shape, device=q.device, dtype=torch.float32)
+    if g is not None and (g.dtype != torch.float32 or not g.is_contiguous()):
+        raise ValueError("g must be contiguous float32.")
+    if g is not None and tuple(g.shape) != (B, T, H):
+        raise ValueError(f"g must have shape {(B, T, H)}, got {tuple(g.shape)}.")
     if gk is not None and (gk.dtype != torch.float32 or not gk.is_contiguous()):
         raise ValueError("gk must be contiguous float32.")
+    if gk is not None and tuple(gk.shape) != (B, T, H, K):
+        raise ValueError(f"gk must have shape {(B, T, H, K)}, got {tuple(gk.shape)}.")
     if dht is not None and (dht.dtype != torch.float32 or not dht.is_contiguous()):
         raise ValueError("dht must be contiguous float32.")
+    if dht is not None and tuple(dht.shape) != state_shape:
+        raise ValueError(f"dht must have shape {state_shape} for this state layout, got {tuple(dht.shape)}.")
+    if h0 is not None and tuple(h0.shape) != state_shape:
+        raise ValueError(f"h0 must have shape {state_shape} for this state layout, got {tuple(h0.shape)}.")
 
     compiled = _compile_bwd_dhu_sm90(
         B,
         T,
+        N,
+        NT,
         H,
         K,
         V,
+        is_varlen,
+        g is not None,
         gk is not None,
         dht is not None,
         h0 is not None,
         use_exp2,
+        transpose_state_layout,
         scale_value,
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    compiled(q, k, w, gk_arg, dht_arg, dh0_arg, do, dh, dv, dv2, stream)
+    compiled(q, k, w, g_arg, gk_arg, dht_arg, dh0_arg, do, dh, dv, dv2, cu_seqlens_arg, chunk_offsets, stream)
     return dh, dh0, dv2
 
 
