@@ -37,6 +37,8 @@ from fla.utils import tensor_cache
 
 from cula.utils import USE_FAST_MATH, assert_blackwell
 
+COMPILE_OPTIONS = "--enable-tvm-ffi --generate-line-info --ptxas-options '--verbose'"
+
 
 # in FLA, cumsum returns int64 tensor by default
 @tensor_cache
@@ -1958,7 +1960,7 @@ def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size, use_fas
         Int32(0),  # store_final_state
         Int32(0),  # save_v_new
         stream_fake,
-        options="--enable-tvm-ffi",
+        options=COMPILE_OPTIONS,
     )
     return compiled_fn
 
