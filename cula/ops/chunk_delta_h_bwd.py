@@ -761,18 +761,17 @@ class ChunkDeltaRuleBwdDHUSm90:
                             sDh[k_rel, v_rel, 0] = state_bf16
                             sB[v_rel, k_rel, 0] = state_bf16
                         else:
-                            dh[state_b, chunk_base + i_t, i_h, k_idx, v_idx] = state_bf16
+                            sDh[v_rel, k_rel, 0] = state_bf16
                             sB[v_rel, k_rel, 0] = state_bf16
             cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.sync_threads()
             if warp_idx == self.store_warp_id:
                 if cutlass.const_expr(self.transpose_state_layout):
                     cute.copy(tma_atom_dh, bSG_sDh[None, 0], bSG_gDh[(None, 0, i_v_tile, i_t)])
-                    cute.arch.cp_async_bulk_commit_group()
-                elif cutlass.const_expr(False):
+                else:
                     cute.copy(tma_atom_dh, bSG_sDh[None, 0], bSG_gDh[(None, i_v_tile, 0, i_t)])
-                    cute.arch.cp_async_bulk_commit_group()
-                if cutlass.const_expr(self.transpose_state_layout and self.is_varlen):
+                cute.arch.cp_async_bulk_commit_group()
+                if cutlass.const_expr(self.is_varlen):
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
             if cutlass.const_expr(self.is_varlen):
                 cute.arch.sync_threads()
