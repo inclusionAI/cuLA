@@ -16,6 +16,7 @@ allows:
 Usage:
   python benchmarks/bench_chunk_delta_h_bwd_sm90.py --mode both
   python benchmarks/bench_chunk_delta_h_bwd_sm90.py --preset fwd --mode non-varlen
+  python benchmarks/bench_chunk_delta_h_bwd_sm90.py --preset focused --mode non-varlen
 """
 
 import argparse
@@ -34,7 +35,9 @@ import torch
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu as fla_bwd_dhu
 from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
 
-from cula.ops.chunk_delta_h_bwd import chunk_gated_delta_rule_bwd_dhu_sm90
+import cula.ops.chunk_delta_h_bwd as bwd_mod
+
+chunk_gated_delta_rule_bwd_dhu_sm90 = bwd_mod.chunk_gated_delta_rule_bwd_dhu_sm90
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
@@ -69,26 +72,32 @@ def time_kernel(fn, warmup=None, n_iters=None):
 
 def accuracy_stats(ref, out):
     diff = (ref.float() - out.float()).abs()
-    return diff.max().item(), diff.mean().item()
+    max_abs = diff.max().item()
+    rel_linf = max_abs / max(ref.float().abs().max().item(), 1e-6)
+    return max_abs, diff.mean().item(), rel_linf
 
 
 def bwd_accuracy_stats(ref_result, cute_result):
     ref_dh, ref_dh0, ref_dv2 = ref_result
     got_dh, got_dh0, got_dv2 = cute_result
-    dh_max, dh_mean = accuracy_stats(ref_dh, got_dh)
-    dv2_max, dv2_mean = accuracy_stats(ref_dv2, got_dv2)
-    dh0_max, dh0_mean = 0.0, 0.0
+    dh_max, dh_mean, dh_rel = accuracy_stats(ref_dh, got_dh)
+    dv2_max, dv2_mean, dv2_rel = accuracy_stats(ref_dv2, got_dv2)
+    dh0_max, dh0_mean, dh0_rel = 0.0, 0.0, 0.0
     if ref_dh0 is not None:
-        dh0_max, dh0_mean = accuracy_stats(ref_dh0, got_dh0)
+        dh0_max, dh0_mean, dh0_rel = accuracy_stats(ref_dh0, got_dh0)
     return {
         "dh_max": dh_max,
         "dh_mean": dh_mean,
+        "dh_rel": dh_rel,
         "dh0_max": dh0_max,
         "dh0_mean": dh0_mean,
+        "dh0_rel": dh0_rel,
         "dv2_max": dv2_max,
         "dv2_mean": dv2_mean,
+        "dv2_rel": dv2_rel,
         "max_diff": max(dh_max, dh0_max, dv2_max),
         "mean_diff": max(dh_mean, dh0_mean, dv2_mean),
+        "max_rel": max(dh_rel, dh0_rel, dv2_rel),
     }
 
 
@@ -230,6 +239,51 @@ def flags_str(use_g, use_gk, use_dht, use_dh0):
     return f" [{','.join(flags)}]" if flags else ""
 
 
+FOCUSED_FEATURE_MODES = {
+    "A": (False, False, False, False),
+    "B": (False, False, True, True),
+    "C": (True, False, False, False),
+    "D": (False, True, False, False),
+    "E": (True, True, False, False),
+}
+
+
+def focused_feature_label(use_g, use_gk, use_dht, use_dh0):
+    for name, flags in FOCUSED_FEATURE_MODES.items():
+        if flags == (use_g, use_gk, use_dht, use_dh0):
+            return name
+    return "-"
+
+
+def build_focused_non_varlen_configs(feature_mode="all"):
+    modes = FOCUSED_FEATURE_MODES.items()
+    if feature_mode != "all":
+        modes = [(feature_mode, FOCUSED_FEATURE_MODES[feature_mode])]
+
+    configs = []
+    for B in (1, 2, 4):
+        for H in (16, 32):
+            for T in (2048, 4096, 8192, 16384):
+                for _, flags in modes:
+                    use_g, use_gk, use_dht, use_dh0 = flags
+                    configs.append((B, T, H, use_g, use_gk, use_dht, use_dh0))
+    return configs
+
+
+def filter_non_varlen_configs(configs, only_b=None, only_h=None, only_t=None):
+    if only_b is not None:
+        configs = [cfg for cfg in configs if cfg[0] == only_b]
+    if only_t is not None:
+        configs = [cfg for cfg in configs if cfg[1] == only_t]
+    if only_h is not None:
+        configs = [cfg for cfg in configs if cfg[2] == only_h]
+    return configs
+
+
+def _compile_cache_misses():
+    return bwd_mod._compile_bwd_dhu_sm90.cache_info().misses
+
+
 def bench_non_varlen(configs):
     print("\n" + "=" * 80)
     print(" Non-Varlen Benchmark: CuTe DSL (SM90) bwd_dhu vs FLA Triton")
@@ -240,7 +294,9 @@ def bench_non_varlen(configs):
         q, k, w, do, dv, g, gk, dht, dh0 = make_non_varlen_inputs(B, T, H, use_g, use_gk, use_dht, use_dh0)
 
         ref = run_fla(q, k, w, do, dv, g, gk, dht, dh0)
+        misses_before = _compile_cache_misses()
         got = run_cute(q, k, w, do, dv, g, gk, dht, dh0)
+        compiled_new = _compile_cache_misses() > misses_before
         torch.cuda.synchronize()
         acc = bwd_accuracy_stats(ref, got)
 
@@ -254,12 +310,15 @@ def bench_non_varlen(configs):
         ms_cute = time_kernel(run_cute_case)
         speedup = ms_fla / ms_cute if ms_cute > 0 else float("inf")
         flag_str = flags_str(use_g, use_gk, use_dht, use_dh0)
+        feature_mode = focused_feature_label(use_g, use_gk, use_dht, use_dh0)
 
         r = {
             "B": B,
             "T": T,
             "H": H,
+            "feature_mode": feature_mode,
             "flags": flag_str,
+            "compiled_new": compiled_new,
             "ms_fla": ms_fla,
             "ms_cute": ms_cute,
             "speedup": speedup,
@@ -267,10 +326,11 @@ def bench_non_varlen(configs):
         }
         results.append(r)
         print(
-            f"  B={B:2d} T={T:5d} H={H:3d}{flag_str:<18s} | "
-            f"max={acc['max_diff']:.6f} mean={acc['mean_diff']:.8f} "
-            f"(dh={acc['dh_max']:.6f} dh0={acc['dh0_max']:.6f} dv2={acc['dv2_max']:.6f}) | "
-            f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms | speedup={speedup:.2f}x"
+            f"  B={B:2d} T={T:5d} H={H:3d} mode={feature_mode}{flag_str:<18s} | "
+            f"abs(dh={acc['dh_max']:.6f} dh0={acc['dh0_max']:.6f} dv2={acc['dv2_max']:.6f}) "
+            f"rel(dh={acc['dh_rel']:.3e} dh0={acc['dh0_rel']:.3e} dv2={acc['dv2_rel']:.3e}) | "
+            f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms speedup={speedup:.2f}x | "
+            f"compiled={'yes' if compiled_new else 'no'}"
         )
 
     return results
@@ -351,7 +411,9 @@ def bench_varlen(configs):
             "T_total": total_T,
             "H": H,
             "n_seqs": num_seqs,
+            "feature_mode": focused_feature_label(use_g, use_gk, use_dht, use_dh0),
             "flags": flag_str,
+            "compiled_new": False,
             "ms_fla": ms_fla,
             "ms_cute": ms_cute,
             "speedup": speedup,
@@ -382,19 +444,23 @@ def print_report(nv_results, vl_results):
 
     if nv_results:
         print("\n  [Non-Varlen]")
-        print(f"  {'-' * 112}")
-        print(f"  {'Config':<37s} | {'max_diff':>10s} {'mean_diff':>12s} | {'FLA(ms)':>9s} {'CuTe(ms)':>9s} {'Speedup':>8s}")
-        print(f"  {'-' * 112}")
+        print(f"  {'-' * 132}")
+        print(
+            f"  {'Config':<45s} | {'max_abs':>10s} {'max_rel':>10s} | "
+            f"{'FLA(ms)':>9s} {'CuTe(ms)':>9s} {'Speedup':>8s} {'Compiled':>8s}"
+        )
+        print(f"  {'-' * 132}")
         for r in nv_results:
-            label = f"B={r['B']:2d} T={r['T']:5d} H={r['H']:3d}{r['flags']}"
+            label = f"B={r['B']:2d} T={r['T']:5d} H={r['H']:3d} mode={r.get('feature_mode', '-')}{r['flags']}"
             print(
-                f"  {label:<37s} | {r['max_diff']:10.6f} {r['mean_diff']:12.8f} | "
-                f"{r['ms_fla']:9.4f} {r['ms_cute']:9.4f} {r['speedup']:7.2f}x"
+                f"  {label:<45s} | {r['max_diff']:10.6f} {r['max_rel']:10.3e} | "
+                f"{r['ms_fla']:9.4f} {r['ms_cute']:9.4f} {r['speedup']:7.2f}x "
+                f"{'yes' if r.get('compiled_new') else 'no':>8s}"
             )
-        print(f"  {'-' * 112}")
+        print(f"  {'-' * 132}")
         speedups = [r["speedup"] for r in nv_results]
         geo = math.exp(sum(math.log(s) for s in speedups) / len(speedups))
-        print(f"  {'Geometric mean':<37s} | {'':>10s} {'':>12s} | {'':>9s} {'':>9s} {geo:7.2f}x")
+        print(f"  {'Geometric mean':<45s} | {'':>10s} {'':>10s} | {'':>9s} {'':>9s} {geo:7.2f}x {'':>8s}")
 
     if vl_results:
         print("\n  [Varlen]")
@@ -428,9 +494,20 @@ def main():
         "--preset",
         type=str,
         default="representative",
-        choices=["representative", "fwd"],
-        help="representative runs a short subset; fwd mirrors bench_chunk_delta_h.py's large default configs",
+        choices=["representative", "fwd", "focused"],
+        help="representative runs a short subset; fwd mirrors bench_chunk_delta_h.py; focused runs the long non-varlen matrix",
     )
+    parser.add_argument(
+        "--feature-mode",
+        type=str,
+        default="all",
+        choices=["all", "A", "B", "C", "D", "E"],
+        help="For --preset focused: A=no gates/state, B=dht+dh0, C=g, D=gk, E=g+gk",
+    )
+    parser.add_argument("--max-configs", type=int, default=None, help="Run only the first N configs from the selected preset")
+    parser.add_argument("--filter-b", type=int, default=None, help="Only run non-varlen configs with this B")
+    parser.add_argument("--filter-h", type=int, default=None, help="Only run non-varlen configs with this H")
+    parser.add_argument("--filter-t", type=int, default=None, help="Only run non-varlen configs with this T")
     parser.add_argument("--warmup", type=int, default=None, help="Override warmup iterations")
     parser.add_argument("--iters", type=int, default=None, help="Override timed iterations")
     parser.add_argument("--ncu", action="store_true", help="NCU profiling mode: warmup=1, iters=1")
@@ -448,7 +525,12 @@ def main():
     if args.iters is not None:
         N_ITERS = args.iters
 
-    if args.preset == "fwd":
+    if args.preset == "focused":
+        # Focused non-varlen long-token matrix requested for SM90 bwd_dhu tuning.
+        # Tuple: (B, T, H, use_g, use_gk, use_dht, use_dh0)
+        non_varlen_configs = build_focused_non_varlen_configs(args.feature_mode)
+        varlen_configs = []
+    elif args.preset == "fwd":
         # Matches bench_chunk_delta_h.py's default dimensions.
         # Tuple: (B, T, H, use_g, use_gk, use_dht, use_dh0)
         non_varlen_configs = [
@@ -481,6 +563,17 @@ def main():
             (3, 512, 2, 3.0, False, True, True, False),
             (4, 768, 2, 4.0, True, False, True, True),
         ]
+
+    non_varlen_configs = filter_non_varlen_configs(
+        non_varlen_configs,
+        only_b=args.filter_b,
+        only_h=args.filter_h,
+        only_t=args.filter_t,
+    )
+
+    if args.max_configs is not None:
+        non_varlen_configs = non_varlen_configs[: args.max_configs]
+        varlen_configs = varlen_configs[: args.max_configs]
 
     nv_res, vl_res = [], []
     if args.mode in ("non-varlen", "both"):
