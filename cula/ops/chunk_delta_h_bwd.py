@@ -39,6 +39,7 @@ import math
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.cute.nvgpu.warpgroup as warpgroup
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
@@ -121,6 +122,7 @@ class ChunkDeltaRuleBwdDHUSm90:
         self.buffer_align_bytes = 1024
 
         self.mma_tiler = (BT, BV, self.BK)
+        self.kdh_mma_tiler = (BV, BT, self.BK)
         self.update_mma_tiler = (BV, self.BK, BT)
         self.atom_layout_mnk = (1, 1, 1)
         self.cluster_shape_mnk = (1, 1, 1)
@@ -269,7 +271,8 @@ class ChunkDeltaRuleBwdDHUSm90:
             utils.LayoutEnum.ROW_MAJOR.sm90_mma_major_mode(),
             self.acc_dtype,
             self.atom_layout_mnk,
-            self.mma_tiler[:2],
+            self.kdh_mma_tiler[:2],
+            warpgroup.OperandSource.RMEM,
         )
 
         update_tiled_mma = sm90_utils.make_trivial_tiled_mma(
@@ -282,17 +285,11 @@ class ChunkDeltaRuleBwdDHUSm90:
             self.update_mma_tiler[:2],
         )
 
-        a_smem_layout_staged = sm90_utils.make_smem_layout_a(
+        a_smem_layout_staged = sm90_utils.make_smem_layout_b(
             utils.LayoutEnum.ROW_MAJOR,
-            self.mma_tiler,
+            self.kdh_mma_tiler,
             self.io_dtype,
             self.input_stage,
-        )
-        b_smem_layout_staged = sm90_utils.make_smem_layout_b(
-            utils.LayoutEnum.ROW_MAJOR,
-            self.mma_tiler,
-            self.io_dtype,
-            1,
         )
         update_a_smem_layout_staged = sm90_utils.make_smem_layout_a(
             utils.LayoutEnum.COL_MAJOR,
@@ -390,10 +387,6 @@ class ChunkDeltaRuleBwdDHUSm90:
                 cute.struct.MemRange[self.io_dtype, cute.cosize(a_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
-            sB: cute.struct.Align[
-                cute.struct.MemRange[self.io_dtype, cute.cosize(b_smem_layout_staged)],
-                self.buffer_align_bytes,
-            ]
             sUA: cute.struct.Align[
                 cute.struct.MemRange[self.io_dtype, cute.cosize(update_a_smem_layout_staged)],
                 self.buffer_align_bytes,
@@ -438,7 +431,6 @@ class ChunkDeltaRuleBwdDHUSm90:
             tiled_mma,
             update_tiled_mma,
             a_smem_layout_staged,
-            b_smem_layout_staged,
             update_a_smem_layout_staged,
             update_b_smem_layout_staged,
             tma_atom_k,
@@ -485,7 +477,6 @@ class ChunkDeltaRuleBwdDHUSm90:
         tiled_mma: cute.TiledMma,
         update_tiled_mma: cute.TiledMma,
         a_smem_layout_staged: cute.ComposedLayout,
-        b_smem_layout_staged: cute.ComposedLayout,
         update_a_smem_layout_staged: cute.ComposedLayout,
         update_b_smem_layout_staged: cute.ComposedLayout,
         tma_atom_k: cute.CopyAtom,
@@ -530,7 +521,6 @@ class ChunkDeltaRuleBwdDHUSm90:
         storage = smem.allocate(self.shared_storage)
 
         sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
-        sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
         sUA = storage.sUA.get_tensor(update_a_smem_layout_staged.outer, swizzle=update_a_smem_layout_staged.inner)
         sDv2Stage = storage.sDv2Stage.get_tensor(cute.make_layout((self.dv2_store_stage,)))
         sDo = storage.sDo.get_tensor(update_a_smem_layout_staged.outer, swizzle=update_a_smem_layout_staged.inner)
@@ -675,10 +665,8 @@ class ChunkDeltaRuleBwdDHUSm90:
         thr_mma = tiled_mma.get_slice(local_tidx)
         update_thr_mma = update_tiled_mma.get_slice(local_tidx)
 
-        tCsA = thr_mma.partition_A(sA)
-        tCsB = thr_mma.partition_B(sB)
-        tCrA = thr_mma.make_fragment_A(tCsA)
-        tCrB = thr_mma.make_fragment_B(tCsB)
+        tKsB = thr_mma.partition_B(sA)
+        tKrB = thr_mma.make_fragment_B(tKsB)
         tUsA = update_thr_mma.partition_A(sUA)
         tUsDo = update_thr_mma.partition_A(sDo)
         tUsB = update_thr_mma.partition_B(sUB)
@@ -688,9 +676,9 @@ class ChunkDeltaRuleBwdDHUSm90:
         tUrB = update_thr_mma.make_fragment_B(tUsB)
         tWrB = update_thr_mma.make_fragment_B(tWsB)
 
-        cDV = cute.make_identity_tensor((BT, BV))
+        cDV = cute.make_identity_tensor((BV, BT))
         tCcDV = thr_mma.partition_C(cDV)
-        acc_dv = thr_mma.make_fragment_C(thr_mma.partition_shape_C((BT, BV)))
+        acc_dv = thr_mma.make_fragment_C(thr_mma.partition_shape_C((BV, BT)))
 
         cState = cute.make_identity_tensor((BV, self.BK))
         tUcState = update_thr_mma.partition_C(cState)
@@ -762,23 +750,19 @@ class ChunkDeltaRuleBwdDHUSm90:
                 else:
                     g_last_exp = cute.exp(g_last, fastmath=self.use_fast_math)
 
-            # Publish the current reverse state both as dh output and as the
-            # K@dH WGMMA B operand. The dh path is staged for the store warp;
-            # sB remains single-buffered because only the compute warpgroup uses it.
+            # Publish the current reverse state as dh output. K@dH consumes the
+            # same register-carried state through the RMEM WGMMA path below.
             if is_compute_warp:
                 dh_h = store_dh_P.acquire_and_advance()
                 for k_block in cutlass.range_constexpr(self.num_k_blocks):
-                    k_base = k_block * self.BK
                     rState = rStates[k_block]
                     for ei in cutlass.range(cute.size(rState), unroll_full=True):
                         v_rel, k_rel = tUcState[ei]
                         state_bf16 = rState[ei].to(self.io_dtype)
                         if cutlass.const_expr(self.transpose_state_layout):
                             sDh[k_rel, v_rel, dh_h.index] = state_bf16
-                            sB[v_rel, k_rel, 0] = state_bf16
                         else:
                             sDh[v_rel, k_rel, dh_h.index] = state_bf16
-                            sB[v_rel, k_rel, 0] = state_bf16
                 cute.arch.fence_proxy("async.shared", space="cta")
                 dh_h.commit()
 
@@ -818,14 +802,16 @@ class ChunkDeltaRuleBwdDHUSm90:
                 cute.copy(tma_atom_q, bSG_gQ[(None, 0, i_t)], bSG_sQ[None, q_h.index], tma_bar_ptr=q_h.barrier)
                 w_h = load_w_P.acquire_and_advance()
                 cute.copy(tma_atom_w, bSG_gW[(None, 0, i_t)], bSG_sW[None, w_h.index], tma_bar_ptr=w_h.barrier)
-            # dv2 = dv + K @ dh.
+            # dv2 = dv + K @ dh. Compute the equivalent (dh @ K^T) tile so the
+            # register-carried state can feed WGMMA as an RMEM A operand.
             if is_compute_warp:
                 acc_dv.fill(0.0)
                 for k_block in cutlass.range_constexpr(self.num_k_blocks):
                     k_wait = load_k_C.wait_and_advance()
                     cute.arch.barrier(barrier_id=2, number_of_threads=self.num_compute_threads)
+                    rState_op = self.make_acc_into_op(rStates[k_block], tiled_mma.tv_layout_A, self.io_dtype)
                     cute.nvgpu.warpgroup.fence()
-                    for kp in cutlass.range(cute.size(tCrA, mode=[2]), unroll_full=True):
+                    for kp in cutlass.range(cute.size(tKrB, mode=[2]), unroll_full=True):
                         tiled_mma.set(
                             cute.nvgpu.warpgroup.Field.ACCUMULATE,
                             cutlass.Boolean((k_block != 0) or (kp != 0)),
@@ -833,8 +819,8 @@ class ChunkDeltaRuleBwdDHUSm90:
                         cute.gemm(
                             tiled_mma,
                             acc_dv,
-                            tCrA[None, None, kp, k_wait.index],
-                            tCrB[None, None, kp, 0],
+                            rState_op[None, None, kp],
+                            tKrB[None, None, kp, k_wait.index],
                             acc_dv,
                         )
                     cute.nvgpu.warpgroup.commit_group()
@@ -848,7 +834,7 @@ class ChunkDeltaRuleBwdDHUSm90:
                     sDv2Stage[dv2_store_h.index] = dv_stage
                 cute.arch.barrier(barrier_id=2, number_of_threads=self.num_compute_threads)
                 for ei in cutlass.range(cute.size(acc_dv), unroll_full=True):
-                    t_rel, v_rel = tCcDV[ei]
+                    v_rel, t_rel = tCcDV[ei]
                     t_idx = chunk_start + t_rel
                     out = Float32(0.0)
                     if t_idx < seq_len:
@@ -1015,6 +1001,27 @@ class ChunkDeltaRuleBwdDHUSm90:
             gC_g,
         )
         return atom, bSG_sC, bSG_gC
+
+    @staticmethod
+    def _convert_c_layout_to_a_layout(c, a):
+        return cute.make_layout(
+            (a, c.shape[1], (c.shape[2], cute.size(c, mode=[0]) // cute.size(a))),
+            stride=(
+                c.stride[0],
+                c.stride[1],
+                (c.stride[2], cute.size(a, mode=[2]) * c.stride[0][2]),
+            ),
+        )
+
+    @cute.jit
+    def make_acc_into_op(self, acc, operand_layout_tv, element_type):
+        operand = cute.make_rmem_tensor_like(
+            self._convert_c_layout_to_a_layout(acc.layout, operand_layout_tv.shape[1]),
+            element_type,
+        )
+        operand_as_acc = cute.make_tensor(operand.iterator, acc.layout)
+        operand_as_acc.store(acc.load().to(element_type))
+        return operand
 
 
 def _as_cute(tensor: torch.Tensor):
