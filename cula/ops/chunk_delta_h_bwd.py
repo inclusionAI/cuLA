@@ -763,7 +763,7 @@ class ChunkDeltaRuleBwdDHUSm90:
                     g_last_exp = cute.exp(g_last, fastmath=self.use_fast_math)
 
             # Publish the current reverse state both as dh output and as the
-            # K@dH WGMMA B operand.  The dh path is staged for the store warp;
+            # K@dH WGMMA B operand. The dh path is staged for the store warp;
             # sB remains single-buffered because only the compute warpgroup uses it.
             if is_compute_warp:
                 dh_h = store_dh_P.acquire_and_advance()
@@ -961,6 +961,11 @@ class ChunkDeltaRuleBwdDHUSm90:
                         rState[ei] = rState[ei] + update
                     w_wait.release()
                 do_wait.release()
+                # sUA[dv_stage] has three consumers after dv2 is written:
+                # direct tail stores (above), W^T@dv2 (completed here), and
+                # full-tile TMA stores by the store warp. Keep the load_dv stage
+                # owned until the store warp signals done, otherwise the load
+                # warp could refill this stage while a TMA store still reads it.
                 dv2_done_h = store_dv2_done_C.wait_and_advance()
                 dv2_done_h.release()
                 dv_wait.release()
@@ -968,6 +973,9 @@ class ChunkDeltaRuleBwdDHUSm90:
             if warp_idx == self.store_warp_id:
                 dv2_store_h = store_dv2_C.wait_and_advance()
                 dv2_done_h = store_dv2_done_P.acquire_and_advance()
+                # One done token is committed per chunk. Tail chunks skip TMA
+                # because the tile would cross sequence bounds, but still
+                # publish done so compute and store pipeline phases stay paired.
                 if remaining >= self.BT:
                     dv_stage = sDv2Stage[dv2_store_h.index]
                     cute.copy(

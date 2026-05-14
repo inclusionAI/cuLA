@@ -146,7 +146,17 @@ def _make_inputs(
     return q, k, w, do, dv, g, gk, dht, dh0
 
 
-def _make_varlen_inputs(seq_lens, H, K, V, use_g=False, use_gk=False, use_state=False, seed=42):
+def _make_varlen_inputs(
+    seq_lens,
+    H,
+    K,
+    V,
+    use_g=False,
+    use_gk=False,
+    use_state=False,
+    seed=42,
+    transpose_state_layout=False,
+):
     T_total = sum(seq_lens)
     num_seqs = len(seq_lens)
     cu = [0]
@@ -176,7 +186,7 @@ def _make_varlen_inputs(seq_lens, H, K, V, use_g=False, use_gk=False, use_state=
             seg = torch.randn(1, eos - bos, H, K, dtype=torch.float32, device=device) * 0.01
             gk[:, bos:eos] = -torch.abs(seg).cumsum(dim=1)
 
-    state_shape = (num_seqs, H, K, V)
+    state_shape = (num_seqs, H, V, K) if transpose_state_layout else (num_seqs, H, K, V)
     dht = torch.randn(state_shape, dtype=torch.float32, device=device) * 0.01 if use_state else None
     dh0 = torch.empty(state_shape, dtype=torch.float32, device=device) if use_state else None
     cu_seqlens = torch.tensor(cu, dtype=torch.int32, device=device)
@@ -269,6 +279,116 @@ def test_scalar_g_features(use_g, use_gk):
     ref = run_fla_ref(q, k, w, do, dv, g=g, gk=gk, dht=dht, dh0=dh0)
     got = run_cute_dsl(q, k, w, do, dv, g=g, gk=gk, dht=dht, dh0=dh0)
     _assert_bwd_close(got, ref, True, f"scalar-g g={use_g} gk={use_gk}")
+
+
+@pytest.mark.parametrize(
+    "T,use_g,use_gk,transpose_state_layout",
+    [
+        (65, False, False, False),
+        (127, True, False, False),
+        (129, False, True, True),
+        (191, True, True, True),
+    ],
+    ids=["t65-plain", "t127-g", "t129-gk-trans", "t191-g-gk-trans"],
+)
+def test_tail_chunk_sizes(T, use_g, use_gk, transpose_state_layout):
+    q, k, w, do, dv, g, gk, dht, dh0 = _make_inputs(
+        B=1,
+        T=T,
+        H=2,
+        K=128,
+        V=128,
+        use_g=use_g,
+        use_gk=use_gk,
+        use_state=True,
+        seed=1000 + T,
+        transpose_state_layout=transpose_state_layout,
+    )
+    ref = run_fla_ref(
+        q,
+        k,
+        w,
+        do,
+        dv,
+        g=g,
+        gk=gk,
+        dht=dht,
+        dh0=dh0,
+        transpose_state_layout=transpose_state_layout,
+    )
+    got = run_cute_dsl(
+        q,
+        k,
+        w,
+        do,
+        dv,
+        g=g,
+        gk=gk,
+        dht=dht,
+        dh0=dh0,
+        transpose_state_layout=transpose_state_layout,
+    )
+    _assert_bwd_close(got, ref, True, f"T={T} g={use_g} gk={use_gk} trans={transpose_state_layout}")
+
+
+@pytest.mark.parametrize(
+    "use_g,use_gk,transpose_state_layout",
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (True, True, False),
+        (False, False, True),
+        (True, False, True),
+        (False, True, True),
+        (True, True, True),
+    ],
+)
+def test_varlen_tail_chunk_sizes(use_g, use_gk, transpose_state_layout):
+    seq_lens = [1, 63, 64, 65, 127, 128, 129]
+    q, k, w, do, dv, g, gk, dht, dh0, cu_seqlens = _make_varlen_inputs(
+        seq_lens,
+        H=1,
+        K=128,
+        V=128,
+        use_g=use_g,
+        use_gk=use_gk,
+        use_state=True,
+        seed=2000 + int(use_g) * 10 + int(use_gk) * 20 + int(transpose_state_layout) * 40,
+        transpose_state_layout=transpose_state_layout,
+    )
+    ref = run_fla_ref(
+        q,
+        k,
+        w,
+        do,
+        dv,
+        g=g,
+        gk=gk,
+        dht=dht,
+        dh0=dh0,
+        cu_seqlens=cu_seqlens,
+        transpose_state_layout=transpose_state_layout,
+    )
+    got = run_cute_dsl(
+        q,
+        k,
+        w,
+        do,
+        dv,
+        g=g,
+        gk=gk,
+        dht=dht,
+        dh0=dh0,
+        cu_seqlens=cu_seqlens,
+        transpose_state_layout=transpose_state_layout,
+    )
+    _assert_bwd_close(
+        got,
+        ref,
+        True,
+        f"varlen tails g={use_g} gk={use_gk} trans={transpose_state_layout}",
+    )
 
 
 def test_transpose_state_layout():
