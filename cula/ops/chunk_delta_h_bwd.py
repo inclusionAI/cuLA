@@ -220,16 +220,18 @@ class ChunkDeltaRuleBwdDHUSm90:
         dh = cute.make_tensor(dh_ptr, state_layout)
         if cutlass.const_expr(self.transpose_state_layout):
             dh_tma_layout = cute.make_layout(
-                (self.K, self.V, (NT_total, self.H, self.B)),
-                stride=(1, self.K, (self.H * self.K * self.V, self.K * self.V, NT_total * self.H * self.K * self.V)),
+                (self.V, self.K, (NT_total, self.H, self.B)),
+                stride=(self.K, 1, (self.H * self.K * self.V, self.K * self.V, NT_total * self.H * self.K * self.V)),
             )
-            dh_tma_tile = (self.BK, self.BV)
         else:
             dh_tma_layout = cute.make_layout(
                 (self.V, self.K, (NT_total, self.H, self.B)),
                 stride=(1, self.V, (self.H * self.K * self.V, self.K * self.V, NT_total * self.H * self.K * self.V)),
             )
-            dh_tma_tile = (self.BV, self.BK)
+        dh_tma_tile = (self.BV, self.BK)
+        dh_smem_layout_enum = (
+            utils.LayoutEnum.ROW_MAJOR if cutlass.const_expr(self.transpose_state_layout) else utils.LayoutEnum.COL_MAJOR
+        )
         dh_tma = cute.make_tensor(dh_ptr, dh_tma_layout)
 
         if cutlass.const_expr(self.transpose_state_layout):
@@ -309,7 +311,7 @@ class ChunkDeltaRuleBwdDHUSm90:
         )
         dh_smem_layout_staged = sm90_utils.make_smem_layout_epi(
             self.io_dtype,
-            utils.LayoutEnum.COL_MAJOR,
+            dh_smem_layout_enum,
             dh_tma_tile,
             self.dh_store_stage,
         )
@@ -643,14 +645,9 @@ class ChunkDeltaRuleBwdDHUSm90:
             _, bSG_sGK, bSG_gGK = self._epilog_partition(
                 tma_atom_gk, tma_tensor_gk_use[None, None, (i_h, data_b)], (self.BK, 1), sGK
             )
-        if cutlass.const_expr(self.transpose_state_layout):
-            _, bSG_sDh, bSG_gDh = self._epilog_partition(
-                tma_atom_dh, tma_tensor_dh_use[None, None, (None, i_h, state_b)], (self.BK, self.BV), sDh
-            )
-        else:
-            _, bSG_sDh, bSG_gDh = self._epilog_partition(
-                tma_atom_dh, tma_tensor_dh_use[None, None, (None, i_h, state_b)], (self.BV, self.BK), sDh
-            )
+        _, bSG_sDh, bSG_gDh = self._epilog_partition(
+            tma_atom_dh, tma_tensor_dh_use[None, None, (None, i_h, state_b)], (self.BV, self.BK), sDh
+        )
         _, bSG_sDv2, bSG_gDv2 = self._epilog_partition(
             tma_atom_dv2, tma_tensor_dv2_use[None, None, (i_h, data_b)], (self.BV, self.BT), sUA
         )
@@ -696,26 +693,28 @@ class ChunkDeltaRuleBwdDHUSm90:
             rStates = (rState0, rState1, rState2, rState3)
         acc_qdo = update_thr_mma.make_fragment_C(state_shape)
         acc_wdv = update_thr_mma.make_fragment_C(state_shape)
-        if cutlass.const_expr(not self.transpose_state_layout):
-            dh_copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
-                utils.LayoutEnum.COL_MAJOR,
-                elem_ty_d=self.io_dtype,
-                elem_ty_acc=self.acc_dtype,
-            )
-            dh_copy_atom = cute.make_copy_atom(
-                cute.nvgpu.warp.StMatrix8x8x16bOp(
-                    utils.LayoutEnum.COL_MAJOR.is_m_major_c(),
-                    4,
-                ),
-                self.io_dtype,
-            )
-            tiled_copy_dh_atom = cute.make_tiled_copy_C_atom(dh_copy_atom, update_tiled_mma)
-            tiled_copy_dh_r2s = cute.make_tiled_copy_S(dh_copy_atom_r2s, tiled_copy_dh_atom)
-            thr_copy_dh_r2s = tiled_copy_dh_r2s.get_slice(local_tidx)
-            tRS_sDh = thr_copy_dh_r2s.partition_D(sDh)
-            rDh_shape = cute.shape(thr_copy_dh_r2s.partition_S(sDh))
-            tRS_rDh_layout = cute.make_layout(rDh_shape[:3])
-            tRS_rDh_out = cute.make_rmem_tensor_like(tRS_rDh_layout, self.io_dtype)
+        dh_smem_layout_enum = (
+            utils.LayoutEnum.ROW_MAJOR if cutlass.const_expr(self.transpose_state_layout) else utils.LayoutEnum.COL_MAJOR
+        )
+        dh_copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
+            dh_smem_layout_enum,
+            elem_ty_d=self.io_dtype,
+            elem_ty_acc=self.acc_dtype,
+        )
+        dh_copy_atom = cute.make_copy_atom(
+            cute.nvgpu.warp.StMatrix8x8x16bOp(
+                dh_smem_layout_enum.is_m_major_c(),
+                4,
+            ),
+            self.io_dtype,
+        )
+        tiled_copy_dh_atom = cute.make_tiled_copy_C_atom(dh_copy_atom, update_tiled_mma)
+        tiled_copy_dh_r2s = cute.make_tiled_copy_S(dh_copy_atom_r2s, tiled_copy_dh_atom)
+        thr_copy_dh_r2s = tiled_copy_dh_r2s.get_slice(local_tidx)
+        tRS_sDh = thr_copy_dh_r2s.partition_D(sDh)
+        rDh_shape = cute.shape(thr_copy_dh_r2s.partition_S(sDh))
+        tRS_rDh_layout = cute.make_layout(rDh_shape[:3])
+        tRS_rDh_out = cute.make_rmem_tensor_like(tRS_rDh_layout, self.io_dtype)
 
         # Initialize carried dh state in register blocks.
         if is_compute_warp:
@@ -903,20 +902,13 @@ class ChunkDeltaRuleBwdDHUSm90:
                         # QDO does not read rState, so publish the old reverse
                         # state to the dh store side path while QDO is in flight.
                         dh_h = store_dh_P.acquire_and_advance()
-                        if cutlass.const_expr(self.transpose_state_layout):
-                            for state_block in cutlass.range_constexpr(self.num_k_blocks):
-                                state = rStates[state_block]
-                                for ei in cutlass.range(cute.size(state), unroll_full=True):
-                                    v_rel, k_rel = tUcState[ei]
-                                    sDh[k_rel, v_rel, dh_h.index] = state[ei].to(self.io_dtype)
-                        else:
-                            tRS_rState = tiled_copy_dh_r2s.retile(rState)
-                            tRS_rDh_out.store(tRS_rState.load().to(self.io_dtype))
-                            cute.copy(
-                                tiled_copy_dh_r2s,
-                                tRS_rDh_out,
-                                tRS_sDh[(None, None, None, dh_h.index)],
-                            )
+                        tRS_rState = tiled_copy_dh_r2s.retile(rState)
+                        tRS_rDh_out.store(tRS_rState.load().to(self.io_dtype))
+                        cute.copy(
+                            tiled_copy_dh_r2s,
+                            tRS_rDh_out,
+                            tRS_sDh[(None, None, None, dh_h.index)],
+                        )
                         cute.arch.fence_proxy("async.shared", space="cta")
                         dh_h.commit()
 
@@ -989,10 +981,7 @@ class ChunkDeltaRuleBwdDHUSm90:
                 dv2_store_h.release()
 
                 dh_h = store_dh_C.wait_and_advance()
-                if cutlass.const_expr(self.transpose_state_layout):
-                    cute.copy(tma_atom_dh, bSG_sDh[None, dh_h.index], bSG_gDh[(None, 0, i_v_tile, i_t)])
-                else:
-                    cute.copy(tma_atom_dh, bSG_sDh[None, dh_h.index], bSG_gDh[(None, i_v_tile, 0, i_t)])
+                cute.copy(tma_atom_dh, bSG_sDh[None, dh_h.index], bSG_gDh[(None, i_v_tile, 0, i_t)])
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
                 dh_h.release()
