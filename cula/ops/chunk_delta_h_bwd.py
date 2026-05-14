@@ -696,6 +696,26 @@ class ChunkDeltaRuleBwdDHUSm90:
             rStates = (rState0, rState1, rState2, rState3)
         acc_qdo = update_thr_mma.make_fragment_C(state_shape)
         acc_wdv = update_thr_mma.make_fragment_C(state_shape)
+        if cutlass.const_expr(not self.transpose_state_layout):
+            dh_copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
+                utils.LayoutEnum.COL_MAJOR,
+                elem_ty_d=self.io_dtype,
+                elem_ty_acc=self.acc_dtype,
+            )
+            dh_copy_atom = cute.make_copy_atom(
+                cute.nvgpu.warp.StMatrix8x8x16bOp(
+                    utils.LayoutEnum.COL_MAJOR.is_m_major_c(),
+                    4,
+                ),
+                self.io_dtype,
+            )
+            tiled_copy_dh_atom = cute.make_tiled_copy_C_atom(dh_copy_atom, update_tiled_mma)
+            tiled_copy_dh_r2s = cute.make_tiled_copy_S(dh_copy_atom_r2s, tiled_copy_dh_atom)
+            thr_copy_dh_r2s = tiled_copy_dh_r2s.get_slice(local_tidx)
+            tRS_sDh = thr_copy_dh_r2s.partition_D(sDh)
+            rDh_shape = cute.shape(thr_copy_dh_r2s.partition_S(sDh))
+            tRS_rDh_layout = cute.make_layout(rDh_shape[:3])
+            tRS_rDh_out = cute.make_rmem_tensor_like(tRS_rDh_layout, self.io_dtype)
 
         # Initialize carried dh state in register blocks.
         if is_compute_warp:
@@ -883,15 +903,20 @@ class ChunkDeltaRuleBwdDHUSm90:
                         # QDO does not read rState, so publish the old reverse
                         # state to the dh store side path while QDO is in flight.
                         dh_h = store_dh_P.acquire_and_advance()
-                        for state_block in cutlass.range_constexpr(self.num_k_blocks):
-                            state = rStates[state_block]
-                            for ei in cutlass.range(cute.size(state), unroll_full=True):
-                                v_rel, k_rel = tUcState[ei]
-                                state_bf16 = state[ei].to(self.io_dtype)
-                                if cutlass.const_expr(self.transpose_state_layout):
-                                    sDh[k_rel, v_rel, dh_h.index] = state_bf16
-                                else:
-                                    sDh[v_rel, k_rel, dh_h.index] = state_bf16
+                        if cutlass.const_expr(self.transpose_state_layout):
+                            for state_block in cutlass.range_constexpr(self.num_k_blocks):
+                                state = rStates[state_block]
+                                for ei in cutlass.range(cute.size(state), unroll_full=True):
+                                    v_rel, k_rel = tUcState[ei]
+                                    sDh[k_rel, v_rel, dh_h.index] = state[ei].to(self.io_dtype)
+                        else:
+                            tRS_rState = tiled_copy_dh_r2s.retile(rState)
+                            tRS_rDh_out.store(tRS_rState.load().to(self.io_dtype))
+                            cute.copy(
+                                tiled_copy_dh_r2s,
+                                tRS_rDh_out,
+                                tRS_sDh[(None, None, None, dh_h.index)],
+                            )
                         cute.arch.fence_proxy("async.shared", space="cta")
                         dh_h.commit()
 
