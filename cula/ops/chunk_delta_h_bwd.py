@@ -750,32 +750,6 @@ class ChunkDeltaRuleBwdDHUSm90:
                 else:
                     g_last_exp = cute.exp(g_last, fastmath=self.use_fast_math)
 
-            # Publish the current reverse state as dh output. K@dH consumes the
-            # same register-carried state through the RMEM WGMMA path below.
-            if is_compute_warp:
-                dh_h = store_dh_P.acquire_and_advance()
-                for k_block in cutlass.range_constexpr(self.num_k_blocks):
-                    rState = rStates[k_block]
-                    for ei in cutlass.range(cute.size(rState), unroll_full=True):
-                        v_rel, k_rel = tUcState[ei]
-                        state_bf16 = rState[ei].to(self.io_dtype)
-                        if cutlass.const_expr(self.transpose_state_layout):
-                            sDh[k_rel, v_rel, dh_h.index] = state_bf16
-                        else:
-                            sDh[v_rel, k_rel, dh_h.index] = state_bf16
-                cute.arch.fence_proxy("async.shared", space="cta")
-                dh_h.commit()
-
-            if warp_idx == self.store_warp_id:
-                dh_h = store_dh_C.wait_and_advance()
-                if cutlass.const_expr(self.transpose_state_layout):
-                    cute.copy(tma_atom_dh, bSG_sDh[None, dh_h.index], bSG_gDh[(None, 0, i_v_tile, i_t)])
-                else:
-                    cute.copy(tma_atom_dh, bSG_sDh[None, dh_h.index], bSG_gDh[(None, i_v_tile, 0, i_t)])
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
-                dh_h.release()
-
             if warp_idx == self.load_warp_id and next_i_t >= 0:
                 k_h = load_k_P.acquire_and_advance()
                 cute.copy(tma_atom_k, bSG_gK[(None, next_i_t, 0)], bSG_sK[None, k_h.index], tma_bar_ptr=k_h.barrier)
@@ -808,7 +782,6 @@ class ChunkDeltaRuleBwdDHUSm90:
                 acc_dv.fill(0.0)
                 for k_block in cutlass.range_constexpr(self.num_k_blocks):
                     k_wait = load_k_C.wait_and_advance()
-                    cute.arch.barrier(barrier_id=2, number_of_threads=self.num_compute_threads)
                     rState_op = self.make_acc_into_op(rStates[k_block], tiled_mma.tv_layout_A, self.io_dtype)
                     cute.nvgpu.warpgroup.fence()
                     for kp in cutlass.range(cute.size(tKrB, mode=[2]), unroll_full=True):
@@ -906,6 +879,22 @@ class ChunkDeltaRuleBwdDHUSm90:
                         )
                     cute.nvgpu.warpgroup.commit_group()
 
+                    if cutlass.const_expr(k_block == 0):
+                        # QDO does not read rState, so publish the old reverse
+                        # state to the dh store side path while QDO is in flight.
+                        dh_h = store_dh_P.acquire_and_advance()
+                        for state_block in cutlass.range_constexpr(self.num_k_blocks):
+                            state = rStates[state_block]
+                            for ei in cutlass.range(cute.size(state), unroll_full=True):
+                                v_rel, k_rel = tUcState[ei]
+                                state_bf16 = state[ei].to(self.io_dtype)
+                                if cutlass.const_expr(self.transpose_state_layout):
+                                    sDh[k_rel, v_rel, dh_h.index] = state_bf16
+                                else:
+                                    sDh[v_rel, k_rel, dh_h.index] = state_bf16
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        dh_h.commit()
+
                     # QDO does not consume rState, so hide g/gk state decay under its WGMMA latency.
                     if cutlass.const_expr(self.use_g):
                         for ei in cutlass.range(cute.size(rState), unroll_full=True):
@@ -973,6 +962,15 @@ class ChunkDeltaRuleBwdDHUSm90:
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
                 dv2_done_h.commit()
                 dv2_store_h.release()
+
+                dh_h = store_dh_C.wait_and_advance()
+                if cutlass.const_expr(self.transpose_state_layout):
+                    cute.copy(tma_atom_dh, bSG_sDh[None, dh_h.index], bSG_gDh[(None, 0, i_v_tile, i_t)])
+                else:
+                    cute.copy(tma_atom_dh, bSG_sDh[None, dh_h.index], bSG_gDh[(None, i_v_tile, 0, i_t)])
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                dh_h.release()
 
         if cutlass.const_expr(self.use_dh0):
             if is_compute_warp:
