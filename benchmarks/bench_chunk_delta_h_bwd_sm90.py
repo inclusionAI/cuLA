@@ -15,7 +15,6 @@ allows:
 
 Usage:
   python benchmarks/bench_chunk_delta_h_bwd_sm90.py --mode both
-  python benchmarks/bench_chunk_delta_h_bwd_sm90.py --preset fwd --mode non-varlen
   python benchmarks/bench_chunk_delta_h_bwd_sm90.py --preset focused --mode non-varlen
 """
 
@@ -47,8 +46,8 @@ K, V, BT = 128, 128, 64
 dtype = torch.bfloat16
 device = "cuda"
 
-WARMUP = 5
-N_ITERS = 30
+WARMUP = 10
+N_ITERS = 100
 NCU_MODE = False
 
 
@@ -493,9 +492,9 @@ def main():
     parser.add_argument(
         "--preset",
         type=str,
-        default="representative",
+        default="fwd",
         choices=["representative", "fwd", "focused"],
-        help="representative runs a short subset; fwd mirrors bench_chunk_delta_h.py; focused runs the long non-varlen matrix",
+        help="fwd mirrors bench_chunk_delta_h.py; representative runs a short subset; focused runs the long non-varlen matrix",
     )
     parser.add_argument(
         "--feature-mode",

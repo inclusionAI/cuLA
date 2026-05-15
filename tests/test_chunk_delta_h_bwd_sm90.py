@@ -2,11 +2,10 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Representative correctness tests for the SM90 CuTe DSL WGMMA bwd_dhu path.
+"""Correctness tests for the SM90 CuTe DSL WGMMA bwd_dhu path.
 
-These cases follow the same logic as tests/test_chunk_delta_h.py but avoid the
-full Cartesian sweep during kernel iteration.  For bwd_dhu, fwd's
-initial_state/output_final_state pair maps to dht/dh0.
+These cases follow tests/test_chunk_delta_h.py where the backward API permits.
+For bwd_dhu, fwd's initial_state/output_final_state pair maps to dht/dh0.
 """
 
 import os
@@ -193,27 +192,29 @@ def _make_varlen_inputs(
     return q, k, w, do, dv, g, gk, dht, dh0, cu_seqlens
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
-        dict(B=1, T=64, H=1, K=128, V=128, use_gk=False, use_state=False),
-        dict(B=1, T=128, H=4, K=128, V=128, use_gk=True, use_state=False),
-        dict(B=2, T=256, H=4, K=128, V=128, use_gk=True, use_state=True),
-        dict(B=1, T=1024, H=64, K=128, V=128, use_gk=True, use_state=False),
-    ],
-    ids=["minimal", "multihead-gk", "batch-state", "long-h64"],
-)
-def test_dhu_against_fla(case):
-    B, T, H, K, V = case["B"], case["T"], case["H"], case["K"], case["V"]
-    use_gk, use_state = case["use_gk"], case["use_state"]
+@pytest.mark.parametrize("B", [1, 2])
+@pytest.mark.parametrize("H", [1, 4])
+@pytest.mark.parametrize("T", [64, 128, 256])
+@pytest.mark.parametrize("K", [128])
+@pytest.mark.parametrize("V", [128])
+@pytest.mark.parametrize("use_gk", [False, True])
+@pytest.mark.parametrize("use_state", [False, True])
+def test_dhu_against_fla(B, H, T, K, V, use_gk, use_state):
     q, k, w, do, dv, g, gk, dht, dh0 = _make_inputs(B, T, H, K, V, use_gk=use_gk, use_state=use_state)
     ref = run_fla_ref(q, k, w, do, dv, g=g, gk=gk, dht=dht, dh0=dh0)
     got = run_cute_dsl(q, k, w, do, dv, g=g, gk=gk, dht=dht, dh0=dh0)
     _assert_bwd_close(got, ref, use_state, f"B={B} H={H} T={T} gk={use_gk} state={use_state}")
 
 
-def test_dv2_no_gating():
-    B, T, H, K, V = 4, 512, 4, 128, 128
+@pytest.mark.parametrize(
+    "B,T,H,K,V",
+    [
+        (1, 64, 1, 128, 128),
+        (2, 128, 4, 128, 128),
+        (4, 512, 4, 128, 128),
+    ],
+)
+def test_dv2_no_gating(B, T, H, K, V):
     q, k, w, do, dv, g, gk, dht, dh0 = _make_inputs(B, T, H, K, V)
     ref = run_fla_ref(q, k, w, do, dv, g=g, gk=gk, dht=dht, dh0=dh0)
     got = run_cute_dsl(q, k, w, do, dv, g=g, gk=gk, dht=dht, dh0=dh0)
@@ -221,23 +222,19 @@ def test_dv2_no_gating():
 
 
 @pytest.mark.parametrize(
-    "case",
+    "seq_lens",
     [
-        dict(seq_lens=[50, 192, 100], H=2, use_g=False, use_gk=True, use_state=False),
-        dict(seq_lens=[33, 128, 200, 95], H=1, use_g=True, use_gk=False, use_state=True),
+        [128, 128],
+        [50, 192, 100],
+        [33, 128, 200, 95],
     ],
-    ids=["gk-dht", "g-dh0"],
 )
-def test_varlen_against_fla(case):
+@pytest.mark.parametrize("H", [1, 4])
+@pytest.mark.parametrize("use_gk", [False, True])
+@pytest.mark.parametrize("use_state", [False, True])
+def test_varlen_against_fla(seq_lens, H, use_gk, use_state):
     K, V = 128, 128
-    seq_lens = case["seq_lens"]
-    H = case["H"]
-    use_g = case["use_g"]
-    use_gk = case["use_gk"]
-    use_state = case["use_state"]
-    q, k, w, do, dv, g, gk, dht, dh0, cu_seqlens = _make_varlen_inputs(
-        seq_lens, H, K, V, use_g=use_g, use_gk=use_gk, use_state=use_state
-    )
+    q, k, w, do, dv, g, gk, dht, dh0, cu_seqlens = _make_varlen_inputs(seq_lens, H, K, V, use_gk=use_gk, use_state=use_state)
     ref = run_fla_ref(q, k, w, do, dv, g=g, gk=gk, dht=dht, dh0=dh0, cu_seqlens=cu_seqlens)
     got = run_cute_dsl(q, k, w, do, dv, g=g, gk=gk, dht=dht, dh0=dh0, cu_seqlens=cu_seqlens)
     _assert_bwd_close(got, ref, use_state, f"varlen seqs={seq_lens} H={H} gk={use_gk} state={use_state}")
