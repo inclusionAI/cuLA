@@ -21,8 +21,8 @@ from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu as fla_b
 from cula.ops.chunk_delta_h_bwd import chunk_gated_delta_rule_bwd_dhu_sm90
 
 BT = 64
-ATOL = 3e-2
-RTOL = 3e-2
+ATOL = 1e-2
+RTOL = 1e-2
 device = "cuda"
 
 
