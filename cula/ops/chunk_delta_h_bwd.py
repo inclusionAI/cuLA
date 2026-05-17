@@ -678,20 +678,22 @@ class ChunkDeltaRuleBwdDHUSm90:
 
         thr_mma = tiled_mma.get_slice(local_tidx)
         update_thr_mma = update_tiled_mma.get_slice(local_tidx)
-        qdo_thr_mma = qdo_tiled_mma.get_slice(local_tidx)
 
         tKsB = thr_mma.partition_B(sA)
         tKrB = thr_mma.make_fragment_B(tKsB)
         tUsA = update_thr_mma.partition_A(sUA)
-        tUsDo = update_thr_mma.partition_A(sDo)
         tUsB = update_thr_mma.partition_B(sUB)
         tWsB = update_thr_mma.partition_B(sW)
-        qdo_tUsB = qdo_thr_mma.partition_B(sUB)
         tUrA = update_thr_mma.make_fragment_A(tUsA)
-        tUrDo = update_thr_mma.make_fragment_A(tUsDo)
         tUrB = update_thr_mma.make_fragment_B(tUsB)
         tWrB = update_thr_mma.make_fragment_B(tWsB)
-        qdo_tUrB = qdo_thr_mma.make_fragment_B(qdo_tUsB)
+        if cutlass.const_expr(self.use_g):
+            qdo_thr_mma = qdo_tiled_mma.get_slice(local_tidx)
+            qdo_tUsB = qdo_thr_mma.partition_B(sUB)
+            qdo_tUrB = qdo_thr_mma.make_fragment_B(qdo_tUsB)
+        else:
+            tUsDo = update_thr_mma.partition_A(sDo)
+            tUrDo = update_thr_mma.make_fragment_A(tUsDo)
 
         cDV = cute.make_identity_tensor((BV, BT))
         tCcDV = thr_mma.partition_C(cDV)
@@ -921,8 +923,8 @@ class ChunkDeltaRuleBwdDHUSm90:
                         gk_wait = load_gk_C.wait_and_advance()
                     acc_qdo.fill(0.0)
                     cute.nvgpu.warpgroup.fence()
-                    for kp in cutlass.range(cute.size(tUrDo, mode=[2]), unroll_full=True):
-                        if cutlass.const_expr(self.use_g):
+                    if cutlass.const_expr(self.use_g):
+                        for kp in cutlass.range(cute.size(qdo_tUrB, mode=[2]), unroll_full=True):
                             qdo_tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
                             cute.gemm(
                                 qdo_tiled_mma,
@@ -931,7 +933,8 @@ class ChunkDeltaRuleBwdDHUSm90:
                                 qdo_tUrB[None, None, kp, q_wait.index],
                                 acc_qdo,
                             )
-                        else:
+                    else:
+                        for kp in cutlass.range(cute.size(tUrDo, mode=[2]), unroll_full=True):
                             update_tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
                             cute.gemm(
                                 update_tiled_mma,
