@@ -820,6 +820,19 @@ class ChunkDeltaRuleBwdDHUSm90:
             # dv2 = dv + K @ dh. Compute the equivalent (dh @ K^T) tile so the
             # register-carried state can feed WGMMA as an RMEM A operand.
             if is_compute_warp:
+                # Match chunk_delta_h.py's h_out overlap: publish the carried
+                # state to the store pipeline before the chunk GEMM chain.
+                dh_h = store_dh_P.acquire_and_advance()
+                tRS_rState = tiled_copy_dh_r2s.retile(rStates[0])
+                tRS_rDh_out.store(tRS_rState.load().to(self.io_dtype))
+                cute.copy(
+                    tiled_copy_dh_r2s,
+                    tRS_rDh_out,
+                    tRS_sDh[(None, None, None, dh_h.index)],
+                )
+                cute.arch.fence_proxy("async.shared", space="cta")
+                dh_h.commit()
+
                 acc_dv.fill(0.0)
                 for k_block in cutlass.range_constexpr(self.num_k_blocks):
                     k_wait = load_k_C.wait_and_advance()
@@ -945,18 +958,6 @@ class ChunkDeltaRuleBwdDHUSm90:
                             )
                     cute.nvgpu.warpgroup.commit_group()
 
-                    if cutlass.const_expr(k_block == 0):
-                        dh_h = store_dh_P.acquire_and_advance()
-                        tRS_rState = tiled_copy_dh_r2s.retile(rState)
-                        tRS_rDh_out.store(tRS_rState.load().to(self.io_dtype))
-                        cute.copy(
-                            tiled_copy_dh_r2s,
-                            tRS_rDh_out,
-                            tRS_sDh[(None, None, None, dh_h.index)],
-                        )
-                        cute.arch.fence_proxy("async.shared", space="cta")
-                        dh_h.commit()
-
                     # QDO does not consume rState, so hide g/gk state decay under its WGMMA latency.
                     if cutlass.const_expr(self.use_g):
                         for ei in cutlass.range(cute.size(rState), unroll_full=True):
@@ -1009,6 +1010,12 @@ class ChunkDeltaRuleBwdDHUSm90:
                 dv_wait.release()
 
             if warp_idx == self.store_warp_id:
+                dh_h = store_dh_C.wait_and_advance()
+                cute.copy(tma_atom_dh, bSG_sDh[None, dh_h.index], bSG_gDh[(None, i_v_tile, 0, i_t)])
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                dh_h.release()
+
                 dv2_store_h = store_dv2_C.wait_and_advance()
                 dv2_done_h = store_dv2_done_P.acquire_and_advance()
                 # One done token is committed per chunk. Tail chunks skip TMA
@@ -1025,12 +1032,6 @@ class ChunkDeltaRuleBwdDHUSm90:
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
                 dv2_done_h.commit()
                 dv2_store_h.release()
-
-                dh_h = store_dh_C.wait_and_advance()
-                cute.copy(tma_atom_dh, bSG_sDh[None, dh_h.index], bSG_gDh[(None, i_v_tile, 0, i_t)])
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
-                dh_h.release()
 
         if cutlass.const_expr(self.use_dh0):
             if is_compute_warp:
