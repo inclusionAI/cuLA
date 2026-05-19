@@ -180,7 +180,7 @@ struct KdaChunkFwdIntraKernelSm100 {
 
         // === MMA -> CudaCore pipelines (UMMA) ===
         typename PipelineQKDone::Params qk_done_pipe_params;
-        qk_done_pipe_params.producer_arv_count = NumMmaThreads;
+        qk_done_pipe_params.producer_arv_count = 1;
         qk_done_pipe_params.consumer_arv_count = NumCudaCoreThreads;
 
         if (role == WarpRole::Mma) {
@@ -214,10 +214,7 @@ struct KdaChunkFwdIntraKernelSm100 {
         PipelineQKGInterReady qkg_inter_pipeline(
             shared_plan->pipe_qkg_inter_storage, qkg_inter_pipe_params, ClusterShape{});
 
-        PipelineQKDone qk_done_pipeline(
-            shared_plan->pipe_qk_done_storage,
-            qk_done_pipe_params,
-            /*InitBarriers*/ cute::true_type{});
+        PipelineQKDone qk_done_pipeline(shared_plan->pipe_qk_done_storage, qk_done_pipe_params, ClusterShape{});
 
         PipelineKKInvReady kk_inv_pipeline(
             shared_plan->pipe_kk_inv_storage,

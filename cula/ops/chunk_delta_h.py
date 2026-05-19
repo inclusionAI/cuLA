@@ -37,6 +37,8 @@ from fla.utils import tensor_cache
 
 from cula.utils import USE_FAST_MATH, assert_blackwell
 
+COMPILE_OPTIONS = "--enable-tvm-ffi --generate-line-info --ptxas-options '--verbose'"
+
 
 # in FLA, cumsum returns int64 tensor by default
 @tensor_cache
@@ -151,9 +153,10 @@ class ChunkDeltaRuleFwdH:
             barrier_id=3,
             num_threads=self.threads_per_warp * len(self.cuda_warp_ids),  # 128
         )
-        # No CTA-wide barrier needed for WU scheduling:
-        # Load warp elect_one arrives on a lightweight mbarrier (count=1),
-        # other warps just wait on mbarrier phase (no arrive needed).
+        # WU scheduling uses full-thread mbarrier arrives (no elect_one) to guarantee
+        # all 32 lanes have completed their sWorkIdx read before the producer can overwrite it.
+        # sched_mbar: count=32 (all Load warp threads arrive).
+        # sched_consumed_mbar: count=32*7 (all threads of 7 consumer warps arrive).
         self.buffer_align_bytes = 1024
 
     @staticmethod
@@ -548,9 +551,9 @@ class ChunkDeltaRuleFwdH:
             ]
             # Double-buffered work index for dynamic scheduling
             sWorkIdx: cute.struct.MemRange[Int32, 2]
-            # Double-buffered scheduling mbarriers (count=1 each, Load warp elect_one arrives)
+            # Double-buffered scheduling mbarriers (count=32, all Load warp threads arrive)
             sched_mbar: cute.struct.MemRange[Int64, 2]
-            # Double-buffered consumed mbarriers (count=4, one arrive per consumer warp group)
+            # Double-buffered consumed mbarriers (count=32*7, all threads of 7 consumer warps arrive)
             sched_consumed_mbar: cute.struct.MemRange[Int64, 2]
 
         self.shared_storage = SharedStorage
@@ -747,14 +750,14 @@ class ChunkDeltaRuleFwdH:
         if cutlass.const_expr(self.is_varlen and self.persistent):
             sched_mbar_base = storage.sched_mbar.data_ptr()
             sched_consumed_mbar_base = storage.sched_consumed_mbar.data_ptr()
-            # Init 2 scheduling mbarriers with count=1: only Load warp elect_one arrives
-            # Init 2 consumed mbarriers with count=7: one arrive per non-load warp
-            # (MMA=1, CC=4, Store=1, Empty=1)
+            # Init 2 scheduling mbarriers with count=32: all 32 Load warp threads arrive.
+            # Init 2 consumed mbarriers with count=32*7: all 32 threads × 7 consumer warps arrive.
+            # (MMA=1, CC=4, Store=1, Empty=1; all full-thread arrives, no elect_one)
             if warp_idx == 0:
-                cute.arch.mbarrier_init(sched_mbar_base, 1)
-                cute.arch.mbarrier_init(sched_mbar_base + 1, 1)
-                cute.arch.mbarrier_init(sched_consumed_mbar_base, 7)
-                cute.arch.mbarrier_init(sched_consumed_mbar_base + 1, 7)
+                cute.arch.mbarrier_init(sched_mbar_base, 32)
+                cute.arch.mbarrier_init(sched_mbar_base + 1, 32)
+                cute.arch.mbarrier_init(sched_consumed_mbar_base, 32 * 7)
+                cute.arch.mbarrier_init(sched_consumed_mbar_base + 1, 32 * 7)
             cute.arch.mbarrier_init_fence()
             cute.arch.barrier(barrier_id=0, number_of_threads=self.threads_per_cta)
 
@@ -852,8 +855,12 @@ class ChunkDeltaRuleFwdH:
 
         # =========================================================================
         # DYNAMIC SCHEDULING: initial work_idx fetch (persistent varlen only)
-        # Load warp elect_one does atomicAdd → sWorkIdx[buf] → fence → arrive mbar[buf].
-        # Other warps wait on mbar[buf] at the correct phase, then read sWorkIdx[buf].
+        # Load warp: elect_one does atomicAdd → sWorkIdx[buf] → fence_acq_rel_cta;
+        #   then ALL 32 threads arrive on sched_mbar[buf] (count=32) so the arrive
+        #   is ordered after every lane's write, not just the elected lane's.
+        # Consumer warps: wait on sched_mbar[buf]; ALL 32 threads arrive on
+        #   sched_consumed_mbar[buf] (count=32*7) so the Load warp's back-pressure
+        #   wait is satisfied only after every consumer lane has read sWorkIdx.
         # Double-buffered to avoid phase racing.
         # =========================================================================
         if cutlass.const_expr(self.is_varlen and self.persistent):
@@ -862,14 +869,11 @@ class ChunkDeltaRuleFwdH:
                 with cute.arch.elect_one():
                     first_work_idx = _atomic_add_global_i32(workspace_iter.toint().ir_value(), Int32(1).ir_value())
                     sWorkIdx[(0,)] = first_work_idx
-                    cute.arch.fence_acq_rel_cta()
-                    cute.arch.mbarrier_arrive(sched_mbar_base)
+                cute.arch.fence_acq_rel_cta()
+                cute.arch.mbarrier_arrive(sched_mbar_base)
             else:
                 # All other warps: wait for Load warp's signal on mbar[0], phase=0
                 cute.arch.mbarrier_wait(sched_mbar_base, Int32(0))
-                # Signal consumed_mbar[0]: buf 0 has been consumed
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive(sched_consumed_mbar_base)
 
         # =========================================================================
         # LOAD WARP
@@ -1050,8 +1054,8 @@ class ChunkDeltaRuleFwdH:
                     with cute.arch.elect_one():
                         next_idx = _atomic_add_global_i32(workspace_iter.toint().ir_value(), Int32(1).ir_value())
                         sWorkIdx[(sched_buf,)] = next_idx
-                        cute.arch.fence_acq_rel_cta()
-                        cute.arch.mbarrier_arrive(sched_mbar_base + sched_buf)
+                    cute.arch.fence_acq_rel_cta()
+                    cute.arch.mbarrier_arrive(sched_mbar_base + sched_buf)
                     cute.arch.sync_warp()
                     work_idx = sWorkIdx[(sched_buf,)]
                     sched_buf = Int32(1) - sched_buf
@@ -1069,6 +1073,8 @@ class ChunkDeltaRuleFwdH:
             wu_iter = Int32(0)
             if cutlass.const_expr(self.is_varlen and self.persistent):
                 work_idx = sWorkIdx[(0,)]
+                # All 32 MMA warp threads arrive on consumed_mbar[0]: buf 0 has been read
+                cute.arch.mbarrier_arrive(sched_consumed_mbar_base)
                 sched_buf = Int32(1)  # next buffer to wait on
                 sched_phase0 = Int32(1)  # mbar[0]: init consumed phase=0, next=1
                 sched_phase1 = Int32(0)  # mbar[1]: not yet used, next=0
@@ -1149,9 +1155,8 @@ class ChunkDeltaRuleFwdH:
                         cute.arch.mbarrier_wait(sched_mbar_base + 1, sched_phase1)
                         sched_phase1 = Int32(1) - sched_phase1
                     work_idx = sWorkIdx[(sched_buf,)]
-                    # Signal consumed: Load warp can reuse this sched buffer
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(sched_consumed_mbar_base + sched_buf)
+                    # All 32 MMA warp threads arrive: Load warp can reuse this sched buffer
+                    cute.arch.mbarrier_arrive(sched_consumed_mbar_base + sched_buf)
                     sched_buf = Int32(1) - sched_buf
                     should_continue = work_idx < total_work_units
                 else:
@@ -1259,6 +1264,8 @@ class ChunkDeltaRuleFwdH:
             wu_iter = Int32(0)
             if cutlass.const_expr(self.is_varlen and self.persistent):
                 work_idx = sWorkIdx[(0,)]
+                # All 32 CC warp threads arrive on consumed_mbar[0]: buf 0 has been read
+                cute.arch.mbarrier_arrive(sched_consumed_mbar_base)
                 sched_buf = Int32(1)
                 sched_phase0 = Int32(1)
                 sched_phase1 = Int32(0)
@@ -1447,9 +1454,8 @@ class ChunkDeltaRuleFwdH:
                         cute.arch.mbarrier_wait(sched_mbar_base + 1, sched_phase1)
                         sched_phase1 = Int32(1) - sched_phase1
                     work_idx = sWorkIdx[(sched_buf,)]
-                    # Signal consumed: CC has 4 warps, elect_one per warp → 4 arrives
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(sched_consumed_mbar_base + sched_buf)
+                    # Signal consumed: all 32 threads × 4 CC warps → 128 arrives
+                    cute.arch.mbarrier_arrive(sched_consumed_mbar_base + sched_buf)
                     sched_buf = Int32(1) - sched_buf
                     should_continue = work_idx < total_work_units
                 else:
@@ -1472,6 +1478,8 @@ class ChunkDeltaRuleFwdH:
             wu_iter = Int32(0)
             if cutlass.const_expr(self.is_varlen and self.persistent):
                 work_idx = sWorkIdx[(0,)]
+                # All 32 Store warp threads arrive on consumed_mbar[0]: buf 0 has been read
+                cute.arch.mbarrier_arrive(sched_consumed_mbar_base)
                 sched_buf = Int32(1)
                 sched_phase0 = Int32(1)
                 sched_phase1 = Int32(0)
@@ -1631,9 +1639,8 @@ class ChunkDeltaRuleFwdH:
                         cute.arch.mbarrier_wait(sched_mbar_base + 1, sched_phase1)
                         sched_phase1 = Int32(1) - sched_phase1
                     work_idx = sWorkIdx[(sched_buf,)]
-                    # Signal consumed: Store warp → 1 arrive
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(sched_consumed_mbar_base + sched_buf)
+                    # Signal consumed: all 32 Store warp threads arrive
+                    cute.arch.mbarrier_arrive(sched_consumed_mbar_base + sched_buf)
                     sched_buf = Int32(1) - sched_buf
                     should_continue = work_idx < total_work_units
                 else:
@@ -1648,6 +1655,8 @@ class ChunkDeltaRuleFwdH:
             # Dynamic scheduling: wait on double-buffered mbarriers for each WU
             if cutlass.const_expr(self.is_varlen and self.persistent):
                 work_idx = sWorkIdx[(0,)]
+                # All 32 Empty warp threads arrive on consumed_mbar[0]: buf 0 has been read
+                cute.arch.mbarrier_arrive(sched_consumed_mbar_base)
                 sched_buf = Int32(1)
                 sched_phase0 = Int32(1)
                 sched_phase1 = Int32(0)
@@ -1659,9 +1668,8 @@ class ChunkDeltaRuleFwdH:
                         cute.arch.mbarrier_wait(sched_mbar_base + 1, sched_phase1)
                         sched_phase1 = Int32(1) - sched_phase1
                     work_idx = sWorkIdx[(sched_buf,)]
-                    # Signal consumed: Empty warp → 1 arrive
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(sched_consumed_mbar_base + sched_buf)
+                    # Signal consumed: all 32 Empty warp threads arrive
+                    cute.arch.mbarrier_arrive(sched_consumed_mbar_base + sched_buf)
                     sched_buf = Int32(1) - sched_buf
 
         tmem.relinquish_alloc_permit()
@@ -1958,7 +1966,7 @@ def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size, use_fas
         Int32(0),  # store_final_state
         Int32(0),  # save_v_new
         stream_fake,
-        options="--enable-tvm-ffi",
+        options=COMPILE_OPTIONS,
     )
     return compiled_fn
 

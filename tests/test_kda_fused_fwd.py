@@ -36,28 +36,34 @@ pytestmark = pytest.mark.sm90_only
         "B",
         "T",
         "H",
+        "HV",
         "D",
         "gate_logit_normalizer",
         "mask_p",
         "use_qk_l2norm_in_kernel",
         "use_gate_in_kernel",
         "safe_gate",
+        "use_initial_state",
         "dtype",
     ),
     [
         pytest.param(
             *test,
-            id="B{}-T{}-H{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-{}".format(*test),
+            id=("B{}-T{}-H{}-HV{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-init{}-{}").format(*test),
         )
         for test in [
-            (1, 63, 1, 128, 1, 0, False, False, True, torch.bfloat16),
-            (2, 500, 3, 128, 1, 0, False, False, True, torch.bfloat16),
-            (2, 1000, 3, 128, 1, 0.5, False, False, True, torch.bfloat16),
-            (3, 1024, 4, 128, 0.1, 0, False, False, True, torch.bfloat16),
-            (4, 1024, 4, 128, 1, 0, False, False, True, torch.bfloat16),
-            (4, 1024, 4, 128, 1, 0, True, False, True, torch.bfloat16),
-            (2, 1500, 4, 128, 10, 0, False, True, True, torch.bfloat16),
-            (4, 2048, 8, 128, 1, 0, False, True, True, torch.bfloat16),
+            (1, 63, 1, 1, 128, 1, 0, False, False, True, True, torch.bfloat16),
+            (2, 500, 3, 3, 128, 1, 0, False, False, True, True, torch.bfloat16),
+            (2, 1000, 3, 3, 128, 1, 0.5, False, False, True, True, torch.bfloat16),
+            (3, 1024, 4, 4, 128, 0.1, 0, False, False, True, True, torch.bfloat16),
+            (4, 1024, 4, 4, 128, 1, 0, False, False, True, True, torch.bfloat16),
+            (4, 1024, 4, 4, 128, 1, 0, True, False, True, True, torch.bfloat16),
+            (2, 1500, 4, 4, 128, 10, 0, False, True, True, True, torch.bfloat16),
+            (4, 2048, 8, 8, 128, 1, 0, False, True, True, True, torch.bfloat16),
+            (2, 512, 2, 4, 128, 1, 0, False, False, True, True, torch.bfloat16),
+            (2, 1024, 2, 8, 128, 1, 0, False, True, True, True, torch.bfloat16),
+            (1, 64, 1, 2, 128, 1, 0, False, False, True, True, torch.bfloat16),
+            (1, 65, 1, 4, 128, 1, 0, False, False, True, False, torch.bfloat16),
         ]
     ],
 )
@@ -65,12 +71,14 @@ def test_safe_gate_chunk(
     B: int,
     T: int,
     H: int,
+    HV: int,
     D: int,
     gate_logit_normalizer: float,
     mask_p: float,
     use_qk_l2norm_in_kernel: bool,
     use_gate_in_kernel: bool,
     safe_gate: bool,
+    use_initial_state: bool,
     dtype: torch.dtype,
     beta_dtype: torch.dtype,
 ):
@@ -81,11 +89,11 @@ def test_safe_gate_chunk(
     torch.manual_seed(42)
     q = torch.rand(B, T, H, D, dtype=dtype)
     k = torch.rand(B, T, H, D, dtype=dtype)
-    v = torch.rand(B, T, H, D, dtype=dtype)
-    g = torch.randn(B, T, H, D, dtype=torch.float if not use_gate_in_kernel else dtype)
+    v = torch.rand(B, T, HV, D, dtype=dtype)
+    g = torch.randn(B, T, HV, D, dtype=torch.float if not use_gate_in_kernel else dtype)
     if use_gate_in_kernel:
-        A_log = torch.randn(H, dtype=torch.float)
-        dt_bias = torch.randn(H * D, dtype=torch.float)
+        A_log = torch.randn(HV, dtype=torch.float)
+        dt_bias = torch.randn(HV * D, dtype=torch.float)
     else:
         g = F.logsigmoid(g) / gate_logit_normalizer
         g = g * (torch.rand_like(g) > mask_p)
@@ -98,33 +106,39 @@ def test_safe_gate_chunk(
         lower_bound = None
         naive_kda_gate_fn = naive_kda_gate
 
-    beta = torch.randn(B, T, H, dtype=torch.float32).sigmoid().to(beta_dtype)
-    h0 = torch.randn(B, H, D, D, dtype=torch.float32)
+    beta = torch.randn(B, T, HV, dtype=torch.float32).sigmoid().to(beta_dtype)
+    h0 = torch.randn(B, HV, D, D, dtype=torch.float32)
     # NOTE: for inference scenarios, we only use transposed state layout for better decoding performance
     h0_vk = h0.transpose(-1, -2).contiguous()
     if use_gate_in_kernel:
         A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(False), (A_log, dt_bias))
     q, k, v, g, beta, h0, h0_vk = map(lambda x: x.to(device).requires_grad_(False), (q, k, v, g, beta, h0, h0_vk))
+    initial_state = h0.clone() if use_initial_state else None
+    initial_state_vk = h0_vk.clone() if use_initial_state else None
+
+    heads_per_group = HV // H
+    q_ref = q.repeat_interleave(heads_per_group, dim=2)
+    k_ref = k.repeat_interleave(heads_per_group, dim=2)
 
     ref, ref_ht = naive_recurrent_kda(
-        q=F.normalize(q.clone(), p=2, dim=-1),
-        k=F.normalize(k.clone(), p=2, dim=-1),
+        q=F.normalize(q_ref.clone(), p=2, dim=-1),
+        k=F.normalize(k_ref.clone(), p=2, dim=-1),
         v=v.clone(),
         g=(naive_kda_gate_fn(g, A_log, dt_bias) if use_gate_in_kernel else g.clone()),
         beta=beta.clone(),
-        initial_state=h0.clone(),
+        initial_state=initial_state,
         output_final_state=True,
     )
 
     ref_fla, ref_ht_fla = fla_chunk_kda(
-        q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
-        k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),
+        q=F.normalize(q_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q_ref.clone(),
+        k=F.normalize(k_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k_ref.clone(),
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),
         A_log=(A_log.clone() if use_gate_in_kernel else None),
         dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-        initial_state=h0.clone(),
+        initial_state=initial_state,
         output_final_state=True,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_gate_in_kernel=use_gate_in_kernel,
@@ -133,14 +147,14 @@ def test_safe_gate_chunk(
     )
 
     ref_fla_trans, ref_ht_fla_trans = fla_chunk_kda(
-        q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
-        k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),
+        q=F.normalize(q_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q_ref.clone(),
+        k=F.normalize(k_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k_ref.clone(),
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),
         A_log=(A_log.clone() if use_gate_in_kernel else None),
         dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-        initial_state=h0_vk.clone(),
+        initial_state=initial_state_vk,
         output_final_state=True,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_gate_in_kernel=use_gate_in_kernel,
@@ -157,7 +171,7 @@ def test_safe_gate_chunk(
         beta=beta.clone(),
         A_log=(A_log.clone() if use_gate_in_kernel else None),
         dt_bias=(dt_bias.clone() if use_gate_in_kernel else None),
-        initial_state=h0_vk.clone(),
+        initial_state=initial_state_vk,
         output_final_state=True,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_gate_in_kernel=use_gate_in_kernel,
@@ -166,55 +180,117 @@ def test_safe_gate_chunk(
     )
 
     assert_close("o", ref, tri, 0.005)
-    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
     assert_close("o", ref_fla, tri, 0.005)
-    assert_close("ht", ref_ht_fla, tri_ht.transpose(-1, -2), 0.005)
     assert_close("o", ref_fla_trans, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
+    assert_close("ht", ref_ht_fla, tri_ht.transpose(-1, -2), 0.005)
     assert_close("ht", ref_ht_fla_trans, tri_ht, 0.005)
+
+
+def test_safe_gate_chunk_no_final_state():
+    cula_kda_fused_fwd = get_kda_fused_fwd(device)
+
+    B, T, H, D = 1, 63, 1, 128
+    dtype = torch.bfloat16
+
+    torch.manual_seed(42)
+    q = torch.rand(B, T, H, D, dtype=dtype, device=device)
+    k = torch.rand(B, T, H, D, dtype=dtype, device=device)
+    v = torch.rand(B, T, H, D, dtype=dtype, device=device)
+    g = F.logsigmoid(torch.randn(B, T, H, D, dtype=torch.float32, device=device)).clamp(-5, 0)
+    beta = torch.randn(B, T, H, dtype=torch.float32, device=device).sigmoid()
+    h0 = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+    h0_vk = h0.transpose(-1, -2).contiguous()
+
+    q = F.normalize(q, p=2, dim=-1)
+    k = F.normalize(k, p=2, dim=-1)
+
+    tri_no_state, tri_ht_no_state = cula_kda_fused_fwd(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        initial_state=h0_vk.clone(),
+        output_final_state=False,
+        safe_gate=True,
+        lower_bound=-5.0,
+    )
+
+    tri_with_state, tri_ht_with_state = cula_kda_fused_fwd(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        initial_state=h0_vk.clone(),
+        output_final_state=True,
+        safe_gate=True,
+        lower_bound=-5.0,
+    )
+
+    assert tri_ht_no_state is None
+    assert tri_ht_with_state is not None
+    assert_close("o", tri_with_state, tri_no_state, 0.005)
 
 
 @pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
 @pytest.mark.parametrize(
-    ("H", "D", "mask_p", "cu_seqlens", "dtype", "safe_gate"),
+    ("H", "HV", "D", "mask_p", "cu_seqlens", "dtype", "safe_gate", "use_initial_state"),
     [
-        pytest.param(*test, id="H{}-D{}-mask_p{}-cu_seqlens{}-{}-safe_gate{}".format(*test))
+        pytest.param(
+            *test,
+            id="H{}-HV{}-D{}-mask_p{}-cu_seqlens{}-{}-safe_gate{}-init{}".format(*test),
+        )
         for test in [
-            (4, 128, 0.1, [0, 15], torch.bfloat16, True),
-            (4, 128, 0.9, [0, 256, 500, 1000], torch.bfloat16, True),
-            (4, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True),
-            (4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16, True),
-            (4, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True),
+            (4, 4, 128, 0.1, [0, 15], torch.bfloat16, True, True),
+            (4, 4, 128, 0.9, [0, 256, 500, 1000], torch.bfloat16, True, True),
+            (4, 4, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True, True),
+            (4, 4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16, True, True),
+            (4, 4, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True, True),
+            (2, 4, 128, 0, [0, 63, 130], torch.bfloat16, True, True),
+            (1, 2, 128, 0, [0, 1], torch.bfloat16, True, True),
+            (1, 2, 128, 0, [0, 63, 64, 65], torch.bfloat16, True, True),
+            (2, 4, 128, 0, [0, 17, 64, 65, 130], torch.bfloat16, True, False),
             # ======Varlen test with simulated trace=======
             (
+                32,
                 32,
                 128,
                 0,
                 [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192],
                 torch.bfloat16,
                 True,
+                True,
             ),
             (
+                32,
                 32,
                 128,
                 0,
                 [0, 652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236, 5543, 6255, 6480, 6947, 7616, 8192],
                 torch.bfloat16,
                 True,
+                True,
             ),
             (
+                32,
                 32,
                 128,
                 0,
                 [0, 315, 973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459, 6318, 6669, 6979, 7583, 8192],
                 torch.bfloat16,
                 True,
+                True,
             ),
             (
+                32,
                 32,
                 128,
                 0,
                 [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
                 torch.bfloat16,
+                True,
                 True,
             ),
         ]
@@ -222,11 +298,13 @@ def test_safe_gate_chunk(
 )
 def test_safe_gate_chunk_varlen(
     H: int,
+    HV: int,
     D: int,
     mask_p: float,
     cu_seqlens: list[int],
     dtype: torch.dtype,
     safe_gate: bool,
+    use_initial_state: bool,
     beta_dtype: torch.dtype,
 ):
     cula_kda_fused_fwd = get_kda_fused_fwd(device)
@@ -239,19 +317,24 @@ def test_safe_gate_chunk_varlen(
 
     q = torch.randn((1, T, H, D), dtype=dtype)
     k = F.normalize(torch.randn(1, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
-    v = torch.randn((1, T, H, D), dtype=dtype)
-    g = F.logsigmoid(torch.randn(1, T, H, D, dtype=torch.float))
+    v = torch.randn((1, T, HV, D), dtype=dtype)
+    g = F.logsigmoid(torch.randn(1, T, HV, D, dtype=torch.float))
     mask = torch.rand_like(g) > mask_p
     g = g * mask + (~mask) * (-1000)
     if safe_gate:
         g = g.clamp(-5, 0)
 
-    beta = torch.randn(1, T, H, dtype=torch.float32).sigmoid().to(beta_dtype)
-    h0 = torch.randn((N, H, D, D), dtype=torch.float32)
+    beta = torch.randn(1, T, HV, dtype=torch.float32).sigmoid().to(beta_dtype)
+    h0 = torch.randn((N, HV, D, D), dtype=torch.float32)
     # NOTE: for inference scenarios, we only use transposed state layout for better decoding performance
     h0_vk = h0.transpose(-1, -2).contiguous()
 
     q, k, v, g, beta, h0, h0_vk = map(lambda x: x.to(device).requires_grad_(False), (q, k, v, g, beta, h0, h0_vk))
+    initial_state = h0.clone() if use_initial_state else None
+    initial_state_vk = h0_vk.clone() if use_initial_state else None
+    heads_per_group = HV // H
+    q_ref = q.repeat_interleave(heads_per_group, dim=2)
+    k_ref = k.repeat_interleave(heads_per_group, dim=2)
 
     tri, tri_ht = cula_kda_fused_fwd(
         q=F.normalize(q.clone(), p=2, dim=-1),
@@ -259,7 +342,7 @@ def test_safe_gate_chunk_varlen(
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),
-        initial_state=h0_vk.clone(),
+        initial_state=initial_state_vk,
         output_final_state=True,
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
@@ -268,12 +351,12 @@ def test_safe_gate_chunk_varlen(
     )
 
     ref_fla, ref_ht_fla = fla_chunk_kda(
-        q=F.normalize(q.clone(), p=2, dim=-1),
-        k=k.clone(),
+        q=F.normalize(q_ref.clone(), p=2, dim=-1),
+        k=k_ref.clone(),
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),
-        initial_state=h0.clone(),
+        initial_state=initial_state,
         output_final_state=True,
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
@@ -282,12 +365,12 @@ def test_safe_gate_chunk_varlen(
     )
 
     ref_fla_trans, ref_ht_fla_trans = fla_chunk_kda(
-        q=F.normalize(q.clone(), p=2, dim=-1),
-        k=k.clone(),
+        q=F.normalize(q_ref.clone(), p=2, dim=-1),
+        k=k_ref.clone(),
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),
-        initial_state=h0_vk.clone(),
+        initial_state=initial_state_vk,
         output_final_state=True,
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
@@ -300,12 +383,12 @@ def test_safe_gate_chunk_varlen(
     ref_ht = []
     for i in range(N):
         ref_i, ref_ht_i = naive_recurrent_kda(
-            q=F.normalize(q[:, cu_seqlens[i] : cu_seqlens[i + 1]], p=2, dim=-1),
-            k=k[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            q=F.normalize(q_ref[:, cu_seqlens[i] : cu_seqlens[i + 1]], p=2, dim=-1),
+            k=k_ref[:, cu_seqlens[i] : cu_seqlens[i + 1]],
             v=v[:, cu_seqlens[i] : cu_seqlens[i + 1]],
             beta=beta[:, cu_seqlens[i] : cu_seqlens[i + 1]],
             g=g[:, cu_seqlens[i] : cu_seqlens[i + 1]],
-            initial_state=h0[i],
+            initial_state=h0[i] if use_initial_state else None,
             output_final_state=True,
         )
         ref.append(ref_i)
@@ -314,8 +397,8 @@ def test_safe_gate_chunk_varlen(
     ref_ht = torch.cat(ref_ht, 0)
 
     assert_close("o", ref, tri, 0.005)
-    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
     assert_close("o", ref_fla, tri, 0.005)
-    assert_close("ht", ref_ht_fla, tri_ht.transpose(-1, -2), 0.005)
     assert_close("o", ref_fla_trans, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
+    assert_close("ht", ref_ht_fla, tri_ht.transpose(-1, -2), 0.005)
     assert_close("ht", ref_ht_fla_trans, tri_ht, 0.005)

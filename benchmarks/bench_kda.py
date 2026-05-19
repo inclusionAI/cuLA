@@ -66,6 +66,12 @@ DISABLE_RECOMPUTE = False  # Whether to disable recompute (compute QG in forward
 # ============================================================
 # Helpers
 # ============================================================
+def generate_balanced_seqlens(total_tokens, num_seqs):
+    base = total_tokens // num_seqs
+    remainder = total_tokens % num_seqs
+    return [base] * (num_seqs - 1) + [base + remainder]
+
+
 def time_kernel(fn, warmup=None, n_iters=None):
     if warmup is None:
         warmup = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
@@ -116,6 +122,44 @@ def run_kda(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, low
         lower_bound=lower_bound,
         disable_recompute=DISABLE_RECOMPUTE,
     )
+
+
+def check_determinism(H=4, total_T=8192, num_seqs=10, iters=10000):
+    """Run the kernel multiple times and check that outputs are identical."""
+    device = torch.device("cuda")
+    D = 128
+    seq_lens = generate_balanced_seqlens(total_T, num_seqs)
+    cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
+
+    inputs = prepare_safe_gate_inputs(1, total_T, H, D, device, cu_seqlens=cu_seqlens)
+    q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
+    A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
+    scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
+
+    common = dict(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        init_state=init_state,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+    )
+
+    ref_out, ref_state = run_kda(**common, fn=cula_chunk_kda)
+
+    for i in range(iters):
+        out, state = run_kda(**common, fn=cula_chunk_kda)
+        assert torch.isnan(out).sum() == 0, f"Output contains NaNs at iter {i}"
+        assert torch.isnan(state).sum() == 0, f"State contains NaNs at iter {i}"
+        assert torch.isfinite(out).all(), f"Output contains infs at iter {i}"
+        assert torch.isfinite(state).all(), f"State contains infs at iter {i}"
+        assert torch.equal(out, ref_out), f"Output mismatch at iter {i}"
+        assert torch.equal(state, ref_state), f"State mismatch at iter {i}"
 
 
 # ============================================================
@@ -379,6 +423,9 @@ def main():
     )
 
     fixed_res, varlen_res = [], []
+
+    if not (args.ncu or args.sanitizer):
+        check_determinism(H=H, iters=10000)
 
     if args.mode in ("fixed", "both"):
         fixed_res = bench_fixed(fixed_configs)

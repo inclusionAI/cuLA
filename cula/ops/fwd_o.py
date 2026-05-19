@@ -87,6 +87,8 @@ PRINT_SMEM_DEBUG = False  # Print SMEM contents after TMA loads for non-aligned 
 LN2 = 0.6931471805599453
 RCP_LN2 = 1.4426950408889634
 
+COMPILE_OPTIONS = "--enable-tvm-ffi --generate-line-info --ptxas-options '--verbose'"
+
 
 def make_thread_cooperative_group(size: int):
     return pipeline.CooperativeGroup(pipeline.Agent.Thread, size)
@@ -1721,7 +1723,7 @@ def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size, us
         (Int32(1), Int32(1), Int32(H), Int32(K), Int32(V)),
         Int32(1),
         stream_fake,
-        options="--enable-tvm-ffi",
+        options=COMPILE_OPTIONS,
     )
     return compiled_fn
 

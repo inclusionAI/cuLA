@@ -51,7 +51,7 @@ ChunkKDAFwdRecompWU(
 #endif
 
 #if defined(CULA_SM90A_ENABLED)
-std::tuple<torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, std::optional<torch::Tensor>>
 kda_fwd_prefill(
     std::optional<torch::Tensor> output_,
     std::optional<torch::Tensor> output_state_,
@@ -64,6 +64,7 @@ kda_fwd_prefill(
     torch::Tensor const& cu_seqlens,
     torch::Tensor workspace_buffer,
     float scale,
+    bool output_final_state,
     bool safe_gate);
 #endif
 

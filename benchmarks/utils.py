@@ -256,25 +256,46 @@ def build_varlen_configs(
 
 
 def prepare_safe_gate_inputs(
-    batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED, has_init_state=False
+    batch_size,
+    T,
+    H,
+    D,
+    device,
+    cu_seqlens=None,
+    chunk_size=CHUNK_SIZE,
+    seed=SEED,
+    has_init_state=False,
+    num_v_heads=None,
 ):
     """Prepare inputs for safe_gate benchmarks (use_gate_in_kernel=True, safe_gate=True).
 
     All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
     """
+    HV = H if num_v_heads is None else num_v_heads
+    assert HV >= H and HV % H == 0, f"HV ({HV}) must be a positive multiple of H ({H}) with HV >= H."
+
     dtype = torch.bfloat16
     scale = D ** (-0.5)
 
     set_seed(seed)
 
+    # Allocate native GVA shapes:
     q = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
     k = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    v = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    g = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    beta = torch.randn(batch_size, T, H, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
+    v = torch.randn(batch_size, T, HV, D, dtype=dtype, device=device).requires_grad_(False)
+    g = torch.randn(batch_size, T, HV, D, dtype=dtype, device=device).requires_grad_(False)
+    beta = torch.randn(batch_size, T, HV, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
 
-    A_log = torch.randn(H, dtype=torch.float, device=device).requires_grad_(False)
-    dt_bias = torch.randn(H * D, dtype=torch.float, device=device).requires_grad_(False)
+    # GVA expansion: bring q/k up to HV heads so all tensors share head dim.
+    group = HV // H
+    if group > 1:
+        q = q.repeat_interleave(group, dim=2).contiguous()
+        k = k.repeat_interleave(group, dim=2).contiguous()
+
+    # A_log / dt_bias must match the head count of `g` (HV), otherwise
+    # kda_gate_chunk_cumsum would index out of bounds for i_h >= H.
+    A_log = torch.randn(HV, dtype=torch.float, device=device).requires_grad_(False)
+    dt_bias = torch.randn(HV * D, dtype=torch.float, device=device).requires_grad_(False)
 
     # flatten to batch_size=1 for cu_seqlens compatibility
     if batch_size != 1:
@@ -285,7 +306,7 @@ def prepare_safe_gate_inputs(
     init_state = None
     if has_init_state:
         num_seqs = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else batch_size
-        init_state = torch.randn(num_seqs, H, D, D, dtype=torch.float, device=device).requires_grad_(False)
+        init_state = torch.randn(num_seqs, HV, D, D, dtype=torch.float, device=device).requires_grad_(False)
 
     return dict(
         q=q,
