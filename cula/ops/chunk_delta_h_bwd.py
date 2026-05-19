@@ -61,10 +61,6 @@ def make_thread_cooperative_group(size: int):
 class ChunkDeltaRuleBwdDHUSm90:
     def __init__(
         self,
-        batch_size: int,
-        seq_len: int,
-        num_sequences: int,
-        total_chunks: int,
         num_heads: int,
         head_dim_k: int,
         head_dim_v: int,
@@ -81,10 +77,6 @@ class ChunkDeltaRuleBwdDHUSm90:
         assert head_dim_k == 128 and head_dim_v == 128, (
             f"SM90 bwd_dhu currently aligns with ChunkDeltaRuleFwdH and requires K=V=128, got K={head_dim_k}, V={head_dim_v}"
         )
-        self.B = batch_size
-        self.T = seq_len
-        self.N = num_sequences
-        self.NT = total_chunks
         self.H = num_heads
         self.K = head_dim_k
         self.V = head_dim_v
@@ -148,6 +140,7 @@ class ChunkDeltaRuleBwdDHUSm90:
         dv2_in: cute.Tensor,
         cu_seqlens_in: cute.Tensor,
         chunk_offsets_in: cute.Tensor,
+        problem_size: tuple[Int32, Int32, Int32, Int32],
         stream: cuda.CUstream,
     ):
         q_ptr = q_in.iterator
@@ -164,27 +157,27 @@ class ChunkDeltaRuleBwdDHUSm90:
         cu_seqlens_ptr = cu_seqlens_in.iterator
         chunk_offsets_ptr = chunk_offsets_in.iterator
 
-        NT_total = self.NT
+        B, T, N, NT_total = problem_size
 
         # ===================== GMEM layouts =====================
         g_layout = cute.make_layout(
-            (self.B, self.T, self.H),
-            stride=(self.T * self.H, self.H, 1),
+            (B, T, self.H),
+            stride=(T * self.H, self.H, 1),
         )
         g = cute.make_tensor(g_ptr, g_layout)
 
-        cu_seqlens = cute.make_tensor(cu_seqlens_ptr, cute.make_layout((self.N + 1,)))
-        chunk_offsets = cute.make_tensor(chunk_offsets_ptr, cute.make_layout((self.N + 1,)))
+        cu_seqlens = cute.make_tensor(cu_seqlens_ptr, cute.make_layout((N + 1,)))
+        chunk_offsets = cute.make_tensor(chunk_offsets_ptr, cute.make_layout((N + 1,)))
 
         # dh TMA store view: (V, K) tile with layout selected by the requested state layout.
         if cutlass.const_expr(self.transpose_state_layout):
             dh_tma_layout = cute.make_layout(
-                (self.V, self.K, (NT_total, self.H, self.B)),
+                (self.V, self.K, (NT_total, self.H, B)),
                 stride=(self.K, 1, (self.H * self.K * self.V, self.K * self.V, NT_total * self.H * self.K * self.V)),
             )
         else:
             dh_tma_layout = cute.make_layout(
-                (self.V, self.K, (NT_total, self.H, self.B)),
+                (self.V, self.K, (NT_total, self.H, B)),
                 stride=(1, self.V, (self.H * self.K * self.V, self.K * self.V, NT_total * self.H * self.K * self.V)),
             )
         dh_tma_tile = (self.BV, self.BK)
@@ -195,39 +188,33 @@ class ChunkDeltaRuleBwdDHUSm90:
 
         if cutlass.const_expr(self.transpose_state_layout):
             final_layout = cute.make_layout(
-                (self.N, self.H, self.V, self.K),
+                (N, self.H, self.V, self.K),
                 stride=(self.H * self.K * self.V, self.K * self.V, self.K, 1),
             )
         else:
             final_layout = cute.make_layout(
-                (self.N, self.H, self.K, self.V),
+                (N, self.H, self.K, self.V),
                 stride=(self.H * self.K * self.V, self.K * self.V, self.V, 1),
             )
         dht = cute.make_tensor(dht_ptr, final_layout)
         dh0 = cute.make_tensor(dh0_ptr, final_layout)
 
         # TMA operand views. Varlen shifts the T dimension with domain_offset below.
-        tk_layout = cute.make_layout(
-            (self.T, self.K, (self.H, self.B)), stride=(self.H * self.K, 1, (self.K, self.T * self.H * self.K))
-        )
+        tk_layout = cute.make_layout((T, self.K, (self.H, B)), stride=(self.H * self.K, 1, (self.K, T * self.H * self.K)))
         k_tk = cute.make_tensor(k_ptr, tk_layout)
 
-        kt_layout = cute.make_layout(
-            (self.K, self.T, (self.H, self.B)), stride=(1, self.H * self.K, (self.K, self.T * self.H * self.K))
-        )
+        kt_layout = cute.make_layout((self.K, T, (self.H, B)), stride=(1, self.H * self.K, (self.K, T * self.H * self.K)))
         q_kt = cute.make_tensor(q_ptr, kt_layout)
         w_kt = cute.make_tensor(w_ptr, kt_layout)
         gk_kt = cute.make_tensor(gk_ptr, kt_layout)
 
-        vt_layout = cute.make_layout(
-            (self.V, self.T, (self.H, self.B)), stride=(1, self.H * self.V, (self.V, self.T * self.H * self.V))
-        )
+        vt_layout = cute.make_layout((self.V, T, (self.H, B)), stride=(1, self.H * self.V, (self.V, T * self.H * self.V)))
         do_vt = cute.make_tensor(do_ptr, vt_layout)
         dv_vt = cute.make_tensor(dv_ptr, vt_layout)
         dv2_vt = cute.make_tensor(dv2_ptr, vt_layout)
         dv2_layout = cute.make_layout(
-            (self.B, self.T, self.H, self.V),
-            stride=(self.T * self.H * self.V, self.H * self.V, self.V, 1),
+            (B, T, self.H, self.V),
+            stride=(T * self.H * self.V, self.H * self.V, self.V, 1),
         )
         dv2 = cute.make_tensor(dv2_ptr, dv2_layout)
 
@@ -426,6 +413,7 @@ class ChunkDeltaRuleBwdDHUSm90:
             dv2,
             cu_seqlens,
             chunk_offsets,
+            problem_size,
             tiled_mma,
             update_tiled_mma,
             qdo_tiled_mma,
@@ -453,7 +441,7 @@ class ChunkDeltaRuleBwdDHUSm90:
             tma_atom_dv2,
             tma_tensor_dv2,
         ).launch(
-            grid=[cute.ceil_div(self.V, self.BV), self.N * self.H, 1],
+            grid=[cute.ceil_div(self.V, self.BV), N * self.H, 1],
             block=[self.num_threads, 1, 1],
             cluster=self.cluster_shape_mnk,
             stream=stream,
@@ -469,6 +457,7 @@ class ChunkDeltaRuleBwdDHUSm90:
         dv2: cute.Tensor,
         cu_seqlens: cute.Tensor,
         chunk_offsets: cute.Tensor,
+        problem_size: tuple[Int32, Int32, Int32, Int32],
         tiled_mma: cute.TiledMma,
         update_tiled_mma: cute.TiledMma,
         qdo_tiled_mma: cute.TiledMma,
@@ -498,6 +487,7 @@ class ChunkDeltaRuleBwdDHUSm90:
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
+        B, T, N, NT_total = problem_size
 
         # ===================== Block indices =====================
         v_tile_idx, bh_idx, _ = cute.arch.block_idx()
@@ -505,8 +495,8 @@ class ChunkDeltaRuleBwdDHUSm90:
         hidx = bh_idx - bidx * self.H
         data_bidx = bidx
         tok_offset = Int32(0)
-        seq_len = self.T
-        NT = (self.T + self.BT - 1) // self.BT
+        seq_len = T
+        NT = (T + self.BT - 1) // self.BT
         chunk_off = Int32(0)
         if cutlass.const_expr(self.is_varlen):
             data_bidx = Int32(0)
@@ -1114,10 +1104,6 @@ class ChunkDeltaRuleBwdDHUSm90:
 
 @functools.lru_cache(maxsize=64)
 def _compile_bwd_dhu_sm90(
-    B: int,
-    T: int,
-    N: int,
-    NT: int,
     H: int,
     K: int,
     V: int,
@@ -1130,11 +1116,12 @@ def _compile_bwd_dhu_sm90(
     transpose_state_layout: bool,
     scale: float,
 ):
+    """Compile one bwd_dhu kernel variant.
+
+    B, T, N, and NT are symbolic during compilation and are passed as runtime
+    problem_size values, matching the forward kernel's dynamic-shape pattern.
+    """
     kernel = ChunkDeltaRuleBwdDHUSm90(
-        batch_size=B,
-        seq_len=T,
-        num_sequences=N,
-        total_chunks=NT,
         num_heads=H,
         head_dim_k=K,
         head_dim_v=V,
@@ -1149,94 +1136,100 @@ def _compile_bwd_dhu_sm90(
         use_fast_math=USE_FAST_MATH,
     )
 
+    sym_b = cute.sym_int()
+    sym_t = cute.sym_int()
+    sym_n = cute.sym_int()
+    sym_nt = cute.sym_int()
+    sym_meta = cute.sym_int()
+
     q_fake = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (B, T, H, K),
+        (sym_b, sym_t, H, K),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     k_fake = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (B, T, H, K),
+        (sym_b, sym_t, H, K),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     w_fake = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (B, T, H, K),
+        (sym_b, sym_t, H, K),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     do_fake = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (B, T, H, V),
+        (sym_b, sym_t, H, V),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     dv_fake = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (B, T, H, V),
+        (sym_b, sym_t, H, V),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     dv2_fake = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (B, T, H, V),
+        (sym_b, sym_t, H, V),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     g_fake = make_fake_compact_tensor(
         cutlass.Float32,
-        (B, T, H),
+        (sym_b, sym_t, H),
         stride_order=(2, 1, 0),
         assumed_align=128,
     )
     gk_fake = make_fake_compact_tensor(
         cutlass.Float32,
-        (B, T, H, K),
+        (sym_b, sym_t, H, K),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     if transpose_state_layout:
         dht_fake = make_fake_compact_tensor(
             cutlass.Float32,
-            (N, H, V, K),
+            (sym_n, H, V, K),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
         dh0_fake = make_fake_compact_tensor(
             cutlass.Float32,
-            (N, H, V, K),
+            (sym_n, H, V, K),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
         dh_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (B, NT, H, V, K),
+            (sym_b, sym_nt, H, V, K),
             stride_order=(4, 3, 2, 1, 0),
             assumed_align=128,
         )
     else:
         dht_fake = make_fake_compact_tensor(
             cutlass.Float32,
-            (N, H, K, V),
+            (sym_n, H, K, V),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
         dh0_fake = make_fake_compact_tensor(
             cutlass.Float32,
-            (N, H, K, V),
+            (sym_n, H, K, V),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
         dh_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (B, NT, H, K, V),
+            (sym_b, sym_nt, H, K, V),
             stride_order=(4, 3, 2, 1, 0),
             assumed_align=128,
         )
-    cu_fake = make_fake_compact_tensor(cutlass.Int32, (N + 1,), assumed_align=128)
-    offsets_fake = make_fake_compact_tensor(cutlass.Int32, (N + 1,), assumed_align=128)
+    cu_fake = make_fake_compact_tensor(cutlass.Int32, (sym_meta,), assumed_align=128)
+    offsets_fake = make_fake_compact_tensor(cutlass.Int32, (sym_meta,), assumed_align=128)
     stream_fake = make_fake_stream(use_tvm_ffi_env_stream=True)
 
     return cute.compile(
@@ -1254,6 +1247,7 @@ def _compile_bwd_dhu_sm90(
         dv2_fake,
         cu_fake,
         offsets_fake,
+        (Int32(1), Int32(1), Int32(1), Int32(1)),
         stream_fake,
         options="--enable-tvm-ffi",
     )
@@ -1348,10 +1342,6 @@ def chunk_gated_delta_rule_bwd_dhu_sm90(
         raise ValueError(f"h0 must have shape {state_shape} for this state layout, got {tuple(h0.shape)}.")
 
     compiled = _compile_bwd_dhu_sm90(
-        B,
-        T,
-        N,
-        NT,
         H,
         K,
         V,
@@ -1364,7 +1354,8 @@ def chunk_gated_delta_rule_bwd_dhu_sm90(
         transpose_state_layout,
         scale_value,
     )
-    compiled(q, k, w, g_arg, gk_arg, dht_arg, dh0_arg, do, dh, dv, dv2, cu_seqlens_arg, chunk_offsets)
+    problem_size = (Int32(B), Int32(T), Int32(N), Int32(NT))
+    compiled(q, k, w, g_arg, gk_arg, dht_arg, dh0_arg, do, dh, dv, dv2, cu_seqlens_arg, chunk_offsets, problem_size)
     return dh, dh0, dv2
 
 
