@@ -52,45 +52,10 @@ BT = 64
 BV = 64
 BK = 128
 NUM_THREADS = 224
-_DUMMY_TENSOR_CACHE_MAX = 32
-_dummy_tensor_cache: dict[tuple, torch.Tensor] = {}
-_nonvarlen_metadata_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def make_thread_cooperative_group(size: int):
     return pipeline.CooperativeGroup(pipeline.Agent.Thread, size)
-
-
-def _device_key(device: torch.device) -> tuple[str, int | None]:
-    device = torch.device(device)
-    index = device.index
-    if device.type == "cuda" and index is None:
-        index = torch.cuda.current_device()
-    return device.type, index
-
-
-def _cached_empty(shape: tuple[int, ...], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    key = (_device_key(device), dtype, tuple(int(x) for x in shape))
-    tensor = _dummy_tensor_cache.get(key)
-    if tensor is None:
-        if len(_dummy_tensor_cache) >= _DUMMY_TENSOR_CACHE_MAX:
-            _dummy_tensor_cache.clear()
-        tensor = torch.empty(shape, device=device, dtype=dtype)
-        _dummy_tensor_cache[key] = tensor
-    return tensor
-
-
-def _cached_nonvarlen_metadata(B: int, T: int, NT: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    key = (_device_key(device), int(B), int(T), int(NT))
-    metadata = _nonvarlen_metadata_cache.get(key)
-    if metadata is None:
-        if len(_nonvarlen_metadata_cache) >= _DUMMY_TENSOR_CACHE_MAX:
-            _nonvarlen_metadata_cache.clear()
-        cu_seqlens = torch.arange(B + 1, device=device, dtype=torch.int32) * T
-        chunk_offsets = torch.arange(B + 1, device=device, dtype=torch.int32) * NT
-        metadata = (cu_seqlens, chunk_offsets)
-        _nonvarlen_metadata_cache[key] = metadata
-    return metadata
 
 
 class ChunkDeltaRuleBwdDHUSm90:
@@ -1290,7 +1255,8 @@ def chunk_gated_delta_rule_bwd_dhu_sm90(
     else:
         N = B
         NT = (T + BT - 1) // BT
-        cu_seqlens_arg, chunk_offsets = _cached_nonvarlen_metadata(B, T, NT, q.device)
+        cu_seqlens_arg = torch.empty(B + 1, device=q.device, dtype=torch.int32)
+        chunk_offsets = torch.empty(B + 1, device=q.device, dtype=torch.int32)
     scale_value = 1.0 if scale is None else float(scale)
 
     state_shape = (N, H, V, K) if transpose_state_layout else (N, H, K, V)
@@ -1298,10 +1264,10 @@ def chunk_gated_delta_rule_bwd_dhu_sm90(
     dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
     dv2 = torch.empty_like(dv)
 
-    g_arg = g if g is not None else _cached_empty((B, T, H), device=q.device, dtype=torch.float32)
-    gk_arg = gk if gk is not None else _cached_empty((B, T, H, K), device=q.device, dtype=torch.float32)
-    dht_arg = dht if dht is not None else _cached_empty(state_shape, device=q.device, dtype=torch.float32)
-    dh0_arg = dh0 if dh0 is not None else _cached_empty(state_shape, device=q.device, dtype=torch.float32)
+    g_arg = g if g is not None else torch.empty(B, T, H, device=q.device, dtype=torch.float32)
+    gk_arg = gk if gk is not None else torch.empty(B, T, H, K, device=q.device, dtype=torch.float32)
+    dht_arg = dht if dht is not None else torch.empty(state_shape, device=q.device, dtype=torch.float32)
+    dh0_arg = dh0 if dh0 is not None else torch.empty(state_shape, device=q.device, dtype=torch.float32)
     if g is not None and (g.dtype != torch.float32 or not g.is_contiguous()):
         raise ValueError("g must be contiguous float32.")
     if g is not None and tuple(g.shape) != (B, T, H):
