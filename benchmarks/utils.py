@@ -286,12 +286,6 @@ def prepare_safe_gate_inputs(
     g = torch.randn(batch_size, T, HV, D, dtype=dtype, device=device).requires_grad_(False)
     beta = torch.randn(batch_size, T, HV, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
 
-    # GVA expansion: bring q/k up to HV heads so all tensors share head dim.
-    group = HV // H
-    if group > 1:
-        q = q.repeat_interleave(group, dim=2).contiguous()
-        k = k.repeat_interleave(group, dim=2).contiguous()
-
     # A_log / dt_bias must match the head count of `g` (HV), otherwise
     # kda_gate_chunk_cumsum would index out of bounds for i_h >= H.
     A_log = torch.randn(HV, dtype=torch.float, device=device).requires_grad_(False)
