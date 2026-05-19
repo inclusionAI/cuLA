@@ -42,7 +42,7 @@ import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 import torch
 from cutlass.cute.nvgpu import cpasync
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Float32, Int32, Int64
 from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
 
@@ -504,14 +504,12 @@ class ChunkDeltaRuleBwdDHUSm90:
         bidx = bh_idx // self.H
         hidx = bh_idx - bidx * self.H
         data_bidx = bidx
-        state_bidx = bidx
         tok_offset = Int32(0)
         seq_len = self.T
         NT = (self.T + self.BT - 1) // self.BT
         chunk_off = Int32(0)
         if cutlass.const_expr(self.is_varlen):
             data_bidx = Int32(0)
-            state_bidx = Int32(0)
             tok_offset = cu_seqlens[bidx]
             seq_len = cu_seqlens[bidx + 1] - tok_offset
             NT = (seq_len + self.BT - 1) // self.BT
@@ -633,7 +631,7 @@ class ChunkDeltaRuleBwdDHUSm90:
                 tma_atom_gk, tma_tensor_gk_use[None, None, (hidx, data_bidx)], (self.BK, 1), sGK
             )
         _, bSG_sDh, bSG_gDh = self._epilog_partition(
-            tma_atom_dh, tma_tensor_dh_use[None, None, (None, hidx, state_bidx)], (self.BV, self.BK), sDh
+            tma_atom_dh, tma_tensor_dh_use[None, None, (None, hidx, data_bidx)], (self.BV, self.BK), sDh
         )
         _, bSG_sDv2, bSG_gDv2 = self._epilog_partition(
             tma_atom_dv2, tma_tensor_dv2_use[None, None, (hidx, data_bidx)], (self.BV, self.BT), sDv2
@@ -1114,10 +1112,6 @@ class ChunkDeltaRuleBwdDHUSm90:
         return operand
 
 
-def _as_cute(tensor: torch.Tensor):
-    return from_dlpack(tensor, assumed_align=16)
-
-
 @functools.lru_cache(maxsize=64)
 def _compile_bwd_dhu_sm90(
     B: int,
@@ -1155,42 +1149,112 @@ def _compile_bwd_dhu_sm90(
         use_fast_math=USE_FAST_MATH,
     )
 
-    q_fake = torch.empty(B, T, H, K, device="cuda", dtype=torch.bfloat16)
-    k_fake = torch.empty_like(q_fake)
-    w_fake = torch.empty_like(q_fake)
-    do_fake = torch.empty(B, T, H, V, device="cuda", dtype=torch.bfloat16)
-    dv_fake = torch.empty_like(do_fake)
-    dv2_fake = torch.empty_like(do_fake)
-    g_fake = torch.empty(B, T, H, device="cuda", dtype=torch.float32)
-    gk_fake = torch.empty(B, T, H, K, device="cuda", dtype=torch.float32)
+    q_fake = make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (B, T, H, K),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
+    )
+    k_fake = make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (B, T, H, K),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
+    )
+    w_fake = make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (B, T, H, K),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
+    )
+    do_fake = make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (B, T, H, V),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
+    )
+    dv_fake = make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (B, T, H, V),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
+    )
+    dv2_fake = make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (B, T, H, V),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
+    )
+    g_fake = make_fake_compact_tensor(
+        cutlass.Float32,
+        (B, T, H),
+        stride_order=(2, 1, 0),
+        assumed_align=128,
+    )
+    gk_fake = make_fake_compact_tensor(
+        cutlass.Float32,
+        (B, T, H, K),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=128,
+    )
     if transpose_state_layout:
-        dht_fake = torch.empty(N, H, V, K, device="cuda", dtype=torch.float32)
-        dh0_fake = torch.empty_like(dht_fake)
-        dh_fake = torch.empty(B, NT, H, V, K, device="cuda", dtype=torch.bfloat16)
+        dht_fake = make_fake_compact_tensor(
+            cutlass.Float32,
+            (N, H, V, K),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
+        )
+        dh0_fake = make_fake_compact_tensor(
+            cutlass.Float32,
+            (N, H, V, K),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
+        )
+        dh_fake = make_fake_compact_tensor(
+            cutlass.BFloat16,
+            (B, NT, H, V, K),
+            stride_order=(4, 3, 2, 1, 0),
+            assumed_align=128,
+        )
     else:
-        dht_fake = torch.empty(N, H, K, V, device="cuda", dtype=torch.float32)
-        dh0_fake = torch.empty_like(dht_fake)
-        dh_fake = torch.empty(B, NT, H, K, V, device="cuda", dtype=torch.bfloat16)
-    cu_fake = torch.empty(N + 1, device="cuda", dtype=torch.int32)
-    offsets_fake = torch.empty(N + 1, device="cuda", dtype=torch.int32)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        dht_fake = make_fake_compact_tensor(
+            cutlass.Float32,
+            (N, H, K, V),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
+        )
+        dh0_fake = make_fake_compact_tensor(
+            cutlass.Float32,
+            (N, H, K, V),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
+        )
+        dh_fake = make_fake_compact_tensor(
+            cutlass.BFloat16,
+            (B, NT, H, K, V),
+            stride_order=(4, 3, 2, 1, 0),
+            assumed_align=128,
+        )
+    cu_fake = make_fake_compact_tensor(cutlass.Int32, (N + 1,), assumed_align=128)
+    offsets_fake = make_fake_compact_tensor(cutlass.Int32, (N + 1,), assumed_align=128)
+    stream_fake = make_fake_stream(use_tvm_ffi_env_stream=True)
 
     return cute.compile(
         kernel,
-        _as_cute(q_fake),
-        _as_cute(k_fake),
-        _as_cute(w_fake),
-        _as_cute(g_fake),
-        _as_cute(gk_fake),
-        _as_cute(dht_fake),
-        _as_cute(dh0_fake),
-        _as_cute(do_fake),
-        _as_cute(dh_fake),
-        _as_cute(dv_fake),
-        _as_cute(dv2_fake),
-        _as_cute(cu_fake),
-        _as_cute(offsets_fake),
-        stream=stream,
+        q_fake,
+        k_fake,
+        w_fake,
+        g_fake,
+        gk_fake,
+        dht_fake,
+        dh0_fake,
+        do_fake,
+        dh_fake,
+        dv_fake,
+        dv2_fake,
+        cu_fake,
+        offsets_fake,
+        stream_fake,
         options="--enable-tvm-ffi",
     )
 
@@ -1300,8 +1364,7 @@ def chunk_gated_delta_rule_bwd_dhu_sm90(
         transpose_state_layout,
         scale_value,
     )
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    compiled(q, k, w, g_arg, gk_arg, dht_arg, dh0_arg, do, dh, dv, dv2, cu_seqlens_arg, chunk_offsets, stream)
+    compiled(q, k, w, g_arg, gk_arg, dht_arg, dh0_arg, do, dh, dv, dv2, cu_seqlens_arg, chunk_offsets)
     return dh, dh0, dv2
 
 
