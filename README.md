@@ -117,7 +117,7 @@ See [BENCHMARK_H200.md](BENCHMARK_H200.md) tested with CUDA 12.9 for detailed re
 - **KDA Modular Forward (Blackwell):** **avg 1.33x** speedup on fixed-length, **avg 1.35x** on variable-length (18 configs, uniform/skewed/random).
 - **Lightning Attention Prefill (Blackwell):** up to **2.08x** speedup (B=2).
 - **Lightning Attention Varlen (Blackwell):** **avg 1.47x** speedup across 126 configs (uniform/skewed/random).
-- **KDA Fused Forward (Hopper):** **avg 1.52x** speedup across fixed-length and variable-length sequences.
+- **KDA Fused Forward (Hopper):** **avg 1.58x** speedup across fixed-length and variable-length sequences.
 
 To regenerate benchmarks:
 
