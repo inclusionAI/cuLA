@@ -869,9 +869,6 @@ class ChunkDeltaRuleBwdDHUSm90:
                             k_decay = cute.exp(gk_last, fastmath=self.use_fast_math)
                         sGK[local_tidx, 0, gk_wait_early.index] = k_decay
                         self.gk_precompute_bar.arrive_and_wait()
-                        for ei in cutlass.range(cute.size(rState), unroll_full=True):
-                            v_rel, k_rel = tUcState[ei]
-                            rState[ei] = rState[ei] * sGK[k_rel, 0, gk_wait_early.index]
                     cute.nvgpu.warpgroup.wait_group(1)
                 else:
                     cute.nvgpu.warpgroup.wait_group(0)
@@ -922,14 +919,18 @@ class ChunkDeltaRuleBwdDHUSm90:
                     cute.nvgpu.warpgroup.commit_group()
                     cute.nvgpu.warpgroup.wait_group(0)
                     q_wait_early.release()
-                    if cutlass.const_expr(self.use_gk):
-                        gk_wait_early.release()
 
                     for ei in cutlass.range(cute.size(rState), unroll_full=True):
                         update = acc_qdo[ei] * Float32(self.scale) - acc_wdv[ei]
-                        rState[ei] = rState[ei] + update
+                        if cutlass.const_expr(self.use_gk):
+                            v_rel, k_rel = tUcState[ei]
+                            rState[ei] = rState[ei] * sGK[k_rel, 0, gk_wait_early.index] + update
+                        else:
+                            rState[ei] = rState[ei] + update
                     w_wait.release()
                     do_wait_early.release()
+                    if cutlass.const_expr(self.use_gk):
+                        gk_wait_early.release()
                 else:
                     do_wait = load_do_C.wait_and_advance()
                     if cutlass.const_expr(self.use_g):
