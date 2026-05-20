@@ -1972,7 +1972,13 @@ def main():
                     co = chunk_offsets_list[seq_idx]
                     nt_seq = (sl + BT - 1) // BT
                     o_seq = reference_chunk_gla_fwd_o(
-                        q_ref_flat[:, s:e], v_flat[:, s:e], g_flat[:, s:e], h_flat[:, co : co + nt_seq], A_flat[:, s:e], scale, BT
+                        q_ref_flat[:, s:e],
+                        v_flat[:, s:e],
+                        g_flat[:, s:e],
+                        h_flat[:, co : co + nt_seq],
+                        A_flat[:, s:e],
+                        scale,
+                        BT,
                     )
                     o_ref_flat[:, s:e] = o_seq
 

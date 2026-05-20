@@ -2192,7 +2192,9 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=256)
     parser.add_argument("--num_heads", type=int, default=1)
-    parser.add_argument("--num_v_heads", type=int, default=None, help="Number of value heads (default: num_heads, i.e. no GVA)")
+    parser.add_argument(
+        "--num_v_heads", type=int, default=None, help="Number of value heads (default: num_heads, i.e. no GVA)"
+    )
     parser.add_argument("--head_dim_k", type=int, default=128)
     parser.add_argument("--head_dim_v", type=int, default=128)
     parser.add_argument("--chunk_size", type=int, default=64)
