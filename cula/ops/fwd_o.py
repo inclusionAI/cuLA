@@ -198,7 +198,7 @@ class ChunkGlaFwdO:
         )
         self.buffer_align_bytes = 1024
 
-    def _compute_grid(self, B, T, H, V, total_nt=None):
+    def _compute_grid(self, B, T, HV, V, total_nt=None):
         """Compute grid dimensions for kernel launch."""
         num_v_tiles = (V + self.BV - 1) // self.BV
         if self.persistent:
@@ -210,10 +210,10 @@ class ChunkGlaFwdO:
             return (sm_count, 1, 1)
         elif self.is_varlen:
             # Non-persistent varlen: one CTA per work unit.
-            total_work_units = num_v_tiles * total_nt * H
+            total_work_units = num_v_tiles * total_nt * HV
             return (total_work_units, 1, 1)
         NT = (T + self.BT - 1) // self.BT
-        return (num_v_tiles, NT, B * H)
+        return (num_v_tiles, NT, B * HV)
 
     @staticmethod
     def _plan_tmem_offsets(
@@ -260,14 +260,14 @@ class ChunkGlaFwdO:
     def __call__(
         self,
         q_in: cute.Tensor,  # [B, T, H, K] (B=1 for varlen)
-        v_in: cute.Tensor,  # [B, T, H, V] (B=1 for varlen)
-        g_in: cute.Tensor,  # [B, T, H, K] fp32 (B=1 for varlen)
-        h_in: cute.Tensor,  # [B, NT, H, K, V] (B=1 for varlen)
-        o_in: cute.Tensor,  # [B, T, H, V] (B=1 for varlen)
-        A_in: cute.Tensor,  # [B, T, H, BT] (B=1 for varlen)
+        v_in: cute.Tensor,  # [B, T, HV, V] (B=1 for varlen)
+        g_in: cute.Tensor,  # [B, T, HV, K] fp32 (B=1 for varlen)
+        h_in: cute.Tensor,  # [B, NT, HV, K, V] (B=1 for varlen)
+        o_in: cute.Tensor,  # [B, T, HV, V] (B=1 for varlen)
+        A_in: cute.Tensor,  # [B, T, HV, BT] (B=1 for varlen)
         cu_seqlens_in: cute.Tensor,  # [N+1] int32
         chunk_indices_in: cute.Tensor,  # [NT, 2] int32
-        problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
+        problem_size: tuple[Int32, Int32, Int32, Int32, Int32, Int32],
         total_nt: Int32,  # total chunks across all seqs (varlen)
         stream,
     ):
@@ -281,7 +281,7 @@ class ChunkGlaFwdO:
         cu_seqlens_ptr = cu_seqlens_in.iterator
         chunk_indices_ptr = chunk_indices_in.iterator
 
-        B, T, H, K, V = problem_size
+        B, T, H, HV, K, V = problem_size
         BT = self.BT
 
         # For varlen: B=num_seqs, T=max_seqlen (or total_tokens), data_B=1
@@ -303,17 +303,17 @@ class ChunkGlaFwdO:
         )
         q = cute.make_tensor(q_ptr, q_layout)
 
-        # g layout: token-indexed (T, K, (H, data_B)) — fp32 (separate from q)
+        # g layout: token-indexed (T, K, (HV, data_B)) — fp32
         g_layout = cute.make_layout(
-            (T, K, (H, data_B)),
-            stride=(H * K, 1, (K, T * H * K)),
+            (T, K, (HV, data_B)),
+            stride=(HV * K, 1, (K, T * HV * K)),
         )
         g = cute.make_tensor(g_ptr, g_layout)
 
-        # o: row-major (T, V, (H, data_B)) — token-indexed for direct GMEM write (varlen)
+        # o: row-major (T, V, (HV, data_B)) — token-indexed for direct GMEM write (varlen)
         o_layout = cute.make_layout(
-            (T, V, (H, data_B)),
-            stride=(H * V, 1, (V, T * H * V)),
+            (T, V, (HV, data_B)),
+            stride=(HV * V, 1, (V, T * HV * V)),
         )
         o = cute.make_tensor(o_ptr, o_layout)
 
@@ -323,8 +323,8 @@ class ChunkGlaFwdO:
         # TMA descriptor collapses the degenerate H dim; keeping batch
         # at coord-2 guarantees it always maps to an existing TMA dim.
         v_T_layout = cute.make_layout(
-            (V, T, (data_B, H)),
-            stride=(1, H * V, (T * H * V, V)),
+            (V, T, (data_B, HV)),
+            stride=(1, HV * V, (T * HV * V, V)),
         )
         v_T = cute.make_tensor(v_ptr, v_T_layout)
 
@@ -337,15 +337,15 @@ class ChunkGlaFwdO:
             h_nt_total = B * NT
         # NOTE: Mode 2 uses (batch, H) order — see v_T comment above.
         h_T_layout = cute.make_layout(
-            (V, K, (h_nt_total, H)),
-            stride=(1, V, (H * K * V, K * V)),
+            (V, K, (h_nt_total, HV)),
+            stride=(1, V, (HV * K * V, K * V)),
         )
         h_T = cute.make_tensor(h_ptr, h_T_layout)
 
-        # A layout: token-indexed (T, BT, (H, data_B))
+        # A layout: token-indexed (T, BT, (HV, data_B))
         a_layout = cute.make_layout(
-            (T, BT, (H, data_B)),
-            stride=(H * BT, 1, (BT, T * H * BT)),
+            (T, BT, (HV, data_B)),
+            stride=(HV * BT, 1, (BT, T * HV * BT)),
         )
         A = cute.make_tensor(A_ptr, a_layout)
 
@@ -570,7 +570,7 @@ class ChunkGlaFwdO:
         )
 
         # ===================== Grid =====================
-        grid = self._compute_grid(B, T, H, V, total_nt=total_nt)
+        grid = self._compute_grid(B, T, HV, V, total_nt=total_nt)
 
         # ===================== cu_seqlens / chunk_indices tensors =====================
         cu_seqlens = cute.make_tensor(cu_seqlens_ptr, cute.make_layout((B + 1,)))
@@ -683,7 +683,7 @@ class ChunkGlaFwdO:
         problem_size,
         total_nt,
     ):
-        B, T, H, K, V = problem_size
+        B, T, H, HV, K, V = problem_size
         BT = self.BT
 
         # ===================== Work decode =====================
@@ -693,12 +693,13 @@ class ChunkGlaFwdO:
             # Persistent kernel: 1D grid, work decoded inside each warp's loop
             block_idx_x = cute.arch.block_idx()[0]
             grid_dim_x = cute.arch.grid_dim()[0]
-            total_work_units = num_v_tiles * total_nt * H
+            total_work_units = num_v_tiles * total_nt * HV
             num_iters = (total_work_units - block_idx_x + grid_dim_x - 1) // grid_dim_x
             # Pre-initialize persistent loop variables (CuTe DSL requirement)
             i_v = Int32(0)
             chunk_global_idx = Int32(0)
             i_h = Int32(0)
+            i_qh = Int32(0)
             i_b = Int32(0)
             i_t = Int32(0)
             tok_offset = Int32(0)
@@ -713,8 +714,9 @@ class ChunkGlaFwdO:
             i_v = cute.arch.block_idx()[0]
             i_t = cute.arch.block_idx()[1]
             i_bh = cute.arch.block_idx()[2]
-            i_b = i_bh // H
-            i_h = i_bh % H
+            i_b = i_bh // HV
+            i_h = i_bh % HV
+            i_qh = i_h // (HV // H)
             tok_offset = i_b * T
             seq_len = T
             data_bidx = i_b
@@ -874,6 +876,7 @@ class ChunkGlaFwdO:
                     temp_work = work_idx // num_v_tiles
                     chunk_flat = temp_work % total_nt
                     i_h = temp_work // total_nt
+                    i_qh = i_h // (HV // H)
                     if cutlass.const_expr(self.is_varlen):
                         i_b = chunk_indices[(chunk_flat, 0)]
                         i_t = chunk_indices[(chunk_flat, 1)]
@@ -901,7 +904,7 @@ class ChunkGlaFwdO:
                 # --- Unconditional TMA partitions ---
                 bSG_sQ, bSG_gQ = self._epilog_partition_varlen(
                     tma_atom_q,
-                    tma_q_v[None, None, (i_h, data_bidx)],
+                    tma_q_v[None, None, (i_qh, data_bidx)],
                     (self.BT, self.BK),
                     sQ_epi,
                 )
@@ -1001,7 +1004,7 @@ class ChunkGlaFwdO:
 
                     # Bulk prefetch: SMEM → registers (all 256 bf16 at once)
                     cute.autovec_copy(tOsO, tOrO)
-                    o_chunk_raw = o_tensor.iterator + (tok_offset + i_t * BT) * H * V + i_h * V + i_v * self.BV
+                    o_chunk_raw = o_tensor.iterator + (tok_offset + i_t * BT) * HV * V + i_h * V + i_v * self.BV
                     o_chunk_ptr = cute.make_ptr(
                         self.io_dtype,
                         o_chunk_raw.toint(),
@@ -1009,7 +1012,7 @@ class ChunkGlaFwdO:
                         assumed_align=16,
                     )
                     o_stride_bt = cute.assume(
-                        H * V,
+                        HV * V,
                         divby=128 // self.io_dtype.width,
                     )
                     gO_chunk = cute.make_tensor(
@@ -1580,7 +1583,7 @@ def reference_chunk_gla_fwd_o(q, v, g, h, A, scale, chunk_size=64):
 # Compile cache + TVM-FFI API
 # ---------------------------------------------------------------------------
 
-# Internal cache: maps (is_varlen, persistent, H, K, V, scale, chunk_size) → compiled_fn
+# Internal cache: maps (is_varlen, persistent, H, HV, K, V, scale, chunk_size) → compiled_fn
 _fwd_o_kernel_cache: dict = {}
 
 # Pre-allocated dummy tensors for non-varlen path (avoid per-call torch.zeros)
@@ -1588,7 +1591,7 @@ _fwd_o_dummy_cu_seqlens: torch.Tensor = None
 _fwd_o_dummy_chunk_indices: torch.Tensor = None
 
 
-def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size, use_fast_math):
+def _compile_fwd_o_variant(is_varlen, persistent, H, HV, K, V, scale, chunk_size, use_fast_math):
     """Compile one ChunkGlaFwdO kernel variant. Returns the compiled TVM-FFI callable.
 
     Uses make_fake_compact_tensor and make_fake_stream for compilation with
@@ -1615,8 +1618,8 @@ def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size, us
     BT = chunk_size
 
     if is_varlen:
-        # varlen: tensors are [1, T_total, H, ...] (4D with B=1)
-        # This avoids squeeze(0) CPU overhead at the call site.
+        # varlen: tensors are [1, T_total, H/HV, ...] (4D with B=1)
+        # q uses H (QK heads), g/v/o/A use HV (value heads)
         q_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
             (1, sym_b, H, K),
@@ -1625,30 +1628,31 @@ def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size, us
         )
         v_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (1, sym_b, H, V),
+            (1, sym_b, HV, V),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
         g_fake = make_fake_compact_tensor(
             cutlass.Float32,
-            (1, sym_b, H, K),
+            (1, sym_b, HV, K),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
         o_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (1, sym_b, H, V),
+            (1, sym_b, HV, V),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
         A_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (1, sym_b, H, BT),
+            (1, sym_b, HV, BT),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
     else:
-        # non-varlen: tensors are [B, T, H, ...] (4D)
+        # non-varlen: tensors are [B, T, H/HV, ...] (4D)
+        # q uses H (QK heads), g/v/o/A use HV (value heads)
         q_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
             (sym_a, sym_b, H, K),
@@ -1657,42 +1661,42 @@ def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size, us
         )
         v_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (sym_a, sym_b, H, V),
+            (sym_a, sym_b, HV, V),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
         g_fake = make_fake_compact_tensor(
             cutlass.Float32,
-            (sym_a, sym_b, H, K),
+            (sym_a, sym_b, HV, K),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
         o_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (sym_a, sym_b, H, V),
+            (sym_a, sym_b, HV, V),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
         A_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (sym_a, sym_b, H, BT),
+            (sym_a, sym_b, HV, BT),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
 
     if is_varlen:
-        # varlen: h is [1, NT_total, H, K, V] (5D with B=1)
+        # varlen: h is [1, NT_total, HV, K, V] (5D with B=1)
         h_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (1, sym_nt, H, K, V),
+            (1, sym_nt, HV, K, V),
             stride_order=(4, 3, 2, 1, 0),
             assumed_align=128,
         )
     else:
-        # non-varlen: h is [B, NT, H, K, V] (5D)
+        # non-varlen: h is [B, NT, HV, K, V] (5D)
         h_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (sym_a, sym_nt, H, K, V),
+            (sym_a, sym_nt, HV, K, V),
             stride_order=(4, 3, 2, 1, 0),
             assumed_align=128,
         )
@@ -1720,7 +1724,7 @@ def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size, us
         A_fake,
         cu_fake,
         ci_fake,
-        (Int32(1), Int32(1), Int32(H), Int32(K), Int32(V)),
+        (Int32(1), Int32(1), Int32(H), Int32(HV), Int32(K), Int32(V)),
         Int32(1),
         stream_fake,
         options=COMPILE_OPTIONS,
@@ -1728,7 +1732,7 @@ def _compile_fwd_o_variant(is_varlen, persistent, H, K, V, scale, chunk_size, us
     return compiled_fn
 
 
-def _get_compiled_fwd_o(is_varlen, persistent, H, K, V, scale, chunk_size):
+def _get_compiled_fwd_o(is_varlen, persistent, H, HV, K, V, scale, chunk_size):
     """Get a compiled ChunkGlaFwdO kernel with on-demand (lazy) compilation.
 
     Each variant is compiled exactly once and cached.  Compilation is deferred
@@ -1737,14 +1741,15 @@ def _get_compiled_fwd_o(is_varlen, persistent, H, K, V, scale, chunk_size):
     where a subsequent cute.compile can invalidate previously compiled but
     not-yet-executed functions.
 
-    Cache key: (is_varlen, persistent, H, K, V, scale, chunk_size, USE_FAST_MATH)
+    Cache key: (is_varlen, persistent, H, HV, K, V, scale, chunk_size, USE_FAST_MATH)
     """
-    key = (is_varlen, persistent, H, K, V, scale, chunk_size, USE_FAST_MATH)
+    key = (is_varlen, persistent, H, HV, K, V, scale, chunk_size, USE_FAST_MATH)
     if key not in _fwd_o_kernel_cache:
         _fwd_o_kernel_cache[key] = _compile_fwd_o_variant(
             is_varlen,
             persistent,
             H,
+            HV,
             K,
             V,
             scale,
@@ -1778,15 +1783,15 @@ def chunk_gla_fwd_o(
     sym_int() is used for B, T, NT so a single compilation handles all
     batch-size / sequence-length combinations.
 
-    Cache key: (is_varlen, persistent, H, K, V, scale, chunk_size)
+    Cache key: (is_varlen, persistent, H, HV, K, V, scale, chunk_size)
 
     Args:
-        q: query tensor — [B, T, H, K] bf16 (both non-varlen and varlen with B=1)
-        v: value tensor — [B, T, H, V] bf16 (both non-varlen and varlen with B=1)
-        g: gate tensor — [B, T, H, K] fp32 (both non-varlen and varlen with B=1)
-        h: state tensor — [B, NT, H, K, V] bf16 (B=1 for varlen)
-        o: output tensor (pre-allocated) — same shape as q but with V dim
-        A: attention matrix — [B, T, H, BT] bf16 (both non-varlen and varlen with B=1)
+        q: query tensor — [B, T, H, K] bf16 (H = QK heads)
+        v: value tensor — [B, T, HV, V] bf16 (HV = value heads, HV >= H)
+        g: gate tensor — [B, T, HV, K] fp32
+        h: state tensor — [B, NT, HV, K, V] bf16 (B=1 for varlen)
+        o: output tensor (pre-allocated) — [B, T, HV, V] bf16
+        A: attention matrix — [B, T, HV, BT] bf16
         scale: attention scale factor
         chunk_size: chunk size (default: 64)
         cu_seqlens: cumulative sequence lengths [N+1] int32 (varlen only)
@@ -1802,20 +1807,22 @@ def chunk_gla_fwd_o(
             "cu_seqlens and chunk_indices are required for varlen mode"
         )
         assert q.dim() == 4 and q.shape[0] == 1, f"varlen mode expects [1, T_total, H, K] input, got shape {q.shape}"
-        assert h.dim() == 5 and h.shape[0] == 1, f"varlen mode expects [1, NT_total, H, K, V] for h, got shape {h.shape}"
+        assert h.dim() == 5 and h.shape[0] == 1, f"varlen mode expects [1, NT_total, HV, K, V] for h, got shape {h.shape}"
         T_total = q.shape[1]
         H = q.shape[2]
+        HV = v.shape[2]
         K = q.shape[3]
         V = v.shape[3]
         num_seqs = cu_seqlens.shape[0] - 1
         total_nt_val = chunk_indices.shape[0]
-        ps = (Int32(num_seqs), Int32(T_total), Int32(H), Int32(K), Int32(V))
+        ps = (Int32(num_seqs), Int32(T_total), Int32(H), Int32(HV), Int32(K), Int32(V))
     else:
         B, T, H, K = q.shape
+        HV = v.shape[2]
         V = v.shape[3]
         NT = (T + chunk_size - 1) // chunk_size
         total_nt_val = B * NT
-        ps = (Int32(B), Int32(T), Int32(H), Int32(K), Int32(V))
+        ps = (Int32(B), Int32(T), Int32(H), Int32(HV), Int32(K), Int32(V))
         if cu_seqlens is None:
             global _fwd_o_dummy_cu_seqlens
             if _fwd_o_dummy_cu_seqlens is None or _fwd_o_dummy_cu_seqlens.device != q.device:
@@ -1831,6 +1838,7 @@ def chunk_gla_fwd_o(
         is_varlen,
         persistent,
         H,
+        HV,
         K,
         V,
         scale,
@@ -1864,6 +1872,7 @@ def main():
     parser.add_argument("--B", type=int, default=2)
     parser.add_argument("--T", type=int, default=256)
     parser.add_argument("--H", type=int, default=4)
+    parser.add_argument("--HV", type=int, default=None, help="Number of value heads (default: same as --H)")
     parser.add_argument("--K", type=int, default=128)
     parser.add_argument("--V", type=int, default=128)
     parser.add_argument("--scale", type=float, default=None)
@@ -1873,12 +1882,16 @@ def main():
     if args.scale is None:
         args.scale = args.K**-0.5
     B, T, H, K, V = args.B, args.T, args.H, args.K, args.V
+    HV = args.HV if args.HV is not None else H
+    assert HV >= H and HV % H == 0, f"HV ({HV}) must be >= H ({H}) and divisible by H"
+    G = HV // H
     BT = args.chunk_size
     scale = args.scale
     NT = (T + BT - 1) // BT
     dtype, device = torch.bfloat16, "cuda"
 
-    print(f"Config: B={B}, T={T}, H={H}, K={K}, V={V}, BT={BT}, scale={scale:.4f}")
+    hv_str = f"/{HV}" if HV != H else ""
+    print(f"Config: B={B}, T={T}, H={H}{hv_str}, K={K}, V={V}, BT={BT}, scale={scale:.4f}")
     print(f"  Chunks per seq: {NT}, Total chunks: {B * NT}")
 
     if args.test in ("correctness", "both"):
@@ -1888,13 +1901,14 @@ def main():
         print("\n=== Non-Varlen Correctness Test ===")
         torch.manual_seed(42)
         q_nv = torch.randn(B, T, H, K, dtype=dtype, device=device)
-        v_nv = torch.randn(B, T, H, V, dtype=dtype, device=device)
-        g_nv = torch.randn(B, T, H, K, dtype=torch.float32, device=device) * 0.1
-        h_nv = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
-        A_nv = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
+        v_nv = torch.randn(B, T, HV, V, dtype=dtype, device=device)
+        g_nv = torch.randn(B, T, HV, K, dtype=torch.float32, device=device) * 0.1
+        h_nv = torch.randn(B, NT, HV, K, V, dtype=dtype, device=device) * 0.01
+        A_nv = torch.randn(B, T, HV, BT, dtype=dtype, device=device) * 0.1
 
-        o_ref_nv = reference_chunk_gla_fwd_o(q_nv, v_nv, g_nv, h_nv, A_nv, scale, BT)
-        o_nv = torch.zeros(B, T, H, V, dtype=dtype, device=device)
+        q_ref = q_nv.repeat_interleave(G, dim=2)
+        o_ref_nv = reference_chunk_gla_fwd_o(q_ref, v_nv, g_nv, h_nv, A_nv, scale, BT)
+        o_nv = torch.zeros(B, T, HV, V, dtype=dtype, device=device)
 
         chunk_gla_fwd_o(
             q=q_nv,
@@ -1943,13 +1957,14 @@ def main():
                 ci_t = build_chunk_indices(seq_lens, BT=BT, device=device)
 
                 q_flat = torch.randn(1, T_total, H, K, dtype=dtype, device=device)
-                v_flat = torch.randn(1, T_total, H, V, dtype=dtype, device=device)
-                g_flat = torch.randn(1, T_total, H, K, dtype=torch.float32, device=device) * 0.1
-                h_flat = torch.randn(1, total_nt_val, H, K, V, dtype=dtype, device=device) * 0.01
-                A_flat = torch.randn(1, T_total, H, BT, dtype=dtype, device=device) * 0.1
-                o_flat = torch.zeros(1, T_total, H, V, dtype=dtype, device=device)
+                v_flat = torch.randn(1, T_total, HV, V, dtype=dtype, device=device)
+                g_flat = torch.randn(1, T_total, HV, K, dtype=torch.float32, device=device) * 0.1
+                h_flat = torch.randn(1, total_nt_val, HV, K, V, dtype=dtype, device=device) * 0.01
+                A_flat = torch.randn(1, T_total, HV, BT, dtype=dtype, device=device) * 0.1
+                o_flat = torch.zeros(1, T_total, HV, V, dtype=dtype, device=device)
 
                 # Reference per-sequence
+                q_ref_flat = q_flat[:, :, :, :].repeat_interleave(G, dim=2)
                 o_ref_flat = torch.zeros_like(o_flat)
                 for seq_idx, sl in enumerate(seq_lens):
                     s = cu_seqlens_list[seq_idx]
@@ -1957,7 +1972,7 @@ def main():
                     co = chunk_offsets_list[seq_idx]
                     nt_seq = (sl + BT - 1) // BT
                     o_seq = reference_chunk_gla_fwd_o(
-                        q_flat[:, s:e], v_flat[:, s:e], g_flat[:, s:e], h_flat[:, co : co + nt_seq], A_flat[:, s:e], scale, BT
+                        q_ref_flat[:, s:e], v_flat[:, s:e], g_flat[:, s:e], h_flat[:, co : co + nt_seq], A_flat[:, s:e], scale, BT
                     )
                     o_ref_flat[:, s:e] = o_seq
 
@@ -1995,12 +2010,13 @@ def main():
         for i in range(3):
             torch.manual_seed(i * 100)
             q_cr = torch.randn(B, T, H, K, dtype=dtype, device=device)
-            v_cr = torch.randn(B, T, H, V, dtype=dtype, device=device)
-            g_cr = torch.randn(B, T, H, K, dtype=torch.float32, device=device) * 0.1
-            h_cr = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
-            A_cr = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
-            o_cr = torch.zeros(B, T, H, V, dtype=dtype, device=device)
-            o_ref_cr = reference_chunk_gla_fwd_o(q_cr, v_cr, g_cr, h_cr, A_cr, scale, BT)
+            v_cr = torch.randn(B, T, HV, V, dtype=dtype, device=device)
+            g_cr = torch.randn(B, T, HV, K, dtype=torch.float32, device=device) * 0.1
+            h_cr = torch.randn(B, NT, HV, K, V, dtype=dtype, device=device) * 0.01
+            A_cr = torch.randn(B, T, HV, BT, dtype=dtype, device=device) * 0.1
+            o_cr = torch.zeros(B, T, HV, V, dtype=dtype, device=device)
+            q_ref_cr = q_cr.repeat_interleave(G, dim=2)
+            o_ref_cr = reference_chunk_gla_fwd_o(q_ref_cr, v_cr, g_cr, h_cr, A_cr, scale, BT)
 
             chunk_gla_fwd_o(
                 q=q_cr,
@@ -2027,11 +2043,11 @@ def main():
         for bench_T in [1024, 2048, 4096]:
             bench_NT = (bench_T + BT - 1) // BT
             q_b = torch.randn(B, bench_T, H, K, dtype=dtype, device=device)
-            v_b = torch.randn(B, bench_T, H, V, dtype=dtype, device=device)
-            g_b = torch.randn(B, bench_T, H, K, dtype=torch.float32, device=device) * 0.1
-            h_b = torch.randn(B, bench_NT, H, K, V, dtype=dtype, device=device) * 0.01
-            A_b = torch.randn(B, bench_T, H, BT, dtype=dtype, device=device) * 0.1
-            o_b = torch.zeros(B, bench_T, H, V, dtype=dtype, device=device)
+            v_b = torch.randn(B, bench_T, HV, V, dtype=dtype, device=device)
+            g_b = torch.randn(B, bench_T, HV, K, dtype=torch.float32, device=device) * 0.1
+            h_b = torch.randn(B, bench_NT, HV, K, V, dtype=dtype, device=device) * 0.01
+            A_b = torch.randn(B, bench_T, HV, BT, dtype=dtype, device=device) * 0.1
+            o_b = torch.zeros(B, bench_T, HV, V, dtype=dtype, device=device)
 
             # Warmup (also triggers lazy compilation if needed)
             for _ in range(3):

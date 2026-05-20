@@ -108,17 +108,17 @@ def bench_non_varlen(configs):
     print("=" * 80)
     results = []
 
-    for B, T, H in configs:
+    for B, T, H, HV in configs:
         scale = K**-0.5
         NT = (T + BT - 1) // BT
         torch.manual_seed(42)
         torch.cuda.empty_cache()
 
         q = torch.randn(B, T, H, K, dtype=dtype, device=device)
-        v = torch.randn(B, T, H, V, dtype=dtype, device=device)
-        g = torch.randn(B, T, H, K, dtype=torch.float32, device=device) * 0.1
-        h = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
-        A = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
+        v = torch.randn(B, T, HV, V, dtype=dtype, device=device)
+        g = torch.randn(B, T, HV, K, dtype=torch.float32, device=device) * 0.1
+        h = torch.randn(B, NT, HV, K, V, dtype=dtype, device=device) * 0.01
+        A = torch.randn(B, T, HV, BT, dtype=dtype, device=device) * 0.1
 
         # ---- FLA baseline (accuracy) ----
         o_fla = chunk_gla_fwd_o_gk(
@@ -133,7 +133,7 @@ def bench_non_varlen(configs):
         )
 
         # ---- CuTe DSL (accuracy) ----
-        o_cute_t = torch.zeros(B, T, H, V, dtype=dtype, device=device)
+        o_cute_t = torch.zeros(B, T, HV, V, dtype=dtype, device=device)
 
         # Warmup / first call triggers compilation via cache
         chunk_gla_fwd_o(
@@ -183,10 +183,13 @@ def bench_non_varlen(configs):
         ms_cute = time_kernel(run_cute)
         speedup = ms_fla / ms_cute if ms_cute > 0 else float("inf")
 
+        hv_str = f"/{HV}" if HV != H else ""
         r = {
             "B": B,
             "T": T,
             "H": H,
+            "HV": HV,
+            "hv_str": hv_str,
             "max_diff": max_diff,
             "rel_max_diff": rel_max_diff,
             "mean_diff": mean_diff,
@@ -196,7 +199,7 @@ def bench_non_varlen(configs):
         }
         results.append(r)
         print(
-            f"  B={B:2d} T={T:5d} H={H:2d} | "
+            f"  B={B:2d} T={T:5d} H={H:2d}{hv_str:<4s} | "
             f"max_diff={max_diff:.6f} rel_max={rel_max_diff:.6f} mean_diff={mean_diff:.8f} | "
             f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms | "
             f"speedup={speedup:.2f}x"
@@ -232,7 +235,7 @@ def bench_varlen(configs):
     print("=" * 80)
     results = []
 
-    for seq_lens, H in configs:
+    for seq_lens, H, HV in configs:
         scale = K**-0.5
         T_total = sum(seq_lens)
         cu_seqlens_list = [0]
@@ -244,12 +247,12 @@ def bench_varlen(configs):
         torch.cuda.empty_cache()
 
         # Flat token-indexed tensors (shared data for both kernels)
-        # 4D with B=1: [1, T_total, H, *]
+        # q uses H (QK heads), g/v/h/A/o use HV (value heads)
         q_flat = torch.randn(1, T_total, H, K, dtype=dtype, device=device)
-        v_flat = torch.randn(1, T_total, H, V, dtype=dtype, device=device)
-        g_flat = torch.randn(1, T_total, H, K, dtype=torch.float32, device=device) * 0.1
-        h_flat = torch.randn(1, total_nt_val, H, K, V, dtype=dtype, device=device) * 0.01
-        A_flat = torch.randn(1, T_total, H, BT, dtype=dtype, device=device) * 0.1
+        v_flat = torch.randn(1, T_total, HV, V, dtype=dtype, device=device)
+        g_flat = torch.randn(1, T_total, HV, K, dtype=torch.float32, device=device) * 0.1
+        h_flat = torch.randn(1, total_nt_val, HV, K, V, dtype=dtype, device=device) * 0.01
+        A_flat = torch.randn(1, T_total, HV, BT, dtype=dtype, device=device) * 0.1
 
         # ---- FLA baseline (needs [1, T_total, H, *] + cu_seqlens int64) ----
         cu_fla = torch.tensor(cu_seqlens_list, dtype=torch.long, device=device)
@@ -267,7 +270,7 @@ def bench_varlen(configs):
         )
 
         # ---- CuTe DSL varlen ----
-        o_cute_flat = torch.zeros(1, T_total, H, V, dtype=dtype, device=device)
+        o_cute_flat = torch.zeros(1, T_total, HV, V, dtype=dtype, device=device)
         cu_cute = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
         ci_cute = build_chunk_indices(seq_lens, BT=BT, device=device)
 
@@ -339,10 +342,13 @@ def bench_varlen(configs):
         min_l, max_l = min(seq_lens), max(seq_lens)
         avg_l = T_total // n_seqs
         tag = f"{n_seqs}seqs T={T_total} [{min_l}..{max_l}] avg={avg_l}"
+        hv_str = f"/{HV}" if HV != H else ""
         r = {
             "tag": tag,
             "T_total": T_total,
             "H": H,
+            "HV": HV,
+            "hv_str": hv_str,
             "n_seqs": n_seqs,
             "max_diff": max_diff,
             "rel_max_diff": rel_max_diff,
@@ -353,7 +359,7 @@ def bench_varlen(configs):
         }
         results.append(r)
         print(
-            f"  {tag:45s} H={H:2d} | "
+            f"  {tag:45s} H={H:2d}{hv_str:<4s} | "
             f"max_diff={max_diff:.6f} rel_max={rel_max_diff:.6f} mean_diff={mean_diff:.8f} | "
             f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms | "
             f"speedup={speedup:.2f}x"
@@ -380,15 +386,16 @@ def print_report(nv_results, vl_results):
     if nv_results:
         print("\n  [Non-Varlen]")
         hdr = (
-            f"  {'B':>3s}  {'T':>5s}  {'H':>3s}  │  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
+            f"  {'B':>3s}  {'T':>5s}  {'H':>7s}  │  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
             f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 90}")
         print(hdr)
         print(f"  {'─' * 90}")
         for r in nv_results:
+            h_label = f"{r['H']}{r['hv_str']}"
             print(
-                f"  {r['B']:3d}  {r['T']:5d}  {r['H']:3d}  │  "
+                f"  {r['B']:3d}  {r['T']:5d}  {h_label:>7s}  │  "
                 f"{r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x"
             )
@@ -397,15 +404,16 @@ def print_report(nv_results, vl_results):
     if vl_results:
         print("\n  [Varlen]")
         hdr = (
-            f"  {'Config':>45s}  {'H':>3s}  │  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
+            f"  {'Config':>45s}  {'H':>7s}  │  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
             f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 117}")
         print(hdr)
         print(f"  {'─' * 117}")
         for r in vl_results:
+            h_label = f"{r['H']}{r['hv_str']}"
             print(
-                f"  {r['tag']:>45s}  {r['H']:3d}  │  "
+                f"  {r['tag']:>45s}  {h_label:>7s}  │  "
                 f"{r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x"
             )
@@ -431,6 +439,18 @@ def main():
         action="store_true",
         help="NCU profiling mode: warmup=1, iters=1",
     )
+    parser.add_argument(
+        "--heads",
+        type=int,
+        default=64,
+        help="Number of QK heads H (default: 64)",
+    )
+    parser.add_argument(
+        "--hv",
+        type=int,
+        default=None,
+        help="Number of value heads HV (default: same as --heads, i.e. no GVA)",
+    )
     args = parser.parse_args()
 
     global NCU_MODE
@@ -438,21 +458,24 @@ def main():
         NCU_MODE = True
         print("[NCU mode] warmup=1, iters=1")
 
+    H = args.heads
+    HV = args.hv if args.hv is not None else H
+    assert HV >= H and HV % H == 0, f"HV ({HV}) must be >= H ({H}) and divisible by H"
+
     non_varlen_configs = [
-        # (B, T, H)
-        (2, 8192, 64),
-        (2, 32768, 64),
-        (4, 8192, 64),
-        (4, 32768, 64),
+        # (B, T, H, HV)
+        (2, 8192, H, HV),
+        (2, 32768, H, HV),
+        (4, 8192, H, HV),
+        (4, 32768, H, HV),
     ]
 
     varlen_configs = [
-        # (seq_lens, H) — realistic serving scenarios
-        # ~20-25 seqs, total 8k/32k, lengths vary 2-3x, H=64
-        (gen_varlen_seqs(8192, 20, seed=1), 64),
-        (gen_varlen_seqs(8192, 25, seed=2), 64),
-        (gen_varlen_seqs(32768, 20, seed=3), 64),
-        (gen_varlen_seqs(32768, 25, seed=4), 64),
+        # (seq_lens, H, HV)
+        (gen_varlen_seqs(8192, 20, seed=1), H, HV),
+        (gen_varlen_seqs(8192, 25, seed=2), H, HV),
+        (gen_varlen_seqs(32768, 20, seed=3), H, HV),
+        (gen_varlen_seqs(32768, 25, seed=4), H, HV),
     ]
 
     nv_res, vl_res = [], []
