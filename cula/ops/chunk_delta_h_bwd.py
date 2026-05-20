@@ -109,7 +109,7 @@ class ChunkDeltaRuleBwdDHUSm90:
         self.w_stage = 3
         self.gk_stage = 3
         self.dh_store_stage = 2
-        self.dv2_store_stage = 2
+        self.dv2_store_stage = 1
         self.io_dtype = cutlass.BFloat16
         self.acc_dtype = cutlass.Float32
         self.buffer_align_bytes = 128
@@ -198,6 +198,17 @@ class ChunkDeltaRuleBwdDHUSm90:
             )
         dht = cute.make_tensor(dht_ptr, final_layout)
         dh0 = cute.make_tensor(dh0_ptr, final_layout)
+        if cutlass.const_expr(self.transpose_state_layout):
+            dht_tma_layout = cute.make_layout(
+                (self.V, self.K, (self.H, N)),
+                stride=(self.K, 1, (self.K * self.V, self.H * self.K * self.V)),
+            )
+        else:
+            dht_tma_layout = cute.make_layout(
+                (self.V, self.K, (self.H, N)),
+                stride=(1, self.V, (self.K * self.V, self.H * self.K * self.V)),
+            )
+        dht_tma = cute.make_tensor(dht_ptr, dht_tma_layout)
 
         # TMA operand views. Varlen shifts the T dimension with domain_offset below.
         tk_layout = cute.make_layout((T, self.K, (self.H, B)), stride=(self.H * self.K, 1, (self.K, T * self.H * self.K)))
@@ -291,6 +302,11 @@ class ChunkDeltaRuleBwdDHUSm90:
             (self.BK, 1, self.gk_stage),
             stride=(1, self.BK, self.BK),
         )
+        dht_smem_layout = (
+            cute.make_layout((self.BV, self.BK), stride=(self.BK, 1))
+            if cutlass.const_expr(self.transpose_state_layout)
+            else cute.make_layout((self.BV, self.BK), stride=(1, self.BV))
+        )
         dh_smem_layout_staged = sm90_utils.make_smem_layout_epi(
             self.io_dtype,
             dh_smem_layout_enum,
@@ -337,6 +353,12 @@ class ChunkDeltaRuleBwdDHUSm90:
             cute.slice_(gk_smem_layout_staged, (None, None, 0)),
             (self.BK, 1),
         )
+        tma_atom_dht, tma_tensor_dht = cpasync.make_tiled_tma_atom(
+            tma_load_op,
+            dht_tma,
+            dht_smem_layout,
+            (self.BV, self.BK),
+        )
         tma_atom_dh, tma_tensor_dh = cpasync.make_tiled_tma_atom(
             tma_store_op,
             dh_tma,
@@ -355,6 +377,7 @@ class ChunkDeltaRuleBwdDHUSm90:
         self.tma_q_bytes = cute.size_in_bytes(self.io_dtype, cute.slice_(q_smem_layout_staged, (None, None, 0)))
         self.tma_w_bytes = cute.size_in_bytes(self.io_dtype, cute.slice_(w_smem_layout_staged, (None, None, 0)))
         self.tma_gk_bytes = cute.size_in_bytes(cutlass.Float32, cute.slice_(gk_smem_layout_staged, (None, None, 0)))
+        self.tma_dht_bytes = cute.size_in_bytes(cutlass.Float32, dht_smem_layout)
 
         # ===================== SharedStorage =====================
         @cute.struct
@@ -365,6 +388,7 @@ class ChunkDeltaRuleBwdDHUSm90:
             load_q_mbar: cute.struct.MemRange[Int64, self.q_stage * 2]
             load_w_mbar: cute.struct.MemRange[Int64, self.w_stage * 2]
             load_gk_mbar: cute.struct.MemRange[Int64, self.gk_stage * 2]
+            load_dht_mbar: cute.struct.MemRange[Int64, 2]
             store_dh_mbar: cute.struct.MemRange[Int64, self.dh_store_stage * 2]
             store_dv2_mbar: cute.struct.MemRange[Int64, self.dv2_store_stage * 2]
             sK: cute.struct.Align[
@@ -435,6 +459,9 @@ class ChunkDeltaRuleBwdDHUSm90:
             tma_tensor_w,
             tma_atom_gk,
             tma_tensor_gk,
+            tma_atom_dht,
+            tma_tensor_dht,
+            dht_smem_layout,
             tma_atom_dh,
             tma_tensor_dh,
             dh_smem_layout_staged,
@@ -479,6 +506,9 @@ class ChunkDeltaRuleBwdDHUSm90:
         tma_tensor_w: cute.Tensor,
         tma_atom_gk: cute.CopyAtom,
         tma_tensor_gk: cute.Tensor,
+        tma_atom_dht: cute.CopyAtom,
+        tma_tensor_dht: cute.Tensor,
+        dht_smem_layout: cute.Layout,
         tma_atom_dh: cute.CopyAtom,
         tma_tensor_dh: cute.Tensor,
         dh_smem_layout_staged: cute.ComposedLayout,
@@ -519,6 +549,7 @@ class ChunkDeltaRuleBwdDHUSm90:
         sW = storage.sW.get_tensor(w_smem_layout_staged.outer, swizzle=w_smem_layout_staged.inner)
         sDv2 = storage.sDv2.get_tensor(dv2_smem_layout_staged.outer, swizzle=dv2_smem_layout_staged.inner)
         sDh = storage.sDh.get_tensor(dh_smem_layout_staged.outer, swizzle=dh_smem_layout_staged.inner)
+        sDht = cute.make_tensor(cute.recast_ptr(storage.sDh.data_ptr(), dtype=cutlass.Float32), dht_smem_layout)
 
         # ===================== Pipelines =====================
         load_k_P, load_k_C = pipeline.PipelineTmaAsync.create(
@@ -564,6 +595,14 @@ class ChunkDeltaRuleBwdDHUSm90:
                 tx_count=self.tma_gk_bytes,
                 barrier_storage=storage.load_gk_mbar.data_ptr(),
             ).make_participants()
+        if cutlass.const_expr(self.use_dht):
+            load_dht_P, load_dht_C = pipeline.PipelineTmaAsync.create(
+                num_stages=1,
+                producer_group=make_thread_cooperative_group(1),
+                consumer_group=make_thread_cooperative_group(self.num_compute_warps),
+                tx_count=self.tma_dht_bytes,
+                barrier_storage=storage.load_dht_mbar.data_ptr(),
+            ).make_participants()
         store_dh_P, store_dh_C = pipeline.PipelineAsync.create(
             num_stages=self.dh_store_stage,
             producer_group=make_thread_cooperative_group(self.num_compute_threads),
@@ -590,6 +629,7 @@ class ChunkDeltaRuleBwdDHUSm90:
             tma_tensor_dv2_use = cute.domain_offset((0, tok_offset, (0, 0)), tma_tensor_dv2)
             if cutlass.const_expr(self.use_gk):
                 tma_tensor_gk_use = cute.domain_offset((0, tok_offset, (0, 0)), tma_tensor_gk)
+            tma_tensor_dht_use = tma_tensor_dht
         else:
             tma_tensor_k_use = tma_tensor_k
             tma_tensor_dv_use = tma_tensor_dv
@@ -600,6 +640,7 @@ class ChunkDeltaRuleBwdDHUSm90:
             tma_tensor_dv2_use = tma_tensor_dv2
             if cutlass.const_expr(self.use_gk):
                 tma_tensor_gk_use = tma_tensor_gk
+            tma_tensor_dht_use = tma_tensor_dht
 
         _, bSG_sK, bSG_gK = self._epilog_partition(
             tma_atom_k, tma_tensor_k_use[None, None, (hidx, data_bidx)], (self.BT, self.BK), sK
@@ -619,6 +660,10 @@ class ChunkDeltaRuleBwdDHUSm90:
         if cutlass.const_expr(self.use_gk):
             _, bSG_sGK, bSG_gGK = self._epilog_partition(
                 tma_atom_gk, tma_tensor_gk_use[None, None, (hidx, data_bidx)], (self.BK, 1), sGK
+            )
+        if cutlass.const_expr(self.use_dht):
+            _, bSG_sDht, bSG_gDht = self._epilog_partition(
+                tma_atom_dht, tma_tensor_dht_use[None, None, (hidx, bidx)], (self.BV, self.BK), sDht
             )
         _, bSG_sDh, bSG_gDh = self._epilog_partition(
             tma_atom_dh, tma_tensor_dh_use[None, None, (None, hidx, data_bidx)], (self.BV, self.BK), sDh
@@ -688,19 +733,6 @@ class ChunkDeltaRuleBwdDHUSm90:
         rDh_shape = cute.shape(thr_copy_dh_r2s.partition_S(sDh))
         tRS_rDh_layout = cute.make_layout(rDh_shape[:3])
 
-        # Initialize carried dh state in registers.
-        if is_compute_warp:
-            for ei in cutlass.range(cute.size(rState), unroll_full=True):
-                v_rel, k_rel = tUcState[ei]
-                v_idx = v_tile_base + v_rel
-                init = Float32(0.0)
-                if cutlass.const_expr(self.use_dht):
-                    if cutlass.const_expr(self.transpose_state_layout):
-                        init = dht[bidx, hidx, v_idx, k_rel].to(self.acc_dtype)
-                    else:
-                        init = dht[bidx, hidx, k_rel, v_idx].to(self.acc_dtype)
-                rState[ei] = init
-
         # =========================================================================
         # WARP SPECIALIZATION
         #   load_warp_id         : preloads K, dv, and optional gk for the next reverse chunk
@@ -716,6 +748,15 @@ class ChunkDeltaRuleBwdDHUSm90:
             cpasync.prefetch_descriptor(tma_atom_dv)
             if cutlass.const_expr(self.use_gk):
                 cpasync.prefetch_descriptor(tma_atom_gk)
+            if cutlass.const_expr(self.use_dht):
+                cpasync.prefetch_descriptor(tma_atom_dht)
+                dht_h = load_dht_P.acquire_and_advance()
+                cute.copy(
+                    tma_atom_dht,
+                    bSG_gDht[(None, v_tile_idx, 0)],
+                    bSG_sDht[None],
+                    tma_bar_ptr=dht_h.barrier,
+                )
 
             if NT > 0:
                 first_chunk = NT - 1
@@ -777,6 +818,20 @@ class ChunkDeltaRuleBwdDHUSm90:
                 cute.copy(tma_atom_w, bSG_gW[(None, 0, chunk_idx)], bSG_sW[None, w_h.index], tma_bar_ptr=w_h.barrier)
 
         elif is_compute_warp:
+            # Initialize carried dh state in registers.  dht is loaded by the
+            # load warp into the sDh backing buffer before sDh is used for
+            # per-chunk output stores.
+            if cutlass.const_expr(self.use_dht):
+                dht_h = load_dht_C.wait_and_advance()
+            for ei in cutlass.range(cute.size(rState), unroll_full=True):
+                v_rel, k_rel = tUcState[ei]
+                init = Float32(0.0)
+                if cutlass.const_expr(self.use_dht):
+                    init = sDht[v_rel, k_rel].to(self.acc_dtype)
+                rState[ei] = init
+            if cutlass.const_expr(self.use_dht):
+                dht_h.release()
+
             for chunk_rev in cutlass.range(0, NT, unroll=0):
                 chunk_idx = NT - 1 - chunk_rev
                 chunk_start = chunk_idx * self.BT
