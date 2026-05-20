@@ -2234,6 +2234,10 @@ def main():
 
     all_pass = True
 
+    # For GVA (H != HV), expand k to HV heads for reference comparison
+    G = HV // H
+    k_ref = k.repeat_interleave(G, dim=2) if G > 1 else k
+
     # ===== Test 1: No gating, no h0 =====
     print("\n" + "=" * 60)
     print("Test 1: No gating, no h0")
@@ -2242,7 +2246,7 @@ def main():
     h0_z = torch.zeros(B, HV, K, V, device="cuda", dtype=torch.float32)
 
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_z, h0_z, 0, 0, 0, 0)
-    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, h0=None, chunk_size=BT)
+    _, h_ref_bf16 = reference_bf16_roundtrip(k_ref, w, u, h0=None, chunk_size=BT)
 
     max_diff = 0.0
     for t in range(min(NT - 1, len(h_ref_bf16))):
@@ -2263,7 +2267,7 @@ def main():
     h0_val = torch.randn(B, HV, K, V, device="cuda", dtype=torch.float32) * 0.01
 
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_val, h0_val, 0, 1, 1, 0)
-    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, gk=gk_val, h0=h0_val, chunk_size=BT)
+    _, h_ref_bf16 = reference_bf16_roundtrip(k_ref, w, u, gk=gk_val, h0=h0_val, chunk_size=BT)
 
     max_diff = 0.0
     for t in range(min(NT - 1, len(h_ref_bf16))):
@@ -2280,11 +2284,10 @@ def main():
     gk_val = torch.randn(B, T, HV, K, device="cuda", dtype=torch.float32) * 0.1
     gk_val = -torch.abs(gk_val)
     gk_val = gk_val.cumsum(dim=1)
-    # Pre-scale by RCP_LN2 to match KDA convention (kernel does exp2 directly)
     gk_val = gk_val * INV_LN2
 
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_val, h0_z, 0, 1, 0, 0)
-    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, gk=gk_val, h0=None, chunk_size=BT)
+    _, h_ref_bf16 = reference_bf16_roundtrip(k_ref, w, u, gk=gk_val, h0=None, chunk_size=BT)
 
     max_diff = 0.0
     for t in range(min(NT - 1, len(h_ref_bf16))):
@@ -2301,7 +2304,7 @@ def main():
     h0_val = torch.randn(B, HV, K, V, device="cuda", dtype=torch.float32) * 0.01
 
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_z, h0_val, 0, 0, 1, 0)
-    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, h0=h0_val, chunk_size=BT)
+    _, h_ref_bf16 = reference_bf16_roundtrip(k_ref, w, u, h0=h0_val, chunk_size=BT)
 
     # h_out[0] should be h0 (bf16 rounded)
     h0_bf16 = h0_val.to(torch.bfloat16)
@@ -2322,12 +2325,9 @@ def main():
     print("Test 5: store_final_state")
 
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_z, h0_z, 0, 0, 0, 1)
-    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, h0=None, chunk_size=BT)
+    _, h_ref_bf16 = reference_bf16_roundtrip(k_ref, w, u, h0=None, chunk_size=BT)
 
-    # ht should match the last h_ref (after all chunks)
-    ht_ref = h_ref_bf16[-1]  # last chunk's state
-    # ht layout: (B, H, K, V) but kernel writes in transposed (V, K) format
-    # Compare ht[0, 0] with ht_ref
+    ht_ref = h_ref_bf16[-1]
     d_ht = (ht[0, 0].float() - ht_ref.float()).abs().max().item()
     print(f"  ht vs ref: {d_ht:.6f}")
     t5_pass = d_ht < 0.5
@@ -2339,7 +2339,7 @@ def main():
     print("Test 6: gk + h0 + ht (all features)")
 
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_val, h0_val, 0, 1, 1, 1)
-    _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, gk=gk_val, h0=h0_val, chunk_size=BT)
+    _, h_ref_bf16 = reference_bf16_roundtrip(k_ref, w, u, gk=gk_val, h0=h0_val, chunk_size=BT)
 
     max_diff = 0.0
     for t in range(min(NT - 1, len(h_ref_bf16))):
@@ -2387,7 +2387,7 @@ def main():
     print("Test 8: v_new output (no gating)")
 
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_z, h0_z, 0, 0, 0, 0, do_save_vnew=1)
-    vnew_ref, _ = reference_bf16_roundtrip(k, w, u, h0=None, chunk_size=BT)
+    vnew_ref, _ = reference_bf16_roundtrip(k_ref, w, u, h0=None, chunk_size=BT)
 
     d_vnew = (v_new.float() - vnew_ref.float()).abs().max().item()
     print(f"  v_new max diff: {d_vnew:.6f}")
@@ -2400,7 +2400,7 @@ def main():
     print("Test 9: v_new output (with gk gating)")
 
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_val, h0_z, 0, 1, 0, 0, do_save_vnew=1)
-    vnew_ref, _ = reference_bf16_roundtrip(k, w, u, gk=gk_val, h0=None, chunk_size=BT)
+    vnew_ref, _ = reference_bf16_roundtrip(k_ref, w, u, gk=gk_val, h0=None, chunk_size=BT)
 
     d_vnew = (v_new.float() - vnew_ref.float()).abs().max().item()
     print(f"  v_new max diff: {d_vnew:.6f}")
@@ -2430,12 +2430,13 @@ def main():
 
     # ===== Benchmark =====
     print("\n" + "=" * 60)
-    print("Benchmark: B=4, T=4096, H=64, K=128, V=128")
-    Bb, Tb, Hb = 4, 4096, 64
+    hv_tag = f"/{HV}" if HV != H else ""
+    print(f"Benchmark: B=4, T=4096, H={H}{hv_tag}, K=128, V=128")
+    Bb, Tb = 4, 4096
     torch.manual_seed(999)
-    kb = torch.randn(Bb, Tb, Hb, K, device="cuda", dtype=torch.bfloat16) * 0.1
-    wb = torch.randn(Bb, Tb, Hb, K, device="cuda", dtype=torch.bfloat16) * 0.1
-    ub = torch.randn(Bb, Tb, Hb, V, device="cuda", dtype=torch.bfloat16) * 0.1
+    kb = torch.randn(Bb, Tb, H, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    wb = torch.randn(Bb, Tb, HV, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    ub = torch.randn(Bb, Tb, HV, V, device="cuda", dtype=torch.bfloat16) * 0.1
 
     def run_bench():
         chunk_gated_delta_rule_fwd_h(
