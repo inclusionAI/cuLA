@@ -209,6 +209,7 @@ class ChunkDeltaRuleBwdDHUSm90:
                 stride=(1, self.V, (self.K * self.V, self.H * self.K * self.V)),
             )
         dht_tma = cute.make_tensor(dht_ptr, dht_tma_layout)
+        dh0_tma = cute.make_tensor(dh0_ptr, dht_tma_layout)
 
         # TMA operand views. Varlen shifts the T dimension with domain_offset below.
         tk_layout = cute.make_layout((T, self.K, (self.H, B)), stride=(self.H * self.K, 1, (self.K, T * self.H * self.K)))
@@ -359,6 +360,12 @@ class ChunkDeltaRuleBwdDHUSm90:
             dht_smem_layout,
             (self.BV, self.BK),
         )
+        tma_atom_dh0, tma_tensor_dh0 = cpasync.make_tiled_tma_atom(
+            tma_store_op,
+            dh0_tma,
+            dht_smem_layout,
+            (self.BV, self.BK),
+        )
         tma_atom_dh, tma_tensor_dh = cpasync.make_tiled_tma_atom(
             tma_store_op,
             dh_tma,
@@ -390,6 +397,7 @@ class ChunkDeltaRuleBwdDHUSm90:
             load_gk_mbar: cute.struct.MemRange[Int64, self.gk_stage * 2]
             load_dht_mbar: cute.struct.MemRange[Int64, 2]
             store_dh_mbar: cute.struct.MemRange[Int64, self.dh_store_stage * 2]
+            store_dh0_mbar: cute.struct.MemRange[Int64, 2]
             store_dv2_mbar: cute.struct.MemRange[Int64, self.dv2_store_stage * 2]
             sK: cute.struct.Align[
                 cute.struct.MemRange[self.io_dtype, cute.cosize(k_smem_layout_staged)],
@@ -461,6 +469,8 @@ class ChunkDeltaRuleBwdDHUSm90:
             tma_tensor_gk,
             tma_atom_dht,
             tma_tensor_dht,
+            tma_atom_dh0,
+            tma_tensor_dh0,
             dht_smem_layout,
             tma_atom_dh,
             tma_tensor_dh,
@@ -508,6 +518,8 @@ class ChunkDeltaRuleBwdDHUSm90:
         tma_tensor_gk: cute.Tensor,
         tma_atom_dht: cute.CopyAtom,
         tma_tensor_dht: cute.Tensor,
+        tma_atom_dh0: cute.CopyAtom,
+        tma_tensor_dh0: cute.Tensor,
         dht_smem_layout: cute.Layout,
         tma_atom_dh: cute.CopyAtom,
         tma_tensor_dh: cute.Tensor,
@@ -550,6 +562,7 @@ class ChunkDeltaRuleBwdDHUSm90:
         sDv2 = storage.sDv2.get_tensor(dv2_smem_layout_staged.outer, swizzle=dv2_smem_layout_staged.inner)
         sDh = storage.sDh.get_tensor(dh_smem_layout_staged.outer, swizzle=dh_smem_layout_staged.inner)
         sDht = cute.make_tensor(cute.recast_ptr(storage.sDh.data_ptr(), dtype=cutlass.Float32), dht_smem_layout)
+        sDh0 = cute.make_tensor(cute.recast_ptr(storage.sK.data_ptr(), dtype=cutlass.Float32), dht_smem_layout)
 
         # ===================== Pipelines =====================
         load_k_P, load_k_C = pipeline.PipelineTmaAsync.create(
@@ -602,6 +615,13 @@ class ChunkDeltaRuleBwdDHUSm90:
                 consumer_group=make_thread_cooperative_group(self.num_compute_warps),
                 tx_count=self.tma_dht_bytes,
                 barrier_storage=storage.load_dht_mbar.data_ptr(),
+            ).make_participants()
+        if cutlass.const_expr(self.use_dh0):
+            store_dh0_P, store_dh0_C = pipeline.PipelineAsync.create(
+                num_stages=1,
+                producer_group=make_thread_cooperative_group(self.num_compute_threads),
+                consumer_group=make_thread_cooperative_group(self.threads_per_warp),
+                barrier_storage=storage.store_dh0_mbar.data_ptr(),
             ).make_participants()
         store_dh_P, store_dh_C = pipeline.PipelineAsync.create(
             num_stages=self.dh_store_stage,
@@ -664,6 +684,10 @@ class ChunkDeltaRuleBwdDHUSm90:
         if cutlass.const_expr(self.use_dht):
             _, bSG_sDht, bSG_gDht = self._epilog_partition(
                 tma_atom_dht, tma_tensor_dht_use[None, None, (hidx, bidx)], (self.BV, self.BK), sDht
+            )
+        if cutlass.const_expr(self.use_dh0):
+            _, bSG_sDh0, bSG_gDh0 = self._epilog_partition(
+                tma_atom_dh0, tma_tensor_dh0[None, None, (hidx, bidx)], (self.BV, self.BK), sDh0
             )
         _, bSG_sDh, bSG_gDh = self._epilog_partition(
             tma_atom_dh, tma_tensor_dh_use[None, None, (None, hidx, data_bidx)], (self.BV, self.BK), sDh
@@ -897,13 +921,28 @@ class ChunkDeltaRuleBwdDHUSm90:
                                 g_exp = cute.exp(g_cur, fastmath=self.use_fast_math)
                         sG[local_tidx, 0] = g_decay
                         sG[local_tidx, 1] = g_exp
-                if cutlass.const_expr((not self.use_g) and (not self.is_varlen)):
+                if cutlass.const_expr(not self.use_g):
                     # Phase 3 is independent of K@dh, so overlap QDO and optional gk decay
-                    # with the first GEMM in the no-scalar-g non-varlen fast path.
+                    # with the first GEMM in the no-scalar-g fast path.  For
+                    # varlen tails, zero padded do positions before QDO so TMA
+                    # overfetch into the next sequence cannot contribute.
                     do_wait_early = load_do_C.wait_and_advance()
                     q_wait_early = load_q_C.wait_and_advance()
                     if cutlass.const_expr(self.use_gk):
                         gk_wait_early = load_gk_C.wait_and_advance()
+                    if cutlass.const_expr(self.is_varlen):
+                        if remaining < self.BT:
+                            linear_do = local_tidx
+                            while linear_do < self.BV * self.BT:
+                                v_rel = linear_do // self.BT
+                                t_rel = linear_do - v_rel * self.BT
+                                t_idx = chunk_start + t_rel
+                                do_scaled = Float32(0.0)
+                                if t_idx < seq_len:
+                                    do_scaled = sDo[v_rel, t_rel, do_wait_early.index].to(self.acc_dtype)
+                                sDo[v_rel, t_rel, do_wait_early.index] = do_scaled.to(self.io_dtype)
+                                linear_do += self.num_compute_threads
+                            cute.arch.barrier(barrier_id=2, number_of_threads=self.num_compute_threads)
                     acc_qdo.fill(0.0)
                     cute.nvgpu.warpgroup.fence()
                     for kp in cutlass.range(cute.size(tUrDo, mode=[2]), unroll_full=True):
@@ -958,7 +997,7 @@ class ChunkDeltaRuleBwdDHUSm90:
                 # ========================================
                 # Phase 3/4: dh += scale * do^T @ q - dv2^T @ w
                 # ========================================
-                if cutlass.const_expr((not self.use_g) and (not self.is_varlen)):
+                if cutlass.const_expr(not self.use_g):
                     w_wait = load_w_C.wait_and_advance()
                     acc_wdv.fill(0.0)
                     cute.nvgpu.warpgroup.fence()
@@ -1001,17 +1040,18 @@ class ChunkDeltaRuleBwdDHUSm90:
                         do_wait.release()
                     if cutlass.const_expr((not self.use_g) and self.is_varlen):
                         # Phase 3a: zero padded do positions in SMEM for varlen tails.
-                        linear_do = local_tidx
-                        while linear_do < self.BV * self.BT:
-                            v_rel = linear_do // self.BT
-                            t_rel = linear_do - v_rel * self.BT
-                            t_idx = chunk_start + t_rel
-                            do_scaled = Float32(0.0)
-                            if t_idx < seq_len:
-                                do_scaled = sDo[v_rel, t_rel, do_wait.index].to(self.acc_dtype)
-                            sDo[v_rel, t_rel, do_wait.index] = do_scaled.to(self.io_dtype)
-                            linear_do += self.num_compute_threads
-                        cute.arch.barrier(barrier_id=2, number_of_threads=self.num_compute_threads)
+                        if remaining < self.BT:
+                            linear_do = local_tidx
+                            while linear_do < self.BV * self.BT:
+                                v_rel = linear_do // self.BT
+                                t_rel = linear_do - v_rel * self.BT
+                                t_idx = chunk_start + t_rel
+                                do_scaled = Float32(0.0)
+                                if t_idx < seq_len:
+                                    do_scaled = sDo[v_rel, t_rel, do_wait.index].to(self.acc_dtype)
+                                sDo[v_rel, t_rel, do_wait.index] = do_scaled.to(self.io_dtype)
+                                linear_do += self.num_compute_threads
+                            cute.arch.barrier(barrier_id=2, number_of_threads=self.num_compute_threads)
 
                     # Phase 3b: QDO plus scalar/key decay while QDO is in flight.
                     q_wait = load_q_C.wait_and_advance()
@@ -1084,17 +1124,18 @@ class ChunkDeltaRuleBwdDHUSm90:
                         do_wait.release()
 
             if cutlass.const_expr(self.use_dh0):
+                dh0_h = store_dh0_P.acquire_and_advance()
                 for ei in cutlass.range(cute.size(rState), unroll_full=True):
                     v_rel, k_rel = tUcState[ei]
-                    v_idx = v_tile_base + v_rel
-                    if cutlass.const_expr(self.transpose_state_layout):
-                        dh0[bidx, hidx, v_idx, k_rel] = rState[ei]
-                    else:
-                        dh0[bidx, hidx, k_rel, v_idx] = rState[ei]
+                    sDh0[v_rel, k_rel] = rState[ei]
+                cute.arch.fence_proxy("async.shared", space="cta")
+                dh0_h.commit()
 
         elif warp_idx == self.store_warp_id:
             cpasync.prefetch_descriptor(tma_atom_dh)
             cpasync.prefetch_descriptor(tma_atom_dv2)
+            if cutlass.const_expr(self.use_dh0):
+                cpasync.prefetch_descriptor(tma_atom_dh0)
 
             for chunk_rev in cutlass.range(0, NT, unroll=0):
                 chunk_idx = NT - 1 - chunk_rev
@@ -1121,6 +1162,13 @@ class ChunkDeltaRuleBwdDHUSm90:
                     cute.arch.cp_async_bulk_commit_group()
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
                 dv2_store_h.release()
+
+            if cutlass.const_expr(self.use_dh0):
+                dh0_h = store_dh0_C.wait_and_advance()
+                cute.copy(tma_atom_dh0, bSG_sDh0[None], bSG_gDh0[(None, v_tile_idx, 0)])
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                dh0_h.release()
 
     @cute.jit
     def _epilog_partition(self, atom, gC_mnl, epi_tile, sC):
