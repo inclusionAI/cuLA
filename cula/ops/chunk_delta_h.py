@@ -192,7 +192,7 @@ class ChunkDeltaRuleFwdH:
             )
         return wh_off, state_off, vnew_off, kv_off, total
 
-    def _compute_grid(self, B, H, V):
+    def _compute_grid(self, B, HV, V):
         num_v_tiles = (V + self.BV - 1) // self.BV
         if self.is_varlen:
             if self.persistent:
@@ -202,26 +202,26 @@ class ChunkDeltaRuleFwdH:
                 return (sm_count, 1, 1)
             else:
                 # Non-persistent: one CTA per work unit, free HW scheduling
-                total_work_units = num_v_tiles * H * B
+                total_work_units = num_v_tiles * HV * B
                 return (total_work_units, 1, 1)
-        return (num_v_tiles, H, B)
+        return (num_v_tiles, HV, B)
 
     @cute.jit
     def __call__(
         self,
         k_in: cute.Tensor,  # [B, T, H, K] or [T_total, H, K]
-        w_in: cute.Tensor,  # [B, T, H, K] or [T_total, H, K]
-        u_in: cute.Tensor,  # [B, T, H, V] or [T_total, H, V]
-        g_in: cute.Tensor,  # [B, T, H] or [T_total, H] (fp32, unused currently)
-        gk_in: cute.Tensor,  # [B, T, H, K] or [T_total, H, K] (fp32)
-        h_out_in: cute.Tensor,  # [B, NT, H, K, V] or [NT_total, H, K, V]
-        v_new_in: cute.Tensor,  # [B, T, H, V] or [T_total, H, V]
-        h0_in: cute.Tensor,  # [B, H, K, V] (fp32)
-        ht_in: cute.Tensor,  # [B, H, K, V]
+        w_in: cute.Tensor,  # [B, T, HV, K] or [T_total, HV, K]
+        u_in: cute.Tensor,  # [B, T, HV, V] or [T_total, HV, V]
+        g_in: cute.Tensor,  # [B, T, HV] or [T_total, HV] (fp32, unused currently)
+        gk_in: cute.Tensor,  # [B, T, HV, K] or [T_total, HV, K] (fp32)
+        h_out_in: cute.Tensor,  # [B, NT, HV, K, V] or [NT_total, HV, K, V]
+        v_new_in: cute.Tensor,  # [B, T, HV, V] or [T_total, HV, V]
+        h0_in: cute.Tensor,  # [B, HV, K, V] (fp32)
+        ht_in: cute.Tensor,  # [B, HV, K, V]
         cu_seqlens_in: cute.Tensor,  # [N+1] int32
         chunk_offsets_in: cute.Tensor,  # [N+1] int32
         workspace_in: cute.Tensor,  # workspace buffer
-        problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
+        problem_size: tuple[Int32, Int32, Int32, Int32, Int32, Int32],
         total_nt: Int32,
         use_g: Int32,
         use_gk: Int32,
@@ -243,7 +243,7 @@ class ChunkDeltaRuleFwdH:
         chunk_offsets_ptr = chunk_offsets_in.iterator
         workspace_ptr = workspace_in.iterator
 
-        B, T, H, K, V = problem_size
+        B, T, H, HV, K, V = problem_size
 
         # For varlen: B=num_seqs, T=total_tokens, data tensors use data_B=1.
         # For non-varlen: data_B=B, NT=ceil(T/BT).
@@ -259,34 +259,34 @@ class ChunkDeltaRuleFwdH:
         kt_layout = cute.make_layout((K, T, (H, data_B)), stride=(1, H * K, (K, T * H * K)))
         kt = cute.make_tensor(k_ptr, kt_layout)
 
-        w_layout = cute.make_layout((T, K, (H, data_B)), stride=(H * K, 1, (K, T * H * K)))
+        w_layout = cute.make_layout((T, K, (HV, data_B)), stride=(HV * K, 1, (K, T * HV * K)))
         w = cute.make_tensor(w_ptr, w_layout)
 
-        u_layout = cute.make_layout((T, V, (H, data_B)), stride=(H * V, 1, (V, T * H * V)))
+        u_layout = cute.make_layout((T, V, (HV, data_B)), stride=(HV * V, 1, (V, T * HV * V)))
         u = cute.make_tensor(u_ptr, u_layout)
 
         v_new = cute.make_tensor(v_new_ptr, u_layout)
 
         # h_out: for varlen, NT=total_chunks and data_B=1; for non-varlen, NT=per-seq chunks and data_B=B
         h_out_T_layout = cute.make_layout(
-            (V, K, (NT, H, data_B)),
-            stride=(1, V, (H * K * V, K * V, NT * H * K * V)),
+            (V, K, (NT, HV, data_B)),
+            stride=(1, V, (HV * K * V, K * V, NT * HV * K * V)),
         )
         h_out_T = cute.make_tensor(h_out_ptr, h_out_T_layout)
 
         # h0/ht always use B=num_seqs (same for both varlen and non-varlen)
-        h0_layout = cute.make_layout((K, V, (H, B)), stride=(V, 1, (K * V, H * K * V)))
+        h0_layout = cute.make_layout((K, V, (HV, B)), stride=(V, 1, (K * V, HV * K * V)))
         h0 = cute.make_tensor(h0_ptr, h0_layout)
 
-        ht_T_layout = cute.make_layout((V, K, (H, B)), stride=(1, V, (K * V, H * K * V)))
+        ht_T_layout = cute.make_layout((V, K, (HV, B)), stride=(1, V, (K * V, HV * K * V)))
         ht_T = cute.make_tensor(ht_ptr, ht_T_layout)
 
         # gk K-first view for TMA: (K, T, (H, data_B)) with K contiguous
-        gk_K_layout = cute.make_layout((K, T, (H, data_B)), stride=(1, H * K, (K, T * H * K)))
+        gk_K_layout = cute.make_layout((K, T, (HV, data_B)), stride=(1, HV * K, (K, T * HV * K)))
         gk_K = cute.make_tensor(gk_ptr, gk_K_layout)
 
         # Transposed U view: (V, T, (H, data_B)) to match WH acc shape (M=BV, N=BT)
-        u_T_layout = cute.make_layout((V, T, (H, data_B)), stride=(1, H * V, (V, T * H * V)))
+        u_T_layout = cute.make_layout((V, T, (HV, data_B)), stride=(1, HV * V, (V, T * HV * V)))
         u_T = cute.make_tensor(u_ptr, u_T_layout)
 
         self.k_dtype = kt.element_type
@@ -432,8 +432,8 @@ class ChunkDeltaRuleFwdH:
 
         # v_new transposed GMEM view: (V, T, (H, data_B)) for TMA store
         v_new_T_layout = cute.make_layout(
-            (V, T, (H, data_B)),
-            stride=(1, H * V, (V, T * H * V)),
+            (V, T, (HV, data_B)),
+            stride=(1, HV * V, (V, T * HV * V)),
         )
         v_new_T = cute.make_tensor(v_new_ptr, v_new_T_layout)
 
@@ -557,7 +557,7 @@ class ChunkDeltaRuleFwdH:
             sched_consumed_mbar: cute.struct.MemRange[Int64, 2]
 
         self.shared_storage = SharedStorage
-        self.grid = self._compute_grid(B, H, V)
+        self.grid = self._compute_grid(B, HV, V)
 
         self.kernel(
             wh_tiled_mma,
@@ -642,7 +642,7 @@ class ChunkDeltaRuleFwdH:
         cu_seqlens: cute.Tensor,
         chunk_offsets: cute.Tensor,
         workspace_iter: cute.Pointer,
-        problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
+        problem_size: tuple[Int32, Int32, Int32, Int32, Int32, Int32],
         use_gk: Int32,
         use_initial_state: Int32,
         store_final_state: Int32,
@@ -819,7 +819,7 @@ class ChunkDeltaRuleFwdH:
         tCtAccKV = cute.make_tensor(tmem_ptr + self.tmem_kv_off, tCtAccKV_fake.layout)
 
         # ===================== Block indices =====================
-        B, T, H, K, V = problem_size
+        B, T, H, HV, K, V = problem_size
         BT = self.BT
 
         if cutlass.const_expr(self.is_varlen):
@@ -828,7 +828,7 @@ class ChunkDeltaRuleFwdH:
             block_idx_x = cute.arch.block_idx()[0]
             grid_dim_x = cute.arch.grid_dim()[0]
             num_v_tiles = (V + self.BV - 1) // self.BV
-            total_work_units = num_v_tiles * H * B
+            total_work_units = num_v_tiles * HV * B
             if cutlass.const_expr(self.persistent):
                 # Dynamic scheduling: while loop uses work_idx < total_work_units
                 num_iters = Int32(0)  # not used, while loop controls iteration
@@ -838,6 +838,7 @@ class ChunkDeltaRuleFwdH:
             work_idx = Int32(0)
             v_tile_idx = Int32(0)
             hidx = Int32(0)
+            i_h = Int32(0)
             bidx = Int32(0)
             tok_offset = Int32(0)
             seq_len = Int32(0)
@@ -846,6 +847,7 @@ class ChunkDeltaRuleFwdH:
             chunk_off = Int32(0)
         else:
             (v_tile_idx, hidx, bidx) = cute.arch.block_idx()
+            i_h = hidx // (HV // H)
             tok_offset = Int32(0)
             seq_len = T
             NT = (T + BT - 1) // BT
@@ -907,8 +909,9 @@ class ChunkDeltaRuleFwdH:
                         work_idx = block_idx_x + wu_iter * grid_dim_x
                     v_tile_idx = work_idx % num_v_tiles
                     temp_work = work_idx // num_v_tiles
-                    hidx = temp_work % H
-                    bidx = temp_work // H
+                    hidx = temp_work % HV
+                    bidx = temp_work // HV
+                    i_h = hidx // (HV // H)
                     tok_offset = cu_seqlens[bidx]
                     seq_len = cu_seqlens[bidx + 1] - tok_offset
                     NT = (seq_len + BT - 1) // BT
@@ -946,7 +949,7 @@ class ChunkDeltaRuleFwdH:
                     self.kv_mma_tiler,
                     kv_tiled_mma,
                     data_bidx,
-                    hidx,
+                    i_h,
                 )
 
                 # U TMA load partition (non-MMA, epilog-style)
@@ -1087,7 +1090,7 @@ class ChunkDeltaRuleFwdH:
                 if cutlass.const_expr(self.is_varlen):
                     if cutlass.const_expr(not self.persistent):
                         work_idx = block_idx_x + wu_iter * grid_dim_x
-                    bidx_mma = (work_idx // num_v_tiles) // H
+                    bidx_mma = (work_idx // num_v_tiles) // HV
                     tok_off_mma = cu_seqlens[bidx_mma]
                     NT = (cu_seqlens[bidx_mma + 1] - tok_off_mma + BT - 1) // BT
                     if cutlass.const_expr(PRINT_DEBUG):
@@ -1280,8 +1283,9 @@ class ChunkDeltaRuleFwdH:
                         work_idx = block_idx_x + wu_iter * grid_dim_x
                     v_tile_idx = work_idx % num_v_tiles
                     temp_work = work_idx // num_v_tiles
-                    hidx = temp_work % H
-                    bidx = temp_work // H
+                    hidx = temp_work % HV
+                    bidx = temp_work // HV
+                    i_h = hidx // (HV // H)
                     tok_offset = cu_seqlens[bidx]
                     seq_len = cu_seqlens[bidx + 1] - tok_offset
                     NT = (seq_len + BT - 1) // BT
@@ -1494,8 +1498,9 @@ class ChunkDeltaRuleFwdH:
                         work_idx = block_idx_x + wu_iter * grid_dim_x
                     v_tile_idx = work_idx % num_v_tiles
                     temp_work = work_idx // num_v_tiles
-                    hidx = temp_work % H
-                    bidx = temp_work // H
+                    hidx = temp_work % HV
+                    bidx = temp_work // HV
+                    i_h = hidx // (HV // H)
                     tok_offset = cu_seqlens[bidx]
                     seq_len = cu_seqlens[bidx + 1] - tok_offset
                     NT = (seq_len + BT - 1) // BT
@@ -1582,7 +1587,7 @@ class ChunkDeltaRuleFwdH:
                                 # Construct GMEM tile for this chunk
                                 vnew_chunk_raw = (
                                     v_new_tensor.iterator
-                                    + (tok_offset + chunk_idx * BT) * H * V
+                                    + (tok_offset + chunk_idx * BT) * HV * V
                                     + hidx * V
                                     + v_tile_idx * self.BV
                                 )
@@ -1593,7 +1598,7 @@ class ChunkDeltaRuleFwdH:
                                     assumed_align=16,
                                 )
                                 vnew_stride_t = cute.assume(
-                                    H * V,
+                                    HV * V,
                                     divby=128 // self.io_dtype.width,
                                 )
                                 gVnew_chunk = cute.make_tensor(
@@ -1792,11 +1797,11 @@ def reference_bf16_roundtrip(k, w, u, g=None, gk=None, h0=None, chunk_size=64):
 # Compile cache + TVM-FFI API
 # ---------------------------------------------------------------------------
 
-# Internal cache: maps (is_varlen, persistent, H, K, V, chunk_size) → compiled_fn
+# Internal cache: maps (is_varlen, persistent, H, HV, K, V, chunk_size) → compiled_fn
 _delta_h_kernel_cache: dict = {}
 
 
-def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size, use_fast_math):
+def _compile_delta_h_variant(is_varlen, persistent, H, HV, K, V, chunk_size, use_fast_math):
     """Compile one ChunkDeltaRuleFwdH kernel variant. Returns the compiled TVM-FFI callable.
 
     Uses make_fake_compact_tensor and make_fake_stream for compilation with
@@ -1825,7 +1830,7 @@ def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size, use_fas
     sym_ns = cute.sym_int()  # num_seqs (varlen h0/ht) or B (non-varlen, == sym_a)
 
     if is_varlen:
-        # varlen: data tensors are [T_total, H, ...] (3D)
+        # varlen: data tensors are [T_total, H/HV, ...] (3D)
         k_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
             (sym_a, H, K),
@@ -1834,42 +1839,42 @@ def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size, use_fas
         )
         w_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (sym_a, H, K),
+            (sym_a, HV, K),
             stride_order=(2, 1, 0),
             assumed_align=128,
         )
         u_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (sym_a, H, V),
+            (sym_a, HV, V),
             stride_order=(2, 1, 0),
             assumed_align=128,
         )
         g_fake = make_fake_compact_tensor(
             cutlass.Float32,
-            (sym_a, H),
+            (sym_a, HV),
             stride_order=(1, 0),
             assumed_align=128,
         )
         gk_fake = make_fake_compact_tensor(
             cutlass.Float32,
-            (sym_a, H, K),
+            (sym_a, HV, K),
             stride_order=(2, 1, 0),
             assumed_align=128,
         )
         v_new_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (sym_a, H, V),
+            (sym_a, HV, V),
             stride_order=(2, 1, 0),
             assumed_align=128,
         )
         h_out_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (sym_nt, H, K, V),
+            (sym_nt, HV, K, V),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
     else:
-        # non-varlen: data tensors are [B, T, H, ...] (4D)
+        # non-varlen: data tensors are [B, T, H/HV, ...] (4D)
         k_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
             (sym_a, sym_b, H, K),
@@ -1878,52 +1883,52 @@ def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size, use_fas
         )
         w_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (sym_a, sym_b, H, K),
+            (sym_a, sym_b, HV, K),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
         u_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (sym_a, sym_b, H, V),
+            (sym_a, sym_b, HV, V),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
         g_fake = make_fake_compact_tensor(
             cutlass.Float32,
-            (sym_a, sym_b, H),
+            (sym_a, sym_b, HV),
             stride_order=(2, 1, 0),
             assumed_align=128,
         )
         gk_fake = make_fake_compact_tensor(
             cutlass.Float32,
-            (sym_a, sym_b, H, K),
+            (sym_a, sym_b, HV, K),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
         v_new_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (sym_a, sym_b, H, V),
+            (sym_a, sym_b, HV, V),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
         h_out_fake = make_fake_compact_tensor(
             cutlass.BFloat16,
-            (sym_a, sym_nt, H, K, V),
+            (sym_a, sym_nt, HV, K, V),
             stride_order=(4, 3, 2, 1, 0),
             assumed_align=128,
         )
 
-    # h0/ht use [B, H, K, V] (non-varlen) or [num_seqs, H, K, V] (varlen)
+    # h0/ht use [B, HV, K, V] (non-varlen) or [num_seqs, HV, K, V] (varlen)
     # In varlen mode, num_seqs != T_total, so use a separate sym_ns
     h0_fake = make_fake_compact_tensor(
         cutlass.Float32,
-        (sym_ns, H, K, V),
+        (sym_ns, HV, K, V),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     ht_fake = make_fake_compact_tensor(
         cutlass.Float32,
-        (sym_ns, H, K, V),
+        (sym_ns, HV, K, V),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
@@ -1958,7 +1963,7 @@ def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size, use_fas
         cu_fake,
         co_fake,
         ws_fake,
-        (Int32(1), Int32(1), Int32(H), Int32(K), Int32(V)),
+        (Int32(1), Int32(1), Int32(H), Int32(HV), Int32(K), Int32(V)),
         Int32(1),  # total_nt dummy
         Int32(0),  # use_g
         Int32(0),  # use_gk
@@ -1971,7 +1976,7 @@ def _compile_delta_h_variant(is_varlen, persistent, H, K, V, chunk_size, use_fas
     return compiled_fn
 
 
-def _get_compiled_delta_h(is_varlen, persistent, H, K, V, chunk_size):
+def _get_compiled_delta_h(is_varlen, persistent, H, HV, K, V, chunk_size):
     """Get a compiled ChunkDeltaRuleFwdH kernel with on-demand (lazy) compilation.
 
     Each variant is compiled exactly once and cached.  Compilation is deferred
@@ -1980,14 +1985,15 @@ def _get_compiled_delta_h(is_varlen, persistent, H, K, V, chunk_size):
     where a subsequent cute.compile can invalidate previously compiled but
     not-yet-executed functions.
 
-    Cache key: (is_varlen, persistent, H, K, V, chunk_size, USE_FAST_MATH)
+    Cache key: (is_varlen, persistent, H, HV, K, V, chunk_size, USE_FAST_MATH)
     """
-    key = (is_varlen, persistent, H, K, V, chunk_size, USE_FAST_MATH)
+    key = (is_varlen, persistent, H, HV, K, V, chunk_size, USE_FAST_MATH)
     if key not in _delta_h_kernel_cache:
         _delta_h_kernel_cache[key] = _compile_delta_h_variant(
             is_varlen,
             persistent,
             H,
+            HV,
             K,
             V,
             chunk_size,
@@ -2016,13 +2022,17 @@ def chunk_gated_delta_rule_fwd_h(
     Interface aligned with FLA's chunk_gated_delta_rule_fwd_h for fair benchmarking.
     Allocates output tensors internally and returns (h, v_new, final_state).
 
+    GVA (Gated Value Attention): k uses H (QK) heads; w, u, g, gk, h, h0, ht
+    use HV (value) heads.  HV is inferred from u.shape[2].  When H == HV this
+    reduces to standard (non-GVA) behavior.
+
     Args:
-        k:  key tensor           [B, T, H, K]  bf16
-        w:  decay weight tensor  [B, T, H, K]  bf16
-        u:  value tensor         [B, T, H, V]  bf16
-        g:  scalar gate          [B, T, H]     fp32, or None
-        gk: key gate             [B, T, H, K]  fp32, or None
-        initial_state: h0        [N, H, K, V]  fp32, or None
+        k:  key tensor           [B, T, H, K]   bf16
+        w:  decay weight tensor  [B, T, HV, K]  bf16
+        u:  value tensor         [B, T, HV, V]  bf16
+        g:  scalar gate          [B, T, HV]     fp32, or None
+        gk: key gate             [B, T, HV, K]  fp32, or None
+        initial_state: h0        [N, HV, K, V]  fp32, or None
         output_final_state: whether to return final_state
         chunk_size: chunk size (default 64)
         save_new_value: whether to return v_new
@@ -2032,11 +2042,12 @@ def chunk_gated_delta_rule_fwd_h(
 
     Returns:
         (h, v_new, final_state) — same as FLA
-        h:           [B, NT, H, K, V] bf16  (or [1, NT_total, H, K, V] for varlen)
-        v_new:       [B, T, H, V] bf16      (or None if save_new_value=False)
-        final_state: [N, H, K, V] fp32      (or None if output_final_state=False)
+        h:           [B, NT, HV, K, V] bf16  (or [1, NT_total, HV, K, V] for varlen)
+        v_new:       [B, T, HV, V] bf16      (or None if save_new_value=False)
+        final_state: [N, HV, K, V] fp32      (or None if output_final_state=False)
     """
     B, T, H, K_dim = k.shape
+    HV = u.shape[2]
     V_dim = u.shape[3]
     BT = chunk_size
     is_varlen = cu_seqlens is not None
@@ -2069,29 +2080,29 @@ def chunk_gated_delta_rule_fwd_h(
         w_kern = w[0]
         u_kern = u[0]
         # Use torch.empty for dummies the kernel won't read (flag-gated)
-        g_kern = g[0] if g is not None else torch.empty(T, H, device=k.device, dtype=torch.float32)
-        gk_kern = gk[0] if gk is not None else torch.empty(T, H, K_dim, device=k.device, dtype=torch.float32)
+        g_kern = g[0] if g is not None else torch.empty(T, HV, device=k.device, dtype=torch.float32)
+        gk_kern = gk[0] if gk is not None else torch.empty(T, HV, K_dim, device=k.device, dtype=torch.float32)
 
         # Allocate outputs (3D for kernel)
-        h_out_kern = k.new_empty(total_nt, H, K_dim, V_dim)  # bf16
+        h_out_kern = k.new_empty(total_nt, HV, K_dim, V_dim)  # bf16
         v_new_kern = torch.empty_like(u_kern)  # always allocate; kernel checks save_v_new flag
         h0_kern = (
             initial_state
             if initial_state is not None
-            else torch.empty(N, H, K_dim, V_dim, device=k.device, dtype=torch.float32)
+            else torch.empty(N, HV, K_dim, V_dim, device=k.device, dtype=torch.float32)
         )
         # ht is purely an output (kernel writes all elements when store_final_state=1);
         # use empty instead of zeros to skip the zero-fill kernel launch.
         # NOTE: Ensure final output is zeros
         # vLLM will use padding for CUDA Graph
-        ht_kern = torch.zeros(N, H, K_dim, V_dim, device=k.device, dtype=torch.float32)
+        ht_kern = torch.zeros(N, HV, K_dim, V_dim, device=k.device, dtype=torch.float32)
 
         # Workspace: first 4 bytes used as atomic counter for dynamic scheduling
         workspace = torch.zeros(max(N * 128, 4), dtype=torch.uint8, device=k.device)
 
-        ps = (Int32(N), Int32(T), Int32(H), Int32(K_dim), Int32(V_dim))
+        ps = (Int32(N), Int32(T), Int32(H), Int32(HV), Int32(K_dim), Int32(V_dim))
 
-        compiled_fn = _get_compiled_delta_h(True, persistent, H, K_dim, V_dim, chunk_size)
+        compiled_fn = _get_compiled_delta_h(True, persistent, H, HV, K_dim, V_dim, chunk_size)
         compiled_fn(
             k_kern,
             w_kern,
@@ -2125,29 +2136,29 @@ def chunk_gated_delta_rule_fwd_h(
         N = B
 
         # Allocate outputs
-        h = k.new_empty(B, NT, H, K_dim, V_dim)  # bf16
+        h = k.new_empty(B, NT, HV, K_dim, V_dim)  # bf16
         v_new_out = torch.empty_like(u)  # always allocate; kernel checks save_v_new flag
         # Use torch.empty for dummies the kernel won't read (flag-gated)
         h0 = (
             initial_state
             if initial_state is not None
-            else torch.empty(B, H, K_dim, V_dim, device=k.device, dtype=torch.float32)
+            else torch.empty(B, HV, K_dim, V_dim, device=k.device, dtype=torch.float32)
         )
         # ht must share sym_ns (first dim) with h0, so always use B
-        ht = k.new_zeros(B, H, K_dim, V_dim, dtype=torch.float32)
+        ht = k.new_zeros(B, HV, K_dim, V_dim, dtype=torch.float32)
 
         # Dummy tensors for unused optional gate inputs (kernel checks flags)
-        g_kern = g if g is not None else torch.empty(B, T, H, device=k.device, dtype=torch.float32)
-        gk_kern = gk if gk is not None else torch.empty(B, T, H, K_dim, device=k.device, dtype=torch.float32)
+        g_kern = g if g is not None else torch.empty(B, T, HV, device=k.device, dtype=torch.float32)
+        gk_kern = gk if gk is not None else torch.empty(B, T, HV, K_dim, device=k.device, dtype=torch.float32)
 
         # Dummy cu_seqlens / chunk_offsets / workspace (kernel requires them)
         cu_dummy = torch.empty(2, dtype=torch.int32, device=k.device)
         co_dummy = torch.empty(2, dtype=torch.int32, device=k.device)
         ws_dummy = torch.empty(128, dtype=torch.uint8, device=k.device)
 
-        ps = (Int32(B), Int32(T), Int32(H), Int32(K_dim), Int32(V_dim))
+        ps = (Int32(B), Int32(T), Int32(H), Int32(HV), Int32(K_dim), Int32(V_dim))
 
-        compiled_fn = _get_compiled_delta_h(False, persistent, H, K_dim, V_dim, chunk_size)
+        compiled_fn = _get_compiled_delta_h(False, persistent, H, HV, K_dim, V_dim, chunk_size)
         compiled_fn(
             k,
             w,
@@ -2181,21 +2192,23 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=256)
     parser.add_argument("--num_heads", type=int, default=1)
+    parser.add_argument("--num_v_heads", type=int, default=None, help="Number of value heads (default: num_heads, i.e. no GVA)")
     parser.add_argument("--head_dim_k", type=int, default=128)
     parser.add_argument("--head_dim_v", type=int, default=128)
     parser.add_argument("--chunk_size", type=int, default=64)
     args = parser.parse_args()
 
     B, T, H, K, V = args.batch_size, args.seq_len, args.num_heads, args.head_dim_k, args.head_dim_v
+    HV = args.num_v_heads if args.num_v_heads is not None else H
     BT = args.chunk_size
     NT = (T + BT - 1) // BT
 
-    print(f"V2 Test: B={B}, T={T}, H={H}, K={K}, V={V}, BT={BT}, NT={NT}")
+    print(f"V2 Test: B={B}, T={T}, H={H}, HV={HV}, K={K}, V={V}, BT={BT}, NT={NT}")
 
     torch.manual_seed(42)
     k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16) * 0.1
-    w = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16) * 0.1
-    u = torch.randn(B, T, H, V, device="cuda", dtype=torch.bfloat16) * 0.1
+    w = torch.randn(B, T, HV, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    u = torch.randn(B, T, HV, V, device="cuda", dtype=torch.bfloat16) * 0.1
 
     def run_kernel(k_t, w_t, u_t, g_t, gk_t, h0_t, use_g_val, use_gk_val, use_h0, store_ht, do_save_vnew=0):
         h_out, v_new, ht = chunk_gated_delta_rule_fwd_h(
@@ -2212,11 +2225,11 @@ def main():
         torch.cuda.synchronize()
         # Ensure consistent return shapes for backward compat with manual tests
         if h_out is None:
-            h_out = torch.zeros(B, NT, H, K, V, device="cuda", dtype=torch.bfloat16)
+            h_out = torch.zeros(B, NT, HV, K, V, device="cuda", dtype=torch.bfloat16)
         if v_new is None:
-            v_new = torch.zeros(B, T, H, V, device="cuda", dtype=torch.bfloat16)
+            v_new = torch.zeros(B, T, HV, V, device="cuda", dtype=torch.bfloat16)
         if ht is None:
-            ht = torch.zeros(B, H, K, V, device="cuda", dtype=torch.float32)
+            ht = torch.zeros(B, HV, K, V, device="cuda", dtype=torch.float32)
         return h_out, v_new, ht
 
     all_pass = True
@@ -2224,9 +2237,9 @@ def main():
     # ===== Test 1: No gating, no h0 =====
     print("\n" + "=" * 60)
     print("Test 1: No gating, no h0")
-    g_z = torch.zeros(B, T, H, device="cuda", dtype=torch.float32)
-    gk_z = torch.zeros(B, T, H, K, device="cuda", dtype=torch.float32)
-    h0_z = torch.zeros(B, H, K, V, device="cuda", dtype=torch.float32)
+    g_z = torch.zeros(B, T, HV, device="cuda", dtype=torch.float32)
+    gk_z = torch.zeros(B, T, HV, K, device="cuda", dtype=torch.float32)
+    h0_z = torch.zeros(B, HV, K, V, device="cuda", dtype=torch.float32)
 
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_z, h0_z, 0, 0, 0, 0)
     _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, h0=None, chunk_size=BT)
@@ -2243,12 +2256,11 @@ def main():
     # ===== Test 2: With gk + h0 =====
     print("\n" + "=" * 60)
     print("Test 2: With gk + h0")
-    gk_val = torch.randn(B, T, H, K, device="cuda", dtype=torch.float32) * 0.1
+    gk_val = torch.randn(B, T, HV, K, device="cuda", dtype=torch.float32) * 0.1
     gk_val = -torch.abs(gk_val)
     gk_val = gk_val.cumsum(dim=1)
-    # Pre-scale by RCP_LN2 to match KDA convention (kernel does exp2 directly)
     gk_val = gk_val * INV_LN2
-    h0_val = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) * 0.01
+    h0_val = torch.randn(B, HV, K, V, device="cuda", dtype=torch.float32) * 0.01
 
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_val, h0_val, 0, 1, 1, 0)
     _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, gk=gk_val, h0=h0_val, chunk_size=BT)
@@ -2265,7 +2277,7 @@ def main():
     # ===== Test 3: With gk gating =====
     print("\n" + "=" * 60)
     print("Test 3: With gk gating")
-    gk_val = torch.randn(B, T, H, K, device="cuda", dtype=torch.float32) * 0.1
+    gk_val = torch.randn(B, T, HV, K, device="cuda", dtype=torch.float32) * 0.1
     gk_val = -torch.abs(gk_val)
     gk_val = gk_val.cumsum(dim=1)
     # Pre-scale by RCP_LN2 to match KDA convention (kernel does exp2 directly)
@@ -2286,7 +2298,7 @@ def main():
     # ===== Test 4: With h0 initial state =====
     print("\n" + "=" * 60)
     print("Test 4: With h0 initial state")
-    h0_val = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) * 0.01
+    h0_val = torch.randn(B, HV, K, V, device="cuda", dtype=torch.float32) * 0.01
 
     h_out, v_new, ht = run_kernel(k, w, u, g_z, gk_z, h0_val, 0, 0, 1, 0)
     _, h_ref_bf16 = reference_bf16_roundtrip(k, w, u, h0=h0_val, chunk_size=BT)
