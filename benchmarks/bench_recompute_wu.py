@@ -271,14 +271,14 @@ def check_determinism(num_seqs=NUM_SEQS, T=2001, H=H, iters=1000):
             print(f"Iteration {i}: u mismatch")
             print(f"{get_abs_err(ref_u, u):.6f} absolute error, {get_err_ratio(ref_u, u):.6f} relative error")
             raise AssertionError("Non-deterministic output detected in u")
-        if qg is not None and not torch.equal(qg, ref_qg):
-            print(f"Iteration {i}: qg mismatch")
-            print(f"{get_abs_err(ref_qg, qg):.6f} absolute error, {get_err_ratio(ref_qg, qg):.6f} relative error")
-            raise AssertionError("Non-deterministic output detected in qg")
         if kg is not None and not torch.equal(kg, ref_kg):
             print(f"Iteration {i}: kg mismatch")
             print(f"{get_abs_err(ref_kg, kg):.6f} absolute error, {get_err_ratio(ref_kg, kg):.6f} relative error")
             raise AssertionError("Non-deterministic output detected in kg")
+        if qg is not None and not torch.equal(qg, ref_qg):
+            print(f"Iteration {i}: qg mismatch")
+            print(f"{get_abs_err(ref_qg, qg):.6f} absolute error, {get_err_ratio(ref_qg, qg):.6f} relative error")
+            raise AssertionError("Non-deterministic output detected in qg")
 
 
 if __name__ == "__main__":
@@ -294,7 +294,7 @@ if __name__ == "__main__":
         DISABLE_RECOMPUTE = True
         print("[Disable recompute] pre-compute QG in forward")
 
-    check_determinism(iters=100000)
+    check_determinism(iters=1000000)
 
     benchmark_recompute_wu_uniform()
     benchmark_recompute_wu_varlen()

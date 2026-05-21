@@ -277,6 +277,8 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
             for (int i_k = 0; i_k < NumKIters; ++i_k) {
                 // Wait for K data from TMA Load warp
                 k_pipeline.consumer_wait(k_pipe_state_read);
+                // NOTE: add fence to make TMA load data (async proxy) to be visible for ld.shared (general proxy)
+                fence_view_async_shared();
 
                 Tensor sK =
                     make_tensor(make_smem_ptr(shared_plan->k[k_pipe_state_read.index()].data()), SmemLayoutInputBF16{});
@@ -320,6 +322,8 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                 }
 
                 g_pipeline.consumer_wait(g_pipe_state_read);
+                // NOTE: add fence to make TMA load data (async proxy) to be visible for ld.shared (general proxy)
+                fence_view_async_shared();
                 Tensor sG =
                     make_tensor(make_smem_ptr(shared_plan->g[g_pipe_state_read.index()].data()), SmemLayoutInputFP32{});
                 // Load G with same 16x64 column mapping as K (two float4 per iteration)
@@ -496,6 +500,8 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                 if constexpr (StoreQG) {
                     // Wait for Q data from TMA Load warp
                     q_pipeline.consumer_wait(q_pipe_state_read);
+                    // NOTE: add fence to make TMA load data (async proxy) to be visible for ld.shared (general proxy)
+                    fence_view_async_shared();
                     Tensor sQ = make_tensor(
                         make_smem_ptr(shared_plan->q_buf.q[q_pipe_state_read.index()].data()), SmemLayoutInputBF16{});
 
@@ -523,7 +529,6 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                         int t = x_local + ti * 16;
 #pragma unroll
                         for (int k_yi = 0; k_yi < TileK / 64; ++k_yi) {
-                            int y = k_y_base + k_yi * 64;
                             if (t < sub_seq_len) {
                                 // lo half (cols y..y+3)
                                 float2 qf_01 = __bfloat1622float2(q_reg[ti][k_yi].a01);
