@@ -109,7 +109,7 @@ class ChunkDeltaRuleBwdDHUSm90:
         self.w_stage = 3
         self.gk_stage = 3
         self.dh_store_stage = 2
-        self.dv2_store_stage = 1
+        self.dv2_store_stage = 2
         self.io_dtype = cutlass.BFloat16
         self.acc_dtype = cutlass.Float32
         self.buffer_align_bytes = 128
@@ -1146,8 +1146,6 @@ class ChunkDeltaRuleBwdDHUSm90:
                 dh_h = store_dh_C.wait_and_advance()
                 cute.copy(tma_atom_dh, bSG_sDh[None, dh_h.index], bSG_gDh[(None, v_tile_idx, 0, chunk_idx)])
                 cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
-                dh_h.release()
 
                 dv2_store_h = store_dv2_C.wait_and_advance()
                 # Tail chunks skip TMA because the tile would cross sequence
@@ -1160,7 +1158,8 @@ class ChunkDeltaRuleBwdDHUSm90:
                         bSG_gDv2[(None, v_tile_idx, chunk_idx)],
                     )
                     cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                dh_h.release()
                 dv2_store_h.release()
 
             if cutlass.const_expr(self.use_dh0):
