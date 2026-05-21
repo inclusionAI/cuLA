@@ -318,9 +318,6 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                         }
                     }
                 }
-                // Release K SMEM back to Load warp (done reading K)
-                k_pipeline.consumer_release(k_pipe_state_read);
-                ++k_pipe_state_read;
 
                 g_pipeline.consumer_wait(g_pipe_state_read);
                 Tensor sG =
@@ -393,6 +390,9 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                         }
                     }
                 }
+                // Release K SMEM back to Load warp (done reading K)
+                k_pipeline.consumer_release(k_pipe_state_read);
+                ++k_pipe_state_read;
 
                 fence_view_async_shared();
                 prologue_ready_pipeline.producer_commit(prologue_ready_pipe_state_write);
@@ -407,9 +407,6 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                     g_last_reg[k_yi][0] = *reinterpret_cast<float4*>(&sG(sub_seq_len - 1, y));
                     g_last_reg[k_yi][1] = *reinterpret_cast<float4*>(&sG(sub_seq_len - 1, y + 4));
                 }
-
-                g_pipeline.consumer_release(g_pipe_state_read);
-                ++g_pipe_state_read;
 
                 // Need NamedBarrier to ensure all 128 prologue threads finish previous sKG_out writes
                 cutlass::arch::NamedBarrier::arrive_and_wait(
@@ -464,6 +461,9 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                     }
                 }
 
+                g_pipeline.consumer_release(g_pipe_state_read);
+                ++g_pipe_state_read;
+
                 // Ensure all 128 prologue threads have finished writing sKG_out
                 cutlass::arch::NamedBarrier::arrive_and_wait(
                     NumPrologueThreads, KdaChunkFwdRecompWUSm100NamedBarriers::PrologueCudaCore);
@@ -517,16 +517,7 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                             }
                         }
                     }
-                    // Release Q SMEM back to Load warp
-                    q_pipeline.consumer_release(q_pipe_state_read);
-                    ++q_pipe_state_read;
-
-                    // Need NamedBarrier to ensure all 128 prologue threads finish previous sKG_out writes (from KG
-                    // store)
-                    cutlass::arch::NamedBarrier::arrive_and_wait(
-                        NumPrologueThreads, KdaChunkFwdRecompWUSm100NamedBarriers::PrologueCudaCore);
-
-                    // Compute QG = Q * exp2(G) and write to sKG_out (reuse output buffer)
+                    // Compute QG = Q * exp2(G)
 #pragma unroll
                     for (int ti = 0; ti < TileT / 16; ++ti) {
                         int t = x_local + ti * 16;
@@ -554,17 +545,36 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                                 out.a23 = __float22bfloat162_rn(res_23);
                                 out.a45 = __float22bfloat162_rn(res_45);
                                 out.a67 = __float22bfloat162_rn(res_67);
-                                *reinterpret_cast<bf16x8*>(&sKG_out(t, y)) = out;
+                                q_reg[ti][k_yi] = out;
                             } else {
                                 bf16x8 zero;
                                 zero.a01 = __float2bfloat162_rn(0.0f);
                                 zero.a23 = __float2bfloat162_rn(0.0f);
                                 zero.a45 = __float2bfloat162_rn(0.0f);
                                 zero.a67 = __float2bfloat162_rn(0.0f);
-                                *reinterpret_cast<bf16x8*>(&sKG_out(t, y)) = zero;
+                                q_reg[ti][k_yi] = zero;
                             }
                         }
                     }
+
+                    // Need NamedBarrier to ensure all 128 prologue threads finish previous sKG_out writes
+                    cutlass::arch::NamedBarrier::arrive_and_wait(
+                        NumPrologueThreads, KdaChunkFwdRecompWUSm100NamedBarriers::PrologueCudaCore);
+
+                    // write to sKG_out
+#pragma unroll
+                    for (int ti = 0; ti < TileT / 16; ++ti) {
+                        int t = x_local + ti * 16;
+#pragma unroll
+                        for (int k_yi = 0; k_yi < TileK / 64; ++k_yi) {
+                            int y = k_y_base + k_yi * 64;
+                            *reinterpret_cast<bf16x8*>(&sKG_out(t, y)) = q_reg[ti][k_yi];
+                        }
+                    }
+
+                    // Release Q SMEM back to Load warp
+                    q_pipeline.consumer_release(q_pipe_state_read);
+                    ++q_pipe_state_read;
 
                     // Ensure all 128 prologue threads have finished writing QG to sKG_out
                     cutlass::arch::NamedBarrier::arrive_and_wait(

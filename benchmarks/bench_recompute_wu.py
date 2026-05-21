@@ -25,6 +25,7 @@ os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1")) 
 
 from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_intra
 from fla.ops.kda.wy_fast import recompute_w_u_fwd as fla_recompute_w_u_fwd
+from fla.utils import get_abs_err, get_err_ratio
 
 import cula.cudac as cula_cuda
 from benchmarks.utils import SEED, exclusive_cumsum, generate_random_seq_lens, prepare_intra_inputs
@@ -241,6 +242,45 @@ def benchmark_recompute_wu_varlen():
     print("─" * 100)
 
 
+def check_determinism(num_seqs=NUM_SEQS, T=2001, H=H, iters=1000):
+    """Run the recompute_w_u kernel multiple times and check for deterministic outputs."""
+    device = torch.device("cuda")
+    chunk_size = BT
+
+    seq_lens = generate_random_seq_lens(num_seqs, T, MIN_SEQ_LEN, VARIANCE, SEED)
+    cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
+
+    q, k, v, g, beta, Akk, cu_seqlens, chunk_indices = prepare_recompute_wu_inputs(
+        B=1, T=T, H=H, D=D, device=device, cu_seqlens=cu_seqlens, chunk_size=chunk_size
+    )
+
+    ref_w, ref_u, ref_qg, ref_kg = run_cula_recompute_wu(
+        k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, chunk_size, disable_recompute=DISABLE_RECOMPUTE
+    )
+
+    for i in range(iters):
+        w, u, qg, kg = run_cula_recompute_wu(
+            k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, chunk_size, disable_recompute=DISABLE_RECOMPUTE
+        )
+
+        if not torch.equal(w, ref_w):
+            print(f"Iteration {i}: w mismatch")
+            print(f"{get_abs_err(ref_w, w):.6f} absolute error, {get_err_ratio(ref_w, w):.6f} relative error")
+            raise AssertionError("Non-deterministic output detected in w")
+        if not torch.equal(u, ref_u):
+            print(f"Iteration {i}: u mismatch")
+            print(f"{get_abs_err(ref_u, u):.6f} absolute error, {get_err_ratio(ref_u, u):.6f} relative error")
+            raise AssertionError("Non-deterministic output detected in u")
+        if qg is not None and not torch.equal(qg, ref_qg):
+            print(f"Iteration {i}: qg mismatch")
+            print(f"{get_abs_err(ref_qg, qg):.6f} absolute error, {get_err_ratio(ref_qg, qg):.6f} relative error")
+            raise AssertionError("Non-deterministic output detected in qg")
+        if kg is not None and not torch.equal(kg, ref_kg):
+            print(f"Iteration {i}: kg mismatch")
+            print(f"{get_abs_err(ref_kg, kg):.6f} absolute error, {get_err_ratio(ref_kg, kg):.6f} relative error")
+            raise AssertionError("Non-deterministic output detected in kg")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="bench_recompute_wu: cuLA vs FLA Triton for recompute_w_u")
     parser.add_argument(
@@ -253,6 +293,8 @@ if __name__ == "__main__":
     if args.disable_recompute:
         DISABLE_RECOMPUTE = True
         print("[Disable recompute] pre-compute QG in forward")
+
+    check_determinism(iters=100000)
 
     benchmark_recompute_wu_uniform()
     benchmark_recompute_wu_varlen()
