@@ -34,7 +34,7 @@ defaults to H and can be overridden globally via --hv to run every config in
 GVA (Grouped Value Attention) mode. HV must be a positive multiple of H.
 
 Usage:
-  python bench_kda_fused_fwd.py [--mode fixed|varlen|both] [--hv HV] [--ncu]
+  python bench_kda_fused_fwd.py [--mode fixed|varlen|both] [--heads H] [--hv HV] [--ncu]
 
 With --ncu, warmup=1 and iters=1 for ncu profiling:
   ncu --set full -o report python bench_kda_fused_fwd.py --mode varlen --ncu
@@ -406,6 +406,13 @@ def main():
         action="store_true",
         help="Use non-zero initial state (default: False)",
     )
+    global H
+    parser.add_argument(
+        "--heads",
+        type=int,
+        default=H,
+        help=f"Number of Q/K heads (H). Default: {H}",
+    )
     parser.add_argument(
         "--hv",
         type=int,
@@ -415,6 +422,7 @@ def main():
     args = parser.parse_args()
 
     global NCU_MODE, SANITIZER_MODE, HAS_INIT_STATE, HV
+    H = args.heads
     if args.ncu:
         NCU_MODE = True
         print("[NCU mode] warmup=1, iters=1")

@@ -101,25 +101,23 @@ See [USAGE.md](USAGE.md) for detailed usage examples and notes.
 
 ## Benchmarks
 
-Benchmarks run on a single **NVIDIA GB300/GB200/H200** GPU with **CUDA Toolkit 12.9**, **PyTorch 2.9.1**, **Triton 3.5.1**.
+Benchmarks run on a single **NVIDIA GB200/H200** GPU with **PyTorch 2.9.1**, **Triton 3.5.1**.
 
-FLA baseline: [flash-linear-attention v0.4.2](https://github.com/fla-org/flash-linear-attention/releases/tag/v0.4.2).
+FLA baseline: [flash-linear-attention v0.5.0](https://github.com/fla-org/flash-linear-attention/releases/tag/v0.5.0).
 
 **Blackwell (SM10X)**
 
-See [BENCHMARK_GB300.md](BENCHMARK_GB300.md) for detailed results.
-
-See [BENCHMARK_GB200.md](BENCHMARK_GB200.md) for detailed results.
+See [BENCHMARK_GB200_CUDA_130.md](BENCHMARK_GB200_CUDA_130.md) tested with CUDA 13.0 for detailed results.
  
 **Hopper (SM90)**
 
-See [BENCHMARK_H200.md](BENCHMARK_H200.md) for detailed results.
+See [BENCHMARK_H200.md](BENCHMARK_H200.md) tested with CUDA 12.9 for detailed results.
 
 **Highlights:**
-- **KDA Modular Forward (Blackwell):** **avg 1.45x** speedup on fixed-length, **avg 1.32x** on variable-length (18 configs, uniform/skewed/random).
-- **Lightning Attention Prefill (Blackwell):** up to **1.86x** speedup (B=2).
-- **Lightning Attention Varlen (Blackwell):** **avg 1.54x** speedup across 126 configs (uniform/skewed/random).
-- **KDA Fused Forward (Hopper):** **avg 1.52x** speedup across fixed-length and variable-length sequences.
+- **KDA Modular Forward (Blackwell):** **avg 1.33x** speedup on fixed-length, **avg 1.35x** on variable-length (18 configs, uniform/skewed/random).
+- **Lightning Attention Prefill (Blackwell):** up to **2.08x** speedup (B=2).
+- **Lightning Attention Varlen (Blackwell):** **avg 1.47x** speedup across 126 configs (uniform/skewed/random).
+- **KDA Fused Forward (Hopper):** **avg 1.58x** speedup across fixed-length and variable-length sequences.
 
 To regenerate benchmarks:
 

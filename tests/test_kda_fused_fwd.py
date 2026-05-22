@@ -131,8 +131,8 @@ def test_safe_gate_chunk(
     )
 
     ref_fla, ref_ht_fla = fla_chunk_kda(
-        q=F.normalize(q_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q_ref.clone(),
-        k=F.normalize(k_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k_ref.clone(),
+        q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
+        k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),
@@ -147,8 +147,8 @@ def test_safe_gate_chunk(
     )
 
     ref_fla_trans, ref_ht_fla_trans = fla_chunk_kda(
-        q=F.normalize(q_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q_ref.clone(),
-        k=F.normalize(k_ref.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k_ref.clone(),
+        q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
+        k=F.normalize(k.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else k.clone(),
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),
@@ -351,8 +351,8 @@ def test_safe_gate_chunk_varlen(
     )
 
     ref_fla, ref_ht_fla = fla_chunk_kda(
-        q=F.normalize(q_ref.clone(), p=2, dim=-1),
-        k=k_ref.clone(),
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=k.clone(),
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),
@@ -365,8 +365,8 @@ def test_safe_gate_chunk_varlen(
     )
 
     ref_fla_trans, ref_ht_fla_trans = fla_chunk_kda(
-        q=F.normalize(q_ref.clone(), p=2, dim=-1),
-        k=k_ref.clone(),
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=k.clone(),
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),
