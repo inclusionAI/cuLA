@@ -391,6 +391,8 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                     }
                 }
                 // Release K SMEM back to Load warp (done reading K)
+                // NOTE: must make smem visible from CUDA Core (general proxy) to TMA (async proxy)
+                fence_view_async_shared();
                 k_pipeline.consumer_release(k_pipe_state_read);
                 ++k_pipe_state_read;
 
@@ -461,6 +463,8 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                     }
                 }
 
+                // NOTE: must make smem visible from CUDA Core (general proxy) to TMA (async proxy)
+                fence_view_async_shared();
                 g_pipeline.consumer_release(g_pipe_state_read);
                 ++g_pipe_state_read;
 
@@ -571,6 +575,8 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                         }
                     }
 
+                    // NOTE: must make smem visible from CUDA Core (general proxy) to TMA (async proxy)
+                    fence_view_async_shared();
                     // Release Q SMEM back to Load warp
                     q_pipeline.consumer_release(q_pipe_state_read);
                     ++q_pipe_state_read;
