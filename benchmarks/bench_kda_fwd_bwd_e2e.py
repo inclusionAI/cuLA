@@ -51,6 +51,7 @@ from benchmarks.utils import (
     SEED,
     build_varlen_configs,
     exclusive_cumsum,
+    generate_random_seq_lens,
     prepare_safe_gate_inputs,
     set_seed,
 )
@@ -60,8 +61,8 @@ from cula.kda import chunk_kda as cula_chunk_kda
 # Constants
 # ============================================================
 H, D = 64, 128
-WARMUP = 10
-N_ITERS = 30
+WARMUP = 25
+N_ITERS = 100
 NCU_MODE = False
 SANITIZER_MODE = False
 DISABLE_RECOMPUTE = False
@@ -135,9 +136,7 @@ def run_kda_e2e(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens,
         disable_recompute=DISABLE_RECOMPUTE,
     )
     if PHASE == "e2e":
-        loss = (out * do).sum() + (ht * dht).sum()
-        loss.backward()
-    torch.cuda.synchronize()
+        out.backward(do)
     return out, ht
 
 
@@ -181,6 +180,52 @@ def run_kda_e2e_with_grads(q, k, v, g, beta, scale, A_log, dt_bias, init_state, 
         dbeta=b_c.grad,
         dh0=h_c.grad,
     )
+
+
+# ============================================================
+# Determinism check
+# ============================================================
+def check_determinism(num_seqs=5, T=512, iters=20):
+    """Verify that cuLA chunk_kda produces identical outputs across repeated runs."""
+    device = torch.device("cuda")
+    set_seed(SEED)
+
+    seq_lens = generate_random_seq_lens(num_seqs, T, 63, seed=SEED)
+    cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
+
+    inputs = prepare_safe_gate_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens, has_init_state=True)
+    q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
+    A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
+    scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
+
+    set_seed(SEED + 1)
+    do = torch.randn_like(v)
+    dht = torch.randn_like(init_state)
+
+    common = dict(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        init_state=init_state,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+        do=do,
+        dht=dht,
+    )
+
+    ref = run_kda_e2e_with_grads(**common, fn=cula_chunk_kda)
+    for i in range(iters):
+        out = run_kda_e2e_with_grads(**common, fn=cula_chunk_kda)
+        for name in ("o", "ht", "dq", "dk", "dv", "dg", "dbeta", "dh0"):
+            assert torch.isnan(out[name]).sum() == 0, f"[determinism] cuLA {name} has NaNs at iter {i}"
+            assert torch.isfinite(out[name]).all(), f"[determinism] cuLA {name} has infs at iter {i}"
+            assert torch.equal(out[name], ref[name]), f"[determinism] cuLA {name} mismatch at iter {i}"
+    return True
 
 
 # ============================================================
@@ -529,6 +574,14 @@ def main():
         DISABLE_RECOMPUTE = True
         print("[Disable recompute] pre-compute QG in forward")
     PHASE = args.phase
+
+    if not (args.ncu or args.sanitizer):
+        det_configs = [(5, 1024), (10, 4096), (10, 8192), (10, 16384)]
+        print("\n[Determinism Check] cuLA chunk_kda E2E ...")
+        for num_seqs, T in det_configs:
+            result = check_determinism(num_seqs=num_seqs, T=T, iters=1000)
+            print(f"  num_seqs={num_seqs}  T={T:5d}  {'PASS' if result else 'FAIL'}")
+        print("[Determinism Check] All passed.\n")
 
     fixed_configs = [
         # (B, T)
