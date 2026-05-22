@@ -118,7 +118,8 @@ class ChunkDeltaRuleBwdDHUSm90:
         self.kdh_mma_tiler = (self.BV, self.BT, self.BK)
         self.update_mma_tiler = (self.BV, self.BK, self.BT)
         self.atom_layout_mnk = (1, 1, 1)
-        self.cluster_shape_mnk = (1, 1, 1)
+        self.num_v_tile_mcast_ctas = 2
+        self.cluster_shape_mnk = (self.num_v_tile_mcast_ctas, 1, 1)
         self.gk_precompute_bar = pipeline.NamedBarrier(
             barrier_id=1,
             num_threads=self.num_compute_threads,
@@ -315,14 +316,16 @@ class ChunkDeltaRuleBwdDHUSm90:
             self.dh_store_stage,
         )
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
+        tma_load_mcast_op = cpasync.CopyBulkTensorTileG2SMulticastOp()
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
 
         # ===================== TMA descriptors =====================
         tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
-            tma_load_op,
+            tma_load_mcast_op,
             k_tk,
             cute.slice_(k_smem_layout_staged, (None, None, 0)),
             (self.BT, self.BK),
+            num_multicast=self.num_v_tile_mcast_ctas,
         )
         tma_atom_dv, tma_tensor_dv = cpasync.make_tiled_tma_atom(
             tma_load_op,
@@ -337,16 +340,18 @@ class ChunkDeltaRuleBwdDHUSm90:
             (self.BV, self.BT),
         )
         tma_atom_q, tma_tensor_q = cpasync.make_tiled_tma_atom(
-            tma_load_op,
+            tma_load_mcast_op,
             q_kt,
             cute.slice_(q_smem_layout_staged, (None, None, 0)),
             (self.BK, self.BT),
+            num_multicast=self.num_v_tile_mcast_ctas,
         )
         tma_atom_w, tma_tensor_w = cpasync.make_tiled_tma_atom(
-            tma_load_op,
+            tma_load_mcast_op,
             w_kt,
             cute.slice_(w_smem_layout_staged, (None, None, 0)),
             (self.BK, self.BT),
+            num_multicast=self.num_v_tile_mcast_ctas,
         )
         tma_atom_gk, tma_tensor_gk = cpasync.make_tiled_tma_atom(
             tma_load_op,
@@ -564,13 +569,24 @@ class ChunkDeltaRuleBwdDHUSm90:
         sDht = cute.make_tensor(cute.recast_ptr(storage.sDh.data_ptr(), dtype=cutlass.Float32), dht_smem_layout)
         sDh0 = cute.make_tensor(cute.recast_ptr(storage.sK.data_ptr(), dtype=cutlass.Float32), dht_smem_layout)
 
+        cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
+        v_tile_mcast_mask = cute.make_layout_image_mask(
+            cta_layout_mnk,
+            cluster_coord_mnk,
+            mode=0,
+        )
+
         # ===================== Pipelines =====================
         load_k_P, load_k_C = pipeline.PipelineTmaAsync.create(
             num_stages=self.k_stage,
             producer_group=make_thread_cooperative_group(1),
-            consumer_group=make_thread_cooperative_group(self.num_compute_warps),
+            consumer_group=make_thread_cooperative_group(self.num_compute_warps * self.num_v_tile_mcast_ctas),
             tx_count=self.tma_k_bytes,
             barrier_storage=storage.load_k_mbar.data_ptr(),
+            cta_layout_vmnk=cute.make_layout((1, *cta_layout_mnk.shape)),
+            mcast_mode_mn=(0, 1),
         ).make_participants()
         load_dv_P, load_dv_C = pipeline.PipelineTmaAsync.create(
             num_stages=self.dv_stage,
@@ -589,16 +605,20 @@ class ChunkDeltaRuleBwdDHUSm90:
         load_q_P, load_q_C = pipeline.PipelineTmaAsync.create(
             num_stages=self.q_stage,
             producer_group=make_thread_cooperative_group(1),
-            consumer_group=make_thread_cooperative_group(self.num_compute_warps),
+            consumer_group=make_thread_cooperative_group(self.num_compute_warps * self.num_v_tile_mcast_ctas),
             tx_count=self.tma_q_bytes,
             barrier_storage=storage.load_q_mbar.data_ptr(),
+            cta_layout_vmnk=cute.make_layout((1, *cta_layout_mnk.shape)),
+            mcast_mode_mn=(0, 1),
         ).make_participants()
         load_w_P, load_w_C = pipeline.PipelineTmaAsync.create(
             num_stages=self.w_stage,
             producer_group=make_thread_cooperative_group(1),
-            consumer_group=make_thread_cooperative_group(self.num_compute_warps),
+            consumer_group=make_thread_cooperative_group(self.num_compute_warps * self.num_v_tile_mcast_ctas),
             tx_count=self.tma_w_bytes,
             barrier_storage=storage.load_w_mbar.data_ptr(),
+            cta_layout_vmnk=cute.make_layout((1, *cta_layout_mnk.shape)),
+            mcast_mode_mn=(0, 1),
         ).make_participants()
         if cutlass.const_expr(self.use_gk):
             load_gk_P, load_gk_C = pipeline.PipelineTmaAsync.create(
@@ -662,8 +682,18 @@ class ChunkDeltaRuleBwdDHUSm90:
                 tma_tensor_gk_use = tma_tensor_gk
             tma_tensor_dht_use = tma_tensor_dht
 
-        _, bSG_sK, bSG_gK = self._epilog_partition(
-            tma_atom_k, tma_tensor_k_use[None, None, (hidx, data_bidx)], (self.BT, self.BK), sK
+        v_tile_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
+        v_tile_cta_crd = cluster_coord_mnk[0]
+        k_gmem_tile = cute.flat_divide(
+            tma_tensor_k_use[None, None, (hidx, data_bidx)],
+            (self.BT, self.BK),
+        )
+        bSG_sK, bSG_gK = cpasync.tma_partition(
+            tma_atom_k,
+            v_tile_cta_crd,
+            v_tile_cta_layout,
+            cute.group_modes(sK, 0, 2),
+            cute.group_modes(k_gmem_tile, 0, 2),
         )
         _, bSG_sDv, bSG_gDv = self._epilog_partition(
             tma_atom_dv, tma_tensor_dv_use[None, None, (hidx, data_bidx)], (self.BV, self.BT), sDv
@@ -671,11 +701,27 @@ class ChunkDeltaRuleBwdDHUSm90:
         _, bSG_sDo, bSG_gDo = self._epilog_partition(
             tma_atom_do, tma_tensor_do_use[None, None, (hidx, data_bidx)], (self.BV, self.BT), sDo
         )
-        _, bSG_sQ, bSG_gQ = self._epilog_partition(
-            tma_atom_q, tma_tensor_q_use[None, None, (hidx, data_bidx)], (self.BK, self.BT), sQ
+        q_gmem_tile = cute.flat_divide(
+            tma_tensor_q_use[None, None, (hidx, data_bidx)],
+            (self.BK, self.BT),
         )
-        _, bSG_sW, bSG_gW = self._epilog_partition(
-            tma_atom_w, tma_tensor_w_use[None, None, (hidx, data_bidx)], (self.BK, self.BT), sW
+        bSG_sQ, bSG_gQ = cpasync.tma_partition(
+            tma_atom_q,
+            v_tile_cta_crd,
+            v_tile_cta_layout,
+            cute.group_modes(sQ, 0, 2),
+            cute.group_modes(q_gmem_tile, 0, 2),
+        )
+        w_gmem_tile = cute.flat_divide(
+            tma_tensor_w_use[None, None, (hidx, data_bidx)],
+            (self.BK, self.BT),
+        )
+        bSG_sW, bSG_gW = cpasync.tma_partition(
+            tma_atom_w,
+            v_tile_cta_crd,
+            v_tile_cta_layout,
+            cute.group_modes(sW, 0, 2),
+            cute.group_modes(w_gmem_tile, 0, 2),
         )
         if cutlass.const_expr(self.use_gk):
             _, bSG_sGK, bSG_gGK = self._epilog_partition(
@@ -785,7 +831,13 @@ class ChunkDeltaRuleBwdDHUSm90:
             if NT > 0:
                 first_chunk = NT - 1
                 k_h = load_k_P.acquire_and_advance()
-                cute.copy(tma_atom_k, bSG_gK[(None, first_chunk, 0)], bSG_sK[None, k_h.index], tma_bar_ptr=k_h.barrier)
+                cute.copy(
+                    tma_atom_k,
+                    bSG_gK[(None, first_chunk, 0)],
+                    bSG_sK[None, k_h.index],
+                    tma_bar_ptr=k_h.barrier,
+                    mcast_mask=v_tile_mcast_mask,
+                )
                 dv_h = load_dv_P.acquire_and_advance()
                 cute.copy(
                     tma_atom_dv,
@@ -807,7 +859,13 @@ class ChunkDeltaRuleBwdDHUSm90:
                 next_chunk_idx = chunk_idx - 1
                 if next_chunk_idx >= 0:
                     k_h = load_k_P.acquire_and_advance()
-                    cute.copy(tma_atom_k, bSG_gK[(None, next_chunk_idx, 0)], bSG_sK[None, k_h.index], tma_bar_ptr=k_h.barrier)
+                    cute.copy(
+                        tma_atom_k,
+                        bSG_gK[(None, next_chunk_idx, 0)],
+                        bSG_sK[None, k_h.index],
+                        tma_bar_ptr=k_h.barrier,
+                        mcast_mask=v_tile_mcast_mask,
+                    )
                     dv_h = load_dv_P.acquire_and_advance()
                     cute.copy(
                         tma_atom_dv,
@@ -837,9 +895,21 @@ class ChunkDeltaRuleBwdDHUSm90:
                     tma_atom_do, bSG_gDo[(None, v_tile_idx, chunk_idx)], bSG_sDo[None, do_h.index], tma_bar_ptr=do_h.barrier
                 )
                 q_h = load_q_P.acquire_and_advance()
-                cute.copy(tma_atom_q, bSG_gQ[(None, 0, chunk_idx)], bSG_sQ[None, q_h.index], tma_bar_ptr=q_h.barrier)
+                cute.copy(
+                    tma_atom_q,
+                    bSG_gQ[(None, 0, chunk_idx)],
+                    bSG_sQ[None, q_h.index],
+                    tma_bar_ptr=q_h.barrier,
+                    mcast_mask=v_tile_mcast_mask,
+                )
                 w_h = load_w_P.acquire_and_advance()
-                cute.copy(tma_atom_w, bSG_gW[(None, 0, chunk_idx)], bSG_sW[None, w_h.index], tma_bar_ptr=w_h.barrier)
+                cute.copy(
+                    tma_atom_w,
+                    bSG_gW[(None, 0, chunk_idx)],
+                    bSG_sW[None, w_h.index],
+                    tma_bar_ptr=w_h.barrier,
+                    mcast_mask=v_tile_mcast_mask,
+                )
 
         elif is_compute_warp:
             # Initialize carried dh state in registers.  dht is loaded by the
@@ -1168,6 +1238,9 @@ class ChunkDeltaRuleBwdDHUSm90:
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
                 dh0_h.release()
+
+        cute.arch.cluster_arrive()
+        cute.arch.cluster_wait()
 
     @cute.jit
     def _epilog_partition(self, atom, gC_mnl, epi_tile, sC):
