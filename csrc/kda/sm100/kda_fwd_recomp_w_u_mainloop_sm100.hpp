@@ -390,15 +390,13 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                         }
                     }
                 }
-                // Release K SMEM back to Load warp (done reading K)
-                // NOTE: must make smem visible from CUDA Core (general proxy) to TMA (async proxy)
-                fence_view_async_shared();
-                k_pipeline.consumer_release(k_pipe_state_read);
-                ++k_pipe_state_read;
-
                 fence_view_async_shared();
                 prologue_ready_pipeline.producer_commit(prologue_ready_pipe_state_write);
                 ++prologue_ready_pipe_state_write;
+
+                // Release K SMEM back to Load warp (done reading K)
+                k_pipeline.consumer_release(k_pipe_state_read);
+                ++k_pipe_state_read;
 
                 // ---- Step 3: Compute KG = K * exp2(g_last - G) → write to out (K-major) → store to GMEM ----
                 // Load g_last from SMEM into registers (only need last valid row)
@@ -463,8 +461,6 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                     }
                 }
 
-                // NOTE: must make smem visible from CUDA Core (general proxy) to TMA (async proxy)
-                fence_view_async_shared();
                 g_pipeline.consumer_release(g_pipe_state_read);
                 ++g_pipe_state_read;
 
@@ -726,14 +722,14 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                     }
                 }
 
-                // Release V SMEM back to Load warp (done reading sV, all in sV_dst now)
-                v_pipeline.consumer_release(v_pipe_state_read);
-                ++v_pipe_state_read;
-
                 // Co-commit prologue_ready with Prologue → MMA can now consume k_mma + v_mma
                 fence_view_async_shared();
                 prologue_ready_pipeline.producer_commit(prologue_ready_pipe_state_write);
                 ++prologue_ready_pipe_state_write;
+
+                // Release V SMEM back to Load warp (done reading sV, all in sV_dst now)
+                v_pipeline.consumer_release(v_pipe_state_read);
+                ++v_pipe_state_read;
 
                 // ---- w/u output: wait K-GEMM & V-GEMM acc → T2R → bf16 → R2G ----
                 // Split into 2 iterations of TileK/2 to reduce register pressure (avoid spill)

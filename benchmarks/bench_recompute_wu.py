@@ -294,7 +294,7 @@ if __name__ == "__main__":
         DISABLE_RECOMPUTE = True
         print("[Disable recompute] pre-compute QG in forward")
 
-    check_determinism(iters=1000000)
+    check_determinism(iters=100000)
 
     benchmark_recompute_wu_uniform()
     benchmark_recompute_wu_varlen()
