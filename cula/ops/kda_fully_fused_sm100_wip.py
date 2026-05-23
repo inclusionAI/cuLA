@@ -731,7 +731,6 @@ class KDAChunkwise:
 
         q_copy_size = cute.size_in_bytes(self.q_dtype, q_smem_layout)
         k_copy_size = cute.size_in_bytes(self.k_dtype, k_smem_layout)
-        v_copy_size = cute.size_in_bytes(self.v_dtype, v_smem_layout)
         g_copy_size = cute.size_in_bytes(self.g_dtype, g_smem_layout)  # NEW for KDA
         self.tma_copy_q_bytes = q_copy_size
         self.tma_copy_k_bytes = k_copy_size
@@ -1514,12 +1513,6 @@ class KDAChunkwise:
         )
         # ROW MAJOR
         sG_flat = storage.sG.get_tensor(g_smem_layout_coalesce.outer, swizzle=g_smem_layout_coalesce.inner)
-        # HALF SPACE - CRITICAL FIX: Double the stage stride for BF16
-        sG_flat_layout = sG_flat.layout
-        sG_flat_bf16_layout = cute.make_layout(
-            sG_flat_layout.shape, stride=(*sG_flat_layout.stride[:-1], sG_flat_layout.stride[-1] * 2)
-        )
-        sG_flat_as_bf16 = cute.make_tensor(cute.recast_ptr(sG_flat.iterator, dtype=self.io_dtype), layout=sG_flat_bf16_layout)
         # ///////////////////////////////////////////////////////////////////////////////
         # LOAD WARP
         # ///////////////////////////////////////////////////////////////////////////////
