@@ -7,7 +7,7 @@ cuLA/
 │   │   ├── chunk.py              # End-to-end chunk KDA (fwd + bwd entry point)
 │   │   ├── chunk_fwd.py          # Chunk forward dispatch
 │   │   ├── chunk_intra.py        # Intra-chunk forward logic
-│   │   ├── fused_fwd_sm100_wip.py  # Fused KDA forward (SM100, WIP)
+│   │   ├── blackwell_fused_fwd.py  # Fused KDA forward (SM100)
 │   │   └── hopper_fused_fwd.py     # Fused KDA forward (SM90)
 │   ├── lightning/                # Lightning Attention operators
 │   │   └── la_decode.py          # Single-token decode kernel (CuTe DSL)

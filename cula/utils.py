@@ -83,7 +83,7 @@ def assert_hopper(device: torch.device | str | int | None = None) -> None:
 def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callable:
     """Return the appropriate ``kda_prefill`` implementation for *device*.
 
-    - sm100/sm103 (Blackwell) → cula.kda.flash_kda_prefill_sm100_wip
+    - sm100/sm103 (Blackwell) → cula.kda.blackwell_fused_fwd.flash_kda_prefill
     - sm90  (Hopper)          → cula.kda.kda_prefill_hopper
 
     Args:
@@ -94,9 +94,9 @@ def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callabl
     """
     major, minor = get_device_sm_version(device)
     if major == 10 and minor in (0, 3):
-        from cula.kda import flash_kda_prefill_sm100_wip
+        from cula.kda import kda_prefill_blackwell
 
-        return flash_kda_prefill_sm100_wip
+        return kda_prefill_blackwell
     elif major == 9 and minor == 0:
         from cula.kda import kda_prefill_hopper
 
