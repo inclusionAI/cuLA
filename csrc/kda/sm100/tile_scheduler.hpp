@@ -26,11 +26,20 @@
 // No smem synchronization needed — every CTA processes tiles starting
 // at blockIdx.x and striding by gridDim.x. All warps within a CTA
 // independently maintain the same tile_id, so no tile pipeline is needed.
+//
+// GVA (Grouped V-head Attention) support:
+//   Q/K are sized by `num_qk_heads`; V, g, beta, O and state tensors are
+//   sized by `num_v_heads`. We enumerate tiles by `num_v_heads` so that
+//   each v-head is scheduled independently, and derive the companion
+//   `qk_head_idx = v_head_idx / heads_per_group` on the device side.
+//   `heads_per_group = num_v_heads / num_qk_heads` is precomputed on the
+//   host to avoid a per-tile integer division.
 // ===================================================================
 struct StaticPersistentTileScheduler {
     struct Params {
-        int num_blocks;  // number of sequence chunks (from chunk_indices)
-        int num_heads;
+        int num_blocks;        // number of sequence chunks (from chunk_indices)
+        int num_heads;         // == num_v_heads; tiles are enumerated by v-head
+        int heads_per_group;   // == num_v_heads / num_qk_heads, precomputed on host
 
         int num_sm;
         int* tile_counter;  // unused
@@ -77,14 +86,22 @@ struct StaticPersistentTileScheduler {
         return current_tile_id < total_tiles();
     }
 
+    // Decode tile_id -> (batch_idx, v_head_idx, seq_idx, qk_head_idx).
+    // `num_v_heads` is the number of V/O/g/beta heads; tile enumeration is
+    // done in v-head space. `heads_per_group` (= num_v_heads/num_qk_heads)
+    // is used to derive the companion Q/K head index for GVA.
+    // For backward compatibility, when HV == HQK, `heads_per_group == 1`
+    // and `qk_head_idx == v_head_idx`.
     CUTLASS_DEVICE
     static auto
-    decode_tile_coord(int tile_id, int num_heads, int* chunk_indices_ptr, int* cu_seqlens_ptr) {
+    decode_tile_coord(
+        int tile_id, int num_v_heads, int heads_per_group, int* chunk_indices_ptr, int* /*cu_seqlens_ptr*/) {
         using namespace cute;
-        int tile_idx_raw = tile_id / num_heads;
-        int head_idx = tile_id % num_heads;
+        int tile_idx_raw = tile_id / num_v_heads;
+        int v_head_idx = tile_id % num_v_heads;
+        int qk_head_idx = v_head_idx / heads_per_group;
         int batch_idx = chunk_indices_ptr[tile_idx_raw * 2];
         int seq_idx = chunk_indices_ptr[tile_idx_raw * 2 + 1];
-        return make_coord(batch_idx, head_idx, seq_idx, 0);
+        return make_coord(batch_idx, v_head_idx, seq_idx, qk_head_idx);
     }
 };

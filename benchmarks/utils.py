@@ -318,11 +318,25 @@ def prepare_safe_gate_inputs(
     )
 
 
-def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED):
+def prepare_intra_inputs(
+    batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED, num_v_heads=None
+):
     """Prepare preprocessed inputs ready for chunk_kda_fwd_intra.
 
-    All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
+    Supports both standard (HV=H) and GVA (HV > H) layouts via ``num_v_heads``:
+
+        q, k  : (batch_size_flat, T, H,  D)  — Q/K head space (always compact)
+        v     : (batch_size_flat, T, HV, D)  — V head space
+        g     : (batch_size_flat, T, HV, D)  — gate in V head space (after cumsum)
+        beta  : (batch_size_flat, T, HV)      — beta in V head space
+
+    When ``num_v_heads`` is None or equal to H this matches the original non-GVA
+    behaviour exactly. All tensors are flattened to batch_size=1 for cu_seqlens
+    compatibility.
     """
+    HV = H if num_v_heads is None else num_v_heads
+    assert HV >= H and HV % H == 0, f"num_v_heads ({HV}) must be a positive multiple of H ({H})"
+
     dtype = torch.bfloat16
     scale = D ** (-0.5)
 
@@ -330,9 +344,9 @@ def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_siz
 
     q = torch.randn(batch_size, T, H, D, dtype=dtype, device=device)
     k = torch.randn(batch_size, T, H, D, dtype=dtype, device=device)
-    v = torch.randn(batch_size, T, H, D, dtype=dtype, device=device)
-    g_raw = torch.randn(batch_size, T, H, D, dtype=dtype, device=device)
-    beta = torch.randn(batch_size, T, H, dtype=torch.float, device=device).sigmoid()
+    v = torch.randn(batch_size, T, HV, D, dtype=dtype, device=device)
+    g_raw = torch.randn(batch_size, T, HV, D, dtype=dtype, device=device)
+    beta = torch.randn(batch_size, T, HV, dtype=torch.float, device=device).sigmoid()
 
     # l2norm q, k
     q, _ = l2norm_fwd(q)
@@ -342,9 +356,9 @@ def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_siz
     if batch_size != 1:
         q, k, v, g_raw, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g_raw, beta))
 
-    # gate preprocessing
-    A_log = torch.randn(H, dtype=torch.float, device=device)
-    dt_bias = torch.randn(H * D, dtype=torch.float, device=device)
+    # gate preprocessing — A_log / dt_bias live in HV head space
+    A_log = torch.randn(HV, dtype=torch.float, device=device)
+    dt_bias = torch.randn(HV * D, dtype=torch.float, device=device)
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
 

@@ -41,14 +41,16 @@ struct KdaChunkFwdRecompWUKernelSm100 {
 
     // TMA params (for host launcher)
     template <
-        typename ShapeKVG,
+        typename ShapeQK,
+        typename ShapeVG,
         typename ShapeAkk,
         typename TMA_V,
         typename TMA_K,
         typename TMA_G,
         typename TMA_Akk,
         typename TMA_Q = int>
-    using TmaParams = typename Mainloop::template TmaParams<ShapeKVG, ShapeAkk, TMA_V, TMA_K, TMA_G, TMA_Akk, TMA_Q>;
+    using TmaParams =
+        typename Mainloop::template TmaParams<ShapeQK, ShapeVG, ShapeAkk, TMA_V, TMA_K, TMA_G, TMA_Akk, TMA_Q>;
 
     // Pipeline types (for construction in operator())
     using PipelineA = typename Mainloop::PipelineA;
@@ -431,25 +433,29 @@ __launch_bounds__(384, 1, 1) kda_fwd_recomp_w_u_sm100_kernel_entry(
 template <typename Kernel>
 inline void
 run_kda_fwd_recomp_w_u_sm100_impl_dispatch(KDA_fwd_recomp_w_u_params& params, cudaStream_t stream) {
-    auto shape_KVG = make_shape(params.total_len, params.d, params.h);
-    auto stride_KVG = make_stride(params.h * params.d, _1{}, params.d);
-    auto shape_Akk = make_shape(params.total_len, params.chunk_size, params.h);
-    auto stride_Akk = make_stride(params.h * params.chunk_size, _1{}, params.chunk_size);
+    // GVA: K and (optional) Q are sized by h_qk; V and G are sized by h_v.
+    // Akk lives in v-head space (BT x BT per v-head).
+    auto shape_QK = make_shape(params.total_len, params.d, params.h_qk);
+    auto stride_QK = make_stride(params.h_qk * params.d, _1{}, params.d);
+    auto shape_VG = make_shape(params.total_len, params.d, params.h_v);
+    auto stride_VG = make_stride(params.h_v * params.d, _1{}, params.d);
+    auto shape_Akk = make_shape(params.total_len, params.chunk_size, params.h_v);
+    auto stride_Akk = make_stride(params.h_v * params.chunk_size, _1{}, params.chunk_size);
 
     // --- Build TMA descriptors ---
     auto tma_V = cute::make_tma_copy(
         SM90_TMA_LOAD{},
-        make_tensor(make_gmem_ptr((bf16*)params.v_ptr), make_layout(shape_KVG, stride_KVG)),
+        make_tensor(make_gmem_ptr((bf16*)params.v_ptr), make_layout(shape_VG, stride_VG)),
         typename Kernel::SmemLayoutInputBF16{});
 
     auto tma_K = cute::make_tma_copy(
         SM90_TMA_LOAD{},
-        make_tensor(make_gmem_ptr((bf16*)params.k_ptr), make_layout(shape_KVG, stride_KVG)),
+        make_tensor(make_gmem_ptr((bf16*)params.k_ptr), make_layout(shape_QK, stride_QK)),
         typename Kernel::SmemLayoutInputBF16{});
 
     auto tma_G = cute::make_tma_copy(
         SM90_TMA_LOAD{},
-        make_tensor(make_gmem_ptr((float*)params.g_ptr), make_layout(shape_KVG, stride_KVG)),
+        make_tensor(make_gmem_ptr((float*)params.g_ptr), make_layout(shape_VG, stride_VG)),
         typename Kernel::SmemLayoutInputFP32{});
 
     auto tma_Akk = cute::make_tma_copy(
@@ -457,12 +463,12 @@ run_kda_fwd_recomp_w_u_sm100_impl_dispatch(KDA_fwd_recomp_w_u_params& params, cu
         make_tensor(make_gmem_ptr((bf16*)params.A_ptr), make_layout(shape_Akk, stride_Akk)),
         typename Kernel::SmemLayoutInputAkkBF16{});
 
-    // Q TMA descriptor (only meaningful when StoreQG=true)
+    // Q TMA descriptor (only meaningful when StoreQG=true). Q lives in h_qk head space.
     auto tma_Q = [&]() {
         if constexpr (Kernel::StoreQG) {
             return cute::make_tma_copy(
                 SM90_TMA_LOAD{},
-                make_tensor(make_gmem_ptr((bf16*)params.q_ptr), make_layout(shape_KVG, stride_KVG)),
+                make_tensor(make_gmem_ptr((bf16*)params.q_ptr), make_layout(shape_QK, stride_QK)),
                 typename Kernel::SmemLayoutInputBF16{});
         } else {
             return 0;  // placeholder, not used
@@ -471,14 +477,15 @@ run_kda_fwd_recomp_w_u_sm100_impl_dispatch(KDA_fwd_recomp_w_u_params& params, cu
 
     // --- Pack TMA params ---
     typename Kernel::template TmaParams<
-        decltype(shape_KVG),
+        decltype(shape_QK),
+        decltype(shape_VG),
         decltype(shape_Akk),
         decltype(tma_V),
         decltype(tma_K),
         decltype(tma_G),
         decltype(tma_Akk),
         decltype(tma_Q)>
-        tma_params = {shape_KVG, shape_Akk, tma_V, tma_K, tma_G, tma_Akk, tma_Q};
+        tma_params = {shape_QK, shape_VG, shape_Akk, tma_V, tma_K, tma_G, tma_Akk, tma_Q};
 
     // --- Launch config ---
     auto kernel_fn = &kda_fwd_recomp_w_u_sm100_kernel_entry<Kernel, decltype(tma_params)>;
