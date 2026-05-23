@@ -34,6 +34,7 @@ pytestmark = pytest.mark.sm100_only
         "B",
         "T",
         "H",
+        "HV",
         "D",
         "gate_logit_normalizer",
         "mask_p",
@@ -45,17 +46,21 @@ pytestmark = pytest.mark.sm100_only
     [
         pytest.param(
             *test,
-            id="B{}-T{}-H{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-{}".format(*test),
+            id="B{}-T{}-H{}-HV{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-{}".format(*test),
         )
         for test in [
-            (1, 63, 1, 128, 1, 0, False, False, True, torch.bfloat16),
-            (2, 500, 3, 128, 1, 0, False, False, True, torch.bfloat16),
-            (2, 1000, 3, 128, 1, 0.5, False, False, True, torch.bfloat16),
-            (3, 1024, 4, 128, 0.1, 0, False, False, True, torch.bfloat16),
-            (4, 1024, 4, 128, 1, 0, False, False, True, torch.bfloat16),
-            (4, 1024, 4, 128, 1, 0, True, False, True, torch.bfloat16),
-            (2, 1500, 4, 128, 10, 0, False, True, True, torch.bfloat16),
-            (4, 2048, 8, 128, 1, 0, False, True, True, torch.bfloat16),
+            (1, 63, 1, 1, 128, 1, 0, False, False, True, torch.bfloat16),
+            (2, 500, 3, 3, 128, 1, 0, False, False, True, torch.bfloat16),
+            (2, 1000, 3, 3, 128, 1, 0.5, False, False, True, torch.bfloat16),
+            (3, 1024, 4, 4, 128, 0.1, 0, False, False, True, torch.bfloat16),
+            (4, 1024, 4, 4, 128, 1, 0, False, False, True, torch.bfloat16),
+            (4, 1024, 4, 4, 128, 1, 0, True, False, True, torch.bfloat16),
+            (2, 1500, 4, 4, 128, 10, 0, False, True, True, torch.bfloat16),
+            (4, 2048, 8, 8, 128, 1, 0, False, True, True, torch.bfloat16),
+            # GVA cases: HV > H
+            (2, 1024, 4, 8, 128, 1, 0, True, False, True, torch.bfloat16),
+            (2, 1500, 2, 4, 128, 10, 0, False, True, True, torch.bfloat16),
+            (2, 2048, 4, 8, 128, 1, 0, False, True, True, torch.bfloat16),
         ]
     ],
 )
@@ -63,6 +68,7 @@ def test_safe_gate_chunk(
     B: int,
     T: int,
     H: int,
+    HV: int,
     D: int,
     gate_logit_normalizer: float,
     mask_p: float,
@@ -76,11 +82,11 @@ def test_safe_gate_chunk(
     torch.manual_seed(42)
     q = torch.rand(B, T, H, D, dtype=dtype)
     k = torch.rand(B, T, H, D, dtype=dtype)
-    v = torch.rand(B, T, H, D, dtype=dtype)
-    g = torch.randn(B, T, H, D, dtype=torch.float if not use_gate_in_kernel else dtype)
+    v = torch.rand(B, T, HV, D, dtype=dtype)
+    g = torch.randn(B, T, HV, D, dtype=torch.float if not use_gate_in_kernel else dtype)
     if use_gate_in_kernel:
-        A_log = torch.randn(H, dtype=torch.float)
-        dt_bias = torch.randn(H * D, dtype=torch.float)
+        A_log = torch.randn(HV, dtype=torch.float)
+        dt_bias = torch.randn(HV * D, dtype=torch.float)
     else:
         g = F.logsigmoid(g) / gate_logit_normalizer
         g = g * (torch.rand_like(g) > mask_p)
@@ -91,8 +97,8 @@ def test_safe_gate_chunk(
     else:
         lower_bound = None
 
-    beta = torch.randn(B, T, H, dtype=torch.float32).sigmoid().to(beta_dtype)
-    h0 = torch.randn(B, H, D, D, dtype=torch.float32)
+    beta = torch.randn(B, T, HV, dtype=torch.float32).sigmoid().to(beta_dtype)
+    h0 = torch.randn(B, HV, D, D, dtype=torch.float32)
     if use_gate_in_kernel:
         A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(True), (A_log, dt_bias))
     q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(True), (q, k, v, g, beta, h0))
@@ -162,17 +168,18 @@ def test_safe_gate_chunk(
 @pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
 @pytest.mark.parametrize("disable_recompute", [True, False], ids=["no_recomp", "recomp"])
 @pytest.mark.parametrize(
-    ("H", "D", "mask_p", "cu_seqlens", "dtype", "safe_gate"),
+    ("H", "HV", "D", "mask_p", "cu_seqlens", "dtype", "safe_gate"),
     [
-        pytest.param(*test, id="H{}-D{}-mask_p{}-cu_seqlens{}-{}-safe_gate{}".format(*test))
+        pytest.param(*test, id="H{}-HV{}-D{}-mask_p{}-cu_seqlens{}-{}-safe_gate{}".format(*test))
         for test in [
-            (4, 128, 0.1, [0, 15], torch.bfloat16, True),
-            (4, 128, 0.9, [0, 256, 500, 1000], torch.bfloat16, True),
-            (4, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True),
-            (4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16, True),
-            (4, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True),
+            (4, 4, 128, 0.1, [0, 15], torch.bfloat16, True),
+            (4, 4, 128, 0.9, [0, 256, 500, 1000], torch.bfloat16, True),
+            (4, 4, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True),
+            (4, 4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16, True),
+            (4, 4, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True),
             # ======Varlen test with simulated trace=======
             (
+                32,
                 32,
                 128,
                 0,
@@ -182,6 +189,7 @@ def test_safe_gate_chunk(
             ),
             (
                 32,
+                32,
                 128,
                 0,
                 [0, 652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236, 5543, 6255, 6480, 6947, 7616, 8192],
@@ -190,6 +198,7 @@ def test_safe_gate_chunk(
             ),
             (
                 32,
+                32,
                 128,
                 0,
                 [0, 315, 973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459, 6318, 6669, 6979, 7583, 8192],
@@ -197,6 +206,20 @@ def test_safe_gate_chunk(
                 True,
             ),
             (
+                32,
+                32,
+                128,
+                0,
+                [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
+                torch.bfloat16,
+                True,
+            ),
+            # ======GVA varlen cases: HV > H=======
+            (2, 4, 128, 0.1, [0, 15], torch.bfloat16, True),
+            (4, 8, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True),
+            (4, 8, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True),
+            (
+                8,
                 32,
                 128,
                 0,
@@ -209,6 +232,7 @@ def test_safe_gate_chunk(
 )
 def test_safe_gate_chunk_varlen(
     H: int,
+    HV: int,
     D: int,
     mask_p: float,
     cu_seqlens: list[int],
@@ -225,15 +249,15 @@ def test_safe_gate_chunk_varlen(
 
     q = torch.randn((1, T, H, D), dtype=dtype)
     k = F.normalize(torch.randn(1, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
-    v = torch.randn((1, T, H, D), dtype=dtype)
-    g = F.logsigmoid(torch.randn(1, T, H, D, dtype=torch.float))
+    v = torch.randn((1, T, HV, D), dtype=dtype)
+    g = F.logsigmoid(torch.randn(1, T, HV, D, dtype=torch.float))
     mask = torch.rand_like(g) > mask_p
     g = g * mask + (~mask) * (-1000)
     if safe_gate:
         g = g.clamp(-5, 0)
 
-    beta = torch.randn(1, T, H, dtype=torch.float32).sigmoid().to(beta_dtype)
-    h0 = torch.randn((N, H, D, D), dtype=torch.float32)
+    beta = torch.randn(1, T, HV, dtype=torch.float32).sigmoid().to(beta_dtype)
+    h0 = torch.randn((N, HV, D, D), dtype=torch.float32)
 
     q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(), (q, k, v, g, beta, h0))
     do = torch.randn_like(v)
