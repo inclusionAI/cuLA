@@ -2052,6 +2052,8 @@ def chunk_gated_delta_rule_fwd_h(
     BT = chunk_size
     is_varlen = cu_seqlens is not None
 
+    assert HV >= H and HV % H == 0, f"HV ({HV}) must be >= H ({H}) and divisible by H"
+
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     # N: the actual number of sequences in the batch with either equal or variable lengths
