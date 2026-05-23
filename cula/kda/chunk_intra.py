@@ -20,15 +20,10 @@ import triton
 import triton.language as tl
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2, gather
-from fla.utils import IS_GATHER_SUPPORTED, IS_TF32_SUPPORTED, autotune_cache_kwargs
+from fla.utils import IS_GATHER_SUPPORTED, autotune_cache_kwargs
 
 import cula.cudac as cula_cuda
 from cula.utils import prepare_uniform_cu_seqlens
-
-if IS_TF32_SUPPORTED:
-    SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
-else:
-    SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
 
 
 @triton.heuristics(
