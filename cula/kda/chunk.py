@@ -365,6 +365,7 @@ def chunk_kda(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
             )
+        assert cu_seqlens.dtype == torch.int32, "cu_seqlens must be in int32"
     if initial_state is not None:
         assert initial_state.dtype == torch.float32, "initial_state must be in float32."
 
