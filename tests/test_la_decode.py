@@ -233,7 +233,7 @@ def test_vs_fla(B):
 # ---------------------------------------------------------------------------
 def test_prefill_decode_e2e():
     """Verify prefill output state passes directly into decode without transpose."""
-    from cula.ops.lightning_attn import lightning_attn_fwd
+    from cula.ops.lightning_attn_sm100 import lightning_attn_fwd
 
     B, S, H, D = 2, 64, 8, 128
     scale = D**-0.5

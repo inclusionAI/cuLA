@@ -45,7 +45,7 @@ import sys
 import torch
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
-_fwd_o_mod = importlib.import_module("cula.ops.fwd_o")
+_fwd_o_mod = importlib.import_module("cula.ops.fwd_o_sm100")
 chunk_gla_fwd_o = _fwd_o_mod.chunk_gla_fwd_o
 build_chunk_indices = _fwd_o_mod.build_chunk_indices
 

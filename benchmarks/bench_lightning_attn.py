@@ -52,7 +52,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from fla.ops.simple_gla.chunk import chunk_simple_gla_fwd
 
-from cula.ops.lightning_attn import lightning_attn_fwd, lightning_attn_fwd_varlen
+from cula.ops.lightning_attn_sm100 import lightning_attn_fwd, lightning_attn_fwd_varlen
 
 # =============================================================================
 # Constants

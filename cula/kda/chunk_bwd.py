@@ -39,7 +39,7 @@ import cula.cudac as cula_cuda
 from cula.kda.chunk_intra import chunk_kda_bwd_intra
 from cula.utils import prepare_uniform_cu_seqlens
 
-_delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h")
+_delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h_sm100")
 chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
 
 BK_LIST = [32, 64] if check_shared_mem() else [16, 32]

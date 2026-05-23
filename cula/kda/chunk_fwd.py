@@ -30,9 +30,9 @@ from cula.kda.chunk_intra import chunk_kda_fwd_intra
 from cula.utils import assert_blackwell
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
-_delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h")
+_delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h_sm100")
 chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
-_fwd_o_mod = importlib.import_module("cula.ops.fwd_o")
+_fwd_o_mod = importlib.import_module("cula.ops.fwd_o_sm100")
 chunk_gla_fwd_o = _fwd_o_mod.chunk_gla_fwd_o
 
 

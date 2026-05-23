@@ -32,7 +32,7 @@ from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
-from cula.ops.kda_fully_fused_wip import KDAChunkwise
+from cula.ops.kda_fully_fused_sm100_wip import KDAChunkwise
 from cula.utils import USE_FAST_MATH, assert_blackwell
 
 # Global kernel cache
@@ -80,10 +80,6 @@ class ChunkKDAFunction(torch.autograd.Function):
         else:
             num_seqs = B
 
-        # No output padding needed — the kernel handles tail tiles via
-        # TMA descriptor modification (like flashkda), preventing writes
-        # into the next sequence's output region.
-
         g_org = None
         if use_gate_in_kernel:
             try:
@@ -110,7 +106,6 @@ class ChunkKDAFunction(torch.autograd.Function):
                     A_log=A_log,
                     dt_bias=dt_bias,
                 )
-        # only in safe_gate && use_gate_in_kernel, cumsum is fused into kda_gate_chunk_cumsum
         if not (safe_gate and use_gate_in_kernel):
             g = chunk_local_cumsum(
                 g=g, chunk_size=chunk_size, scale=RCP_LN2, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -126,7 +121,6 @@ class ChunkKDAFunction(torch.autograd.Function):
         g_cute = from_dlpack(g.detach())
         beta_cute = from_dlpack(beta.detach())
 
-        # FIXME: support return final_states
         o = torch.empty_like(q)
         o_cute = from_dlpack(o.detach())
 
@@ -135,12 +129,10 @@ class ChunkKDAFunction(torch.autograd.Function):
         has_initial_state = initial_state is not None
         cache_key = (has_initial_state, output_final_state, safe_gate, is_varlen, scale, chunk_size, D, USE_FAST_MATH)
 
-        # Prepare cu_seqlens as int32 for kernel
         if is_varlen:
             cu_seqlens_i32 = cu_seqlens.to(torch.int32).contiguous()
             cu_seqlens_cute = from_dlpack(cu_seqlens_i32.detach())
         else:
-            # Use cached dummy cu_seqlens to avoid per-call allocation overhead
             dev = q.device
             if dev not in _dummy_cache:
                 _dummy_cu = torch.zeros(2, dtype=torch.int32, device=dev)
@@ -155,9 +147,6 @@ class ChunkKDAFunction(torch.autograd.Function):
             cu_seqlens_i32 = dc["cu_seqlens"]
             cu_seqlens_cute = dc["cu_seqlens_cute"]
 
-        # Workspace buffer for TMA descriptor modification (varlen tail tiles)
-        # Same approach as flashkda: per-CTA slot for modified TMA descriptors
-        # 128 bytes per TMA descriptor, indexed by bidx (sequence index)
         dev = q.device
         if dev not in _dummy_cache:
             _dummy_cu = torch.zeros(2, dtype=torch.int32, device=dev)
@@ -171,7 +160,6 @@ class ChunkKDAFunction(torch.autograd.Function):
         dc = _dummy_cache[dev]
         if is_varlen:
             ws_size = num_seqs * 128
-            # Allocate/reuse workspace (grow if needed)
             if "workspace" not in dc or dc["workspace"].numel() < ws_size:
                 ws_buf = torch.zeros(ws_size, dtype=torch.uint8, device=dev)
                 dc["workspace"] = ws_buf
@@ -184,13 +172,10 @@ class ChunkKDAFunction(torch.autograd.Function):
                 dc["workspace_cute"] = from_dlpack(ws_buf.detach())
             workspace_cute = dc["workspace_cute"]
 
-        # State shape: [num_seqs, H, D, D]
-        # Prepare initial_state and final_state tensors
         if has_initial_state:
             initial_state_f32 = initial_state.to(torch.float32).contiguous()
             initial_state_cute = from_dlpack(initial_state_f32.detach())
         else:
-            # Use cached tiny dummy (pointer won't be dereferenced when has_initial_state=False)
             initial_state_f32 = None
             initial_state_cute = _dummy_cache[q.device]["state_cute"]
 
@@ -198,11 +183,9 @@ class ChunkKDAFunction(torch.autograd.Function):
             final_state_f32 = torch.zeros(num_seqs, H, D, D, dtype=torch.float32, device=q.device)
             final_state_cute = from_dlpack(final_state_f32.detach())
         else:
-            # Use cached tiny dummy (pointer won't be dereferenced when output_final_state=False)
             final_state_f32 = None
             final_state_cute = _dummy_cache[q.device]["state_cute"]
 
-        # problem_size: (num_seqs, total_tokens_or_seq_len, H, D)
         problem_size = (num_seqs, S, H, D)
 
         if cache_key in compiled_kernel_cache:
@@ -270,7 +253,6 @@ class ChunkKDAFunction(torch.autograd.Function):
         raise NotImplementedError("Backward pass is not implemented yet.")
 
 
-# TODO: Blackwell fused prefill is still under development
 @torch.compiler.disable
 def flash_kda_prefill(
     q: torch.Tensor,
@@ -289,61 +271,8 @@ def flash_kda_prefill(
     chunk_indices: torch.IntTensor | None = None,
     **kwargs,
 ):
-    r"""
-    Args:
-        q (torch.Tensor):
-            queries of shape `[B, T, H, K]`.
-        k (torch.Tensor):
-            keys of shape `[B, T, H, K]`.
-        v (torch.Tensor):
-            values of shape `[B, T, H, V]`.
-        g (torch.Tensor):
-            (forget) gating tensor (in log space!) of shape `[B, T, H, K]`.
-        beta (torch.Tensor):
-            betas of shape `[B, T, H]`.
-        scale (Optional[float]):
-            Scale factor for the KDA attention scores.
-            If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
-        initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[N, H, K, V]` for `N` input sequences.
-            For equal-length input sequences, `N` equals the batch size `B`.
-            Default: `None`.
-        output_final_state (Optional[bool]):
-            Whether to output the final state of shape `[N, H, K, V]`. Default: `False`.
-        use_qk_l2norm_in_kernel (bool):
-            Whether to apply L2norm to the q,k tensor internally. Default: `False`.
-        use_gate_in_kernel (bool):
-            Whether to compute the log-space KDA decay internally.
-            - If `True`:
-              The passed `g` acts as the raw input for `-exp(A_log).view(H, -1) * softplus(g + dt_bias.view(H, K))`.
-              Note that as part of the input arguments,
-              `A_log` (shape `[H]`) and the optional `dt_bias` (shape `[H * K]`) should be provided.
-            - If `False`, `g` is expected to be the pre-computed decay value.
-            Default: `False`.
-        safe_gate (bool):
-            Whether the kernel can assume the input gate values `g` are in a safe range.
-            When `True`, the kernel can use M=16 TensorCore acceleration.
-            The safe range is approximately [-5, 0). Default: `False`.
-        lower_bound (Optional[float]):
-            Lower bound for the forget gate activation function when `use_gate_in_kernel=True`.
-            This parameter modifies the internal forget gate activation and is recommended
-            to be set to `-5` when `safe_gate` is enabled. Default: `None`.
-        cu_seqlens (torch.IntTensor):
-            Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
-            consistent with the FlashAttention API.
-        chunk_indices (torch.IntTensor):
-            Chunk indices used for variable-length training,
-
-    Returns:
-        o (torch.Tensor):
-            Outputs of shape `[B, T, H, V]`.
-        final_state (torch.Tensor):
-            Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
-    """
     assert_blackwell()
-    # initial_state is now supported
     assert cu_seqlens is None or q.shape[0] == 1, "For varlen, batch size must be 1. Flatten sequences first."
-    # assert output_final_state == False, "output_final_state=True is not supported in cutedsl_kda_prefill yet."
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
@@ -355,7 +284,6 @@ def flash_kda_prefill(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
             )
-        # Non-aligned sequence lengths are handled natively by the kernel
     if initial_state is not None:
         assert initial_state.dtype == torch.float32, "initial_state must be in float32."
 

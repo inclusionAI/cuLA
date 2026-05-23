@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import importlib.util
 
 _spec = importlib.util.spec_from_file_location(
-    "fwd_o", os.path.join(os.path.dirname(__file__), "..", "cula", "ops", "fwd_o.py")
+    "fwd_o_sm100", os.path.join(os.path.dirname(__file__), "..", "cula", "ops", "fwd_o_sm100.py")
 )
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
