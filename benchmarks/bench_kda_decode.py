@@ -51,42 +51,9 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+from benchmarks.utils import benchmark_cuda_fn, relative_rms_error_rel_max
 from cula.kda import fused_sigmoid_gating_delta_rule_update as cula_fused
 from cula.ops.kda_decode_fla import fused_sigmoid_gating_delta_rule_update as fla_fused
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Timing utility
-# ──────────────────────────────────────────────────────────────────────
-def benchmark_fn(fn, *, setup_fn=None, warmup=30, rep=200):
-    """Benchmark using CUDA events.
-
-    If provided, setup_fn runs before each iteration and is excluded from the
-    timing window. This is used to reset the mutable recurrent state fairly.
-    """
-    for _ in range(warmup):
-        if setup_fn is not None:
-            setup_fn()
-        fn()
-    torch.cuda.synchronize()
-
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
-
-    for i in range(rep):
-        if setup_fn is not None:
-            setup_fn()
-        starts[i].record()
-        fn()
-        ends[i].record()
-
-    torch.cuda.synchronize()
-    times = sorted(s.elapsed_time(e) for s, e in zip(starts, ends))
-    n = len(times)
-    if n <= 2:
-        return sum(times) / max(len(times), 1)
-    iqr = times[n // 4 : 3 * n // 4]
-    return sum(iqr) / len(iqr)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -104,19 +71,6 @@ def make_inputs(N, H, HV, K, V, device="cuda", seed=42):
     dt_bias = torch.randn(HV, K, device=device, dtype=torch.float32) * 0.1
     state = torch.randn(N, HV, V, K, device=device, dtype=torch.float32) * 0.01
     return q, k, v, a, b, A_log, dt_bias, state
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Accuracy check
-# ──────────────────────────────────────────────────────────────────────
-def accuracy_stats(ref, out):
-    ref_f, out_f = ref.float(), out.float()
-    diff = (ref_f - out_f).abs()
-    rmse = diff.pow(2).mean().sqrt().item()
-    max_diff = diff.max().item()
-    denom = ref_f.abs().max().item()
-    rel_max = max_diff / denom if denom > 0 else 0.0
-    return rmse, rel_max
 
 
 def to_v_last_state(state: torch.Tensor, layout: str) -> torch.Tensor:
@@ -202,23 +156,25 @@ def write_markdown_report(args, gpu_name: str, sections: list[tuple[int, int, li
 
         lines.append("### Accuracy (Output)")
         lines.append("")
-        lines.append("| N | cuLA v out RMSE | cuLA v out rel | cuLA k out RMSE | cuLA k out rel |")
-        lines.append("|---|----------------:|---------------:|----------------:|---------------:|")
+        lines.append("| N | cuLA v out rel_rmse | cuLA v out rel_max | cuLA k out rel_rmse | cuLA k out rel_max |")
+        lines.append("|---|------------------------------:|-------------------:|------------------------------:|-------------------:|")
         for r in results:
             lines.append(
-                f"| {r['N']} | {r['out_v_last_rmse']:.3e} | {r['out_v_last_rel']:.3e} | "
-                f"{r['out_k_last_rmse']:.3e} | {r['out_k_last_rel']:.3e} |"
+                f"| {r['N']} | {r['out_v_last_relative_rms_error']:.3e} | {r['out_v_last_rel_max']:.3e} | "
+                f"{r['out_k_last_relative_rms_error']:.3e} | {r['out_k_last_rel_max']:.3e} |"
             )
         lines.append("")
 
         lines.append("### Accuracy (State)")
         lines.append("")
-        lines.append("| N | cuLA v state RMSE | cuLA v state rel | cuLA k state RMSE | cuLA k state rel |")
-        lines.append("|---|------------------:|-----------------:|------------------:|-----------------:|")
+        lines.append(
+            "| N | cuLA v state rel_rmse | cuLA v state rel_max | cuLA k state rel_rmse | cuLA k state rel_max |"
+        )
+        lines.append("|---|--------------------------------:|---------------------:|--------------------------------:|---------------------:|")
         for r in results:
             lines.append(
-                f"| {r['N']} | {r['state_v_last_rmse']:.3e} | {r['state_v_last_rel']:.3e} | "
-                f"{r['state_k_last_rmse']:.3e} | {r['state_k_last_rel']:.3e} |"
+                f"| {r['N']} | {r['state_v_last_relative_rms_error']:.3e} | {r['state_v_last_rel_max']:.3e} | "
+                f"{r['state_k_last_relative_rms_error']:.3e} | {r['state_k_last_rel_max']:.3e} |"
             )
         lines.append("")
 
@@ -316,10 +272,12 @@ def run_config(N, H, HV, K, V, warmup, rep, ncu_mode):
         o_cula_k_last = call_cula_k_last(state_cula_k_last)
         o_fla_v_last = call_fla_v_last(state_fla_v_last)
 
-    out_v_last_rmse, out_v_last_rel = accuracy_stats(o_fla_v_last, o_cula_v_last)
-    out_k_last_rmse, out_k_last_rel = accuracy_stats(o_fla_v_last, o_cula_k_last)
-    state_v_last_rmse, state_v_last_rel = accuracy_stats(state_fla_v_last, state_cula_v_last)
-    state_k_last_rmse, state_k_last_rel = accuracy_stats(state_fla_v_last, to_v_last_state(state_cula_k_last, "vk"))
+    out_v_last_relative_rms_error, out_v_last_rel_max = relative_rms_error_rel_max(o_fla_v_last, o_cula_v_last)
+    out_k_last_relative_rms_error, out_k_last_rel_max = relative_rms_error_rel_max(o_fla_v_last, o_cula_k_last)
+    state_v_last_relative_rms_error, state_v_last_rel_max = relative_rms_error_rel_max(state_fla_v_last, state_cula_v_last)
+    state_k_last_relative_rms_error, state_k_last_rel_max = relative_rms_error_rel_max(
+        state_fla_v_last, to_v_last_state(state_cula_k_last, "vk")
+    )
 
     if ncu_mode:
         w, r = 1, 1
@@ -340,13 +298,13 @@ def run_config(N, H, HV, K, V, warmup, rep, ncu_mode):
         state_bench_fla_v_last.copy_(state_init_v_last)
 
     with torch.no_grad():
-        t_cula_v_last = benchmark_fn(
+        t_cula_v_last = benchmark_cuda_fn(
             lambda: call_cula_v_last(state_bench_cula_v_last), setup_fn=setup_cula_v_last, warmup=w, rep=r
         )
-        t_cula_k_last = benchmark_fn(
+        t_cula_k_last = benchmark_cuda_fn(
             lambda: call_cula_k_last(state_bench_cula_k_last), setup_fn=setup_cula_k_last, warmup=w, rep=r
         )
-        t_fla_v_last = benchmark_fn(
+        t_fla_v_last = benchmark_cuda_fn(
             lambda: call_fla_v_last(state_bench_fla_v_last), setup_fn=setup_fla_v_last, warmup=w, rep=r
         )
 
@@ -361,14 +319,14 @@ def run_config(N, H, HV, K, V, warmup, rep, ncu_mode):
         "t_fla_v_last_ms": t_fla_v_last,
         "speedup_v_last": t_fla_v_last / t_cula_v_last if t_cula_v_last > 0 else float("inf"),
         "speedup_k_last": t_fla_v_last / t_cula_k_last if t_cula_k_last > 0 else float("inf"),
-        "out_v_last_rmse": out_v_last_rmse,
-        "out_v_last_rel": out_v_last_rel,
-        "out_k_last_rmse": out_k_last_rmse,
-        "out_k_last_rel": out_k_last_rel,
-        "state_v_last_rmse": state_v_last_rmse,
-        "state_v_last_rel": state_v_last_rel,
-        "state_k_last_rmse": state_k_last_rmse,
-        "state_k_last_rel": state_k_last_rel,
+        "out_v_last_relative_rms_error": out_v_last_relative_rms_error,
+        "out_v_last_rel_max": out_v_last_rel_max,
+        "out_k_last_relative_rms_error": out_k_last_relative_rms_error,
+        "out_k_last_rel_max": out_k_last_rel_max,
+        "state_v_last_relative_rms_error": state_v_last_relative_rms_error,
+        "state_v_last_rel_max": state_v_last_rel_max,
+        "state_k_last_relative_rms_error": state_k_last_relative_rms_error,
+        "state_k_last_rel_max": state_k_last_rel_max,
     }
 
 
@@ -427,23 +385,29 @@ def main():
             )
 
         print()
-        hdr_out = f"{'N':>5} | {'cuLA v out RMSE':>16} | {'rel':>10} | {'cuLA k out RMSE':>16} | {'rel':>10}"
+        hdr_out = (
+            f"{'N':>5} | {'cuLA v out rel_rmse':>30} | {'rel_max':>10} | "
+            f"{'cuLA k out rel_rmse':>30} | {'rel_max':>10}"
+        )
         print(hdr_out)
         print("-" * len(hdr_out))
         for res in results:
             print(
-                f"{res['N']:5d} | {res['out_v_last_rmse']:16.3e} | {res['out_v_last_rel']:10.3e} | "
-                f"{res['out_k_last_rmse']:16.3e} | {res['out_k_last_rel']:10.3e}"
+                f"{res['N']:5d} | {res['out_v_last_relative_rms_error']:30.3e} | {res['out_v_last_rel_max']:10.3e} | "
+                f"{res['out_k_last_relative_rms_error']:30.3e} | {res['out_k_last_rel_max']:10.3e}"
             )
 
         print()
-        hdr_state = f"{'N':>5} | {'cuLA v state RMSE':>18} | {'rel':>10} | {'cuLA k state RMSE':>18} | {'rel':>10}"
+        hdr_state = (
+            f"{'N':>5} | {'cuLA v state rel_rmse':>32} | {'rel_max':>10} | "
+            f"{'cuLA k state rel_rmse':>32} | {'rel_max':>10}"
+        )
         print(hdr_state)
         print("-" * len(hdr_state))
         for res in results:
             print(
-                f"{res['N']:5d} | {res['state_v_last_rmse']:18.3e} | {res['state_v_last_rel']:10.3e} | "
-                f"{res['state_k_last_rmse']:18.3e} | {res['state_k_last_rel']:10.3e}"
+                f"{res['N']:5d} | {res['state_v_last_relative_rms_error']:32.3e} | {res['state_v_last_rel_max']:10.3e} | "
+                f"{res['state_k_last_relative_rms_error']:32.3e} | {res['state_k_last_rel_max']:10.3e}"
             )
 
         all_sections.append((h_dim, v_dim, results))

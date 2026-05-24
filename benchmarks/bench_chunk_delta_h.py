@@ -18,7 +18,7 @@ bench_chunk_delta_h.py — Benchmark: CuTe DSL kernel vs FLA Triton baseline
                          for chunk_delta_rule_fwd_h (inter-chunk recurrent state)
 
 Compares:
-  - Accuracy: max_diff, mean_diff between CuTe DSL and FLA Triton outputs
+    - Accuracy: relative_rms_error, max_diff, mean_diff between CuTe DSL and FLA Triton outputs
   - Performance: kernel execution time (ms) with CUDA events
 
 Both non-varlen and varlen modes are supported.
@@ -46,6 +46,7 @@ import importlib
 
 import numpy as np
 import torch
+from benchmarks.utils import benchmark_cuda_mode_fn, relative_rms_error_max_mean_abs
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
 _delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h_sm100")
@@ -70,29 +71,6 @@ NCU_MODE = False
 # ============================================================
 # Helpers
 # ============================================================
-def time_kernel(fn, warmup=None, n_iters=None):
-    if warmup is None:
-        warmup = 1 if NCU_MODE else WARMUP
-    if n_iters is None:
-        n_iters = 1 if NCU_MODE else N_ITERS
-    """Time a kernel using CUDA events. Returns ms/call."""
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    start_evt.record()
-    for _ in range(n_iters):
-        fn()
-    end_evt.record()
-    torch.cuda.synchronize()
-    return start_evt.elapsed_time(end_evt) / n_iters
-
-
-def accuracy_stats(ref, out):
-    """Compute max and mean absolute difference."""
-    diff = (ref.float() - out.float()).abs()
-    return diff.max().item(), diff.mean().item()
 
 
 # ============================================================
@@ -148,7 +126,7 @@ def bench_non_varlen(configs):
         h_out = cute_result[0]
         torch.cuda.synchronize()
 
-        max_diff, mean_diff = accuracy_stats(h_fla, h_out)
+        relative_rms_error, max_diff, mean_diff = relative_rms_error_max_mean_abs(h_fla, h_out)
 
         # ---- Performance timing ----
         def run_fla(k=k, w=w, u=u, gk=gk, h0=h0):
@@ -177,8 +155,8 @@ def bench_non_varlen(configs):
                 save_new_value=save_vnew,
             )
 
-        ms_fla = time_kernel(run_fla)
-        ms_cute = time_kernel(run_cute)
+        ms_fla = benchmark_cuda_mode_fn(run_fla, default_warmup=WARMUP, default_rep=N_ITERS, ncu_mode=NCU_MODE)
+        ms_cute = benchmark_cuda_mode_fn(run_cute, default_warmup=WARMUP, default_rep=N_ITERS, ncu_mode=NCU_MODE)
         speedup = ms_fla / ms_cute if ms_cute > 0 else float("inf")
 
         flags = []
@@ -197,6 +175,7 @@ def bench_non_varlen(configs):
             "T": T,
             "H": H,
             "flags": flag_str,
+            "relative_rms_error": relative_rms_error,
             "max_diff": max_diff,
             "mean_diff": mean_diff,
             "ms_fla": ms_fla,
@@ -206,7 +185,7 @@ def bench_non_varlen(configs):
         results.append(r)
         print(
             f"  B={B:2d} T={T:5d} H={H:3d}{flag_str:<16s} | "
-            f"max_diff={max_diff:.6f} mean_diff={mean_diff:.8f} | "
+            f"relative_rms_error={relative_rms_error:.6f} max_diff={max_diff:.6f} mean_diff={mean_diff:.8f} | "
             f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms | "
             f"speedup={speedup:.2f}x"
         )
@@ -309,7 +288,7 @@ def bench_varlen(configs):
         h_out = cute_result[0]
         torch.cuda.synchronize()
 
-        max_diff, mean_diff = accuracy_stats(h_fla, h_out)
+        relative_rms_error, max_diff, mean_diff = relative_rms_error_max_mean_abs(h_fla, h_out)
 
         # ---- Performance timing ----
         def run_fla(k=k, w=w, u=u, gk=gk, h0=h0, cu=cu_seqlens_long):
@@ -340,8 +319,8 @@ def bench_varlen(configs):
                 cu_seqlens=cu,
             )
 
-        ms_fla = time_kernel(run_fla)
-        ms_cute = time_kernel(run_cute)
+        ms_fla = benchmark_cuda_mode_fn(run_fla, default_warmup=WARMUP, default_rep=N_ITERS, ncu_mode=NCU_MODE)
+        ms_cute = benchmark_cuda_mode_fn(run_cute, default_warmup=WARMUP, default_rep=N_ITERS, ncu_mode=NCU_MODE)
         speedup = ms_fla / ms_cute if ms_cute > 0 else float("inf")
 
         min_l, max_l = min(seq_lens), max(seq_lens)
@@ -365,6 +344,7 @@ def bench_varlen(configs):
             "H": H,
             "n_seqs": num_seqs,
             "flags": flag_str,
+            "relative_rms_error": relative_rms_error,
             "max_diff": max_diff,
             "mean_diff": mean_diff,
             "ms_fla": ms_fla,
@@ -374,7 +354,7 @@ def bench_varlen(configs):
         results.append(r)
         print(
             f"  {tag:40s} H={H:3d}{flag_str:<16s} | "
-            f"max_diff={max_diff:.6f} mean_diff={mean_diff:.8f} | "
+            f"relative_rms_error={relative_rms_error:.6f} max_diff={max_diff:.6f} mean_diff={mean_diff:.8f} | "
             f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms | "
             f"speedup={speedup:.2f}x"
         )
@@ -401,7 +381,7 @@ def print_report(nv_results, vl_results):
         print("\n  [Non-Varlen]")
         print(f"  {'─' * 100}")
         print(
-            f"  {'Config':<35s}  │  {'max_diff':>10s}  {'mean_diff':>12s}"
+            f"  {'Config':<35s}  │  {'rel_rmse':>18s}  {'max_diff':>10s}  {'mean_diff':>12s}"
             f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 100}")
@@ -409,19 +389,19 @@ def print_report(nv_results, vl_results):
             label = f"B={r['B']:2d} T={r['T']:5d} H={r['H']:3d}{r['flags']}"
             print(
                 f"  {label:<35s}  │  "
-                f"{r['max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                f"{r['relative_rms_error']:18.6f}  {r['max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x"
             )
         print(f"  {'─' * 100}")
         speedups = [r["speedup"] for r in nv_results]
         geo = math.exp(sum(math.log(s) for s in speedups) / len(speedups))
-        print(f"  {'Geometric mean':<35s}  │  {'':>10s}  {'':>12s}  │  {'':>9s}  {'':>9s}  {geo:7.2f}x")
+        print(f"  {'Geometric mean':<35s}  │  {'':>18s}  {'':>10s}  {'':>12s}  │  {'':>9s}  {'':>9s}  {geo:7.2f}x")
 
     if vl_results:
         print("\n  [Varlen]")
         print(f"  {'─' * 115}")
         print(
-            f"  {'Config':>55s}  │  {'max_diff':>10s}  {'mean_diff':>12s}"
+            f"  {'Config':>55s}  │  {'rel_rmse':>18s}  {'max_diff':>10s}  {'mean_diff':>12s}"
             f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 115}")
@@ -429,13 +409,13 @@ def print_report(nv_results, vl_results):
             label = f"{r['tag']} H={r['H']:3d}{r['flags']}"
             print(
                 f"  {label:>55s}  │  "
-                f"{r['max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                f"{r['relative_rms_error']:18.6f}  {r['max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x"
             )
         print(f"  {'─' * 115}")
         speedups = [r["speedup"] for r in vl_results]
         geo = math.exp(sum(math.log(s) for s in speedups) / len(speedups))
-        print(f"  {'Geometric mean':>55s}  │  {'':>10s}  {'':>12s}  │  {'':>9s}  {'':>9s}  {geo:7.2f}x")
+        print(f"  {'Geometric mean':>55s}  │  {'':>18s}  {'':>10s}  {'':>12s}  │  {'':>9s}  {'':>9s}  {geo:7.2f}x")
 
     print(f"\n{sep}\n")
 
