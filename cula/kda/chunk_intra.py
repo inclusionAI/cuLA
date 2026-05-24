@@ -779,10 +779,9 @@ def chunk_kda_fwd_intra(
         "cu_seqlens and chunk_indices must be int32 for cuda impl"
     )
 
-    # The SM100 intra kernel only materializes the valid causal region. Zero-fill
-    # the outputs so any untouched slots stay neutral for downstream recompute.
-    Aqk = torch.zeros(B, T, H_V, BT, device=k.device, dtype=k.dtype)
-    Akk = torch.zeros(B, T, H_V, BT, device=k.device, dtype=k.dtype)
+    # Aqk and Akk are produced per v-head by the intra kernel.
+    Aqk = torch.empty(B, T, H_V, BT, device=k.device, dtype=k.dtype)
+    Akk = torch.empty(B, T, H_V, BT, device=k.device, dtype=k.dtype)
 
     tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
     cula_cuda.chunk_kda_fwd_intra_cuda(

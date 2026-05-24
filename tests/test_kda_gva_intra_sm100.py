@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pyright: reportMissingImports=false
+
 """Unit tests for SM100 KDA GVA (HV > HQK) support in chunk_kda_fwd_intra.
 
 The SM100 kernels (kda_fwd_intra / kda_fwd_recomp_w_u) now accept:
@@ -28,16 +30,11 @@ the non-GVA behaviour untouched.
 
 from __future__ import annotations
 
-import pathlib
-import sys
+from typing import cast
 
 import pytest
 import torch
 from einops import rearrange
-
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "third_party" / "flash-linear-attention"))
-sys.path.insert(0, str(ROOT))
 
 from fla.modules.l2norm import l2norm_fwd
 from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_intra
@@ -72,7 +69,7 @@ def _make_gva_inputs(
     HV: int,
     D: int,
     chunk_size: int,
-    cu_seqlens: torch.Tensor | None = None,
+    cu_seqlens: torch.IntTensor | None = None,
     dtype: torch.dtype = torch.bfloat16,
     seed: int = 42,
 ):
@@ -184,6 +181,7 @@ def _assert_intra_outputs_match(ref, tri, disable_recompute: bool) -> None:
     assert Akk_c.shape == Akk_r.shape, (Akk_c.shape, Akk_r.shape)
     assert w_c.shape == w_r.shape, (w_c.shape, w_r.shape)
     assert u_c.shape == u_r.shape, (u_c.shape, u_r.shape)
+    assert kg_c is not None and kg_r is not None
     assert kg_c.shape == kg_r.shape, (kg_c.shape, kg_r.shape)
 
     assert_close("Akk", Akk_r, Akk_c, 0.008)
@@ -227,6 +225,7 @@ def test_gva_intra_uniform(B, T, HQK, group_size, D, disable_recompute):
     chunk_size = 64
 
     cu_seqlens = prepare_uniform_cu_seqlens(B, T, torch.device(device), torch.int32)
+    cu_seqlens = cast(torch.IntTensor, cu_seqlens)
     q, k, v, g, beta, scale, cu_seqlens, chunk_indices = _make_gva_inputs(
         B=B, T=T, HQK=HQK, HV=HV, D=D, chunk_size=chunk_size, cu_seqlens=cu_seqlens,
     )
@@ -275,6 +274,7 @@ def test_gva_intra_varlen(HQK, group_size, D, cu_seqlens, disable_recompute):
     chunk_size = 64
 
     cu_seqlens_t = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    cu_seqlens_t = cast(torch.IntTensor, cu_seqlens_t)
     T = int(cu_seqlens_t[-1].item())
     # Packed layout uses B=1 and a flat time axis.
     q, k, v, g, beta, scale, cu_seqlens_t, chunk_indices = _make_gva_inputs(
@@ -320,6 +320,7 @@ def test_gva_intra_degenerate_equals_non_gva(B, T, H, D, disable_recompute):
     """
     chunk_size = 64
     cu_seqlens = prepare_uniform_cu_seqlens(B, T, torch.device(device), torch.int32)
+    cu_seqlens = cast(torch.IntTensor, cu_seqlens)
     q, k, v, g, beta, scale, cu_seqlens, chunk_indices = _make_gva_inputs(
         B=B, T=T, HQK=H, HV=H, D=D, chunk_size=chunk_size, cu_seqlens=cu_seqlens,
     )
@@ -352,6 +353,7 @@ def test_gva_intra_output_shapes(group_size):
     HV = HQK * group_size
     chunk_size = 64
     cu_seqlens = prepare_uniform_cu_seqlens(B, T, torch.device(device), torch.int32)
+    cu_seqlens = cast(torch.IntTensor, cu_seqlens)
     q, k, v, g, beta, scale, cu_seqlens, chunk_indices = _make_gva_inputs(
         B=B, T=T, HQK=HQK, HV=HV, D=D, chunk_size=chunk_size, cu_seqlens=cu_seqlens,
     )
@@ -363,6 +365,7 @@ def test_gva_intra_output_shapes(group_size):
     assert Akk.shape == (B, T, HV, chunk_size), Akk.shape
     assert w.shape == (B, T, HV, D), w.shape
     assert u.shape == (B, T, HV, D), u.shape
+    assert kg is not None
     assert kg.shape == (B, T, HV, D), kg.shape
     assert qg is not None and qg.shape == (B, T, HV, D), (None if qg is None else qg.shape)
 
@@ -376,6 +379,7 @@ def test_gva_intra_rejects_non_multiple_ratio():
     B, T, HQK, HV, D = 1, 128, 3, 5, 128  # 5 % 3 != 0
     chunk_size = 64
     cu_seqlens = prepare_uniform_cu_seqlens(B, T, torch.device(device), torch.int32)
+    cu_seqlens = cast(torch.IntTensor, cu_seqlens)
     # We intentionally do not use _make_gva_inputs because the assert fires
     # before kernel launch on the python side.
     dtype = torch.bfloat16
