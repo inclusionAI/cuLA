@@ -201,7 +201,7 @@ def run_config(B, H, K, V, layer_idx, num_layers):
     # cute kernel: pre-create compiled + stream handle
     cute_state_k = state_init.clone().permute(0, 1, 3, 2).reshape(B * H, V, K).contiguous()
     out_cute_k = torch.empty(B, H, V, device=device, dtype=dtype)
-    cache = _get_compiled_kernel(B, 1, H, K, V, scale, USE_FAST_MATH)
+    cache = _get_compiled_kernel(B, 1, H, K, V, cute_state_k.shape[0], scale, USE_FAST_MATH)
     compiled_cute = cache["compiled"]
     stream_handle = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
 

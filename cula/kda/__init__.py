@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from cula.kda.blackwell_fused_fwd import flash_kda_prefill as kda_prefill_blackwell
 from cula.kda.chunk import chunk_kda
 from cula.kda.hopper_fused_fwd import cula_kda_prefill as kda_prefill_hopper
 from cula.ops.kda_decode import fused_sigmoid_gating_delta_rule_update, kda_decode
 
 __all__ = [
     "chunk_kda",
+    "kda_prefill_blackwell",
     "kda_decode",
     "fused_sigmoid_gating_delta_rule_update",
     "kda_prefill_hopper",

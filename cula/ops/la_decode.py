@@ -127,8 +127,9 @@ def la_decode_kernel_small_batch_pretranspose(
     cute.arch.barrier()
 
     # Get current batch
-    gSrc_batch = h0_source[(batch_idx, None, None)]  # (V, K)
-    gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (batch_idx, None, 0))
+    pool_idx = h0_indices[i_n] * HV + i_hv
+    gSrc_batch = h0_source[(pool_idx, None, None)]  # (V, K)
+    gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (pool_idx, None, 0))
 
     # split tiles in V-dimension
     gSrc = cute.local_tile(gSrc_batch, (TILE_V, TILE_K), (None, 0))  # (TILE_V, TILE_K, num_v_tiles)
@@ -289,8 +290,9 @@ def la_decode_kernel_big_batch_pretranspose(
     cute.arch.barrier()
 
     # Get current batch
-    gSrc_batch = h0_source[(batch_idx, None, None)]  # (V, K)
-    gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (batch_idx, None, 0))
+    pool_idx = h0_indices[i_n] * HV + i_hv
+    gSrc_batch = h0_source[(pool_idx, None, None)]  # (V, K)
+    gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (pool_idx, None, 0))
 
     # split tiles in V-dimension
     gSrc = cute.local_tile(gSrc_batch, (TILE_V, TILE_K), (None, 0))  # (TILE_V, TILE_K, num_v_tiles)
@@ -418,7 +420,7 @@ def run_la_decode_kernel_big_batch_pretranspose(
     stream: cuda.CUstream,
 ):
     # h0_source: (B*HV, V, K)
-    batch_size, v_dim, _k_dim = (
+    _pool_dim0, v_dim, _k_dim = (
         h0_source.layout.shape[0],
         h0_source.layout.shape[1],
         h0_source.layout.shape[2],
@@ -477,7 +479,7 @@ def run_la_decode_kernel_big_batch_pretranspose(
         TILE_V_BIG,
         NUM_STAGES_BIG,
     ).launch(
-        grid=(batch_size, 1, 1),
+        grid=(B * H, 1, 1),
         block=[NUM_THREADS_BIG, 1, 1],
         smem=smem_bytes,
         stream=stream,
@@ -502,7 +504,7 @@ def run_la_decode_kernel_small_batch_pretranspose(
     stream: cuda.CUstream,
 ):
     # h0_source: (B*H, V, K)
-    batch_size, v_dim, _k_dim = (
+    _pool_dim0, v_dim, _k_dim = (
         h0_source.layout.shape[0],
         h0_source.layout.shape[1],
         h0_source.layout.shape[2],
@@ -561,7 +563,7 @@ def run_la_decode_kernel_small_batch_pretranspose(
         TILE_V_SMALL,
         NUM_STAGES_SMALL,
     ).launch(
-        grid=(batch_size * NUM_BLOCKS_PER_STATE, 1, 1),
+        grid=(B * H * NUM_BLOCKS_PER_STATE, 1, 1),
         block=[NUM_THREADS_SMALL, 1, 1],
         smem=smem_bytes,
         stream=stream,
@@ -569,7 +571,9 @@ def run_la_decode_kernel_small_batch_pretranspose(
 
 
 @functools.cache
-def _get_compiled_kernel(B: int, T: int, H: int, K: int, V: int, softmax_scale: float, use_fast_math: bool = True):
+def _get_compiled_kernel(
+    B: int, T: int, H: int, K: int, V: int, pool_dim0: int, softmax_scale: float, use_fast_math: bool = True
+):
     """Get or create compiled kernel cache."""
     return {}
 
@@ -625,10 +629,14 @@ def linear_attention_decode(
         raise NotImplementedError(f"CuTe kernel doesn't support K splitting (k_dim_block={k_dim_block})")
 
     # Get compiled kernel (cached)
-    cache_key = (B, 1, H, HEAD_DIM, HEAD_DIM, softmax_scale, USE_FAST_MATH)
+    pool_dim0 = s.shape[0]
+    cache_key = (B, 1, H, HEAD_DIM, HEAD_DIM, pool_dim0, softmax_scale, USE_FAST_MATH)
     cache = _get_compiled_kernel(*cache_key)
 
     h0_source = s
+
+    # Validate state pool dimensions
+    assert s.shape[0] % H == 0, f"s.shape[0] must be divisible by H={H}, got {s.shape[0]}"
     # First-time compilation
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -644,7 +652,6 @@ def linear_attention_decode(
         v_view = v
         o_view = out
 
-        # Use s_offsets directly (pass to kernel but not actually used in current implementation)
         h0_indices = s_offsets
 
         # Convert to CuTe format for compilation

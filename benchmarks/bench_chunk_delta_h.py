@@ -48,7 +48,7 @@ import numpy as np
 import torch
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
-_delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h")
+_delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h_sm100")
 chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
 
 # ─── FLA baseline imports ───

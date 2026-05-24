@@ -12,11 +12,11 @@ cuLA/
 │   ├── lightning/                # Lightning Attention operators
 │   │   └── la_decode.py          # Single-token decode kernel (CuTe DSL)
 │   ├── ops/                      # CuTe DSL kernel implementations
-│   │   ├── chunk_delta_h.py      # Chunk delta-H kernel
-│   │   ├── fwd_o.py              # Forward output kernel
-│   │   ├── lightning_attn.py     # Lightning Attention prefill kernel
-│   │   ├── linear_attn.py        # Generic linear attention kernel
-│   │   ├── kda_fully_fused_wip.py # WIP fully fused KDA kernel
+│   │   ├── chunk_delta_h_sm100.py      # Chunk delta-H kernel (SM100)
+│   │   ├── fwd_o_sm100.py              # Forward output kernel (SM100)
+│   │   ├── lightning_attn_sm100.py     # Lightning Attention prefill kernel (SM100)
+│   │   ├── linear_attn_sm100.py        # Generic linear attention kernel (SM100)
+│   │   ├── kda_fully_fused_sm100_wip.py # WIP fully fused KDA kernel (SM100)
 │   └── utils.py                  # Shared utilities
 │
 ├── csrc/                         # CUDA C++ / CUTLASS kernels

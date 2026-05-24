@@ -282,9 +282,6 @@ class KDAChunkwise:
         acc_shape_pv = tiled_mma_pv.partition_shape_C(tile_shape_mnk_pv[:2])
         tCtAccPV_fake = tiled_mma_pv.make_fragment_C(cute.append(acc_shape_pv, acc_stages))
         num_pv_acc_cols = tcgen05.find_tmem_tensor_col_offset(tCtAccPV_fake)
-        if cutlass.const_expr(PRINT_DEBUG):
-            print(f"tCtAccPV_fake={tCtAccPV_fake}, num_pv_acc_cols={num_pv_acc_cols}")
-
         # No stage for linear state.
         acc_shape_kv = tiled_mma_kv.partition_shape_C(tile_shape_mnk_kv[:2])
         tCtAccKV_fake = tiled_mma_kv.make_fragment_C(cute.append(acc_shape_kv, 1))
@@ -292,15 +289,11 @@ class KDAChunkwise:
         # Cannot reuse KV since we need to accumulate KV in FP32.
         # We setup a separated tmem space for KV16 as operand A for mma.
         num_kv16_acc_cols = num_kv_acc_cols // 2  # BF16 has half columns
-        if cutlass.const_expr(PRINT_DEBUG):
-            print(f"tCtAccKV_fake={tCtAccKV_fake}, num_kv_acc_cols={num_kv_acc_cols}, num_kv16_acc_cols={num_kv16_acc_cols}")
 
         acc_shape_sq = tiled_mma_sq.partition_shape_C(tile_shape_mnk_sq[:2])
         # No Stage for QS since state has no stages.
         tCtAccSQ_fake = tiled_mma_sq.make_fragment_C(cute.append(acc_shape_sq, 1))
         num_qs_acc_cols = tcgen05.find_tmem_tensor_col_offset(tCtAccSQ_fake)
-        if cutlass.const_expr(PRINT_DEBUG):
-            print(f"tCtAccSQ_fake={tCtAccSQ_fake}, num_qs_acc_cols={num_qs_acc_cols}")
 
         num_qk_acc_cols_offset = 0
         num_pv_acc_cols_offset = num_qk_acc_cols_offset + num_qk_acc_cols
@@ -315,14 +308,6 @@ class KDAChunkwise:
         while num_tmem_cols_total < num_tmem_cols_total_tmp:
             num_tmem_cols_total *= 2
         assert num_tmem_cols_total <= SM100_TMEM_CAPACITY_COLS
-
-        if cutlass.const_expr(PRINT_DEBUG):
-            print(f"num_qk_acc_cols_offset: {num_qk_acc_cols_offset}")
-            print(f"num_pv_acc_cols_offset: {num_pv_acc_cols_offset}")
-            print(f"num_kv_acc_cols_offset: {num_kv_acc_cols_offset}")
-            print(f"num_kv16_acc_cols_offset: {num_kv16_acc_cols_offset}")
-            print(f"num_qs_acc_cols_offset: {num_qs_acc_cols_offset}")
-            print(f"num_tmem_cols_total: {num_tmem_cols_total}")
 
         return (
             num_qk_acc_cols_offset,
@@ -649,8 +634,6 @@ class KDAChunkwise:
             self.g_dtype,
             self.g_stage,
         )
-        if PRINT_DEBUG:
-            print(f"g_smem_layout_staged: {g_smem_layout_staged}")
         # V^T*P
         p_smem_layout_staged = sm100_utils.make_smem_layout_b(
             vp_tiled_mma,
@@ -735,10 +718,6 @@ class KDAChunkwise:
             qk_tiled_mma,
             cluster_layout_vmnk.shape,
         )
-        if PRINT_DEBUG:
-            print(f"tma_atom_g: {cute.pretty_str(tma_atom_g)}")
-            print(f"g_smem_layout: {cute.pretty_str(g_smem_layout)}")
-
         # NOTE: G's last row will be extracted from sG in CUDA warp after TMA load
         # No separate TMA needed for G last row - we extract it from the full G tile
 
@@ -752,60 +731,12 @@ class KDAChunkwise:
 
         q_copy_size = cute.size_in_bytes(self.q_dtype, q_smem_layout)
         k_copy_size = cute.size_in_bytes(self.k_dtype, k_smem_layout)
-        v_copy_size = cute.size_in_bytes(self.v_dtype, v_smem_layout)
         g_copy_size = cute.size_in_bytes(self.g_dtype, g_smem_layout)  # NEW for KDA
-        if PRINT_DEBUG:
-            print(
-                f"q_copy_size: {q_copy_size}, k_copy_size: {k_copy_size}, v_copy_size: {v_copy_size}, g_copy_size: {g_copy_size}"
-            )
         self.tma_copy_q_bytes = q_copy_size
         self.tma_copy_k_bytes = k_copy_size
         # self.tma_copy_v_bytes = v_copy_size
         self.tma_copy_v_bytes = k_copy_size
         self.tma_copy_g_bytes = g_copy_size  # NEW for KDA
-
-        if cutlass.const_expr(PRINT_DEBUG):
-            print(f"q_layout: {cute.pretty_str(q_layout)}")
-            print(f"q: {cute.pretty_str(q)}")
-            print(f"k_layout: {cute.pretty_str(k_layout)}")
-            print(f"k: {cute.pretty_str(k)}")
-            print(f"v_layout: {cute.pretty_str(v_layout)}")
-            print(f"v: {cute.pretty_str(v)}")
-            print(f"o_layout: {cute.pretty_str(o_layout)}")
-            print(f"o: {cute.pretty_str(o)}")
-            print(f"qk_tiled_mma: {cute.pretty_str(qk_tiled_mma)}")
-            print(f"kv_tiled_mma: {cute.pretty_str(kv_tiled_mma)}")
-            print(f"vp_tiled_mma: {cute.pretty_str(vp_tiled_mma)}")
-            print(f"sq_tiled_mma: {cute.pretty_str(sq_tiled_mma)}")
-            print(f"cluster_layout_vmnk: {cute.pretty_str(cluster_layout_vmnk)}")
-            print(f"epi_tile: {cute.pretty_str(self.epi_tile)}")
-            print(f"q_smem_layout: {cute.pretty_str(q_smem_layout)}")
-            print(f"k_smem_layout: {cute.pretty_str(k_smem_layout)}")
-            print(f"v_smem_layout: {cute.pretty_str(v_smem_layout)}")
-            print(f"q_smem_layout_staged: {cute.pretty_str(q_smem_layout_staged)}")
-            print(f"k_smem_layout_staged: {cute.pretty_str(k_smem_layout_staged)}")
-            print(f"k_smem_layout_staged.swzzle: {cute.pretty_str(k_smem_layout_staged.inner)}")
-            print(f"k_smem_layout_staged.outer: {cute.pretty_str(k_smem_layout_staged.outer)}")
-            print(f"kv_k_smem_layout_staged: {cute.pretty_str(kv_k_smem_layout_staged)}")
-            print(f"kv_k_smem_layout_staged.swzzle: {cute.pretty_str(kv_k_smem_layout_staged.inner)}")
-            print(f"kv_k_smem_layout_staged.outer: {cute.pretty_str(kv_k_smem_layout_staged.outer)}")
-            print(f"v_smem_layout_staged: {cute.pretty_str(v_smem_layout_staged)}")
-            print(f"o_smem_layout_staged: {cute.pretty_str(o_smem_layout_staged)}")
-            print(f"p_smem_layout_staged: {cute.pretty_str(p_smem_layout_staged)}")
-            print(f"tma_atom_q: {cute.pretty_str(tma_atom_q)}")
-            print(f"tma_atom_k: {cute.pretty_str(tma_atom_k)}")
-            print(f"tma_atom_v: {cute.pretty_str(tma_atom_v)}")
-            print(f"tma_tensor_q: {cute.pretty_str(tma_tensor_q)}")
-            print(f"tma_tensor_k: {cute.pretty_str(tma_tensor_k)}")
-            print(f"tma_tensor_v: {cute.pretty_str(tma_tensor_v)}")
-
-            print(f"tma_atom_o: {cute.pretty_str(tma_atom_o)}")
-            print(f"o_smem_layout: {cute.pretty_str(o_smem_layout)}")
-            print(f"tma_tensor_o: {cute.pretty_str(tma_tensor_o)}")
-
-            print(f"q_copy_size: {q_copy_size}")
-            print(f"k_copy_size: {k_copy_size}")
-            print(f"v_copy_size: {v_copy_size}")
 
         beta_layout = cute.make_layout((Constant.C, self.beta_stage), stride=(1, Constant.C))
         g_last_layout = cute.make_layout((Constant.D, self.g_stage), stride=(1, Constant.D))
@@ -900,10 +831,6 @@ class KDAChunkwise:
             ]
 
         self.shared_storage = SharedStorage
-        if PRINT_DEBUG:
-            print(f"size of storage: {SharedStorage.__sizeof__()}")
-            print(f"m_smem_layout_staged: {m_smem_layout_staged}")
-
         if cutlass.const_expr(self.is_varlen):
             self.grid = (1, H, B)
             # TensorMapManager for TMA descriptor modification in varlen tail tiles
@@ -914,9 +841,6 @@ class KDAChunkwise:
                 o_shape=cute.shape(o),
                 chunk_size=self.chunk_size,
             )
-        if PRINT_DEBUG:
-            print(f"grid: {self.grid}")
-
         self.kernel(
             qk_tiled_mma,
             kk_tiled_mma,
@@ -1318,23 +1242,15 @@ class KDAChunkwise:
         #         swizzle_=k_smem_layout_staged.inner,
         #         dtype=self.io_dtype),
         #     layout=sK_neg_g_f32.layout)
-        if PRINT_DEBUG:
-            print(f"sK_neg_g: {cute.pretty_str(sK_neg_g)}")
-            print(f"sK_neg_g_b: {cute.pretty_str(sK_neg_g_b)}")
-            print(f"sK_g: {cute.pretty_str(sK_g)}")
         # (((64,2),16),1,4,2):(((1,4096),64),0,1024,8192)>
         sV = storage.sV.get_tensor(v_smem_layout_staged.outer, swizzle=v_smem_layout_staged.inner)
         # G (gate/g_cumsum) - NEW for KDA
         sG = storage.sG.get_tensor(g_smem_layout_staged.outer, swizzle=g_smem_layout_staged.inner)
         # No swizzling for last row of exp(G)
         sG_last = self.get_smem_tensor_sG_last(storage, g_last_layout)
-        if PRINT_DEBUG:
-            print(f"sG_last: {sG_last}")
 
         # NOTE: optimize swizzle
         sBeta = storage.sBeta.get_tensor(beta_layout, swizzle=None)
-        if PRINT_DEBUG:
-            print(f"sBeta: {sBeta}")
 
         # (MMA, MMA_N, MMA_K, STAGE)
         sP = storage.sP.get_tensor(p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner)
@@ -1459,14 +1375,6 @@ class KDAChunkwise:
             layout=k_smem_layout_bf16_fixed,
         )
 
-        if cutlass.const_expr(PRINT_DEBUG):
-            print(f"sQ: {cute.pretty_str(sQ)}")
-            print(f"sK: {cute.pretty_str(sK)}")
-            print(f"sV: {cute.pretty_str(sV)}")
-            print(f"sO: {cute.pretty_str(sO)}")
-            print(f"sP: {cute.pretty_str(sP)}")
-            print(f"sQK: {cute.pretty_str(sQK)}")
-
         (_, hidx, bidx) = cute.arch.block_idx()
         B, S, H, D = problem_size
         C = self.chunk_size
@@ -1580,9 +1488,6 @@ class KDAChunkwise:
         # (MMA, MMA_M, MMA_K, INPUT_STAGE)
         # (MMA, MMA_N, MMA_K, INPUT_STAGE)
         # (MMA, MMA_M, MMA_N, ACC_STAGE)
-        if PRINT_DEBUG:
-            print(f"sP: {cute.pretty_str(sP)}")
-            print(f"sM: {cute.pretty_str(sM)}")
         tCrV_corr, tCrM, tCtAccMV = self.mma_partition_ss(
             mv_tiled_mma,
             self.mv_mma_tiler,
@@ -1608,18 +1513,6 @@ class KDAChunkwise:
         )
         # ROW MAJOR
         sG_flat = storage.sG.get_tensor(g_smem_layout_coalesce.outer, swizzle=g_smem_layout_coalesce.inner)
-        # HALF SPACE - CRITICAL FIX: Double the stage stride for BF16
-        sG_flat_layout = sG_flat.layout
-        sG_flat_bf16_layout = cute.make_layout(
-            sG_flat_layout.shape, stride=(*sG_flat_layout.stride[:-1], sG_flat_layout.stride[-1] * 2)
-        )
-        sG_flat_as_bf16 = cute.make_tensor(cute.recast_ptr(sG_flat.iterator, dtype=self.io_dtype), layout=sG_flat_bf16_layout)
-        if PRINT_DEBUG:
-            print(f"sG_flat: {cute.pretty_str(sG_flat)}")
-            print(f"sG_flat_as_bf16: {cute.pretty_str(sG_flat_as_bf16)}")
-            print(f"g_smem_layout_epi: {g_smem_layout_epi}")
-            print(f"g_smem_layout_coalesce: {g_smem_layout_coalesce}")
-
         # ///////////////////////////////////////////////////////////////////////////////
         # LOAD WARP
         # ///////////////////////////////////////////////////////////////////////////////
@@ -4644,16 +4537,6 @@ class KDAChunkwise:
 
         # ((V, R), M, N)
         tXrX_r2s = thr_r2s_x.retile(tXrX_t2r)
-
-        if show_debug_info:
-            print(f"-------------------- SMEM STORE: {debug_name}")
-            print(f"copy_atom_r2s_x: {copy_atom_r2s_x}")
-            print(f"tiled_t2r_x: {tiled_t2r_x}")
-            print(f"thr_t2r_x: {thr_r2s_x}")
-            print(f"before partition_D: {smem_x}")
-            print(f"after partition_D, tXsX_r2s: {tXsX_r2s}")
-            print(f"before retile tXrX_t2r: {tXrX_t2r}")
-            print(f"after retile tXrX_r2s: {tXrX_r2s}")
 
         return tiled_r2s_x, thr_r2s_x, tXrX_r2s, tXsX_r2s
 
