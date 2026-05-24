@@ -18,7 +18,6 @@
 import torch
 import triton
 import triton.language as tl
-from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_intra
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2, gather
 from fla.utils import IS_GATHER_SUPPORTED, IS_TF32_SUPPORTED, autotune_cache_kwargs
@@ -766,24 +765,6 @@ def chunk_kda_fwd_intra(
     assert H_QK > 0 and H_V > 0 and H_V % H_QK == 0, (
         f"HV ({H_V}) must be a positive multiple of HQK ({H_QK})"
     )
-
-    if H_V != H_QK:
-        group_size = H_V // H_QK
-        q_hv = q.repeat_interleave(group_size, dim=2).contiguous()
-        k_hv = k.repeat_interleave(group_size, dim=2).contiguous()
-        return fla_chunk_kda_fwd_intra(
-            q=q_hv,
-            k=k_hv,
-            v=v,
-            gk=gk,
-            beta=beta,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size,
-            chunk_indices=chunk_indices,
-            safe_gate=safe_gate,
-            disable_recompute=disable_recompute,
-        )
 
     BT = chunk_size
 
