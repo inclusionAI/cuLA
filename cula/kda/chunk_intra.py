@@ -18,6 +18,7 @@
 import torch
 import triton
 import triton.language as tl
+from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_intra
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2, gather
 from fla.utils import IS_GATHER_SUPPORTED, IS_TF32_SUPPORTED, autotune_cache_kwargs
@@ -759,7 +760,31 @@ def chunk_kda_fwd_intra(
     unified_gref: bool = False,  # Set True for ~5% extra perf (slightly lower precision)
 ):
     assert safe_gate, "Only safe_gate=True is supported in chunk_kda_fwd_intra for now"
-    B, T, H, K = k.shape
+    B, T, H_QK, K = k.shape
+    # GVA: g/beta/v live in h_v head space; q/k live in h_qk head space.
+    H_V = v.size(2)
+    assert H_QK > 0 and H_V > 0 and H_V % H_QK == 0, (
+        f"HV ({H_V}) must be a positive multiple of HQK ({H_QK})"
+    )
+
+    if H_V != H_QK:
+        group_size = H_V // H_QK
+        q_hv = q.repeat_interleave(group_size, dim=2).contiguous()
+        k_hv = k.repeat_interleave(group_size, dim=2).contiguous()
+        return fla_chunk_kda_fwd_intra(
+            q=q_hv,
+            k=k_hv,
+            v=v,
+            gk=gk,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            safe_gate=safe_gate,
+            disable_recompute=disable_recompute,
+        )
+
     BT = chunk_size
 
     if cu_seqlens is None:
@@ -773,18 +798,21 @@ def chunk_kda_fwd_intra(
         "cu_seqlens and chunk_indices must be int32 for cuda impl"
     )
 
-    Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
-    Akk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
+    # The SM100 intra kernel only materializes the valid causal region. Zero-fill
+    # the outputs so any untouched slots stay neutral for downstream recompute.
+    Aqk = torch.zeros(B, T, H_V, BT, device=k.device, dtype=k.dtype)
+    Akk = torch.zeros(B, T, H_V, BT, device=k.device, dtype=k.dtype)
 
     tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
     cula_cuda.chunk_kda_fwd_intra_cuda(
         q, k, gk, beta, cu_seqlens, chunk_indices, Aqk, Akk, tile_counter, scale, chunk_size, use_tf32_inverse, unified_gref
     )
 
-    w = torch.empty_like(k)
+    # w, u, kg, qg all live in h_v head space.
+    w = torch.empty_like(v)
     u = torch.empty_like(v)
-    qg = torch.empty_like(q) if disable_recompute else None
-    kg = torch.empty_like(k) if gk is not None else None
+    qg = torch.empty(B, T, H_V, K, device=q.device, dtype=q.dtype) if disable_recompute else None
+    kg = torch.empty(B, T, H_V, K, device=k.device, dtype=k.dtype) if gk is not None else None
 
     cula_cuda.recompute_w_u_cuda(
         k, v, beta, Akk, gk, cu_seqlens, chunk_indices, w, u, kg, chunk_size, q if disable_recompute else None, qg

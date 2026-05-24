@@ -190,8 +190,11 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     };
 
     // ===================== TMA Params =====================
+    // GVA: K and (optional) Q live in h_qk head space (shape_qk), while V
+    // and G live in h_v head space (shape_vg). Akk is per v-head.
     template <
-        typename ShapeKVG,
+        typename ShapeQK,
+        typename ShapeVG,
         typename ShapeAkk,
         typename TMA_V,
         typename TMA_K,
@@ -199,7 +202,8 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         typename TMA_Akk,
         typename TMA_Q = int>
     struct TmaParams {
-        ShapeKVG shape_kvg;
+        ShapeQK shape_qk;
+        ShapeVG shape_vg;
         ShapeAkk shape_Akk;
         TMA_V tma_v;
         TMA_K tma_k;
@@ -255,7 +259,10 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         CUTE_NO_UNROLL
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
-            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
+            // Prologue touches K (h_qk) and G (h_v) + beta (h_v) + optional Q (h_qk).
+            // head_idx is the v-head index; qk_head_idx is derived via heads_per_group.
+            auto blk_coord = TileScheduler::decode_tile_coord(
+                tid, params.h_v, params.heads_per_group, chunk_indices_ptr, cu_seqlens_ptr);
             int batch_idx = get<0>(blk_coord);
             int head_idx = get<1>(blk_coord);
             int tile_idx = get<2>(blk_coord);
@@ -646,7 +653,9 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         CUTE_NO_UNROLL
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
-            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
+            // Epilogue consumes V/beta (both h_v) and writes w/u/kg/qg (all h_v).
+            auto blk_coord = TileScheduler::decode_tile_coord(
+                tid, params.h_v, params.heads_per_group, chunk_indices_ptr, cu_seqlens_ptr);
             int batch_idx = get<0>(blk_coord);
             int head_idx = get<1>(blk_coord);
             int tile_idx = get<2>(blk_coord);
@@ -746,9 +755,9 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                 // each thread processes one row of W/U (TileK columns)
                 int row = (idx_in_wg / 32) * 16 + (idx_in_wg % 16);
 
-                // GMEM output address: layout [total_len, d, h], stride [d*h, 1, d]
+                // GMEM output address: layout [total_len, d, h_v], stride [d*h_v, 1, d]
                 __nv_bfloat16* out_row_base =
-                    out_ptr_base + (token_offset_cur + row) * params.d * params.h + head_idx * params.d;
+                    out_ptr_base + (token_offset_cur + row) * params.d * params.h_v + head_idx * params.d;
 
                 constexpr int QuarK = TileK / 4;
 
@@ -810,7 +819,8 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         CUTE_NO_UNROLL
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             // int tid = tile_scheduler.get_current_tile_id();
-            // auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
+            // auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h_v, params.heads_per_group,
+            // chunk_indices_ptr, cu_seqlens_ptr);
 
             // ============================================================
             // Once per WU: Wait for Akk in SMEM (from Load warp)
@@ -890,31 +900,36 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
             for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
                 int tid = tile_scheduler.get_current_tile_id();
 
-                // Decode tile coordinates
-                auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
+                // Decode tile coordinates. head_idx is the v-head (used for V/G/Akk
+                // TMA loads); qk_head_idx (= head_idx / heads_per_group) is used for
+                // K/Q TMA loads under GVA.
+                auto blk_coord = TileScheduler::decode_tile_coord(
+                    tid, params.h_v, params.heads_per_group, chunk_indices_ptr, cu_seqlens_ptr);
                 int batch_idx = get<0>(blk_coord);
-                int head_idx = get<1>(blk_coord);
+                int head_idx = get<1>(blk_coord);     // v-head
                 int tile_idx = get<2>(blk_coord);
+                int qk_head_idx = get<3>(blk_coord);  // qk-head
                 int token_offset = cu_seqlens_ptr[batch_idx];
                 int seq_len = cu_seqlens_ptr[batch_idx + 1] - cu_seqlens_ptr[batch_idx];
                 int sub_seq_len = min(TileT, seq_len - tile_idx * TileT);
 
                 // Build GMEM tensor views (with domain offset for batch)
+                // K and Q live in h_qk head space (shape_qk); V, G and Akk live in h_v space.
                 Tensor mK = domain_offset(
-                    make_coord(token_offset, _0{}, _0{}), tma_params.tma_k.get_tma_tensor(tma_params.shape_kvg));
+                    make_coord(token_offset, _0{}, _0{}), tma_params.tma_k.get_tma_tensor(tma_params.shape_qk));
                 Tensor mV = domain_offset(
-                    make_coord(token_offset, _0{}, _0{}), tma_params.tma_v.get_tma_tensor(tma_params.shape_kvg));
+                    make_coord(token_offset, _0{}, _0{}), tma_params.tma_v.get_tma_tensor(tma_params.shape_vg));
                 Tensor mG = domain_offset(
-                    make_coord(token_offset, _0{}, _0{}), tma_params.tma_g.get_tma_tensor(tma_params.shape_kvg));
+                    make_coord(token_offset, _0{}, _0{}), tma_params.tma_g.get_tma_tensor(tma_params.shape_vg));
                 Tensor mA = domain_offset(
                     make_coord(token_offset, _0{}, _0{}), tma_params.tma_akk.get_tma_tensor(tma_params.shape_Akk));
 
-                // Q GMEM tensor (only used when StoreQG=true)
+                // Q GMEM tensor (only used when StoreQG=true). Q lives in h_qk space.
                 [[maybe_unused]] auto mQ = [&]() {
                     if constexpr (StoreQG) {
                         return domain_offset(
                             make_coord(token_offset, _0{}, _0{}),
-                            tma_params.tma_q.get_tma_tensor(tma_params.shape_kvg));
+                            tma_params.tma_q.get_tma_tensor(tma_params.shape_qk));
                     } else {
                         return 0;  // unused placeholder
                     }
@@ -947,8 +962,9 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                     Tensor sG = make_tensor(
                         make_smem_ptr(shared_plan->g[g_pipe_state_write.index()].data()), SmemLayoutInputFP32{});
 
+                    // GVA slicing: K uses qk_head_idx; V and G use the v-head index.
                     Tensor gK = local_tile(
-                        mK(_, _, head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, i_k));
+                        mK(_, _, qk_head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, i_k));
                     Tensor gV = local_tile(
                         mV(_, _, head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, i_k));
                     Tensor gG = local_tile(
@@ -974,8 +990,9 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                         Tensor sQ = make_tensor(
                             make_smem_ptr(shared_plan->q_buf.q[q_pipe_state_write.index()].data()),
                             SmemLayoutInputBF16{});
+                        // Q (StoreQG) lives in h_qk space → slice by qk_head_idx.
                         Tensor gQ = local_tile(
-                            mQ(_, _, head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, i_k));
+                            mQ(_, _, qk_head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, i_k));
                         q_pipeline.producer_acquire(q_pipe_state_write);
                         ku::launch_tma_copy(
                             tma_params.tma_q, gQ, sQ, *q_pipeline.producer_get_barrier(q_pipe_state_write));
@@ -1008,7 +1025,9 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
 
-            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
+            // LoadAux: beta is per v-head (row stride = h_v).
+            auto blk_coord = TileScheduler::decode_tile_coord(
+                tid, params.h_v, params.heads_per_group, chunk_indices_ptr, cu_seqlens_ptr);
             int batch_idx = get<0>(blk_coord);
             int head_idx = get<1>(blk_coord);
             int tile_idx = get<2>(blk_coord);
@@ -1024,7 +1043,7 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                 float beta_val =
                     (thread_idx < sub_seq_len)
                         ? float(reinterpret_cast<ElementBeta*>(
-                              params.beta_ptr)[(token_offset + tile_idx * TileT + thread_idx) * params.h + head_idx])
+                              params.beta_ptr)[(token_offset + tile_idx * TileT + thread_idx) * params.h_v + head_idx])
                         : float(0);
                 shared_plan->beta_smem[beta_pipe_state_write.index()][thread_idx] = beta_val;
             }

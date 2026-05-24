@@ -53,8 +53,8 @@ struct KdaChunkFwdIntraKernelSm100 {
     using SmemLayoutInputFP32 = typename Mainloop::SmemLayoutInputFP32;
 
     // TMA params (for host launcher)
-    template <typename ShapeQKG, typename TMA_Q, typename TMA_K, typename TMA_G>
-    using TmaParams = typename Mainloop::template TmaParams<ShapeQKG, TMA_Q, TMA_K, TMA_G>;
+    template <typename ShapeQK, typename ShapeVG, typename TMA_Q, typename TMA_K, typename TMA_G>
+    using TmaParams = typename Mainloop::template TmaParams<ShapeQK, ShapeVG, TMA_Q, TMA_K, TMA_G>;
 
     // Pipeline types (for construction in operator())
     using PipelineQKG = typename Mainloop::PipelineQKG;
@@ -318,29 +318,40 @@ __launch_bounds__(512, 1, 1) kda_fwd_intra_sm100_kernel_entry(
 template <typename Kernel>
 inline void
 run_kda_fwd_intra_sm100_impl_dispatch(KDA_fwd_intra_params& params, cudaStream_t stream) {
-    auto shape_QKG = make_shape(params.total_q_len, params.d, params.h);
-    auto stride_QKG = make_stride(params.h * params.d, _1{}, params.d);
+    // GVA: Q/K are sized by `h_qk`; G is sized by `h_v`. When HV == HQK
+    // (heads_per_group == 1), shape_QK and shape_VG coincide with the
+    // pre-GVA shape_QKG and behaviour is unchanged.
+    auto shape_QK = make_shape(params.total_q_len, params.d, params.h_qk);
+    auto stride_QK = make_stride(params.h_qk * params.d, _1{}, params.d);
+    auto shape_VG = make_shape(params.total_q_len, params.d, params.h_v);
+    auto stride_VG = make_stride(params.h_v * params.d, _1{}, params.d);
 
     // --- Build TMA descriptors ---
     auto tma_Q = cute::make_tma_copy(
         SM90_TMA_LOAD{},
-        make_tensor(make_gmem_ptr((ku::bf16*)params.q_ptr), make_layout(shape_QKG, stride_QKG)),
+        make_tensor(make_gmem_ptr((ku::bf16*)params.q_ptr), make_layout(shape_QK, stride_QK)),
         typename Kernel::SmemLayoutInputBF16{});
 
     auto tma_K = cute::make_tma_copy(
         SM90_TMA_LOAD{},
-        make_tensor(make_gmem_ptr((ku::bf16*)params.k_ptr), make_layout(shape_QKG, stride_QKG)),
+        make_tensor(make_gmem_ptr((ku::bf16*)params.k_ptr), make_layout(shape_QK, stride_QK)),
         typename Kernel::SmemLayoutInputBF16{});
 
     auto tma_G = cute::make_tma_copy(
         SM90_TMA_LOAD{},
-        make_tensor(make_gmem_ptr((float*)params.g_ptr), make_layout(shape_QKG, stride_QKG)),
+        make_tensor(make_gmem_ptr((float*)params.g_ptr), make_layout(shape_VG, stride_VG)),
         typename Kernel::SmemLayoutInputFP32{});
 
     // --- Pack TMA params ---
-    typename Kernel::template TmaParams<decltype(shape_QKG), decltype(tma_Q), decltype(tma_K), decltype(tma_G)>
+    typename Kernel::template TmaParams<
+        decltype(shape_QK),
+        decltype(shape_VG),
+        decltype(tma_Q),
+        decltype(tma_K),
+        decltype(tma_G)>
         tma_params = {
-            shape_QKG,
+            shape_QK,
+            shape_VG,
             tma_Q,
             tma_K,
             tma_G,

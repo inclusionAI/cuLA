@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+bench_kda_chunk_intra.py — Benchmark: cuLA vs FLA Triton for chunk_kda_fwd_intra
+
+Supports both standard (HV=H) and GVA (HV > H) modes.
+In GVA mode both FLA (v0.5.0+) and cuLA accept compact q/k in HQK space natively.
+
+Usage:
+  python bench_kda_chunk_intra.py [--heads H] [--hv HV] [--disable_recompute]
+"""
+
 import argparse
 import os
 import pathlib
@@ -36,6 +46,7 @@ from cula.kda.chunk_intra import chunk_kda_fwd_intra as cula_chunk_kda_fwd_intra
 
 # Constant params
 B, H, D = 2, 64, 128
+HV = H   # overridable via --hv; HV > H enables GVA mode
 BT = 64  # chunk size
 
 # Varlen benchmark params
@@ -47,196 +58,117 @@ VARIANCE = 1.0
 DISABLE_RECOMPUTE = False  # Whether to disable recompute (compute QG in forward)
 
 # ==============================================================================
-# Uniform seqlen benchmark
+# Unified uniform seqlen benchmark (handles both standard and GVA)
 # ==============================================================================
 def benchmark_chunk_intra_uniform():
     device = torch.device("cuda")
     chunk_size = BT
+    HQK = H
+    gva_mode = HV > HQK
+    group_size = HV // HQK
     T_vals = [512, 1024, 4096, 8192, 16384, 32768]
 
-    print("=" * 90)
+    gva_note = f"HQK={HQK} HV={HV} (group_size={group_size})" if gva_mode else f"H={HQK}"
+    print("=" * 100)
     print(
-        f"  Uniform-Length ChunkIntra Benchmark: cuLA vs FLA Triton  B={B} H={H} D={D}  disable_recompute={DISABLE_RECOMPUTE}"
+        f"  Uniform-Length ChunkIntra Benchmark: cuLA vs FLA Triton  "
+        f"B={B} {gva_note} D={D}  disable_recompute={DISABLE_RECOMPUTE}"
     )
-    print("=" * 90)
+    print("=" * 100)
     print(
         f"{'B':>4} {'T':>7} │ {'rel_rmse':>18} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
     )
-    print("─" * 90)
+    print("─" * 100)
 
     for T in T_vals:
         seq_lens = [T] * B
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-        q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens)
+        q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(
+            B, T, HQK, D, device, cu_seqlens=cu_seqlens, num_v_heads=HV
+        )
+
+        common = dict(
+            q=q, k=k, v=v, gk=g, beta=beta, scale=scale,
+            cu_seqlens=cu_seqlens, chunk_size=chunk_size, chunk_indices=chunk_indices,
+            safe_gate=True, disable_recompute=DISABLE_RECOMPUTE,
+        )
 
         # Accuracy: run once and compare
-        out_fla = fla_chunk_kda_fwd_intra(
-            q=q,
-            k=k,
-            v=v,
-            gk=g,
-            beta=beta,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size,
-            chunk_indices=chunk_indices,
-            safe_gate=True,
-            disable_recompute=DISABLE_RECOMPUTE,
-        )
-        out_cula = cula_chunk_kda_fwd_intra(
-            q=q,
-            k=k,
-            v=v,
-            gk=g,
-            beta=beta,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size,
-            chunk_indices=chunk_indices,
-            safe_gate=True,
-            disable_recompute=DISABLE_RECOMPUTE,
-        )
-        # Compare the first output tensor (o)
+        out_fla = fla_chunk_kda_fwd_intra(**common)
+        out_cula = cula_chunk_kda_fwd_intra(**common)
         o_fla = out_fla[0] if isinstance(out_fla, (tuple, list)) else out_fla
         o_cula = out_cula[0] if isinstance(out_cula, (tuple, list)) else out_cula
         relative_rms_error, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs_rhs(o_fla, o_cula)
 
         # Performance
-        ms_fla = triton_bench_fn(
-            lambda: fla_chunk_kda_fwd_intra(
-                q=q,
-                k=k,
-                v=v,
-                gk=g,
-                beta=beta,
-                scale=scale,
-                cu_seqlens=cu_seqlens,
-                chunk_size=chunk_size,
-                chunk_indices=chunk_indices,
-                safe_gate=True,
-                disable_recompute=DISABLE_RECOMPUTE,
-            ),
-        )
-        ms_cula = triton_bench_fn(
-            lambda: cula_chunk_kda_fwd_intra(
-                q=q,
-                k=k,
-                v=v,
-                gk=g,
-                beta=beta,
-                scale=scale,
-                cu_seqlens=cu_seqlens,
-                chunk_size=chunk_size,
-                chunk_indices=chunk_indices,
-                safe_gate=True,
-                disable_recompute=DISABLE_RECOMPUTE,
-            ),
-        )
+        ms_fla = triton_bench_fn(lambda: fla_chunk_kda_fwd_intra(**common))
+        ms_cula = triton_bench_fn(lambda: cula_chunk_kda_fwd_intra(**common))
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         print(
             f"{B:>4} {T:>7} │ {relative_rms_error:>18.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
         )
 
-    print("─" * 90)
+    print("─" * 100)
 
 
 # ==============================================================================
-# Varlen benchmark
+# Unified varlen benchmark (handles both standard and GVA)
 # ==============================================================================
 def benchmark_chunk_intra_varlen():
     device = torch.device("cuda")
     chunk_size = BT
+    HQK = H
+    gva_mode = HV > HQK
+    group_size = HV // HQK
     total_len_vals = [8192, 16384, 32768, 65536]
 
+    gva_note = f"HQK={HQK} HV={HV} (group_size={group_size})" if gva_mode else f"H={HQK}"
     print()
-    print("=" * 100)
+    print("=" * 110)
     print(
-        f"  Varlen ChunkIntra Benchmark: cuLA vs FLA Triton  NUM_SEQS={NUM_SEQS} H={H} D={D}  disable_recompute={DISABLE_RECOMPUTE}"
+        f"  Varlen ChunkIntra Benchmark: cuLA vs FLA Triton  "
+        f"NUM_SEQS={NUM_SEQS} {gva_note} D={D}  disable_recompute={DISABLE_RECOMPUTE}"
     )
-    print("=" * 100)
+    print("=" * 110)
     print(
         f"{'total_len':>10} │ {'rel_rmse':>18} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
     )
-    print("─" * 100)
+    print("─" * 110)
 
     for total_len in total_len_vals:
         seq_lens = generate_random_seq_lens(NUM_SEQS, total_len, MIN_SEQ_LEN, VARIANCE, SEED)
         T = total_len
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-        q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens)
+        q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(
+            1, T, HQK, D, device, cu_seqlens=cu_seqlens, num_v_heads=HV
+        )
+
+        common = dict(
+            q=q, k=k, v=v, gk=g, beta=beta, scale=scale,
+            cu_seqlens=cu_seqlens, chunk_size=chunk_size, chunk_indices=chunk_indices,
+            safe_gate=True, disable_recompute=DISABLE_RECOMPUTE,
+        )
 
         # Accuracy
-        out_fla = fla_chunk_kda_fwd_intra(
-            q=q,
-            k=k,
-            v=v,
-            gk=g,
-            beta=beta,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size,
-            chunk_indices=chunk_indices,
-            safe_gate=True,
-            disable_recompute=DISABLE_RECOMPUTE,
-        )
-        out_cula = cula_chunk_kda_fwd_intra(
-            q=q,
-            k=k,
-            v=v,
-            gk=g,
-            beta=beta,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size,
-            chunk_indices=chunk_indices,
-            safe_gate=True,
-            disable_recompute=DISABLE_RECOMPUTE,
-        )
+        out_fla = fla_chunk_kda_fwd_intra(**common)
+        out_cula = cula_chunk_kda_fwd_intra(**common)
         o_fla = out_fla[0] if isinstance(out_fla, (tuple, list)) else out_fla
         o_cula = out_cula[0] if isinstance(out_cula, (tuple, list)) else out_cula
         relative_rms_error, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs_rhs(o_fla, o_cula)
 
         # Performance
-        ms_fla = triton_bench_fn(
-            lambda: fla_chunk_kda_fwd_intra(
-                q=q,
-                k=k,
-                v=v,
-                gk=g,
-                beta=beta,
-                scale=scale,
-                cu_seqlens=cu_seqlens,
-                chunk_size=chunk_size,
-                chunk_indices=chunk_indices,
-                safe_gate=True,
-                disable_recompute=DISABLE_RECOMPUTE,
-            ),
-        )
-        ms_cula = triton_bench_fn(
-            lambda: cula_chunk_kda_fwd_intra(
-                q=q,
-                k=k,
-                v=v,
-                gk=g,
-                beta=beta,
-                scale=scale,
-                cu_seqlens=cu_seqlens,
-                chunk_size=chunk_size,
-                chunk_indices=chunk_indices,
-                safe_gate=True,
-                disable_recompute=DISABLE_RECOMPUTE,
-            ),
-        )
+        ms_fla = triton_bench_fn(lambda: fla_chunk_kda_fwd_intra(**common))
+        ms_cula = triton_bench_fn(lambda: cula_chunk_kda_fwd_intra(**common))
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         print(
             f"{total_len:>10} │ {relative_rms_error:>18.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
         )
 
-    print("─" * 100)
+    print("─" * 110)
 
 
 if __name__ == "__main__":
@@ -246,11 +178,37 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable recompute in both FLA and cuLA (pre-compute QG)",
     )
+    parser.add_argument(
+        "--heads",
+        type=int,
+        default=None,
+        help=f"Override number of Q/K heads (H). Default: {H}.",
+    )
+    parser.add_argument(
+        "--hv",
+        type=int,
+        default=None,
+        help=f"Override number of V heads (HV). Default: H (no GVA). Set HV > H to enable GVA mode.",
+    )
     args = parser.parse_args()
 
     if args.disable_recompute:
         DISABLE_RECOMPUTE = True
         print("[Disable recompute] pre-compute QG in forward")
+
+    if args.heads is not None:
+        if args.heads <= 0:
+            raise ValueError(f"--heads must be a positive integer, got {args.heads}")
+        H = args.heads
+        HV = H  # reset HV to new H before --hv override
+
+    if args.hv is not None:
+        if args.hv < H or args.hv % H != 0:
+            raise ValueError(f"--hv must be a positive multiple of H ({H}), got {args.hv}")
+        HV = args.hv
+
+    if HV > H:
+        print(f"[GVA] HV={HV} (H={H}, group_size={HV // H}x)")
 
     benchmark_chunk_intra_uniform()
     benchmark_chunk_intra_varlen()
