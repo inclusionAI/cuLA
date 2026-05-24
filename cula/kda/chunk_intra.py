@@ -765,7 +765,6 @@ def chunk_kda_fwd_intra(
     assert H_QK > 0 and H_V > 0 and H_V % H_QK == 0, (
         f"HV ({H_V}) must be a positive multiple of HQK ({H_QK})"
     )
-
     BT = chunk_size
 
     if cu_seqlens is None:
