@@ -131,126 +131,96 @@ def time_cuda_fn(fn, warmup, iters):
     return benchmark_cuda_fn(fn, warmup=warmup, rep=iters, aggregate="mean")
 
 
-def rmse_rel_max(ref: torch.Tensor, out: torch.Tensor):
-    """Return RMSE and relative max error between two tensors."""
+def _error_stats(ref: torch.Tensor, out: torch.Tensor):
+    """Return shared float-cast tensors and basic absolute/RMS error stats."""
     ref_f = ref.float()
     out_f = out.float()
     diff = (ref_f - out_f).abs()
-    rmse = diff.pow(2).mean().sqrt().item()
     max_diff = diff.max().item()
-    denom = ref_f.abs().max().item()
-    rel_max = max_diff / denom if denom > 0 else 0.0
+    mean_diff = diff.mean().item()
+    rmse = diff.pow(2).mean().sqrt().item()
+    ref_rms = ref_f.pow(2).mean().sqrt().item()
+    return ref_f, out_f, max_diff, mean_diff, rmse, ref_rms
+
+
+def _relative_max(max_diff: float, denom: float):
+    return max_diff / denom if denom > 0 else 0.0
+
+
+def rmse_rel_max(ref: torch.Tensor, out: torch.Tensor):
+    """Return RMSE and relative max error between two tensors."""
+    ref_f, _out_f, max_diff, _mean_diff, rmse, _ref_rms = _error_stats(ref, out)
+    rel_max = _relative_max(max_diff, ref_f.abs().max().item())
     return rmse, rel_max
 
 
 def relative_rms_error(ref: torch.Tensor, out: torch.Tensor):
     """Return relative RMS error between two tensors."""
-    ref_f = ref.float()
-    out_f = out.float()
-    err = (ref_f - out_f).pow(2).mean().sqrt().item()
-    base = ref_f.pow(2).mean().sqrt().item()
-    return err / (base + 1e-8)
+    _ref_f, _out_f, _max_diff, _mean_diff, rmse, ref_rms = _error_stats(ref, out)
+    return rmse / (ref_rms + 1e-8)
 
 
 def relative_rms_error_rel_max(ref: torch.Tensor, out: torch.Tensor):
     """Return relative RMS error and relative max error."""
-    ref_f = ref.float()
-    out_f = out.float()
-    diff = (ref_f - out_f).abs()
-    relative_rms = relative_rms_error(ref_f, out_f)
-    max_diff = diff.max().item()
-    denom = ref_f.abs().max().item()
-    rel_max = max_diff / denom if denom > 0 else 0.0
+    ref_f, _out_f, max_diff, _mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    relative_rms = relative_rms_error(ref, out)
+    rel_max = _relative_max(max_diff, ref_f.abs().max().item())
     return relative_rms, rel_max
 
 
 def rmse_rel_max_mean_abs(ref: torch.Tensor, out: torch.Tensor):
     """Return RMSE, relative max error, and mean absolute difference."""
-    ref_f = ref.float()
-    out_f = out.float()
-    diff = (ref_f - out_f).abs()
-    rmse = diff.pow(2).mean().sqrt().item()
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-    denom = ref_f.abs().max().item()
-    rel_max = max_diff / denom if denom > 0 else 0.0
+    ref_f, _out_f, max_diff, mean_diff, rmse, _ref_rms = _error_stats(ref, out)
+    rel_max = _relative_max(max_diff, ref_f.abs().max().item())
     return rmse, rel_max, mean_diff
 
 
 def rmse_rel_max_mean_abs_rhs(ref: torch.Tensor, out: torch.Tensor):
     """Return RMSE, relative max error vs rhs magnitude, and mean absolute difference."""
-    ref_f = ref.float()
-    out_f = out.float()
-    diff = (ref_f - out_f).abs()
-    rmse = diff.pow(2).mean().sqrt().item()
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-    denom = out_f.abs().max().item()
-    rel_max = max_diff / denom if denom > 0 else 0.0
+    _ref_f, out_f, max_diff, mean_diff, rmse, _ref_rms = _error_stats(ref, out)
+    rel_max = _relative_max(max_diff, out_f.abs().max().item())
     return rmse, rel_max, mean_diff
 
 
 def relative_rms_error_rel_max_mean_abs(ref: torch.Tensor, out: torch.Tensor):
     """Return relative RMS error, relative max error, and mean absolute difference."""
-    ref_f = ref.float()
-    out_f = out.float()
-    diff = (ref_f - out_f).abs()
-    err = diff.pow(2).mean().sqrt().item()
-    base = ref_f.pow(2).mean().sqrt().item()
-    relative_rms_error = err / (base + 1e-8)
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-    denom = ref_f.abs().max().item()
-    rel_max = max_diff / denom if denom > 0 else 0.0
-    return relative_rms_error, rel_max, mean_diff
+    ref_f, _out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    relative_rms = relative_rms_error(ref, out)
+    rel_max = _relative_max(max_diff, ref_f.abs().max().item())
+    return relative_rms, rel_max, mean_diff
 
 
 def relative_rms_error_rel_max_mean_abs_rhs(ref: torch.Tensor, out: torch.Tensor):
     """Return relative RMS error, rhs-relative max error, and mean absolute difference."""
-    ref_f = ref.float()
-    out_f = out.float()
-    diff = (ref_f - out_f).abs()
-    err = diff.pow(2).mean().sqrt().item()
-    base = ref_f.pow(2).mean().sqrt().item()
-    relative_rms = err / (base + 1e-8)
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-    denom = out_f.abs().max().item()
-    rel_max = max_diff / denom if denom > 0 else 0.0
+    _ref_f, out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    relative_rms = relative_rms_error(ref, out)
+    rel_max = _relative_max(max_diff, out_f.abs().max().item())
     return relative_rms, rel_max, mean_diff
 
 
 def relative_rms_error_max_mean_abs(ref: torch.Tensor, out: torch.Tensor):
     """Return relative RMS error, max error, and mean absolute difference."""
-    diff = (ref.float() - out.float()).abs()
-    return relative_rms_error(ref, out), diff.max().item(), diff.mean().item()
+    _ref_f, _out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    return relative_rms_error(ref, out), max_diff, mean_diff
 
 
 def relative_rms_error_max_rel_mean_abs(ref: torch.Tensor, out: torch.Tensor):
     """Return relative RMS error, max error, relative max error, and mean absolute difference."""
-    ref_f = ref.float()
-    diff = (ref_f - out.float()).abs()
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-    denom = ref_f.abs().max().item()
-    rel_max_diff = max_diff / denom if denom > 0 else 0.0
+    ref_f, _out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    rel_max_diff = _relative_max(max_diff, ref_f.abs().max().item())
     return relative_rms_error(ref, out), max_diff, rel_max_diff, mean_diff
 
 
 def max_mean_abs_diff(ref: torch.Tensor, out: torch.Tensor):
     """Return max and mean absolute difference."""
-    diff = (ref.float() - out.float()).abs()
-    return diff.max().item(), diff.mean().item()
+    _ref_f, _out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    return max_diff, mean_diff
 
 
 def max_rel_mean_abs_diff(ref: torch.Tensor, out: torch.Tensor):
     """Return max error, relative max error, and mean absolute difference."""
-    ref_f = ref.float()
-    diff = (ref_f - out.float()).abs()
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-    denom = ref_f.abs().max().item()
-    rel_max_diff = max_diff / denom if denom > 0 else 0.0
+    ref_f, _out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    rel_max_diff = _relative_max(max_diff, ref_f.abs().max().item())
     return max_diff, rel_max_diff, mean_diff
 
 

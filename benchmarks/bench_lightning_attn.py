@@ -50,7 +50,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from benchmarks.utils import gen_random, gen_skewed, gen_uniform, time_cuda_fn
+from benchmarks.utils import gen_random, gen_skewed, gen_uniform, relative_rms_error, time_cuda_fn
 from fla.ops.simple_gla.chunk import chunk_simple_gla_fwd
 
 from cula.ops.lightning_attn_sm100 import lightning_attn_fwd, lightning_attn_fwd_varlen
@@ -266,17 +266,12 @@ def benchmark_standard_config(B, T, H, D, layer_idx, num_layers, mode, warmup, i
     for label, o_test, ht_test in [("fla", o_fla, ht_fla), ("cute", o_cute, ht_cute)]:
         if o_test is not None:
             diff = o_naive - o_test.float()
-            rms = o_naive.pow(2).mean().sqrt().item()
-            rmse = diff.pow(2).mean().sqrt().item()
-            result[f"{label}_o_relative_rms_error"] = rmse / (rms + 1e-8)
+            result[f"{label}_o_relative_rms_error"] = relative_rms_error(o_naive, o_test)
             result[f"{label}_o_maxdiff"] = diff.abs().max().item()
             if output_ht and ht_naive is not None and ht_test is not None:
                 # CuTe kernel outputs BHVK state; transpose to BHKV for comparison
                 ht_cmp = ht_test.transpose(-1, -2).float() if label == "cute" else ht_test.float()
-                diff_ht = ht_naive - ht_cmp
-                ht_rms = ht_naive.pow(2).mean().sqrt().item()
-                ht_rmse = diff_ht.pow(2).mean().sqrt().item()
-                result[f"{label}_ht_relative_rms_error"] = ht_rmse / (ht_rms + 1e-8)
+                result[f"{label}_ht_relative_rms_error"] = relative_rms_error(ht_naive, ht_cmp)
             else:
                 result[f"{label}_ht_relative_rms_error"] = float("nan")
         else:
@@ -351,15 +346,13 @@ def benchmark_varlen_config(N, seq_lens, H, D, warmup, iters, dist=""):
         diff_o = O_p.float() - O_np.float()
         result["p_vs_np_O_diff"] = diff_o.abs().max().item()
         o_rmse = diff_o.pow(2).mean().sqrt().item()
-        o_rms = O_p.float().pow(2).mean().sqrt().item()
         result["p_vs_np_O_rmse"] = o_rmse
-        result["p_vs_np_O_relative_rms_error"] = o_rmse / (o_rms + 1e-8)
+        result["p_vs_np_O_relative_rms_error"] = relative_rms_error(O_p, O_np)
         diff_ht = sp_p.float() - sp_np.float()
         result["p_vs_np_ht_diff"] = diff_ht.abs().max().item()
         ht_rmse = diff_ht.pow(2).mean().sqrt().item()
-        ht_rms = sp_p.float().pow(2).mean().sqrt().item()
         result["p_vs_np_ht_rmse"] = ht_rmse
-        result["p_vs_np_ht_relative_rms_error"] = ht_rmse / (ht_rms + 1e-8)
+        result["p_vs_np_ht_relative_rms_error"] = relative_rms_error(sp_p, sp_np)
     else:
         result["p_vs_np_O_diff"] = float("nan")
         result["p_vs_np_ht_diff"] = float("nan")
