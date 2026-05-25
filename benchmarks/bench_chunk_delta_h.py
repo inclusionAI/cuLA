@@ -388,7 +388,7 @@ def print_report(nv_results, vl_results):
         print("\n  [Non-Varlen]")
         print(f"  {'─' * 100}")
         print(
-            f"  {'Config':<35s}  │  {'rel_rmse':>18s}  {'max_diff':>10s}  {'mean_diff':>12s}"
+            f"  {'Config':<35s}  │  {'rel_rmse':>10s}  {'max_diff':>10s}  {'mean_diff':>12s}"
             f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 100}")
@@ -396,7 +396,7 @@ def print_report(nv_results, vl_results):
             label = f"B={r['B']:2d} T={r['T']:5d} H={r['H']:3d}{r['hv_str']}{r['flags']}"
             print(
                 f"  {label:<35s}  │  "
-                f"{r['relative_rms_error']:18.6f}  {r['max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                f"{r['relative_rms_error']:10.6f}  {r['max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x"
             )
         print(f"  {'─' * 100}")
@@ -408,7 +408,7 @@ def print_report(nv_results, vl_results):
         print("\n  [Varlen]")
         print(f"  {'─' * 115}")
         print(
-            f"  {'Config':>55s}  │  {'rel_rmse':>18s}  {'max_diff':>10s}  {'mean_diff':>12s}"
+            f"  {'Config':>55s}  │  {'rel_rmse':>10s}  {'max_diff':>10s}  {'mean_diff':>12s}"
             f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 115}")
@@ -416,7 +416,7 @@ def print_report(nv_results, vl_results):
             label = f"{r['tag']} H={r['H']:3d}{r['hv_str']}{r['flags']}"
             print(
                 f"  {label:>55s}  │  "
-                f"{r['relative_rms_error']:18.6f}  {r['max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                f"{r['relative_rms_error']:10.6f}  {r['max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x"
             )
         print(f"  {'─' * 115}")

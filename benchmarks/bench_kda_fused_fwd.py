@@ -342,7 +342,7 @@ def print_report(fixed_results, varlen_results):
         print(f"  {'─' * 110}")
         print(
             f"  {'B':>3s}  {'T':>6s}  {'H':>3s}  {'HV':>3s}  {'GVA':>4s}  │  "
-            f"{'rel_rmse':>18s}  {'rel_max':>10s}  {'mean_diff':>10s}  │  "
+            f"{'rel_rmse':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}  │  "
             f"{'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 110}")
@@ -350,7 +350,7 @@ def print_report(fixed_results, varlen_results):
             gva_tag = f"{r['HV'] // r['H']}x" if r["HV"] > r["H"] else "no"
             print(
                 f"  {r['B']:3d}  {r['T']:6d}  {r['H']:3d}  {r['HV']:3d}  {gva_tag:>4s}  │  "
-                f"{r['relative_rms_error']:18.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
+                f"{r['relative_rms_error']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x"
             )
         print(f"  {'─' * 110}")
@@ -360,7 +360,7 @@ def print_report(fixed_results, varlen_results):
         print(f"  {'─' * 120}")
         print(
             f"  {'Config':>45s}  {'H':>3s}  {'HV':>3s}  {'GVA':>4s}  │  "
-            f"{'rel_rmse':>18s}  {'rel_max':>10s}  {'mean_diff':>10s}  │  "
+            f"{'rel_rmse':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}  │  "
             f"{'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 120}")
@@ -368,7 +368,7 @@ def print_report(fixed_results, varlen_results):
             gva_tag = f"{r['HV'] // r['H']}x" if r["HV"] > r["H"] else "no"
             print(
                 f"  {r['tag']:>45s}  {r['H']:3d}  {r['HV']:3d}  {gva_tag:>4s}  │  "
-                f"{r['relative_rms_error']:18.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
+                f"{r['relative_rms_error']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x"
             )
         print(f"  {'─' * 120}")

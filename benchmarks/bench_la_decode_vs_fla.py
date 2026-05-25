@@ -276,7 +276,7 @@ def main():
     print(f"{'=' * 100}")
     print(
         f"{'B':>5} | {'fla (ms)':>10} | {'cute (ms)':>10} | "
-        f"{'speedup':>8} | {'rel_rmse':>18} | {'Rel MaxDiff':>12} | {'State rel_rmse':>24}"
+        f"{'speedup':>8} | {'rel_rmse':>12} | {'Rel MaxDiff':>12} | {'State rel_rmse':>12}"
     )
     print("─" * 90)
 
@@ -286,8 +286,8 @@ def main():
         results.append(r)
         print(
             f"{r['B']:>5} | {r['kernel_fla_ms']:>10.4f} | {r['kernel_cute_ms']:>10.4f} | "
-            f"{r['kernel_speedup']:>7.2f}x | {r['output_relative_rms_error']:>18.6f} | "
-            f"{r['rel_maxdiff']:>12.6f} | {r['state_relative_rms_error']:>24.8f}"
+            f"{r['kernel_speedup']:>7.2f}x | {r['output_relative_rms_error']:>12.6f} | "
+            f"{r['rel_maxdiff']:>12.6f} | {r['state_relative_rms_error']:>12.8f}"
         )
 
     # ── Wrapper comparison ──────────────────────────────────────────────

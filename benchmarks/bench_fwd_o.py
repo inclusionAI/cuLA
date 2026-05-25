@@ -365,7 +365,7 @@ def print_report(nv_results, vl_results):
     if nv_results:
         print("\n  [Non-Varlen]")
         hdr = (
-            f"  {'B':>3s}  {'T':>5s}  {'H':>7s}  │  {'rel_rmse':>18s}  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
+            f"  {'B':>3s}  {'T':>5s}  {'H':>7s}  │  {'rel_rmse':>10s}  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
             f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 90}")
@@ -375,7 +375,7 @@ def print_report(nv_results, vl_results):
             h_label = f"{r['H']}{r['hv_str']}"
             print(
                 f"  {r['B']:3d}  {r['T']:5d}  {h_label:>7s}  │  "
-                f"{r['relative_rms_error']:18.6f}  {r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                f"{r['relative_rms_error']:10.6f}  {r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x"
             )
         print(f"  {'─' * 90}")
@@ -383,7 +383,7 @@ def print_report(nv_results, vl_results):
     if vl_results:
         print("\n  [Varlen]")
         hdr = (
-            f"  {'Config':>45s}  {'H':>7s}  │  {'rel_rmse':>18s}  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
+            f"  {'Config':>45s}  {'H':>7s}  │  {'rel_rmse':>10s}  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
             f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 117}")
@@ -393,7 +393,7 @@ def print_report(nv_results, vl_results):
             h_label = f"{r['H']}{r['hv_str']}"
             print(
                 f"  {r['tag']:>45s}  {h_label:>7s}  │  "
-                f"{r['relative_rms_error']:18.6f}  {r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                f"{r['relative_rms_error']:10.6f}  {r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x"
             )
         print(f"  {'─' * 117}")

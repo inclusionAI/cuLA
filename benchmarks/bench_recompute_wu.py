@@ -136,7 +136,7 @@ def benchmark_recompute_wu_uniform():
     )
     print("=" * 100)
     print(
-        f"{'B':>4} {'T':>7} │ {'rel_rmse':>18} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
+        f"{'B':>4} {'T':>7} │ {'rel_rmse':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
     )
     print("─" * 100)
 
@@ -180,7 +180,7 @@ def benchmark_recompute_wu_uniform():
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         print(
-            f"{B:>4} {T:>7} │ {relative_rms_error_value:>18.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
+            f"{B:>4} {T:>7} │ {relative_rms_error_value:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
         )
 
     print("─" * 100)
@@ -204,7 +204,7 @@ def benchmark_recompute_wu_varlen():
     )
     print("=" * 110)
     print(
-        f"{'total_len':>10} │ {'rel_rmse':>18} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
+        f"{'total_len':>10} │ {'rel_rmse':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
     )
     print("─" * 110)
 
@@ -249,7 +249,7 @@ def benchmark_recompute_wu_varlen():
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         print(
-            f"{total_len:>10} │ {relative_rms_error_value:>18.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
+            f"{total_len:>10} │ {relative_rms_error_value:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
         )
 
     print("─" * 110)

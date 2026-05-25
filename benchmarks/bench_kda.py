@@ -330,14 +330,14 @@ def print_report(fixed_results, varlen_results):
         print("\n  [Fixed-Length]")
         print(f"  {'─' * 85}")
         print(
-            f"  {'B':>3s}  {'T':>5s}  │  {'rel_rmse':>18s}  {'rel_max':>10s}"
+            f"  {'B':>3s}  {'T':>5s}  │  {'rel_rmse':>10s}  {'rel_max':>10s}"
             f"  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>11s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 85}")
         for r in fixed_results:
             print(
                 f"  {r['B']:3d}  {r['T']:5d}  │  "
-                f"{r['relative_rms_error']:18.6f}  {r['rel_max']:10.6f}  │  "
+                f"{r['relative_rms_error']:10.6f}  {r['rel_max']:10.6f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cula']:11.4f}  {r['speedup']:7.2f}x"
             )
         print(f"  {'─' * 85}")
@@ -346,13 +346,13 @@ def print_report(fixed_results, varlen_results):
         print("\n  [Varlen]")
         print(f"  {'─' * 100}")
         print(
-            f"  {'Config':>45s}  │  {'rel_rmse':>18s}  {'rel_max':>10s}  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>11s}  {'Speedup':>8s}"
+            f"  {'Config':>45s}  │  {'rel_rmse':>10s}  {'rel_max':>10s}  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>11s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 100}")
         for r in varlen_results:
             print(
                 f"  {r['tag']:>45s}  │  "
-                f"{r['relative_rms_error']:18.6f}  {r['rel_max']:10.6f}  │  "
+                f"{r['relative_rms_error']:10.6f}  {r['rel_max']:10.6f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cula']:11.4f}  {r['speedup']:7.2f}x"
             )
         print(f"  {'─' * 100}")
