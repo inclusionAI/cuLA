@@ -100,7 +100,7 @@ class ChunkDeltaRuleBwdDHUSm90:
         self.load_current_warp_id = 5
         self.store_warp_id = 6
         self.num_threads = NUM_THREADS
-        self.num_regs_compute = 232
+        self.num_regs_compute = 256
         self.num_regs_other = 40
         self.k_stage = 3
         self.dv_stage = 2
@@ -756,10 +756,8 @@ class ChunkDeltaRuleBwdDHUSm90:
 
         tKsB = thr_mma.partition_B(sK)
         tKrB = thr_mma.make_fragment_B(tKsB)
-        tUsA = update_thr_mma.partition_A(sDv)
         tUsB = update_thr_mma.partition_B(sQ)
         tWsB = update_thr_mma.partition_B(sW)
-        tUrA = update_thr_mma.make_fragment_A(tUsA)
         tDv2sA = update_thr_mma.partition_A(sDv2)
         tDv2rA = update_thr_mma.make_fragment_A(tDv2sA)
         tUrB = update_thr_mma.make_fragment_B(tUsB)
@@ -768,6 +766,7 @@ class ChunkDeltaRuleBwdDHUSm90:
             qdo_thr_mma = qdo_tiled_mma.get_slice(local_tidx)
             qdo_tUsB = qdo_thr_mma.partition_B(sQ)
             qdo_tUrB = qdo_thr_mma.make_fragment_B(qdo_tUsB)
+            rDo = thr_mma.make_fragment_C(thr_mma.partition_shape_C((self.BV, self.BT)))
         else:
             tUsDo = update_thr_mma.partition_A(sDo)
             tUrDo = update_thr_mma.make_fragment_A(tUsDo)
@@ -781,7 +780,6 @@ class ChunkDeltaRuleBwdDHUSm90:
         state_shape = update_thr_mma.partition_shape_C((self.BV, self.BK))
         rState = update_thr_mma.make_fragment_C(state_shape)
         acc_qdo = update_thr_mma.make_fragment_C(state_shape)
-        acc_wdv = update_thr_mma.make_fragment_C(state_shape)
         dh_smem_layout_enum = (
             utils.LayoutEnum.ROW_MAJOR if cutlass.const_expr(self.transpose_state_layout) else utils.LayoutEnum.COL_MAJOR
         )
@@ -911,7 +909,6 @@ class ChunkDeltaRuleBwdDHUSm90:
                     tma_bar_ptr=w_h.barrier,
                     mcast_mask=v_tile_mcast_mask,
                 )
-
         elif is_compute_warp:
             # Initialize carried dh state in registers.  dht is loaded by the
             # load warp into the sDh backing buffer before sDh is used for
@@ -932,7 +929,6 @@ class ChunkDeltaRuleBwdDHUSm90:
                 chunk_start = chunk_idx * self.BT
                 chunk_end = cutlass.min(chunk_start + self.BT, seq_len)
                 remaining = chunk_end - chunk_start
-                last_idx = chunk_end - 1
 
                 # ========================================
                 # Phase 1: Publish dh + start K @ dh
@@ -972,7 +968,7 @@ class ChunkDeltaRuleBwdDHUSm90:
                 if cutlass.const_expr(self.use_g):
                     if local_tidx < self.BT:
                         t_idx = chunk_start + local_tidx
-                        g_last = g[data_bidx, tok_offset + last_idx, hidx].to(self.acc_dtype)
+                        g_last = g[data_bidx, tok_offset + chunk_end - 1, hidx].to(self.acc_dtype)
                         g_decay = Float32(0.0)
                         g_exp = Float32(0.0)
                         if t_idx < seq_len:
@@ -985,7 +981,50 @@ class ChunkDeltaRuleBwdDHUSm90:
                                 g_exp = cute.exp(g_cur, fastmath=self.use_fast_math)
                         sG[local_tidx, 0] = g_decay
                         sG[local_tidx, 1] = g_exp
-                if cutlass.const_expr(not self.use_g):
+                    cute.arch.barrier(barrier_id=2, number_of_threads=self.num_compute_threads)
+                    do_wait_early = load_do_C.wait_and_advance()
+                    q_wait_early = load_q_C.wait_and_advance()
+                    for ei in cutlass.range(cute.size(rDo), unroll_full=True):
+                        v_rel, t_rel = tCcDV[ei]
+                        t_idx = chunk_start + t_rel
+                        do_scaled = Float32(0.0)
+                        if t_idx < seq_len:
+                            do_scaled = sDo[v_rel, t_rel, do_wait_early.index].to(self.acc_dtype) * sG[t_rel, 1]
+                        rDo[ei] = do_scaled
+                    rDo_op = self.make_acc_into_op(rDo, qdo_tiled_mma.tv_layout_A, self.io_dtype)
+                    do_wait_early.release()
+
+                    acc_qdo.fill(0.0)
+                    cute.nvgpu.warpgroup.fence()
+                    for kp in cutlass.range(cute.size(qdo_tUrB, mode=[2]), unroll_full=True):
+                        qdo_tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
+                        cute.gemm(
+                            qdo_tiled_mma,
+                            acc_qdo,
+                            rDo_op[None, None, kp],
+                            qdo_tUrB[None, None, kp, q_wait_early.index],
+                            acc_qdo,
+                        )
+                    cute.nvgpu.warpgroup.commit_group()
+
+                    g_state_scale = sG[remaining - 1, 1].to(self.acc_dtype)
+                    for ei in cutlass.range(cute.size(rState), unroll_full=True):
+                        rState[ei] = rState[ei] * g_state_scale
+                    if cutlass.const_expr(self.use_gk):
+                        gk_wait_early = load_gk_C.wait_and_advance()
+                        gk_last = sGK[local_tidx, 0, gk_wait_early.index].to(self.acc_dtype)
+                        if cutlass.const_expr(self.use_exp2):
+                            k_decay = cute.exp2(gk_last, fastmath=self.use_fast_math)
+                        else:
+                            k_decay = cute.exp(gk_last, fastmath=self.use_fast_math)
+                        sGK[local_tidx, 0, gk_wait_early.index] = k_decay
+                        self.gk_precompute_bar.arrive_and_wait()
+                        for ei in cutlass.range(cute.size(rState), unroll_full=True):
+                            v_rel, k_rel = tUcState[ei]
+                            rState[ei] = rState[ei] * sGK[k_rel, 0, gk_wait_early.index]
+                        gk_wait_early.release()
+                    cute.nvgpu.warpgroup.wait_group(1)
+                else:
                     # Phase 3 is independent of K@dh, so overlap QDO and optional gk decay
                     # with the first GEMM in the no-scalar-g fast path.  For
                     # varlen tails, zero padded do positions before QDO so TMA
@@ -1028,28 +1067,6 @@ class ChunkDeltaRuleBwdDHUSm90:
                         sGK[local_tidx, 0, gk_wait_early.index] = k_decay
                         self.gk_precompute_bar.arrive_and_wait()
                     cute.nvgpu.warpgroup.wait_group(1)
-                else:
-                    # The K@dh WGMMA consumes rState_op, a bf16 register copy
-                    # made above, so the carried state can be decayed while
-                    # K@dh is still in flight.
-                    cute.arch.barrier(barrier_id=2, number_of_threads=self.num_compute_threads)
-                    g_state_scale = sG[remaining - 1, 1].to(self.acc_dtype)
-                    for ei in cutlass.range(cute.size(rState), unroll_full=True):
-                        rState[ei] = rState[ei] * g_state_scale
-                    if cutlass.const_expr(self.use_gk):
-                        gk_wait_early = load_gk_C.wait_and_advance()
-                        gk_last = sGK[local_tidx, 0, gk_wait_early.index].to(self.acc_dtype)
-                        if cutlass.const_expr(self.use_exp2):
-                            k_decay = cute.exp2(gk_last, fastmath=self.use_fast_math)
-                        else:
-                            k_decay = cute.exp(gk_last, fastmath=self.use_fast_math)
-                        sGK[local_tidx, 0, gk_wait_early.index] = k_decay
-                        self.gk_precompute_bar.arrive_and_wait()
-                        for ei in cutlass.range(cute.size(rState), unroll_full=True):
-                            v_rel, k_rel = tUcState[ei]
-                            rState[ei] = rState[ei] * sGK[k_rel, 0, gk_wait_early.index]
-                        gk_wait_early.release()
-                    cute.nvgpu.warpgroup.wait_group(0)
                 k_wait.release()
 
                 # ========================================
@@ -1081,9 +1098,10 @@ class ChunkDeltaRuleBwdDHUSm90:
                 # ========================================
                 if cutlass.const_expr(not self.use_g):
                     w_wait = load_w_C.wait_and_advance()
+                    acc_wdv = update_thr_mma.make_fragment_C(state_shape)
                     acc_wdv.fill(0.0)
                     cute.nvgpu.warpgroup.fence()
-                    for kp in cutlass.range(cute.size(tUrA, mode=[2]), unroll_full=True):
+                    for kp in cutlass.range(cute.size(tDv2rA, mode=[2]), unroll_full=True):
                         update_tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
                         cute.gemm(
                             update_tiled_mma,
@@ -1108,64 +1126,12 @@ class ChunkDeltaRuleBwdDHUSm90:
                     if cutlass.const_expr(self.use_gk):
                         gk_wait_early.release()
                 else:
-                    do_wait = load_do_C.wait_and_advance()
-                    if cutlass.const_expr(self.use_g):
-                        # Phase 3a: materialize gated do in registers for QDO.
-                        for ei in cutlass.range(cute.size(acc_dv), unroll_full=True):
-                            v_rel, t_rel = tCcDV[ei]
-                            t_idx = chunk_start + t_rel
-                            do_scaled = Float32(0.0)
-                            if t_idx < seq_len:
-                                do_scaled = sDo[v_rel, t_rel, do_wait.index].to(self.acc_dtype) * sG[t_rel, 1]
-                            acc_dv[ei] = do_scaled
-                        rDo_op = self.make_acc_into_op(acc_dv, qdo_tiled_mma.tv_layout_A, self.io_dtype)
-                        do_wait.release()
-                    if cutlass.const_expr((not self.use_g) and self.is_varlen):
-                        # Phase 3a: zero padded do positions in SMEM for varlen tails.
-                        if remaining < self.BT:
-                            linear_do = local_tidx
-                            while linear_do < self.BV * self.BT:
-                                v_rel = linear_do // self.BT
-                                t_rel = linear_do - v_rel * self.BT
-                                t_idx = chunk_start + t_rel
-                                do_scaled = Float32(0.0)
-                                if t_idx < seq_len:
-                                    do_scaled = sDo[v_rel, t_rel, do_wait.index].to(self.acc_dtype)
-                                sDo[v_rel, t_rel, do_wait.index] = do_scaled.to(self.io_dtype)
-                                linear_do += self.num_compute_threads
-                            cute.arch.barrier(barrier_id=2, number_of_threads=self.num_compute_threads)
-
-                    # Phase 3b: QDO plus scalar/key decay while QDO is in flight.
-                    q_wait = load_q_C.wait_and_advance()
-                    acc_qdo.fill(0.0)
-                    cute.nvgpu.warpgroup.fence()
-                    if cutlass.const_expr(self.use_g):
-                        for kp in cutlass.range(cute.size(qdo_tUrB, mode=[2]), unroll_full=True):
-                            qdo_tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
-                            cute.gemm(
-                                qdo_tiled_mma,
-                                acc_qdo,
-                                rDo_op[None, None, kp],
-                                qdo_tUrB[None, None, kp, q_wait.index],
-                                acc_qdo,
-                            )
-                    else:
-                        for kp in cutlass.range(cute.size(tUrDo, mode=[2]), unroll_full=True):
-                            update_tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
-                            cute.gemm(
-                                update_tiled_mma,
-                                acc_qdo,
-                                tUrDo[None, None, kp, do_wait.index],
-                                tUrB[None, None, kp, q_wait.index],
-                                acc_qdo,
-                            )
-                    cute.nvgpu.warpgroup.commit_group()
-
                     # Phase 4: WDV and final dh update.
                     w_wait = load_w_C.wait_and_advance()
+                    acc_wdv = update_thr_mma.make_fragment_C(state_shape)
                     acc_wdv.fill(0.0)
                     cute.nvgpu.warpgroup.fence()
-                    for kp in cutlass.range(cute.size(tUrA, mode=[2]), unroll_full=True):
+                    for kp in cutlass.range(cute.size(tDv2rA, mode=[2]), unroll_full=True):
                         update_tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
                         cute.gemm(
                             update_tiled_mma,
@@ -1176,14 +1142,12 @@ class ChunkDeltaRuleBwdDHUSm90:
                         )
                     cute.nvgpu.warpgroup.commit_group()
                     cute.nvgpu.warpgroup.wait_group(0)
-                    q_wait.release()
+                    q_wait_early.release()
 
                     for ei in cutlass.range(cute.size(rState), unroll_full=True):
                         update = acc_qdo[ei] * Float32(self.scale) - acc_wdv[ei]
                         rState[ei] = rState[ei] + update
                     w_wait.release()
-                    if cutlass.const_expr(not self.use_g):
-                        do_wait.release()
 
             if cutlass.const_expr(self.use_dh0):
                 dh0_h = store_dh0_P.acquire_and_advance()
