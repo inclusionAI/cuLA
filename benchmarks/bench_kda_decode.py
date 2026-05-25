@@ -166,7 +166,9 @@ def write_markdown_report(
         lines.append("### Accuracy (Output)")
         lines.append("")
         lines.append("| N | cuLA v out rel_rmse | cuLA v out rel_max | cuLA k out rel_rmse | cuLA k out rel_max |")
-        lines.append("|---|------------------------------:|-------------------:|------------------------------:|-------------------:|")
+        lines.append(
+            "|---|------------------------------:|-------------------:|------------------------------:|-------------------:|"
+        )
         for r in results:
             lines.append(
                 f"| {r['N']} | {r['out_v_last_relative_rms_error']:.3e} | {r['out_v_last_rel_max']:.3e} | "
@@ -176,10 +178,10 @@ def write_markdown_report(
 
         lines.append("### Accuracy (State)")
         lines.append("")
+        lines.append("| N | cuLA v state rel_rmse | cuLA v state rel_max | cuLA k state rel_rmse | cuLA k state rel_max |")
         lines.append(
-            "| N | cuLA v state rel_rmse | cuLA v state rel_max | cuLA k state rel_rmse | cuLA k state rel_max |"
+            "|---|--------------------------------:|---------------------:|--------------------------------:|---------------------:|"
         )
-        lines.append("|---|--------------------------------:|---------------------:|--------------------------------:|---------------------:|")
         for r in results:
             lines.append(
                 f"| {r['N']} | {r['state_v_last_relative_rms_error']:.3e} | {r['state_v_last_rel_max']:.3e} | "
@@ -410,10 +412,7 @@ def main(argv=None):
             )
 
         print()
-        hdr_out = (
-            f"{'N':>5} | {'cuLA v out rel_rmse':>30} | {'rel_max':>10} | "
-            f"{'cuLA k out rel_rmse':>30} | {'rel_max':>10}"
-        )
+        hdr_out = f"{'N':>5} | {'cuLA v out rel_rmse':>30} | {'rel_max':>10} | {'cuLA k out rel_rmse':>30} | {'rel_max':>10}"
         print(hdr_out)
         print("-" * len(hdr_out))
         for res in results:
@@ -424,8 +423,7 @@ def main(argv=None):
 
         print()
         hdr_state = (
-            f"{'N':>5} | {'cuLA v state rel_rmse':>32} | {'rel_max':>10} | "
-            f"{'cuLA k state rel_rmse':>32} | {'rel_max':>10}"
+            f"{'N':>5} | {'cuLA v state rel_rmse':>32} | {'rel_max':>10} | {'cuLA k state rel_rmse':>32} | {'rel_max':>10}"
         )
         print(hdr_state)
         print("-" * len(hdr_state))

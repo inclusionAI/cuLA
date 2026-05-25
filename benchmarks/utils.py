@@ -482,9 +482,7 @@ def prepare_safe_gate_inputs(
     )
 
 
-def prepare_intra_inputs(
-    batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED, num_v_heads=None
-):
+def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED, num_v_heads=None):
     """Prepare preprocessed inputs ready for chunk_kda_fwd_intra.
 
     Supports both standard (HV=H) and GVA (HV > H) layouts via ``num_v_heads``:

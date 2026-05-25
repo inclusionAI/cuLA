@@ -718,7 +718,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 auto blk_coord = TileScheduler::decode_tile_coord(
                     tid, params.h_v, params.heads_per_group, chunk_indices_ptr, cu_seqlens_ptr);
                 int batch_idx = get<0>(blk_coord);
-                int head_idx = get<1>(blk_coord);     // v-head index
+                int head_idx = get<1>(blk_coord);  // v-head index
                 int tile_idx = get<2>(blk_coord);
                 int qk_head_idx = get<3>(blk_coord);  // == head_idx / heads_per_group
                 int token_offset = cu_seqlens_ptr[batch_idx];

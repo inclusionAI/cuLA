@@ -37,9 +37,9 @@
 // ===================================================================
 struct StaticPersistentTileScheduler {
     struct Params {
-        int num_blocks;        // number of sequence chunks (from chunk_indices)
-        int num_heads;         // == num_v_heads; tiles are enumerated by v-head
-        int heads_per_group;   // == num_v_heads / num_qk_heads, precomputed on host
+        int num_blocks;       // number of sequence chunks (from chunk_indices)
+        int num_heads;        // == num_v_heads; tiles are enumerated by v-head
+        int heads_per_group;  // == num_v_heads / num_qk_heads, precomputed on host
 
         int num_sm;
         int* tile_counter;  // unused

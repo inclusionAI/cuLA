@@ -50,9 +50,9 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from benchmarks.utils import gen_random, gen_skewed, gen_uniform, relative_rms_error, time_cuda_fn
 from fla.ops.simple_gla.chunk import chunk_simple_gla_fwd
 
+from benchmarks.utils import gen_random, gen_skewed, gen_uniform, relative_rms_error, time_cuda_fn
 from cula.ops.lightning_attn_sm100 import lightning_attn_fwd, lightning_attn_fwd_varlen
 
 # =============================================================================
@@ -400,9 +400,7 @@ def print_standard_result(r):
     dsl = f"{r['cutedsl_ms']:.3f}" if _valid(r.get("cutedsl_ms", float("nan"))) else "ERR"
     sp = f"{r['speedup']:.2f}x" if _valid(r.get("speedup", float("nan"))) else "-"
     fla_o = (
-        f"{r['fla_o_relative_rms_error'] * 100:.3f}%"
-        if not np.isnan(r.get("fla_o_relative_rms_error", float("nan")))
-        else "-"
+        f"{r['fla_o_relative_rms_error'] * 100:.3f}%" if not np.isnan(r.get("fla_o_relative_rms_error", float("nan"))) else "-"
     )
     cute_o = (
         f"{r['cute_o_relative_rms_error'] * 100:.3f}%"
@@ -609,14 +607,18 @@ def run_benchmark_suite(args):
                     if not np.isnan(r.get(f"{label}_o_relative_rms_error", float("nan")))
                 ]
                 if o_rmses:
-                    print(f"    {name} O relative_rms_error% (vs naive): avg={np.mean(o_rmses):.4f}  max={np.max(o_rmses):.4f}")
+                    print(
+                        f"    {name} O relative_rms_error% (vs naive): avg={np.mean(o_rmses):.4f}  max={np.max(o_rmses):.4f}"
+                    )
                 ht_rmses = [
                     r[f"{label}_ht_relative_rms_error"] * 100
                     for r in mode_r
                     if not np.isnan(r.get(f"{label}_ht_relative_rms_error", float("nan")))
                 ]
                 if ht_rmses:
-                    print(f"    {name} Ht relative_rms_error% (vs naive): avg={np.mean(ht_rmses):.4f}  max={np.max(ht_rmses):.4f}")
+                    print(
+                        f"    {name} Ht relative_rms_error% (vs naive): avg={np.mean(ht_rmses):.4f}  max={np.max(ht_rmses):.4f}"
+                    )
 
     # --- Plot ---
     if args.plot:
@@ -747,7 +749,9 @@ def generate_report(all_results, modes, args):
                     )
                 else:
                     f.write("| Config | FLA(ms) | CuteDSL(ms) | Speedup | FLA_O_rel_rmse% | Cute_O_rel_rmse% |\n")
-                    f.write("|--------|---------|-------------|---------|---------------------------|----------------------------|\n")
+                    f.write(
+                        "|--------|---------|-------------|---------|---------------------------|----------------------------|\n"
+                    )
                 for r in mr:
                     cfg = f"B={r['B']},T={r['T']},H={r['H']}"
                     sp = f"{r['speedup']:.2f}x" if _valid(r.get("speedup", float("nan"))) else "-"

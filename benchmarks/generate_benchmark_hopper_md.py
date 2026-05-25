@@ -179,7 +179,9 @@ def main():
         kda_fused_fixed = data["kda_fused_fixed"]
         kda_fused_varlen = data["kda_fused_varlen"]
     else:
-        kda_fused_fixed, kda_fused_varlen = run_kda_fused_fwd_benchmarks(has_init_state=args.init_state, heads=args.heads, hv=args.hv)
+        kda_fused_fixed, kda_fused_varlen = run_kda_fused_fwd_benchmarks(
+            has_init_state=args.init_state, heads=args.heads, hv=args.hv
+        )
 
         if args.save_cache:
             cache_path = Path(args.save_cache)

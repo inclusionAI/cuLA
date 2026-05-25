@@ -46,7 +46,7 @@ from cula.kda.chunk_intra import chunk_kda_fwd_intra as cula_chunk_kda_fwd_intra
 
 # Constant params
 B, H, D = 2, 64, 128
-HV = H   # overridable via --hv; HV > H enables GVA mode
+HV = H  # overridable via --hv; HV > H enables GVA mode
 BT = 64  # chunk size
 
 # Varlen benchmark params
@@ -56,6 +56,7 @@ MIN_SEQ_LEN = 63
 VARIANCE = 1.0
 
 DISABLE_RECOMPUTE = False  # Whether to disable recompute (compute QG in forward)
+
 
 # ==============================================================================
 # Unified uniform seqlen benchmark (handles both standard and GVA)
@@ -89,9 +90,17 @@ def benchmark_chunk_intra_uniform():
         )
 
         common = dict(
-            q=q, k=k, v=v, gk=g, beta=beta, scale=scale,
-            cu_seqlens=cu_seqlens, chunk_size=chunk_size, chunk_indices=chunk_indices,
-            safe_gate=True, disable_recompute=DISABLE_RECOMPUTE,
+            q=q,
+            k=k,
+            v=v,
+            gk=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            safe_gate=True,
+            disable_recompute=DISABLE_RECOMPUTE,
         )
 
         # Accuracy: run once and compare
@@ -147,9 +156,17 @@ def benchmark_chunk_intra_varlen():
         )
 
         common = dict(
-            q=q, k=k, v=v, gk=g, beta=beta, scale=scale,
-            cu_seqlens=cu_seqlens, chunk_size=chunk_size, chunk_indices=chunk_indices,
-            safe_gate=True, disable_recompute=DISABLE_RECOMPUTE,
+            q=q,
+            k=k,
+            v=v,
+            gk=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            safe_gate=True,
+            disable_recompute=DISABLE_RECOMPUTE,
         )
 
         # Accuracy
@@ -188,7 +205,7 @@ if __name__ == "__main__":
         "--hv",
         type=int,
         default=None,
-        help=f"Override number of V heads (HV). Default: H (no GVA). Set HV > H to enable GVA mode.",
+        help="Override number of V heads (HV). Default: H (no GVA). Set HV > H to enable GVA mode.",
     )
     args = parser.parse_args()
 

@@ -387,6 +387,7 @@ def main():
         action="store_true",
         help="Disable recompute in both FLA and cuLA (pre-compute QG)",
     )
+    global H
     parser.add_argument(
         "--heads",
         type=int,
@@ -397,11 +398,11 @@ def main():
         "--hv",
         type=int,
         default=None,
-        help=f"Number of V heads (HV). Default: same as H (no GVA). Set HV > H to run in GVA mode.",
+        help="Number of V heads (HV). Default: same as H (no GVA). Set HV > H to run in GVA mode.",
     )
     args = parser.parse_args()
 
-    global NCU_MODE, SANITIZER_MODE, DISABLE_RECOMPUTE, H
+    global NCU_MODE, SANITIZER_MODE, DISABLE_RECOMPUTE
     H = args.heads
     if args.ncu:
         NCU_MODE = True

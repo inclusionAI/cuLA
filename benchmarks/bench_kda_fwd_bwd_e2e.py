@@ -503,10 +503,7 @@ def print_report(fixed_results, varlen_results):
                 f"{'rel_max:':>10s}{rel_max_vals}"
             )
             # Line 2: rel_rmse (no timing columns)
-            print(
-                f"  {'':3s}  {'':5s}  │  {'':9s}  {'':11s}  {'':8s}  │  "
-                f"{'rel_rmse:':>10s}{relative_rms_error_vals}"
-            )
+            print(f"  {'':3s}  {'':5s}  │  {'':9s}  {'':11s}  {'':8s}  │  {'rel_rmse:':>10s}{relative_rms_error_vals}")
         print(f"  {'─' * 125}")
 
     if varlen_results:
@@ -528,10 +525,7 @@ def print_report(fixed_results, varlen_results):
                 f"{'rel_max:':>10s}{rel_max_vals}"
             )
             # Line 2: rel_rmse (no config/timing columns)
-            print(
-                f"  {'':>45s}  │  {'':9s}  {'':11s}  {'':8s}  │  "
-                f"{'rel_rmse:':>10s}{relative_rms_error_vals}"
-            )
+            print(f"  {'':>45s}  │  {'':9s}  {'':11s}  {'':8s}  │  {'rel_rmse:':>10s}{relative_rms_error_vals}")
         print(f"  {'─' * 140}")
 
     print(f"\n{sep}\n")
@@ -571,6 +565,7 @@ def main():
         action="store_true",
         help="Disable recompute in both FLA and cuLA (pre-compute QG)",
     )
+    global H
     parser.add_argument(
         "--heads",
         type=int,
@@ -581,11 +576,11 @@ def main():
         "--hv",
         type=int,
         default=None,
-        help=f"Number of V heads (HV). Default: same as --heads. For GVA, set HV > H with HV %% H == 0",
+        help="Number of V heads (HV). Default: same as --heads. For GVA, set HV > H with HV %% H == 0",
     )
     args = parser.parse_args()
 
-    global NCU_MODE, SANITIZER_MODE, DISABLE_RECOMPUTE, PHASE, H, HV
+    global NCU_MODE, SANITIZER_MODE, DISABLE_RECOMPUTE, PHASE, HV
     H = args.heads
     HV = args.hv if args.hv is not None else H
     if HV < H or HV % H != 0:

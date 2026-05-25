@@ -184,8 +184,8 @@ ChunkKDAFwdRecompWU(
     int tile_num = chunk_indices.size(0);
     auto device_prop = at::cuda::getCurrentDeviceProperties();
     params.num_sm = device_prop->multiProcessorCount;
-    params.tile_scheduler_params = StaticPersistentTileScheduler::Params{
-        tile_num, params.h_v, params.heads_per_group, params.num_sm, nullptr};
+    params.tile_scheduler_params =
+        StaticPersistentTileScheduler::Params{tile_num, params.h_v, params.heads_per_group, params.num_sm, nullptr};
 
     kda::sm100::run_kda_fwd_recomp_w_u_sm100(params, at::cuda::getCurrentCUDAStream());
 }

@@ -343,19 +343,15 @@ run_kda_fwd_intra_sm100_impl_dispatch(KDA_fwd_intra_params& params, cudaStream_t
         typename Kernel::SmemLayoutInputFP32{});
 
     // --- Pack TMA params ---
-    typename Kernel::template TmaParams<
-        decltype(shape_QK),
-        decltype(shape_VG),
-        decltype(tma_Q),
-        decltype(tma_K),
-        decltype(tma_G)>
-        tma_params = {
-            shape_QK,
-            shape_VG,
-            tma_Q,
-            tma_K,
-            tma_G,
-        };
+    typename Kernel::
+        template TmaParams<decltype(shape_QK), decltype(shape_VG), decltype(tma_Q), decltype(tma_K), decltype(tma_G)>
+            tma_params = {
+                shape_QK,
+                shape_VG,
+                tma_Q,
+                tma_K,
+                tma_G,
+            };
 
     // --- Launch config ---
     auto kernel_fn = &kda_fwd_intra_sm100_kernel_entry<Kernel, decltype(tma_params)>;
