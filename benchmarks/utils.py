@@ -60,6 +60,170 @@ def set_seed(seed: int):
     torch.cuda.manual_seed(seed)
 
 
+def benchmark_cuda_fn(fn, *, setup_fn=None, warmup=30, rep=200, aggregate="iqr_mean"):
+    """Benchmark a CUDA callable with events and return milliseconds per call."""
+    for _ in range(warmup):
+        if setup_fn is not None:
+            setup_fn()
+        fn()
+    torch.cuda.synchronize()
+
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+
+    for i in range(rep):
+        if setup_fn is not None:
+            setup_fn()
+        starts[i].record()
+        fn()
+        ends[i].record()
+
+    torch.cuda.synchronize()
+    times = [s.elapsed_time(e) for s, e in zip(starts, ends)]
+    if not times:
+        return 0.0
+    if aggregate == "mean":
+        return sum(times) / len(times)
+    if aggregate == "iqr_mean":
+        times = sorted(times)
+        if len(times) <= 2:
+            return sum(times) / len(times)
+        iqr = times[len(times) // 4 : 3 * len(times) // 4]
+        return sum(iqr) / len(iqr)
+    raise ValueError(f"Unsupported aggregate={aggregate}")
+
+
+def resolve_benchmark_repeats(default_warmup, default_rep, *, ncu_mode=False, sanitizer_mode=False):
+    """Resolve benchmark warmup and repeat counts for normal vs profiling runs."""
+    if ncu_mode or sanitizer_mode:
+        return 1, 1
+    return default_warmup, default_rep
+
+
+def benchmark_cuda_mode_fn(
+    fn,
+    *,
+    default_warmup,
+    default_rep,
+    ncu_mode=False,
+    sanitizer_mode=False,
+    setup_fn=None,
+):
+    """Benchmark a CUDA callable using standard repo warmup/repeat mode rules."""
+    warmup, rep = resolve_benchmark_repeats(
+        default_warmup,
+        default_rep,
+        ncu_mode=ncu_mode,
+        sanitizer_mode=sanitizer_mode,
+    )
+    return benchmark_cuda_fn(fn, setup_fn=setup_fn, warmup=warmup, rep=rep, aggregate="mean")
+
+
+def triton_bench_fn(fn, **kwargs):
+    """Benchmark a callable with Triton's do_bench helper."""
+    import triton
+
+    return triton.testing.do_bench(fn, **kwargs)
+
+
+def time_cuda_fn(fn, warmup, iters):
+    """Time a CUDA callable and return milliseconds per call."""
+    return benchmark_cuda_fn(fn, warmup=warmup, rep=iters, aggregate="mean")
+
+
+def _error_stats(ref: torch.Tensor, out: torch.Tensor):
+    """Return shared float-cast tensors and basic absolute/RMS error stats."""
+    ref_f = ref.float()
+    out_f = out.float()
+    diff = (ref_f - out_f).abs()
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+    rmse = diff.pow(2).mean().sqrt().item()
+    ref_rms = ref_f.pow(2).mean().sqrt().item()
+    return ref_f, out_f, max_diff, mean_diff, rmse, ref_rms
+
+
+def _relative_max(max_diff: float, denom: float):
+    return max_diff / denom if denom > 0 else 0.0
+
+
+def rmse_rel_max(ref: torch.Tensor, out: torch.Tensor):
+    """Return RMSE and relative max error between two tensors."""
+    ref_f, _out_f, max_diff, _mean_diff, rmse, _ref_rms = _error_stats(ref, out)
+    rel_max = _relative_max(max_diff, ref_f.abs().max().item())
+    return rmse, rel_max
+
+
+def relative_rms_error(ref: torch.Tensor, out: torch.Tensor):
+    """Return relative RMS error between two tensors."""
+    _ref_f, _out_f, _max_diff, _mean_diff, rmse, ref_rms = _error_stats(ref, out)
+    return rmse / (ref_rms + 1e-8)
+
+
+def relative_rms_error_rel_max(ref: torch.Tensor, out: torch.Tensor):
+    """Return relative RMS error and relative max error."""
+    ref_f, _out_f, max_diff, _mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    relative_rms = relative_rms_error(ref, out)
+    rel_max = _relative_max(max_diff, ref_f.abs().max().item())
+    return relative_rms, rel_max
+
+
+def rmse_rel_max_mean_abs(ref: torch.Tensor, out: torch.Tensor):
+    """Return RMSE, relative max error, and mean absolute difference."""
+    ref_f, _out_f, max_diff, mean_diff, rmse, _ref_rms = _error_stats(ref, out)
+    rel_max = _relative_max(max_diff, ref_f.abs().max().item())
+    return rmse, rel_max, mean_diff
+
+
+def rmse_rel_max_mean_abs_rhs(ref: torch.Tensor, out: torch.Tensor):
+    """Return RMSE, relative max error vs rhs magnitude, and mean absolute difference."""
+    _ref_f, out_f, max_diff, mean_diff, rmse, _ref_rms = _error_stats(ref, out)
+    rel_max = _relative_max(max_diff, out_f.abs().max().item())
+    return rmse, rel_max, mean_diff
+
+
+def relative_rms_error_rel_max_mean_abs(ref: torch.Tensor, out: torch.Tensor):
+    """Return relative RMS error, relative max error, and mean absolute difference."""
+    ref_f, _out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    relative_rms = relative_rms_error(ref, out)
+    rel_max = _relative_max(max_diff, ref_f.abs().max().item())
+    return relative_rms, rel_max, mean_diff
+
+
+def relative_rms_error_rel_max_mean_abs_rhs(ref: torch.Tensor, out: torch.Tensor):
+    """Return relative RMS error, rhs-relative max error, and mean absolute difference."""
+    _ref_f, out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    relative_rms = relative_rms_error(ref, out)
+    rel_max = _relative_max(max_diff, out_f.abs().max().item())
+    return relative_rms, rel_max, mean_diff
+
+
+def relative_rms_error_max_mean_abs(ref: torch.Tensor, out: torch.Tensor):
+    """Return relative RMS error, max error, and mean absolute difference."""
+    _ref_f, _out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    return relative_rms_error(ref, out), max_diff, mean_diff
+
+
+def relative_rms_error_max_rel_mean_abs(ref: torch.Tensor, out: torch.Tensor):
+    """Return relative RMS error, max error, relative max error, and mean absolute difference."""
+    ref_f, _out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    rel_max_diff = _relative_max(max_diff, ref_f.abs().max().item())
+    return relative_rms_error(ref, out), max_diff, rel_max_diff, mean_diff
+
+
+def max_mean_abs_diff(ref: torch.Tensor, out: torch.Tensor):
+    """Return max and mean absolute difference."""
+    _ref_f, _out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    return max_diff, mean_diff
+
+
+def max_rel_mean_abs_diff(ref: torch.Tensor, out: torch.Tensor):
+    """Return max error, relative max error, and mean absolute difference."""
+    ref_f, _out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    rel_max_diff = _relative_max(max_diff, ref_f.abs().max().item())
+    return max_diff, rel_max_diff, mean_diff
+
+
 def exclusive_cumsum(a: list[int]):
     r = [0]
     for v in a:

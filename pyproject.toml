@@ -14,7 +14,7 @@ dependencies = [
     "nvidia-cutlass-dsl==4.4.2",
     "apache-tvm-ffi==0.1.9",
 ]
-license = "Apache-2.0"
+license = { text = "Apache-2.0" }
 
 [project.optional-dependencies]
 dev = [

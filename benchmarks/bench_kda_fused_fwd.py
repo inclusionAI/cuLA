@@ -22,7 +22,7 @@ GPU architecture:
   - sm90  (Hopper)    → cula.kda.hopper_fused_fwd.cula_kda_prefill
 
 Compares:
-  - Accuracy: RMSE, relative max diff between cuLA fully-fused and FLA Triton
+    - Accuracy: relative_rms_error, relative max diff between cuLA fully-fused and FLA Triton
   - Performance: kernel execution time (ms) with CUDA events
 
 Modes:
@@ -53,9 +53,11 @@ from fla.ops.kda import chunk_kda as fla_chunk_kda
 
 from benchmarks.utils import (
     SEED,
+    benchmark_cuda_mode_fn,
     build_varlen_configs,
     exclusive_cumsum,
     prepare_safe_gate_inputs,
+    relative_rms_error_rel_max_mean_abs,
     set_seed,
 )
 from cula.utils import get_device_sm_version, get_kda_fused_fwd
@@ -86,35 +88,6 @@ HAS_INIT_STATE = False
 # ============================================================
 # Helpers
 # ============================================================
-def time_kernel(fn, warmup=None, n_iters=None):
-    if warmup is None:
-        warmup = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
-    if n_iters is None:
-        n_iters = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    start_evt.record()
-    for _ in range(n_iters):
-        fn()
-    end_evt.record()
-    torch.cuda.synchronize()
-    return start_evt.elapsed_time(end_evt) / n_iters
-
-
-def accuracy_stats(ref, out):
-    """Compute RMSE, relative max diff, and mean absolute difference."""
-    ref_f = ref.float()
-    out_f = out.float()
-    diff = (ref_f - out_f).abs()
-    rmse = diff.pow(2).mean().sqrt().item()
-    max_diff = diff.max().item()
-    denom = ref_f.abs().max().item()
-    rel_max = max_diff / denom if denom > 0 else 0.0
-    mean_diff = diff.mean().item()
-    return rmse, rel_max, mean_diff
 
 
 def run_fla(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, lower_bound):
@@ -209,11 +182,23 @@ def bench_fixed(configs):
         o_cula, _ = run_cula(**common)
         torch.cuda.synchronize()
 
-        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
+        relative_rms_error, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs(o_fla, o_cula)
 
         # Performance
-        ms_fla = time_kernel(lambda: run_fla(**common))
-        ms_cula = time_kernel(lambda: run_cula(**common))
+        ms_fla = benchmark_cuda_mode_fn(
+            lambda: run_fla(**common),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+            sanitizer_mode=SANITIZER_MODE,
+        )
+        ms_cula = benchmark_cuda_mode_fn(
+            lambda: run_cula(**common),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+            sanitizer_mode=SANITIZER_MODE,
+        )
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         results.append(
@@ -222,7 +207,7 @@ def bench_fixed(configs):
                 "T": T,
                 "H": H,
                 "HV": HV,
-                "rmse": rmse,
+                "relative_rms_error": relative_rms_error,
                 "rel_max": rel_max,
                 "mean_diff": mean_diff,
                 "ms_fla": ms_fla,
@@ -288,11 +273,23 @@ def bench_varlen(configs):
         o_cula, _ = run_cula(**common)
         torch.cuda.synchronize()
 
-        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
+        relative_rms_error, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs(o_fla, o_cula)
 
         # Performance
-        ms_fla = time_kernel(lambda: run_fla(**common))
-        ms_cula = time_kernel(lambda: run_cula(**common))
+        ms_fla = benchmark_cuda_mode_fn(
+            lambda: run_fla(**common),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+            sanitizer_mode=SANITIZER_MODE,
+        )
+        ms_cula = benchmark_cuda_mode_fn(
+            lambda: run_cula(**common),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+            sanitizer_mode=SANITIZER_MODE,
+        )
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         n_seqs = len(seq_lens)
@@ -308,7 +305,7 @@ def bench_varlen(configs):
                 "n_seqs": n_seqs,
                 "H": H,
                 "HV": HV,
-                "rmse": rmse,
+                "relative_rms_error": relative_rms_error,
                 "rel_max": rel_max,
                 "mean_diff": mean_diff,
                 "ms_fla": ms_fla,
@@ -345,7 +342,7 @@ def print_report(fixed_results, varlen_results):
         print(f"  {'─' * 110}")
         print(
             f"  {'B':>3s}  {'T':>6s}  {'H':>3s}  {'HV':>3s}  {'GVA':>4s}  │  "
-            f"{'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}  │  "
+            f"{'rel_rmse':>18s}  {'rel_max':>10s}  {'mean_diff':>10s}  │  "
             f"{'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 110}")
@@ -353,7 +350,7 @@ def print_report(fixed_results, varlen_results):
             gva_tag = f"{r['HV'] // r['H']}x" if r["HV"] > r["H"] else "no"
             print(
                 f"  {r['B']:3d}  {r['T']:6d}  {r['H']:3d}  {r['HV']:3d}  {gva_tag:>4s}  │  "
-                f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
+                f"{r['relative_rms_error']:18.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x"
             )
         print(f"  {'─' * 110}")
@@ -363,7 +360,7 @@ def print_report(fixed_results, varlen_results):
         print(f"  {'─' * 120}")
         print(
             f"  {'Config':>45s}  {'H':>3s}  {'HV':>3s}  {'GVA':>4s}  │  "
-            f"{'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}  │  "
+            f"{'rel_rmse':>18s}  {'rel_max':>10s}  {'mean_diff':>10s}  │  "
             f"{'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 120}")
@@ -371,7 +368,7 @@ def print_report(fixed_results, varlen_results):
             gva_tag = f"{r['HV'] // r['H']}x" if r["HV"] > r["H"] else "no"
             print(
                 f"  {r['tag']:>45s}  {r['H']:3d}  {r['HV']:3d}  {gva_tag:>4s}  │  "
-                f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
+                f"{r['relative_rms_error']:18.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x"
             )
         print(f"  {'─' * 120}")

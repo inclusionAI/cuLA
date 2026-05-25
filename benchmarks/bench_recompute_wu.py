@@ -28,17 +28,23 @@ import pathlib
 import sys
 
 import torch
-import triton
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 
 from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_intra
 from fla.ops.kda.wy_fast import recompute_w_u_fwd as fla_recompute_w_u_fwd
-from fla.utils import get_abs_err, get_err_ratio
 
 import cula.cudac as cula_cuda
-from benchmarks.utils import SEED, exclusive_cumsum, generate_random_seq_lens, prepare_intra_inputs
+from benchmarks.utils import (
+    SEED,
+    exclusive_cumsum,
+    generate_random_seq_lens,
+    prepare_intra_inputs,
+    relative_rms_error,
+    relative_rms_error_rel_max_mean_abs_rhs,
+    triton_bench_fn,
+)
 from cula.kda.chunk_intra import chunk_kda_fwd_intra as cula_chunk_kda_fwd_intra
 
 # Constant params
@@ -55,17 +61,8 @@ VARIANCE = 1.0
 DISABLE_RECOMPUTE = False  # Whether to disable recompute (compute QG in forward)
 
 
-def accuracy_stats(a, b):
-    """Compute RMSE, relative max diff, and mean absolute difference."""
-    a, b = a.float(), b.float()
-    diff = a - b
-    rmse = diff.pow(2).mean().sqrt().item()
-    max_diff = diff.abs().max().item()
-    denom = b.abs().max().item()
-    rel_max = max_diff / denom if denom > 0 else 0.0
-    mean_diff = diff.abs().mean().item()
-    return rmse, rel_max, mean_diff
-
+def get_abs_err(ref: torch.Tensor, out: torch.Tensor) -> float:
+    return (ref.float() - out.float()).abs().max().item()
 
 def prepare_recompute_wu_inputs(B, T, device, cu_seqlens=None, chunk_size=BT):
     """Prepare inputs for recompute_w_u benchmarking (handles both MHA and GVA).
@@ -131,7 +128,7 @@ def benchmark_recompute_wu_uniform():
     )
     print("=" * 100)
     print(
-        f"{'B':>4} {'T':>7} │ {'RMSE':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
+        f"{'B':>4} {'T':>7} │ {'rel_rmse':>18} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
     )
     print("─" * 100)
 
@@ -156,22 +153,23 @@ def benchmark_recompute_wu_uniform():
             ("w", w_fla, w_cula), ("u", u_fla, u_cula), ("qg", qg_fla, qg_cula), ("kg", kg_fla, kg_cula),
         ]:
             if t_fla is not None and t_cula is not None:
-                stats[name] = accuracy_stats(t_fla, t_cula)
-        rmse = max(s[0] for s in stats.values())
+                stats[name] = relative_rms_error_rel_max_mean_abs_rhs(t_fla, t_cula)
+        # Use max across all outputs for display.
+        relative_rms_error_value = max(s[0] for s in stats.values())
         rel_max = max(s[1] for s in stats.values())
         mean_diff = max(s[2] for s in stats.values())
 
         # Performance
-        ms_fla = triton.testing.do_bench(
+        ms_fla = triton_bench_fn(
             lambda: run_fla_recompute_wu(k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, DISABLE_RECOMPUTE),
         )
-        ms_cula = triton.testing.do_bench(
+        ms_cula = triton_bench_fn(
             lambda: run_cula_recompute_wu(k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, chunk_size, DISABLE_RECOMPUTE),
         )
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         print(
-            f"{B:>4} {T:>7} │ {rmse:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
+            f"{B:>4} {T:>7} │ {relative_rms_error_value:>18.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
         )
 
     print("─" * 100)
@@ -195,7 +193,7 @@ def benchmark_recompute_wu_varlen():
     )
     print("=" * 110)
     print(
-        f"{'total_len':>10} │ {'RMSE':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
+        f"{'total_len':>10} │ {'rel_rmse':>18} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
     )
     print("─" * 110)
 
@@ -221,22 +219,23 @@ def benchmark_recompute_wu_varlen():
             ("w", w_fla, w_cula), ("u", u_fla, u_cula), ("qg", qg_fla, qg_cula), ("kg", kg_fla, kg_cula),
         ]:
             if t_fla is not None and t_cula is not None:
-                stats[name] = accuracy_stats(t_fla, t_cula)
-        rmse = max(s[0] for s in stats.values())
+                stats[name] = relative_rms_error_rel_max_mean_abs_rhs(t_fla, t_cula)
+        # Use max across all outputs for display.
+        relative_rms_error_value = max(s[0] for s in stats.values())
         rel_max = max(s[1] for s in stats.values())
         mean_diff = max(s[2] for s in stats.values())
 
         # Performance
-        ms_fla = triton.testing.do_bench(
+        ms_fla = triton_bench_fn(
             lambda: run_fla_recompute_wu(k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, DISABLE_RECOMPUTE),
         )
-        ms_cula = triton.testing.do_bench(
+        ms_cula = triton_bench_fn(
             lambda: run_cula_recompute_wu(k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, chunk_size, DISABLE_RECOMPUTE),
         )
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         print(
-            f"{total_len:>10} │ {rmse:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
+            f"{total_len:>10} │ {relative_rms_error_value:>18.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
         )
 
     print("─" * 110)
@@ -265,19 +264,19 @@ def check_determinism(num_seqs=NUM_SEQS, T=2001, H=H, iters=1000):
 
         if not torch.equal(w, ref_w):
             print(f"Iteration {i}: w mismatch")
-            print(f"{get_abs_err(ref_w, w):.6f} absolute error, {get_err_ratio(ref_w, w):.6f} relative error")
+            print(f"{get_abs_err(ref_w, w):.6f} absolute error, {relative_rms_error(ref_w, w):.6f} relative_rms_error")
             raise AssertionError("Non-deterministic output detected in w")
         if not torch.equal(u, ref_u):
             print(f"Iteration {i}: u mismatch")
-            print(f"{get_abs_err(ref_u, u):.6f} absolute error, {get_err_ratio(ref_u, u):.6f} relative error")
+            print(f"{get_abs_err(ref_u, u):.6f} absolute error, {relative_rms_error(ref_u, u):.6f} relative_rms_error")
             raise AssertionError("Non-deterministic output detected in u")
         if kg is not None and not torch.equal(kg, ref_kg):
             print(f"Iteration {i}: kg mismatch")
-            print(f"{get_abs_err(ref_kg, kg):.6f} absolute error, {get_err_ratio(ref_kg, kg):.6f} relative error")
+            print(f"{get_abs_err(ref_kg, kg):.6f} absolute error, {relative_rms_error(ref_kg, kg):.6f} relative_rms_error")
             raise AssertionError("Non-deterministic output detected in kg")
         if qg is not None and not torch.equal(qg, ref_qg):
             print(f"Iteration {i}: qg mismatch")
-            print(f"{get_abs_err(ref_qg, qg):.6f} absolute error, {get_err_ratio(ref_qg, qg):.6f} relative error")
+            print(f"{get_abs_err(ref_qg, qg):.6f} absolute error, {relative_rms_error(ref_qg, qg):.6f} relative_rms_error")
             raise AssertionError("Non-deterministic output detected in qg")
 
 

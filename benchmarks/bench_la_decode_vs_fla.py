@@ -53,34 +53,11 @@ import triton
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from benchmarks.utils import benchmark_cuda_fn, relative_rms_error
 from fla.ops.common.fused_recurrent import fused_recurrent_fwd, fused_recurrent_fwd_kernel
 
 from cula.ops.la_decode import _get_compiled_kernel, linear_attention_decode
 from cula.utils import USE_FAST_MATH
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Timing utility
-# ─────────────────────────────────────────────────────────────────────────────
-def benchmark_fn(fn, warmup=30, rep=200):
-    """Benchmark using CUDA events. Returns IQR-mean time in ms."""
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
-
-    for i in range(rep):
-        starts[i].record()
-        fn()
-        ends[i].record()
-
-    torch.cuda.synchronize()
-    times = sorted(s.elapsed_time(e) for s, e in zip(starts, ends))
-    n = len(times)
-    iqr = times[n // 4 : 3 * n // 4]
-    return sum(iqr) / len(iqr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,12 +124,12 @@ def run_config(B, H, K, V, layer_idx, num_layers):
     # ── Correctness ────────────────────────────────────────────────────────
     o_fla_cmp = o_fla.squeeze(1).float()
     o_cute_cmp = out_cute.float()
-    rmse = torch.sqrt(torch.mean((o_cute_cmp - o_fla_cmp) ** 2)).item()
+    output_relative_rms_error = relative_rms_error(o_fla_cmp, o_cute_cmp)
     max_ref = torch.abs(o_fla_cmp).max().item()
     rel_maxdiff = torch.abs(o_cute_cmp - o_fla_cmp).max().item() / (max_ref + 1e-8)
 
     state_cute_back = state_cute.reshape(B, H, V, K).permute(0, 1, 3, 2).contiguous()
-    state_rmse = torch.sqrt(torch.mean((state_cute_back - ht_fla.float()) ** 2)).item()
+    state_relative_rms_error = relative_rms_error(ht_fla, state_cute_back)
 
     # ==================================================================
     # Mode 1: KERNEL-ONLY (pre-allocated everything, minimal host overhead)
@@ -209,8 +186,8 @@ def run_config(B, H, K, V, layer_idx, num_layers):
         compiled_cute(cute_state_k, decay_scales, q_3d, k_3d, v_3d, out_cute_k, s_offsets, stream_handle)
 
     with torch.no_grad():
-        kernel_fla_ms = benchmark_fn(kernel_fla)
-        kernel_cute_ms = benchmark_fn(kernel_cute)
+        kernel_fla_ms = benchmark_cuda_fn(kernel_fla)
+        kernel_cute_ms = benchmark_cuda_fn(kernel_cute)
 
     # ==================================================================
     # Mode 2: WRAPPER (full call path as used in production)
@@ -251,8 +228,8 @@ def run_config(B, H, K, V, layer_idx, num_layers):
         )
 
     with torch.no_grad():
-        wrap_fla_ms = benchmark_fn(wrapper_fla)
-        wrap_cute_ms = benchmark_fn(wrapper_cute)
+        wrap_fla_ms = benchmark_cuda_fn(wrapper_fla)
+        wrap_cute_ms = benchmark_cuda_fn(wrapper_cute)
 
     return {
         "B": B,
@@ -262,9 +239,9 @@ def run_config(B, H, K, V, layer_idx, num_layers):
         "wrap_fla_ms": wrap_fla_ms,
         "wrap_cute_ms": wrap_cute_ms,
         "wrap_speedup": wrap_fla_ms / wrap_cute_ms,
-        "rmse": rmse,
+        "output_relative_rms_error": output_relative_rms_error,
         "rel_maxdiff": rel_maxdiff,
-        "state_rmse": state_rmse,
+        "state_relative_rms_error": state_relative_rms_error,
     }
 
 
@@ -299,7 +276,7 @@ def main():
     print(f"{'=' * 100}")
     print(
         f"{'B':>5} | {'fla (ms)':>10} | {'cute (ms)':>10} | "
-        f"{'speedup':>8} | {'RMSE':>10} | {'Rel MaxDiff':>12} | {'State RMSE':>12}"
+        f"{'speedup':>8} | {'rel_rmse':>18} | {'Rel MaxDiff':>12} | {'State rel_rmse':>24}"
     )
     print("─" * 90)
 
@@ -309,8 +286,8 @@ def main():
         results.append(r)
         print(
             f"{r['B']:>5} | {r['kernel_fla_ms']:>10.4f} | {r['kernel_cute_ms']:>10.4f} | "
-            f"{r['kernel_speedup']:>7.2f}x | {r['rmse']:>10.6f} | "
-            f"{r['rel_maxdiff']:>12.6f} | {r['state_rmse']:>12.8f}"
+            f"{r['kernel_speedup']:>7.2f}x | {r['output_relative_rms_error']:>18.6f} | "
+            f"{r['rel_maxdiff']:>12.6f} | {r['state_relative_rms_error']:>24.8f}"
         )
 
     # ── Wrapper comparison ──────────────────────────────────────────────

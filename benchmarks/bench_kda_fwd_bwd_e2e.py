@@ -18,7 +18,7 @@ bench_kda_fwd_bwd_e2e.py — Benchmark: cuLA CuTe DSL vs FLA Triton baseline
                             for chunk_kda forward + backward (end-to-end)
 
 Compares:
-  - Accuracy: err_ratio, relative max diff between cuLA and FLA outputs & gradients
+    - Accuracy: relative_rms_error, relative max diff between cuLA and FLA outputs & gradients
   - Performance: kernel execution time (ms) with CUDA events
 
 Modes:
@@ -49,10 +49,12 @@ from fla.ops.kda import chunk_kda as fla_chunk_kda
 
 from benchmarks.utils import (
     SEED,
+    benchmark_cuda_mode_fn,
     build_varlen_configs,
     exclusive_cumsum,
     generate_random_seq_lens,
     prepare_safe_gate_inputs,
+    relative_rms_error_rel_max_mean_abs,
     set_seed,
 )
 from cula.kda import chunk_kda as cula_chunk_kda
@@ -72,37 +74,6 @@ PHASE = "e2e"  # "forward" or "e2e"
 # ============================================================
 # Helpers
 # ============================================================
-def time_kernel(fn, warmup=None, n_iters=None):
-    if warmup is None:
-        warmup = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
-    if n_iters is None:
-        n_iters = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    start_evt.record()
-    for _ in range(n_iters):
-        fn()
-    end_evt.record()
-    torch.cuda.synchronize()
-    return start_evt.elapsed_time(end_evt) / n_iters
-
-
-def accuracy_stats(ref, out):
-    """Compute err_ratio, relative max diff, and mean absolute difference."""
-    ref_f = ref.float()
-    out_f = out.float()
-    diff = (ref_f - out_f).abs()
-    err = diff.flatten().pow(2).mean().sqrt().item()
-    base = ref_f.flatten().pow(2).mean().sqrt().item()
-    err_ratio = err / (base + 1e-8)
-    max_diff = diff.max().item()
-    denom = ref_f.abs().max().item()
-    rel_max = max_diff / denom if denom > 0 else 0.0
-    mean_diff = diff.mean().item()
-    return err_ratio, rel_max, mean_diff
 
 
 def run_kda_e2e(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, lower_bound, do, dht, fn):
@@ -279,16 +250,18 @@ def bench_fixed(configs):
             torch.cuda.synchronize()
 
             for name in ("o", "ht", "dq", "dk", "dv", "dg", "dbeta", "dh0"):
-                err_ratio, rel_max, mean_diff = accuracy_stats(fla_results[name], cula_results[name])
-                acc[name] = {"err_ratio": err_ratio, "rel_max": rel_max, "mean_diff": mean_diff}
+                relative_rms_error, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs(
+                    fla_results[name], cula_results[name]
+                )
+                acc[name] = {"relative_rms_error": relative_rms_error, "rel_max": rel_max, "mean_diff": mean_diff}
         else:
             # forward-only accuracy
             o_fla, ht_fla = run_kda_e2e(**common, fn=fla_chunk_kda)
             o_cula, ht_cula = run_kda_e2e(**common, fn=cula_chunk_kda)
             torch.cuda.synchronize()
             for name, ref, out in [("o", o_fla, o_cula), ("ht", ht_fla, ht_cula)]:
-                err_ratio, rel_max, mean_diff = accuracy_stats(ref, out)
-                acc[name] = {"err_ratio": err_ratio, "rel_max": rel_max, "mean_diff": mean_diff}
+                relative_rms_error, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs(ref, out)
+                acc[name] = {"relative_rms_error": relative_rms_error, "rel_max": rel_max, "mean_diff": mean_diff}
 
         # For timing, use leaf tensors with requires_grad
         q_t = q.detach().clone().requires_grad_(True)
@@ -320,8 +293,20 @@ def bench_fixed(configs):
         def fn_cula(**kw):
             return lambda: run_kda_e2e(**kw, fn=cula_chunk_kda)
 
-        ms_fla = time_kernel(fn_fla(**timing_common))
-        ms_cula = time_kernel(fn_cula(**timing_common))
+        ms_fla = benchmark_cuda_mode_fn(
+            fn_fla(**timing_common),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+            sanitizer_mode=SANITIZER_MODE,
+        )
+        ms_cula = benchmark_cuda_mode_fn(
+            fn_cula(**timing_common),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+            sanitizer_mode=SANITIZER_MODE,
+        )
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         r = {
@@ -391,15 +376,17 @@ def bench_varlen(configs):
             torch.cuda.synchronize()
 
             for name in ("o", "ht", "dq", "dk", "dv", "dg", "dbeta", "dh0"):
-                err_ratio, rel_max, mean_diff = accuracy_stats(fla_results[name], cula_results[name])
-                acc[name] = {"err_ratio": err_ratio, "rel_max": rel_max, "mean_diff": mean_diff}
+                relative_rms_error, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs(
+                    fla_results[name], cula_results[name]
+                )
+                acc[name] = {"relative_rms_error": relative_rms_error, "rel_max": rel_max, "mean_diff": mean_diff}
         else:
             o_fla, ht_fla = run_kda_e2e(**common, fn=fla_chunk_kda)
             o_cula, ht_cula = run_kda_e2e(**common, fn=cula_chunk_kda)
             torch.cuda.synchronize()
             for name, ref, out in [("o", o_fla, o_cula), ("ht", ht_fla, ht_cula)]:
-                err_ratio, rel_max, mean_diff = accuracy_stats(ref, out)
-                acc[name] = {"err_ratio": err_ratio, "rel_max": rel_max, "mean_diff": mean_diff}
+                relative_rms_error, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs(ref, out)
+                acc[name] = {"relative_rms_error": relative_rms_error, "rel_max": rel_max, "mean_diff": mean_diff}
 
         # For timing, use leaf tensors with requires_grad
         q_t = q.detach().clone().requires_grad_(True)
@@ -431,8 +418,20 @@ def bench_varlen(configs):
         def fn_cula(**kw):
             return lambda: run_kda_e2e(**kw, fn=cula_chunk_kda)
 
-        ms_fla = time_kernel(fn_fla(**timing_common))
-        ms_cula = time_kernel(fn_cula(**timing_common))
+        ms_fla = benchmark_cuda_mode_fn(
+            fn_fla(**timing_common),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+            sanitizer_mode=SANITIZER_MODE,
+        )
+        ms_cula = benchmark_cuda_mode_fn(
+            fn_cula(**timing_common),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+            sanitizer_mode=SANITIZER_MODE,
+        )
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         n_seqs = len(seq_lens)
@@ -493,15 +492,20 @@ def print_report(fixed_results, varlen_results):
 
         for r in fixed_results:
             rel_max_vals = "  ".join(f"{r['accuracy'].get(k, {}).get('rel_max', 0.0):10.6f}" for k in acc_keys)
-            err_ratio_vals = "  ".join(f"{r['accuracy'].get(k, {}).get('err_ratio', 0.0):10.6f}" for k in acc_keys)
+            relative_rms_error_vals = "  ".join(
+                f"{r['accuracy'].get(k, {}).get('relative_rms_error', 0.0):10.6f}" for k in acc_keys
+            )
             # Line 1: timing + rel_max
             print(
                 f"  {r['B']:3d}  {r['T']:5d}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cula']:11.4f}  {r['speedup']:7.2f}x  │  "
                 f"{'rel_max:':>10s}{rel_max_vals}"
             )
-            # Line 2: err_ratio (no timing columns)
-            print(f"  {'':3s}  {'':5s}  │  {'':9s}  {'':11s}  {'':8s}  │  {'err_ratio:':>10s}{err_ratio_vals}")
+            # Line 2: rel_rmse (no timing columns)
+            print(
+                f"  {'':3s}  {'':5s}  │  {'':9s}  {'':11s}  {'':8s}  │  "
+                f"{'rel_rmse:':>10s}{relative_rms_error_vals}"
+            )
         print(f"  {'─' * 125}")
 
     if varlen_results:
@@ -513,15 +517,20 @@ def print_report(fixed_results, varlen_results):
 
         for r in varlen_results:
             rel_max_vals = "  ".join(f"{r['accuracy'].get(k, {}).get('rel_max', 0.0):10.6f}" for k in acc_keys)
-            err_ratio_vals = "  ".join(f"{r['accuracy'].get(k, {}).get('err_ratio', 0.0):10.6f}" for k in acc_keys)
+            relative_rms_error_vals = "  ".join(
+                f"{r['accuracy'].get(k, {}).get('relative_rms_error', 0.0):10.6f}" for k in acc_keys
+            )
             # Line 1: timing + rel_max
             print(
                 f"  {r['tag']:>45s}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cula']:11.4f}  {r['speedup']:7.2f}x  │  "
                 f"{'rel_max:':>10s}{rel_max_vals}"
             )
-            # Line 2: err_ratio (no config/timing columns)
-            print(f"  {'':>45s}  │  {'':9s}  {'':11s}  {'':8s}  │  {'err_ratio:':>10s}{err_ratio_vals}")
+            # Line 2: rel_rmse (no config/timing columns)
+            print(
+                f"  {'':>45s}  │  {'':9s}  {'':11s}  {'':8s}  │  "
+                f"{'rel_rmse:':>10s}{relative_rms_error_vals}"
+            )
         print(f"  {'─' * 140}")
 
     print(f"\n{sep}\n")
