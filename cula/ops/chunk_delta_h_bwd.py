@@ -933,14 +933,6 @@ class ChunkDeltaRuleBwdDHUSm90:
                 chunk_end = cutlass.min(chunk_start + self.BT, seq_len)
                 remaining = chunk_end - chunk_start
                 last_idx = chunk_end - 1
-                g_last = Float32(0.0)
-                g_last_exp = Float32(1.0)
-                if cutlass.const_expr(self.use_g):
-                    g_last = g[data_bidx, tok_offset + last_idx, hidx].to(self.acc_dtype)
-                    if cutlass.const_expr(self.use_exp2):
-                        g_last_exp = cute.exp2(g_last, fastmath=self.use_fast_math)
-                    else:
-                        g_last_exp = cute.exp(g_last, fastmath=self.use_fast_math)
 
                 # ========================================
                 # Phase 1: Publish dh + start K @ dh
@@ -980,6 +972,7 @@ class ChunkDeltaRuleBwdDHUSm90:
                 if cutlass.const_expr(self.use_g):
                     if local_tidx < self.BT:
                         t_idx = chunk_start + local_tidx
+                        g_last = g[data_bidx, tok_offset + last_idx, hidx].to(self.acc_dtype)
                         g_decay = Float32(0.0)
                         g_exp = Float32(0.0)
                         if t_idx < seq_len:
@@ -1036,6 +1029,26 @@ class ChunkDeltaRuleBwdDHUSm90:
                         self.gk_precompute_bar.arrive_and_wait()
                     cute.nvgpu.warpgroup.wait_group(1)
                 else:
+                    # The K@dh WGMMA consumes rState_op, a bf16 register copy
+                    # made above, so the carried state can be decayed while
+                    # K@dh is still in flight.
+                    cute.arch.barrier(barrier_id=2, number_of_threads=self.num_compute_threads)
+                    g_state_scale = sG[remaining - 1, 1].to(self.acc_dtype)
+                    for ei in cutlass.range(cute.size(rState), unroll_full=True):
+                        rState[ei] = rState[ei] * g_state_scale
+                    if cutlass.const_expr(self.use_gk):
+                        gk_wait_early = load_gk_C.wait_and_advance()
+                        gk_last = sGK[local_tidx, 0, gk_wait_early.index].to(self.acc_dtype)
+                        if cutlass.const_expr(self.use_exp2):
+                            k_decay = cute.exp2(gk_last, fastmath=self.use_fast_math)
+                        else:
+                            k_decay = cute.exp(gk_last, fastmath=self.use_fast_math)
+                        sGK[local_tidx, 0, gk_wait_early.index] = k_decay
+                        self.gk_precompute_bar.arrive_and_wait()
+                        for ei in cutlass.range(cute.size(rState), unroll_full=True):
+                            v_rel, k_rel = tUcState[ei]
+                            rState[ei] = rState[ei] * sGK[k_rel, 0, gk_wait_early.index]
+                        gk_wait_early.release()
                     cute.nvgpu.warpgroup.wait_group(0)
                 k_wait.release()
 
@@ -1046,8 +1059,6 @@ class ChunkDeltaRuleBwdDHUSm90:
                 dv_stage = dv_wait.index
                 dv2_store_h = store_dv2_P.acquire_and_advance()
                 dv2_stage = dv2_store_h.index
-                if cutlass.const_expr(self.use_g):
-                    cute.arch.barrier(barrier_id=2, number_of_threads=self.num_compute_threads)
                 for ei in cutlass.range(cute.size(acc_dv), unroll_full=True):
                     v_rel, t_rel = tCcDV[ei]
                     t_idx = chunk_start + t_rel
@@ -1126,8 +1137,6 @@ class ChunkDeltaRuleBwdDHUSm90:
 
                     # Phase 3b: QDO plus scalar/key decay while QDO is in flight.
                     q_wait = load_q_C.wait_and_advance()
-                    if cutlass.const_expr(self.use_gk):
-                        gk_wait = load_gk_C.wait_and_advance()
                     acc_qdo.fill(0.0)
                     cute.nvgpu.warpgroup.fence()
                     if cutlass.const_expr(self.use_g):
@@ -1152,22 +1161,6 @@ class ChunkDeltaRuleBwdDHUSm90:
                             )
                     cute.nvgpu.warpgroup.commit_group()
 
-                    # QDO does not consume rState, so hide g/gk state decay under its WGMMA latency.
-                    if cutlass.const_expr(self.use_g):
-                        for ei in cutlass.range(cute.size(rState), unroll_full=True):
-                            rState[ei] = rState[ei] * g_last_exp
-                    if cutlass.const_expr(self.use_gk):
-                        gk_last = sGK[local_tidx, 0, gk_wait.index].to(self.acc_dtype)
-                        if cutlass.const_expr(self.use_exp2):
-                            k_decay = cute.exp2(gk_last, fastmath=self.use_fast_math)
-                        else:
-                            k_decay = cute.exp(gk_last, fastmath=self.use_fast_math)
-                        sGK[local_tidx, 0, gk_wait.index] = k_decay
-                        self.gk_precompute_bar.arrive_and_wait()
-                        for ei in cutlass.range(cute.size(rState), unroll_full=True):
-                            v_rel, k_rel = tUcState[ei]
-                            rState[ei] = rState[ei] * sGK[k_rel, 0, gk_wait.index]
-
                     # Phase 4: WDV and final dh update.
                     w_wait = load_w_C.wait_and_advance()
                     acc_wdv.fill(0.0)
@@ -1184,8 +1177,6 @@ class ChunkDeltaRuleBwdDHUSm90:
                     cute.nvgpu.warpgroup.commit_group()
                     cute.nvgpu.warpgroup.wait_group(0)
                     q_wait.release()
-                    if cutlass.const_expr(self.use_gk):
-                        gk_wait.release()
 
                     for ei in cutlass.range(cute.size(rState), unroll_full=True):
                         update = acc_qdo[ei] * Float32(self.scale) - acc_wdv[ei]
