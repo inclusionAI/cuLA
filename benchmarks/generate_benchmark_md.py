@@ -78,12 +78,17 @@ LA_H = 64  # for display only
 # ============================================================
 
 
-def run_kda_benchmarks():
+def run_kda_benchmarks(heads=None, hv=None):
     """Run bench_kda.main() with programmatic args and return (fixed, varlen) results."""
     print("\n>>> Running KDA benchmarks (via bench_kda.main)...")
     # bench_kda.main() parses sys.argv — override it temporarily
     orig_argv = sys.argv
-    sys.argv = ["bench_kda.py", "--mode", "both"]
+    argv = ["bench_kda.py", "--mode", "both"]
+    if heads is not None:
+        argv += ["--heads", str(heads)]
+    if hv is not None:
+        argv += ["--hv", str(hv)]
+    sys.argv = argv
     try:
         fixed_res, varlen_res = kda_main()
     finally:
@@ -289,6 +294,18 @@ def main():
         help="Output markdown filename (relative to project root). Default: BENCHMARK_GB200.md",
     )
     parser.add_argument("--save-cache", type=str, default=None, help="Save benchmark results to JSON for future --cache use.")
+    parser.add_argument(
+        "--heads",
+        type=int,
+        default=None,
+        help="Number of Q/K heads (H) for KDA benchmarks. Default: use bench_kda default.",
+    )
+    parser.add_argument(
+        "--hv",
+        type=int,
+        default=None,
+        help="Number of V heads (HV) for KDA benchmarks. For GVA, set HV > H with HV %% H == 0.",
+    )
     args = parser.parse_args()
 
     env = get_env_info()
@@ -303,7 +320,7 @@ def main():
         la_varlen = data["la_varlen"]
         la_decode = data.get("la_decode", [])
     else:
-        kda_fixed, kda_varlen = run_kda_benchmarks()
+        kda_fixed, kda_varlen = run_kda_benchmarks(heads=args.heads, hv=args.hv)
         la_standard, la_varlen = run_lightning_attn_benchmarks()
         la_decode = run_la_decode_benchmarks()
 
