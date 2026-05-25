@@ -55,13 +55,18 @@ BENCHMARK_MD_DEFAULT = "BENCHMARK_H200.md"
 # ============================================================
 
 
-def run_kda_fused_fwd_benchmarks(has_init_state: bool = False):
+def run_kda_fused_fwd_benchmarks(has_init_state: bool = False, heads=None, hv=None):
     """Run bench_kda_fused_fwd.main() with programmatic args and return (fixed, varlen) results."""
     print("\n>>> Running KDA Fused Forward benchmarks (via bench_kda_fused_fwd.main)...")
     orig_argv = sys.argv
-    sys.argv = ["bench_kda_fused_fwd.py", "--mode", "both"]
+    argv = ["bench_kda_fused_fwd.py", "--mode", "both"]
     if has_init_state:
-        sys.argv.append("--init_state")
+        argv.append("--init_state")
+    if heads is not None:
+        argv += ["--heads", str(heads)]
+    if hv is not None:
+        argv += ["--hv", str(hv)]
+    sys.argv = argv
     try:
         fixed_res, varlen_res = kda_fused_fwd_main()
     finally:
@@ -151,6 +156,18 @@ def main():
         action="store_true",
         help="Use non-zero initial state (default: False)",
     )
+    parser.add_argument(
+        "--heads",
+        type=int,
+        default=None,
+        help="Number of Q/K heads (H) for KDA benchmarks. Default: use bench_kda_fused_fwd default.",
+    )
+    parser.add_argument(
+        "--hv",
+        type=int,
+        default=None,
+        help="Number of V heads (HV) for KDA benchmarks. For GVA, set HV > H with HV %% H == 0.",
+    )
     args = parser.parse_args()
 
     env = get_env_info()
@@ -162,7 +179,7 @@ def main():
         kda_fused_fixed = data["kda_fused_fixed"]
         kda_fused_varlen = data["kda_fused_varlen"]
     else:
-        kda_fused_fixed, kda_fused_varlen = run_kda_fused_fwd_benchmarks(has_init_state=args.init_state)
+        kda_fused_fixed, kda_fused_varlen = run_kda_fused_fwd_benchmarks(has_init_state=args.init_state, heads=args.heads, hv=args.hv)
 
         if args.save_cache:
             cache_path = Path(args.save_cache)
