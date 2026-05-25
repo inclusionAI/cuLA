@@ -224,10 +224,11 @@ class ChunkDeltaRuleBwdDHUSm90:
         vt_layout = cute.make_layout((self.V, T, (self.H, B)), stride=(1, self.H * self.V, (self.V, T * self.H * self.V)))
         do_vt = cute.make_tensor(do_ptr, vt_layout)
         dv_vt = cute.make_tensor(dv_ptr, vt_layout)
-        dv2_vt = cute.make_tensor(dv2_ptr, vt_layout)
+        dv2_vt_layout = cute.make_layout((self.V, T, (self.H, B)), stride=(1, self.V, (T * self.V, T * self.H * self.V)))
+        dv2_vt = cute.make_tensor(dv2_ptr, dv2_vt_layout)
         dv2_layout = cute.make_layout(
-            (B, T, self.H, self.V),
-            stride=(T * self.H * self.V, self.H * self.V, self.V, 1),
+            (B, self.H, T, self.V),
+            stride=(T * self.H * self.V, T * self.V, self.V, 1),
         )
         dv2 = cute.make_tensor(dv2_ptr, dv2_layout)
 
@@ -1059,7 +1060,7 @@ class ChunkDeltaRuleBwdDHUSm90:
                     out_bf16 = out.to(self.io_dtype)
                     sDv2[v_rel, t_rel, dv2_stage] = out_bf16
                     if remaining < self.BT and t_idx < seq_len:
-                        dv2[data_bidx, tok_offset + chunk_start + t_rel, hidx, v_tile_base + v_rel] = out_bf16
+                        dv2[data_bidx, hidx, tok_offset + chunk_start + t_rel, v_tile_base + v_rel] = out_bf16
                 cute.arch.fence_proxy("async.shared", space="cta")
                 dv2_store_h.commit()
                 dv_wait.release()
@@ -1350,7 +1351,7 @@ def _compile_bwd_dhu_sm90(
     )
     dv2_fake = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (sym_b, sym_t, H, V),
+        (sym_b, H, sym_t, V),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
@@ -1496,7 +1497,8 @@ def chunk_gated_delta_rule_bwd_dhu_sm90(
     state_shape = (N, H, V, K) if transpose_state_layout else (N, H, K, V)
     dh = q.new_empty(B, NT, H, V, K) if transpose_state_layout else q.new_empty(B, NT, H, K, V)
     dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
-    dv2 = torch.empty_like(dv)
+    dv2_storage = q.new_empty(B, H, T, V)
+    dv2 = dv2_storage.permute(0, 2, 1, 3)
 
     g_arg = g if g is not None else torch.empty(B, T, H, device=q.device, dtype=torch.float32)
     gk_arg = gk if gk is not None else torch.empty(B, T, H, K, device=q.device, dtype=torch.float32)
@@ -1531,7 +1533,7 @@ def chunk_gated_delta_rule_bwd_dhu_sm90(
         scale_value,
     )
     problem_size = (Int32(B), Int32(T), Int32(N), Int32(NT))
-    compiled(q, k, w, g_arg, gk_arg, dht_arg, dh0_arg, do, dh, dv, dv2, cu_seqlens_arg, chunk_offsets, problem_size)
+    compiled(q, k, w, g_arg, gk_arg, dht_arg, dh0_arg, do, dh, dv, dv2_storage, cu_seqlens_arg, chunk_offsets, problem_size)
     return dh, dh0, dv2
 
 
