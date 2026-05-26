@@ -104,7 +104,33 @@ T_values = [63, 500, 1000, 512, 1024, 4096]  # 63 = 64-1 (tail chunk = 1 token)
 
 ---
 
-## 二、可能踩坑的地方
+## 二、如何正确、高效地写 Kernel
+
+> 基于 [PR #74](https://github.com/inclusionAI/cuLA/pull/74) 的实践经验总结。
+
+### 2.1 核心原则：AI 协作，逐步验证
+
+从零开始写一个 kernel 时，**绝对不要一上来就想全部写对**。正确的做法是：
+
+1. **和 AI 理清算法计算流程**：先把算法的数学形式梳理清楚，观察是否有简化计算的机会（如合并操作、减少中间变量、利用结合律/分配律等），在数学层面确定最优的计算顺序。
+2. **和 AI 设计并搭建 kernel 整体框架**：结合 AI 广泛查阅现有 PTX doc、CUDA doc、SOTA kernel 实现等资料，发现可借鉴之处，然后设计 pipeline 结构、SMEM layout、warp 分工、数据流等，形成可编译运行的骨架。
+3. **和 AI 合作逐步完成具体逻辑**：按子任务逐个实现各模块的计算逻辑，每完成一个子任务都进行精度和性能测试。
+4. **每一步都掌握精度和性能状态**：确保当前子任务的精度正确、性能符合预期，及时发现问题所在，再推进下一步。
+
+### 2.2 Warp-Specialized Kernel 开发步骤
+
+| 阶段 | 目标 | 验证方法 |
+|------|------|---------|
+| **Phase 0**: 算法计算流程梳理 | 理清算法的数学形式，观察是否有简化计算的机会（合并操作、减少中间变量、利用结合律/分配律等），确定最优计算顺序 | 数学推导验证、与参考实现逻辑对齐 |
+| **Phase 1**: 整体架构设计 | 查阅 PTX doc、CUDA doc、SOTA kernel 实现，定义好整体 pipeline、SMEM layout、warp 分工（Producer/Consumer/Epilogue 等） | 设计文档 / 伪代码评审 |
+| **Phase 2**: Pipeline 同步 | 先把 pipeline 的同步框架搭好（TMA load、mbarrier arrive/wait、fence），确保 kernel 整体没有同步问题、不会 hang | Kernel 正常运行不 hang，循环迭代无死锁 |
+| **Phase 3**: 逐模块实现 | 按子任务实现各个模块的计算逻辑（如 QK matmul、softmax/decay、OV accumulate 等），每完成一个模块就验证 | 每模块对比参考实现精度 + 观察性能变化 + determinism check |
+| **Phase 4**: 全功能集成 | 完成所有模块的逻辑，在各种 case 下整体验证 | 全量精度测试（多 B/T/H、tail chunk、varlen、flag 组合）+ determinism check (10K+) |
+| **Phase 5**: 性能调优 | Multi-stage pipeline、SMEM/TMEM 复用、register 调整、bank conflict 消解、SMEM/GMEM 读取优化等 | Benchmark + 精度不退化 |
+
+---
+
+## 三、可能踩坑的地方
 
 ### 坑 1: Cross-Proxy Fence — TMA 与 CUDA Core 之间的内存序
 
@@ -278,7 +304,7 @@ arrival count 调整为 1（匹配 `umma_arrive` 的 single-thread election）�
 
 ---
 
-## 三、性能优化经验
+## 四、性能优化经验
 
 ### 3.1 Register Allocation 优化 (PR [#27](https://github.com/inclusionAI/cuLA/pull/27), [#61](https://github.com/inclusionAI/cuLA/pull/61))
 
@@ -324,7 +350,7 @@ V/g/beta/O/state 按 v_head_idx 索引
 
 ---
 
-## 四、检查清单
+## 五、检查清单
 
 ### 开发新 Kernel 时
 
