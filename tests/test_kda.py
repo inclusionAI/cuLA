@@ -203,8 +203,8 @@ def test_safe_gate_chunk(
     beta = torch.randn(B, T, HV, dtype=torch.float32).sigmoid().to(beta_dtype)
     h0 = torch.randn(B, HV, D, D, dtype=torch.float32)
     if use_gate_in_kernel:
-        A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(True), (A_log, dt_bias))
-    q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(True), (q, k, v, g, beta, h0))
+        A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(needs_backward), (A_log, dt_bias))
+    q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(needs_backward), (q, k, v, g, beta, h0))
 
     if needs_backward:
         do = torch.randn_like(v)
@@ -322,7 +322,7 @@ def test_safe_gate_chunk_varlen(
     beta = torch.randn(1, T, HV, dtype=torch.float32).sigmoid().to(beta_dtype)
     h0 = torch.randn((N, HV, D, D), dtype=torch.float32)
 
-    q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(), (q, k, v, g, beta, h0))
+    q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(needs_backward), (q, k, v, g, beta, h0))
     if needs_backward:
         do = torch.randn_like(v)
         dht = torch.rand_like(h0)
