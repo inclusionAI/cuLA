@@ -37,6 +37,7 @@ from fla.utils import (
 
 import cula.cudac as cula_cuda
 from cula.kda.chunk_intra import chunk_kda_bwd_intra
+from cula.ops.chunk_wy_dqkg_sm100 import chunk_kda_bwd_wy_dqkg_fused as chunk_kda_bwd_wy_dqkg_fused_cutedsl
 from cula.utils import prepare_uniform_cu_seqlens
 
 _delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h_sm100")
@@ -567,7 +568,7 @@ def chunk_kda_bwd(
         transpose_state_layout=transpose_state_layout,
     )
 
-    dq, dk, dv, db, dg, dAkk = chunk_kda_bwd_wy_dqkg_fused(
+    dq, dk, dv, db, dg, dAkk = chunk_kda_bwd_wy_dqkg_fused_cutedsl(
         q=q,
         k=k,
         v=v,
@@ -583,7 +584,7 @@ def chunk_kda_bwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
-        transpose_state_layout=transpose_state_layout,
+        # transpose_state_layout=transpose_state_layout,
     )
 
     dq, dk, db, dg = chunk_kda_bwd_intra(
