@@ -15,6 +15,11 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 # Tests for the chunk-decomposed KDA implementation (python/kda/chunk.py)
+"""Test modes (see issue #78):
+    default:                       fast subset (kda_fast cases only)
+    pytest -m kda_slow:            slow stress traces and wider parameter grids
+    pytest -m "kda_fast or kda_slow": full sweep (fast + slow)
+"""
 
 import pytest
 import torch
@@ -27,9 +32,115 @@ from cula.kda import chunk_kda
 
 pytestmark = pytest.mark.sm100_only
 
+_FAST = [pytest.mark.kda_fast]
+_FAST_BWD = [pytest.mark.kda_fast, pytest.mark.kda_backward]
+_SLOW = [pytest.mark.kda_slow]
 
-@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
-@pytest.mark.parametrize("disable_recompute", [True, False], ids=["no_recomp", "recomp"])
+# (B, T, H, HV, D, gln, mask_p, l2norm, gate, safe_gate, dtype), marks
+_FIXED_CONFIGS = [
+    ((1, 63, 1, 1, 128, 1, 0, False, False, True, torch.bfloat16), _FAST_BWD),  # small fixed backward
+    ((2, 500, 3, 3, 128, 1, 0, False, False, True, torch.bfloat16), _SLOW),
+    ((2, 1000, 3, 3, 128, 1, 0.5, False, False, True, torch.bfloat16), _SLOW),
+    ((3, 1024, 4, 4, 128, 0.1, 0, False, False, True, torch.bfloat16), _SLOW),
+    ((4, 1024, 4, 4, 128, 1, 0, False, False, True, torch.bfloat16), _SLOW),
+    ((4, 1024, 4, 4, 128, 1, 0, True, False, True, torch.bfloat16), _FAST_BWD),  # l2norm medium backward
+    ((2, 1500, 4, 4, 128, 10, 0, False, True, True, torch.bfloat16), _FAST_BWD),  # gated backward
+    ((4, 2048, 8, 8, 128, 1, 0, False, True, True, torch.bfloat16), _SLOW),
+    # GVA cases: HV > H
+    ((2, 1024, 4, 8, 128, 1, 0, True, False, True, torch.bfloat16), _FAST_BWD),  # GVA medium backward
+    ((2, 1500, 2, 4, 128, 10, 0, False, True, True, torch.bfloat16), _SLOW),
+    ((2, 2048, 4, 8, 128, 1, 0, False, True, True, torch.bfloat16), _SLOW),
+]
+
+# (H, HV, D, mask_p, cu_seqlens, dtype, safe_gate), marks
+_VARLEN_CONFIGS = [
+    ((4, 4, 128, 0.1, [0, 15], torch.bfloat16, True), _FAST),  # short varlen smoke (fwd+ht only)
+    ((4, 4, 128, 0.9, [0, 256, 500, 1000], torch.bfloat16, True), _SLOW),
+    ((4, 4, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True), _SLOW),
+    ((4, 4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16, True), _FAST_BWD),  # multi-batch varlen backward
+    ((4, 4, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True), _SLOW),
+    # ======Varlen test with simulated trace=======
+    (
+        (
+            32,
+            32,
+            128,
+            0,
+            [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192],
+            torch.bfloat16,
+            True,
+        ),
+        _SLOW,
+    ),
+    (
+        (
+            32,
+            32,
+            128,
+            0,
+            [0, 652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236, 5543, 6255, 6480, 6947, 7616, 8192],
+            torch.bfloat16,
+            True,
+        ),
+        _SLOW,
+    ),
+    (
+        (
+            32,
+            32,
+            128,
+            0,
+            [0, 315, 973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459, 6318, 6669, 6979, 7583, 8192],
+            torch.bfloat16,
+            True,
+        ),
+        _SLOW,
+    ),
+    (
+        (
+            32,
+            32,
+            128,
+            0,
+            [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
+            torch.bfloat16,
+            True,
+        ),
+        _SLOW,
+    ),
+    # ======GVA varlen cases: HV > H=======
+    ((2, 4, 128, 0.1, [0, 15], torch.bfloat16, True), _FAST),  # GVA varlen smoke (fwd+ht only)
+    ((4, 8, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True), _SLOW),
+    ((4, 8, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True), _SLOW),
+    (
+        (
+            8,
+            32,
+            128,
+            0,
+            [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
+            torch.bfloat16,
+            True,
+        ),
+        _SLOW,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "beta_dtype",
+    [
+        pytest.param(torch.float32, id="beta_fp32", marks=pytest.mark.kda_slow),
+        pytest.param(torch.bfloat16, id="beta_bf16"),
+    ],
+)
+@pytest.mark.parametrize(
+    "disable_recompute",
+    [
+        pytest.param(True, id="no_recomp", marks=pytest.mark.kda_slow),
+        pytest.param(False, id="recomp"),
+    ],
+)
 @pytest.mark.parametrize(
     (
         "B",
@@ -46,23 +157,11 @@ pytestmark = pytest.mark.sm100_only
     ),
     [
         pytest.param(
-            *test,
-            id="B{}-T{}-H{}-HV{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-{}".format(*test),
+            *params,
+            id="B{}-T{}-H{}-HV{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-{}".format(*params),
+            marks=marks,
         )
-        for test in [
-            (1, 63, 1, 1, 128, 1, 0, False, False, True, torch.bfloat16),
-            (2, 500, 3, 3, 128, 1, 0, False, False, True, torch.bfloat16),
-            (2, 1000, 3, 3, 128, 1, 0.5, False, False, True, torch.bfloat16),
-            (3, 1024, 4, 4, 128, 0.1, 0, False, False, True, torch.bfloat16),
-            (4, 1024, 4, 4, 128, 1, 0, False, False, True, torch.bfloat16),
-            (4, 1024, 4, 4, 128, 1, 0, True, False, True, torch.bfloat16),
-            (2, 1500, 4, 4, 128, 10, 0, False, True, True, torch.bfloat16),
-            (4, 2048, 8, 8, 128, 1, 0, False, True, True, torch.bfloat16),
-            # GVA cases: HV > H
-            (2, 1024, 4, 8, 128, 1, 0, True, False, True, torch.bfloat16),
-            (2, 1500, 2, 4, 128, 10, 0, False, True, True, torch.bfloat16),
-            (2, 2048, 4, 8, 128, 1, 0, False, True, True, torch.bfloat16),
-        ]
+        for params, marks in _FIXED_CONFIGS
     ],
 )
 def test_safe_gate_chunk(
@@ -79,6 +178,7 @@ def test_safe_gate_chunk(
     dtype: torch.dtype,
     disable_recompute: bool,
     beta_dtype: torch.dtype,
+    needs_backward: bool,
 ):
     torch.manual_seed(42)
     q = torch.rand(B, T, H, D, dtype=dtype)
@@ -106,8 +206,9 @@ def test_safe_gate_chunk(
         A_log, dt_bias = map(lambda x: x.to(device).requires_grad_(True), (A_log, dt_bias))
     q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(True), (q, k, v, g, beta, h0))
 
-    do = torch.randn_like(v)
-    dht = torch.randn_like(h0)
+    if needs_backward:
+        do = torch.randn_like(v)
+        dht = torch.randn_like(h0)
 
     ref, ref_ht = naive_recurrent_kda(
         q=F.normalize(q.clone(), p=2, dim=-1),
@@ -118,12 +219,13 @@ def test_safe_gate_chunk(
         initial_state=h0.clone(),
         output_final_state=True,
     )
-    ((ref * do).sum() + (ref_ht * dht).sum()).backward(retain_graph=True)
-    if use_gate_in_kernel:
-        ref_dA, A_log.grad = A_log.grad, None
-        ref_dbias, dt_bias.grad = dt_bias.grad, None
-    ref_dq, ref_dk, ref_dv, ref_dg, ref_db, ref_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
-    q.grad = k.grad = v.grad = g.grad = beta.grad = h0.grad = None
+    if needs_backward:
+        ((ref * do).sum() + (ref_ht * dht).sum()).backward()
+        if use_gate_in_kernel:
+            ref_dA, A_log.grad = A_log.grad, None
+            ref_dbias, dt_bias.grad = dt_bias.grad, None
+        ref_dq, ref_dk, ref_dv, ref_dg, ref_db, ref_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
+        q.grad = k.grad = v.grad = g.grad = beta.grad = h0.grad = None
 
     tri, tri_ht = chunk_kda(
         q=F.normalize(q.clone(), p=2, dim=-1) if not use_qk_l2norm_in_kernel else q.clone(),
@@ -141,15 +243,19 @@ def test_safe_gate_chunk(
         lower_bound=lower_bound,
         disable_recompute=disable_recompute,
     )
-    ((tri * do).sum() + (tri_ht * dht).sum()).backward(retain_graph=True)
-    if use_gate_in_kernel:
-        tri_dA, A_log.grad = A_log.grad, None
-        tri_dbias, dt_bias.grad = dt_bias.grad, None
-    tri_dq, tri_dk, tri_dv, tri_dg, tri_db, tri_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
-    q.grad = k.grad = v.grad = g.grad = beta.grad = h0.grad = None
+    if needs_backward:
+        ((tri * do).sum() + (tri_ht * dht).sum()).backward()
+        if use_gate_in_kernel:
+            tri_dA, A_log.grad = A_log.grad, None
+            tri_dbias, dt_bias.grad = dt_bias.grad, None
+        tri_dq, tri_dk, tri_dv, tri_dg, tri_db, tri_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
+        q.grad = k.grad = v.grad = g.grad = beta.grad = h0.grad = None
 
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+    if not needs_backward:
+        return
+
     assert_close("dq", ref_dq, tri_dq, 0.008)
     assert_close("dk", ref_dk, tri_dk, 0.008)
     assert_close("dv", ref_dv, tri_dv, 0.008)
@@ -161,69 +267,29 @@ def test_safe_gate_chunk(
     assert_close("dh0", ref_dh0, tri_dh0, 0.008)
 
 
-@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
-@pytest.mark.parametrize("disable_recompute", [True, False], ids=["no_recomp", "recomp"])
+@pytest.mark.parametrize(
+    "beta_dtype",
+    [
+        pytest.param(torch.float32, id="beta_fp32", marks=pytest.mark.kda_slow),
+        pytest.param(torch.bfloat16, id="beta_bf16"),
+    ],
+)
+@pytest.mark.parametrize(
+    "disable_recompute",
+    [
+        pytest.param(True, id="no_recomp", marks=pytest.mark.kda_slow),
+        pytest.param(False, id="recomp"),
+    ],
+)
 @pytest.mark.parametrize(
     ("H", "HV", "D", "mask_p", "cu_seqlens", "dtype", "safe_gate"),
     [
-        pytest.param(*test, id="H{}-HV{}-D{}-mask_p{}-cu_seqlens{}-{}-safe_gate{}".format(*test))
-        for test in [
-            (4, 4, 128, 0.1, [0, 15], torch.bfloat16, True),
-            (4, 4, 128, 0.9, [0, 256, 500, 1000], torch.bfloat16, True),
-            (4, 4, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True),
-            (4, 4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16, True),
-            (4, 4, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True),
-            # ======Varlen test with simulated trace=======
-            (
-                32,
-                32,
-                128,
-                0,
-                [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192],
-                torch.bfloat16,
-                True,
-            ),
-            (
-                32,
-                32,
-                128,
-                0,
-                [0, 652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236, 5543, 6255, 6480, 6947, 7616, 8192],
-                torch.bfloat16,
-                True,
-            ),
-            (
-                32,
-                32,
-                128,
-                0,
-                [0, 315, 973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459, 6318, 6669, 6979, 7583, 8192],
-                torch.bfloat16,
-                True,
-            ),
-            (
-                32,
-                32,
-                128,
-                0,
-                [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
-                torch.bfloat16,
-                True,
-            ),
-            # ======GVA varlen cases: HV > H=======
-            (2, 4, 128, 0.1, [0, 15], torch.bfloat16, True),
-            (4, 8, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True),
-            (4, 8, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True),
-            (
-                8,
-                32,
-                128,
-                0,
-                [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
-                torch.bfloat16,
-                True,
-            ),
-        ]
+        pytest.param(
+            *params,
+            id="H{}-HV{}-D{}-mask_p{}-cu_seqlens{}-{}-safe_gate{}".format(*params),
+            marks=marks,
+        )
+        for params, marks in _VARLEN_CONFIGS
     ],
 )
 def test_safe_gate_chunk_varlen(
@@ -236,6 +302,7 @@ def test_safe_gate_chunk_varlen(
     safe_gate: bool,
     disable_recompute: bool,
     beta_dtype: torch.dtype,
+    needs_backward: bool,
 ):
     torch.manual_seed(42)
     cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
@@ -256,8 +323,9 @@ def test_safe_gate_chunk_varlen(
     h0 = torch.randn((N, HV, D, D), dtype=torch.float32)
 
     q, k, v, g, beta, h0 = map(lambda x: x.to(device).requires_grad_(), (q, k, v, g, beta, h0))
-    do = torch.randn_like(v)
-    dht = torch.rand_like(h0)
+    if needs_backward:
+        do = torch.randn_like(v)
+        dht = torch.rand_like(h0)
 
     tri, tri_ht = chunk_kda(
         q=F.normalize(q.clone(), p=2, dim=-1),
@@ -273,9 +341,10 @@ def test_safe_gate_chunk_varlen(
         lower_bound=-5.0 if safe_gate else None,
         disable_recompute=disable_recompute,
     )
-    ((tri * do).sum() + (tri_ht * dht).sum()).backward(retain_graph=True)
-    tri_dq, tri_dk, tri_dv, tri_dg, tri_db, tri_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
-    q.grad = k.grad = v.grad = g.grad = beta.grad = h0.grad = None
+    if needs_backward:
+        ((tri * do).sum() + (tri_ht * dht).sum()).backward()
+        tri_dq, tri_dk, tri_dv, tri_dg, tri_db, tri_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
+        q.grad = k.grad = v.grad = g.grad = beta.grad = h0.grad = None
 
     ref = []
     ref_ht = []
@@ -294,11 +363,15 @@ def test_safe_gate_chunk_varlen(
     ref = torch.cat(ref, 1)
     ref_ht = torch.cat(ref_ht, 0)
 
-    ((ref * do).sum() + (ref_ht * dht).sum()).backward(retain_graph=True)
-    ref_dq, ref_dk, ref_dv, ref_dg, ref_db, ref_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
+    if needs_backward:
+        ((ref * do).sum() + (ref_ht * dht).sum()).backward()
+        ref_dq, ref_dk, ref_dv, ref_dg, ref_db, ref_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
 
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+    if not needs_backward:
+        return
+
     assert_close("dq", ref_dq, tri_dq, 0.007)
     assert_close("dk", ref_dk, tri_dk, 0.008)
     assert_close("dv", ref_dv, tri_dv, 0.007)

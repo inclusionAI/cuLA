@@ -108,7 +108,7 @@ FLA baseline: [flash-linear-attention v0.5.0](https://github.com/fla-org/flash-l
 **Blackwell (SM10X)**
 
 See [BENCHMARK_GB200_CUDA_130.md](BENCHMARK_GB200_CUDA_130.md) tested with CUDA 13.0 for detailed results.
- 
+
 **Hopper (SM90)**
 
 See [BENCHMARK_H200.md](BENCHMARK_H200.md) tested with CUDA 12.9 for detailed results.
@@ -142,6 +142,14 @@ python -m pytest tests/test_kda_fused_fwd.py -v
 python tests/test_lightning_attn.py
 # Tests for Lightning Attention decode
 python -m pytest tests/test_la_decode.py -v
+
+# test_kda.py and test_kda_compare_fla.py support a fast/slow split.
+# Fast (default) — representative correctness paths for default CI and local iteration
+python -m pytest tests/test_kda.py tests/test_kda_compare_fla.py -v
+# Slow — broader stress coverage for nightly or manual runs
+python -m pytest -m kda_slow tests/test_kda.py tests/test_kda_compare_fla.py -v
+# Full sweep (fast + slow) — run before submitting a PR
+python -m pytest -m "kda_fast or kda_slow" tests/test_kda.py tests/test_kda_compare_fla.py -v
 ```
 
 <details>
