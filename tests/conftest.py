@@ -20,8 +20,8 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers",
-        "kda_backward: fast-mode KDA case that performs full backward validation "
-        "(without this marker, fast-mode cases verify only forward output and final state)",
+        "kda_fast_norecomp: fast-mode KDA config that also runs the disable_recompute=True "
+        "variant in fast mode (other fast configs run disable_recompute=False only)",
     )
 
 
@@ -35,26 +35,25 @@ def pytest_collection_modifyitems(config, items):
     skip_slow = pytest.mark.skip(
         reason="kda_slow case: run 'pytest -m kda_slow' or '-m \"kda_fast or kda_slow\"' to include"
     )
+    skip_fast_norecomp = pytest.mark.skip(
+        reason="disable_recompute=True runs in fast mode only for kda_fast_norecomp configs; "
+        "include the rest via a slow mode"
+    )
 
     for item in items:
         if "sm100_only" in item.keywords and not is_sm100:
             item.add_marker(skip_non_sm100)
         if "sm90_only" in item.keywords and is_sm100:
             item.add_marker(skip_on_sm100)
-        if not include_slow and "kda_slow" in item.keywords:
+        if include_slow:
+            continue
+        if "kda_slow" in item.keywords:
             item.add_marker(skip_slow)
-
-
-@pytest.fixture
-def needs_backward(request) -> bool:
-    """Whether the current test should run full backward validation.
-
-    Slow / full sweeps (``-m`` contains ``kda_slow``): every test that runs
-    validates backward. Default fast run: only ``kda_backward`` cases validate
-    backward; the remaining fast smoke cases verify forward output and final
-    state only.
-    """
-    if "kda_slow" in (request.config.option.markexpr or ""):
-        return True
-    keywords = request.node.keywords
-    return "kda_slow" in keywords or "kda_backward" in keywords
+            continue
+        callspec = getattr(item, "callspec", None)
+        if (
+            callspec is not None
+            and callspec.params.get("disable_recompute")
+            and "kda_fast_norecomp" not in item.keywords
+        ):
+            item.add_marker(skip_fast_norecomp)
