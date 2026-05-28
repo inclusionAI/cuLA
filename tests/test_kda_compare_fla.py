@@ -16,9 +16,9 @@
 
 # Precision Tests for FlashKDA implementation compared with FLA Triton baseline
 # Test modes (see issue #78):
-#     default:                          fast subset (kda_fast cases only)
-#     pytest -m kda_slow:               slow stress traces and wider parameter grids
-#     pytest -m "kda_fast or kda_slow": full sweep (fast + slow)
+#     default:            fast subset (kda_fast cases only)
+#     pytest -m kda_slow: slow stress traces and wider parameter grids
+#     pytest -m kda_full: full sweep (fast + slow)
 
 import pytest
 import torch

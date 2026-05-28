@@ -149,7 +149,7 @@ python -m pytest tests/test_kda.py tests/test_kda_compare_fla.py -v
 # Slow — broader stress coverage for nightly or manual runs
 python -m pytest -m kda_slow tests/test_kda.py tests/test_kda_compare_fla.py -v
 # Full sweep (fast + slow) — run before submitting a PR
-python -m pytest -m "kda_fast or kda_slow" tests/test_kda.py tests/test_kda_compare_fla.py -v
+python -m pytest -m kda_full tests/test_kda.py tests/test_kda_compare_fla.py -v
 ```
 
 <details>
