@@ -15,9 +15,29 @@
 version: "2.0"
 
 stages:
+  - 环境变量准备
+  # - image-build
   - 前置校验
+  - 构建
 
 jobs:
+  variableExport:
+    stage: 环境变量准备
+    id: envprepare
+    component: shell-with-clone-and-output
+    inputs:
+      script: |
+        add_output output "ACI-v$(date +'%Y%m%d-%H%M%S')-$(git log -1 --pretty=format:%h)"
+
+  # 镜像构建:
+  #   stage: image-build
+  #   id: build
+  #   component: docker-image-build
+  #   inputs:
+  #     nydusSwitch: true # 启用 Nydus 镜像构建（可不填，默认为 true）
+  #     imageName: reg.antgroup-inc.cn/ling/flashla-dev
+  #     imageTag: ${{jobs.envprepare.outputs.output}}
+
   python-format-check:
     stage: 前置校验
     component: python-ruff-check
@@ -66,3 +86,36 @@ jobs:
           web_output+="<p>所有 C++/CUDA 代码格式检查均已通过！</p>"
           add_output webOutput "$web_output"
         fi
+
+  build-and-upload-wheel-cu129:
+    stage: 构建
+    component: pypi-artifact-uploader
+    inputs:
+      # CUDA 环境镜像（包含 PyTorch + CUDA 12.9）
+      buildImage: reg.antgroup-inc.cn/ling/flashla-dev:ACI-v20260526-111049-7ebd48e_nydus_v2
+      # 自定义构建命令（关键：--no-isolation 避免 CUDA 版本冲突，Gitee 下载 CUTLASS）
+      buildCmd: |
+        export CULA_CUTLASS_URL="https://gitee.com/yunfeiliu/cutlass/repository/archive/v4.4.0.zip"
+        pip install build wheel setuptools_scm -q -i https://artifacts.antgroup-inc.cn/artifact/repositories/simple/
+        CULA_DISABLE_SM100=1 CULA_DISABLE_SM103=1 CULA_DISABLE_SM90=0 python -m build --wheel --no-isolation
+      # 上传到内部 PyPI（需要配置 uploadUser/uploadToken 环境变量）
+      registry: "https://artifacts.antgroup-inc.cn/artifact/repositories/simple-dev"
+      # 构建超时（编译 CUTLASS + CUDA 扩展较耗时）
+      timeoutInSec: "3600"
+
+  build-and-upload-wheel-cu130:
+    stage: 构建
+    component: pypi-artifact-uploader
+    inputs:
+      computeType: xlarge
+      # CUDA 环境镜像（包含 PyTorch + CUDA 13.0）
+      buildImage: reg.antgroup-inc.cn/ling/flashla-dev:ACI-v20260529-205749-96543a3_nydus_v2
+      # 自定义构建命令（关键：--no-isolation 避免 CUDA 版本冲突，Gitee 下载 CUTLASS）
+      buildCmd: |
+        export CULA_CUTLASS_URL="https://gitee.com/yunfeiliu/cutlass/repository/archive/v4.4.0.zip"
+        pip install build wheel setuptools_scm -q -i https://artifacts.antgroup-inc.cn/artifact/repositories/simple/
+        CULA_DISABLE_SM100=0 CULA_DISABLE_SM103=1 CULA_DISABLE_SM90=1 python -m build --wheel --no-isolation
+      # 上传到内部 PyPI（需要配置 uploadUser/uploadToken 环境变量）
+      registry: "https://artifacts.antgroup-inc.cn/artifact/repositories/simple-dev"
+      # 构建超时（编译 CUTLASS + CUDA 扩展较耗时）
+      timeoutInSec: "3600"

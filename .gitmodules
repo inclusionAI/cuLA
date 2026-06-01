@@ -1,6 +1,0 @@
-[submodule "csrc/cutlass"]
-	path = csrc/cutlass
-	url = https://github.com/NVIDIA/cutlass.git
-[submodule "third_party/flash-linear-attention"]
-	path = third_party/flash-linear-attention
-	url = https://github.com/fla-org/flash-linear-attention.git

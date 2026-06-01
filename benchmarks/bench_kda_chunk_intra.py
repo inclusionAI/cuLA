@@ -98,8 +98,8 @@ def benchmark_chunk_intra_uniform():
             safe_gate=True,
         )
         # Compare the first output tensor (o)
-        o_fla = out_fla[0] if isinstance(out_fla, (tuple, list)) else out_fla
-        o_cula = out_cula[0] if isinstance(out_cula, (tuple, list)) else out_cula
+        o_fla = out_fla[0] if isinstance(out_fla, tuple | list) else out_fla
+        o_cula = out_cula[0] if isinstance(out_cula, tuple | list) else out_cula
         rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
 
         # Performance
@@ -189,8 +189,8 @@ def benchmark_chunk_intra_varlen():
             chunk_indices=chunk_indices,
             safe_gate=True,
         )
-        o_fla = out_fla[0] if isinstance(out_fla, (tuple, list)) else out_fla
-        o_cula = out_cula[0] if isinstance(out_cula, (tuple, list)) else out_cula
+        o_fla = out_fla[0] if isinstance(out_fla, tuple | list) else out_fla
+        o_cula = out_cula[0] if isinstance(out_cula, tuple | list) else out_cula
         rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
 
         # Performance

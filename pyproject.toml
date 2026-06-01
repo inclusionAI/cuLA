@@ -2,26 +2,15 @@
 [build-system]
 requires = ["setuptools>=61", "wheel", "setuptools_scm>=6.0"]
 build-backend = "setuptools.build_meta"
+# Note: torch is required at build time but must be pre-installed with correct CUDA version.
+# Do NOT add torch here to avoid pip downloading wrong CUDA version from PyPI.
+# Install torch manually: pip install torch --index-url https://download.pytorch.org/whl/cu129
 
-[project]
-name = "cula"
-dynamic = ["version"]
-description = "cuLA CUDA extension"
-readme = "README.md"
-authors = [ { name = "cula contributors" } ]
-requires-python = ">=3.8"
-dependencies = [
-    "nvidia-cutlass-dsl==4.4.2",
-    "apache-tvm-ffi==0.1.9",
-    "pytest",
-    "matplotlib",
-    "pandas",
-]
-license = { text = "Apache-2.0" }
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["cula"]
+# NOTE: project metadata (name, deps, etc.) is intentionally NOT declared here.
+# The package name is computed dynamically in setup.py based on the NVCC version
+# (e.g. ant-cuda-linear-attention-cu129). PEP 621 forbids `name` from being dynamic
+# in [project], so we omit the [project] table entirely and let setuptools read
+# everything from setup.py.
 
 [tool.ruff]
 target-version = "py312"
@@ -75,12 +64,8 @@ force-sort-within-sections = false
 "cula/_version.py" = ["UP007"]
 # TODO: fix undefined names (exp_g, chunk_kda_bwd_dqkwg) — WIP code
 "cula/ops/kda_fully_fused.py" = ["F821"]
+"cula/ops/kda_fully_fused_wip.py" = ["F821"]
 "cula/kda/blackwell_fused_fwd.py" = ["F821"]
 
-[tool.setuptools_scm]
-# write generated version into package for runtime access
-write_to = "cula/_version.py"
-# add a date-based local suffix when needed
-local_scheme = "node-and-date"
-# fallback for non-git sources
-fallback_version = "0.1.0"
+# setuptools_scm config moved to setup.py (use_scm_version=...) since the
+# [project] table was removed; keeping a single source of truth there.
