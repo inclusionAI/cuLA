@@ -9,6 +9,8 @@ def _is_sm100() -> bool:
 def pytest_configure(config):
     config.addinivalue_line("markers", "sm100_only: only run on SM100 devices")
     config.addinivalue_line("markers", "sm90_only: skip on SM100 devices")
+    config.addinivalue_line("markers", "benchmark: tests that mirror benchmark coverage")
+    config.addinivalue_line("markers", "sanitizer: opt-in tests intended to run under compute-sanitizer")
 
 
 def pytest_collection_modifyitems(config, items):

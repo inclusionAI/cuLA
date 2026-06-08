@@ -165,7 +165,7 @@ def main():
                 for r in results:
                     clean = {}
                     for k, v in r.items():
-                        if isinstance(v, (list, tuple)):
+                        if isinstance(v, list | tuple):
                             clean[k] = list(v)
                         elif isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
                             clean[k] = None

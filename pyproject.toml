@@ -29,6 +29,7 @@ line-length = 127
 exclude = [
     "csrc/",
     "third_party/",
+    ".venv"
 ]
 
 [tool.ruff.lint]
