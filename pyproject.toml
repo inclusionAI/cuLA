@@ -11,8 +11,8 @@ readme = "README.md"
 authors = [ { name = "cula contributors" } ]
 requires-python = ">=3.10"
 dependencies = [
-    "nvidia-cutlass-dsl==4.4.2",
-    "apache-tvm-ffi==0.1.9",
+    "nvidia-cutlass-dsl>=4.4.2",
+    "apache-tvm-ffi>=0.1.9",
 ]
 license = { text = "Apache-2.0" }
 
