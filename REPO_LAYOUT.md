@@ -8,7 +8,8 @@ cuLA/
 │   │   ├── chunk_fwd.py          # Chunk forward dispatch
 │   │   ├── chunk_intra.py        # Intra-chunk forward logic
 │   │   ├── blackwell_fused_fwd.py  # Fused KDA forward (SM100)
-│   │   └── hopper_fused_fwd.py     # Fused KDA forward (SM90)
+│   │   ├── hopper_fused_fwd.py     # Fused KDA forward (SM90)
+│   │   └── ampere_fused_fwd.py     # Fused KDA forward (SM80, FLA Triton)
 │   ├── lightning/                # Lightning Attention operators
 │   │   └── la_decode.py          # Single-token decode kernel (CuTe DSL)
 │   ├── ops/                      # CuTe DSL kernel implementations
@@ -17,6 +18,7 @@ cuLA/
 │   │   ├── lightning_attn_sm100.py     # Lightning Attention prefill kernel (SM100)
 │   │   ├── linear_attn_sm100.py        # Generic linear attention kernel (SM100)
 │   │   ├── kda_fully_fused_sm100_wip.py # WIP fully fused KDA kernel (SM100)
+│   │   └── kda_fused_fwd_sm80.py        # Fused KDA forward skeleton (SM80 CuTe DSL)
 │   └── utils.py                  # Shared utilities
 │
 ├── csrc/                         # CUDA C++ / CUTLASS kernels
@@ -91,7 +93,7 @@ cuLA/
 | Directory | Language | Description |
 |-----------|----------|-------------|
 | `cula/ops/` | Python (CuTe DSL) | Warp-specialized GPU kernels written in CuTe DSL — compiled to CUDA at import time |
-| `cula/kda/` | Python | KDA operator dispatch — selects SM90 or SM100 path, handles chunking and autograd |
+| `cula/kda/` | Python | KDA operator dispatch — selects SM80/SM90/SM100 path, handles chunking and autograd |
 | `cula/lightning/` | Python (CuTe DSL) | Lightning Attention decode kernel |
 | `csrc/kda/sm90/` | CUDA C++ | Hopper KDA kernels using CUTLASS 3.x collective API |
 | `csrc/kda/sm100/` | CUDA C++ | Blackwell KDA kernels using CUTLASS 3.x + UMMA extensions |

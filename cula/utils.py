@@ -80,6 +80,26 @@ def assert_hopper(device: torch.device | str | int | None = None) -> None:
         raise RuntimeError(f"Only Hopper GPUs (SM90) are supported, got compute capability sm_{major}{minor}.")
 
 
+def is_ampere(device: torch.device | str | int | None = None) -> bool:
+    """Check whether *device* is an Ampere-architecture GPU (SM80/SM86/SM89).
+
+    Returns ``True`` for SM80 (A100), SM86 (RTX 30-series), SM89 (Ada).
+    """
+    major, _minor = get_device_sm_version(device)
+    return major == 8
+
+
+def assert_ampere(device: torch.device | str | int | None = None) -> None:
+    """Assert that *device* is an Ampere-architecture GPU (SM80/SM86/SM89).
+
+    Raises:
+        RuntimeError: If the device is not Ampere.
+    """
+    major, minor = get_device_sm_version(device)
+    if not (major == 8):
+        raise RuntimeError(f"Only Ampere GPUs (SM80/SM86/SM89) are supported, got compute capability sm_{major}{minor}.")
+
+
 def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callable:
     """Return the appropriate ``kda_prefill`` implementation for *device*.
 
@@ -101,10 +121,14 @@ def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callabl
         from cula.kda import kda_prefill_hopper
 
         return kda_prefill_hopper
+    elif major == 8:
+        from cula.kda import kda_prefill_ampere
+
+        return kda_prefill_ampere
     else:
         raise RuntimeError(
             f"Unsupported CUDA compute capability sm_{major}{minor}. "
-            f"Only sm90a (Hopper) and Blackwell (SM100/SM103) are supported."
+            f"Only Ampere (SM80), Hopper (SM90), and Blackwell (SM100/SM103) are supported."
         )
 
 

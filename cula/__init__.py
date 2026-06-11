@@ -14,7 +14,10 @@
 
 __version__ = "0.1.0"
 
-from cula.ops.lightning_attn_sm100 import LinearAttentionChunkwiseDecay
+try:
+    from cula.ops.lightning_attn_sm100 import LinearAttentionChunkwiseDecay
+except ImportError:
+    LinearAttentionChunkwiseDecay = None
 
 __all__ = [
     "LinearAttentionChunkwiseDecay",
