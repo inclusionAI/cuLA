@@ -57,7 +57,6 @@ struct Qwen35ScalarKdaDecodeKernel {
     alignas(16) float k_smem[kHeadDimQK];
     alignas(16) scalar_t v_smem[kHeadDimV];
     alignas(16) float norm_smem[2];
-    alignas(16) float state_smem[kHeadDimQK * kTileV];
     alignas(16) float proj_smem[kHeadDimV];
     alignas(16) float out_smem[kHeadDimV];
   };
@@ -67,12 +66,8 @@ struct Qwen35ScalarKdaDecodeKernel {
   }
 
   static dim3 grid_shape(int token_count) {
-    // One block owns one V tile for one (token_idx, hv) pair.
-    constexpr int kNumVTiles = (kHeadDimV + kTileV - 1) / kTileV;
-    return dim3(
-        static_cast<unsigned int>(kNumVTiles),
-        static_cast<unsigned int>(Shape::kLocalVHeads),
-        static_cast<unsigned int>(token_count));
+    // One block owns one (token_idx, hv) pair in the first implementation.
+    return dim3(static_cast<unsigned int>(Shape::kLocalVHeads), static_cast<unsigned int>(token_count), 1);
   }
 
   template <typename Mainloop>
@@ -89,9 +84,8 @@ struct Qwen35ScalarKdaDecodeKernel {
       scalar_t* __restrict__ out,
       int token_count,
       SharedStorage& storage) {
-    const int v_tile = static_cast<int>(blockIdx.x);
-    const int hv = static_cast<int>(blockIdx.y);
-    const int token_idx = static_cast<int>(blockIdx.z);
+    const int hv = static_cast<int>(blockIdx.x);
+    const int token_idx = static_cast<int>(blockIdx.y);
     const int tid = static_cast<int>(threadIdx.x);
     if (token_idx >= token_count || hv >= kLocalVHeads) {
       return;
@@ -189,7 +183,6 @@ struct Qwen35ScalarKdaDecodeKernel {
         state_vk,
         out_vec,
         storage,
-        v_tile * kTileV,
         tid,
         kThreads);
   }
@@ -211,9 +204,8 @@ struct Qwen35ScalarKdaDecodeKernel {
     constexpr int kLocalKDim = Shape::kLocalKDim;
     constexpr int kLocalMixedQKVDim = Shape::kLocalMixedQKVDim;
 
-    const int v_tile = static_cast<int>(blockIdx.x);
-    const int hv = static_cast<int>(blockIdx.y);
-    const int token_idx = static_cast<int>(blockIdx.z);
+    const int hv = static_cast<int>(blockIdx.x);
+    const int token_idx = static_cast<int>(blockIdx.y);
     const int tid = static_cast<int>(threadIdx.x);
     if (token_idx >= token_count || hv >= kLocalVHeads) {
       return;
@@ -283,7 +275,6 @@ struct Qwen35ScalarKdaDecodeKernel {
         state_vk,
         out_vec,
         storage,
-        v_tile * kTileV,
         tid,
         kThreads);
   }

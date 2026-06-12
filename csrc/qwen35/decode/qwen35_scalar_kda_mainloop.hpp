@@ -56,8 +56,8 @@ struct Qwen35ScalarKdaDecodeMainloop {
   // 2. optimize proj / update / out reductions
   // 3. evaluate warp-specialized load/compute roles only after the fp32 path
   //    is stable and measured
-  static constexpr int kTileV = 32;
-  static constexpr int kTileK = kHeadDimQK;
+  static constexpr int kTileV = 16;
+  static constexpr int kTileK = 16;
   static constexpr int kTilesPerV = kHeadDimV / kTileV;
   static constexpr int kTilesPerK = kHeadDimQK / kTileK;
   static constexpr int kWarpSize = 32;
@@ -65,14 +65,10 @@ struct Qwen35ScalarKdaDecodeMainloop {
   static constexpr int kWarpsPerCta = 4;
   static constexpr int kRowsPerWarp = kWarpSize;
   static constexpr int kRowsPerThread = 1;
-  static constexpr int kThreadsPerVRow = 4;
-  static constexpr int kKPerThread = kHeadDimQK / kThreadsPerVRow;
 
   static_assert(kHeadDimV == 128);
   static_assert(kHeadDimQK == 128);
   static_assert(kWarpsPerCta * kRowsPerWarp == kHeadDimV);
-  static_assert(kTileV * kThreadsPerVRow == kWarpsPerCta * kWarpSize);
-  static_assert(kHeadDimQK % kThreadsPerVRow == 0);
 
   // First concrete decode threading plan:
   //
@@ -362,7 +358,6 @@ struct Qwen35ScalarKdaDecodeMainloop {
       TensorHvk& state_vk,
       TensorOut& out_vec,
       SharedStorage& storage,
-      int v_tile_base,
       int tid,
       int num_threads) {
     // Decode organization:
@@ -398,9 +393,6 @@ struct Qwen35ScalarKdaDecodeMainloop {
     auto k_smem = make_tensor(make_smem_ptr(storage.k_smem), make_layout(make_shape(Int<kHeadDimQK>{})));
     auto v_smem = make_tensor(make_smem_ptr(storage.v_smem), make_layout(make_shape(Int<kHeadDimV>{})));
     auto norm_smem = make_tensor(make_smem_ptr(storage.norm_smem), make_layout(make_shape(Int<2>{})));
-    auto state_smem = make_tensor(
-        make_smem_ptr(storage.state_smem),
-        make_layout(make_shape(Int<kHeadDimQK>{}, Int<kTileV>{}), make_stride(Int<kTileV>{}, Int<1>{})));
     auto proj_smem = make_tensor(make_smem_ptr(storage.proj_smem), make_layout(make_shape(Int<kHeadDimV>{})));
     auto out_smem = make_tensor(make_smem_ptr(storage.out_smem), make_layout(make_shape(Int<kHeadDimV>{})));
 
@@ -409,21 +401,10 @@ struct Qwen35ScalarKdaDecodeMainloop {
       q_smem(idx) = static_cast<float>(q_vec(idx));
       k_smem(idx) = static_cast<float>(k_vec(idx));
     }
-    for (int local_v = tid; local_v < kTileV; local_v += num_threads) {
-      const int v_global = v_tile_base + local_v;
-      if (v_global < kHeadDimV) {
-        v_smem(local_v) = v_vec(v_global);
-      }
-    }
     for (int idx = tid; idx < kHeadDimV; idx += num_threads) {
+      v_smem(idx) = v_vec(idx);
       proj_smem(idx) = 0.f;
       out_smem(idx) = 0.f;
-    }
-    for (int idx = tid; idx < kHeadDimQK * kTileV; idx += num_threads) {
-      const int k_idx = idx / kTileV;
-      const int local_v = idx - k_idx * kTileV;
-      const int v_global = v_tile_base + local_v;
-      state_smem(k_idx, local_v) = v_global < kHeadDimV ? static_cast<float>(state_vk(v_global, k_idx)) : 0.f;
     }
     __syncthreads();
 
@@ -448,55 +429,45 @@ struct Qwen35ScalarKdaDecodeMainloop {
     }
     __syncthreads();
 
-    const int local_v = tid / kThreadsPerVRow;
-    const int row_lane = tid - local_v * kThreadsPerVRow;
-    const int v_global = v_tile_base + local_v;
-    if (local_v < kTileV && v_global < kHeadDimV) {
-      const int k_begin = row_lane * kKPerThread;
-      float proj_part = 0.f;
-#pragma unroll
-      for (int kk = 0; kk < kKPerThread; ++kk) {
-        const int k_idx = k_begin + kk;
-        proj_part += state_smem(k_idx, local_v) * k_smem(k_idx);
-      }
-      proj_smem(tid) = proj_part;
-    }
-    __syncthreads();
+    ThreadRowPlan row_plan = make_thread_row_plan(tid);
 
-    if (local_v < kTileV && row_lane == 0 && v_global < kHeadDimV) {
+    // First concrete ownership model:
+    // - each thread owns one full state row across all 128 K columns
+    // - the row is streamed tile-by-tile through registers
+    // - no cross-thread reduction is needed for proj/out because the full row
+    //   stays with one thread for the duration of the token update
+    if (row_plan.owns_row) {
       float proj_row = 0.f;
-#pragma unroll
-      for (int lane = 0; lane < kThreadsPerVRow; ++lane) {
-        proj_row += proj_smem(local_v * kThreadsPerVRow + lane);
+      for (int tile_k = 0; tile_k < kTilesPerK; ++tile_k) {
+        TileCoords coords = TileCoords{(row_plan.v_row / kTileV) * kTileV, tile_k * kTileK};
+        RowTileProjPlan proj_plan = make_row_tile_proj_plan(coords, row_plan.warp_id, row_plan.lane_id);
+        proj_plan.v_row = row_plan.v_row;
+        proj_plan.owns_row = true;
+        proj_row += project_row_tile(state_vk, k_smem, proj_plan);
       }
-      const float v_val = static_cast<float>(v_smem(local_v));
-      proj_smem(local_v) = beta * (v_val - decay * proj_row);
-    }
-    __syncthreads();
 
-    if (local_v < kTileV && v_global < kHeadDimV) {
-      const int k_begin = row_lane * kKPerThread;
-      const float v_new_row = proj_smem(local_v);
-      float out_part = 0.f;
-#pragma unroll
-      for (int kk = 0; kk < kKPerThread; ++kk) {
-        const int k_idx = k_begin + kk;
-        const float state_new = decay * state_smem(k_idx, local_v) + v_new_row * k_smem(k_idx);
-        state_smem(k_idx, local_v) = state_new;
-        out_part += state_new * q_smem(k_idx);
-        state_vk(v_global, k_idx) = state_new;
-      }
-      out_smem(local_v * kThreadsPerVRow + row_lane) = out_part;
-    }
-    __syncthreads();
+      proj_smem(row_plan.v_row) = proj_row;
 
-    if (local_v < kTileV && row_lane == 0 && v_global < kHeadDimV) {
+      const float v_val = static_cast<float>(v_smem(row_plan.v_row));
+      const float decayed_proj_row = decay * proj_row;
+      const float v_new_row = beta * (v_val - decayed_proj_row);
+
       float out_row = 0.f;
-#pragma unroll
-      for (int lane = 0; lane < kThreadsPerVRow; ++lane) {
-        out_row += out_smem(local_v * kThreadsPerVRow + lane);
+      for (int tile_k = 0; tile_k < kTilesPerK; ++tile_k) {
+        TileCoords coords = TileCoords{(row_plan.v_row / kTileV) * kTileV, tile_k * kTileK};
+        RowTileUpdatePlan update_plan = make_row_tile_update_plan(coords, row_plan.warp_id, row_plan.lane_id);
+        update_plan.v_row = row_plan.v_row;
+        update_plan.owns_row = true;
+        out_row += update_and_output_row_tile(
+            state_vk, k_smem, q_smem, update_plan, decay, v_new_row);
       }
-      out_vec(v_global) = static_cast<scalar_t>(out_row);
+
+      out_smem(row_plan.v_row) = out_row;
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < kHeadDimV; idx += num_threads) {
+      out_vec(idx) = static_cast<scalar_t>(out_smem(idx));
     }
   }
 };

@@ -67,8 +67,8 @@ struct Qwen35DecodeLocalShape {
   static constexpr int kLayoutVec = 4;
   static constexpr int kLayoutThreads = kHeadDimQK / kLayoutVec;
   static constexpr int kKdaThreads = 128;
-  static constexpr int kKdaTileV = 32;
-  static constexpr int kKdaTileK = kHeadDimQK;
+  static constexpr int kKdaTileV = 16;
+  static constexpr int kKdaTileK = 16;
 
   static_assert(kLocalVHeads % kLocalQKHeads == 0);
   static_assert(kHeadDimQK == kHeadDimV);
