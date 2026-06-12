@@ -177,8 +177,11 @@ if not DISABLE_SM100 or not DISABLE_SM103:
             ],
             extra_compile_args={
                 "cxx": cxx_args + get_features_args(),
-                "nvcc": nvcc_common_args + get_features_args() + sm100_arch_flags
-                + get_nvcc_thread_args() + (["--use_fast_math"] if USE_FAST_MATH else []),
+                "nvcc": nvcc_common_args
+                + get_features_args()
+                + sm100_arch_flags
+                + get_nvcc_thread_args()
+                + (["--use_fast_math"] if USE_FAST_MATH else []),
             },
             include_dirs=include_dirs,
         )
@@ -197,8 +200,11 @@ if not DISABLE_SM90:
             ],
             extra_compile_args={
                 "cxx": cxx_args + get_features_args(),
-                "nvcc": nvcc_common_args + get_features_args() + sm90_arch_flags
-                + get_nvcc_thread_args() + (["--use_fast_math"] if USE_FAST_MATH else []),
+                "nvcc": nvcc_common_args
+                + get_features_args()
+                + sm90_arch_flags
+                + get_nvcc_thread_args()
+                + (["--use_fast_math"] if USE_FAST_MATH else []),
             },
             include_dirs=include_dirs,
         )
