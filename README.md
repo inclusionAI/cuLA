@@ -24,6 +24,18 @@ cuLA supports both **Hopper (SM90)** and **Blackwell (SM10X)** GPUs.
 
 > **Note:** The PyTorch CUDA version must match your system CUDA Toolkit version. Check with `nvcc --version` and `python -c "import torch; print(torch.version.cuda)"`.
 
+### Pre-built Wheels
+
+Pre-built fat-binary wheels (SM90 + SM100 + SM103) are available on [GitHub Releases](https://github.com/inclusionAI/cuLA/releases):
+
+```bash
+pip install cuda-linear-attention -f https://github.com/inclusionAI/cuLA/releases/expanded_assets/<TAG>
+```
+
+Replace `<TAG>` with the release version (e.g., `v0.2.0`). `pip` will select the wheel matching your local CUDA version. Or download the `.whl` file directly from the [Releases page](https://github.com/inclusionAI/cuLA/releases) and install it with `pip install <filename>.whl`.
+
+### Build from Source
+
 **Clone cuLA & dependencies:**
 
 ```bash

@@ -189,3 +189,9 @@ ChunkKDAFwdRecompWU(
 
     kda::sm100::run_kda_fwd_recomp_w_u_sm100(params, at::cuda::getCurrentCUDAStream());
 }
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.doc() = "cuLA SM100/SM103 kernels";
+    m.def("chunk_kda_fwd_intra_cuda", &ChunkKDAFwdIntra);
+    m.def("recompute_w_u_cuda", &ChunkKDAFwdRecompWU);
+}

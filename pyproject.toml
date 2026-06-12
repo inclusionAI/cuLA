@@ -11,8 +11,8 @@ readme = "README.md"
 authors = [ { name = "cula contributors" } ]
 requires-python = ">=3.10"
 dependencies = [
-    "nvidia-cutlass-dsl>=4.4.2",
-    "apache-tvm-ffi>=0.1.9",
+    "nvidia-cutlass-dsl==4.4.2",
+    "apache-tvm-ffi==0.1.9",
 ]
 license = { text = "Apache-2.0" }
 
@@ -84,9 +84,6 @@ force-sort-within-sections = false
 "cula/kda/blackwell_fused_fwd.py" = ["F821"]
 
 [tool.setuptools_scm]
-# write generated version into package for runtime access
 write_to = "cula/_version.py"
-# add a date-based local suffix when needed
-local_scheme = "node-and-date"
-# fallback for non-git sources
+local_scheme = "no-local-version"
 fallback_version = "0.1.0"

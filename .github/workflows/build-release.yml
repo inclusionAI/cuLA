@@ -1,0 +1,125 @@
+name: Build & Release Wheels
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-wheel:
+    name: "wheel / ${{ matrix.cuda }} / cp312 / ${{ matrix.arch }}"
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda:
+          - cu129
+          - cu130
+        arch:
+          - x86_64
+          - aarch64
+        include:
+          - cuda: cu129
+            cuda_version: "12.9.0"
+            torch_index: "https://download.pytorch.org/whl/cu129"
+          - cuda: cu130
+            cuda_version: "13.0.0"
+            torch_index: "https://download.pytorch.org/whl/cu130"
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    container:
+      image: "nvidia/cuda:${{ matrix.cuda_version }}-devel-ubuntu24.04"
+
+    steps:
+      - name: Free disk space
+        run: |
+          rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet \
+                 /usr/local/share/boost /opt/ghc 2>/dev/null || true
+          apt-get clean 2>/dev/null || true
+          df -h / || true
+
+      - name: Install git
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends git \
+            && rm -rf /var/lib/apt/lists/*
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Configure git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --no-cache-dir --upgrade pip
+          python -m pip install --no-cache-dir torch --index-url ${{ matrix.torch_index }}
+          python -m pip install --no-cache-dir setuptools wheel "setuptools_scm>=6.0" build ninja
+
+      - name: Compute version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            BASE="${GITHUB_REF#refs/tags/v}"
+          else
+            # Strip any local segment (+gXXX) so we get a clean base
+            BASE=$(python -c "from setuptools_scm import get_version; print(get_version().split('+')[0])")
+          fi
+          echo "version=${BASE}+${{ matrix.cuda }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build fat-binary wheel
+        env:
+          CULA_BUILD_ALL_ARCHS: "1"
+          SETUPTOOLS_SCM_PRETEND_VERSION: "${{ steps.version.outputs.version }}"
+          NVCC_THREADS: "4"
+          MAX_JOBS: "4"
+        run: python -m build --wheel --no-isolation
+
+      - name: Verify wheel
+        run: |
+          echo "Built wheel:"
+          ls -lh dist/*.whl
+          ls dist/*.whl | grep -q "+${{ matrix.cuda }}" \
+            || { echo "ERROR: wheel name missing +${{ matrix.cuda }} suffix"; exit 1; }
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheel-${{ matrix.cuda }}-${{ matrix.arch }}
+          path: dist/*.whl
+
+  release:
+    name: Create GitHub Release
+    needs: [build-wheel]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            artifacts/wheel-*/*.whl
+          generate_release_notes: true
+          draft: true
+          prerelease: ${{ contains(github.ref, 'rc') || contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
