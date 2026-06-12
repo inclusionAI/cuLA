@@ -22,6 +22,7 @@ extension provides the function.
 
 import importlib
 import sys
+import threading
 from types import ModuleType
 
 
@@ -33,20 +34,31 @@ class _CudacProxy(ModuleType):
         self.__path__ = []
         self._modules_loaded = False
         self._funcs: dict[str, object] = {}
+        self._lock = threading.Lock()
 
     def _load(self):
         if self._modules_loaded:
             return
-        self._modules_loaded = True
-        for ext_name in ("cula._cudac_sm100", "cula._cudac_sm90"):
-            try:
-                mod = importlib.import_module(ext_name)
-                for attr in dir(mod):
-                    if not attr.startswith("_"):
-                        self._funcs[attr] = getattr(mod, attr)
-            except ImportError:
-                pass
-        self.__dict__.update(self._funcs)
+        with self._lock:
+            if self._modules_loaded:
+                return
+            loaded_any = False
+            for ext_name in ("cula._cudac_sm100", "cula._cudac_sm90"):
+                try:
+                    mod = importlib.import_module(ext_name)
+                    for attr in dir(mod):
+                        if not attr.startswith("_"):
+                            self._funcs[attr] = getattr(mod, attr)
+                    loaded_any = True
+                except ImportError:
+                    pass
+            if not loaded_any:
+                raise ImportError(
+                    "None of the cuLA CUDA extensions ('cula._cudac_sm100', 'cula._cudac_sm90') "
+                    "could be imported. Please make sure cuLA is compiled correctly."
+                )
+            self.__dict__.update(self._funcs)
+            self._modules_loaded = True
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
