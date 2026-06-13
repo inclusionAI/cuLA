@@ -424,6 +424,7 @@ __global__ void qwen35_layout_scalar_kda_decode_long_kernel(
   constexpr int kPipeTileK = 16;
   constexpr int kPipeStages = 2;
   constexpr int kVecFloats = 4;
+  constexpr int kStatePipeStrideV = kHeadDimV + 4;
 
   static_assert(kLocalQKHeads == Shape::kLocalQKHeads);
   static_assert(kHeadDimQK == 128);
@@ -435,7 +436,7 @@ __global__ void qwen35_layout_scalar_kda_decode_long_kernel(
   __shared__ float q_smem[kHeadDimQK];
   __shared__ float k_smem[kHeadDimQK];
   __shared__ float norm_smem[2 * kWarps];
-  __shared__ float state_pipe[kPipeStages][kPipeTileK][kHeadDimV];
+  __shared__ float state_pipe[kPipeStages][kPipeTileK][kStatePipeStrideV];
 
   const int hv = static_cast<int>(blockIdx.x);
   const int token_idx = static_cast<int>(blockIdx.y);
@@ -525,6 +526,21 @@ __global__ void qwen35_layout_scalar_kda_decode_long_kernel(
   k_smem[tid] = k_smem[tid] * norm_smem[1];
   __syncthreads();
 
+  float qk_dot = q_smem[tid] * k_smem[tid];
+  qk_dot = Qwen35ScalarKdaDecodeMainloop<scalar_t>::warp_sum(qk_dot);
+  if (lane == 0) {
+    norm_smem[warp_id] = qk_dot;
+  }
+  __syncthreads();
+  float qk_block_sum = lane < kWarps ? norm_smem[lane] : 0.f;
+  if (warp_id == 0) {
+    qk_block_sum = Qwen35ScalarKdaDecodeMainloop<scalar_t>::warp_sum(qk_block_sum);
+    if (lane == 0) {
+      norm_smem[2] = qk_block_sum;
+    }
+  }
+  __syncthreads();
+
   auto load_state_pipe_tile = [&](int stage, int k_base) {
 #pragma unroll 1
     for (int elem = tid * kVecFloats; elem < kPipeTileK * kHeadDimV; elem += kThreads * kVecFloats) {
@@ -537,6 +553,7 @@ __global__ void qwen35_layout_scalar_kda_decode_long_kernel(
   };
 
   float proj_row = 0.f;
+  float out_old_row = 0.f;
   int pipe_stage = 0;
   load_state_pipe_tile(pipe_stage, 0);
   cp_async_commit_group();
@@ -563,6 +580,10 @@ __global__ void qwen35_layout_scalar_kda_decode_long_kernel(
       proj_row += state1 * k_smem[k_base + k_local + 1];
       proj_row += state2 * k_smem[k_base + k_local + 2];
       proj_row += state3 * k_smem[k_base + k_local + 3];
+      out_old_row += state0 * q_smem[k_base + k_local + 0];
+      out_old_row += state1 * q_smem[k_base + k_local + 1];
+      out_old_row += state2 * q_smem[k_base + k_local + 2];
+      out_old_row += state3 * q_smem[k_base + k_local + 3];
     }
     __syncthreads();
     pipe_stage = next_stage;
@@ -570,24 +591,38 @@ __global__ void qwen35_layout_scalar_kda_decode_long_kernel(
 
   const float v_val = static_cast<float>(v_vec(v_row));
   const float v_new_row = beta * (v_val - decay * proj_row);
+  out_vec(v_row) = static_cast<scalar_t>(decay * out_old_row + v_new_row * norm_smem[2]);
 
-  float out_row = 0.f;
+  pipe_stage = 0;
+  load_state_pipe_tile(pipe_stage, 0);
+  cp_async_commit_group();
+
 #pragma unroll 1
-  for (int k_idx = 0; k_idx < kHeadDimQK; k_idx += 4) {
-    const float state_new0 = decay * static_cast<float>(state_vk(v_row, k_idx + 0)) + v_new_row * k_smem[k_idx + 0];
-    const float state_new1 = decay * static_cast<float>(state_vk(v_row, k_idx + 1)) + v_new_row * k_smem[k_idx + 1];
-    const float state_new2 = decay * static_cast<float>(state_vk(v_row, k_idx + 2)) + v_new_row * k_smem[k_idx + 2];
-    const float state_new3 = decay * static_cast<float>(state_vk(v_row, k_idx + 3)) + v_new_row * k_smem[k_idx + 3];
-    state_vk(v_row, k_idx + 0) = state_new0;
-    state_vk(v_row, k_idx + 1) = state_new1;
-    state_vk(v_row, k_idx + 2) = state_new2;
-    state_vk(v_row, k_idx + 3) = state_new3;
-    out_row += state_new0 * q_smem[k_idx + 0];
-    out_row += state_new1 * q_smem[k_idx + 1];
-    out_row += state_new2 * q_smem[k_idx + 2];
-    out_row += state_new3 * q_smem[k_idx + 3];
+  for (int k_base = 0; k_base < kHeadDimQK; k_base += kPipeTileK) {
+    cp_async_wait_all();
+    __syncthreads();
+
+    const int next_k_base = k_base + kPipeTileK;
+    const int next_stage = pipe_stage ^ 1;
+    if (next_k_base < kHeadDimQK) {
+      load_state_pipe_tile(next_stage, next_k_base);
+      cp_async_commit_group();
+    }
+
+#pragma unroll
+    for (int k_local = 0; k_local < kPipeTileK; k_local += 4) {
+      const float state_new0 = decay * state_pipe[pipe_stage][k_local + 0][v_row] + v_new_row * k_smem[k_base + k_local + 0];
+      const float state_new1 = decay * state_pipe[pipe_stage][k_local + 1][v_row] + v_new_row * k_smem[k_base + k_local + 1];
+      const float state_new2 = decay * state_pipe[pipe_stage][k_local + 2][v_row] + v_new_row * k_smem[k_base + k_local + 2];
+      const float state_new3 = decay * state_pipe[pipe_stage][k_local + 3][v_row] + v_new_row * k_smem[k_base + k_local + 3];
+      state_vk(v_row, k_base + k_local + 0) = state_new0;
+      state_vk(v_row, k_base + k_local + 1) = state_new1;
+      state_vk(v_row, k_base + k_local + 2) = state_new2;
+      state_vk(v_row, k_base + k_local + 3) = state_new3;
+    }
+    __syncthreads();
+    pipe_stage = next_stage;
   }
-  out_vec(v_row) = static_cast<scalar_t>(out_row);
 }
 
 template <typename scalar_t, int kLocalQKHeads, int kLocalVHeads>
