@@ -25,7 +25,7 @@ namespace cula::qwen35::decode::kernel {
 
 using namespace cute;
 
-template <typename scalar_t>
+template <typename scalar_t, int kTileV_ = 16, int kTileK_ = 16>
 struct Qwen35ScalarKdaDecodeMainloop {
   // Decode design decision:
   // - recurrent_state remains fp32 both physically and mathematically
@@ -56,8 +56,8 @@ struct Qwen35ScalarKdaDecodeMainloop {
   // 2. optimize proj / update / out reductions
   // 3. evaluate warp-specialized load/compute roles only after the fp32 path
   //    is stable and measured
-  static constexpr int kTileV = 16;
-  static constexpr int kTileK = 16;
+  static constexpr int kTileV = kTileV_;
+  static constexpr int kTileK = kTileK_;
   static constexpr int kTilesPerV = kHeadDimV / kTileV;
   static constexpr int kTilesPerK = kHeadDimQK / kTileK;
   static constexpr int kWarpSize = 32;
@@ -68,6 +68,8 @@ struct Qwen35ScalarKdaDecodeMainloop {
 
   static_assert(kHeadDimV == 128);
   static_assert(kHeadDimQK == 128);
+  static_assert(kHeadDimV % kTileV == 0);
+  static_assert(kHeadDimQK % kTileK == 0);
   static_assert(kWarpsPerCta * kRowsPerWarp == kHeadDimV);
 
   // First concrete decode threading plan:
@@ -336,6 +338,15 @@ struct Qwen35ScalarKdaDecodeMainloop {
     return x > 20.f ? x : log1pf(expf(x));
   }
 
+  CUTE_DEVICE static float warp_sum(float value) {
+    constexpr unsigned int kFullMask = 0xffffffffu;
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+      value += __shfl_down_sync(kFullMask, value, offset);
+    }
+    return value;
+  }
+
   template <
       typename TensorQ,
       typename TensorK,
@@ -470,6 +481,12 @@ struct Qwen35ScalarKdaDecodeMainloop {
       out_vec(idx) = static_cast<scalar_t>(out_smem(idx));
     }
   }
+};
+
+template <typename scalar_t>
+struct Qwen35ScalarKdaDecodeLongMainloop : public Qwen35ScalarKdaDecodeMainloop<scalar_t, 16, 32> {
+  using Base = Qwen35ScalarKdaDecodeMainloop<scalar_t, 16, 32>;
+  using Base::run;
 };
 
 } // namespace cula::qwen35::decode::kernel
