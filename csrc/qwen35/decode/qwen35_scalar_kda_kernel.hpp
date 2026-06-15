@@ -38,6 +38,10 @@ CUTE_DEVICE void cp_async_wait_all() {
   asm volatile("cp.async.wait_group 0;\n" ::);
 }
 
+CUTE_DEVICE void cp_async_wait_group_1() {
+  asm volatile("cp.async.wait_group 1;\n" ::);
+}
+
 template <typename scalar_t, int kLocalQKHeads, int kLocalVHeads>
 struct Qwen35ScalarKdaDecodeKernel {
   using Shape = cula::qwen35::decode::Qwen35DecodeLocalShape<kLocalVHeads>;
@@ -401,7 +405,7 @@ __global__ void qwen35_layout_scalar_kda_decode_kernel(
       storage);
 }
 
-template <typename scalar_t, int kLocalQKHeads, int kLocalVHeads>
+template <typename scalar_t, int kLocalQKHeads, int kLocalVHeads, int kPipeTileK_ = 16>
 __global__ void qwen35_layout_scalar_kda_decode_long_kernel(
     const scalar_t* __restrict__ mixed_qkv_conv,
     const scalar_t* __restrict__ a,
@@ -421,7 +425,7 @@ __global__ void qwen35_layout_scalar_kda_decode_long_kernel(
   constexpr int kWarpSize = 32;
   constexpr int kThreads = 128;
   constexpr int kWarps = kThreads / kWarpSize;
-  constexpr int kPipeTileK = 16;
+  constexpr int kPipeTileK = kPipeTileK_;
   constexpr int kPipeStages = 2;
   constexpr int kVecFloats = 4;
   constexpr int kStatePipeStrideV = kHeadDimV + 4;
@@ -432,6 +436,7 @@ __global__ void qwen35_layout_scalar_kda_decode_long_kernel(
   static_assert(kHeadDimV % kWarpTileV == 0);
   static_assert(kWarps * kWarpTileV == kHeadDimV);
   static_assert(kHeadDimQK % kPipeTileK == 0);
+  static_assert(kPipeTileK == 16 || kPipeTileK == 32);
 
   __shared__ float q_smem[kHeadDimQK];
   __shared__ float k_smem[kHeadDimQK];
@@ -522,11 +527,12 @@ __global__ void qwen35_layout_scalar_kda_decode_long_kernel(
   }
   __syncthreads();
 
-  q_smem[tid] = q_smem[tid] * norm_smem[0];
-  k_smem[tid] = k_smem[tid] * norm_smem[1];
-  __syncthreads();
+  const float q_normed = q_raw * norm_smem[0];
+  const float k_normed = k_raw * norm_smem[1];
+  q_smem[tid] = q_normed;
+  k_smem[tid] = k_normed;
 
-  float qk_dot = q_smem[tid] * k_smem[tid];
+  float qk_dot = q_normed * k_normed;
   qk_dot = Qwen35ScalarKdaDecodeMainloop<scalar_t>::warp_sum(qk_dot);
   if (lane == 0) {
     norm_smem[warp_id] = qk_dot;
@@ -552,22 +558,40 @@ __global__ void qwen35_layout_scalar_kda_decode_long_kernel(
     }
   };
 
-  float proj_row = 0.f;
-  float out_old_row = 0.f;
+  float proj_acc0 = 0.f;
+  float proj_acc1 = 0.f;
+  float proj_acc2 = 0.f;
+  float proj_acc3 = 0.f;
+  float out_acc0 = 0.f;
+  float out_acc1 = 0.f;
+  float out_acc2 = 0.f;
+  float out_acc3 = 0.f;
   int pipe_stage = 0;
-  load_state_pipe_tile(pipe_stage, 0);
+  load_state_pipe_tile(0, 0);
   cp_async_commit_group();
+  if (kPipeTileK < kHeadDimQK) {
+    load_state_pipe_tile(1, kPipeTileK);
+    cp_async_commit_group();
+  }
 
 #pragma unroll 1
   for (int k_base = 0; k_base < kHeadDimQK; k_base += kPipeTileK) {
-    cp_async_wait_all();
-    __syncthreads();
-
     const int next_k_base = k_base + kPipeTileK;
     const int next_stage = pipe_stage ^ 1;
+    const int prefetch_k_base = k_base + 2 * kPipeTileK;
     if (next_k_base < kHeadDimQK) {
-      load_state_pipe_tile(next_stage, next_k_base);
-      cp_async_commit_group();
+      cp_async_wait_group_1();
+    } else {
+      cp_async_wait_all();
+    }
+    __syncthreads();
+
+    float q_regs[kPipeTileK];
+    float k_regs[kPipeTileK];
+#pragma unroll
+    for (int kk = 0; kk < kPipeTileK; ++kk) {
+      q_regs[kk] = q_smem[k_base + kk];
+      k_regs[kk] = k_smem[k_base + kk];
     }
 
 #pragma unroll
@@ -576,51 +600,71 @@ __global__ void qwen35_layout_scalar_kda_decode_long_kernel(
       const float state1 = state_pipe[pipe_stage][k_local + 1][v_row];
       const float state2 = state_pipe[pipe_stage][k_local + 2][v_row];
       const float state3 = state_pipe[pipe_stage][k_local + 3][v_row];
-      proj_row += state0 * k_smem[k_base + k_local + 0];
-      proj_row += state1 * k_smem[k_base + k_local + 1];
-      proj_row += state2 * k_smem[k_base + k_local + 2];
-      proj_row += state3 * k_smem[k_base + k_local + 3];
-      out_old_row += state0 * q_smem[k_base + k_local + 0];
-      out_old_row += state1 * q_smem[k_base + k_local + 1];
-      out_old_row += state2 * q_smem[k_base + k_local + 2];
-      out_old_row += state3 * q_smem[k_base + k_local + 3];
+      proj_acc0 += state0 * k_regs[k_local + 0];
+      proj_acc1 += state1 * k_regs[k_local + 1];
+      proj_acc2 += state2 * k_regs[k_local + 2];
+      proj_acc3 += state3 * k_regs[k_local + 3];
+      out_acc0 += state0 * q_regs[k_local + 0];
+      out_acc1 += state1 * q_regs[k_local + 1];
+      out_acc2 += state2 * q_regs[k_local + 2];
+      out_acc3 += state3 * q_regs[k_local + 3];
     }
-    __syncthreads();
+    if (prefetch_k_base < kHeadDimQK) {
+      __syncthreads();
+      load_state_pipe_tile(pipe_stage, prefetch_k_base);
+      cp_async_commit_group();
+    }
     pipe_stage = next_stage;
   }
 
+  const float proj_row = (proj_acc0 + proj_acc1) + (proj_acc2 + proj_acc3);
+  const float out_old_row = (out_acc0 + out_acc1) + (out_acc2 + out_acc3);
   const float v_val = static_cast<float>(v_vec(v_row));
   const float v_new_row = beta * (v_val - decay * proj_row);
   out_vec(v_row) = static_cast<scalar_t>(decay * out_old_row + v_new_row * norm_smem[2]);
 
   pipe_stage = 0;
-  load_state_pipe_tile(pipe_stage, 0);
+  load_state_pipe_tile(0, 0);
   cp_async_commit_group();
+  if (kPipeTileK < kHeadDimQK) {
+    load_state_pipe_tile(1, kPipeTileK);
+    cp_async_commit_group();
+  }
 
 #pragma unroll 1
   for (int k_base = 0; k_base < kHeadDimQK; k_base += kPipeTileK) {
-    cp_async_wait_all();
-    __syncthreads();
-
     const int next_k_base = k_base + kPipeTileK;
     const int next_stage = pipe_stage ^ 1;
+    const int prefetch_k_base = k_base + 2 * kPipeTileK;
     if (next_k_base < kHeadDimQK) {
-      load_state_pipe_tile(next_stage, next_k_base);
-      cp_async_commit_group();
+      cp_async_wait_group_1();
+    } else {
+      cp_async_wait_all();
+    }
+    __syncthreads();
+
+    float k_regs[kPipeTileK];
+#pragma unroll
+    for (int kk = 0; kk < kPipeTileK; ++kk) {
+      k_regs[kk] = k_smem[k_base + kk];
     }
 
 #pragma unroll
     for (int k_local = 0; k_local < kPipeTileK; k_local += 4) {
-      const float state_new0 = decay * state_pipe[pipe_stage][k_local + 0][v_row] + v_new_row * k_smem[k_base + k_local + 0];
-      const float state_new1 = decay * state_pipe[pipe_stage][k_local + 1][v_row] + v_new_row * k_smem[k_base + k_local + 1];
-      const float state_new2 = decay * state_pipe[pipe_stage][k_local + 2][v_row] + v_new_row * k_smem[k_base + k_local + 2];
-      const float state_new3 = decay * state_pipe[pipe_stage][k_local + 3][v_row] + v_new_row * k_smem[k_base + k_local + 3];
+      const float state_new0 = decay * state_pipe[pipe_stage][k_local + 0][v_row] + v_new_row * k_regs[k_local + 0];
+      const float state_new1 = decay * state_pipe[pipe_stage][k_local + 1][v_row] + v_new_row * k_regs[k_local + 1];
+      const float state_new2 = decay * state_pipe[pipe_stage][k_local + 2][v_row] + v_new_row * k_regs[k_local + 2];
+      const float state_new3 = decay * state_pipe[pipe_stage][k_local + 3][v_row] + v_new_row * k_regs[k_local + 3];
       state_vk(v_row, k_base + k_local + 0) = state_new0;
       state_vk(v_row, k_base + k_local + 1) = state_new1;
       state_vk(v_row, k_base + k_local + 2) = state_new2;
       state_vk(v_row, k_base + k_local + 3) = state_new3;
     }
-    __syncthreads();
+    if (prefetch_k_base < kHeadDimQK) {
+      __syncthreads();
+      load_state_pipe_tile(pipe_stage, prefetch_k_base);
+      cp_async_commit_group();
+    }
     pipe_stage = next_stage;
   }
 }
@@ -641,7 +685,21 @@ void launch_qwen35_layout_scalar_kda_decode_long_kernel(
   (void)kWarpTileV;
   dim3 grid(kLocalVHeads, token_count, 1);
   dim3 block(128, 1, 1);
-  qwen35_layout_scalar_kda_decode_long_kernel<scalar_t, kLocalQKHeads, kLocalVHeads><<<grid, block, 0, stream>>>(
+  if (token_count == 64 || token_count == 128) {
+    qwen35_layout_scalar_kda_decode_long_kernel<scalar_t, kLocalQKHeads, kLocalVHeads, 32><<<grid, block, 0, stream>>>(
+        mixed_qkv_conv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        recurrent_state,
+        pool_idx,
+        out,
+        token_count);
+    return;
+  }
+
+  qwen35_layout_scalar_kda_decode_long_kernel<scalar_t, kLocalQKHeads, kLocalVHeads, 16><<<grid, block, 0, stream>>>(
       mixed_qkv_conv,
       a,
       b,
