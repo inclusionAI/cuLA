@@ -48,7 +48,8 @@ launch_kda_fwd_prefill_kernel_gbai(
     int32_t const* cu_seqlens,
     uint8_t* workspace_buffer,
     int32_t num_seqs,
-    int32_t num_heads,
+    int32_t num_qk_heads,
+    int32_t num_v_heads,
     int32_t head_size,
     int64_t total_seqlen,
     float scale,
@@ -74,7 +75,8 @@ launch_kda_fwd_prefill_kernel(
     int32_t const* cu_seqlens,
     uint8_t* workspace_buffer,
     int32_t num_seqs,
-    int32_t num_heads,
+    int32_t num_qk_heads,
+    int32_t num_v_heads,
     int32_t head_size,
     int64_t total_seqlen,
     float scale,
@@ -98,7 +100,8 @@ launch_kda_fwd_prefill_kernel(
         cu_seqlens,                                                                              \
         workspace_buffer,                                                                        \
         num_seqs,                                                                                \
-        num_heads,                                                                               \
+        num_qk_heads,                                                                            \
+        num_v_heads,                                                                             \
         head_size,                                                                               \
         total_seqlen,                                                                            \
         scale,                                                                                   \
@@ -137,7 +140,8 @@ launch_kda_fwd_prefill_kernel<cutlass::arch::Sm90, bf16, bf16, float, float>(
     int32_t const* cu_seqlens,
     uint8_t* workspace_buffer,
     int32_t num_seqs,
-    int32_t num_heads,
+    int32_t num_qk_heads,
+    int32_t num_v_heads,
     int32_t head_size,
     int64_t total_seqlen,
     float scale,
@@ -159,7 +163,8 @@ launch_kda_fwd_prefill_kernel<cutlass::arch::Sm90, bf16, bf16, float, bf16>(
     int32_t const* cu_seqlens,
     uint8_t* workspace_buffer,
     int32_t num_seqs,
-    int32_t num_heads,
+    int32_t num_qk_heads,
+    int32_t num_v_heads,
     int32_t head_size,
     int64_t total_seqlen,
     float scale,

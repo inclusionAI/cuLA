@@ -21,16 +21,39 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 from einops import rearrange
 from fla.ops.linear_attn import fused_chunk_linear_attn
-from fla.ops.linear_attn.utils import normalize_output
 
 # from fla.ops.linear_attn.naive import naive_recurrent_linear_attn
 from fla.utils import assert_close, device
 
-from cula.ops.linear_attn import LinearAttentionChunkwise
+from cula.ops.linear_attn_sm100 import LinearAttentionChunkwise
 
 os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 
 PRINT_DEBUG = False
+
+
+def normalize_output(q: torch.Tensor, k: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
+    """Backward-compatible normalization for old linear-attn benchmark paths.
+
+    Supports both the historical `[B, T, H, D]` layout and the chunked
+    `[B, H, N, C, D]` layout used by `naive_chunk_linear_attn`.
+    """
+    if q.ndim == 4:
+        k_cum = k.cumsum(1)
+        z = (q * k_cum).sum(-1, keepdim=True)
+        return o / (z + 1e-10)
+
+    if q.ndim == 5:
+        batch, heads, num_chunks, chunk_size, depth = q.shape
+        q_flat = q.reshape(batch, heads, num_chunks * chunk_size, depth)
+        k_flat = k.reshape(batch, heads, num_chunks * chunk_size, depth)
+        o_flat = o.reshape(batch, heads, num_chunks * chunk_size, o.shape[-1])
+        k_cum = k_flat.cumsum(2)
+        z = (q_flat * k_cum).sum(-1, keepdim=True)
+        o_flat = o_flat / (z + 1e-10)
+        return o_flat.reshape_as(o)
+
+    raise ValueError(f"Unsupported normalize_output layout with ndim={q.ndim}")
 
 
 def print_chunkwise(t, name):

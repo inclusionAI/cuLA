@@ -25,7 +25,7 @@ Both are drop-in replacements for [FLA](https://github.com/fla-org/flash-linear-
 
 ### Modular Forward (SM100 — Blackwell)
 
-The modular forward kernel replaces sub-kernels of KDA in FLA (chunk_intra, chunk_delta_h, fwd_o, etc.) for easy integration with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/KCP.md).
+The modular forward kernel replaces sub-kernels of KDA in FLA (chunk_intra, chunk_delta_h, fwd_o, etc.) for easy integration with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/README.md).
 
 #### Example
 
@@ -66,7 +66,7 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 **Notes**
 
 - The backward pass is currently supported via FLA's implementation; further optimizations are on the roadmap.
-- Compatible with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/KCP.md) via the `cp_context` parameter, same as in FLA.
+- Compatible with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/README.md) via the `cp_context` parameter, same as in FLA.
 
 ---
 
@@ -112,3 +112,54 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 - Mainly **suitable for large-batch inference**; performance is limited when both batch size and head count are small, because we do not parallelize over the sequence-length dimension.
 - **Matrix inversion uses fp16 precision**, which is faster and occupies less shared memory but introduces minor numerical differences compared to tf32 inversion.
 - **Intra-subchunk attention uses g-first as anchor**, which causes some numerical differences compared with the FLA Triton implementation (FLA uses g-half as anchor in the diagonal).
+
+---
+
+## Intra-Card Context Parallel (chunk_delta_h)
+
+cuLA includes an intra-card context parallel (CP) path for `chunk_gated_delta_rule_fwd_h`. Long sequences are split into sub-sequences, processed independently in parallel, then merged via a prefix-scan step — unlocking sequence-dimension parallelism on a single GPU.
+
+**Requirements**
+
+| Condition | Detail |
+|---|---|
+| Environment variable | `CULA_INTRACARD_CP=1` |
+| Execution context | Inside `torch.inference_mode()` |
+| Input mode | Varlen only (`cu_seqlens` must be provided) |
+| Global gate | `g=None` (scalar gate `g` not supported; key-dim gate `gk` is supported) |
+
+If the heuristic decides CP would not help (e.g. batch already saturates SMs, or sequences are too short), it silently falls back to the standard single-pass kernel.
+
+**Example**
+
+```python
+import os
+os.environ["CULA_INTRACARD_CP"] = "1"
+
+import torch
+from cula.ops.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+
+B, T, H, K, V = 1, 65536, 8, 128, 128
+device = 'cuda'
+
+k  = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16)
+w  = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16)
+u  = torch.randn(B, T, H, V, device=device, dtype=torch.bfloat16)
+cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device=device)
+
+with torch.inference_mode():
+    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+        k=k, w=w, u=u,
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+    )
+
+print(f'h shape: {h.shape}')              # [1, NT, H, K, V]
+print(f'final_state shape: {final_state.shape}')  # [1, H, K, V]
+```
+
+**Notes**
+
+- CP is only beneficial when a small number of long sequences under-utilise the SM array. The built-in heuristic checks SM saturation, minimum sequence length (≥ 256 chunks), and effective batch size before enabling CP.
+- Currently **inference-only**; the backward pass is not supported through the CP path.
+- `cu_seqlens` must be **`int32`**.

@@ -195,7 +195,7 @@ struct CollectiveStoreTma {
             Tensor m_varlen_head = tma_store_.get_tma_tensor(make_shape(
                 problem_size.head_size,
                 problem_size.total_seqlen,
-                problem_size.num_heads));                                   // global view to the packed varlen sequence
+                problem_size.num_v_heads));                                 // O lives in the V/O head space under GVA
             Tensor m_varlen = m_varlen_head(_, _, work_desc.o_head_idx());  // slice into current head_idx
             Tensor m_offset = domain_offset(
                 make_coord(_0{}, work_desc.tok_offset),

@@ -83,7 +83,7 @@ def assert_hopper(device: torch.device | str | int | None = None) -> None:
 def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callable:
     """Return the appropriate ``kda_prefill`` implementation for *device*.
 
-    - sm100/sm103 (Blackwell) → cula.kda.kda_prefill_blackwell (not yet available)
+    - sm100/sm103 (Blackwell) → cula.kda.blackwell_fused_fwd.flash_kda_prefill
     - sm90  (Hopper)          → cula.kda.kda_prefill_hopper
 
     Args:
@@ -94,15 +94,39 @@ def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callabl
     """
     major, minor = get_device_sm_version(device)
     if major == 10 and minor in (0, 3):
-        # TODO
-        raise NotImplementedError(
-            "The Blackwell implementation of fused prefill is not yet available. "
-            "Please use a sm90a (Hopper) device or wait for future updates."
-        )
+        from cula.kda import kda_prefill_blackwell
+
+        return kda_prefill_blackwell
     elif major == 9 and minor == 0:
         from cula.kda import kda_prefill_hopper
 
         return kda_prefill_hopper
+    else:
+        raise RuntimeError(
+            f"Unsupported CUDA compute capability sm_{major}{minor}. "
+            f"Only sm90a (Hopper) and Blackwell (SM100/SM103) are supported."
+        )
+
+
+def get_pre_scan(device: torch.device | str | int | None = None) -> Callable:
+    """Return the appropriate ``chunk_delta_rule_pre_scan`` implementation for *device*.
+
+    - sm100/sm103 (Blackwell) → cula.ops.cp.pre_scan (CuTeDSL SM100 kernel)
+    - sm90  (Hopper)          → cula.ops.cp.pre_scan_sm90 (to be implemented)
+
+    Args:
+        device: CUDA device to query.  Defaults to the currently active device.
+
+    Raises:
+        RuntimeError: If the device architecture is not supported.
+    """
+    major, minor = get_device_sm_version(device)
+    if major == 10 and minor in (0, 3):
+        from cula.ops.cp.pre_scan import chunk_delta_rule_pre_scan
+
+        return chunk_delta_rule_pre_scan
+    elif major == 9 and minor == 0:
+        raise NotImplementedError("The Hopper (SM90) implementation of pre_scan is not yet available.")
     else:
         raise RuntimeError(
             f"Unsupported CUDA compute capability sm_{major}{minor}. "

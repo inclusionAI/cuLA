@@ -53,7 +53,8 @@ launch_kda_fwd_prefill_kernel_gbai(
     int32_t const* cu_seqlens,
     uint8_t* workspace_buffer,
     int32_t num_seqs,
-    int32_t num_heads,
+    int32_t num_qk_heads,
+    int32_t num_v_heads,
     int32_t head_size,
     int64_t total_seqlen,
     float scale,
@@ -105,8 +106,11 @@ launch_kda_fwd_prefill_kernel_gbai(
         using Arguments = typename Operation::Arguments;
 
         // NOTE: LayoutQ/K/V in (seq, head_size, (b,h)) coordinate semantics
+        // GVA: Q/K rows are packed as [packed_seq, num_qk_heads, head_size];
+        //      V/O/g/beta rows are packed as [packed_seq, num_v_heads, head_size].
 
-        int32_t tok_stride = num_heads * head_size;
+        int32_t qk_tok_stride = num_qk_heads * head_size;
+        int32_t v_tok_stride = num_v_heads * head_size;
         int32_t head_stride = head_size;
 
         Operation op;
@@ -116,21 +120,22 @@ launch_kda_fwd_prefill_kernel_gbai(
                     .cu_seqlens = cu_seqlens,
                     .total_seqlen = total_seqlen,
                     .num_seqs = num_seqs,
-                    .num_heads = num_heads,
+                    .num_qk_heads = num_qk_heads,
+                    .num_v_heads = num_v_heads,
                     .head_size = head_size,
                 },
             .mainloop =
                 {
                     // clang-format off
-                .ptr_Q = (T*)q,      .dQ = {tok_stride, _1{}, head_stride},
-                .ptr_K = (T*)k,      .dK = {tok_stride, _1{}, head_stride},
-                .ptr_V = (T*)v,      .dV = {tok_stride, _1{}, head_stride},
-                .ptr_O = (T*)output, .dO = {tok_stride, _1{}, head_stride},
-                .ptr_Alpha = alpha,  .dAlpha = {tok_stride, _1{}, head_stride},
+                .ptr_Q = (T*)q,      .dQ = {qk_tok_stride, _1{}, head_stride},
+                .ptr_K = (T*)k,      .dK = {qk_tok_stride, _1{}, head_stride},
+                .ptr_V = (T*)v,      .dV = {v_tok_stride,  _1{}, head_stride},
+                .ptr_O = (T*)output, .dO = {v_tok_stride,  _1{}, head_stride},
+                .ptr_Alpha = alpha,  .dAlpha = {v_tok_stride, _1{}, head_stride},
                 .ptr_output_state = (float*)output_state,
                 .ptr_input_state  = (float*)input_state,
                 .scale = scale,
-                .beta_ptr  = beta,  .beta_stride  = {num_heads, 1},
+                .beta_ptr  = beta,  .beta_stride  = {num_v_heads, 1},
         },  // clang-format on
             .hw_info = hw_info};
 

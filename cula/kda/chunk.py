@@ -15,101 +15,14 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # Related files are modified and supported by the Moonshot AI Team
 
-import fla.ops.kda.chunk_bwd as fla_chunk_bwd
-import fla.ops.kda.chunk_intra as fla_chunk_intra
 import torch
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.ops.cp import FLACPContext
-from fla.ops.kda.chunk_bwd import chunk_kda_bwd
 from fla.ops.utils.index import prepare_chunk_indices
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
-import cula.cudac as cula_cuda
+from cula.kda.chunk_bwd import chunk_kda_bwd
 from cula.kda.chunk_fwd import chunk_kda_fwd
-from cula.utils import prepare_uniform_cu_seqlens
-
-_BWD_INTRA_PATCHED = False
-
-
-def _try_patch_bwd_intra_with_cuda_impl() -> None:
-    """Force patch FLA bwd_intra with CUDA implementation.
-
-    Raises:
-        RuntimeError: If CUDA bwd_intra implementation is unavailable.
-    """
-
-    global _BWD_INTRA_PATCHED
-    if _BWD_INTRA_PATCHED:
-        return
-
-    try:
-        cuda_kda_bwd_intra = cula_cuda.chunk_kda_bwd_intra_cuda
-    except Exception as exc:
-        raise RuntimeError(
-            "Required CUDA bwd_intra implementation `cula.cudac.chunk_kda_bwd_intra_cuda` is unavailable. "
-            "Please build/install the CUDA extension before running backward."
-        ) from exc
-
-    def _patched_bwd_intra(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        dAqk: torch.Tensor,
-        dAkk: torch.Tensor,
-        dq: torch.Tensor,
-        dk: torch.Tensor,
-        db: torch.Tensor,
-        dg: torch.Tensor,
-        cu_seqlens: torch.IntTensor | None = None,
-        chunk_indices: torch.IntTensor | None = None,
-        chunk_size: int = 64,
-        safe_gate: bool = False,
-    ):
-        del safe_gate  # External CUDA kernel currently does not use this flag.
-
-        # External CUDA kernel expects varlen metadata. Build fixed-length metadata when absent.
-        if cu_seqlens is None:
-            B, T = q.shape[0], q.shape[1]
-            cu_seqlens = prepare_uniform_cu_seqlens(B, T, q.device, torch.int32)
-        if chunk_indices is None:
-            chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-
-        # csrc kernel writes dq_out/dk_out as bf16 (see __nv_bfloat16* casts in kernel).
-        dq_out = torch.empty_like(dq, dtype=torch.bfloat16)
-        dk_out = torch.empty_like(dk, dtype=torch.bfloat16)
-        db_out = torch.empty_like(db, dtype=torch.float)
-        dg_out = torch.empty_like(dg, dtype=torch.float)
-
-        tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
-        cuda_kda_bwd_intra(
-            q,
-            k,
-            g,
-            beta,
-            dAqk,
-            dAkk,
-            dq,
-            dk,
-            db,
-            dg,
-            cu_seqlens,
-            chunk_indices,
-            dq_out,
-            dk_out,
-            db_out,
-            dg_out,
-            tile_counter,
-            chunk_size,
-        )
-        return dq_out, dk_out, db_out, dg_out
-
-    # Patch both module-level symbol and the symbol already imported into chunk_bwd.
-    # `fla.ops.kda.chunk_bwd` does `from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra`,
-    # so patching only `fla_chunk_intra` is insufficient.
-    fla_chunk_intra.chunk_kda_bwd_intra = _patched_bwd_intra
-    fla_chunk_bwd.chunk_kda_bwd_intra = _patched_bwd_intra
-    _BWD_INTRA_PATCHED = True
 
 
 class ChunkKDAFunction(torch.autograd.Function):
@@ -220,8 +133,6 @@ class ChunkKDAFunction(torch.autograd.Function):
         do: torch.Tensor,
         dht: torch.Tensor,
     ):
-        _try_patch_bwd_intra_with_cuda_impl()
-
         (
             q,
             q_rstd,
@@ -454,6 +365,7 @@ def chunk_kda(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
             )
+        assert cu_seqlens.dtype == torch.int32, "cu_seqlens must be in int32"
     if initial_state is not None:
         assert initial_state.dtype == torch.float32, "initial_state must be in float32."
 
@@ -468,10 +380,17 @@ def chunk_kda(
         if not (-5 <= lower_bound < 0):
             raise ValueError(f"`lower_bound` must be in the safe range [-5, 0), got {lower_bound}.")
 
-    assert q.shape == k.shape == g.shape, "q, k, g must have the same shape."
-    assert k.shape[-1] <= 256, "Currently we only support key headdim <=256 for KDA :-("
-    assert beta.shape == q.shape[:3], "beta must be of shape (batch size, seq len, num of head)."
-    assert v.shape == (*q.shape[:3], v.shape[-1]), "v must be of shape (batch size, seq len, num of head, head dim)."
+    # Validate head dimensions for GVA
+    B, T, H, K, HV = *q.shape, v.shape[2]
+    assert q.shape == k.shape, f"q and k must have the same shape, got q={q.shape} vs k={k.shape}"
+    assert q.dtype == k.dtype == v.dtype == torch.bfloat16, "q, k, v must be in bfloat16."
+    assert beta.dtype == torch.bfloat16 or beta.dtype == torch.float32, "beta must be in bfloat16 or float32."
+    assert q.shape[-1] == k.shape[-1] == v.shape[-1] == 128, "Currently we only support head dim of 128 for KDA"
+    assert HV % H == 0, (
+        f"For GVA, num_v_heads (HV={HV}) must be evenly divisible by num_qk_heads (H={H}), but got HV % H = {HV % H}"
+    )
+    assert g.shape == (B, T, HV, K), f"g must have shape [B, T, HV, K]={[B, T, HV, K]}, got {list(g.shape)}"
+    assert beta.shape == (B, T, HV), f"beta must have shape [B, T, HV]={[B, T, HV]}, got {list(beta.shape)}"
 
     if scale is None:
         scale = k.shape[-1] ** -0.5

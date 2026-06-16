@@ -1,7 +1,7 @@
 # Repository Layout
 
 ```
-flashla/
+cuLA/
 ├── cula/                         # Python package (pip install -e .)
 │   ├── kda/                      # KDA (Kimi Delta Attention) operators
 │   │   ├── chunk.py              # End-to-end chunk KDA (fwd + bwd entry point)
@@ -12,13 +12,11 @@ flashla/
 │   ├── lightning/                # Lightning Attention operators
 │   │   └── la_decode.py          # Single-token decode kernel (CuTe DSL)
 │   ├── ops/                      # CuTe DSL kernel implementations
-│   │   ├── chunk_delta_h.py      # Chunk delta-H kernel
-│   │   ├── fwd_o.py              # Forward output kernel
-│   │   ├── recompute_wu.py       # Recompute WU kernel
-│   │   ├── lightning_attn.py     # Lightning Attention prefill kernel
-│   │   ├── linear_attn.py        # Generic linear attention kernel
-│   │   ├── kda_fully_fused.py    # Fully fused KDA kernel
-│   │   └── inv.py                # Matrix inversion utility
+│   │   ├── chunk_delta_h_sm100.py      # Chunk delta-H kernel (SM100)
+│   │   ├── fwd_o_sm100.py              # Forward output kernel (SM100)
+│   │   ├── lightning_attn_sm100.py     # Lightning Attention prefill kernel (SM100)
+│   │   ├── linear_attn_sm100.py        # Generic linear attention kernel (SM100)
+│   │   ├── kda_fully_fused_sm100_wip.py # WIP fully fused KDA kernel (SM100)
 │   └── utils.py                  # Shared utilities
 │
 ├── csrc/                         # CUDA C++ / CUTLASS kernels
@@ -39,7 +37,9 @@ flashla/
 │   │       ├── kda_fwd_sm100.cu
 │   │       ├── kda_fwd_common.cuh
 │   │       ├── kda_fwd_intra_kernel_sm100.hpp
-│   │       ├── kda_fwd_intra_mainloop_sm100.hpp
+│   │       ├── kda_fwd_intra_mainloop_sm100.hpp # Chunk intra mainloop
+│   │       ├── kda_fwd_recomp_w_u_kernel_sm100.hpp
+│   │       ├── kda_fwd_recomp_w_u_mainloop_sm100.hpp # Recompute W&U mainloop
 │   │       ├── kda_config.hpp
 │   │       ├── fwd_helpers.hpp
 │   │       ├── sm100_umma_ext.hpp
@@ -55,7 +55,6 @@ flashla/
 │   ├── bench_kda_chunk_intra.py  # KDA chunk intra benchmark
 │   ├── bench_chunk_delta_h.py    # Chunk delta-H benchmark
 │   ├── bench_fwd_o.py            # Forward output benchmark
-│   ├── bench_recompute_wu.py     # Recompute WU benchmark
 │   ├── bench_linear_attn.py      # Linear attention benchmark
 │   ├── generate_benchmark_md.py  # Auto-generate BENCHMARK_GB200.md (Blackwell)
 │   ├── generate_benchmark_hopper_md.py  # Auto-generate BENCHMARK_H200.md (Hopper)

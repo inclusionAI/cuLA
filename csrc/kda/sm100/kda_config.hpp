@@ -17,12 +17,18 @@
 #include "kda/sm100/tile_scheduler.hpp"
 
 struct KDA_fwd_intra_params {
-    using GmemShapeAkk = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_kv, seqlen_kv, h)
+    // Akk shape is (total_seqlen, chunk_size, num_v_heads). Under GVA (num_v_heads > num_qk_heads),
+    // Aqk and Akk are produced per v-head because g/beta/Akk scaling all live in v-head space.
+    using GmemShapeAkk = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_kv, chunk_size, h_v)
     using GmemStrideAkk = cute::Stride<int32_t, cute::_1, int32_t>;
 
     int total_q_len;
     int b;
-    int h;
+    // GVA: Q/K are sized by num_qk_heads; V, g, beta are sized by num_v_heads; Aqk/Akk are per v-head.
+    // When num_v_heads == num_qk_heads, heads_per_group == 1 and behaviour matches the pre-GVA path.
+    int h_qk;
+    int h_v;
+    int heads_per_group;  // = h_v / h_qk, precomputed on host
     int d;
     int chunk_size;
     float scale;
@@ -30,12 +36,12 @@ struct KDA_fwd_intra_params {
     bool unified_gref;
     bool is_beta_bf16;
 
-    void* __restrict__ q_ptr;              //[b, t, h, d]
-    void* __restrict__ k_ptr;              //[b, t, h, d]
-    void* __restrict__ g_ptr;              //[b, t, h, d]
-    void* __restrict__ beta_ptr;           //[b, t, h]
-    void* __restrict__ Aqk_out_ptr;        //[b, t, h, BT]
-    void* __restrict__ Akk_out_ptr;        //[b, t, h, BT]
+    void* __restrict__ q_ptr;              //[b, t, h_qk, d]
+    void* __restrict__ k_ptr;              //[b, t, h_qk, d]
+    void* __restrict__ g_ptr;              //[b, t, h_v,  d]
+    void* __restrict__ beta_ptr;           //[b, t, h_v]
+    void* __restrict__ Aqk_out_ptr;        //[b, t, h_v, BT]
+    void* __restrict__ Akk_out_ptr;        //[b, t, h_v, BT]
     void* __restrict__ cu_seqlens_ptr;     //[b + 1]
     void* __restrict__ chunk_indices_ptr;  //[(b * t) / chunk_size, 2]
 
@@ -48,28 +54,32 @@ struct KDA_fwd_intra_params {
 };
 
 struct KDA_fwd_recomp_w_u_params {
-    using GmemShapeWUKg = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_kv, seqlen_kv, h)
+    // w/u/kg/qg all have shape (total_seqlen, d, num_v_heads) under GVA.
+    using GmemShapeWUKg = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_kv, d, h_v)
     using GmemStrideWUKg = cute::Stride<int32_t, cute::_1, int32_t>;
 
     int total_len;
     int b;
-    int h;
+    // GVA: K and (optional) Q are sized by num_qk_heads; V/G/beta/Akk/w/u/kg/qg are per v-head.
+    int h_qk;
+    int h_v;
+    int heads_per_group;  // = h_v / h_qk, precomputed on host
     int d;
     int chunk_size;
     bool is_beta_bf16;
 
-    void* __restrict__ k_ptr;              //[b, t, h, d]
-    void* __restrict__ v_ptr;              //[b, t, h, d]
-    void* __restrict__ q_ptr;              //[b, t, h, d]  (optional, for StoreQG)
-    void* __restrict__ beta_ptr;           //[b, t, h]
-    void* __restrict__ A_ptr;              //[b. t, h, BT]
-    void* __restrict__ g_ptr;              //[b, t, h, d]
+    void* __restrict__ k_ptr;              //[b, t, h_qk, d]
+    void* __restrict__ v_ptr;              //[b, t, h_v,  d]
+    void* __restrict__ q_ptr;              //[b, t, h_qk, d]  (optional, for StoreQG)
+    void* __restrict__ beta_ptr;           //[b, t, h_v]
+    void* __restrict__ A_ptr;              //[b, t, h_v, BT]
+    void* __restrict__ g_ptr;              //[b, t, h_v, d]
     void* __restrict__ cu_seqlens_ptr;     //[b + 1]
     void* __restrict__ chunk_indices_ptr;  //[(b * t) / chunk_size, 2]
-    void* __restrict__ w_out_ptr;          //[b, t, h, d]
-    void* __restrict__ u_out_ptr;          //[b, t, h, d]
-    void* __restrict__ kg_out_ptr;         //[b, t, h, d]
-    void* __restrict__ qg_out_ptr;         //[b, t, h, d]  (optional, for StoreQG)
+    void* __restrict__ w_out_ptr;          //[b, t, h_v, d]
+    void* __restrict__ u_out_ptr;          //[b, t, h_v, d]
+    void* __restrict__ kg_out_ptr;         //[b, t, h_v, d]
+    void* __restrict__ qg_out_ptr;         //[b, t, h_v, d]  (optional, for StoreQG)
 
     bool store_qg;
 

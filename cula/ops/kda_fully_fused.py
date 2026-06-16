@@ -3100,11 +3100,11 @@ class KDAChunkwise:
                     # For full chunks, directly use C-1; only loop for partial chunks (varlen only)
                     if cutlass.const_expr(self.is_varlen):
                         if valid_len_chunk < C:
-                            rG_last = exp_g[valid_len_chunk - 1]
+                            rG_last = cute.exp2(tRS_rG[0, valid_len_chunk - 1, 0], fastmath=self.use_fast_math)
                         else:
-                            rG_last = exp_g[Constant.C - 1]
+                            rG_last = cute.exp2(tRS_rG[0, Constant.C - 1, 0], fastmath=self.use_fast_math)
                     else:
-                        rG_last = exp_g[Constant.C - 1]
+                        rG_last = cute.exp2(tRS_rG[0, Constant.C - 1, 0], fastmath=self.use_fast_math)
                     # NOTE: each thread save one element
                     sG_last[local_tidx, g_stage_idx] = rG_last
 

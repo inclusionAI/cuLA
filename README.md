@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/cuLA-logo.png" alt="cuLA Logo" width="600">
+
 # cuLA — CUDA Linear Attention
 
 **High-performance CUDA kernels for linear attention variants, written in [CuTe DSL](https://github.com/NVIDIA/cutlass/tree/main/python/CuTeDSL) and CUTLASS C++.**
@@ -8,11 +10,7 @@
 
 ## Introduction
 
-Linear attention mechanisms reformulate the standard attention computation by replacing the softmax with a feature map $\phi$, enabling the output to be expressed via a recurrent state:
-
-$$S_i = S_{i-1} + \phi(k_i) v_i^T, \quad o_i = \phi(q_i)^T S_i$$
-
-This recurrence reduces the complexity from $O(N^2)$ (standard attention) to $O(N)$, making linear attention particularly attractive for long-sequence modeling in LLMs. Recent variants — such as [GLA](https://arxiv.org/abs/2312.06635), [KDA](http://arxiv.org/abs/2510.26692), [GDN](https://arxiv.org/abs/2412.06464), and [Lightning Attention](https://arxiv.org/abs/2405.17381) — further enhance expressiveness with gating, delta updates, and chunkwise decomposition.
+Linear attention mechanisms reformulate standard attention to use linear-time state updates instead of quadratic pairwise interactions, making them well suited for long-context LLM workloads. Recent variants such as [GLA](https://arxiv.org/abs/2312.06635), [KDA](http://arxiv.org/abs/2510.26692), [GDN](https://arxiv.org/abs/2412.06464), and [Lightning Attention](https://arxiv.org/abs/2405.17381) further improve expressiveness with gating, delta-style updates, and chunkwise decomposition.
 
 **cuLA** provides hand-tuned CUDA implementations of these linear attention variants, targeting NVIDIA Blackwell (SM10X) and Hopper (SM90) GPUs. It is designed as a submodule of [flash-linear-attention (FLA)](https://github.com/fla-org/flash-linear-attention), sharing the same interface — adopting cuLA requires only a one-line import change. For ease of maintenance, cuLA is currently developed as a standalone library; the end goal is for users to seamlessly access these kernels through FLA. Since FLA already has a kernel dispatch mechanism in place, integration will be ready soon.
 
@@ -29,7 +27,7 @@ cuLA supports both **Hopper (SM90)** and **Blackwell (SM10X)** GPUs.
 **Clone cuLA & dependencies:**
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/inclusionAI/cuLA.git
 git submodule update --init --recursive
 ```
 
@@ -53,7 +51,7 @@ pip install -e . --no-build-isolation
 
 ### KDA (Kimi Delta Attention) — Blackwell (SM10X)
 
-cuLA is a drop-in replacement for [FLA](https://github.com/fla-org/flash-linear-attention) — just change the import:
+Just change the import:
 
 ```python
 import torch
@@ -65,7 +63,7 @@ device = 'cuda'
 q = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16, requires_grad=True)
 k = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16, requires_grad=True)
 v = torch.randn(B, T, H, V, device=device, dtype=torch.bfloat16, requires_grad=True)
-g = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1 # gate (log space)
+g = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1   # gate (log space)
 beta = torch.randn(B, T, H, device=device, dtype=torch.bfloat16).sigmoid()
 A_log = torch.randn(H, device=device, dtype=torch.float32) * 0.01
 dt_bias = torch.zeros(H * K, device=device, dtype=torch.float32)
@@ -94,7 +92,7 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 
 **Notes:**
 - `safe_gate=True` is required to leverage TensorCore acceleration.
-- **`beta`** must be **`float32`** or **`bfloat16`**; **`initial_state`** must be **`float32`**.
+- `beta` supports both `float32` and `bfloat16`; `initial_state` must be `float32`.
 - `cu_seqlens` (for variable-length sequences) must be `int32`.
 
 ## Usage
@@ -103,25 +101,23 @@ See [USAGE.md](USAGE.md) for detailed usage examples and notes.
 
 ## Benchmarks
 
-Benchmarks run on a single **NVIDIA GB300/GB200/H200** GPU with **CUDA Toolkit 12.9**, **PyTorch 2.9.1**, **Triton 3.5.1**.
+Benchmarks run on a single **NVIDIA GB200/H200** GPU with **PyTorch 2.9.1**, **Triton 3.5.1**.
 
-FLA baseline: [flash-linear-attention v0.4.2](https://github.com/fla-org/flash-linear-attention/releases/tag/v0.4.2).
+FLA baseline: [flash-linear-attention v0.5.0](https://github.com/fla-org/flash-linear-attention/releases/tag/v0.5.0).
 
 **Blackwell (SM10X)**
 
-See [BENCHMARK_GB300.md](BENCHMARK_GB300.md) for detailed results.
+See [BENCHMARK_GB200_CUDA_130.md](BENCHMARK_GB200_CUDA_130.md) tested with CUDA 13.0 for detailed results.
 
-See [BENCHMARK_GB200.md](BENCHMARK_GB200.md) for detailed results.
- 
 **Hopper (SM90)**
 
-See [BENCHMARK_H200.md](BENCHMARK_H200.md) for detailed results.
+See [BENCHMARK_H200.md](BENCHMARK_H200.md) tested with CUDA 12.9 for detailed results.
 
 **Highlights:**
-- **KDA Modular Forward (Blackwell):** **avg 1.45x** speedup on fixed-length, **avg 1.32x** on variable-length (18 configs, uniform/skewed/random).
-- **Lightning Attention Prefill (Blackwell):** up to **1.86x** speedup (B=2).
-- **Lightning Attention Varlen (Blackwell):** **avg 1.54x** speedup across 126 configs (uniform/skewed/random).
-- **KDA Fused Forward (Hopper):** **avg 1.52x** speedup across fixed-length and variable-length sequences.
+- **KDA Modular Forward (Blackwell):** **avg 1.33x** speedup on fixed-length, **avg 1.35x** on variable-length (18 configs, uniform/skewed/random).
+- **Lightning Attention Prefill (Blackwell):** up to **2.08x** speedup (B=2).
+- **Lightning Attention Varlen (Blackwell):** **avg 1.47x** speedup across 126 configs (uniform/skewed/random).
+- **KDA Fused Forward (Hopper):** **avg 1.58x** speedup across fixed-length and variable-length sequences.
 
 To regenerate benchmarks:
 
@@ -146,6 +142,14 @@ python -m pytest tests/test_kda_fused_fwd.py -v
 python tests/test_lightning_attn.py
 # Tests for Lightning Attention decode
 python -m pytest tests/test_la_decode.py -v
+
+# test_kda.py and test_kda_compare_fla.py support a fast/slow split.
+# Fast (default) — representative correctness paths for default CI and local iteration
+python -m pytest tests/test_kda.py tests/test_kda_compare_fla.py -v
+# Slow — broader stress coverage for nightly or manual runs
+python -m pytest -m kda_slow tests/test_kda.py tests/test_kda_compare_fla.py -v
+# Full sweep (fast + slow) — run before submitting a PR
+python -m pytest -m kda_full tests/test_kda.py tests/test_kda_compare_fla.py -v
 ```
 
 <details>
@@ -179,17 +183,17 @@ See [REPO_LAYOUT.md](REPO_LAYOUT.md) for the full directory structure and a summ
 * [ ] Continuous optimization via agentic methods such as [AVO](https://arxiv.org/abs/2603.24517).
 * [ ] Support for more algorithms.
 * [ ] Small B/H/S optimizations.
-* [ ] Support for BF16 beta input.
+* [x] Support for BF16 beta input.
 
 **Train**
 
-* [x] Modular KDA Forward (SM10X, compatible with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/KCP.md))
+* [x] Modular KDA Forward (SM10X, compatible with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/README.md))
   * [x] kda chunk intra
   * [x] chunk gated delta h
-  * [ ] recompute wu
+  * [x] recompute wu
   * [x] chunk fwd o
 
-* [ ] Modular GDN Forward / Backward Kernels (compatible with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/KCP.md))
+* [ ] Modular GDN Forward / Backward Kernels (compatible with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/README.md))
 
 * [ ] Backward pass optimizations.
 
@@ -228,6 +232,11 @@ If you find cuLA useful, please cite it using the metadata in our [`CITATION.cff
 
 ## Contact
 
-If you're interested in an internship or job opportunity, feel free to reach out: **shuyan.ycf@antgroup.com**  / **chaofanyu@gmail.com**
+If you're interested in an internship or job opportunity, feel free to reach out:  **chaofanyu@gmail.com**
 
 No CUDA experience is required as long as you're a quick learner.
+
+For Q&A and discussion, you can join us through:
+
+- **Slack:** [cuLA Slack Community](https://join.slack.com/t/cula-hq/shared_invite/zt-3uaacvm9y-xJwZyGueeKxZRYQlj7~hxw)
+- **WeChat:** The WeChat group has exceeded 200 members and can no longer be joined via QR code. To join, please send your WeChat ID to any of the following emails and we'll invite you: **chaofanyu@gmail.com** / **kevinzz08@foxmail.com** / **yzpag@gmail.com** / **haoc80996@gmail.com**. You can also ask someone already in the group to invite you directly.

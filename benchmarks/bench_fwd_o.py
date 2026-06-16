@@ -18,7 +18,7 @@ bench_fwd_o.py — Benchmark: CuTe DSL kernel vs FLA Triton baseline
                   for chunk_gla_fwd_o (KDA forward output)
 
 Compares:
-  - Accuracy: max_diff, mean_diff between CuTe DSL and FLA Triton outputs
+    - Accuracy: relative_rms_error, max_diff, mean_diff between CuTe DSL and FLA Triton outputs
   - Performance: kernel execution time (ms) with CUDA events
 
 Both non-varlen and varlen modes are supported.
@@ -44,15 +44,18 @@ import sys
 
 import torch
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
-_fwd_o_mod = importlib.import_module("cula.ops.fwd_o")
+_fwd_o_mod = importlib.import_module("cula.ops.fwd_o_sm100")
 chunk_gla_fwd_o = _fwd_o_mod.chunk_gla_fwd_o
 build_chunk_indices = _fwd_o_mod.build_chunk_indices
 
 # ─── FLA baseline imports ───
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 from fla.ops.gla.chunk import chunk_gla_fwd_o_gk  # noqa: E402
+
+from benchmarks.utils import benchmark_cuda_mode_fn, relative_rms_error_max_rel_mean_abs  # noqa: E402
 
 # ============================================================
 # Constants
@@ -69,34 +72,6 @@ NCU_MODE = False
 # ============================================================
 # Helpers
 # ============================================================
-def time_kernel(fn, warmup=None, n_iters=None):
-    if warmup is None:
-        warmup = 1 if NCU_MODE else WARMUP
-    if n_iters is None:
-        n_iters = 1 if NCU_MODE else N_ITERS
-    """Time a kernel using CUDA events. Returns ms/call."""
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    start_evt.record()
-    for _ in range(n_iters):
-        fn()
-    end_evt.record()
-    torch.cuda.synchronize()
-    return start_evt.elapsed_time(end_evt) / n_iters
-
-
-def accuracy_stats(ref, out):
-    """Compute max, relative max, and mean absolute difference."""
-    ref_f = ref.float()
-    diff = (ref_f - out.float()).abs()
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-    denom = ref_f.abs().max().item()
-    rel_max_diff = max_diff / denom if denom > 0 else 0.0
-    return max_diff, rel_max_diff, mean_diff
 
 
 # ============================================================
@@ -108,17 +83,17 @@ def bench_non_varlen(configs):
     print("=" * 80)
     results = []
 
-    for B, T, H in configs:
+    for B, T, H, HV in configs:
         scale = K**-0.5
         NT = (T + BT - 1) // BT
         torch.manual_seed(42)
         torch.cuda.empty_cache()
 
         q = torch.randn(B, T, H, K, dtype=dtype, device=device)
-        v = torch.randn(B, T, H, V, dtype=dtype, device=device)
-        g = torch.randn(B, T, H, K, dtype=torch.float32, device=device) * 0.1
-        h = torch.randn(B, NT, H, K, V, dtype=dtype, device=device) * 0.01
-        A = torch.randn(B, T, H, BT, dtype=dtype, device=device) * 0.1
+        v = torch.randn(B, T, HV, V, dtype=dtype, device=device)
+        g = torch.randn(B, T, HV, K, dtype=torch.float32, device=device) * 0.1
+        h = torch.randn(B, NT, HV, K, V, dtype=dtype, device=device) * 0.01
+        A = torch.randn(B, T, HV, BT, dtype=dtype, device=device) * 0.1
 
         # ---- FLA baseline (accuracy) ----
         o_fla = chunk_gla_fwd_o_gk(
@@ -133,7 +108,7 @@ def bench_non_varlen(configs):
         )
 
         # ---- CuTe DSL (accuracy) ----
-        o_cute_t = torch.zeros(B, T, H, V, dtype=dtype, device=device)
+        o_cute_t = torch.zeros(B, T, HV, V, dtype=dtype, device=device)
 
         # Warmup / first call triggers compilation via cache
         chunk_gla_fwd_o(
@@ -150,7 +125,7 @@ def bench_non_varlen(configs):
         )
         torch.cuda.synchronize()
 
-        max_diff, rel_max_diff, mean_diff = accuracy_stats(o_fla, o_cute_t)
+        relative_rms_error, max_diff, rel_max_diff, mean_diff = relative_rms_error_max_rel_mean_abs(o_fla, o_cute_t)
 
         # ---- Performance timing ----
         def run_fla(q=q, v=v, g=g, A=A, h=h, scale=scale):
@@ -179,14 +154,18 @@ def bench_non_varlen(configs):
                 persistent=True,
             )
 
-        ms_fla = time_kernel(run_fla)
-        ms_cute = time_kernel(run_cute)
+        ms_fla = benchmark_cuda_mode_fn(run_fla, default_warmup=WARMUP, default_rep=N_ITERS, ncu_mode=NCU_MODE)
+        ms_cute = benchmark_cuda_mode_fn(run_cute, default_warmup=WARMUP, default_rep=N_ITERS, ncu_mode=NCU_MODE)
         speedup = ms_fla / ms_cute if ms_cute > 0 else float("inf")
 
+        hv_str = f"/{HV}" if HV != H else ""
         r = {
             "B": B,
             "T": T,
             "H": H,
+            "HV": HV,
+            "hv_str": hv_str,
+            "relative_rms_error": relative_rms_error,
             "max_diff": max_diff,
             "rel_max_diff": rel_max_diff,
             "mean_diff": mean_diff,
@@ -196,8 +175,8 @@ def bench_non_varlen(configs):
         }
         results.append(r)
         print(
-            f"  B={B:2d} T={T:5d} H={H:2d} | "
-            f"max_diff={max_diff:.6f} rel_max={rel_max_diff:.6f} mean_diff={mean_diff:.8f} | "
+            f"  B={B:2d} T={T:5d} H={H:2d}{hv_str:<4s} | "
+            f"relative_rms_error={relative_rms_error:.6f} max_diff={max_diff:.6f} rel_max={rel_max_diff:.6f} mean_diff={mean_diff:.8f} | "
             f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms | "
             f"speedup={speedup:.2f}x"
         )
@@ -232,7 +211,7 @@ def bench_varlen(configs):
     print("=" * 80)
     results = []
 
-    for seq_lens, H in configs:
+    for seq_lens, H, HV in configs:
         scale = K**-0.5
         T_total = sum(seq_lens)
         cu_seqlens_list = [0]
@@ -244,12 +223,12 @@ def bench_varlen(configs):
         torch.cuda.empty_cache()
 
         # Flat token-indexed tensors (shared data for both kernels)
-        # 4D with B=1: [1, T_total, H, *]
+        # q uses H (QK heads), g/v/h/A/o use HV (value heads)
         q_flat = torch.randn(1, T_total, H, K, dtype=dtype, device=device)
-        v_flat = torch.randn(1, T_total, H, V, dtype=dtype, device=device)
-        g_flat = torch.randn(1, T_total, H, K, dtype=torch.float32, device=device) * 0.1
-        h_flat = torch.randn(1, total_nt_val, H, K, V, dtype=dtype, device=device) * 0.01
-        A_flat = torch.randn(1, T_total, H, BT, dtype=dtype, device=device) * 0.1
+        v_flat = torch.randn(1, T_total, HV, V, dtype=dtype, device=device)
+        g_flat = torch.randn(1, T_total, HV, K, dtype=torch.float32, device=device) * 0.1
+        h_flat = torch.randn(1, total_nt_val, HV, K, V, dtype=dtype, device=device) * 0.01
+        A_flat = torch.randn(1, T_total, HV, BT, dtype=dtype, device=device) * 0.1
 
         # ---- FLA baseline (needs [1, T_total, H, *] + cu_seqlens int64) ----
         cu_fla = torch.tensor(cu_seqlens_list, dtype=torch.long, device=device)
@@ -267,7 +246,7 @@ def bench_varlen(configs):
         )
 
         # ---- CuTe DSL varlen ----
-        o_cute_flat = torch.zeros(1, T_total, H, V, dtype=dtype, device=device)
+        o_cute_flat = torch.zeros(1, T_total, HV, V, dtype=dtype, device=device)
         cu_cute = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
         ci_cute = build_chunk_indices(seq_lens, BT=BT, device=device)
 
@@ -289,7 +268,9 @@ def bench_varlen(configs):
         torch.cuda.synchronize()
 
         # Both outputs are [1, T_total, H, V]; squeeze to [T_total, H, V] for comparison
-        max_diff, rel_max_diff, mean_diff = accuracy_stats(o_fla.squeeze(0), o_cute_flat.squeeze(0))
+        relative_rms_error, max_diff, rel_max_diff, mean_diff = relative_rms_error_max_rel_mean_abs(
+            o_fla.squeeze(0), o_cute_flat.squeeze(0)
+        )
 
         # ---- Performance timing ----
         def run_fla(q_flat=q_flat, v_flat=v_flat, g_flat=g_flat, A_flat=A_flat, h_flat=h_flat, cu_fla=cu_fla, scale=scale):
@@ -331,19 +312,23 @@ def bench_varlen(configs):
                 persistent=True,
             )
 
-        ms_fla = time_kernel(run_fla)
-        ms_cute = time_kernel(run_cute)
+        ms_fla = benchmark_cuda_mode_fn(run_fla, default_warmup=WARMUP, default_rep=N_ITERS, ncu_mode=NCU_MODE)
+        ms_cute = benchmark_cuda_mode_fn(run_cute, default_warmup=WARMUP, default_rep=N_ITERS, ncu_mode=NCU_MODE)
         speedup = ms_fla / ms_cute if ms_cute > 0 else float("inf")
 
         n_seqs = len(seq_lens)
         min_l, max_l = min(seq_lens), max(seq_lens)
         avg_l = T_total // n_seqs
         tag = f"{n_seqs}seqs T={T_total} [{min_l}..{max_l}] avg={avg_l}"
+        hv_str = f"/{HV}" if HV != H else ""
         r = {
             "tag": tag,
             "T_total": T_total,
             "H": H,
+            "HV": HV,
+            "hv_str": hv_str,
             "n_seqs": n_seqs,
+            "relative_rms_error": relative_rms_error,
             "max_diff": max_diff,
             "rel_max_diff": rel_max_diff,
             "mean_diff": mean_diff,
@@ -353,8 +338,8 @@ def bench_varlen(configs):
         }
         results.append(r)
         print(
-            f"  {tag:45s} H={H:2d} | "
-            f"max_diff={max_diff:.6f} rel_max={rel_max_diff:.6f} mean_diff={mean_diff:.8f} | "
+            f"  {tag:45s} H={H:2d}{hv_str:<4s} | "
+            f"relative_rms_error={relative_rms_error:.6f} max_diff={max_diff:.6f} rel_max={rel_max_diff:.6f} mean_diff={mean_diff:.8f} | "
             f"FLA={ms_fla:.4f}ms CuTe={ms_cute:.4f}ms | "
             f"speedup={speedup:.2f}x"
         )
@@ -380,16 +365,17 @@ def print_report(nv_results, vl_results):
     if nv_results:
         print("\n  [Non-Varlen]")
         hdr = (
-            f"  {'B':>3s}  {'T':>5s}  {'H':>3s}  │  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
+            f"  {'B':>3s}  {'T':>5s}  {'H':>7s}  │  {'rel_rmse':>10s}  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
             f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 90}")
         print(hdr)
         print(f"  {'─' * 90}")
         for r in nv_results:
+            h_label = f"{r['H']}{r['hv_str']}"
             print(
-                f"  {r['B']:3d}  {r['T']:5d}  {r['H']:3d}  │  "
-                f"{r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                f"  {r['B']:3d}  {r['T']:5d}  {h_label:>7s}  │  "
+                f"{r['relative_rms_error']:10.6f}  {r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x"
             )
         print(f"  {'─' * 90}")
@@ -397,16 +383,17 @@ def print_report(nv_results, vl_results):
     if vl_results:
         print("\n  [Varlen]")
         hdr = (
-            f"  {'Config':>45s}  {'H':>3s}  │  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
+            f"  {'Config':>45s}  {'H':>7s}  │  {'rel_rmse':>10s}  {'max_diff':>10s}  {'rel_max':>10s}  {'mean_diff':>12s}"
             f"  │  {'FLA(ms)':>9s}  {'CuTe(ms)':>9s}  {'Speedup':>8s}"
         )
         print(f"  {'─' * 117}")
         print(hdr)
         print(f"  {'─' * 117}")
         for r in vl_results:
+            h_label = f"{r['H']}{r['hv_str']}"
             print(
-                f"  {r['tag']:>45s}  {r['H']:3d}  │  "
-                f"{r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
+                f"  {r['tag']:>45s}  {h_label:>7s}  │  "
+                f"{r['relative_rms_error']:10.6f}  {r['max_diff']:10.6f}  {r['rel_max_diff']:10.6f}  {r['mean_diff']:12.8f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cute']:9.4f}  {r['speedup']:7.2f}x"
             )
         print(f"  {'─' * 117}")
@@ -431,6 +418,18 @@ def main():
         action="store_true",
         help="NCU profiling mode: warmup=1, iters=1",
     )
+    parser.add_argument(
+        "--heads",
+        type=int,
+        default=64,
+        help="Number of QK heads H (default: 64)",
+    )
+    parser.add_argument(
+        "--hv",
+        type=int,
+        default=None,
+        help="Number of value heads HV (default: same as --heads, i.e. no GVA)",
+    )
     args = parser.parse_args()
 
     global NCU_MODE
@@ -438,21 +437,24 @@ def main():
         NCU_MODE = True
         print("[NCU mode] warmup=1, iters=1")
 
+    H = args.heads
+    HV = args.hv if args.hv is not None else H
+    assert HV >= H and HV % H == 0, f"HV ({HV}) must be >= H ({H}) and divisible by H"
+
     non_varlen_configs = [
-        # (B, T, H)
-        (2, 8192, 64),
-        (2, 32768, 64),
-        (4, 8192, 64),
-        (4, 32768, 64),
+        # (B, T, H, HV)
+        (2, 8192, H, HV),
+        (2, 32768, H, HV),
+        (4, 8192, H, HV),
+        (4, 32768, H, HV),
     ]
 
     varlen_configs = [
-        # (seq_lens, H) — realistic serving scenarios
-        # ~20-25 seqs, total 8k/32k, lengths vary 2-3x, H=64
-        (gen_varlen_seqs(8192, 20, seed=1), 64),
-        (gen_varlen_seqs(8192, 25, seed=2), 64),
-        (gen_varlen_seqs(32768, 20, seed=3), 64),
-        (gen_varlen_seqs(32768, 25, seed=4), 64),
+        # (seq_lens, H, HV)
+        (gen_varlen_seqs(8192, 20, seed=1), H, HV),
+        (gen_varlen_seqs(8192, 25, seed=2), H, HV),
+        (gen_varlen_seqs(32768, 20, seed=3), H, HV),
+        (gen_varlen_seqs(32768, 25, seed=4), H, HV),
     ]
 
     nv_res, vl_res = [], []

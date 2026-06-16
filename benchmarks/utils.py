@@ -60,6 +60,170 @@ def set_seed(seed: int):
     torch.cuda.manual_seed(seed)
 
 
+def benchmark_cuda_fn(fn, *, setup_fn=None, warmup=30, rep=200, aggregate="iqr_mean"):
+    """Benchmark a CUDA callable with events and return milliseconds per call."""
+    for _ in range(warmup):
+        if setup_fn is not None:
+            setup_fn()
+        fn()
+    torch.cuda.synchronize()
+
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+
+    for i in range(rep):
+        if setup_fn is not None:
+            setup_fn()
+        starts[i].record()
+        fn()
+        ends[i].record()
+
+    torch.cuda.synchronize()
+    times = [s.elapsed_time(e) for s, e in zip(starts, ends)]
+    if not times:
+        return 0.0
+    if aggregate == "mean":
+        return sum(times) / len(times)
+    if aggregate == "iqr_mean":
+        times = sorted(times)
+        if len(times) <= 2:
+            return sum(times) / len(times)
+        iqr = times[len(times) // 4 : 3 * len(times) // 4]
+        return sum(iqr) / len(iqr)
+    raise ValueError(f"Unsupported aggregate={aggregate}")
+
+
+def resolve_benchmark_repeats(default_warmup, default_rep, *, ncu_mode=False, sanitizer_mode=False):
+    """Resolve benchmark warmup and repeat counts for normal vs profiling runs."""
+    if ncu_mode or sanitizer_mode:
+        return 1, 1
+    return default_warmup, default_rep
+
+
+def benchmark_cuda_mode_fn(
+    fn,
+    *,
+    default_warmup,
+    default_rep,
+    ncu_mode=False,
+    sanitizer_mode=False,
+    setup_fn=None,
+):
+    """Benchmark a CUDA callable using standard repo warmup/repeat mode rules."""
+    warmup, rep = resolve_benchmark_repeats(
+        default_warmup,
+        default_rep,
+        ncu_mode=ncu_mode,
+        sanitizer_mode=sanitizer_mode,
+    )
+    return benchmark_cuda_fn(fn, setup_fn=setup_fn, warmup=warmup, rep=rep, aggregate="mean")
+
+
+def triton_bench_fn(fn, **kwargs):
+    """Benchmark a callable with Triton's do_bench helper."""
+    import triton
+
+    return triton.testing.do_bench(fn, **kwargs)
+
+
+def time_cuda_fn(fn, warmup, iters):
+    """Time a CUDA callable and return milliseconds per call."""
+    return benchmark_cuda_fn(fn, warmup=warmup, rep=iters, aggregate="mean")
+
+
+def _error_stats(ref: torch.Tensor, out: torch.Tensor):
+    """Return shared float-cast tensors and basic absolute/RMS error stats."""
+    ref_f = ref.float()
+    out_f = out.float()
+    diff = (ref_f - out_f).abs()
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+    rmse = diff.pow(2).mean().sqrt().item()
+    ref_rms = ref_f.pow(2).mean().sqrt().item()
+    return ref_f, out_f, max_diff, mean_diff, rmse, ref_rms
+
+
+def _relative_max(max_diff: float, denom: float):
+    return max_diff / denom if denom > 0 else 0.0
+
+
+def rmse_rel_max(ref: torch.Tensor, out: torch.Tensor):
+    """Return RMSE and relative max error between two tensors."""
+    ref_f, _out_f, max_diff, _mean_diff, rmse, _ref_rms = _error_stats(ref, out)
+    rel_max = _relative_max(max_diff, ref_f.abs().max().item())
+    return rmse, rel_max
+
+
+def relative_rms_error(ref: torch.Tensor, out: torch.Tensor):
+    """Return relative RMS error between two tensors."""
+    _ref_f, _out_f, _max_diff, _mean_diff, rmse, ref_rms = _error_stats(ref, out)
+    return rmse / (ref_rms + 1e-8)
+
+
+def relative_rms_error_rel_max(ref: torch.Tensor, out: torch.Tensor):
+    """Return relative RMS error and relative max error."""
+    ref_f, _out_f, max_diff, _mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    relative_rms = relative_rms_error(ref, out)
+    rel_max = _relative_max(max_diff, ref_f.abs().max().item())
+    return relative_rms, rel_max
+
+
+def rmse_rel_max_mean_abs(ref: torch.Tensor, out: torch.Tensor):
+    """Return RMSE, relative max error, and mean absolute difference."""
+    ref_f, _out_f, max_diff, mean_diff, rmse, _ref_rms = _error_stats(ref, out)
+    rel_max = _relative_max(max_diff, ref_f.abs().max().item())
+    return rmse, rel_max, mean_diff
+
+
+def rmse_rel_max_mean_abs_rhs(ref: torch.Tensor, out: torch.Tensor):
+    """Return RMSE, relative max error vs rhs magnitude, and mean absolute difference."""
+    _ref_f, out_f, max_diff, mean_diff, rmse, _ref_rms = _error_stats(ref, out)
+    rel_max = _relative_max(max_diff, out_f.abs().max().item())
+    return rmse, rel_max, mean_diff
+
+
+def relative_rms_error_rel_max_mean_abs(ref: torch.Tensor, out: torch.Tensor):
+    """Return relative RMS error, relative max error, and mean absolute difference."""
+    ref_f, _out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    relative_rms = relative_rms_error(ref, out)
+    rel_max = _relative_max(max_diff, ref_f.abs().max().item())
+    return relative_rms, rel_max, mean_diff
+
+
+def relative_rms_error_rel_max_mean_abs_rhs(ref: torch.Tensor, out: torch.Tensor):
+    """Return relative RMS error, rhs-relative max error, and mean absolute difference."""
+    _ref_f, out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    relative_rms = relative_rms_error(ref, out)
+    rel_max = _relative_max(max_diff, out_f.abs().max().item())
+    return relative_rms, rel_max, mean_diff
+
+
+def relative_rms_error_max_mean_abs(ref: torch.Tensor, out: torch.Tensor):
+    """Return relative RMS error, max error, and mean absolute difference."""
+    _ref_f, _out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    return relative_rms_error(ref, out), max_diff, mean_diff
+
+
+def relative_rms_error_max_rel_mean_abs(ref: torch.Tensor, out: torch.Tensor):
+    """Return relative RMS error, max error, relative max error, and mean absolute difference."""
+    ref_f, _out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    rel_max_diff = _relative_max(max_diff, ref_f.abs().max().item())
+    return relative_rms_error(ref, out), max_diff, rel_max_diff, mean_diff
+
+
+def max_mean_abs_diff(ref: torch.Tensor, out: torch.Tensor):
+    """Return max and mean absolute difference."""
+    _ref_f, _out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    return max_diff, mean_diff
+
+
+def max_rel_mean_abs_diff(ref: torch.Tensor, out: torch.Tensor):
+    """Return max error, relative max error, and mean absolute difference."""
+    ref_f, _out_f, max_diff, mean_diff, _rmse, _ref_rms = _error_stats(ref, out)
+    rel_max_diff = _relative_max(max_diff, ref_f.abs().max().item())
+    return max_diff, rel_max_diff, mean_diff
+
+
 def exclusive_cumsum(a: list[int]):
     r = [0]
     for v in a:
@@ -256,25 +420,40 @@ def build_varlen_configs(
 
 
 def prepare_safe_gate_inputs(
-    batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED, has_init_state=False
+    batch_size,
+    T,
+    H,
+    D,
+    device,
+    cu_seqlens=None,
+    chunk_size=CHUNK_SIZE,
+    seed=SEED,
+    has_init_state=False,
+    num_v_heads=None,
 ):
     """Prepare inputs for safe_gate benchmarks (use_gate_in_kernel=True, safe_gate=True).
 
     All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
     """
+    HV = H if num_v_heads is None else num_v_heads
+    assert HV >= H and HV % H == 0, f"HV ({HV}) must be a positive multiple of H ({H}) with HV >= H."
+
     dtype = torch.bfloat16
     scale = D ** (-0.5)
 
     set_seed(seed)
 
+    # Allocate native GVA shapes:
     q = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
     k = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    v = torch.randn(batch_size, T, H, D, dtype=dtype, device=device).requires_grad_(False)
-    g = torch.randn(batch_size, T, H, D, dtype=torch.float, device=device).requires_grad_(False)
-    beta = torch.randn(batch_size, T, H, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
+    v = torch.randn(batch_size, T, HV, D, dtype=dtype, device=device).requires_grad_(False)
+    g = torch.randn(batch_size, T, HV, D, dtype=dtype, device=device).requires_grad_(False)
+    beta = torch.randn(batch_size, T, HV, dtype=torch.float, device=device).sigmoid().requires_grad_(False)
 
-    A_log = torch.randn(H, dtype=torch.float, device=device).requires_grad_(False)
-    dt_bias = torch.randn(H * D, dtype=torch.float, device=device).requires_grad_(False)
+    # A_log / dt_bias must match the head count of `g` (HV), otherwise
+    # kda_gate_chunk_cumsum would index out of bounds for i_h >= H.
+    A_log = torch.randn(HV, dtype=torch.float, device=device).requires_grad_(False)
+    dt_bias = torch.randn(HV * D, dtype=torch.float, device=device).requires_grad_(False)
 
     # flatten to batch_size=1 for cu_seqlens compatibility
     if batch_size != 1:
@@ -285,7 +464,7 @@ def prepare_safe_gate_inputs(
     init_state = None
     if has_init_state:
         num_seqs = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else batch_size
-        init_state = torch.randn(num_seqs, H, D, D, dtype=torch.float, device=device).requires_grad_(False)
+        init_state = torch.randn(num_seqs, HV, D, D, dtype=torch.float, device=device).requires_grad_(False)
 
     return dict(
         q=q,
@@ -303,11 +482,23 @@ def prepare_safe_gate_inputs(
     )
 
 
-def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED):
+def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_size=CHUNK_SIZE, seed=SEED, num_v_heads=None):
     """Prepare preprocessed inputs ready for chunk_kda_fwd_intra.
 
-    All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
+    Supports both standard (HV=H) and GVA (HV > H) layouts via ``num_v_heads``:
+
+        q, k  : (batch_size_flat, T, H,  D)  — Q/K head space (always compact)
+        v     : (batch_size_flat, T, HV, D)  — V head space
+        g     : (batch_size_flat, T, HV, D)  — gate in V head space (after cumsum)
+        beta  : (batch_size_flat, T, HV)      — beta in V head space
+
+    When ``num_v_heads`` is None or equal to H this matches the original non-GVA
+    behaviour exactly. All tensors are flattened to batch_size=1 for cu_seqlens
+    compatibility.
     """
+    HV = H if num_v_heads is None else num_v_heads
+    assert HV >= H and HV % H == 0, f"num_v_heads ({HV}) must be a positive multiple of H ({H})"
+
     dtype = torch.bfloat16
     scale = D ** (-0.5)
 
@@ -315,9 +506,9 @@ def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_siz
 
     q = torch.randn(batch_size, T, H, D, dtype=dtype, device=device)
     k = torch.randn(batch_size, T, H, D, dtype=dtype, device=device)
-    v = torch.randn(batch_size, T, H, D, dtype=dtype, device=device)
-    g_raw = torch.randn(batch_size, T, H, D, dtype=torch.float, device=device)
-    beta = torch.randn(batch_size, T, H, dtype=torch.float, device=device).sigmoid()
+    v = torch.randn(batch_size, T, HV, D, dtype=dtype, device=device)
+    g_raw = torch.randn(batch_size, T, HV, D, dtype=dtype, device=device)
+    beta = torch.randn(batch_size, T, HV, dtype=torch.float, device=device).sigmoid()
 
     # l2norm q, k
     q, _ = l2norm_fwd(q)
@@ -327,9 +518,9 @@ def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_siz
     if batch_size != 1:
         q, k, v, g_raw, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g_raw, beta))
 
-    # gate preprocessing
-    A_log = torch.randn(H, dtype=torch.float, device=device)
-    dt_bias = torch.randn(H * D, dtype=torch.float, device=device)
+    # gate preprocessing — A_log / dt_bias live in HV head space
+    A_log = torch.randn(HV, dtype=torch.float, device=device)
+    dt_bias = torch.randn(HV * D, dtype=torch.float, device=device)
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
 
@@ -345,3 +536,104 @@ def prepare_intra_inputs(batch_size, T, H, D, device, cu_seqlens=None, chunk_siz
     )
 
     return q, k, v, g, beta, scale, cu_seqlens, chunk_indices
+
+
+def prepare_bwd_wy_dqkg_fused_inputs(
+    B: int,
+    T: int,
+    H: int,
+    K: int,
+    V: int,
+    HV: int | None = None,
+    chunk_size: int = CHUNK_SIZE,
+    device: torch.device | str = "cuda",
+    seed: int = SEED,
+    cu_seqlens: torch.Tensor | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> dict:
+    """Prepare all inputs needed by the bwd_wy_dqkg_fused benchmark runners.
+
+    Generates the full set of tensors consumed by both the FLA Triton and CuTe DSL
+    chunk_kda_bwd_wy_dqkg_fused kernels.  Follows the same flattening convention
+    used in other prepare_* helpers (B=1 with cu_seqlens for varlen mode).
+
+    HV: number of value heads (default: H). Set HV > H for GVA (grouped value attention).
+    q/k always have H heads; all other tensors use HV heads.
+
+    Returns a dict with keys used directly by ``run_fla_triton`` and ``run_cutedsl``
+    in ``bench_bwd_wy_dqkg_fused.py``.
+    """
+    if HV is None:
+        HV = H
+    BT = chunk_size
+    scale = K**-0.5
+
+    set_seed(seed)
+
+    # ---- primary token-indexed tensors ----
+    q = torch.randn(B, T, H, K, dtype=dtype, device=device)
+    k = torch.randn(B, T, H, K, dtype=dtype, device=device)
+    v = torch.randn(B, T, HV, V, dtype=dtype, device=device)
+    g_raw = torch.randn(B, T, HV, K, dtype=dtype, device=device)
+    beta = torch.randn(B, T, HV, dtype=torch.float, device=device).sigmoid()
+
+    # l2norm q, k
+    q, _ = l2norm_fwd(q)
+    k, _ = l2norm_fwd(k)
+
+    # gate preprocessing
+    A_log = torch.randn(HV, dtype=torch.float, device=device)
+    dt_bias = torch.randn(HV * K, dtype=torch.float, device=device)
+
+    v_new = torch.randn(B, T, HV, V, dtype=dtype, device=device)
+    do = torch.randn(B, T, HV, V, dtype=dtype, device=device)
+    dv = torch.randn(B, T, HV, V, dtype=dtype, device=device)
+    A = torch.randn(B, T, HV, BT, dtype=dtype, device=device) * 0.1
+
+    # ---- chunk-indexed state tensors ----
+    if cu_seqlens is not None:
+        cu_seqlens = cu_seqlens.int()
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        NT = chunk_indices.shape[0]
+    else:
+        NT = (B * T + BT - 1) // BT
+        chunk_indices = None
+
+    # h/dh: both FLA Triton and CuTe DSL use bf16 [B, NT, HV, K, V]
+    h = torch.randn(B, NT, HV, K, V, dtype=dtype, device=device) * 0.01
+    dh = torch.randn(B, NT, HV, K, V, dtype=dtype, device=device) * 0.01
+
+    # flatten to batch_size=1 for cu_seqlens compatibility
+    if B != 1:
+        q, k = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k))
+        v, g_raw, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (v, g_raw, beta))
+        v_new, do, dv, A = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (v_new, do, dv, A))
+        h, dh = map(lambda x: rearrange(x, "b nt ... -> 1 (b nt) ..."), (h, dh))
+
+    g = kda_gate_chunk_cumsum(
+        g=g_raw,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=RCP_LN2,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        lower_bound=-5.0,
+    )
+
+    return dict(
+        q=q,
+        k=k,
+        v=v,
+        v_new=v_new,
+        g=g,
+        beta=beta,
+        A=A,
+        h=h,
+        dh=dh,
+        do=do,
+        dv=dv,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )

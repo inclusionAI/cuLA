@@ -18,19 +18,23 @@ bench_kda_fused_fwd.py — Benchmark: cuLA fully-fused KDA forward vs FLA Triton
 
 Automatically selects the cuLA fully-fused implementation based on the current
 GPU architecture:
-  - sm100 (Blackwell) → cula.kda.blackwell_fused_fwd.flash_kda_prefill
+    - sm100 (Blackwell) → cula.kda.blackwell_fused_fwd.flash_kda_prefill
   - sm90  (Hopper)    → cula.kda.hopper_fused_fwd.cula_kda_prefill
 
 Compares:
-  - Accuracy: RMSE, relative max diff between cuLA fully-fused and FLA Triton
+    - Accuracy: relative_rms_error, relative max diff between cuLA fully-fused and FLA Triton
   - Performance: kernel execution time (ms) with CUDA events
 
 Modes:
   - Fixed-length: various (B, T) configs
   - Varlen: sequences with 2-3x length variation
 
+H (number of Q/K heads) is a module-level constant; HV (number of V heads)
+defaults to H and can be overridden globally via --hv to run every config in
+GVA (Grouped Value Attention) mode. HV must be a positive multiple of H.
+
 Usage:
-  python bench_kda_fused_fwd.py [--mode fixed|varlen|both] [--ncu]
+  python bench_kda_fused_fwd.py [--mode fixed|varlen|both] [--heads H] [--hv HV] [--ncu]
 
 With --ncu, warmup=1 and iters=1 for ncu profiling:
   ncu --set full -o report python bench_kda_fused_fwd.py --mode varlen --ncu
@@ -49,9 +53,11 @@ from fla.ops.kda import chunk_kda as fla_chunk_kda
 
 from benchmarks.utils import (
     SEED,
+    benchmark_cuda_mode_fn,
     build_varlen_configs,
     exclusive_cumsum,
     prepare_safe_gate_inputs,
+    relative_rms_error_rel_max_mean_abs,
     set_seed,
 )
 from cula.utils import get_device_sm_version, get_kda_fused_fwd
@@ -67,45 +73,21 @@ cula_kda_fused_fwd = get_kda_fused_fwd(_device)
 # ============================================================
 # Constants
 # ============================================================
+# Default number of Q/K heads (H) and V heads (HV). When HV > H the run is in
+# GVA mode (the kernel sees HV expanded q/k heads, prepared internally by
+# prepare_safe_gate_inputs). HV is overridable globally via --hv.
 H, D = 64, 128
-WARMUP = 10
-N_ITERS = 30
+HV = H
+WARMUP = 25
+N_ITERS = 100
 NCU_MODE = False
 SANITIZER_MODE = False
+HAS_INIT_STATE = False
 
 
 # ============================================================
 # Helpers
 # ============================================================
-def time_kernel(fn, warmup=None, n_iters=None):
-    if warmup is None:
-        warmup = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
-    if n_iters is None:
-        n_iters = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    start_evt.record()
-    for _ in range(n_iters):
-        fn()
-    end_evt.record()
-    torch.cuda.synchronize()
-    return start_evt.elapsed_time(end_evt) / n_iters
-
-
-def accuracy_stats(ref, out):
-    """Compute RMSE, relative max diff, and mean absolute difference."""
-    ref_f = ref.float()
-    out_f = out.float()
-    diff = (ref_f - out_f).abs()
-    rmse = diff.pow(2).mean().sqrt().item()
-    max_diff = diff.max().item()
-    denom = ref_f.abs().max().item()
-    rel_max = max_diff / denom if denom > 0 else 0.0
-    mean_diff = diff.mean().item()
-    return rmse, rel_max, mean_diff
 
 
 def run_fla(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, lower_bound):
@@ -125,6 +107,7 @@ def run_fla(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, low
         use_gate_in_kernel=True,
         safe_gate=True,
         lower_bound=lower_bound,
+        transpose_state_layout=True,
     )
 
 
@@ -157,7 +140,8 @@ def bench_fixed(configs):
     print("=" * 100)
     results = []
 
-    for B, T in configs:
+    for cfg in configs:
+        B, T = cfg
         set_seed(SEED)
         device = torch.device("cuda")
         torch.cuda.empty_cache()
@@ -165,7 +149,16 @@ def bench_fixed(configs):
         seq_lens = [T] * B
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-        inputs = prepare_safe_gate_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens)
+        inputs = prepare_safe_gate_inputs(
+            B,
+            T,
+            H,
+            D,
+            device,
+            cu_seqlens=cu_seqlens,
+            has_init_state=HAS_INIT_STATE,
+            num_v_heads=HV,
+        )
         q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
         A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
         scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
@@ -189,18 +182,32 @@ def bench_fixed(configs):
         o_cula, _ = run_cula(**common)
         torch.cuda.synchronize()
 
-        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
+        relative_rms_error, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs(o_fla, o_cula)
 
         # Performance
-        ms_fla = time_kernel(lambda: run_fla(**common))
-        ms_cula = time_kernel(lambda: run_cula(**common))
+        ms_fla = benchmark_cuda_mode_fn(
+            lambda: run_fla(**common),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+            sanitizer_mode=SANITIZER_MODE,
+        )
+        ms_cula = benchmark_cuda_mode_fn(
+            lambda: run_cula(**common),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+            sanitizer_mode=SANITIZER_MODE,
+        )
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         results.append(
             {
                 "B": B,
                 "T": T,
-                "rmse": rmse,
+                "H": H,
+                "HV": HV,
+                "relative_rms_error": relative_rms_error,
                 "rel_max": rel_max,
                 "mean_diff": mean_diff,
                 "ms_fla": ms_fla,
@@ -224,7 +231,8 @@ def bench_varlen(configs):
     print("=" * 100)
     results = []
 
-    for seq_lens, total_len, dist in configs:
+    for cfg in configs:
+        seq_lens, total_len, dist = cfg
         set_seed(SEED)
         device = torch.device("cuda")
         torch.cuda.empty_cache()
@@ -232,7 +240,16 @@ def bench_varlen(configs):
         T = total_len
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
-        inputs = prepare_safe_gate_inputs(1, T, H, D, device, cu_seqlens=cu_seqlens)
+        inputs = prepare_safe_gate_inputs(
+            1,
+            T,
+            H,
+            D,
+            device,
+            cu_seqlens=cu_seqlens,
+            has_init_state=HAS_INIT_STATE,
+            num_v_heads=HV,
+        )
         q, k, v, g, beta = inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
         A_log, dt_bias = inputs["A_log"], inputs["dt_bias"]
         scale, init_state, lower_bound = inputs["scale"], inputs["init_state"], inputs["lower_bound"]
@@ -256,11 +273,23 @@ def bench_varlen(configs):
         o_cula, _ = run_cula(**common)
         torch.cuda.synchronize()
 
-        rmse, rel_max, mean_diff = accuracy_stats(o_fla, o_cula)
+        relative_rms_error, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs(o_fla, o_cula)
 
         # Performance
-        ms_fla = time_kernel(lambda: run_fla(**common))
-        ms_cula = time_kernel(lambda: run_cula(**common))
+        ms_fla = benchmark_cuda_mode_fn(
+            lambda: run_fla(**common),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+            sanitizer_mode=SANITIZER_MODE,
+        )
+        ms_cula = benchmark_cuda_mode_fn(
+            lambda: run_cula(**common),
+            default_warmup=WARMUP,
+            default_rep=N_ITERS,
+            ncu_mode=NCU_MODE,
+            sanitizer_mode=SANITIZER_MODE,
+        )
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         n_seqs = len(seq_lens)
@@ -274,7 +303,9 @@ def bench_varlen(configs):
                 "dist": dist,
                 "T_total": T,
                 "n_seqs": n_seqs,
-                "rmse": rmse,
+                "H": H,
+                "HV": HV,
+                "relative_rms_error": relative_rms_error,
                 "rel_max": rel_max,
                 "mean_diff": mean_diff,
                 "ms_fla": ms_fla,
@@ -293,11 +324,13 @@ def bench_varlen(configs):
 # Report
 # ============================================================
 def print_report(fixed_results, varlen_results):
-    sep = "=" * 110
+    sep = "=" * 120
     print(f"\n\n{sep}")
     print("                  BENCHMARK REPORT: cula_kda_fused_fwd (fully-fused)")
     print(f"                  cuLA {_SM_TAG} fully-fused vs FLA Triton")
-    print(f"                  H={H}  D={D}  dtype=bf16  safe_gate=True  use_gate_in_kernel=True")
+    print(f"                  D={D}  dtype=bf16  safe_gate=True  has_init_state={HAS_INIT_STATE}")
+    gva_note = f"GVA enabled (HV={HV} > H={H}, ratio={HV // H}x)" if HV > H else f"MHA (HV=H={H})"
+    print(f"                  {gva_note}")
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
     mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
@@ -306,35 +339,39 @@ def print_report(fixed_results, varlen_results):
 
     if fixed_results:
         print("\n  [Fixed-Length]")
-        print(f"  {'─' * 90}")
+        print(f"  {'─' * 110}")
         print(
-            f"  {'B':>3s}  {'T':>6s}  │  {'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}"
-            f"  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
+            f"  {'B':>3s}  {'T':>6s}  {'H':>3s}  {'HV':>3s}  {'GVA':>4s}  │  "
+            f"{'rel_rmse':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}  │  "
+            f"{'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
         )
-        print(f"  {'─' * 90}")
+        print(f"  {'─' * 110}")
         for r in fixed_results:
+            gva_tag = f"{r['HV'] // r['H']}x" if r["HV"] > r["H"] else "no"
             print(
-                f"  {r['B']:3d}  {r['T']:6d}  │  "
-                f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
+                f"  {r['B']:3d}  {r['T']:6d}  {r['H']:3d}  {r['HV']:3d}  {gva_tag:>4s}  │  "
+                f"{r['relative_rms_error']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x"
             )
-        print(f"  {'─' * 90}")
+        print(f"  {'─' * 110}")
 
     if varlen_results:
         print("\n  [Varlen]")
-        print(f"  {'─' * 105}")
+        print(f"  {'─' * 120}")
         print(
-            f"  {'Config':>45s}  │  {'RMSE':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}"
-            f"  │  {'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
+            f"  {'Config':>45s}  {'H':>3s}  {'HV':>3s}  {'GVA':>4s}  │  "
+            f"{'rel_rmse':>10s}  {'rel_max':>10s}  {'mean_diff':>10s}  │  "
+            f"{'FLA(ms)':>9s}  {'cuLA(ms)':>10s}  {'Speedup':>8s}"
         )
-        print(f"  {'─' * 105}")
+        print(f"  {'─' * 120}")
         for r in varlen_results:
+            gva_tag = f"{r['HV'] // r['H']}x" if r["HV"] > r["H"] else "no"
             print(
-                f"  {r['tag']:>45s}  │  "
-                f"{r['rmse']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
+                f"  {r['tag']:>45s}  {r['H']:3d}  {r['HV']:3d}  {gva_tag:>4s}  │  "
+                f"{r['relative_rms_error']:10.6f}  {r['rel_max']:10.6f}  {r['mean_diff']:10.6f}  │  "
                 f"{r['ms_fla']:9.4f}  {r['ms_cula']:10.4f}  {r['speedup']:7.2f}x"
             )
-        print(f"  {'─' * 105}")
+        print(f"  {'─' * 120}")
 
     print(f"\n{sep}\n")
 
@@ -349,7 +386,7 @@ def main():
         type=str,
         default="both",
         choices=["fixed", "varlen", "both"],
-        help="Which benchmark mode to run (default: both)",
+        help="Which benchmark mode to run (default: both).",
     )
     parser.add_argument(
         "--ncu",
@@ -361,20 +398,52 @@ def main():
         action="store_true",
         help="Sanitizer mode: warmup=1, iters=1",
     )
+    parser.add_argument(
+        "--init_state",
+        action="store_true",
+        help="Use non-zero initial state (default: False)",
+    )
+    global H
+    parser.add_argument(
+        "--heads",
+        type=int,
+        default=H,
+        help=f"Number of Q/K heads (H). Default: {H}",
+    )
+    parser.add_argument(
+        "--hv",
+        type=int,
+        default=None,
+        help=f"Override number of V heads (HV). Default: H ({H}, no GVA). Set HV > H to run all configs in GVA mode.",
+    )
     args = parser.parse_args()
 
-    global NCU_MODE, SANITIZER_MODE
+    global NCU_MODE, SANITIZER_MODE, HAS_INIT_STATE, HV
+    H = args.heads
     if args.ncu:
         NCU_MODE = True
         print("[NCU mode] warmup=1, iters=1")
     if args.sanitizer:
         SANITIZER_MODE = True
         print("[Sanitizer mode] warmup=1, iters=1")
+    if args.init_state:
+        HAS_INIT_STATE = True
+        print("[init_state] using non-zero initial state")
+    if args.hv is not None:
+        if args.hv < H or args.hv % H != 0:
+            raise ValueError(f"--hv must be a positive multiple of H ({H}), got {args.hv}")
+        HV = args.hv
+        if HV > H:
+            print(f"[GVA] HV={HV} (H={H}, ratio={HV // H}x)")
 
     print(
         f"[Device] {torch.cuda.get_device_name(0)}  compute capability {_SM_TAG}  →  using {cula_kda_fused_fwd.__module__}.{cula_kda_fused_fwd.__name__}"
     )
 
+    # ------------------------------------------------------------------
+    # Fixed-length configs — (B, T). Per-row H/HV defaults to global H/HV
+    # (HV overridable via --hv to switch all rows into GVA mode).
+    # ------------------------------------------------------------------
     fixed_configs = [
         # (B, T)
         (1, 512),
@@ -389,6 +458,7 @@ def main():
         (2, 16384),
     ]
 
+    # Varlen configs — same layout as fixed; HV is controlled globally via --hv.
     varlen_configs = build_varlen_configs(
         num_seqs_list=(10, 20),
         total_lens=(4096, 8192, 16384),

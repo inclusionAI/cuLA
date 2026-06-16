@@ -15,7 +15,8 @@
 import importlib
 
 import torch
-from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+
+# from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from fla.ops.cp import FLACPContext
 from fla.ops.cp.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h_pre_process,
@@ -29,9 +30,9 @@ from cula.kda.chunk_intra import chunk_kda_fwd_intra
 from cula.utils import assert_blackwell
 
 # ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
-# _delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h")
-# chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
-_fwd_o_mod = importlib.import_module("cula.ops.fwd_o")
+_delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h_sm100")
+chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
+_fwd_o_mod = importlib.import_module("cula.ops.fwd_o_sm100")
 chunk_gla_fwd_o = _fwd_o_mod.chunk_gla_fwd_o
 
 
@@ -58,7 +59,6 @@ def chunk_kda_fwd(
     cp_context: FLACPContext | None = None,
     use_tf32_inverse: bool = True,
     unified_gref: bool = False,  # Set True for ~5% extra perf (slightly lower precision)
-    chunk_offsets: torch.IntTensor | None = None,
 ):
     assert_blackwell(q.device)
 
@@ -117,8 +117,7 @@ def chunk_kda_fwd(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        # chunk_offsets=chunk_offsets,
-        use_exp2=True,  # for FLA impl
+        cu_seqlens_cpu=cu_seqlens_cpu,
     )
 
     if cp_context is not None:

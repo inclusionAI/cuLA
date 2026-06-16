@@ -92,10 +92,11 @@ struct CollectiveLoadTma {
                     work_desc.seq_idx,
                     work_desc.q_head_idx(),
                     work_desc.tok_offset);
+                // Q lives in the QK head space.
                 Tensor m_varlen_head = tma_load.get_tma_tensor(make_shape(
                     problem_size.total_seqlen,
                     problem_size.head_size,
-                    problem_size.num_heads));  // global view to the packed varlen sequence
+                    problem_size.num_qk_heads));  // global view to the packed varlen sequence
                 Tensor m_varlen = m_varlen_head(_, _, work_desc.q_head_idx());  // slice into current head_idx
                 Tensor m_offset = domain_offset(
                     make_coord(work_desc.tok_offset, _0{}),
@@ -103,18 +104,19 @@ struct CollectiveLoadTma {
                 Tensor g_full =
                     local_tile(m_offset, make_tile(BlkSeqQ, HeadSize), make_coord(_, _0{}));  // (blk, d, iter_blk)
                 return g_full;
-            } else if constexpr (kind == LoadKind::kAlpha) {  // same as Q currently
+            } else if constexpr (kind == LoadKind::kAlpha) {
+                // Alpha (gate) is per V/O head under GVA.
                 DPRINTF0_W(
                     "slice view GMEM %s: seq_idx:%d head_idx:%d tok_offset:%lld\n",
                     to_string(kind),
                     work_desc.seq_idx,
-                    work_desc.q_head_idx(),
+                    work_desc.o_head_idx(),
                     work_desc.tok_offset);
                 Tensor m_varlen_head = tma_load.get_tma_tensor(make_shape(
                     problem_size.total_seqlen,
                     problem_size.head_size,
-                    problem_size.num_heads));  // global view to the packed varlen sequence
-                Tensor m_varlen = m_varlen_head(_, _, work_desc.q_head_idx());  // slice into current head_idx
+                    problem_size.num_v_heads));  // global view to the packed varlen sequence
+                Tensor m_varlen = m_varlen_head(_, _, work_desc.o_head_idx());  // slice into current head_idx
                 Tensor m_offset = domain_offset(
                     make_coord(work_desc.tok_offset, _0{}),
                     m_varlen);  // offset to start of the current sequence
@@ -122,7 +124,11 @@ struct CollectiveLoadTma {
                     local_tile(m_offset, make_tile(BlkSeqQ, HeadSize), make_coord(_, _0{}));  // (blk, d, iter_blk)
                 return g_full;
             } else {
-                auto head_idx = (kind == LoadKind::kK ? work_desc.k_head_idx() : work_desc.v_head_idx());
+                // K lives in the QK head space; V lives in the V head space.
+                // `kind` is a static constexpr LoadKind, so the head-count selection collapses at compile time.
+                constexpr bool kIsK = (kind == LoadKind::kK);
+                auto head_idx = kIsK ? work_desc.k_head_idx() : work_desc.v_head_idx();
+                auto num_kv_heads = kIsK ? problem_size.num_qk_heads : problem_size.num_v_heads;
                 DPRINTF0_W(
                     "slice view GMEM %s: seq_idx:%d head_idx:%d tok_offset:%lld\n",
                     to_string(kind),
@@ -132,7 +138,7 @@ struct CollectiveLoadTma {
                 Tensor m_varlen_head = tma_load.get_tma_tensor(make_shape(
                     problem_size.head_size,
                     problem_size.total_seqlen,
-                    problem_size.num_heads));                     // global view to the packed varlen sequence
+                    num_kv_heads));                               // global view to the packed varlen sequence
                 Tensor m_varlen = m_varlen_head(_, _, head_idx);  // slice into current head_idx
                 Tensor m_offset = domain_offset(
                     make_coord(_0{}, work_desc.tok_offset),
