@@ -63,7 +63,9 @@ def _select_kvb_tile_v(V, N, HV):
 
 # flush kernel: read the compact u-buffer from verify, rank-m update over the first m accepted tokens:
 #   S_m[v,k] = b_m[k] * (S0[v,k] + sum_{i<m} u_i[v] * kinv_i[k])
-# Pure Phase-D (no gating/l2norm/reduce/solve). lane=K + vk, grid/layout match verify; m is constexpr.
+# Pure Phase-D (no gating/l2norm/reduce/solve). lane=K + vk, grid/layout match verify.
+# m (accept length) is per-request and read at runtime from m_buf[i_n], so this compiles
+# exactly one kernel per (shape, BV) instead of one per accept-length value.
 @cute.kernel
 def kda_flush_kvbuffer_vk_kernel(
     h0_source: cute.Tensor,  # [pool*HV, V, K] fp32
@@ -71,10 +73,10 @@ def kda_flush_kvbuffer_vk_kernel(
     kinv_buf: cute.Tensor,   # [N, T, HV, K] fp32
     b_buf: cute.Tensor,      # [N, T, HV, K] fp32
     h0_indices: cute.Tensor,
+    m_buf: cute.Tensor,      # [N] int32 per-request accept length (first m tokens)
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     BV: cutlass.Constexpr[int],
-    m: cutlass.Constexpr[int],  # accept length (first m tokens)
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -92,6 +94,7 @@ def kda_flush_kvbuffer_vk_kernel(
     cache_idx = h0_indices[i_n]
     if cache_idx >= 0:
         flat_state_idx = cache_idx * HV + i_hv
+        m_n = m_buf[i_n]  # this request's accept length (runtime; 1 <= m_n <= T)
 
         r_h = cute.make_rmem_tensor(cute.make_layout((BV * vec_size,), stride=(1,)), cutlass.Float32)
         r_h4 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
@@ -107,17 +110,18 @@ def kda_flush_kvbuffer_vk_kernel(
                 r_h[vv * vec_size + c] = r_h4[c]
 
         # b_m: cumulative decay at token m-1 (this lane's channels)
-        bm_tile = cute.local_tile(b_buf, (1, 1, 1, vec_size), (i_n, m - 1, i_hv, lane))
+        bm_tile = cute.local_tile(b_buf, (1, 1, 1, vec_size), (i_n, m_n - 1, i_hv, lane))
         cute.autovec_copy(bm_tile, r_bm)
 
-        # accumulate sum_{i<m} u_i[v] * kinv_i[k]
-        for i_i in cutlass.range_constexpr(m):
-            kinv_tile = cute.local_tile(kinv_buf, (1, 1, 1, vec_size), (i_n, i_i, i_hv, lane))
-            cute.autovec_copy(kinv_tile, r_kinv)
-            for vv in cutlass.range_constexpr(BV):
-                uval = cutlass.Float32(u_buf[i_n, i_i, i_hv, i_v * BV + vv])
-                for c in cutlass.range_constexpr(vec_size):
-                    r_h[vv * vec_size + c] += uval * r_kinv[c]
+        # accumulate sum_{i<m} u_i[v] * kinv_i[k]: static-unroll T, runtime-mask i_i < m_n
+        for i_i in cutlass.range_constexpr(T):
+            if i_i < m_n:
+                kinv_tile = cute.local_tile(kinv_buf, (1, 1, 1, vec_size), (i_n, i_i, i_hv, lane))
+                cute.autovec_copy(kinv_tile, r_kinv)
+                for vv in cutlass.range_constexpr(BV):
+                    uval = cutlass.Float32(u_buf[i_n, i_i, i_hv, i_v * BV + vv])
+                    for c in cutlass.range_constexpr(vec_size):
+                        r_h[vv * vec_size + c] += uval * r_kinv[c]
 
         # S_m = b_m * (S0 + sum ...), write back (contiguous float4)
         for vv in cutlass.range_constexpr(BV):
@@ -135,9 +139,9 @@ def run_kda_flush_kvbuffer_vk_kernel(
     kinv_buf: cute.Tensor,
     b_buf: cute.Tensor,
     h0_indices: cute.Tensor,
+    m_buf: cute.Tensor,
     vec_size: cutlass.Constexpr[int],
     BV: cutlass.Constexpr[int],
-    m: cutlass.Constexpr[int],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -148,16 +152,16 @@ def run_kda_flush_kvbuffer_vk_kernel(
     num_v_tiles = cute.ceil_div(V, BV)
     grid_size = n_indices * HV * num_v_tiles
     kda_flush_kvbuffer_vk_kernel(
-        h0_source, u_buf, kinv_buf, b_buf, h0_indices,
-        vec_size, num_v_tiles, BV, m, HV, T, K, V,
+        h0_source, u_buf, kinv_buf, b_buf, h0_indices, m_buf,
+        vec_size, num_v_tiles, BV, HV, T, K, V,
     ).launch(grid=(grid_size, 1, 1), block=[32, 1, 1], smem=0, stream=stream)
 
 
 _compiled_flush_kvbuffer_kernels: dict[tuple, object] = {}
 
 
-def _get_compiled_flush_kvbuffer_kernel(N, T, HV, K, V, pool_size, BV, m, opt_level=3):
-    key = (N, T, HV, K, V, pool_size, BV, m, opt_level)
+def _get_compiled_flush_kvbuffer_kernel(N, T, HV, K, V, pool_size, BV, opt_level=3):
+    key = (N, T, HV, K, V, pool_size, BV, opt_level)
     if key in _compiled_flush_kvbuffer_kernels:
         return _compiled_flush_kvbuffer_kernels[key]
 
@@ -166,6 +170,7 @@ def _get_compiled_flush_kvbuffer_kernel(N, T, HV, K, V, pool_size, BV, m, opt_le
     kinv_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
     b_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
     h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
+    m_buf = torch.zeros(N, dtype=torch.int32, device="cuda")
 
     compiled = cute.compile(
         run_kda_flush_kvbuffer_vk_kernel,
@@ -174,9 +179,9 @@ def _get_compiled_flush_kvbuffer_kernel(N, T, HV, K, V, pool_size, BV, m, opt_le
         from_dlpack(kinv_buf, assumed_align=16),
         from_dlpack(b_buf, assumed_align=16),
         from_dlpack(h0_indices, assumed_align=16),
+        from_dlpack(m_buf, assumed_align=16),
         vec_size=VEC_SIZE,
         BV=BV,
-        m=m,
         HV=HV,
         T=T,
         K=K,
@@ -187,7 +192,7 @@ def _get_compiled_flush_kvbuffer_kernel(N, T, HV, K, V, pool_size, BV, m, opt_le
     _compiled_flush_kvbuffer_kernels[key] = compiled
     logger.info(
         f"CuTe DSL KDA flush KVBuffer kernel compiled: N={N}, T={T}, HV={HV}, "
-        f"K={K}, V={V}, BV={BV}, m={m}"
+        f"K={K}, V={V}, BV={BV}"
     )
     return compiled
 
@@ -198,14 +203,19 @@ def kda_flush_kvbuffer(
     u_buffer: torch.Tensor,
     kinv_buffer: torch.Tensor,
     b_buffer: torch.Tensor,
-    accept_len: int,
+    accept_len,  # int (broadcast to all N) OR per-request [N] int tensor; each in [1, T]
     bv: int = -1,
     opt_level: int = 3,
 ) -> torch.Tensor:
     N, T, HV, V = u_buffer.shape
     K = kinv_buffer.shape[3]
-    m = int(accept_len)
-    assert 1 <= m <= T, f"accept_len must be in [1,{T}], got {m}"
+    if isinstance(accept_len, torch.Tensor):
+        assert accept_len.numel() == N, f"per-request accept_len must have N={N} entries, got {accept_len.numel()}"
+        m_buf = accept_len.to(device=u_buffer.device, dtype=torch.int32).contiguous()
+    else:
+        m = int(accept_len)
+        assert 1 <= m <= T, f"accept_len must be in [1,{T}], got {m}"
+        m_buf = torch.full((N,), m, dtype=torch.int32, device=u_buffer.device)
 
     if bv <= 0:
         num_sms = torch.cuda.get_device_properties(initial_state_source.device).multi_processor_count
@@ -221,8 +231,8 @@ def kda_flush_kvbuffer(
     stream = _get_cached_stream(initial_state_source.device)
 
     h0_source_flat = h0_source.view(pool_size * HV, V, K)
-    compiled = _get_compiled_flush_kvbuffer_kernel(N, T, HV, K, V, pool_size, bv, m, opt_level=opt_level)
-    compiled(h0_source_flat, u_buffer, kinv_buffer, b_buffer, initial_state_indices, stream)
+    compiled = _get_compiled_flush_kvbuffer_kernel(N, T, HV, K, V, pool_size, bv, opt_level=opt_level)
+    compiled(h0_source_flat, u_buffer, kinv_buffer, b_buffer, initial_state_indices, m_buf, stream)
     return initial_state_source
 
 
@@ -718,9 +728,9 @@ def kda_decode_mtp_tp_kvbuffer(
             raise ValueError(f"kinv_buffer/b_buffer shape must be {(N, T, HV, K)}")
         u_buf, kinv_buf, b_buf = u_buffer, kinv_buffer, b_buffer
     else:
-        u_buf = torch.zeros(N, T, HV, V, dtype=torch.float32, device=q.device)
-        kinv_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device=q.device)
-        b_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device=q.device)
+        u_buf = torch.empty(N, T, HV, V, dtype=torch.float32, device=q.device)
+        kinv_buf = torch.empty(N, T, HV, K, dtype=torch.float32, device=q.device)
+        b_buf = torch.empty(N, T, HV, K, dtype=torch.float32, device=q.device)
 
     stream = _get_cached_stream(q.device)
 
@@ -932,9 +942,9 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
             raise ValueError(f"kinv_buffer/b_buffer shape must be {(N, T, HV, K)}")
         u_buf, kinv_buf, b_buf = u_buffer, kinv_buffer, b_buffer
     else:
-        u_buf = torch.zeros(N, T, HV, V, dtype=torch.float32, device=q.device)
-        kinv_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device=q.device)
-        b_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device=q.device)
+        u_buf = torch.empty(N, T, HV, V, dtype=torch.float32, device=q.device)
+        kinv_buf = torch.empty(N, T, HV, K, dtype=torch.float32, device=q.device)
+        b_buf = torch.empty(N, T, HV, K, dtype=torch.float32, device=q.device)
 
     stream = _get_cached_stream(q.device)
     h0_source_flat = h0_source.view(pool_size * HV, V, K)

@@ -1279,89 +1279,89 @@ def kda_mtp_small_batch_kernel(
     v_global = i_v * BV + v_local  # global V-col this lane serves
     k_start = lane * vec_size  # prep: full warp, 32 lanes x 4 = all 128 K
 
+    # constexpr k_split decisions hoisted to top level so they stay python
+    # constants inside the cache_idx>=0 block (else reboxed to Int32 -> error).
+    ks_single = cutlass.const_expr(k_split == 1)
+    ks_log2 = cutlass.const_expr(k_split.bit_length() - 1)
     if cache_idx >= 0:
         flat_state_idx = cache_idx * HV + i_hv
         for j in cutlass.range_constexpr(k_per_lane):
             r_h[j] = cutlass.Float32(h0_source[flat_state_idx, k_off + j, v_global])
-    else:
-        for j in cutlass.range_constexpr(k_per_lane):
-            r_h[j] = cutlass.Float32(0.0)
 
-    for i_t in cutlass.range_constexpr(T):
-        q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane))
-        k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane))
-        cute.autovec_copy(q_tile, r_q_bf16)
-        cute.autovec_copy(k_tile, r_k_bf16)
-        for i in cutlass.range_constexpr(vec_size):
-            r_q[i] = cutlass.Float32(r_q_bf16[i])
-            r_k[i] = cutlass.Float32(r_k_bf16[i])
+        for i_t in cutlass.range_constexpr(T):
+            q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane))
+            k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane))
+            cute.autovec_copy(q_tile, r_q_bf16)
+            cute.autovec_copy(k_tile, r_k_bf16)
+            for i in cutlass.range_constexpr(vec_size):
+                r_q[i] = cutlass.Float32(r_q_bf16[i])
+                r_k[i] = cutlass.Float32(r_k_bf16[i])
 
-        if cutlass.const_expr(use_qk_l2norm):
-            sum_q = cutlass.Float32(0.0)
-            sum_k = cutlass.Float32(0.0)
-            for i in cutlass.range_constexpr(vec_size):
-                sum_q += r_q[i] * r_q[i]
-                sum_k += r_k[i] * r_k[i]
-            for offset in [16, 8, 4, 2, 1]:
-                sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=offset, mask=-1, mask_and_clamp=31)
-                sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=offset, mask=-1, mask_and_clamp=31)
-            inv_q = cute.rsqrt(sum_q + 1e-6, fastmath=fast_math) * scale
-            inv_k = cute.rsqrt(sum_k + 1e-6, fastmath=fast_math)
-            for i in cutlass.range_constexpr(vec_size):
-                r_q[i] = r_q[i] * inv_q
-                r_k[i] = r_k[i] * inv_k
-        else:
-            for i in cutlass.range_constexpr(vec_size):
-                r_q[i] = r_q[i] * scale
+            if cutlass.const_expr(use_qk_l2norm):
+                sum_q = cutlass.Float32(0.0)
+                sum_k = cutlass.Float32(0.0)
+                for i in cutlass.range_constexpr(vec_size):
+                    sum_q += r_q[i] * r_q[i]
+                    sum_k += r_k[i] * r_k[i]
+                for offset in [16, 8, 4, 2, 1]:
+                    sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=offset, mask=-1, mask_and_clamp=31)
+                    sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=offset, mask=-1, mask_and_clamp=31)
+                inv_q = cute.rsqrt(sum_q + 1e-6, fastmath=fast_math) * scale
+                inv_k = cute.rsqrt(sum_k + 1e-6, fastmath=fast_math)
+                for i in cutlass.range_constexpr(vec_size):
+                    r_q[i] = r_q[i] * inv_q
+                    r_k[i] = r_k[i] * inv_k
+            else:
+                for i in cutlass.range_constexpr(vec_size):
+                    r_q[i] = r_q[i] * scale
 
-        for i in cutlass.range_constexpr(vec_size):
-            kk = k_start + i
-            sw = kk ^ (kk // k_per_lane)  # XOR swizzle SMEM write addr (a/dt_bias read GMEM with raw kk)
-            x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(dt_bias[i_hv, kk])
-            beta_x = softplus_beta * x
-            exp_bx = cute.exp(beta_x, fastmath=fast_math)
-            sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
-            )
-            use_sp = (
+            for i in cutlass.range_constexpr(vec_size):
+                kk = k_start + i
+                sw = kk ^ (kk // k_per_lane)  # XOR swizzle SMEM write addr (a/dt_bias read GMEM with raw kk)
+                x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(dt_bias[i_hv, kk])
+                beta_x = softplus_beta * x
+                exp_bx = cute.exp(beta_x, fastmath=fast_math)
+                sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                    cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
+                )
+                use_sp = (
+                    cutlass.Float32(1.0)
+                    if beta_x <= softplus_threshold
+                    else cutlass.Float32(0.0)
+                )
+                sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
+                sG[sw] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
+                sQ[sw] = r_q[i]
+                sK[sw] = r_k[i]
+
+            r_beta = cutlass.Float32(1.0) / (
                 cutlass.Float32(1.0)
-                if beta_x <= softplus_threshold
-                else cutlass.Float32(0.0)
+                + cute.exp(-cutlass.Float32(b[i_n, i_t, i_hv]), fastmath=fast_math)
             )
-            sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
-            sG[sw] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
-            sQ[sw] = r_q[i]
-            sK[sw] = r_k[i]
 
-        r_beta = cutlass.Float32(1.0) / (
-            cutlass.Float32(1.0)
-            + cute.exp(-cutlass.Float32(b[i_n, i_t, i_hv]), fastmath=fast_math)
-        )
+            cute.arch.barrier()  # publish prep's SMEM writes before recurrence reads
 
-        cute.arch.barrier()  # publish prep's SMEM writes before recurrence reads
+            r_v = cutlass.Float32(v[i_n, i_t, i_hv, v_global])
+            # fused decay + s partial.
+            s = cutlass.Float32(0.0)
+            for j in cutlass.range_constexpr(k_per_lane):
+                sw = j if ks_single else (k_off + j) ^ k_part  # XOR swizzle read addr = swz(k_off+j)
+                r_h[j] = r_h[j] * sG[sw]
+                s += r_h[j] * sK[sw]
+            for st in cutlass.range_constexpr(ks_log2):
+                s += cute.arch.shuffle_sync_bfly(s, offset=BV << st, mask=-1, mask_and_clamp=31)
+            v_new = (r_v - s) * r_beta
+            o_val = cutlass.Float32(0.0)
+            for j in cutlass.range_constexpr(k_per_lane):
+                sw = j if ks_single else (k_off + j) ^ k_part  # XOR swizzle read addr
+                r_h[j] = r_h[j] + sK[sw] * v_new
+                o_val += r_h[j] * sQ[sw]
+            for st in cutlass.range_constexpr(ks_log2):
+                o_val += cute.arch.shuffle_sync_bfly(o_val, offset=BV << st, mask=-1, mask_and_clamp=31)
+            o[(i_n, i_t, i_hv, v_global)] = cutlass.BFloat16(o_val)
 
-        r_v = cutlass.Float32(v[i_n, i_t, i_hv, v_global])
-        # fused decay + s partial.
-        s = cutlass.Float32(0.0)
-        for j in cutlass.range_constexpr(k_per_lane):
-            sw = j if k_split == 1 else (k_off + j) ^ k_part  # XOR swizzle read addr = swz(k_off+j)
-            r_h[j] = r_h[j] * sG[sw]
-            s += r_h[j] * sK[sw]
-        for st in cutlass.range_constexpr(k_split.bit_length() - 1):
-            s += cute.arch.shuffle_sync_bfly(s, offset=BV << st, mask=-1, mask_and_clamp=31)
-        v_new = (r_v - s) * r_beta
-        o_val = cutlass.Float32(0.0)
-        for j in cutlass.range_constexpr(k_per_lane):
-            sw = j if k_split == 1 else (k_off + j) ^ k_part  # XOR swizzle read addr
-            r_h[j] = r_h[j] + sK[sw] * v_new
-            o_val += r_h[j] * sQ[sw]
-        for st in cutlass.range_constexpr(k_split.bit_length() - 1):
-            o_val += cute.arch.shuffle_sync_bfly(o_val, offset=BV << st, mask=-1, mask_and_clamp=31)
-        o[(i_n, i_t, i_hv, v_global)] = cutlass.BFloat16(o_val)
+            cute.arch.barrier()
 
-        cute.arch.barrier()
-
-    if cache_idx >= 0:
         if cutlass.const_expr(not disable_state_update):
             flat_state_idx = cache_idx * HV + i_hv
             for j in cutlass.range_constexpr(k_per_lane):
@@ -1746,120 +1746,116 @@ def kda_mtp_small_batch_vk_kernel(
             cute.autovec_copy(h_tile, r_h4)
             for c in cutlass.range_constexpr(vec_size):
                 r_h[vv * vec_size + c] = r_h4[c]
-    else:
-        for j in cutlass.range_constexpr(BV * vec_size):
-            r_h[j] = cutlass.Float32(0.0)
 
-    for c in cutlass.range_constexpr(vec_size):  # dt_bias loaded once outside loop (contiguous K[4t:4t+4])
-        r_dtb[c] = cutlass.Float32(dt_bias[i_hv, vec_size * lane + c])
+        for c in cutlass.range_constexpr(vec_size):  # dt_bias loaded once outside loop (contiguous K[4t:4t+4])
+            r_dtb[c] = cutlass.Float32(dt_bias[i_hv, vec_size * lane + c])
 
-    # prefetch token 0's q/k/a/b into stage 0 (pipeline fill).
-    q_t0 = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, 0, i_h, lane))
-    k_t0 = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, 0, i_h, lane))
-    cute.autovec_copy(q_t0, r_qbf[0])
-    cute.autovec_copy(k_t0, r_kbf[0])
-    a_t0 = cute.local_tile(a, (1, 1, 1, vec_size), (i_n, 0, i_hv, lane))
-    cute.autovec_copy(a_t0, r_abf[0])
-    v_t0 = cute.local_tile(v, (1, 1, 1, BV), (i_n, 0, i_hv, i_v))
-    cute.autovec_copy(v_t0, r_vbf[0])
-    r_bbf[0][0] = cutlass.Float32(b[i_n, 0, i_hv])
+        # prefetch token 0's q/k/a/b into stage 0 (pipeline fill).
+        q_t0 = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, 0, i_h, lane))
+        k_t0 = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, 0, i_h, lane))
+        cute.autovec_copy(q_t0, r_qbf[0])
+        cute.autovec_copy(k_t0, r_kbf[0])
+        a_t0 = cute.local_tile(a, (1, 1, 1, vec_size), (i_n, 0, i_hv, lane))
+        cute.autovec_copy(a_t0, r_abf[0])
+        v_t0 = cute.local_tile(v, (1, 1, 1, BV), (i_n, 0, i_hv, i_v))
+        cute.autovec_copy(v_t0, r_vbf[0])
+        r_bbf[0][0] = cutlass.Float32(b[i_n, 0, i_hv])
 
-    for i_t in cutlass.range_constexpr(T):
-        cur = i_t % 2
-        # ===== prefetch t+1's q/k/a/b =====
-        if cutlass.const_expr(i_t + 1 < T):
-            nxt = (i_t + 1) % 2
-            q_tn = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t + 1, i_h, lane))
-            k_tn = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t + 1, i_h, lane))
-            cute.autovec_copy(q_tn, r_qbf[nxt])
-            cute.autovec_copy(k_tn, r_kbf[nxt])
-            a_tn = cute.local_tile(a, (1, 1, 1, vec_size), (i_n, i_t + 1, i_hv, lane))
-            cute.autovec_copy(a_tn, r_abf[nxt])
-            v_tn = cute.local_tile(v, (1, 1, 1, BV), (i_n, i_t + 1, i_hv, i_v))
-            cute.autovec_copy(v_tn, r_vbf[nxt])
-            r_bbf[nxt][0] = cutlass.Float32(b[i_n, i_t + 1, i_hv])
+        for i_t in cutlass.range_constexpr(T):
+            cur = i_t % 2
+            # ===== prefetch t+1's q/k/a/b =====
+            if cutlass.const_expr(i_t + 1 < T):
+                nxt = (i_t + 1) % 2
+                q_tn = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t + 1, i_h, lane))
+                k_tn = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t + 1, i_h, lane))
+                cute.autovec_copy(q_tn, r_qbf[nxt])
+                cute.autovec_copy(k_tn, r_kbf[nxt])
+                a_tn = cute.local_tile(a, (1, 1, 1, vec_size), (i_n, i_t + 1, i_hv, lane))
+                cute.autovec_copy(a_tn, r_abf[nxt])
+                v_tn = cute.local_tile(v, (1, 1, 1, BV), (i_n, i_t + 1, i_hv, i_v))
+                cute.autovec_copy(v_tn, r_vbf[nxt])
+                r_bbf[nxt][0] = cutlass.Float32(b[i_n, i_t + 1, i_hv])
 
-        # ===== prep: read q/k + gate<->l2norm cross-pipe interleave =====
-        for c in cutlass.range_constexpr(vec_size):
-            r_q[c] = cutlass.Float32(r_qbf[cur][c])
-            r_k[c] = cutlass.Float32(r_kbf[cur][c])
-
-        # gate stage 1: x=a+dtb
-        for c in cutlass.range_constexpr(vec_size):
-            r_gx[c] = cutlass.Float32(r_abf[cur][c]) + r_dtb[c]  # x = a + dt_bias
-        for c in cutlass.range_constexpr(vec_size):
-            r_gexp[c] = cute.exp(softplus_beta * r_gx[c], fastmath=fast_math)  # exp(beta_x)
-
-        if cutlass.const_expr(use_qk_l2norm):
-            sum_q = cutlass.Float32(0.0)
-            sum_k = cutlass.Float32(0.0)
+            # ===== prep: read q/k + gate<->l2norm cross-pipe interleave =====
             for c in cutlass.range_constexpr(vec_size):
-                sum_q += r_q[c] * r_q[c]
-                sum_k += r_k[c] * r_k[c]
-            for off in [16, 8, 4, 2, 1]:
-                sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=off, mask=-1, mask_and_clamp=31)
-                sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=off, mask=-1, mask_and_clamp=31)
-            inv_q = cute.rsqrt(sum_q + 1e-6, fastmath=fast_math) * scale
-            inv_k = cute.rsqrt(sum_k + 1e-6, fastmath=fast_math)
-            for c in cutlass.range_constexpr(vec_size):
-                r_q[c] = r_q[c] * inv_q
-                r_k[c] = r_k[c] * inv_k
-        else:
-            for c in cutlass.range_constexpr(vec_size):
-                r_q[c] = r_q[c] * scale
+                r_q[c] = cutlass.Float32(r_qbf[cur][c])
+                r_k[c] = cutlass.Float32(r_kbf[cur][c])
 
-        # gate stage 2: log + softplus select -> sp_x stashed in r_g
-        for c in cutlass.range_constexpr(vec_size):
-            beta_x = softplus_beta * r_gx[c]
-            sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                cutlass.Float32(1.0) + r_gexp[c], fastmath=fast_math
-            )
-            use_sp = (
-                cutlass.Float32(1.0)
-                if beta_x <= softplus_threshold
-                else cutlass.Float32(0.0)
-            )
-            r_g[c] = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * r_gx[c]  # stash sp_x
-        for c in cutlass.range_constexpr(vec_size):
-            r_g[c] = cute.exp(-r_exp_A * r_g[c], fastmath=fast_math)  # final exp (batched)
-
-        r_beta = cutlass.Float32(1.0) / (
-            cutlass.Float32(1.0)
-            + cute.exp(-r_bbf[cur][0], fastmath=fast_math)
-        )
-
-        # ===== recurrence (fused: decay+h@k in one pass / update+h@q in one pass) =====
-        for vv in cutlass.range_constexpr(BV):
-            sv = cutlass.Float32(0.0)
+            # gate stage 1: x=a+dtb
             for c in cutlass.range_constexpr(vec_size):
-                r_h[vv * vec_size + c] = r_h[vv * vec_size + c] * r_g[c]  # decay: h *= exp(g) (per K)
-                sv += r_h[vv * vec_size + c] * r_k[c]  # s = sum_k h*k_norm
-            r_red[vv] = sv
-        for off in [16, 8, 4, 2, 1]:
-            for vv in cutlass.range_constexpr(BV):
-                r_red[vv] = r_red[vv] + cute.arch.shuffle_sync_bfly(r_red[vv], offset=off, mask=-1, mask_and_clamp=31)
-        for vv in cutlass.range_constexpr(BV):
-            v_new = (cutlass.Float32(r_vbf[cur][vv]) - r_red[vv]) * r_beta  # v_new = beta*(v - s)
-            ovv = cutlass.Float32(0.0)
+                r_gx[c] = cutlass.Float32(r_abf[cur][c]) + r_dtb[c]  # x = a + dt_bias
             for c in cutlass.range_constexpr(vec_size):
-                r_h[vv * vec_size + c] = r_h[vv * vec_size + c] + r_k[c] * v_new  # rank-1 update: h += k*v_new
-                ovv += r_h[vv * vec_size + c] * r_q[c]  # o = sum_k h*q_scaled (partial)
-            r_red[vv] = ovv
-        for off in [16, 8, 4, 2, 1]:
-            for vv in cutlass.range_constexpr(BV):
-                r_red[vv] = r_red[vv] + cute.arch.shuffle_sync_bfly(r_red[vv], offset=off, mask=-1, mask_and_clamp=31)
-        for vv in cutlass.range_constexpr(BV):
-            o[(i_n, i_t, i_hv, i_v * BV + vv)] = cutlass.BFloat16(r_red[vv])
-        if cutlass.const_expr(cache_intermediate_states):  # Stage-D snapshot: post-token-t state
-            flat_idx = i_n * T * HV + i_t * HV + i_hv
-            for vv in cutlass.range_constexpr(BV):
+                r_gexp[c] = cute.exp(softplus_beta * r_gx[c], fastmath=fast_math)  # exp(beta_x)
+
+            if cutlass.const_expr(use_qk_l2norm):
+                sum_q = cutlass.Float32(0.0)
+                sum_k = cutlass.Float32(0.0)
                 for c in cutlass.range_constexpr(vec_size):
-                    r_h4[c] = r_h[vv * vec_size + c]
-                inter_tile = cute.local_tile(intermediate_states, (1, 1, vec_size), (flat_idx, i_v * BV + vv, lane))
-                cute.autovec_copy(r_h4, inter_tile)
+                    sum_q += r_q[c] * r_q[c]
+                    sum_k += r_k[c] * r_k[c]
+                for off in [16, 8, 4, 2, 1]:
+                    sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=off, mask=-1, mask_and_clamp=31)
+                    sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=off, mask=-1, mask_and_clamp=31)
+                inv_q = cute.rsqrt(sum_q + 1e-6, fastmath=fast_math) * scale
+                inv_k = cute.rsqrt(sum_k + 1e-6, fastmath=fast_math)
+                for c in cutlass.range_constexpr(vec_size):
+                    r_q[c] = r_q[c] * inv_q
+                    r_k[c] = r_k[c] * inv_k
+            else:
+                for c in cutlass.range_constexpr(vec_size):
+                    r_q[c] = r_q[c] * scale
 
-    # ===== epilogue: write state back =====
-    if cache_idx >= 0:
+            # gate stage 2: log + softplus select -> sp_x stashed in r_g
+            for c in cutlass.range_constexpr(vec_size):
+                beta_x = softplus_beta * r_gx[c]
+                sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                    cutlass.Float32(1.0) + r_gexp[c], fastmath=fast_math
+                )
+                use_sp = (
+                    cutlass.Float32(1.0)
+                    if beta_x <= softplus_threshold
+                    else cutlass.Float32(0.0)
+                )
+                r_g[c] = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * r_gx[c]  # stash sp_x
+            for c in cutlass.range_constexpr(vec_size):
+                r_g[c] = cute.exp(-r_exp_A * r_g[c], fastmath=fast_math)  # final exp (batched)
+
+            r_beta = cutlass.Float32(1.0) / (
+                cutlass.Float32(1.0)
+                + cute.exp(-r_bbf[cur][0], fastmath=fast_math)
+            )
+
+            # ===== recurrence (fused: decay+h@k in one pass / update+h@q in one pass) =====
+            for vv in cutlass.range_constexpr(BV):
+                sv = cutlass.Float32(0.0)
+                for c in cutlass.range_constexpr(vec_size):
+                    r_h[vv * vec_size + c] = r_h[vv * vec_size + c] * r_g[c]  # decay: h *= exp(g) (per K)
+                    sv += r_h[vv * vec_size + c] * r_k[c]  # s = sum_k h*k_norm
+                r_red[vv] = sv
+            for off in [16, 8, 4, 2, 1]:
+                for vv in cutlass.range_constexpr(BV):
+                    r_red[vv] = r_red[vv] + cute.arch.shuffle_sync_bfly(r_red[vv], offset=off, mask=-1, mask_and_clamp=31)
+            for vv in cutlass.range_constexpr(BV):
+                v_new = (cutlass.Float32(r_vbf[cur][vv]) - r_red[vv]) * r_beta  # v_new = beta*(v - s)
+                ovv = cutlass.Float32(0.0)
+                for c in cutlass.range_constexpr(vec_size):
+                    r_h[vv * vec_size + c] = r_h[vv * vec_size + c] + r_k[c] * v_new  # rank-1 update: h += k*v_new
+                    ovv += r_h[vv * vec_size + c] * r_q[c]  # o = sum_k h*q_scaled (partial)
+                r_red[vv] = ovv
+            for off in [16, 8, 4, 2, 1]:
+                for vv in cutlass.range_constexpr(BV):
+                    r_red[vv] = r_red[vv] + cute.arch.shuffle_sync_bfly(r_red[vv], offset=off, mask=-1, mask_and_clamp=31)
+            for vv in cutlass.range_constexpr(BV):
+                o[(i_n, i_t, i_hv, i_v * BV + vv)] = cutlass.BFloat16(r_red[vv])
+            if cutlass.const_expr(cache_intermediate_states):  # Stage-D snapshot: post-token-t state
+                flat_idx = i_n * T * HV + i_t * HV + i_hv
+                for vv in cutlass.range_constexpr(BV):
+                    for c in cutlass.range_constexpr(vec_size):
+                        r_h4[c] = r_h[vv * vec_size + c]
+                    inter_tile = cute.local_tile(intermediate_states, (1, 1, vec_size), (flat_idx, i_v * BV + vv, lane))
+                    cute.autovec_copy(r_h4, inter_tile)
+
+        # ===== epilogue: write state back =====
         if cutlass.const_expr(not disable_state_update):
             flat_state_idx = cache_idx * HV + i_hv
             for vv in cutlass.range_constexpr(BV):
