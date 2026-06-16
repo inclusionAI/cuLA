@@ -1,6 +1,6 @@
 # LinearAttentionChunkwiseDecay (Lightning Attention) Pipeline
 
-> 文件: `cula/ops/lightning_attn.py`  
+> 文件: `cula/ops/lightning_attn_sm100.py`
 > 类名: `LinearAttentionChunkwiseDecay`
 
 ## 计算公式

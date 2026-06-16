@@ -1,6 +1,6 @@
 # ChunkDeltaRuleFwdH Pipeline
 
-> 文件: `cula/ops/chunk_delta_h.py`  
+> 文件: `cula/ops/chunk_delta_h_sm100.py`
 > 类名: `ChunkDeltaRuleFwdH`
 
 ## 计算公式

@@ -26,7 +26,7 @@ Pipeline (3 stages):
 Reference:
     - FLA intra-card CP: fla/ops/common/intracard_cp.py
     - FLA CP kernels:    fla/ops/cp/chunk_delta_h.py
-    - cuLA chunk_delta_h: cula/ops/chunk_delta_h.py
+    - cuLA chunk_delta_h: cula/ops/chunk_delta_h_sm100.py
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ import torch
 
 from cula.utils import get_device_sm_count, get_pre_scan
 
-# Lazy import to avoid circular dependency with cula.ops.chunk_delta_h
+# Lazy import to avoid circular dependency with cula.ops.chunk_delta_h_sm100
 _chunk_gated_delta_rule_fwd_h = None
 
 

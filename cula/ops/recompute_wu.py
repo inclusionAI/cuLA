@@ -23,7 +23,7 @@ occ=2 non-persistent: grid = (NT, H, B) or (total_nt*H,) for varlen.
 Varlen mode: variable sequence lengths. cu_seqlens[N+1] gives token
   offsets; chunk_indices[total_nt*2] gives (batch_idx, chunk_in_seq)
   pairs for each global chunk index. TMA uses domain_offset for per-WU
-  alignment, matching the fwd_o.py pattern.
+  alignment, matching the fwd_o_sm100.py pattern.
 
 Warp assignment:
   0-3: CUDA core warps (element-wise compute, scatter to sStore)

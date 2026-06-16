@@ -2825,7 +2825,7 @@ class ChunkKdaBwdWyDqkgFused:
     def _tma_partition_B(self, tma_atom, tma_tensor, smem, tile_shape, tiled_mma, batch_idx, hidx):
         """Partition a TMA tensor as MMA B-operand (N,K dims).
 
-        Mirrors the identical helper in recompute_wu.py / fwd_o.py.
+        Mirrors the identical helper in recompute_wu.py / fwd_o_sm100.py.
         ``tma_tensor`` should already have domain_offset applied for varlen.
 
         For tile_shape = (BT, BK, BV) = (M, N, K):
