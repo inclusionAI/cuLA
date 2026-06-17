@@ -1,0 +1,43 @@
+name: clang-format
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  clang-format:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed C/C++/CUDA files
+        id: changed-files
+        run: |
+          BASE=${{ github.event.pull_request.base.sha }}
+          HEAD=${{ github.event.pull_request.head.sha }}
+          FILES=$(git diff --name-only "$BASE" "$HEAD" \
+            | grep -E '^csrc/' \
+            | grep -v -E '^csrc/(cutlass|kerutils)/' \
+            | grep -E '\.(c|cc|cpp|h|hpp|cuh|cu)$' \
+            || true)
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$FILES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Install clang-format 15
+        if: steps.changed-files.outputs.files != ''
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang-format-15
+          sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-15 100
+
+      - name: Run clang-format
+        if: steps.changed-files.outputs.files != ''
+        run: |
+          echo "${{ steps.changed-files.outputs.files }}" \
+            | xargs clang-format --dry-run --Werror
