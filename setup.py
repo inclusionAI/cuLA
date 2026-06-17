@@ -164,9 +164,9 @@ ext_modules = []
 if not DISABLE_SM100 or not DISABLE_SM103:
     sm100_arch_flags = []
     if not DISABLE_SM100:
-        sm100_arch_flags.extend(["-gencode", "arch=compute_100a,code=sm_100a", "-DCULA_SM100_ENABLED"])
+        sm100_arch_flags.extend(["-gencode", "arch=compute_100a,code=sm_100a"])
     if not DISABLE_SM103:
-        sm100_arch_flags.extend(["-gencode", "arch=compute_103a,code=sm_103a", "-DCULA_SM103_ENABLED"])
+        sm100_arch_flags.extend(["-gencode", "arch=compute_103a,code=sm_103a"])
 
     ext_modules.append(
         CUDAExtension(

@@ -77,4 +77,6 @@ class _CudacProxy(ModuleType):
         return list(self._funcs.keys())
 
 
-sys.modules[__name__] = _CudacProxy()
+_proxy = _CudacProxy()
+_proxy.__dict__.update({k: globals().get(k) for k in ("__spec__", "__file__", "__package__", "__loader__")})
+sys.modules[__name__] = _proxy
