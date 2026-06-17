@@ -57,6 +57,12 @@ pip install -e third_party/flash-linear-attention
 pip install -e . --no-build-isolation
 ```
 
+**Build fat wheel (SM90 + SM100 + SM103):**
+
+```bash
+CULA_BUILD_ALL_ARCHS=1 python -m build --wheel --no-isolation
+```
+
 ## Quick Start
 
 ### KDA (Kimi Delta Attention) — Blackwell (SM10X)
