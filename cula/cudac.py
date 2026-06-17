@@ -43,6 +43,7 @@ class _CudacProxy(ModuleType):
             if self._modules_loaded:
                 return
             loaded_any = False
+            errors: dict[str, Exception] = {}
             for ext_name in ("cula._cudac_sm100", "cula._cudac_sm90"):
                 try:
                     mod = importlib.import_module(ext_name)
@@ -50,12 +51,14 @@ class _CudacProxy(ModuleType):
                         if not attr.startswith("_"):
                             self._funcs[attr] = getattr(mod, attr)
                     loaded_any = True
-                except ImportError:
-                    pass
+                except ImportError as exc:
+                    errors[ext_name] = exc
             if not loaded_any:
+                details = "; ".join(f"{name}: {exc}" for name, exc in errors.items())
                 raise ImportError(
-                    "None of the cuLA CUDA extensions ('cula._cudac_sm100', 'cula._cudac_sm90') "
-                    "could be imported. Please make sure cuLA is compiled correctly."
+                    "None of the cuLA CUDA extensions could be imported. "
+                    f"Per-extension errors: [{details}]. "
+                    "Please make sure cuLA is compiled correctly."
                 )
             self.__dict__.update(self._funcs)
             self._modules_loaded = True
