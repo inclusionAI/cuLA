@@ -14,6 +14,9 @@ jobs:
   build-wheel:
     name: "wheel / ${{ matrix.cuda }} / cp312 / ${{ matrix.arch }}"
     runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -37,7 +40,13 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          dnf install -y git python3.12 python3.12-devel python3.12-pip
+          dnf install -y \
+            git \
+            gcc-toolset-13-gcc \
+            gcc-toolset-13-gcc-c++ \
+            python3.12 \
+            python3.12-devel \
+            python3.12-pip
           dnf clean all
 
       - name: Checkout
@@ -68,11 +77,17 @@ jobs:
 
       - name: Build fat-binary wheel
         env:
+          CC: /opt/rh/gcc-toolset-13/root/usr/bin/gcc
+          CXX: /opt/rh/gcc-toolset-13/root/usr/bin/g++
+          CUDAHOSTCXX: /opt/rh/gcc-toolset-13/root/usr/bin/g++
           CULA_BUILD_ALL_ARCHS: "1"
           SETUPTOOLS_SCM_PRETEND_VERSION: "${{ steps.version.outputs.version }}"
           NVCC_THREADS: "4"
           MAX_JOBS: "4"
-        run: python3.12 -m build --wheel --no-isolation --outdir dist-raw
+        run: |
+          "$CC" --version
+          "$CXX" --version
+          python3.12 -m build --wheel --no-isolation --outdir dist-raw
 
       - name: Repair wheel for manylinux_2_28
         run: |
