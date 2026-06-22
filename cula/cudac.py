@@ -18,11 +18,19 @@ Downstream code can continue to use ``import cula.cudac as cula_cuda``
 and call ``cula_cuda.kda_fwd_prefill(...)`` or
 ``cula_cuda.chunk_kda_fwd_intra_cuda(...)`` without knowing which
 extension provides the function.
+
+Loading is **once per process**: the first attribute access triggers a
+single threaded scan of every built ``cula._cudac_sm*`` extension; the
+discovered callables are then cached on the module instance and no
+further re-scan happens. Installing or rebuilding an extension after a
+process has already imported ``cula.cudac`` will therefore not be picked
+up -- callers that need a freshly built extension must restart Python.
 """
 
 import importlib
 import sys
 import threading
+import warnings
 from types import ModuleType
 
 
@@ -44,6 +52,10 @@ class _CudacProxy(ModuleType):
                 return
             loaded_any = False
             errors: dict[str, Exception] = {}
+            # pybind11 extensions surface missing-symbol / ABI / libcudart
+            # failures as AttributeError or OSError at import time rather
+            # than ImportError, so catch the broader set to keep matching
+            # the c955d47 intent of surfacing every per-extension failure.
             for ext_name in ("cula._cudac_sm100", "cula._cudac_sm90"):
                 try:
                     mod = importlib.import_module(ext_name)
@@ -51,7 +63,7 @@ class _CudacProxy(ModuleType):
                         if not attr.startswith("_"):
                             self._funcs[attr] = getattr(mod, attr)
                     loaded_any = True
-                except ImportError as exc:
+                except (ImportError, AttributeError, OSError) as exc:
                     errors[ext_name] = exc
             if not loaded_any:
                 details = "; ".join(f"{name}: {exc}" for name, exc in errors.items())
@@ -59,6 +71,16 @@ class _CudacProxy(ModuleType):
                     "None of the cuLA CUDA extensions could be imported. "
                     f"Per-extension errors: [{details}]. "
                     "Please make sure cuLA is compiled correctly."
+                )
+            # Partial failures are not fatal (each surviving extension is
+            # usable), but the user still needs to know which kernel sets
+            # are missing so they can diagnose a partial / mismatched build.
+            if errors:
+                details = "; ".join(f"{name}: {exc}" for name, exc in errors.items())
+                warnings.warn(
+                    "Some cuLA CUDA extensions could not be imported and their "
+                    f"kernels are unavailable. Per-extension errors: [{details}].",
+                    stacklevel=2,
                 )
             self.__dict__.update(self._funcs)
             self._modules_loaded = True
