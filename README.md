@@ -26,7 +26,7 @@ cuLA supports both **Hopper (SM90)** and **Blackwell (SM10X)** GPUs.
 
 ### Pre-built Wheels
 
-Pre-built fat-binary wheels (SM90 + SM100 + SM103) are available on [GitHub Releases](https://github.com/inclusionAI/cuLA/releases):
+Pre-built fat-binary wheels (SM90 + SM100 + SM103) are available on [GitHub Releases](https://github.com/inclusionAI/cuLA/releases). Linux wheels target `manylinux_2_28` and require glibc 2.28 or newer:
 
     pip install "cuda-linear-attention==<VERSION>+<CUDA_TAG>" -f https://github.com/inclusionAI/cuLA/releases/expanded_assets/<TAG>
 

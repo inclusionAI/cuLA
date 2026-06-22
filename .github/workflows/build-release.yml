@@ -24,20 +24,21 @@ jobs:
           - x86_64
           - aarch64
     container:
-      image: "nvidia/cuda:${{ matrix.cuda == 'cu129' && '12.9.0' || '13.0.0' }}-devel-ubuntu24.04"
+      # UBI 8 provides the glibc 2.28 baseline required by manylinux_2_28.
+      image: "nvidia/cuda:${{ matrix.cuda == 'cu129' && '12.9.0' || '13.0.0' }}-devel-ubi8"
 
     steps:
       - name: Free disk space
         run: |
           rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet \
                  /usr/local/share/boost /opt/ghc 2>/dev/null || true
-          apt-get clean 2>/dev/null || true
+          dnf clean all 2>/dev/null || true
           df -h / || true
 
       - name: Install git
         run: |
-          apt-get update && apt-get install -y --no-install-recommends git \
-            && rm -rf /var/lib/apt/lists/*
+          dnf install -y git
+          dnf clean all
 
       - name: Checkout
         uses: actions/checkout@v5
@@ -57,7 +58,7 @@ jobs:
         run: |
           python -m pip install --no-cache-dir --upgrade pip
           python -m pip install --no-cache-dir torch --index-url ${{ matrix.cuda == 'cu129' && 'https://download.pytorch.org/whl/cu129' || 'https://download.pytorch.org/whl/cu130' }}
-          python -m pip install --no-cache-dir setuptools wheel "setuptools_scm>=6.0" build ninja
+          python -m pip install --no-cache-dir setuptools wheel "setuptools_scm>=6.0" build ninja auditwheel patchelf
 
       - name: Compute version
         id: version
@@ -76,7 +77,20 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION: "${{ steps.version.outputs.version }}"
           NVCC_THREADS: "4"
           MAX_JOBS: "4"
-        run: python -m build --wheel --no-isolation
+        run: python -m build --wheel --no-isolation --outdir dist-raw
+
+      - name: Repair wheel for manylinux_2_28
+        run: |
+          # These libraries are supplied by the NVIDIA driver, PyTorch, or
+          # PyTorch's CUDA runtime dependency and must remain external.
+          python -m auditwheel repair \
+            --plat manylinux_2_28_${{ matrix.arch }} \
+            --exclude libcuda.so.1 \
+            --exclude 'libcudart.so.*' \
+            --exclude 'libc10*.so' \
+            --exclude 'libtorch*.so' \
+            --wheel-dir dist \
+            dist-raw/*.whl
 
       - name: Verify wheel
         run: |
@@ -84,6 +98,9 @@ jobs:
           ls -lh dist/*.whl
           ls dist/*.whl | grep -q "+${{ matrix.cuda }}" \
             || { echo "ERROR: wheel name missing +${{ matrix.cuda }} suffix"; exit 1; }
+          ls dist/*.whl | grep -q "manylinux_2_28_${{ matrix.arch }}" \
+            || { echo "ERROR: wheel is not tagged manylinux_2_28_${{ matrix.arch }}"; exit 1; }
+          python -m auditwheel show dist/*.whl
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v6
