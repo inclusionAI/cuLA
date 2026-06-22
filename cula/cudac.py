@@ -19,23 +19,41 @@ and call ``cula_cuda.kda_fwd_prefill(...)`` or
 ``cula_cuda.chunk_kda_fwd_intra_cuda(...)`` without knowing which
 extension provides the function.
 
-Loading is **once per process**: the first attribute access triggers a
-single threaded scan of every built ``cula._cudac_sm*`` extension; the
-discovered callables are then cached on the module instance and no
-further re-scan happens. Installing or rebuilding an extension after a
-process has already imported ``cula.cudac`` will therefore not be picked
-up -- callers that need a freshly built extension must restart Python.
+Loading is **once per process**: the first attribute access checks the
+currently active CUDA device, imports the matching ``cula._cudac_sm*``
+extension, and caches the discovered callables on the module instance.
+Changing the active CUDA device to a different architecture after a
+process has already loaded ``cula.cudac`` will therefore not be picked
+up -- callers that need a different extension must restart Python.
 """
 
 import importlib
 import sys
 import threading
-import warnings
 from types import ModuleType
 
 
+def _current_device_extension() -> tuple[str, str]:
+    try:
+        import torch
+    except ImportError as exc:
+        raise ImportError("cuLA CUDA extensions require PyTorch to detect the current GPU.") from exc
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("cuLA CUDA extensions require a visible CUDA GPU, but torch.cuda.is_available() is False.")
+
+    device = torch.cuda.current_device()
+    prop = torch.cuda.get_device_properties(device)
+    sm_label = f"sm_{prop.major}{prop.minor}"
+    if prop.major == 10 and prop.minor in (0, 3):
+        return "cula._cudac_sm100", sm_label
+    if prop.major == 9 and prop.minor == 0:
+        return "cula._cudac_sm90", sm_label
+    raise RuntimeError(f"Unsupported CUDA compute capability {sm_label}. Supported architectures: sm_100, sm_103, sm_90.")
+
+
 class _CudacProxy(ModuleType):
-    """Lazy proxy that exposes functions from all built arch extensions."""
+    """Lazy proxy that exposes functions from the current GPU arch extension."""
 
     def __init__(self):
         super().__init__(__name__)
@@ -50,38 +68,18 @@ class _CudacProxy(ModuleType):
         with self._lock:
             if self._modules_loaded:
                 return
-            loaded_any = False
-            errors: dict[str, Exception] = {}
-            # pybind11 extensions surface missing-symbol / ABI / libcudart
-            # failures as AttributeError or OSError at import time rather
-            # than ImportError, so catch the broader set to keep matching
-            # the c955d47 intent of surfacing every per-extension failure.
-            for ext_name in ("cula._cudac_sm100", "cula._cudac_sm90"):
-                try:
-                    mod = importlib.import_module(ext_name)
-                    for attr in dir(mod):
-                        if not attr.startswith("_"):
-                            self._funcs[attr] = getattr(mod, attr)
-                    loaded_any = True
-                except (ImportError, AttributeError, OSError) as exc:
-                    errors[ext_name] = exc
-            if not loaded_any:
-                details = "; ".join(f"{name}: {exc}" for name, exc in errors.items())
+            ext_name, sm_label = _current_device_extension()
+            try:
+                mod = importlib.import_module(ext_name)
+                for attr in dir(mod):
+                    if not attr.startswith("_"):
+                        self._funcs[attr] = getattr(mod, attr)
+            except (ImportError, AttributeError, OSError) as exc:
                 raise ImportError(
-                    "None of the cuLA CUDA extensions could be imported. "
-                    f"Per-extension errors: [{details}]. "
+                    f"The cuLA CUDA extension for the current GPU ({sm_label}) could not be imported. "
+                    f"Extension {ext_name} failed with: {exc}. "
                     "Please make sure cuLA is compiled correctly."
-                )
-            # Partial failures are not fatal (each surviving extension is
-            # usable), but the user still needs to know which kernel sets
-            # are missing so they can diagnose a partial / mismatched build.
-            if errors:
-                details = "; ".join(f"{name}: {exc}" for name, exc in errors.items())
-                warnings.warn(
-                    "Some cuLA CUDA extensions could not be imported and their "
-                    f"kernels are unavailable. Per-extension errors: [{details}].",
-                    stacklevel=2,
-                )
+                ) from exc
             self.__dict__.update(self._funcs)
             self._modules_loaded = True
 
