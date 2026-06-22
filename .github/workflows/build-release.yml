@@ -35,9 +35,9 @@ jobs:
           dnf clean all 2>/dev/null || true
           df -h / || true
 
-      - name: Install git
+      - name: Install system dependencies
         run: |
-          dnf install -y git
+          dnf install -y git python3.12 python3.12-devel python3.12-pip
           dnf clean all
 
       - name: Checkout
@@ -49,16 +49,11 @@ jobs:
       - name: Configure git safe directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
       - name: Install Python dependencies
         run: |
-          python -m pip install --no-cache-dir --upgrade pip
-          python -m pip install --no-cache-dir torch --index-url ${{ matrix.cuda == 'cu129' && 'https://download.pytorch.org/whl/cu129' || 'https://download.pytorch.org/whl/cu130' }}
-          python -m pip install --no-cache-dir setuptools wheel "setuptools_scm>=6.0" build ninja auditwheel patchelf
+          python3.12 -m pip install --no-cache-dir --upgrade pip
+          python3.12 -m pip install --no-cache-dir torch --index-url ${{ matrix.cuda == 'cu129' && 'https://download.pytorch.org/whl/cu129' || 'https://download.pytorch.org/whl/cu130' }}
+          python3.12 -m pip install --no-cache-dir setuptools wheel "setuptools_scm>=6.0" build ninja auditwheel patchelf
 
       - name: Compute version
         id: version
@@ -67,7 +62,7 @@ jobs:
             BASE="${GITHUB_REF#refs/tags/v}"
           else
             # Strip any local segment (+gXXX) so we get a clean base
-            BASE=$(python -c "from setuptools_scm import get_version; print(get_version().split('+')[0])")
+            BASE=$(python3.12 -c "from setuptools_scm import get_version; print(get_version().split('+')[0])")
           fi
           echo "version=${BASE}+${{ matrix.cuda }}" >> "$GITHUB_OUTPUT"
 
@@ -77,13 +72,13 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION: "${{ steps.version.outputs.version }}"
           NVCC_THREADS: "4"
           MAX_JOBS: "4"
-        run: python -m build --wheel --no-isolation --outdir dist-raw
+        run: python3.12 -m build --wheel --no-isolation --outdir dist-raw
 
       - name: Repair wheel for manylinux_2_28
         run: |
           # These libraries are supplied by the NVIDIA driver, PyTorch, or
           # PyTorch's CUDA runtime dependency and must remain external.
-          python -m auditwheel repair \
+          python3.12 -m auditwheel repair \
             --plat manylinux_2_28_${{ matrix.arch }} \
             --exclude libcuda.so.1 \
             --exclude 'libcudart.so.*' \
@@ -100,7 +95,7 @@ jobs:
             || { echo "ERROR: wheel name missing +${{ matrix.cuda }} suffix"; exit 1; }
           ls dist/*.whl | grep -q "manylinux_2_28_${{ matrix.arch }}" \
             || { echo "ERROR: wheel is not tagged manylinux_2_28_${{ matrix.arch }}"; exit 1; }
-          python -m auditwheel show dist/*.whl
+          python3.12 -m auditwheel show dist/*.whl
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v6
