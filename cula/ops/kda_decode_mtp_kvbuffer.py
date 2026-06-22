@@ -803,6 +803,36 @@ def _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=No
     return d0, d1, d2, d3
 
 
+@dsl_user_op
+def _tf32_lo(v, *, loc=None, ip=None):
+    """Residual v - tf32(v): the low-13-mantissa-bit part of an fp32, as Float32."""
+    i32 = _T.i32()
+    f32 = _T.f32()
+    vv = v.ir_value(loc=loc, ip=ip) if hasattr(v, "ir_value") else v
+    bits = _arith.bitcast(i32, vv, loc=loc, ip=ip)
+    mask = _arith.constant(i32, -8192, loc=loc, ip=ip)  # 0xFFFFE000: zero low 13 mantissa bits
+    hi_bits = _arith.andi(bits, mask, loc=loc, ip=ip)
+    hi = _arith.bitcast(f32, hi_bits, loc=loc, ip=ip)
+    lo = _arith.subf(vv, hi, loc=loc, ip=ip)
+    return cutlass.Float32(lo)
+
+
+@dsl_user_op
+def _mma_m16n8k8_3xtf32(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=None):
+    """3xTF32-emulated m16n8k8 GEMM (~fp32 accuracy). 3 tf32 MMA passes:
+    hi*hi + hi*lo + lo*hi, lo = x - tf32(x). ~3x the HMMA of one tf32 mma."""
+    a0l = _tf32_lo(a0)
+    a1l = _tf32_lo(a1)
+    a2l = _tf32_lo(a2)
+    a3l = _tf32_lo(a3)
+    b0l = _tf32_lo(b0)
+    b1l = _tf32_lo(b1)
+    c0, c1, c2, c3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3)
+    c0, c1, c2, c3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0l, b1l, c0, c1, c2, c3)
+    c0, c1, c2, c3 = _mma_m16n8k8_tf32(a0l, a1l, a2l, a3l, b0, b1, c0, c1, c2, c3)
+    return c0, c1, c2, c3
+
+
 _compiled_gemm_kvbuffer_cute_kernels: dict[tuple, object] = {}
 
 
@@ -1029,7 +1059,7 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
 
     smem = cutlass.utils.SmemAllocator()
     # stacked feature maps: rows 0..7 = kdec(tokens, pad-zeroed), rows 8..15 = qdec
-    sKQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((2 * BT, K), stride=(K + 8, 1)), 16)
+    sKQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((2 * BT, K), stride=(K + 4, 1)), 16)
     sKinv = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT, K), stride=(K + 8, 1)), 16)
     sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT, K), stride=(K + 8, 1)), 16)
     sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT,)), 16)
@@ -1042,7 +1072,7 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
     sLp = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT, BT), stride=(BT + 1, 1)), 16)
     sX = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT, BV), stride=(BV + 1, 1)), 16)
     sU = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT, BV), stride=(BV + 1, 1)), 16)
-    sS0 = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BV, K), stride=(K + 8, 1)), 16)
+    sS0 = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BV, K), stride=(K + 4, 1)), 16)
 
     r_qbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_kbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
@@ -1147,7 +1177,7 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
             a3 = sKQ[gid + 8, kb + tig + 4]
             b0 = sKinv[gid, kb + tig]
             b1 = sKinv[gid, kb + tig + 4]
-            c0, c1, c2, c3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3)
+            c0, c1, c2, c3 = _mma_m16n8k8_3xtf32(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3)
         for fi in cutlass.range_constexpr(4):
             row = gid + (fi // 2) * 8
             col = 2 * tig + (fi % 2)
@@ -1201,7 +1231,6 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
                 sLp[ri, ci] = sPart[ri, ci]
                 sInv[ri, ci] = sInv[ri, ci] + sPart[BT + ri, ci]
             cute.arch.barrier()
-        cute.arch.barrier()
 
         # ---- P5 consumer. V tiled 3 ways (outer->inner):
         #   num_v_tiles  : V split across CTAs (grid=N*HV*num_v_tiles)
@@ -1242,7 +1271,7 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
                 a3 = sKQ[gid + 8, kb + tig + 4]
                 b0 = sS0[nb + gid, kb + tig]
                 b1 = sS0[nb + gid, kb + tig + 4]
-                e0, e1, e2, e3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, e0, e1, e2, e3)
+                e0, e1, e2, e3 = _mma_m16n8k8_3xtf32(a0, a1, a2, a3, b0, b1, e0, e1, e2, e3)
             # x = beta * (v - Skdec) from the top half; Sqdec (e2/e3) stays in registers
             vmask = cutlass.Float32(1.0) if gid < T else cutlass.Float32(0.0)
             vv0 = cutlass.Float32(v[i_n, gid % T, i_hv, v_base + vc0]) * vmask
