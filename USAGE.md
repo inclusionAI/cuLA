@@ -25,7 +25,7 @@ Both are drop-in replacements for [FLA](https://github.com/fla-org/flash-linear-
 
 ### Modular Forward (SM100 — Blackwell)
 
-The modular forward kernel replaces sub-kernels of KDA in FLA (chunk_intra, chunk_delta_h, fwd_o, etc.) for easy integration with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/KCP.md).
+The modular forward kernel replaces sub-kernels of KDA in FLA for easy integration with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/KCP.md). By default, `chunk_kda` uses cuLA for `chunk_intra`, recompute `w/u`, `chunk_delta_h`, and `fwd_o`. Set `CULA_USE_FLA_DELTA_H=1` to route `chunk_delta_h` through FLA instead.
 
 #### Example
 
@@ -67,6 +67,7 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 
 - The backward pass is currently supported via FLA's implementation; further optimizations are on the roadmap.
 - Compatible with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/KCP.md) via the `cp_context` parameter, same as in FLA.
+- `CULA_USE_FLA_DELTA_H=1` enables FLA's delta-h path; unset it or set `0` to use cuLA's delta-h sub-kernel.
 
 ---
 

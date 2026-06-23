@@ -185,7 +185,7 @@ See [REPO_LAYOUT.md](REPO_LAYOUT.md) for the full directory structure and a summ
 
 * [x] Modular KDA Forward (SM10X, compatible with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/KCP.md))
   * [x] kda chunk intra
-  * [x] chunk gated delta h
+  * [x] chunk gated delta h (FLA fallback via `CULA_USE_FLA_DELTA_H=1`)
   * [ ] recompute wu
   * [x] chunk fwd o
 
