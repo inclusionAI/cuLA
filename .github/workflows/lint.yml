@@ -1,0 +1,40 @@
+name: Lint
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clang-format:
+    name: clang-format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: j178/prek-action@v2
+        with:
+          install-only: true
+      - name: Check clang-format
+        run: prek run clang-format --all-files --show-diff-on-failure --color=always
+
+  ruff:
+    name: Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: j178/prek-action@v2
+        with:
+          install-only: true
+
+      - name: Check Ruff lint
+        run: prek run ruff --all-files --show-diff-on-failure --color=always
+
+      - name: Check Ruff format
+        run: prek run ruff-format --all-files --show-diff-on-failure --color=always
