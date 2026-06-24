@@ -250,6 +250,194 @@ def kda_flush_kvbuffer(
     return initial_state_source
 
 
+# ===========================================================================
+# MULTILAYER_FLUSH_PATCH: all-layers batched flush, dynamic-N (2D grid x=single-
+# layer grid / y=layer; N not a compile const). cute.compile traces the real,
+# already-allocated tensors (it only reads shape/stride, does NOT execute).
+@cute.kernel
+def kda_flush_kvbuffer_vk_ml_kernel(
+    h0_source: cute.Tensor,
+    u_buf: cute.Tensor,
+    kinv_buf: cute.Tensor,
+    b_buf: cute.Tensor,
+    h0_indices: cute.Tensor,
+    m_buf: cute.Tensor,
+    vec_size: cutlass.Constexpr[int],
+    num_v_tiles: cutlass.Constexpr[int],
+    BV: cutlass.Constexpr[int],
+    HV: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    lane = tidx
+
+    bx, i_l, _ = cute.arch.block_idx()
+    i_v = bx % num_v_tiles
+    tmp = bx // num_v_tiles
+    i_hv = tmp % HV
+    i_n = tmp // HV
+
+    cache_idx = h0_indices[i_n]
+    if cache_idx >= 0:
+        flat_state_idx = cache_idx * HV + i_hv
+        m_n = m_buf[i_n]
+
+        r_h = cute.make_rmem_tensor(cute.make_layout((BV * vec_size,), stride=(1,)), cutlass.Float32)
+        r_h4 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+        r_bm = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+        r_kinv = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+
+        for vv in cutlass.range_constexpr(BV):
+            v_global = i_v * BV + vv
+            h_tile = cute.local_tile(h0_source, (1, 1, 1, vec_size), (i_l, flat_state_idx, v_global, lane))
+            cute.autovec_copy(h_tile, r_h4)
+            for c in cutlass.range_constexpr(vec_size):
+                r_h[vv * vec_size + c] = r_h4[c]
+
+        bm_tile = cute.local_tile(b_buf, (1, 1, 1, 1, vec_size), (i_l, i_n, m_n - 1, i_hv, lane))
+        cute.autovec_copy(bm_tile, r_bm)
+
+        for i_i in cutlass.range_constexpr(T):
+            if i_i < m_n:
+                kinv_tile = cute.local_tile(kinv_buf, (1, 1, 1, 1, vec_size), (i_l, i_n, i_i, i_hv, lane))
+                cute.autovec_copy(kinv_tile, r_kinv)
+                for vv in cutlass.range_constexpr(BV):
+                    uval = cutlass.Float32(u_buf[i_l, i_n, i_i, i_hv, i_v * BV + vv])
+                    for c in cutlass.range_constexpr(vec_size):
+                        r_h[vv * vec_size + c] += uval * r_kinv[c]
+
+        for vv in cutlass.range_constexpr(BV):
+            v_global = i_v * BV + vv
+            for c in cutlass.range_constexpr(vec_size):
+                r_h4[c] = r_bm[c] * r_h[vv * vec_size + c]
+            h_out = cute.local_tile(h0_source, (1, 1, 1, vec_size), (i_l, flat_state_idx, v_global, lane))
+            cute.autovec_copy(r_h4, h_out)
+
+
+@cute.jit
+def run_kda_flush_kvbuffer_vk_ml_kernel(
+    h0_source: cute.Tensor,
+    u_buf: cute.Tensor,
+    kinv_buf: cute.Tensor,
+    b_buf: cute.Tensor,
+    h0_indices: cute.Tensor,
+    m_buf: cute.Tensor,
+    vec_size: cutlass.Constexpr[int],
+    BV: cutlass.Constexpr[int],
+    HV: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    stream: cuda.CUstream,
+):
+    L = h0_source.layout.shape[0]
+    n_indices = h0_indices.layout.shape[0]
+    num_v_tiles = cute.ceil_div(V, BV)
+    gx = n_indices * HV * num_v_tiles
+    kda_flush_kvbuffer_vk_ml_kernel(
+        h0_source,
+        u_buf,
+        kinv_buf,
+        b_buf,
+        h0_indices,
+        m_buf,
+        vec_size,
+        num_v_tiles,
+        BV,
+        HV,
+        T,
+        K,
+        V,
+    ).launch(grid=(gx, L, 1), block=[32, 1, 1], smem=0, stream=stream)
+
+
+_compiled_flush_kvbuffer_ml_kernels: dict[tuple, object] = {}
+
+
+def _get_compiled_flush_kvbuffer_ml_kernel(
+    L, T, HV, K, V, pool_size, kvb_pool, BV, h0_source, u_buf, kinv_buf, b_buf, h0_indices, m_buf, opt_level=3
+):
+    # Trace on the tensors passed in. N not in key (index layout-dynamic).
+    key = (L, T, HV, K, V, pool_size, kvb_pool, BV, opt_level)
+    if key in _compiled_flush_kvbuffer_ml_kernels:
+        return _compiled_flush_kvbuffer_ml_kernels[key]
+
+    compiled = cute.compile(
+        run_kda_flush_kvbuffer_vk_ml_kernel,
+        from_dlpack(h0_source, assumed_align=16),
+        from_dlpack(u_buf, assumed_align=16),
+        from_dlpack(kinv_buf, assumed_align=16),
+        from_dlpack(b_buf, assumed_align=16),
+        from_dlpack(h0_indices, assumed_align=16).mark_layout_dynamic(),
+        from_dlpack(m_buf, assumed_align=16).mark_layout_dynamic(),
+        vec_size=VEC_SIZE,
+        BV=BV,
+        HV=HV,
+        T=T,
+        K=K,
+        V=V,
+        stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        options=f"--enable-tvm-ffi --opt-level {opt_level}",
+    )
+    _compiled_flush_kvbuffer_ml_kernels[key] = compiled
+    logger.info(f"CuTe DSL KDA flush KVBuffer ML(dyn-N) kernel compiled: L={L}, T={T}, HV={HV}, K={K}, V={V}, BV={BV}")
+    return compiled
+
+
+def kda_flush_kvbuffer_all_layers(
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    u_buffer: torch.Tensor,
+    kinv_buffer: torch.Tensor,
+    b_buffer: torch.Tensor,
+    accept_len,
+    bv: int = -1,
+    opt_level: int = 3,
+) -> torch.Tensor:
+    L, kvb_pool, T, HV, V = u_buffer.shape
+    K = kinv_buffer.shape[4]
+    N = initial_state_indices.shape[0]
+    if isinstance(accept_len, torch.Tensor):
+        assert accept_len.numel() == N, f"per-request accept_len must have N={N} entries, got {accept_len.numel()}"
+        m_buf = accept_len.to(device=u_buffer.device, dtype=torch.int32).contiguous()
+    else:
+        m = int(accept_len)
+        assert 1 <= m <= T, f"accept_len must be in [1,{T}], got {m}"
+        m_buf = torch.full((N,), m, dtype=torch.int32, device=u_buffer.device)
+
+    if bv <= 0:
+        num_sms = torch.cuda.get_device_properties(initial_state_source.device).multi_processor_count
+        bv = _select_vk_bv(N * HV, V, num_sms)
+    assert bv in (8, 16, 32) and V % bv == 0, f"flush bv must be 8/16/32 and divide V, got bv={bv}, V={V}"
+
+    pool_size = initial_state_source.shape[1]
+    h0_source_flat = initial_state_source.view(L, pool_size * HV, V, K)
+    idx = _normalize_state_indices(initial_state_indices, N=N, pool_size=pool_size, device=initial_state_source.device)
+    stream = _get_cached_stream(initial_state_source.device)
+
+    compiled = _get_compiled_flush_kvbuffer_ml_kernel(
+        L,
+        T,
+        HV,
+        K,
+        V,
+        pool_size,
+        kvb_pool,
+        bv,
+        h0_source_flat,
+        u_buffer,
+        kinv_buffer,
+        b_buffer,
+        idx,
+        m_buf,
+        opt_level=opt_level,
+    )
+    compiled(h0_source_flat, u_buffer, kinv_buffer, b_buffer, idx, m_buf, stream)
+    return initial_state_source
+
+
 # ---------------------------------------------------------------------------
 # tp-kvbuffer: token-parallel chunkwise verify (structure B). UT-transform
 # W = L^{-1} diag(beta) makes the consumer solve dependence-free: u = W @ (v - S0 kdec).
