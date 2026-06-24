@@ -184,35 +184,23 @@ def kda_verify_kernel_mtp_ws(
 
     # SMEM broadcast buffers (warp 0 -> all warps). sG is [T, K] (per-channel);
     smem = cutlass.utils.SmemAllocator()
-    sQ = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
-    )
-    sK = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
-    )
-    sG = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
-    )
+    sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
+    sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
+    sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
     sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T,)), 16)
 
     # use_smem_v (Stage C): preload the v-tile into SMEM + accumulate outputs for a
     # coalesced merged writeback. Allocated last/conditionally so off-path offsets stay put.
     if cutlass.const_expr(use_smem_v):
-        sVdata = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16
-        )
-        sOutput = smem.allocate_tensor(
-            cutlass.BFloat16, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16
-        )
+        sVdata = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16)
+        sOutput = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16)
 
     # Per-lane registers: r_g = this lane's vec_size channels of g; r_h = up to 8
     # V-rows of state (only ilp_rows used), each row spanning 32 lanes over K=128.
     r_q = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_g = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
-    r_h = cute.make_rmem_tensor(
-        cute.make_layout((8, vec_size), stride=(vec_size, 1)), cutlass.Float32
-    )
+    r_h = cute.make_rmem_tensor(cute.make_layout((8, vec_size), stride=(vec_size, 1)), cutlass.Float32)
     r_q_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_k_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
 
@@ -225,12 +213,8 @@ def kda_verify_kernel_mtp_ws(
         if warp_idx == 0:
             # Warp 0 computes q/k/g/beta for all T tokens, broadcasts via SMEM.
             for i_t in cutlass.range_constexpr(T):
-                q_tile = cute.local_tile(
-                    q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
-                )
-                k_tile = cute.local_tile(
-                    k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
-                )
+                q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group))
+                k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group))
                 cute.autovec_copy(q_tile, r_q_bf16)
                 cute.autovec_copy(k_tile, r_k_bf16)
                 for i in cutlass.range_constexpr(vec_size):
@@ -245,12 +229,8 @@ def kda_verify_kernel_mtp_ws(
                         sum_k += r_k[i] * r_k[i]
                     # Full-warp reduction (32 lanes x vec_size=4 = all 128 K).
                     for offset in [16, 8, 4, 2, 1]:
-                        sum_q += cute.arch.shuffle_sync_bfly(
-                            sum_q, offset=offset, mask=-1, mask_and_clamp=31
-                        )
-                        sum_k += cute.arch.shuffle_sync_bfly(
-                            sum_k, offset=offset, mask=-1, mask_and_clamp=31
-                        )
+                        sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=offset, mask=-1, mask_and_clamp=31)
+                        sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=offset, mask=-1, mask_and_clamp=31)
                     inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6, fastmath=fast_math) * scale
                     inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=fast_math)
                     for i in cutlass.range_constexpr(vec_size):
@@ -269,40 +249,24 @@ def kda_verify_kernel_mtp_ws(
                 # vec_size channels. g[kk] = exp(-exp(A_log) * softplus(a+dt_bias)).
                 for i in cutlass.range_constexpr(vec_size):
                     kk = k_start + i
-                    x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(
-                        dt_bias[i_hv, kk]
-                    )
+                    x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(dt_bias[i_hv, kk])
                     if cutlass.const_expr(use_lower_bound):
                         # safe gate: g = lower_bound * sigmoid(exp(A_log) * x)
-                        sigmoid_ax = cutlass.Float32(1.0) / (
-                            cutlass.Float32(1.0)
-                            + cute.exp(-r_exp_A * x, fastmath=fast_math)
-                        )
-                        sG[(i_t, kk)] = cute.exp(
-                            lower_bound * sigmoid_ax, fastmath=fast_math
-                        )
+                        sigmoid_ax = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-r_exp_A * x, fastmath=fast_math))
+                        sG[(i_t, kk)] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
                     else:
                         beta_x = softplus_beta * x
                         exp_beta_x = cute.exp(beta_x, fastmath=fast_math)
                         softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
                             cutlass.Float32(1.0) + exp_beta_x, fastmath=fast_math
                         )
-                        use_softplus = (
-                            cutlass.Float32(1.0)
-                            if beta_x <= softplus_threshold
-                            else cutlass.Float32(0.0)
-                        )
-                        softplus_x = (
-                            use_softplus * softplus_val
-                            + (cutlass.Float32(1.0) - use_softplus) * x
-                        )
+                        use_softplus = cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
+                        softplus_x = use_softplus * softplus_val + (cutlass.Float32(1.0) - use_softplus) * x
                         sG[(i_t, kk)] = cute.exp(-r_exp_A * softplus_x, fastmath=fast_math)
 
                 # Update gate beta is a per-(head, token) scalar (warp-uniform).
                 r_b = cutlass.Float32(b[i_n, i_t, i_hv])
-                r_beta = cutlass.Float32(1.0) / (
-                    cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=fast_math)
-                )
+                r_beta = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=fast_math))
                 sBeta[i_t] = r_beta
 
                 # Preload the v-tile into SMEM: warp 0 covers tile-local cols 0..31,
@@ -311,9 +275,7 @@ def kda_verify_kernel_mtp_ws(
                     if tidx < tile_v:
                         v_global_idx = i_v * tile_v + tidx
                         if v_global_idx < V:
-                            sVdata[(i_t, tidx)] = cutlass.Float32(
-                                v[i_n, i_t, i_hv, v_global_idx]
-                            )
+                            sVdata[(i_t, tidx)] = cutlass.Float32(v[i_n, i_t, i_hv, v_global_idx])
         else:
             # Warps 1-3: prefetch the first ILP set of state rows into registers,
             # overlapping the h-state DRAM latency with warp 0's Phase 1 compute.
@@ -369,9 +331,7 @@ def kda_verify_kernel_mtp_ws(
                     if tidx < tile_v:
                         v_global_idx = i_v * tile_v + tidx
                         if v_global_idx < V:
-                            sVdata[(i_t, tidx)] = cutlass.Float32(
-                                v[i_n, i_t, i_hv, v_global_idx]
-                            )
+                            sVdata[(i_t, tidx)] = cutlass.Float32(v[i_n, i_t, i_hv, v_global_idx])
 
         # Publish warp 0's SMEM writes (q/k/g/beta + preloaded v) to all warps
         # before the recurrence reads them.
@@ -424,12 +384,8 @@ def kda_verify_kernel_mtp_ws(
                             sum_hk_a += r_h[0, i] * r_k[i]
                             sum_hk_b += r_h[1, i] * r_k[i]
                         for offset in [16, 8, 4, 2, 1]:
-                            sum_hk_a += cute.arch.shuffle_sync_bfly(
-                                sum_hk_a, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hk_b += cute.arch.shuffle_sync_bfly(
-                                sum_hk_b, offset=offset, mask=-1, mask_and_clamp=31
-                            )
+                            sum_hk_a += cute.arch.shuffle_sync_bfly(sum_hk_a, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hk_b += cute.arch.shuffle_sync_bfly(sum_hk_b, offset=offset, mask=-1, mask_and_clamp=31)
 
                         # Step 3: delta rule. v from SMEM (preloaded) or GMEM.
                         if cutlass.const_expr(use_smem_v):
@@ -471,12 +427,8 @@ def kda_verify_kernel_mtp_ws(
                             sum_hq_a += r_h[0, i] * r_q[i]
                             sum_hq_b += r_h[1, i] * r_q[i]
                         for offset in [16, 8, 4, 2, 1]:
-                            sum_hq_a += cute.arch.shuffle_sync_bfly(
-                                sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_b += cute.arch.shuffle_sync_bfly(
-                                sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31
-                            )
+                            sum_hq_a += cute.arch.shuffle_sync_bfly(sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hq_b += cute.arch.shuffle_sync_bfly(sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31)
 
                         # Reduction result is identical on all lanes -> lane 0
                         # writes. To SMEM (merged flush at kernel end) or GMEM.
@@ -615,18 +567,10 @@ def kda_verify_kernel_mtp_ws(
 
                         # Full-warp reduction for all 4 h@k dot products.
                         for offset in [16, 8, 4, 2, 1]:
-                            sum_hk_a += cute.arch.shuffle_sync_bfly(
-                                sum_hk_a, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hk_b += cute.arch.shuffle_sync_bfly(
-                                sum_hk_b, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hk_c += cute.arch.shuffle_sync_bfly(
-                                sum_hk_c, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hk_d += cute.arch.shuffle_sync_bfly(
-                                sum_hk_d, offset=offset, mask=-1, mask_and_clamp=31
-                            )
+                            sum_hk_a += cute.arch.shuffle_sync_bfly(sum_hk_a, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hk_b += cute.arch.shuffle_sync_bfly(sum_hk_b, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hk_c += cute.arch.shuffle_sync_bfly(sum_hk_c, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hk_d += cute.arch.shuffle_sync_bfly(sum_hk_d, offset=offset, mask=-1, mask_and_clamp=31)
 
                         # Step 3: delta rule for all 4 rows. v from SMEM or GMEM.
                         if cutlass.const_expr(use_smem_v):
@@ -729,18 +673,10 @@ def kda_verify_kernel_mtp_ws(
 
                         # Full-warp reduction for all 4 h@q dot products.
                         for offset in [16, 8, 4, 2, 1]:
-                            sum_hq_a += cute.arch.shuffle_sync_bfly(
-                                sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_b += cute.arch.shuffle_sync_bfly(
-                                sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_c += cute.arch.shuffle_sync_bfly(
-                                sum_hq_c, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_d += cute.arch.shuffle_sync_bfly(
-                                sum_hq_d, offset=offset, mask=-1, mask_and_clamp=31
-                            )
+                            sum_hq_a += cute.arch.shuffle_sync_bfly(sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hq_b += cute.arch.shuffle_sync_bfly(sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hq_c += cute.arch.shuffle_sync_bfly(sum_hq_c, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hq_d += cute.arch.shuffle_sync_bfly(sum_hq_d, offset=offset, mask=-1, mask_and_clamp=31)
 
                         # Reduction result is identical on all lanes -> lane 0
                         # writes. To SMEM (merged flush at kernel end) or GMEM.
@@ -983,9 +919,7 @@ def _get_compiled_mtp_ws_kernel(
     h0_source = torch.zeros(pool_size * HV, V, K, dtype=torch.float32, device="cuda")
     h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
     if cache_intermediate_states:
-        intermediate_states = torch.zeros(
-            N * T * HV, V, K, dtype=torch.float32, device="cuda"
-        )
+        intermediate_states = torch.zeros(N * T * HV, V, K, dtype=torch.float32, device="cuda")
     else:
         intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device="cuda")
 
@@ -997,12 +931,16 @@ def _get_compiled_mtp_ws_kernel(
     b_tensor = from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b.dim_order())
     A_log_tensor = from_dlpack(A_log, assumed_align=16)
     dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-    h0_source_tensor = from_dlpack(h0_source, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=h0_source.dim_order())
+    h0_source_tensor = from_dlpack(h0_source, assumed_align=16).mark_compact_shape_dynamic(
+        mode=0, stride_order=h0_source.dim_order()
+    )
     h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16).mark_layout_dynamic()
     o_tensor = from_dlpack(o, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=o.dim_order())
     intermediate_states_tensor = from_dlpack(intermediate_states, assumed_align=16)
     if cache_intermediate_states:
-        intermediate_states_tensor = intermediate_states_tensor.mark_compact_shape_dynamic(mode=0, stride_order=intermediate_states.dim_order())
+        intermediate_states_tensor = intermediate_states_tensor.mark_compact_shape_dynamic(
+            mode=0, stride_order=intermediate_states.dim_order()
+        )
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -1091,9 +1029,7 @@ def kda_decode_mtp_ws(
     # where not given explicitly. An explicit tile_v can make the heuristic's ilp=4
     # illegal (needs tile_v % 16 == 0); the auto path then falls back to ilp=2.
     if tile_v is None or ilp_rows is None or use_smem_v is None:
-        sel_tile_v, sel_ilp_rows, sel_use_smem_v = _select_mtp_config(
-            N, HV, V, T, disable_state_update=disable_state_update
-        )
+        sel_tile_v, sel_ilp_rows, sel_use_smem_v = _select_mtp_config(N, HV, V, T, disable_state_update=disable_state_update)
         if tile_v is None:
             if intermediate_states_buffer is not None and N >= 8 and V % 16 == 0:
                 # write-bound: smaller tile = more CTAs = more in-flight DRAM requests
@@ -1108,9 +1044,7 @@ def kda_decode_mtp_ws(
             use_smem_v = sel_use_smem_v
 
     if ilp_rows not in (2, 4):
-        raise NotImplementedError(
-            f"kda_decode_mtp_ws implements ilp_rows in {{2, 4}}, got {ilp_rows}"
-        )
+        raise NotImplementedError(f"kda_decode_mtp_ws implements ilp_rows in {{2, 4}}, got {ilp_rows}")
 
     # packed F32x2 FMA exists only on SM100+ (Blackwell）
     if use_packed_fma is None:
@@ -1122,18 +1056,14 @@ def kda_decode_mtp_ws(
 
     state_layout = _canonicalize_state_layout(state_layout)
     if state_layout != "vk":
-        raise NotImplementedError(
-            "kda_decode_mtp_ws only supports state_layout='vk'; "
-            f"got {state_layout!r}"
-        )
+        raise NotImplementedError(f"kda_decode_mtp_ws only supports state_layout='vk'; got {state_layout!r}")
 
     assert tile_v % 4 == 0, f"KDA MTP (ws) requires tile_v % 4 == 0, got tile_v={tile_v}"
     assert V % tile_v == 0, f"KDA MTP (ws) requires V % tile_v == 0, got V={V}, tile_v={tile_v}"
 
     rows_per_group = tile_v // 4
     assert rows_per_group % ilp_rows == 0, (
-        f"ilp_rows={ilp_rows} requires (tile_v//4) divisible by {ilp_rows}, "
-        f"got tile_v={tile_v} (tile_v//4={rows_per_group})"
+        f"ilp_rows={ilp_rows} requires (tile_v//4) divisible by {ilp_rows}, got tile_v={tile_v} (tile_v//4={rows_per_group})"
     )
 
     # State is token-independent: reuse the single-token normalizer/validator.
@@ -1162,21 +1092,16 @@ def kda_decode_mtp_ws(
 
     A_log = _normalize_A_log(A_log, HV)
     dt_bias = _normalize_dt_bias(dt_bias, HV, K)
-    initial_state_indices = _normalize_state_indices(
-        initial_state_indices, N=N, pool_size=pool_size, device=q.device
-    )
+    initial_state_indices = _normalize_state_indices(initial_state_indices, N=N, pool_size=pool_size, device=q.device)
 
     # Flatten the VK state pool [pool, HV, V, K] -> [pool*HV, V, K]
     h0_source_flat = h0_source.view(pool_size * HV, V, K)
 
-    # Stage D: resolve the snapshot cache. 
+    # Stage D: resolve the snapshot cache.
     cache_intermediate_states = intermediate_states_buffer is not None
     if cache_intermediate_states:
         if intermediate_states_buffer.dtype != torch.float32:
-            raise ValueError(
-                "intermediate_states_buffer must be float32, got "
-                f"{intermediate_states_buffer.dtype}"
-            )
+            raise ValueError(f"intermediate_states_buffer must be float32, got {intermediate_states_buffer.dtype}")
         expected_buf_shape = (N, T, HV, V, K)
         if tuple(intermediate_states_buffer.shape) != expected_buf_shape:
             raise ValueError(
@@ -1185,9 +1110,7 @@ def kda_decode_mtp_ws(
             )
         intermediate_states_flat = intermediate_states_buffer.view(N * T * HV, V, K)
     else:
-        intermediate_states_flat = torch.empty(
-            1, 1, 1, dtype=torch.float32, device=q.device
-        )
+        intermediate_states_flat = torch.empty(1, 1, 1, dtype=torch.float32, device=q.device)
 
     stream = _get_cached_stream(q.device)
 
@@ -1349,10 +1272,7 @@ def kda_mtp_small_batch_kernel(
                 x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(dt_bias[i_hv, kk])
                 if cutlass.const_expr(use_lower_bound):
                     # safe gate: g = lower_bound * sigmoid(exp(A_log) * x)
-                    sigmoid_ax = cutlass.Float32(1.0) / (
-                        cutlass.Float32(1.0)
-                        + cute.exp(-r_exp_A * x, fastmath=fast_math)
-                    )
+                    sigmoid_ax = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-r_exp_A * x, fastmath=fast_math))
                     sG[sw] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
                 else:
                     beta_x = softplus_beta * x
@@ -1360,19 +1280,14 @@ def kda_mtp_small_batch_kernel(
                     sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
                         cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
                     )
-                    use_sp = (
-                        cutlass.Float32(1.0)
-                        if beta_x <= softplus_threshold
-                        else cutlass.Float32(0.0)
-                    )
+                    use_sp = cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
                     sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
                     sG[sw] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
                 sQ[sw] = r_q[i]
                 sK[sw] = r_k[i]
 
             r_beta = cutlass.Float32(1.0) / (
-                cutlass.Float32(1.0)
-                + cute.exp(-cutlass.Float32(b[i_n, i_t, i_hv]), fastmath=fast_math)
+                cutlass.Float32(1.0) + cute.exp(-cutlass.Float32(b[i_n, i_t, i_hv]), fastmath=fast_math)
             )
 
             cute.arch.barrier()  # publish prep's SMEM writes before recurrence reads
@@ -1537,7 +1452,9 @@ def _get_compiled_mtp_small_batch_kernel(
     o_t = from_dlpack(o, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=o.dim_order())
     A_log_t = from_dlpack(A_log, assumed_align=16)
     dt_bias_t = from_dlpack(dt_bias, assumed_align=16)
-    h0_source_t = from_dlpack(h0_source, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=h0_source.dim_order())
+    h0_source_t = from_dlpack(h0_source, assumed_align=16).mark_compact_shape_dynamic(
+        mode=0, stride_order=h0_source.dim_order()
+    )
     h0_indices_t = from_dlpack(h0_indices, assumed_align=16).mark_layout_dynamic()
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -1630,9 +1547,7 @@ def kda_decode_mtp_small_batch(
         assert scale > 0, f"scale must be positive, got {scale}"
 
     assert K == TILE_K, f"KDA MTP (small_batch) requires K={TILE_K}, got {K}"
-    assert K % VEC_SIZE == 0 and K // VEC_SIZE == 32, (
-        f"small_batch assumes K//vec_size==32, got K={K}, vec_size={VEC_SIZE}"
-    )
+    assert K % VEC_SIZE == 0 and K // VEC_SIZE == 32, f"small_batch assumes K//vec_size==32, got K={K}, vec_size={VEC_SIZE}"
 
     if variant == "kv":
         state_layout = "kv"
@@ -1655,7 +1570,13 @@ def kda_decode_mtp_small_batch(
         assert V % bv == 0, f"vk requires V % bv == 0, got V={V}, bv={bv}"
 
     h0_source, pool_size, _ = _normalize_state_source(
-        initial_state_source, N=N, HV=HV, K=K, V=V, device=q.device, state_layout=state_layout,
+        initial_state_source,
+        N=N,
+        HV=HV,
+        K=K,
+        V=V,
+        device=q.device,
+        state_layout=state_layout,
     )
 
     a = _normalize_mtp_a(a, N=N, T=T, HV=HV, K=K)
@@ -1672,9 +1593,7 @@ def kda_decode_mtp_small_batch(
 
     A_log = _normalize_A_log(A_log, HV)
     dt_bias = _normalize_dt_bias(dt_bias, HV, K)
-    initial_state_indices = _normalize_state_indices(
-        initial_state_indices, N=N, pool_size=pool_size, device=q.device
-    )
+    initial_state_indices = _normalize_state_indices(initial_state_indices, N=N, pool_size=pool_size, device=q.device)
 
     stream = _get_cached_stream(q.device)
 
@@ -1685,7 +1604,9 @@ def kda_decode_mtp_small_batch(
         if intermediate_states_buffer.dtype != torch.float32:
             raise ValueError(f"intermediate_states_buffer must be float32, got {intermediate_states_buffer.dtype}")
         if tuple(intermediate_states_buffer.shape) != (N, T, HV, V, K):
-            raise ValueError(f"intermediate_states_buffer shape {tuple(intermediate_states_buffer.shape)} != expected {(N, T, HV, V, K)} ([N,T,HV,V,K] vk)")
+            raise ValueError(
+                f"intermediate_states_buffer shape {tuple(intermediate_states_buffer.shape)} != expected {(N, T, HV, V, K)} ([N,T,HV,V,K] vk)"
+            )
         intermediate_states_flat = intermediate_states_buffer.view(N * T * HV, V, K)
     else:
         intermediate_states_flat = torch.empty(1, 1, 1, dtype=torch.float32, device=q.device)
@@ -1693,22 +1614,43 @@ def kda_decode_mtp_small_batch(
     if variant == "kv":
         h0_source_flat = h0_source.view(pool_size * HV, K, V)  # kv
         compiled_kernel = _get_compiled_mtp_small_batch_kernel(
-            N, T, H, HV, K, V, pool_size, vcols, k_split,
-            scale=scale, use_qk_l2norm=use_qk_l2norm_in_kernel,
+            N,
+            T,
+            H,
+            HV,
+            K,
+            V,
+            pool_size,
+            vcols,
+            k_split,
+            scale=scale,
+            use_qk_l2norm=use_qk_l2norm_in_kernel,
             disable_state_update=disable_state_update,
-            softplus_beta=softplus_beta, softplus_threshold=softplus_threshold,
-            opt_level=opt_level, fast_math=fast_math,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            opt_level=opt_level,
+            fast_math=fast_math,
             use_lower_bound=lower_bound is not None,
             lower_bound=(0.0 if lower_bound is None else float(lower_bound)),
         )
     else:  # vk
         h0_source_flat = h0_source.view(pool_size * HV, V, K)  # vk
         compiled_kernel = _get_compiled_mtp_vk_kernel(
-            N, T, H, HV, K, V, pool_size, bv,
-            scale=scale, use_qk_l2norm=use_qk_l2norm_in_kernel,
+            N,
+            T,
+            H,
+            HV,
+            K,
+            V,
+            pool_size,
+            bv,
+            scale=scale,
+            use_qk_l2norm=use_qk_l2norm_in_kernel,
             disable_state_update=disable_state_update,
-            softplus_beta=softplus_beta, softplus_threshold=softplus_threshold,
-            opt_level=opt_level, fast_math=fast_math,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            opt_level=opt_level,
+            fast_math=fast_math,
             cache_intermediate_states=cache_intermediate_states,
             use_lower_bound=lower_bound is not None,
             lower_bound=(0.0 if lower_bound is None else float(lower_bound)),
@@ -1716,16 +1658,36 @@ def kda_decode_mtp_small_batch(
 
     if variant == "vk":
         compiled_kernel(
-            h0_source_flat, A_log, a, dt_bias, q, k, v, b, o,
-            intermediate_states_flat, initial_state_indices, stream,
+            h0_source_flat,
+            A_log,
+            a,
+            dt_bias,
+            q,
+            k,
+            v,
+            b,
+            o,
+            intermediate_states_flat,
+            initial_state_indices,
+            stream,
         )
     else:
         compiled_kernel(
-            h0_source_flat, A_log, a, dt_bias, q, k, v, b, o,
-            initial_state_indices, stream,
+            h0_source_flat,
+            A_log,
+            a,
+            dt_bias,
+            q,
+            k,
+            v,
+            b,
+            o,
+            initial_state_indices,
+            stream,
         )
 
     return o
+
 
 @cute.kernel
 def kda_mtp_small_batch_vk_kernel(
@@ -1776,11 +1738,17 @@ def kda_mtp_small_batch_vk_kernel(
     r_q = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_g = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
-    r_vbf = [cute.make_rmem_tensor(cute.make_layout((BV,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]  # v: bf16 double-buffer
-    r_red = cute.make_rmem_tensor(cute.make_layout((BV,), stride=(1,)), cutlass.Float32)  # ILP: BV reduce partials, batched butterfly
+    r_vbf = [
+        cute.make_rmem_tensor(cute.make_layout((BV,), stride=(1,)), cutlass.BFloat16) for _ in range(2)
+    ]  # v: bf16 double-buffer
+    r_red = cute.make_rmem_tensor(
+        cute.make_layout((BV,), stride=(1,)), cutlass.Float32
+    )  # ILP: BV reduce partials, batched butterfly
     r_gx = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # gate: x=a+dtb
     r_gexp = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # gate: exp(beta_x)
-    r_h4 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # float4 temp buffer (state load/store)
+    r_h4 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
+    )  # float4 temp buffer (state load/store)
     # ===== 2-stage software-pipeline double-buffer: prefetch token t+1's q/k/a/b while computing token t =====
     r_qbf = [cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]
     r_kbf = [cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]
@@ -1863,8 +1831,7 @@ def kda_mtp_small_batch_vk_kernel(
                 # safe gate: g = lower_bound * sigmoid(exp(A_log) * x)
                 for c in cutlass.range_constexpr(vec_size):
                     sigmoid_ax = cutlass.Float32(1.0) / (
-                        cutlass.Float32(1.0)
-                        + cute.exp(-r_exp_A * r_gx[c], fastmath=fast_math)
+                        cutlass.Float32(1.0) + cute.exp(-r_exp_A * r_gx[c], fastmath=fast_math)
                     )
                     r_g[c] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
             else:
@@ -1873,19 +1840,12 @@ def kda_mtp_small_batch_vk_kernel(
                     sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
                         cutlass.Float32(1.0) + r_gexp[c], fastmath=fast_math
                     )
-                    use_sp = (
-                        cutlass.Float32(1.0)
-                        if beta_x <= softplus_threshold
-                        else cutlass.Float32(0.0)
-                    )
+                    use_sp = cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
                     r_g[c] = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * r_gx[c]  # stash sp_x
                 for c in cutlass.range_constexpr(vec_size):
                     r_g[c] = cute.exp(-r_exp_A * r_g[c], fastmath=fast_math)  # final exp (batched)
 
-            r_beta = cutlass.Float32(1.0) / (
-                cutlass.Float32(1.0)
-                + cute.exp(-r_bbf[cur][0], fastmath=fast_math)
-            )
+            r_beta = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-r_bbf[cur][0], fastmath=fast_math))
 
             # ===== recurrence (fused: decay+h@k in one pass / update+h@q in one pass) =====
             for vv in cutlass.range_constexpr(BV):
@@ -2070,11 +2030,15 @@ def _get_compiled_mtp_vk_kernel(
     o_t = from_dlpack(o, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=o.dim_order())
     A_log_t = from_dlpack(A_log, assumed_align=16)
     dt_bias_t = from_dlpack(dt_bias, assumed_align=16)
-    h0_source_t = from_dlpack(h0_source, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=h0_source.dim_order())
+    h0_source_t = from_dlpack(h0_source, assumed_align=16).mark_compact_shape_dynamic(
+        mode=0, stride_order=h0_source.dim_order()
+    )
     h0_indices_t = from_dlpack(h0_indices, assumed_align=16).mark_layout_dynamic()
     intermediate_states_t = from_dlpack(intermediate_states, assumed_align=16)
     if cache_intermediate_states:
-        intermediate_states_t = intermediate_states_t.mark_compact_shape_dynamic(mode=0, stride_order=intermediate_states.dim_order())
+        intermediate_states_t = intermediate_states_t.mark_compact_shape_dynamic(
+            mode=0, stride_order=intermediate_states.dim_order()
+        )
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -2126,6 +2090,7 @@ def _select_vk_bv(work_units, V, num_sms):
         return 8
     return 32
 
+
 def kda_decode_mtp(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -2147,14 +2112,23 @@ def kda_decode_mtp(
     lower_bound: float | None = None,
 ) -> torch.Tensor:
     common = dict(
-        A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
         initial_state_source=initial_state_source,
         initial_state_indices=initial_state_indices,
-        scale=scale, use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        softplus_beta=softplus_beta, softplus_threshold=softplus_threshold,
-        out=out, disable_state_update=disable_state_update,
+        scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        out=out,
+        disable_state_update=disable_state_update,
         lower_bound=lower_bound,
-	intermediate_states_buffer=intermediate_states_buffer,
+        intermediate_states_buffer=intermediate_states_buffer,
     )
     if state_layout == "kv":
         return kda_decode_mtp_small_batch(**common, variant="kv", k_split=-1)  # k_split auto

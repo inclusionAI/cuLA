@@ -69,11 +69,11 @@ def _select_kvb_tile_v(V, N, HV):
 @cute.kernel
 def kda_flush_kvbuffer_vk_kernel(
     h0_source: cute.Tensor,  # [pool*HV, V, K] fp32
-    u_buf: cute.Tensor,      # [N, T, HV, V] fp32
-    kinv_buf: cute.Tensor,   # [N, T, HV, K] fp32
-    b_buf: cute.Tensor,      # [N, T, HV, K] fp32
+    u_buf: cute.Tensor,  # [N, T, HV, V] fp32
+    kinv_buf: cute.Tensor,  # [N, T, HV, K] fp32
+    b_buf: cute.Tensor,  # [N, T, HV, K] fp32
     h0_indices: cute.Tensor,
-    m_buf: cute.Tensor,      # [N] int32 per-request accept length (first m tokens)
+    m_buf: cute.Tensor,  # [N] int32 per-request accept length (first m tokens)
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     BV: cutlass.Constexpr[int],
@@ -152,8 +152,19 @@ def run_kda_flush_kvbuffer_vk_kernel(
     num_v_tiles = cute.ceil_div(V, BV)
     grid_size = n_indices * HV * num_v_tiles
     kda_flush_kvbuffer_vk_kernel(
-        h0_source, u_buf, kinv_buf, b_buf, h0_indices, m_buf,
-        vec_size, num_v_tiles, BV, HV, T, K, V,
+        h0_source,
+        u_buf,
+        kinv_buf,
+        b_buf,
+        h0_indices,
+        m_buf,
+        vec_size,
+        num_v_tiles,
+        BV,
+        HV,
+        T,
+        K,
+        V,
     ).launch(grid=(grid_size, 1, 1), block=[32, 1, 1], smem=0, stream=stream)
 
 
@@ -190,10 +201,7 @@ def _get_compiled_flush_kvbuffer_kernel(N, T, HV, K, V, pool_size, BV, opt_level
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
     )
     _compiled_flush_kvbuffer_kernels[key] = compiled
-    logger.info(
-        f"CuTe DSL KDA flush KVBuffer kernel compiled: N={N}, T={T}, HV={HV}, "
-        f"K={K}, V={V}, BV={BV}"
-    )
+    logger.info(f"CuTe DSL KDA flush KVBuffer kernel compiled: N={N}, T={T}, HV={HV}, K={K}, V={V}, BV={BV}")
     return compiled
 
 
@@ -223,7 +231,13 @@ def kda_flush_kvbuffer(
     assert bv in (8, 16, 32) and V % bv == 0, f"flush bv must be 8/16/32 and divide V, got bv={bv}, V={V}"
 
     h0_source, pool_size, _ = _normalize_state_source(
-        initial_state_source, N=N, HV=HV, K=K, V=V, device=initial_state_source.device, state_layout="vk",
+        initial_state_source,
+        N=N,
+        HV=HV,
+        K=K,
+        V=V,
+        device=initial_state_source.device,
+        state_layout="vk",
     )
     initial_state_indices = _normalize_state_indices(
         initial_state_indices, N=N, pool_size=pool_size, device=initial_state_source.device
@@ -252,9 +266,9 @@ def kda_mtp_tp_kvbuffer_kernel(
     b: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
-    u_buf: cute.Tensor,     # [N, T, HV, V] fp32
+    u_buf: cute.Tensor,  # [N, T, HV, V] fp32
     kinv_buf: cute.Tensor,  # [N, T, HV, K] fp32
-    b_buf: cute.Tensor,     # [N, T, HV, K] fp32
+    b_buf: cute.Tensor,  # [N, T, HV, K] fp32
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
@@ -360,10 +374,7 @@ def kda_mtp_tp_kvbuffer_kernel(
                 for c in cutlass.range_constexpr(vec_size):
                     x = cutlass.Float32(a[i_n, t_tok, i_hv, k_start + c]) + r_dtb[c]
                     if cutlass.const_expr(use_lower_bound):
-                        sigmoid_ax = cutlass.Float32(1.0) / (
-                            cutlass.Float32(1.0)
-                            + cute.exp(-r_exp_A * x, fastmath=fast_math)
-                        )
+                        sigmoid_ax = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-r_exp_A * x, fastmath=fast_math))
                         sG[t_tok, k_start + c] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
                     else:
                         beta_x = softplus_beta * x
@@ -371,19 +382,14 @@ def kda_mtp_tp_kvbuffer_kernel(
                         sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
                             cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
                         )
-                        use_sp = (
-                            cutlass.Float32(1.0)
-                            if beta_x <= softplus_threshold
-                            else cutlass.Float32(0.0)
-                        )
+                        use_sp = cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
                         sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
                         sG[t_tok, k_start + c] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
                     sKdec[t_tok, k_start + c] = r_kf[c]
                     sQdec[t_tok, k_start + c] = r_qf[c]
                 if lane_id == 0:
                     sBeta[t_tok] = cutlass.Float32(1.0) / (
-                        cutlass.Float32(1.0)
-                        + cute.exp(-cutlass.Float32(b[i_n, t_tok, i_hv]), fastmath=fast_math)
+                        cutlass.Float32(1.0) + cute.exp(-cutlass.Float32(b[i_n, t_tok, i_hv]), fastmath=fast_math)
                     )
         cute.arch.barrier()
 
@@ -461,9 +467,7 @@ def kda_mtp_tp_kvbuffer_kernel(
         for rg in cutlass.range_constexpr(n_row_groups):
             v_base = i_v * tile_v + warp_idx * rows_per_group + rg * ilp_rows
             for r in cutlass.range_constexpr(ilp_rows):
-                h_tile = cute.local_tile(
-                    h0_source, (1, 1, vec_size), (flat_state_idx, v_base + r, lane_id)
-                )
+                h_tile = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_base + r, lane_id))
                 cute.autovec_copy(h_tile, cute.slice_(r_h, (r, None)))
             # all T Skdec_t for all ilp_rows rows in ONE batched butterfly
             for r in cutlass.range_constexpr(ilp_rows):
@@ -502,7 +506,9 @@ def kda_mtp_tp_kvbuffer_kernel(
                 for off in [16, 8, 4, 2, 1]:
                     for r in cutlass.range_constexpr(ilp_rows):
                         for i_t in cutlass.range_constexpr(T):
-                            r_part[r, i_t] += cute.arch.shuffle_sync_bfly(r_part[r, i_t], offset=off, mask=-1, mask_and_clamp=31)
+                            r_part[r, i_t] += cute.arch.shuffle_sync_bfly(
+                                r_part[r, i_t], offset=off, mask=-1, mask_and_clamp=31
+                            )
                 for r in cutlass.range_constexpr(ilp_rows):
                     for i_t in cutlass.range_constexpr(T):
                         ov = r_part[r, i_t]
@@ -518,9 +524,7 @@ def kda_mtp_tp_kvbuffer_kernel(
                         for i_t in cutlass.range_constexpr(T):
                             acc += r_u[r, i_t] * sKinv[i_t, k_start + c]
                         r_tmp[c] = sBlast[k_start + c] * acc
-                    h_out = cute.local_tile(
-                        h0_source, (1, 1, vec_size), (flat_state_idx, v_base + r, lane_id)
-                    )
+                    h_out = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_base + r, lane_id))
                     cute.autovec_copy(r_tmp, h_out)
 
 
@@ -571,13 +575,38 @@ def run_kda_mtp_tp_kvbuffer_kernel(
         + 256  # alignment slack
     )
     kda_mtp_tp_kvbuffer_kernel(
-        h0_source, A_log, a, dt_bias, q, k, v, b, o, h0_indices,
-        u_buf, kinv_buf, b_buf,
-        vec_size, num_v_tiles, tile_v, ilp_rows,
-        softplus_beta, softplus_threshold, scale,
-        HV, T, H, K, V,
-        use_qk_l2norm, disable_state_update, emit_output, write_ubuf, fast_math,
-        use_lower_bound, lower_bound,
+        h0_source,
+        A_log,
+        a,
+        dt_bias,
+        q,
+        k,
+        v,
+        b,
+        o,
+        h0_indices,
+        u_buf,
+        kinv_buf,
+        b_buf,
+        vec_size,
+        num_v_tiles,
+        tile_v,
+        ilp_rows,
+        softplus_beta,
+        softplus_threshold,
+        scale,
+        HV,
+        T,
+        H,
+        K,
+        V,
+        use_qk_l2norm,
+        disable_state_update,
+        emit_output,
+        write_ubuf,
+        fast_math,
+        use_lower_bound,
+        lower_bound,
     ).launch(grid=(grid_size, 1, 1), block=[128, 1, 1], smem=smem_bytes, stream=stream)
 
 
@@ -585,16 +614,46 @@ _compiled_mtp_tp_kvbuffer_kernels: dict[tuple, object] = {}
 
 
 def _get_compiled_mtp_tp_kvbuffer_kernel(
-    N, T, H, HV, K, V, pool_size, tile_v, ilp_rows, scale, use_qk_l2norm,
-    disable_state_update, emit_output, write_ubuf,
-    softplus_beta, softplus_threshold, opt_level=3, fast_math=True,
-    use_lower_bound=False, lower_bound=0.0,
+    N,
+    T,
+    H,
+    HV,
+    K,
+    V,
+    pool_size,
+    tile_v,
+    ilp_rows,
+    scale,
+    use_qk_l2norm,
+    disable_state_update,
+    emit_output,
+    write_ubuf,
+    softplus_beta,
+    softplus_threshold,
+    opt_level=3,
+    fast_math=True,
+    use_lower_bound=False,
+    lower_bound=0.0,
 ):
     key = (
-        T, H, HV, K, V, tile_v, ilp_rows, scale, use_qk_l2norm,
-        disable_state_update, emit_output, write_ubuf,
-        softplus_beta, softplus_threshold, opt_level, fast_math,
-        use_lower_bound, lower_bound,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        tile_v,
+        ilp_rows,
+        scale,
+        use_qk_l2norm,
+        disable_state_update,
+        emit_output,
+        write_ubuf,
+        softplus_beta,
+        softplus_threshold,
+        opt_level,
+        fast_math,
+        use_lower_bound,
+        lower_bound,
     )
     if key in _compiled_mtp_tp_kvbuffer_kernels:
         return _compiled_mtp_tp_kvbuffer_kernels[key]
@@ -634,7 +693,11 @@ def _get_compiled_mtp_tp_kvbuffer_kernel(
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
         scale=scale,
-        HV=HV, T=T, H=H, K=K, V=V,
+        HV=HV,
+        T=T,
+        H=H,
+        K=K,
+        V=V,
         use_qk_l2norm=use_qk_l2norm,
         disable_state_update=disable_state_update,
         emit_output=emit_output,
@@ -717,7 +780,13 @@ def kda_decode_mtp_tp_kvbuffer(
     )
 
     h0_source, pool_size, _ = _normalize_state_source(
-        initial_state_source, N=N, HV=HV, K=K, V=V, device=q.device, state_layout="vk",
+        initial_state_source,
+        N=N,
+        HV=HV,
+        K=K,
+        V=V,
+        device=q.device,
+        state_layout="vk",
     )
 
     a = _normalize_mtp_a(a, N=N, T=T, HV=HV, K=K)
@@ -734,9 +803,7 @@ def kda_decode_mtp_tp_kvbuffer(
 
     A_log = _normalize_A_log(A_log, HV)
     dt_bias = _normalize_dt_bias(dt_bias, HV, K)
-    initial_state_indices = _normalize_state_indices(
-        initial_state_indices, N=N, pool_size=pool_size, device=q.device
-    )
+    initial_state_indices = _normalize_state_indices(initial_state_indices, N=N, pool_size=pool_size, device=q.device)
 
     if write_ubuf:
         if tuple(u_buffer.shape) != (N, T, HV, V):
@@ -753,18 +820,42 @@ def kda_decode_mtp_tp_kvbuffer(
 
     h0_source_flat = h0_source.view(pool_size * HV, V, K)
     compiled_kernel = _get_compiled_mtp_tp_kvbuffer_kernel(
-        N, T, H, HV, K, V, pool_size, tile_v, ilp_rows,
-        scale=scale, use_qk_l2norm=use_qk_l2norm_in_kernel,
-        disable_state_update=disable_state_update, emit_output=emit_output,
+        N,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        tile_v,
+        ilp_rows,
+        scale=scale,
+        use_qk_l2norm=use_qk_l2norm_in_kernel,
+        disable_state_update=disable_state_update,
+        emit_output=emit_output,
         write_ubuf=write_ubuf,
-        softplus_beta=softplus_beta, softplus_threshold=softplus_threshold,
-        opt_level=opt_level, fast_math=fast_math,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        opt_level=opt_level,
+        fast_math=fast_math,
         use_lower_bound=lower_bound is not None,
         lower_bound=(0.0 if lower_bound is None else float(lower_bound)),
     )
     compiled_kernel(
-        h0_source_flat, A_log, a, dt_bias, q, k, v, b, o,
-        initial_state_indices, u_buf, kinv_buf, b_buf, stream,
+        h0_source_flat,
+        A_log,
+        a,
+        dt_bias,
+        q,
+        k,
+        v,
+        b,
+        o,
+        initial_state_indices,
+        u_buf,
+        kinv_buf,
+        b_buf,
+        stream,
     )
     return o
 
@@ -804,10 +895,8 @@ def _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=No
     res_ty = _llvm.StructType.get_literal([f32, f32, f32, f32])
     res = _llvm.inline_asm(
         res_ty,
-        [_bits(a0), _bits(a1), _bits(a2), _bits(a3), _bits(b0), _bits(b1),
-         _f(c0), _f(c1), _f(c2), _f(c3)],
-        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
-        "{$0,$1,$2,$3}, {$4,$5,$6,$7}, {$8,$9}, {$10,$11,$12,$13};",
+        [_bits(a0), _bits(a1), _bits(a2), _bits(a3), _bits(b0), _bits(b1), _f(c0), _f(c1), _f(c2), _f(c3)],
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {$0,$1,$2,$3}, {$4,$5,$6,$7}, {$8,$9}, {$10,$11,$12,$13};",
         "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
         has_side_effects=True,
         is_align_stack=False,
@@ -856,16 +945,46 @@ _compiled_gemm_kvbuffer_cute_kernels: dict[tuple, object] = {}
 
 
 def _get_compiled_gemm_kvbuffer_cute_kernel(
-    N, T, H, HV, K, V, pool_size, bv, num_v_tiles, scale, use_qk_l2norm,
-    disable_state_update, emit_output, write_ubuf,
-    softplus_beta, softplus_threshold, opt_level=3, fast_math=True,
-    use_lower_bound=False, lower_bound=0.0,
+    N,
+    T,
+    H,
+    HV,
+    K,
+    V,
+    pool_size,
+    bv,
+    num_v_tiles,
+    scale,
+    use_qk_l2norm,
+    disable_state_update,
+    emit_output,
+    write_ubuf,
+    softplus_beta,
+    softplus_threshold,
+    opt_level=3,
+    fast_math=True,
+    use_lower_bound=False,
+    lower_bound=0.0,
 ):
     key = (
-        T, H, HV, K, V, bv, num_v_tiles, scale, use_qk_l2norm,
-        disable_state_update, emit_output, write_ubuf,
-        softplus_beta, softplus_threshold, opt_level, fast_math,
-        use_lower_bound, lower_bound,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        bv,
+        num_v_tiles,
+        scale,
+        use_qk_l2norm,
+        disable_state_update,
+        emit_output,
+        write_ubuf,
+        softplus_beta,
+        softplus_threshold,
+        opt_level,
+        fast_math,
+        use_lower_bound,
+        lower_bound,
     )
     if key in _compiled_gemm_kvbuffer_cute_kernels:
         return _compiled_gemm_kvbuffer_cute_kernels[key]
@@ -906,7 +1025,11 @@ def _get_compiled_gemm_kvbuffer_cute_kernel(
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
         scale=scale,
-        HV=HV, T=T, H=H, K=K, V=V,
+        HV=HV,
+        T=T,
+        H=H,
+        K=K,
+        V=V,
         use_qk_l2norm=use_qk_l2norm,
         disable_state_update=disable_state_update,
         emit_output=emit_output,
@@ -972,7 +1095,13 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
     assert (V // bv) % num_v_tiles == 0, f"num_v_tiles must divide V//bv, got num_v_tiles={num_v_tiles}"
 
     h0_source, pool_size, _ = _normalize_state_source(
-        initial_state_source, N=N, HV=HV, K=K, V=V, device=q.device, state_layout="vk",
+        initial_state_source,
+        N=N,
+        HV=HV,
+        K=K,
+        V=V,
+        device=q.device,
+        state_layout="vk",
     )
     a = _normalize_mtp_a(a, N=N, T=T, HV=HV, K=K)
     if b.dim() != 3 or tuple(b.shape) != (N, T, HV):
@@ -985,9 +1114,7 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
     b = b if b.is_contiguous() else b.contiguous()
     A_log = _normalize_A_log(A_log, HV)
     dt_bias = _normalize_dt_bias(dt_bias, HV, K)
-    initial_state_indices = _normalize_state_indices(
-        initial_state_indices, N=N, pool_size=pool_size, device=q.device
-    )
+    initial_state_indices = _normalize_state_indices(initial_state_indices, N=N, pool_size=pool_size, device=q.device)
 
     if write_ubuf:
         if tuple(u_buffer.shape) != (N, T, HV, V):
@@ -1003,18 +1130,42 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
     stream = _get_cached_stream(q.device)
     h0_source_flat = h0_source.view(pool_size * HV, V, K)
     compiled_kernel = _get_compiled_gemm_kvbuffer_cute_kernel(
-        N, T, H, HV, K, V, pool_size, bv, num_v_tiles,
-        scale=scale, use_qk_l2norm=use_qk_l2norm_in_kernel,
-        disable_state_update=disable_state_update, emit_output=emit_output,
+        N,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        bv,
+        num_v_tiles,
+        scale=scale,
+        use_qk_l2norm=use_qk_l2norm_in_kernel,
+        disable_state_update=disable_state_update,
+        emit_output=emit_output,
         write_ubuf=write_ubuf,
-        softplus_beta=softplus_beta, softplus_threshold=softplus_threshold,
-        opt_level=opt_level, fast_math=fast_math,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        opt_level=opt_level,
+        fast_math=fast_math,
         use_lower_bound=lower_bound is not None,
         lower_bound=(0.0 if lower_bound is None else float(lower_bound)),
     )
     compiled_kernel(
-        h0_source_flat, A_log, a, dt_bias, q, k, v, b, o,
-        initial_state_indices, u_buf, kinv_buf, b_buf, stream,
+        h0_source_flat,
+        A_log,
+        a,
+        dt_bias,
+        q,
+        k,
+        v,
+        b,
+        o,
+        initial_state_indices,
+        u_buf,
+        kinv_buf,
+        b_buf,
+        stream,
     )
     return o
 
@@ -1143,14 +1294,9 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
                         r_qf[c] = r_qf[c] * scale
                 # gate g_t per channel into sG (decay applied in P2)
                 for c in cutlass.range_constexpr(vec_size):
-                    x = cutlass.Float32(a[i_n, t_tok, i_hv, k_start + c]) + cutlass.Float32(
-                        dt_bias[i_hv, k_start + c]
-                    )
+                    x = cutlass.Float32(a[i_n, t_tok, i_hv, k_start + c]) + cutlass.Float32(dt_bias[i_hv, k_start + c])
                     if cutlass.const_expr(use_lower_bound):
-                        sigmoid_ax = cutlass.Float32(1.0) / (
-                            cutlass.Float32(1.0)
-                            + cute.exp(-r_exp_A * x, fastmath=fast_math)
-                        )
+                        sigmoid_ax = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-r_exp_A * x, fastmath=fast_math))
                         sG[t_tok, k_start + c] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
                     else:
                         beta_x = softplus_beta * x
@@ -1158,19 +1304,16 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
                         sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
                             cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
                         )
-                        use_sp = (
-                            cutlass.Float32(1.0)
-                            if beta_x <= softplus_threshold
-                            else cutlass.Float32(0.0)
-                        )
+                        use_sp = cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
                         sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
-                        sG[t_tok, k_start + c] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)  # g_t directly (exact prefix product in P2)
+                        sG[t_tok, k_start + c] = cute.exp(
+                            -r_exp_A * sp_x, fastmath=fast_math
+                        )  # g_t directly (exact prefix product in P2)
                     sKQ[t_tok, k_start + c] = r_kf[c]
                     sKQ[BT + t_tok, k_start + c] = r_qf[c]
                 if lane_id == 0:
                     sBeta[t_tok] = cutlass.Float32(1.0) / (
-                        cutlass.Float32(1.0)
-                        + cute.exp(-cutlass.Float32(b[i_n, t_tok, i_hv]), fastmath=fast_math)
+                        cutlass.Float32(1.0) + cute.exp(-cutlass.Float32(b[i_n, t_tok, i_hv]), fastmath=fast_math)
                     )
         for rp in cutlass.range_constexpr(BT - T):
             sKQ[T + rp, tidx] = cutlass.Float32(0.0)
@@ -1228,9 +1371,7 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
         # reduce 4 partials; top half -> L (strict lower, -beta), bottom -> P (lower)
         rr = tidx // 8
         cc = tidx % 8
-        psum = (
-            sPart[rr, cc] + sPart[16 + rr, cc] + sPart[32 + rr, cc] + sPart[48 + rr, cc]
-        )
+        psum = sPart[rr, cc] + sPart[16 + rr, cc] + sPart[32 + rr, cc] + sPart[48 + rr, cc]
         if rr < BT:
             keep = cutlass.Float32(1.0) if rr > cc else cutlass.Float32(0.0)
             sL[rr, cc] = -sBeta[rr] * psum * keep
@@ -1244,7 +1385,7 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
             ci = tidx % BT
             one = cutlass.Float32(1.0) if ri == ci else cutlass.Float32(0.0)
             sInv[ri, ci] = one  # inv starts at I: each doubling step does inv += inv@Lp_old
-                # (with Lp_old = Ls^(2^step)), so I+Ls is produced by step 0
+            # (with Lp_old = Ls^(2^step)), so I+Ls is produced by step 0
             sLp[ri, ci] = sL[ri, ci]
         cute.arch.barrier()
 
@@ -1273,17 +1414,15 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
         #   num_v_blocks : BV-blocks each CTA walks serially
         num_v_blocks: cutlass.Constexpr[int] = V // BV // num_v_tiles
         for vb in cutlass.range_constexpr(num_v_blocks):
-            v_base = (i_v * num_v_blocks + vb) * BV # global V-row start of this block
-            row_vecs = K // vec_size            # float4s per V row
+            v_base = (i_v * num_v_blocks + vb) * BV  # global V-row start of this block
+            row_vecs = K // vec_size  # float4s per V row
             # stage S0[BV,K] -> sS0: 128 threads (blockDim), one float4 each;
             # passes = BV*K / (128*vec_size)
             for j in cutlass.range_constexpr(BV * K // (128 * vec_size)):
-                flat = j * 128 + tidx             # float4-group id
-                s_row = flat // row_vecs   # V row
-                s_col = flat % row_vecs    # float4 within row
-                h_tile = cute.local_tile(
-                    h0_source, (1, 1, vec_size), (flat_state_idx, v_base + s_row, s_col)
-                )
+                flat = j * 128 + tidx  # float4-group id
+                s_row = flat // row_vecs  # V row
+                s_col = flat % row_vecs  # float4 within row
+                h_tile = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_base + s_row, s_col))
                 cute.autovec_copy(h_tile, r_s)
                 for cc in cutlass.range_constexpr(vec_size):
                     sS0[s_row, s_col * vec_size + cc] = r_s[cc]
@@ -1372,9 +1511,7 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
                                 gv = g2
                             if cutlass.const_expr(fi == 3):
                                 gv = g3
-                            h0_source[(flat_state_idx, v_base + vrow, kcol)] = (
-                                sBlast[kcol] * (sS0[vrow, kcol] + gv)
-                            )
+                            h0_source[(flat_state_idx, v_base + vrow, kcol)] = sBlast[kcol] * (sS0[vrow, kcol] + gv)
             cute.arch.barrier()
 
 
@@ -1417,23 +1554,48 @@ def run_kda_mtp_gemm_kvbuffer_cute_kernel(
     n_indices = h0_indices.layout.shape[0]
     grid_size = n_indices * HV * num_v_tiles
     smem_bytes = (
-        2 * 4 * BT * (K + 8)       # sKQ (stacked)
-        + 2 * 4 * BT * (K + 8)     # sKinv + sG
-        + 4 * BT + 4 * K           # sBeta + sBlast
-        + 4 * 64 * 12               # sPart
-        + 4 * 4 * BT * (BT + 1)   # sL/sP/sInv/sLp
-        + 2 * 4 * BT * (BV + 1) # sX/sU
-        + 4 * BV * (K + 8)       # sS0
+        2 * 4 * BT * (K + 8)  # sKQ (stacked)
+        + 2 * 4 * BT * (K + 8)  # sKinv + sG
+        + 4 * BT
+        + 4 * K  # sBeta + sBlast
+        + 4 * 64 * 12  # sPart
+        + 4 * 4 * BT * (BT + 1)  # sL/sP/sInv/sLp
+        + 2 * 4 * BT * (BV + 1)  # sX/sU
+        + 4 * BV * (K + 8)  # sS0
         + 512
     )
     kda_mtp_gemm_kvbuffer_cute_kernel(
-        h0_source, A_log, a, dt_bias, q, k, v, b, o, h0_indices,
-        u_buf, kinv_buf, b_buf,
-        vec_size, BV, num_v_tiles,
-        softplus_beta, softplus_threshold, scale,
-        HV, T, H, K, V,
-        use_qk_l2norm, disable_state_update, emit_output, write_ubuf, fast_math,
-        use_lower_bound, lower_bound,
+        h0_source,
+        A_log,
+        a,
+        dt_bias,
+        q,
+        k,
+        v,
+        b,
+        o,
+        h0_indices,
+        u_buf,
+        kinv_buf,
+        b_buf,
+        vec_size,
+        BV,
+        num_v_tiles,
+        softplus_beta,
+        softplus_threshold,
+        scale,
+        HV,
+        T,
+        H,
+        K,
+        V,
+        use_qk_l2norm,
+        disable_state_update,
+        emit_output,
+        write_ubuf,
+        fast_math,
+        use_lower_bound,
+        lower_bound,
     ).launch(grid=(grid_size, 1, 1), block=[128, 1, 1], smem=smem_bytes, stream=stream)
 
 
@@ -1471,13 +1633,27 @@ def kda_decode_mtp_kvbuffer(
     """
     T = q.shape[1]
     common = dict(
-        A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
-        initial_state_source=initial_state_source, initial_state_indices=initial_state_indices,
-        scale=scale, use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        softplus_beta=softplus_beta, softplus_threshold=softplus_threshold, out=out,
-        disable_state_update=disable_state_update, emit_output=emit_output,
-        u_buffer=u_buffer, kinv_buffer=kinv_buffer, b_buffer=b_buffer,
-        opt_level=opt_level, fast_math=fast_math,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        out=out,
+        disable_state_update=disable_state_update,
+        emit_output=emit_output,
+        u_buffer=u_buffer,
+        kinv_buffer=kinv_buffer,
+        b_buffer=b_buffer,
+        opt_level=opt_level,
+        fast_math=fast_math,
         lower_bound=lower_bound,
     )
     if t_crossover <= T:

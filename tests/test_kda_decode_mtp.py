@@ -45,9 +45,9 @@ from cula.ops.kda_decode_mtp_kvbuffer import (
 )
 
 
-def torch_kda_mtp_ref(q, k, v, a, b, A_log, dt_bias, state, scale,
-                      use_l2norm=True, softplus_beta=1.0, softplus_threshold=20.0,
-                      lower_bound=None):
+def torch_kda_mtp_ref(
+    q, k, v, a, b, A_log, dt_bias, state, scale, use_l2norm=True, softplus_beta=1.0, softplus_threshold=20.0, lower_bound=None
+):
     """fp32 ground truth: the single-token KDA recurrence threaded over T. Returns (o, final_state)."""
     N, T, HV, V = v.shape
     H = q.shape[2]
@@ -108,11 +108,18 @@ def run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scal
         a_t = a[:, t].unsqueeze(1).contiguous()
         b_t = b[:, t].unsqueeze(1).contiguous()
         o_t = kda_decode(
-            A_log=A_log, dt_bias=dt_bias,
-            q=q_t.to(torch.bfloat16), k=k_t.to(torch.bfloat16), v=v_t.to(torch.bfloat16),
-            a=a_t.to(torch.bfloat16), b=b_t.to(torch.bfloat16),
-            initial_state_source=state_source, initial_state_indices=indices,
-            scale=scale, use_qk_l2norm_in_kernel=True, opt_level=opt_level,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q_t.to(torch.bfloat16),
+            k=k_t.to(torch.bfloat16),
+            v=v_t.to(torch.bfloat16),
+            a=a_t.to(torch.bfloat16),
+            b=b_t.to(torch.bfloat16),
+            initial_state_source=state_source,
+            initial_state_indices=indices,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+            opt_level=opt_level,
         )
         o_all[:, t] = o_t.squeeze(1)
     return o_all, state_source
@@ -136,16 +143,39 @@ def oracle_intermediate_states(q, k, v, a, b, A_log, dt_bias, state, scale):
     inter = torch.zeros(N, T, HV, V, K, dtype=torch.float32, device=q.device)
     for t in range(T):
         _, state_cur = torch_kda_decode_ref(
-            q[:, t].float(), k[:, t].float(), v[:, t].float(),
-            a[:, t], b[:, t].float(), A_log, dt_bias, state_cur, scale,
+            q[:, t].float(),
+            k[:, t].float(),
+            v[:, t].float(),
+            a[:, t],
+            b[:, t].float(),
+            A_log,
+            dt_bias,
+            state_cur,
+            scale,
         )
         inter[:, t] = state_cur
     return inter
 
 
-def run_ws(q, k, v, a, b, A_log, dt_bias, state, scale, *, tile_v=None,
-           ilp_rows=None, use_packed_fma=None, use_smem_v=None,
-           disable_state_update=False, intermediate=False, lower_bound=None):
+def run_ws(
+    q,
+    k,
+    v,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    state,
+    scale,
+    *,
+    tile_v=None,
+    ilp_rows=None,
+    use_packed_fma=None,
+    use_smem_v=None,
+    disable_state_update=False,
+    intermediate=False,
+    lower_bound=None,
+):
     """Run kda_decode_mtp_ws (vk). Returns (o, state) or (o, state, inter)."""
     N, T, _, K = q.shape
     HV, V = v.shape[2], v.shape[3]
@@ -153,22 +183,46 @@ def run_ws(q, k, v, a, b, A_log, dt_bias, state, scale, *, tile_v=None,
     indices = torch.arange(N, device=q.device, dtype=torch.int32)
     inter = torch.zeros(N, T, HV, V, K, device=q.device, dtype=torch.float32) if intermediate else None
     o = kda_decode_mtp_ws(
-        A_log=A_log, dt_bias=dt_bias,
-        q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
-        a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
-        initial_state_source=st, initial_state_indices=indices,
-        scale=scale, use_qk_l2norm_in_kernel=True,
-        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=use_packed_fma,
-        use_smem_v=use_smem_v, disable_state_update=disable_state_update,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q.to(torch.bfloat16),
+        k=k.to(torch.bfloat16),
+        v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16),
+        b=b.to(torch.bfloat16),
+        initial_state_source=st,
+        initial_state_indices=indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        tile_v=tile_v,
+        ilp_rows=ilp_rows,
+        use_packed_fma=use_packed_fma,
+        use_smem_v=use_smem_v,
+        disable_state_update=disable_state_update,
         intermediate_states_buffer=inter,
         lower_bound=lower_bound,
     )
     return (o, st, inter) if intermediate else (o, st)
 
 
-def run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale, *, variant,
-                    bv=-1, k_split=-1, disable_state_update=False, intermediate=False,
-                    lower_bound=None):
+def run_small_batch(
+    q,
+    k,
+    v,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    state,
+    scale,
+    *,
+    variant,
+    bv=-1,
+    k_split=-1,
+    disable_state_update=False,
+    intermediate=False,
+    lower_bound=None,
+):
     """Run kda_decode_mtp_small_batch; state fed/returned in vk layout (kv transposed in and back)."""
     N = q.shape[0]
     indices = torch.arange(N, device=q.device, dtype=torch.int32)
@@ -179,12 +233,20 @@ def run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale, *, variant,
     if variant == "kv":
         st = st.transpose(-2, -1).contiguous()  # vk -> kv
     sb_kwargs = dict(
-        A_log=A_log, dt_bias=dt_bias,
-        q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
-        a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
-        initial_state_source=st, initial_state_indices=indices,
-        scale=scale, use_qk_l2norm_in_kernel=True,
-        variant=variant, k_split=k_split, disable_state_update=disable_state_update,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q.to(torch.bfloat16),
+        k=k.to(torch.bfloat16),
+        v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16),
+        b=b.to(torch.bfloat16),
+        initial_state_source=st,
+        initial_state_indices=indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        variant=variant,
+        k_split=k_split,
+        disable_state_update=disable_state_update,
         intermediate_states_buffer=inter,
         lower_bound=lower_bound,
     )
@@ -201,14 +263,13 @@ def test_mtp_ref_is_threaded_single_token(T):
     N, H, HV, K, V = 4, 8, 16, 128, 128
     scale = K**-0.5
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
-    o_mtp, st_mtp = torch_kda_mtp_ref(
-        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale)
+    o_mtp, st_mtp = torch_kda_mtp_ref(q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale)
     st_cur = state.clone()
     o_manual = torch.zeros(N, T, HV, V, dtype=torch.float32, device=q.device)
     for t in range(T):
         o_t, st_cur = torch_kda_decode_ref(
-            q[:, t].float(), k[:, t].float(), v[:, t].float(), a[:, t], b[:, t].float(),
-            A_log, dt_bias, st_cur, scale)
+            q[:, t].float(), k[:, t].float(), v[:, t].float(), a[:, t], b[:, t].float(), A_log, dt_bias, st_cur, scale
+        )
         o_manual[:, t] = o_t
     torch.testing.assert_close(o_mtp, o_manual, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(st_mtp, st_cur, atol=1e-5, rtol=1e-5)
@@ -229,8 +290,7 @@ def test_oracle_vs_loop(N, T, H, HV, zero_state):
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
     if zero_state:
         state = torch.zeros_like(state)
-    o_ref, st_ref = torch_kda_mtp_ref(
-        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale)
+    o_ref, st_ref = torch_kda_mtp_ref(q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale)
     o_loop, st_loop = run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scale)
     _assert_close("loop output", o_ref, o_loop.float())
     _assert_close("loop final state", st_ref, st_loop)
@@ -269,8 +329,7 @@ def test_ws_decode(N, T, H, HV, tile_v, ilp_rows, use_smem_v):
     scale = K**-0.5
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
     o_loop, st_loop = run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scale)
-    o_ws, st_ws = run_ws(q, k, v, a, b, A_log, dt_bias, state, scale,
-                         tile_v=tile_v, ilp_rows=ilp_rows, use_smem_v=use_smem_v)
+    o_ws, st_ws = run_ws(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=tile_v, ilp_rows=ilp_rows, use_smem_v=use_smem_v)
     tag = f"ws tv={tile_v} ilp={ilp_rows} smem={use_smem_v}"
     _assert_close(f"{tag} output", o_loop.float(), o_ws.float())
     _assert_close(f"{tag} final state", st_loop, st_ws)
@@ -306,8 +365,7 @@ def test_small_batch_decode(N, T, H, HV, variant, bv, k_split):
     scale = K**-0.5
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
     o_loop, st_loop = run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scale)
-    o_sb, st_sb = run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale,
-                                  variant=variant, bv=bv, k_split=k_split)
+    o_sb, st_sb = run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale, variant=variant, bv=bv, k_split=k_split)
     tag = f"sb {variant} bv={bv} ks={k_split}"
     _assert_close(f"{tag} output", o_loop.float(), o_sb.float())
     _assert_close(f"{tag} final state", st_loop, st_sb)
@@ -334,23 +392,29 @@ def test_lower_bound_safe_gate(kernel, N, T, H, HV):
     lower_bound = -4.0
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
     o_ref, st_ref = torch_kda_mtp_ref(
-        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(),
-        scale, lower_bound=lower_bound,
+        q.float(),
+        k.float(),
+        v.float(),
+        a,
+        b.float(),
+        A_log,
+        dt_bias,
+        state.clone(),
+        scale,
+        lower_bound=lower_bound,
     )
     if kernel == "ws":
         o, st = run_ws(q, k, v, a, b, A_log, dt_bias, state, scale, lower_bound=lower_bound)
     elif kernel == "ws_ilp4":
-        o, st = run_ws(q, k, v, a, b, A_log, dt_bias, state, scale,
-                       tile_v=16, ilp_rows=4, lower_bound=lower_bound)
+        o, st = run_ws(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=16, ilp_rows=4, lower_bound=lower_bound)
     elif kernel == "ws_smem_v":
-        o, st = run_ws(q, k, v, a, b, A_log, dt_bias, state, scale,
-                       tile_v=32, ilp_rows=4, use_smem_v=True, lower_bound=lower_bound)
+        o, st = run_ws(
+            q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=32, ilp_rows=4, use_smem_v=True, lower_bound=lower_bound
+        )
     elif kernel == "sb_vk":
-        o, st = run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale,
-                                variant="vk", lower_bound=lower_bound)
+        o, st = run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale, variant="vk", lower_bound=lower_bound)
     else:  # sb_kv
-        o, st = run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale,
-                                variant="kv", lower_bound=lower_bound)
+        o, st = run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale, variant="kv", lower_bound=lower_bound)
     tag = f"lb {kernel} N={N} T={T} HV={HV}"
     _assert_close(f"{tag} output", o_ref, o.float())
     _assert_close(f"{tag} final state", st_ref, st)
@@ -367,12 +431,10 @@ def test_disable_state_update(kernel):
     if kernel == "ws":
         o, st = run_ws(q, k, v, a, b, A_log, dt_bias, state, scale, disable_state_update=True)
     elif kernel == "ws_ilp4":
-        o, st = run_ws(q, k, v, a, b, A_log, dt_bias, state, scale,
-                       tile_v=32, ilp_rows=4, disable_state_update=True)
+        o, st = run_ws(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=32, ilp_rows=4, disable_state_update=True)
     else:
         variant = "vk" if kernel == "sb_vk" else "kv"
-        o, st = run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale,
-                                variant=variant, disable_state_update=True)
+        o, st = run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale, variant=variant, disable_state_update=True)
 
     assert torch.equal(st, state), f"{kernel}: state pool modified despite disable_state_update=True"
     _assert_close(f"{kernel} dsu output", o_loop.float(), o.float())
@@ -387,11 +449,11 @@ def test_determinism(kernel):
 
     def launch():
         if kernel == "ws":
-            return run_ws(q, k, v, a, b, A_log, dt_bias, state, scale,
-                          tile_v=64, ilp_rows=4, use_packed_fma=False)
+            return run_ws(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=64, ilp_rows=4, use_packed_fma=False)
         if kernel == "ws_smem_v":
-            return run_ws(q, k, v, a, b, A_log, dt_bias, state, scale,
-                          tile_v=64, ilp_rows=4, use_packed_fma=False, use_smem_v=True)
+            return run_ws(
+                q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=64, ilp_rows=4, use_packed_fma=False, use_smem_v=True
+            )
         variant = "vk" if kernel == "sb_vk" else "kv"
         return run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale, variant=variant)
 
@@ -404,18 +466,18 @@ def test_determinism(kernel):
         assert torch.equal(st_i, st_ref), f"{kernel} state non-deterministic at iter {i}"
 
 
-@pytest.mark.parametrize(
-    "tile_v,ilp_rows", [(8, 2), (16, 2), (32, 2), (64, 2), (16, 4), (32, 4), (64, 4)]
-)
+@pytest.mark.parametrize("tile_v,ilp_rows", [(8, 2), (16, 2), (32, 2), (64, 2), (16, 4), (32, 4), (64, 4)])
 def test_ws_smem_v_bit_identical(tile_v, ilp_rows):
     """use_smem_v is pure data movement: byte-for-byte identical to the GMEM path."""
     N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
     scale = K**-0.5
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
-    o_g, st_g = run_ws(q, k, v, a, b, A_log, dt_bias, state, scale,
-                       tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False, use_smem_v=False)
-    o_s, st_s = run_ws(q, k, v, a, b, A_log, dt_bias, state, scale,
-                       tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False, use_smem_v=True)
+    o_g, st_g = run_ws(
+        q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False, use_smem_v=False
+    )
+    o_s, st_s = run_ws(
+        q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False, use_smem_v=True
+    )
     assert torch.equal(o_s, o_g), f"smem_v output != GMEM (tile_v={tile_v}, ilp={ilp_rows})"
     assert torch.equal(st_s, st_g), f"smem_v state != GMEM (tile_v={tile_v}, ilp={ilp_rows})"
 
@@ -426,8 +488,7 @@ def test_ws_ilp4_rejects_bad_tile_v():
     scale = K**-0.5
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
     with pytest.raises(AssertionError):
-        run_ws(q, k, v, a, b, A_log, dt_bias, state, scale,
-               tile_v=8, ilp_rows=4, use_packed_fma=False)
+        run_ws(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=8, ilp_rows=4, use_packed_fma=False)
 
 
 @pytest.mark.parametrize(
@@ -473,9 +534,22 @@ def test_intermediate_vs_oracle_and_final(use_smem_v, tile_v, ilp_rows):
     scale = K**-0.5
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
     inter_ref = oracle_intermediate_states(q, k, v, a, b, A_log, dt_bias, state.clone(), scale)
-    _o, st_final, inter = run_ws(q, k, v, a, b, A_log, dt_bias, state, scale,
-                                 tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False,
-                                 use_smem_v=use_smem_v, intermediate=True)
+    _o, st_final, inter = run_ws(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        scale,
+        tile_v=tile_v,
+        ilp_rows=ilp_rows,
+        use_packed_fma=False,
+        use_smem_v=use_smem_v,
+        intermediate=True,
+    )
     tag = f"inter smem={use_smem_v} tv={tile_v} ilp={ilp_rows}"
     for t in range(T):
         _assert_close(f"{tag} snapshot[t={t}]", inter_ref[:, t], inter[:, t])
@@ -494,12 +568,22 @@ def test_intermediate_disable_state_update():
     indices = torch.arange(N, device=q.device, dtype=torch.int32)
     inter = torch.zeros(N, T, HV, V, K, device=q.device, dtype=torch.float32)
     kda_decode_mtp_ws(
-        A_log=A_log, dt_bias=dt_bias,
-        q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
-        a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
-        initial_state_source=st, initial_state_indices=indices,
-        scale=scale, use_qk_l2norm_in_kernel=True, tile_v=32, ilp_rows=4,
-        use_packed_fma=False, disable_state_update=True, intermediate_states_buffer=inter,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q.to(torch.bfloat16),
+        k=k.to(torch.bfloat16),
+        v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16),
+        b=b.to(torch.bfloat16),
+        initial_state_source=st,
+        initial_state_indices=indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        tile_v=32,
+        ilp_rows=4,
+        use_packed_fma=False,
+        disable_state_update=True,
+        intermediate_states_buffer=inter,
     )
     assert torch.equal(st, before), "pool modified despite disable_state_update=True"
     for t in range(T):
@@ -516,12 +600,21 @@ def test_intermediate_buffer_validation():
 
     def _call(buf):
         return kda_decode_mtp_ws(
-            A_log=A_log, dt_bias=dt_bias,
-            q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
-            a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
-            initial_state_source=st, initial_state_indices=indices,
-            scale=scale, use_qk_l2norm_in_kernel=True, tile_v=32, ilp_rows=4,
-            use_packed_fma=False, intermediate_states_buffer=buf,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q.to(torch.bfloat16),
+            k=k.to(torch.bfloat16),
+            v=v.to(torch.bfloat16),
+            a=a.to(torch.bfloat16),
+            b=b.to(torch.bfloat16),
+            initial_state_source=st,
+            initial_state_indices=indices,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+            tile_v=32,
+            ilp_rows=4,
+            use_packed_fma=False,
+            intermediate_states_buffer=buf,
         )
 
     with pytest.raises((ValueError, AssertionError)):
@@ -530,17 +623,16 @@ def test_intermediate_buffer_validation():
         _call(torch.zeros(N, T, HV, V, K, device="cuda", dtype=torch.bfloat16))
 
 
-@pytest.mark.parametrize(
-    "N,T", [(1, 2), (4, 4), (8, 8), (4, 2), (16, 6)]
-)
+@pytest.mark.parametrize("N,T", [(1, 2), (4, 4), (8, 8), (4, 2), (16, 6)])
 def test_intermediate_small_batch_vk(N, T):
     """vk per-token snapshot == fp32 oracle; t=T-1 snapshot == final state pool."""
     H, HV, K, V = 8, 16, 128, 128
     scale = K**-0.5
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
     inter_ref = oracle_intermediate_states(q, k, v, a, b, A_log, dt_bias, state.clone(), scale)
-    o, st_vk, inter = run_small_batch(q, k, v, a, b, A_log, dt_bias, state.clone(), scale,
-                                      variant="vk", disable_state_update=False, intermediate=True)
+    o, st_vk, inter = run_small_batch(
+        q, k, v, a, b, A_log, dt_bias, state.clone(), scale, variant="vk", disable_state_update=False, intermediate=True
+    )
     for t in range(T):
         _assert_close(f"sbvk inter snapshot[t={t}]", inter_ref[:, t], inter[:, t])
     assert torch.equal(inter[:, T - 1], st_vk), "sbvk: t=T-1 snapshot != final state"
@@ -565,20 +657,37 @@ def _kvb_verify(which, q, k, v, a, b, A_log, dt_bias, state, scale, *, ubufs=Non
     u_b, kinv_b, b_b = ubufs if ubufs is not None else (None, None, None)
     op = kda_decode_mtp_tp_kvbuffer if which == "tp" else kda_decode_mtp_gemm_kvbuffer_cute
     return op(
-        A_log=A_log, dt_bias=dt_bias,
-        q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
-        a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
-        initial_state_source=state.clone().contiguous(), initial_state_indices=indices,
-        scale=scale, use_qk_l2norm_in_kernel=True,
-        disable_state_update=True, emit_output=True,
-        u_buffer=u_b, kinv_buffer=kinv_b, b_buffer=b_b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q.to(torch.bfloat16),
+        k=k.to(torch.bfloat16),
+        v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16),
+        b=b.to(torch.bfloat16),
+        initial_state_source=state.clone().contiguous(),
+        initial_state_indices=indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        disable_state_update=True,
+        emit_output=True,
+        u_buffer=u_b,
+        kinv_buffer=kinv_b,
+        b_buffer=b_b,
         lower_bound=lower_bound,
     )
 
 
 def _kvb_oracle_out(q, k, v, a, b, A_log, dt_bias, state, scale):
     o_ref, _ = torch_kda_mtp_ref(
-        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state, scale,
+        q.float(),
+        k.float(),
+        v.float(),
+        a,
+        b.float(),
+        A_log,
+        dt_bias,
+        state,
+        scale,
     )
     return o_ref
 
@@ -587,7 +696,7 @@ def _check_kvb_verify_and_flush(which, N, T, H, HV):
     """verify output == oracle, u-buffer populated; flush(m) == m-th oracle snapshot (m=full/half/one)."""
     V = K_DIM
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K_DIM, V)
-    scale = K_DIM ** -0.5
+    scale = K_DIM**-0.5
     o_ref = _kvb_oracle_out(q, k, v, a, b, A_log, dt_bias, state, scale)
     inter_ref = oracle_intermediate_states(q, k, v, a, b, A_log, dt_bias, state.clone(), scale)
 
@@ -623,12 +732,20 @@ def test_cg_kvbuffer_verify_and_flush(N, T, H, HV):
 def test_lower_bound_kvbuffer(which, N, T, H, HV):
     """kvbuffer (tp/cg) safe-gate path: verify output matches the fp32 oracle with lower_bound."""
     V = K_DIM
-    scale = K_DIM ** -0.5
+    scale = K_DIM**-0.5
     lower_bound = -4.0
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K_DIM, V)
     o_ref, _ = torch_kda_mtp_ref(
-        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(),
-        scale, lower_bound=lower_bound,
+        q.float(),
+        k.float(),
+        v.float(),
+        a,
+        b.float(),
+        A_log,
+        dt_bias,
+        state.clone(),
+        scale,
+        lower_bound=lower_bound,
     )
     ubufs = _alloc_ubufs(N, T, HV, V)
     o = _kvb_verify(which, q, k, v, a, b, A_log, dt_bias, state, scale, ubufs=ubufs, lower_bound=lower_bound)
@@ -640,14 +757,19 @@ def test_kvbuffer_dispatch_routes_by_T(T, routed):
     """kda_decode_mtp_kvbuffer routes T<3 -> tp, T>=3 -> cg (t_crossover=3); output matches oracle either way."""
     N, H, HV, V = 2, 16, 16, K_DIM
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K_DIM, V)
-    scale = K_DIM ** -0.5
+    scale = K_DIM**-0.5
     o_ref = _kvb_oracle_out(q, k, v, a, b, A_log, dt_bias, state, scale)
     indices = torch.arange(N, device=q.device, dtype=torch.int32)
     o = kda_decode_mtp_kvbuffer(
-        A_log=A_log, dt_bias=dt_bias,
-        q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
-        a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
-        initial_state_source=state.clone().contiguous(), initial_state_indices=indices,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q.to(torch.bfloat16),
+        k=k.to(torch.bfloat16),
+        v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16),
+        b=b.to(torch.bfloat16),
+        initial_state_source=state.clone().contiguous(),
+        initial_state_indices=indices,
         scale=scale,
     )
     _assert_close(f"dispatch T{T}->{routed}", o_ref, o)
@@ -658,7 +780,7 @@ def test_kvbuffer_verify_determinism(which, N, T, H, HV):
     """Repeated kvbuffer verify launches produce a bit-identical output (and u-buffer)."""
     V = K_DIM
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K_DIM, V)
-    scale = K_DIM ** -0.5
+    scale = K_DIM**-0.5
     ub_ref = _alloc_ubufs(N, T, HV, V)
     o_ref = _kvb_verify(which, q, k, v, a, b, A_log, dt_bias, state, scale, ubufs=ub_ref)
     for i in range(3):
@@ -673,7 +795,7 @@ def test_kvbuffer_flush_determinism(which, N, T, H, HV):
     """Repeated flush launches rebuild a bit-identical state."""
     V = K_DIM
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K_DIM, V)
-    scale = K_DIM ** -0.5
+    scale = K_DIM**-0.5
     indices = torch.arange(N, device=q.device, dtype=torch.int32)
     ubufs = _alloc_ubufs(N, T, HV, V)
     _kvb_verify(which, q, k, v, a, b, A_log, dt_bias, state, scale, ubufs=ubufs)
