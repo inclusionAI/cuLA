@@ -45,7 +45,8 @@ from cula.ops.kda_decode_mtp_kvbuffer import (
 
 
 def torch_kda_mtp_ref(q, k, v, a, b, A_log, dt_bias, state, scale,
-                      use_l2norm=True, softplus_beta=1.0, softplus_threshold=20.0):
+                      use_l2norm=True, softplus_beta=1.0, softplus_threshold=20.0,
+                      lower_bound=None):
     """fp32 ground truth: the single-token KDA recurrence threaded over T. Returns (o, final_state)."""
     N, T, HV, V = v.shape
     K = q.shape[-1]
@@ -59,8 +60,12 @@ def torch_kda_mtp_ref(q, k, v, a, b, A_log, dt_bias, state, scale,
             for hv in range(HV):
                 i_h = hv // heads_per_group
                 x = a[n, t, hv, :] + dt_bias[hv, :]
-                sp = F.softplus(x, beta=softplus_beta, threshold=softplus_threshold)
-                gate = torch.exp(-A[hv] * sp)
+                if lower_bound is not None:
+                    # safe gate: g = lower_bound * sigmoid(exp(A_log) * x)
+                    gate = torch.exp(lower_bound * torch.sigmoid(A[hv] * x))
+                else:
+                    sp = F.softplus(x, beta=softplus_beta, threshold=softplus_threshold)
+                    gate = torch.exp(-A[hv] * sp)
                 if use_l2norm:
                     q_vec = F.normalize(q[n, t, i_h, :], dim=0) * scale
                     k_vec = F.normalize(k[n, t, i_h, :], dim=0)
@@ -140,7 +145,7 @@ def oracle_intermediate_states(q, k, v, a, b, A_log, dt_bias, state, scale):
 
 def run_ws(q, k, v, a, b, A_log, dt_bias, state, scale, *, tile_v=None,
            ilp_rows=None, use_packed_fma=None, use_smem_v=None,
-           disable_state_update=False, intermediate=False):
+           disable_state_update=False, intermediate=False, lower_bound=None):
     """Run kda_decode_mtp_ws (vk). Returns (o, state) or (o, state, inter)."""
     N, T, _, K = q.shape
     HV, V = v.shape[2], v.shape[3]
@@ -156,12 +161,14 @@ def run_ws(q, k, v, a, b, A_log, dt_bias, state, scale, *, tile_v=None,
         tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=use_packed_fma,
         use_smem_v=use_smem_v, disable_state_update=disable_state_update,
         intermediate_states_buffer=inter,
+        lower_bound=lower_bound,
     )
     return (o, st, inter) if intermediate else (o, st)
 
 
 def run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale, *, variant,
-                    bv=-1, k_split=-1, disable_state_update=False, intermediate=False):
+                    bv=-1, k_split=-1, disable_state_update=False, intermediate=False,
+                    lower_bound=None):
     """Run kda_decode_mtp_small_batch; state fed/returned in vk layout (kv transposed in and back)."""
     N = q.shape[0]
     indices = torch.arange(N, device=q.device, dtype=torch.int32)
@@ -178,6 +185,7 @@ def run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale, *, variant,
         scale=scale, use_qk_l2norm_in_kernel=True,
         variant=variant, k_split=k_split, disable_state_update=disable_state_update,
         intermediate_states_buffer=inter,
+        lower_bound=lower_bound,
     )
     if variant == "vk":
         sb_kwargs["bv"] = bv  # kv is fixed 1-warp; bv stays at the WARP_BV default
@@ -302,6 +310,49 @@ def test_small_batch_decode(N, T, H, HV, variant, bv, k_split):
     tag = f"sb {variant} bv={bv} ks={k_split}"
     _assert_close(f"{tag} output", o_loop.float(), o_sb.float())
     _assert_close(f"{tag} final state", st_loop, st_sb)
+
+
+@pytest.mark.parametrize("kernel", ["ws", "ws_ilp4", "ws_smem_v", "sb_vk", "sb_kv"])
+@pytest.mark.parametrize(
+    "N,T,H,HV",
+    [
+        pytest.param(*c, id="N{}-T{}-H{}-HV{}".format(*c))
+        for c in [
+            (1, 1, 8, 16),
+            (4, 4, 8, 16),
+            (8, 4, 8, 16),
+            (16, 4, 16, 32),
+        ]
+    ],
+)
+def test_lower_bound_safe_gate(kernel, N, T, H, HV):
+    """Safe-gate path g = lower_bound * sigmoid(exp(A_log) * x): the MTP kernels must
+    match the fp32 oracle (the single-token loop kernel has no safe-gate path)."""
+    K, V = 128, 128
+    scale = K**-0.5
+    lower_bound = -4.0
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+    o_ref, st_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(),
+        scale, lower_bound=lower_bound,
+    )
+    if kernel == "ws":
+        o, st = run_ws(q, k, v, a, b, A_log, dt_bias, state, scale, lower_bound=lower_bound)
+    elif kernel == "ws_ilp4":
+        o, st = run_ws(q, k, v, a, b, A_log, dt_bias, state, scale,
+                       tile_v=16, ilp_rows=4, lower_bound=lower_bound)
+    elif kernel == "ws_smem_v":
+        o, st = run_ws(q, k, v, a, b, A_log, dt_bias, state, scale,
+                       tile_v=32, ilp_rows=4, use_smem_v=True, lower_bound=lower_bound)
+    elif kernel == "sb_vk":
+        o, st = run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale,
+                                variant="vk", lower_bound=lower_bound)
+    else:  # sb_kv
+        o, st = run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale,
+                                variant="kv", lower_bound=lower_bound)
+    tag = f"lb {kernel} N={N} T={T} HV={HV}"
+    _assert_close(f"{tag} output", o_ref, o.float())
+    _assert_close(f"{tag} final state", st_ref, st)
 
 
 @pytest.mark.parametrize("kernel", ["ws", "ws_ilp4", "sb_vk", "sb_kv"])
@@ -506,7 +557,7 @@ def _alloc_ubufs(N, T, HV, V, device="cuda"):
     )
 
 
-def _kvb_verify(which, q, k, v, a, b, A_log, dt_bias, state, scale, *, ubufs=None):
+def _kvb_verify(which, q, k, v, a, b, A_log, dt_bias, state, scale, *, ubufs=None, lower_bound=None):
     """Run a kvbuffer verify op (disable_state_update=True). Returns output o [N,T,HV,V]."""
     N = q.shape[0]
     indices = torch.arange(N, device=q.device, dtype=torch.int32)
@@ -520,6 +571,7 @@ def _kvb_verify(which, q, k, v, a, b, A_log, dt_bias, state, scale, *, ubufs=Non
         scale=scale, use_qk_l2norm_in_kernel=True,
         disable_state_update=True, emit_output=True,
         u_buffer=u_b, kinv_buffer=kinv_b, b_buffer=b_b,
+        lower_bound=lower_bound,
     )
 
 
@@ -561,6 +613,25 @@ def test_tp_kvbuffer_verify_and_flush(N, T, H, HV):
 def test_cg_kvbuffer_verify_and_flush(N, T, H, HV):
     """cg-kvbuffer (CuTe tensor-core gemm) verify output + rank-m flush match the fp32 oracle."""
     _check_kvb_verify_and_flush("cg", N, T, H, HV)
+
+
+@pytest.mark.parametrize(
+    "which,N,T,H,HV",
+    [("tp", 2, 2, 16, 16), ("tp", 4, 2, 16, 16), ("cg", 2, 4, 16, 16), ("cg", 1, 8, 32, 32)],
+)
+def test_lower_bound_kvbuffer(which, N, T, H, HV):
+    """kvbuffer (tp/cg) safe-gate path: verify output matches the fp32 oracle with lower_bound."""
+    V = K_DIM
+    scale = K_DIM ** -0.5
+    lower_bound = -4.0
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K_DIM, V)
+    o_ref, _ = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(),
+        scale, lower_bound=lower_bound,
+    )
+    ubufs = _alloc_ubufs(N, T, HV, V)
+    o = _kvb_verify(which, q, k, v, a, b, A_log, dt_bias, state, scale, ubufs=ubufs, lower_bound=lower_bound)
+    _assert_close(f"lb {which} N{N}T{T}HV{HV}", o_ref, o)
 
 
 @pytest.mark.parametrize("T,routed", [(2, "tp"), (4, "cg")])

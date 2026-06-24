@@ -272,6 +272,8 @@ def kda_mtp_tp_kvbuffer_kernel(
     emit_output: cutlass.Constexpr[bool],
     write_ubuf: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
+    use_lower_bound: cutlass.Constexpr[bool],
+    lower_bound: cutlass.Constexpr[float],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     lane_id = tidx % 32
@@ -357,18 +359,25 @@ def kda_mtp_tp_kvbuffer_kernel(
                 # gate g_t per channel; stage k_norm/q_scaled (decay applied in Stage 2)
                 for c in cutlass.range_constexpr(vec_size):
                     x = cutlass.Float32(a[i_n, t_tok, i_hv, k_start + c]) + r_dtb[c]
-                    beta_x = softplus_beta * x
-                    exp_bx = cute.exp(beta_x, fastmath=fast_math)
-                    sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                        cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
-                    )
-                    use_sp = (
-                        cutlass.Float32(1.0)
-                        if beta_x <= softplus_threshold
-                        else cutlass.Float32(0.0)
-                    )
-                    sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
-                    sG[t_tok, k_start + c] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
+                    if cutlass.const_expr(use_lower_bound):
+                        sigmoid_ax = cutlass.Float32(1.0) / (
+                            cutlass.Float32(1.0)
+                            + cute.exp(-r_exp_A * x, fastmath=fast_math)
+                        )
+                        sG[t_tok, k_start + c] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
+                    else:
+                        beta_x = softplus_beta * x
+                        exp_bx = cute.exp(beta_x, fastmath=fast_math)
+                        sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                            cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
+                        )
+                        use_sp = (
+                            cutlass.Float32(1.0)
+                            if beta_x <= softplus_threshold
+                            else cutlass.Float32(0.0)
+                        )
+                        sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
+                        sG[t_tok, k_start + c] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
                     sKdec[t_tok, k_start + c] = r_kf[c]
                     sQdec[t_tok, k_start + c] = r_qf[c]
                 if lane_id == 0:
@@ -546,6 +555,8 @@ def run_kda_mtp_tp_kvbuffer_kernel(
     emit_output: cutlass.Constexpr[bool],
     write_ubuf: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
+    use_lower_bound: cutlass.Constexpr[bool],
+    lower_bound: cutlass.Constexpr[float],
     stream: cuda.CUstream,
 ):
     """tp-kvbuffer launcher: grid = N*HV*(V//tile_v), block = 128 (4 warps)."""
@@ -566,6 +577,7 @@ def run_kda_mtp_tp_kvbuffer_kernel(
         softplus_beta, softplus_threshold, scale,
         HV, T, H, K, V,
         use_qk_l2norm, disable_state_update, emit_output, write_ubuf, fast_math,
+        use_lower_bound, lower_bound,
     ).launch(grid=(grid_size, 1, 1), block=[128, 1, 1], smem=smem_bytes, stream=stream)
 
 
@@ -576,11 +588,13 @@ def _get_compiled_mtp_tp_kvbuffer_kernel(
     N, T, H, HV, K, V, pool_size, tile_v, ilp_rows, scale, use_qk_l2norm,
     disable_state_update, emit_output, write_ubuf,
     softplus_beta, softplus_threshold, opt_level=3, fast_math=True,
+    use_lower_bound=False, lower_bound=0.0,
 ):
     key = (
         N, T, H, HV, K, V, pool_size, tile_v, ilp_rows, scale, use_qk_l2norm,
         disable_state_update, emit_output, write_ubuf,
         softplus_beta, softplus_threshold, opt_level, fast_math,
+        use_lower_bound, lower_bound,
     )
     if key in _compiled_mtp_tp_kvbuffer_kernels:
         return _compiled_mtp_tp_kvbuffer_kernels[key]
@@ -626,6 +640,8 @@ def _get_compiled_mtp_tp_kvbuffer_kernel(
         emit_output=emit_output,
         write_ubuf=write_ubuf,
         fast_math=fast_math,
+        use_lower_bound=use_lower_bound,
+        lower_bound=lower_bound,
         stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
     )
@@ -672,6 +688,7 @@ def kda_decode_mtp_tp_kvbuffer(
     ilp_rows: int = -1,
     opt_level: int = 3,
     fast_math: bool = True,
+    lower_bound: float | None = None,
 ) -> torch.Tensor:
     """KDA MTP tp-KVBuffer verify (token-parallel chunkwise; flush reuses kda_flush_kvbuffer)."""
     N, T, H, K = q.shape
@@ -742,6 +759,8 @@ def kda_decode_mtp_tp_kvbuffer(
         write_ubuf=write_ubuf,
         softplus_beta=softplus_beta, softplus_threshold=softplus_threshold,
         opt_level=opt_level, fast_math=fast_math,
+        use_lower_bound=lower_bound is not None,
+        lower_bound=(0.0 if lower_bound is None else float(lower_bound)),
     )
     compiled_kernel(
         h0_source_flat, A_log, a, dt_bias, q, k, v, b, o,
@@ -840,11 +859,13 @@ def _get_compiled_gemm_kvbuffer_cute_kernel(
     N, T, H, HV, K, V, pool_size, bv, num_v_tiles, scale, use_qk_l2norm,
     disable_state_update, emit_output, write_ubuf,
     softplus_beta, softplus_threshold, opt_level=3, fast_math=True,
+    use_lower_bound=False, lower_bound=0.0,
 ):
     key = (
         N, T, H, HV, K, V, pool_size, bv, num_v_tiles, scale, use_qk_l2norm,
         disable_state_update, emit_output, write_ubuf,
         softplus_beta, softplus_threshold, opt_level, fast_math,
+        use_lower_bound, lower_bound,
     )
     if key in _compiled_gemm_kvbuffer_cute_kernels:
         return _compiled_gemm_kvbuffer_cute_kernels[key]
@@ -891,6 +912,8 @@ def _get_compiled_gemm_kvbuffer_cute_kernel(
         emit_output=emit_output,
         write_ubuf=write_ubuf,
         fast_math=fast_math,
+        use_lower_bound=use_lower_bound,
+        lower_bound=lower_bound,
         stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
     )
@@ -926,6 +949,7 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
     num_v_tiles: int = -1,
     opt_level: int = 3,
     fast_math: bool = True,
+    lower_bound: float | None = None,
 ) -> torch.Tensor:
     """KDA MTP decode — CuTe sm_90 tensor-core kvbuffer VERIFY (port of the Triton gemm op)."""
     N, T, H, K = q.shape
@@ -985,6 +1009,8 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
         write_ubuf=write_ubuf,
         softplus_beta=softplus_beta, softplus_threshold=softplus_threshold,
         opt_level=opt_level, fast_math=fast_math,
+        use_lower_bound=lower_bound is not None,
+        lower_bound=(0.0 if lower_bound is None else float(lower_bound)),
     )
     compiled_kernel(
         h0_source_flat, A_log, a, dt_bias, q, k, v, b, o,
@@ -1038,6 +1064,8 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
     emit_output: cutlass.Constexpr[bool],
     write_ubuf: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
+    use_lower_bound: cutlass.Constexpr[bool],
+    lower_bound: cutlass.Constexpr[float],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     lane_id = tidx % 32
@@ -1118,18 +1146,25 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
                     x = cutlass.Float32(a[i_n, t_tok, i_hv, k_start + c]) + cutlass.Float32(
                         dt_bias[i_hv, k_start + c]
                     )
-                    beta_x = softplus_beta * x
-                    exp_bx = cute.exp(beta_x, fastmath=fast_math)
-                    sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                        cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
-                    )
-                    use_sp = (
-                        cutlass.Float32(1.0)
-                        if beta_x <= softplus_threshold
-                        else cutlass.Float32(0.0)
-                    )
-                    sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
-                    sG[t_tok, k_start + c] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)  # g_t directly (exact prefix product in P2)
+                    if cutlass.const_expr(use_lower_bound):
+                        sigmoid_ax = cutlass.Float32(1.0) / (
+                            cutlass.Float32(1.0)
+                            + cute.exp(-r_exp_A * x, fastmath=fast_math)
+                        )
+                        sG[t_tok, k_start + c] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
+                    else:
+                        beta_x = softplus_beta * x
+                        exp_bx = cute.exp(beta_x, fastmath=fast_math)
+                        sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                            cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
+                        )
+                        use_sp = (
+                            cutlass.Float32(1.0)
+                            if beta_x <= softplus_threshold
+                            else cutlass.Float32(0.0)
+                        )
+                        sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
+                        sG[t_tok, k_start + c] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)  # g_t directly (exact prefix product in P2)
                     sKQ[t_tok, k_start + c] = r_kf[c]
                     sKQ[BT + t_tok, k_start + c] = r_qf[c]
                 if lane_id == 0:
@@ -1374,6 +1409,8 @@ def run_kda_mtp_gemm_kvbuffer_cute_kernel(
     emit_output: cutlass.Constexpr[bool],
     write_ubuf: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
+    use_lower_bound: cutlass.Constexpr[bool],
+    lower_bound: cutlass.Constexpr[float],
     stream: cuda.CUstream,
 ):
     """BT=8 stacked cute-gemm launcher: grid = N*HV*num_v_tiles, block = 128."""
@@ -1396,6 +1433,7 @@ def run_kda_mtp_gemm_kvbuffer_cute_kernel(
         softplus_beta, softplus_threshold, scale,
         HV, T, H, K, V,
         use_qk_l2norm, disable_state_update, emit_output, write_ubuf, fast_math,
+        use_lower_bound, lower_bound,
     ).launch(grid=(grid_size, 1, 1), block=[128, 1, 1], smem=smem_bytes, stream=stream)
 
 
@@ -1425,6 +1463,7 @@ def kda_decode_mtp_kvbuffer(
     t_crossover: int = 3,
     opt_level: int = 3,
     fast_math: bool = True,
+    lower_bound: float | None = None,
 ) -> torch.Tensor:
     """KDA MTP KVBuffer verify dispatch by T: < t_crossover (default 3) -> tp-kvbuffer
     (token-parallel SIMT), else gemm-kvbuffer (CuTe tensor-core, flat-in-T; crossover T~3
@@ -1439,6 +1478,7 @@ def kda_decode_mtp_kvbuffer(
         disable_state_update=disable_state_update, emit_output=emit_output,
         u_buffer=u_buffer, kinv_buffer=kinv_buffer, b_buffer=b_buffer,
         opt_level=opt_level, fast_math=fast_math,
+        lower_bound=lower_bound,
     )
     if T >= t_crossover:
         return kda_decode_mtp_gemm_kvbuffer_cute(**common)
