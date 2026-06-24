@@ -591,7 +591,7 @@ def _get_compiled_mtp_tp_kvbuffer_kernel(
     use_lower_bound=False, lower_bound=0.0,
 ):
     key = (
-        N, T, H, HV, K, V, pool_size, tile_v, ilp_rows, scale, use_qk_l2norm,
+        T, H, HV, K, V, tile_v, ilp_rows, scale, use_qk_l2norm,
         disable_state_update, emit_output, write_ubuf,
         softplus_beta, softplus_threshold, opt_level, fast_math,
         use_lower_bound, lower_bound,
@@ -615,19 +615,19 @@ def _get_compiled_mtp_tp_kvbuffer_kernel(
 
     compiled_kernel = cute.compile(
         run_kda_mtp_tp_kvbuffer_kernel,
-        from_dlpack(h0_source, assumed_align=16),
+        from_dlpack(h0_source, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=h0_source.dim_order()),
         from_dlpack(A_log, assumed_align=16),
-        from_dlpack(a, assumed_align=16),
+        from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=a.dim_order()),
         from_dlpack(dt_bias, assumed_align=16),
-        from_dlpack(q, assumed_align=16),
-        from_dlpack(k, assumed_align=16),
-        from_dlpack(v, assumed_align=16),
-        from_dlpack(b, assumed_align=16),
-        from_dlpack(o, assumed_align=16),
-        from_dlpack(h0_indices, assumed_align=16),
-        from_dlpack(u_buf, assumed_align=16),
-        from_dlpack(kinv_buf, assumed_align=16),
-        from_dlpack(b_buf, assumed_align=16),
+        from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=q.dim_order()),
+        from_dlpack(k, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=k.dim_order()),
+        from_dlpack(v, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=v.dim_order()),
+        from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b.dim_order()),
+        from_dlpack(o, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=o.dim_order()),
+        from_dlpack(h0_indices, assumed_align=16).mark_layout_dynamic(),
+        from_dlpack(u_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=u_buf.dim_order()),
+        from_dlpack(kinv_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=kinv_buf.dim_order()),
+        from_dlpack(b_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b_buf.dim_order()),
         vec_size=VEC_SIZE,
         tile_v=tile_v,
         ilp_rows=ilp_rows,
@@ -779,10 +779,10 @@ def kda_decode_mtp_tp_kvbuffer(
 #   C/D [16,8] f32:     c0=C[gid][2tig] c1=C[gid][2tig+1] c2=C[gid+8][2tig] c3=C[gid+8][2tig+1]
 # ===========================================================================
 
-from cutlass._mlir.dialects import arith as _arith
-from cutlass._mlir.dialects import llvm as _llvm
-from cutlass.cutlass_dsl import T as _T
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass._mlir.dialects import arith as _arith  # noqa: E402
+from cutlass._mlir.dialects import llvm as _llvm  # noqa: E402
+from cutlass.cutlass_dsl import T as _T  # noqa: E402
+from cutlass.cutlass_dsl import dsl_user_op  # noqa: E402
 
 
 @dsl_user_op
@@ -862,7 +862,7 @@ def _get_compiled_gemm_kvbuffer_cute_kernel(
     use_lower_bound=False, lower_bound=0.0,
 ):
     key = (
-        N, T, H, HV, K, V, pool_size, bv, num_v_tiles, scale, use_qk_l2norm,
+        T, H, HV, K, V, bv, num_v_tiles, scale, use_qk_l2norm,
         disable_state_update, emit_output, write_ubuf,
         softplus_beta, softplus_threshold, opt_level, fast_math,
         use_lower_bound, lower_bound,
@@ -887,19 +887,19 @@ def _get_compiled_gemm_kvbuffer_cute_kernel(
     run_fn = run_kda_mtp_gemm_kvbuffer_cute_kernel
     compiled_kernel = cute.compile(
         run_fn,
-        from_dlpack(h0_source, assumed_align=16),
+        from_dlpack(h0_source, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=h0_source.dim_order()),
         from_dlpack(A_log, assumed_align=16),
-        from_dlpack(a, assumed_align=16),
+        from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=a.dim_order()),
         from_dlpack(dt_bias, assumed_align=16),
-        from_dlpack(q, assumed_align=16),
-        from_dlpack(k, assumed_align=16),
-        from_dlpack(v, assumed_align=16),
-        from_dlpack(b, assumed_align=16),
-        from_dlpack(o, assumed_align=16),
-        from_dlpack(h0_indices, assumed_align=16),
-        from_dlpack(u_buf, assumed_align=16),
-        from_dlpack(kinv_buf, assumed_align=16),
-        from_dlpack(b_buf, assumed_align=16),
+        from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=q.dim_order()),
+        from_dlpack(k, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=k.dim_order()),
+        from_dlpack(v, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=v.dim_order()),
+        from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b.dim_order()),
+        from_dlpack(o, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=o.dim_order()),
+        from_dlpack(h0_indices, assumed_align=16).mark_layout_dynamic(),
+        from_dlpack(u_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=u_buf.dim_order()),
+        from_dlpack(kinv_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=kinv_buf.dim_order()),
+        from_dlpack(b_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b_buf.dim_order()),
         vec_size=VEC_SIZE,
         BV=bv,
         num_v_tiles=num_v_tiles,
@@ -1480,6 +1480,6 @@ def kda_decode_mtp_kvbuffer(
         opt_level=opt_level, fast_math=fast_math,
         lower_bound=lower_bound,
     )
-    if T >= t_crossover:
+    if t_crossover <= T:
         return kda_decode_mtp_gemm_kvbuffer_cute(**common)
     return kda_decode_mtp_tp_kvbuffer(**common)

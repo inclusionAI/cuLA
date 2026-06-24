@@ -24,6 +24,8 @@ import torch.nn.functional as F
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # for sibling test import
 
+from test_kda_decode import torch_kda_decode_ref  # trusted single-token reference
+
 from cula.kda import (
     kda_decode,
     kda_decode_mtp_ws,
@@ -33,7 +35,6 @@ from cula.ops.kda_decode_mtp import (
     _select_mtp_tile_v,
     kda_decode_mtp_small_batch,
 )
-from test_kda_decode import torch_kda_decode_ref  # trusted single-token reference
 from cula.ops.kda_decode_mtp_kvbuffer import (
     _select_kvb_tile_v,
     _select_tp_kvb_ilp_rows,
@@ -49,7 +50,6 @@ def torch_kda_mtp_ref(q, k, v, a, b, A_log, dt_bias, state, scale,
                       lower_bound=None):
     """fp32 ground truth: the single-token KDA recurrence threaded over T. Returns (o, final_state)."""
     N, T, HV, V = v.shape
-    K = q.shape[-1]
     H = q.shape[2]
     heads_per_group = HV // H
     A = torch.exp(A_log)
@@ -172,7 +172,8 @@ def run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale, *, variant,
     """Run kda_decode_mtp_small_batch; state fed/returned in vk layout (kv transposed in and back)."""
     N = q.shape[0]
     indices = torch.arange(N, device=q.device, dtype=torch.int32)
-    T = q.shape[1]; HV, V, K = v.shape[2], v.shape[3], q.shape[3]
+    T = q.shape[1]
+    HV, V, K = v.shape[2], v.shape[3], q.shape[3]
     inter = torch.zeros(N, T, HV, V, K, device=q.device, dtype=torch.float32) if intermediate else None
     st = state.clone().contiguous()
     if variant == "kv":

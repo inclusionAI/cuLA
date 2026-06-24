@@ -948,13 +948,11 @@ def _get_compiled_mtp_ws_kernel(
     ``opt_level`` (``--opt-level``) and ``fast_math`` are part of the cache key.
     """
     key = (
-        N,
         T,
         H,
         HV,
         K,
         V,
-        pool_size,
         scale,
         use_qk_l2norm,
         disable_state_update,
@@ -991,17 +989,20 @@ def _get_compiled_mtp_ws_kernel(
     else:
         intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device="cuda")
 
-    q_tensor = from_dlpack(q, assumed_align=16)
-    k_tensor = from_dlpack(k, assumed_align=16)
-    v_tensor = from_dlpack(v, assumed_align=16)
-    a_tensor = from_dlpack(a, assumed_align=16)
-    b_tensor = from_dlpack(b, assumed_align=16)
+    # dynamic-N (flashinfer-aligned): batch + pool axes dynamic -> one cubin per shape config.
+    q_tensor = from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=q.dim_order())
+    k_tensor = from_dlpack(k, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=k.dim_order())
+    v_tensor = from_dlpack(v, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=v.dim_order())
+    a_tensor = from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=a.dim_order())
+    b_tensor = from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b.dim_order())
     A_log_tensor = from_dlpack(A_log, assumed_align=16)
     dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-    h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
-    h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
-    o_tensor = from_dlpack(o, assumed_align=16)
+    h0_source_tensor = from_dlpack(h0_source, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=h0_source.dim_order())
+    h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16).mark_layout_dynamic()
+    o_tensor = from_dlpack(o, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=o.dim_order())
     intermediate_states_tensor = from_dlpack(intermediate_states, assumed_align=16)
+    if cache_intermediate_states:
+        intermediate_states_tensor = intermediate_states_tensor.mark_compact_shape_dynamic(mode=0, stride_order=intermediate_states.dim_order())
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -1496,13 +1497,11 @@ def _get_compiled_mtp_small_batch_kernel(
     lower_bound=0.0,
 ):
     key = (
-        N,
         T,
         H,
         HV,
         K,
         V,
-        pool_size,
         BV,
         k_split,
         scale,
@@ -1529,16 +1528,17 @@ def _get_compiled_mtp_small_batch_kernel(
     h0_source = torch.zeros(pool_size * HV, K, V, dtype=torch.float32, device="cuda")  # kv
     h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
 
-    q_t = from_dlpack(q, assumed_align=16)
-    k_t = from_dlpack(k, assumed_align=16)
-    v_t = from_dlpack(v, assumed_align=16)
-    a_t = from_dlpack(a, assumed_align=16)
-    b_t = from_dlpack(b, assumed_align=16)
-    o_t = from_dlpack(o, assumed_align=16)
+    # dynamic-N (flashinfer-aligned): batch + pool axes dynamic.
+    q_t = from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=q.dim_order())
+    k_t = from_dlpack(k, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=k.dim_order())
+    v_t = from_dlpack(v, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=v.dim_order())
+    a_t = from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=a.dim_order())
+    b_t = from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b.dim_order())
+    o_t = from_dlpack(o, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=o.dim_order())
     A_log_t = from_dlpack(A_log, assumed_align=16)
     dt_bias_t = from_dlpack(dt_bias, assumed_align=16)
-    h0_source_t = from_dlpack(h0_source, assumed_align=16)
-    h0_indices_t = from_dlpack(h0_indices, assumed_align=16)
+    h0_source_t = from_dlpack(h0_source, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=h0_source.dim_order())
+    h0_indices_t = from_dlpack(h0_indices, assumed_align=16).mark_layout_dynamic()
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -2025,13 +2025,11 @@ def _get_compiled_mtp_vk_kernel(
     lower_bound=0.0,
 ):
     key = (
-        N,
         T,
         H,
         HV,
         K,
         V,
-        pool_size,
         BV,
         scale,
         use_qk_l2norm,
@@ -2062,17 +2060,21 @@ def _get_compiled_mtp_vk_kernel(
     else:
         intermediate_states = torch.empty(1, 1, 1, dtype=torch.float32, device="cuda")
 
-    q_t = from_dlpack(q, assumed_align=16)
-    k_t = from_dlpack(k, assumed_align=16)
-    v_t = from_dlpack(v, assumed_align=16)
-    a_t = from_dlpack(a, assumed_align=16)
-    b_t = from_dlpack(b, assumed_align=16)
-    o_t = from_dlpack(o, assumed_align=16)
+    # dynamic-N: mark the batch axis (dim 0) dynamic so one cubin serves all N.
+    # Explicit stride_order: at N=1/T=1 the size-1 dims make auto-deduction ambiguous.
+    q_t = from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=q.dim_order())
+    k_t = from_dlpack(k, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=k.dim_order())
+    v_t = from_dlpack(v, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=v.dim_order())
+    a_t = from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=a.dim_order())
+    b_t = from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b.dim_order())
+    o_t = from_dlpack(o, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=o.dim_order())
     A_log_t = from_dlpack(A_log, assumed_align=16)
     dt_bias_t = from_dlpack(dt_bias, assumed_align=16)
-    h0_source_t = from_dlpack(h0_source, assumed_align=16)
-    h0_indices_t = from_dlpack(h0_indices, assumed_align=16)
+    h0_source_t = from_dlpack(h0_source, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=h0_source.dim_order())
+    h0_indices_t = from_dlpack(h0_indices, assumed_align=16).mark_layout_dynamic()
     intermediate_states_t = from_dlpack(intermediate_states, assumed_align=16)
+    if cache_intermediate_states:
+        intermediate_states_t = intermediate_states_t.mark_compact_shape_dynamic(mode=0, stride_order=intermediate_states.dim_order())
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
