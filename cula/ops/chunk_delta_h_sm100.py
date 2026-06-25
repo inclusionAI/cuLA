@@ -29,7 +29,7 @@ import torch
 import torch.nn.functional as F
 import triton
 from cutlass._mlir.dialects import llvm as _llvm
-from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.cutlass_dsl import T as _T
@@ -308,8 +308,9 @@ class ChunkDeltaRuleFwdH:
         # WH MMA: A=state(TMEM, K-major), B=W(SMEM, K-major)
         wh_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.K,  # A: state, K-major (required for TMEM source)
-            tcgen05.OperandMajorMode.K,  # B: W, K-major (BK contiguous)
+            self.io_dtype,
+            OperandMajorMode.K,  # A: state, K-major (required for TMEM source)
+            OperandMajorMode.K,  # B: W, K-major (BK contiguous)
             self.acc_dtype,
             self.cta_group,
             self.wh_mma_tiler[:2],
@@ -319,8 +320,9 @@ class ChunkDeltaRuleFwdH:
         # KV MMA: A=v_new^T(TMEM, K-major required), B=K^T(SMEM, MN-major)
         kv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.K,  # A: v_new, K-major (required for TMEM source)
-            tcgen05.OperandMajorMode.MN,  # B: K^T, MN-major (BK contiguous)
+            self.io_dtype,
+            OperandMajorMode.K,  # A: v_new, K-major (required for TMEM source)
+            OperandMajorMode.MN,  # B: K^T, MN-major (BK contiguous)
             self.acc_dtype,
             self.cta_group,
             self.kv_mma_tiler[:2],

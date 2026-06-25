@@ -65,7 +65,7 @@ import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
-from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64
 from fla.modules.l2norm import l2norm_fwd
@@ -478,13 +478,13 @@ class KDAChunkwise:
         self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
         self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
         self.g_major_mode = utils.LayoutEnum.from_tensor(g).mma_major_mode()  # NEW for KDA
-        self.k_major_mode_kv = tcgen05.OperandMajorMode.MN  # For V^T*K, S dimension coalesced
+        self.k_major_mode_kv = OperandMajorMode.MN  # For V^T*K, S dimension coalesced
         # TMEM register output results as (D, C)
         self.o_layout = utils.LayoutEnum.from_tensor(o)
 
-        if cutlass.const_expr(self.q_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.q_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
-        if cutlass.const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.k_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of k is not supported")
         if cutlass.const_expr(self.o_layout != utils.LayoutEnum.COL_MAJOR):
             raise RuntimeError("The layout of o is not supported")
@@ -493,6 +493,7 @@ class KDAChunkwise:
 
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.q_dtype,
+            self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
             self.qk_acc_dtype,
@@ -500,6 +501,7 @@ class KDAChunkwise:
             self.qk_mma_tiler[:2],
         )
         kk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.k_dtype,
             self.k_dtype,
             # SHOULE BE both K-major
             self.k_major_mode,
@@ -520,8 +522,9 @@ class KDAChunkwise:
         # State^T Q^T
         sq_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
+            self.io_dtype,
             # State is in TMEM, always K major, TODO
-            tcgen05.OperandMajorMode.K,
+            OperandMajorMode.K,
             self.q_major_mode,
             self.acc_dtype,
             self.cta_group,
@@ -530,8 +533,9 @@ class KDAChunkwise:
         )
         ks_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
+            self.io_dtype,
             # State is in TMEM, always K major, TODO
-            tcgen05.OperandMajorMode.K,
+            OperandMajorMode.K,
             # State is in TMEM, always K major, TODO
             self.k_major_mode,
             self.acc_dtype,
@@ -540,8 +544,9 @@ class KDAChunkwise:
             a_source=tcgen05.OperandSource.TMEM,
         )
 
-        m_major_mode = tcgen05.OperandMajorMode.K
+        m_major_mode = OperandMajorMode.K
         mv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.v_dtype,
             self.v_dtype,
             self.v_major_mode,
             m_major_mode,
@@ -550,8 +555,9 @@ class KDAChunkwise:
             self.mv_mma_tiler[:2],
         )
 
-        p_major_mode = tcgen05.OperandMajorMode.K
+        p_major_mode = OperandMajorMode.K
         vp_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.v_dtype,
             self.v_dtype,
             self.v_major_mode,
             p_major_mode,
@@ -1459,6 +1465,7 @@ class KDAChunkwise:
         ############################################
         kv_mma_tiler2 = (self.kv_mma_tiler[0], self.kv_mma_tiler[1] // 2, self.kv_mma_tiler[2])
         fake_kv_tiled_mma_acc32 = sm100_utils.make_trivial_tiled_mma(
+            self.k_dtype,
             self.k_dtype,
             self.v_major_mode,
             self.k_major_mode_kv,

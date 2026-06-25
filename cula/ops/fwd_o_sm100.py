@@ -74,7 +74,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
-from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Float32, Int32, Int64
 from fla.ops.utils import prepare_chunk_indices
@@ -354,8 +354,9 @@ class ChunkGlaFwdO:
         # B is MN-major because h_T GMEM has V(=N) contiguous
         qh_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.K,  # A: K-major (TMEM requires K-major)
-            tcgen05.OperandMajorMode.MN,  # B: MN-major (V contiguous in GMEM)
+            self.io_dtype,
+            OperandMajorMode.K,  # A: K-major (TMEM requires K-major)
+            OperandMajorMode.MN,  # B: MN-major (V contiguous in GMEM)
             self.acc_dtype,
             self.cta_group,
             self.qh_mma_tiler[:2],
@@ -366,8 +367,9 @@ class ChunkGlaFwdO:
         # B is MN-major because v_T GMEM has V(=N) contiguous
         av_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.K,  # A: K-major (TMEM requires K-major)
-            tcgen05.OperandMajorMode.MN,  # B: MN-major (V contiguous in GMEM)
+            self.io_dtype,
+            OperandMajorMode.K,  # A: K-major (TMEM requires K-major)
+            OperandMajorMode.MN,  # B: MN-major (V contiguous in GMEM)
             self.acc_dtype,
             self.cta_group,
             self.av_mma_tiler[:2],
@@ -561,8 +563,9 @@ class ChunkGlaFwdO:
         # B operand majorness must match av_tiled_mma for C layout compatibility.
         am_coord_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            self.io_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.MN,
             self.acc_dtype,
             self.cta_group,
             (self.BT, self.BT),

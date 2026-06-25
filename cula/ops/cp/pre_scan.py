@@ -20,7 +20,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
-from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Float32, Int32, Int64
 
@@ -272,8 +272,9 @@ class ChunkDeltaRulePreScanFused:
         # ===================== MMA setup (same as fwd_h) =====================
         wh_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.io_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
             self.acc_dtype,
             self.cta_group,
             self.wh_mma_tiler[:2],
@@ -281,8 +282,9 @@ class ChunkDeltaRulePreScanFused:
         )
         kv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.io_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            self.io_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.MN,
             self.acc_dtype,
             self.cta_group,
             self.kv_mma_tiler[:2],
