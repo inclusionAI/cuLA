@@ -35,6 +35,8 @@ def _try_patch_bwd_intra_with_cuda_impl() -> None:
     """Force patch bwd_intra with CUDA implementation."""
 
     global _BWD_INTRA_PATCHED
+    if cula_chunk_intra._normalize_bwd_intra_backend() != "csrc":
+        return
     if _BWD_INTRA_PATCHED:
         return
 

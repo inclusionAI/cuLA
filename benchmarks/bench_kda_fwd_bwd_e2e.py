@@ -469,8 +469,10 @@ def print_report(fixed_results, varlen_results):
     print(f"\n\n{sep}")
     print("                       BENCHMARK REPORT: chunk_kda forward+backward (E2E)")
     print("                       cuLA CuTe DSL vs FLA Triton")
+    bwd_intra_backend = os.getenv("CULA_KDA_BWD_INTRA_BACKEND", "cutedsl")
     print(
-        f"                       H={H}  HV={HV}  D={D}  dtype=bf16  safe_gate=True  phase={PHASE}  disable_recompute={DISABLE_RECOMPUTE}"
+        f"                       H={H}  HV={HV}  D={D}  dtype=bf16  safe_gate=True  phase={PHASE}  "
+        f"disable_recompute={DISABLE_RECOMPUTE}  bwd_intra_backend={bwd_intra_backend}"
     )
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS

@@ -14,8 +14,8 @@
 # limitations under the License.
 
 """
-bench_kda.py — Benchmark: cuLA CuTe DSL vs FLA Triton baseline
-               for chunk_kda (KDA forward)
+bench_kda_chunk_fwd_sm100.py — Benchmark: cuLA vs FLA Triton baseline
+                               for SM100/SM103 chunk_kda forward
 
 Compares:
     - Accuracy: relative_rms_error, relative max diff between cuLA and FLA outputs
@@ -26,10 +26,10 @@ Modes:
   - Varlen: ~20 seqs with 2-3x length variation
 
 Usage:
-  python bench_kda.py [--mode fixed|varlen|both] [--ncu]
+  python benchmarks/bench_kda_chunk_fwd_sm100.py [--mode fixed|varlen|both] [--ncu]
 
 With --ncu, warmup=1 and iters=1 for ncu profiling:
-  ncu --set full -o report python bench_kda.py --mode varlen --ncu
+  ncu --set full -o report python benchmarks/bench_kda_chunk_fwd_sm100.py --mode varlen --ncu
 """
 
 import argparse
@@ -364,7 +364,7 @@ def print_report(fixed_results, varlen_results):
 # Main
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="bench_kda: cuLA CuTe DSL vs FLA Triton baseline")
+    parser = argparse.ArgumentParser(description="bench_kda_chunk_fwd_sm100: cuLA vs FLA Triton baseline")
     parser.add_argument(
         "--mode",
         type=str,

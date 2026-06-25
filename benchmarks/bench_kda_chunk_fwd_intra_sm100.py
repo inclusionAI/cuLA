@@ -13,13 +13,13 @@
 # limitations under the License.
 
 """
-bench_kda_chunk_intra.py — Benchmark: cuLA vs FLA Triton for chunk_kda_fwd_intra
+bench_kda_chunk_fwd_intra_sm100.py — Benchmark: cuLA vs FLA Triton for SM100/SM103 chunk_kda_fwd_intra
 
 Supports both standard (HV=H) and GVA (HV > H) modes.
 In GVA mode both FLA (v0.5.0+) and cuLA accept compact q/k in HQK space natively.
 
 Usage:
-  python bench_kda_chunk_intra.py [--heads H] [--hv HV] [--disable_recompute]
+  python benchmarks/bench_kda_chunk_fwd_intra_sm100.py [--heads H] [--hv HV] [--disable_recompute]
 """
 
 import argparse
@@ -189,7 +189,9 @@ def benchmark_chunk_intra_varlen():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="bench_kda_chunk_intra: cuLA vs FLA Triton for chunk_kda_fwd_intra")
+    parser = argparse.ArgumentParser(
+        description="bench_kda_chunk_fwd_intra_sm100: cuLA vs FLA Triton for SM100/SM103 chunk_kda_fwd_intra"
+    )
     parser.add_argument(
         "--disable_recompute",
         action="store_true",

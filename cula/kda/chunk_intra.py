@@ -15,6 +15,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 import functools
 import importlib
+import os
 
 import torch
 import triton
@@ -41,6 +42,56 @@ def _get_device_sm_version(device: torch.device):
 
 def _prepare_uniform_cu_seqlens(*args, **kwargs):
     return importlib.import_module("cula.utils").prepare_uniform_cu_seqlens(*args, **kwargs)
+
+
+_BWD_INTRA_BACKEND_ENV = "CULA_KDA_BWD_INTRA_BACKEND"
+
+
+def _normalize_bwd_intra_backend() -> str:
+    backend = os.getenv(_BWD_INTRA_BACKEND_ENV, "cutedsl").strip().lower()
+    aliases = {
+        "cute": "cutedsl",
+        "cute_dsl": "cutedsl",
+        "csrc_cuda": "csrc",
+        "cuda_ext": "csrc",
+        "native": "csrc",
+    }
+    backend = aliases.get(backend, backend)
+    if backend not in {"cutedsl", "csrc", "triton"}:
+        raise ValueError(f"Unsupported {_BWD_INTRA_BACKEND_ENV}={backend!r}. Expected one of: cutedsl, csrc, triton.")
+    return backend
+
+
+def _prepare_bwd_intra_varlen_metadata(
+    B: int,
+    T: int,
+    device: torch.device,
+    cu_seqlens: torch.IntTensor | None,
+    chunk_indices: torch.IntTensor | None,
+    chunk_size: int,
+) -> tuple[torch.IntTensor, torch.IntTensor]:
+    if cu_seqlens is None:
+        cu_seqlens = _prepare_uniform_cu_seqlens(B, T, device, torch.int32)
+    elif cu_seqlens.dtype != torch.int32:
+        cu_seqlens = cu_seqlens.to(torch.int32)
+
+    if chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    elif chunk_indices.dtype != torch.int32:
+        chunk_indices = chunk_indices.to(torch.int32)
+    return cu_seqlens, chunk_indices
+
+
+def _is_bwd_intra_sm100_supported(
+    q: torch.Tensor,
+    g: torch.Tensor,
+    chunk_size: int,
+    safe_gate: bool,
+) -> bool:
+    major, minor = _get_device_sm_version(q.device)
+    return (
+        major == 10 and minor in (0, 3) and safe_gate and chunk_size == 64 and q.shape[-1] == 128 and g.shape[2] == q.shape[2]
+    )
 
 
 @triton.heuristics(
@@ -398,7 +449,7 @@ def chunk_kda_fwd_intra(
     return w, u, qg, kg, Aqk, Akk
 
 
-def chunk_kda_bwd_intra(
+def _chunk_kda_bwd_intra_triton(
     q: torch.Tensor,
     k: torch.Tensor,
     g: torch.Tensor,
@@ -483,3 +534,207 @@ def chunk_kda_bwd_intra(
     dg = dg2
 
     return dq, dk, db, dg
+
+
+def _chunk_kda_bwd_intra_csrc(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    dAqk: torch.Tensor,
+    dAkk: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    db: torch.Tensor,
+    dg: torch.Tensor,
+    cu_seqlens: torch.IntTensor | None = None,
+    chunk_indices: torch.IntTensor | None = None,
+    chunk_size: int = 64,
+    safe_gate: bool = False,
+):
+    if not _is_bwd_intra_sm100_supported(q, g, chunk_size, safe_gate):
+        raise NotImplementedError(
+            "Csrc bwd intra currently supports SM100/SM103, safe_gate=True, chunk_size=64, K=128, and HV == H only. "
+            "Use CULA_KDA_BWD_INTRA_BACKEND=triton for unsupported shapes."
+        )
+    if beta.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"beta must be bfloat16 or float32 for csrc bwd intra, got {beta.dtype}")
+
+    cula_cuda = _get_cula_cuda()
+    if not hasattr(cula_cuda, "chunk_kda_bwd_intra_cuda"):
+        raise RuntimeError(
+            "cula.cudac does not expose chunk_kda_bwd_intra_cuda. Rebuild the extension with SM100/SM103 enabled."
+        )
+
+    B, T, _, _ = q.shape
+    cu_seqlens, chunk_indices = _prepare_bwd_intra_varlen_metadata(B, T, q.device, cu_seqlens, chunk_indices, chunk_size)
+
+    dq_out = torch.empty_like(dq, dtype=torch.bfloat16)
+    dk_out = torch.empty_like(dk, dtype=torch.bfloat16)
+    db_out = torch.empty_like(db, dtype=torch.float)
+    dg_out = torch.empty_like(dg, dtype=torch.float)
+    tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
+
+    cula_cuda.chunk_kda_bwd_intra_cuda(
+        q.contiguous(),
+        k.contiguous(),
+        g.contiguous(),
+        beta.contiguous(),
+        dAqk.contiguous(),
+        dAkk.contiguous(),
+        dq.contiguous(),
+        dk.contiguous(),
+        db.contiguous(),
+        dg.contiguous(),
+        cu_seqlens,
+        chunk_indices.contiguous(),
+        dq_out,
+        dk_out,
+        db_out,
+        dg_out,
+        tile_counter,
+        chunk_size,
+    )
+    return dq_out, dk_out, db_out, dg_out
+
+
+def _chunk_kda_bwd_intra_cutedsl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    dAqk: torch.Tensor,
+    dAkk: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    db: torch.Tensor,
+    dg: torch.Tensor,
+    cu_seqlens: torch.IntTensor | None = None,
+    chunk_indices: torch.IntTensor | None = None,
+    chunk_size: int = 64,
+    safe_gate: bool = False,
+):
+    if not _is_bwd_intra_sm100_supported(q, g, chunk_size, safe_gate):
+        return _chunk_kda_bwd_intra_triton(
+            q=q,
+            k=k,
+            g=g,
+            beta=beta,
+            dAqk=dAqk,
+            dAkk=dAkk,
+            dq=dq,
+            dk=dk,
+            db=db,
+            dg=dg,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_size=chunk_size,
+            safe_gate=safe_gate,
+        )
+    if beta.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"beta must be bfloat16 or float32 for CuTeDSL bwd intra, got {beta.dtype}")
+
+    from cutlass.cute.typing import Int32
+
+    from cula.ops.kda_bwd_intra_sm100 import compile_kda_bwd_intra
+
+    B, T, H, K = q.shape
+    cu_seqlens, chunk_indices = _prepare_bwd_intra_varlen_metadata(B, T, q.device, cu_seqlens, chunk_indices, chunk_size)
+
+    dq_out = torch.empty_like(dq, dtype=torch.bfloat16)
+    dk_out = torch.empty_like(dk, dtype=torch.bfloat16)
+    db_out = torch.empty_like(db, dtype=torch.float)
+    dg_out = torch.empty_like(dg, dtype=torch.float)
+
+    q = q.contiguous()
+    k = k.contiguous()
+    g = g.contiguous()
+    beta = beta.contiguous()
+    dAqk = dAqk.contiguous()
+    dAkk = dAkk.contiguous()
+    dq = dq.contiguous()
+    dk = dk.contiguous()
+    db = db.contiguous()
+    dg = dg.contiguous()
+
+    if B != 1:
+        q = q.reshape(1, B * T, H, K)
+        k = k.reshape(1, B * T, H, K)
+        g = g.reshape(1, B * T, H, K)
+        dAqk = dAqk.reshape(1, B * T, H, -1)
+        dAkk = dAkk.reshape(1, B * T, H, -1)
+        dq = dq.reshape(1, B * T, H, K)
+        dk = dk.reshape(1, B * T, H, K)
+        dg = dg.reshape(1, B * T, H, K)
+        beta = beta.reshape(1, B * T, H)
+        db = db.reshape(1, B * T, H)
+        dq_out = dq_out.reshape(1, B * T, H, K)
+        dk_out = dk_out.reshape(1, B * T, H, K)
+        db_out = db_out.reshape(1, B * T, H)
+        dg_out = dg_out.reshape(1, B * T, H, K)
+
+    ci_flat = chunk_indices.reshape(-1).contiguous()
+    num_chunks = ci_flat.shape[0] // 2
+    num_tiles = num_chunks * H
+    tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
+
+    compiled_fn = compile_kda_bwd_intra(H, K=K, BT=chunk_size, beta_dtype=beta.dtype)
+    compiled_fn(
+        q,
+        k,
+        g,
+        dAqk,
+        dAkk,
+        dq,
+        dk,
+        dg,
+        db,
+        beta,
+        dq_out,
+        dk_out,
+        dg_out,
+        db_out,
+        tile_counter,
+        cu_seqlens,
+        ci_flat,
+        (Int32(B * T), Int32(H), Int32(K)),
+        Int32(num_tiles),
+    )
+
+    if B != 1:
+        dq_out = dq_out.reshape(B, T, H, K)
+        dk_out = dk_out.reshape(B, T, H, K)
+        db_out = db_out.reshape(B, T, H)
+        dg_out = dg_out.reshape(B, T, H, K)
+
+    return dq_out, dk_out, db_out, dg_out
+
+
+def chunk_kda_bwd_intra(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    dAqk: torch.Tensor,
+    dAkk: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    db: torch.Tensor,
+    dg: torch.Tensor,
+    cu_seqlens: torch.IntTensor | None = None,
+    chunk_indices: torch.IntTensor | None = None,
+    chunk_size: int = 64,
+    safe_gate: bool = False,
+):
+    backend = _normalize_bwd_intra_backend()
+    if backend == "cutedsl":
+        return _chunk_kda_bwd_intra_cutedsl(
+            q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices, chunk_size, safe_gate
+        )
+    if backend == "csrc":
+        return _chunk_kda_bwd_intra_csrc(
+            q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices, chunk_size, safe_gate
+        )
+    return _chunk_kda_bwd_intra_triton(
+        q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices, chunk_size, safe_gate
+    )

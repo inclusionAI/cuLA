@@ -16,7 +16,7 @@ things simple we use a two-TMEM-column approach:
   - tmem region 0: accumulator for both phases
   - tmem region 1: holds A data for TS phase (populated via R2T store)
 
-SMEM layout follows the same conventions as test_ptx_umma_masked.py.
+SMEM layout follows the same conventions as test_ptx_umma_ext_masked.py.
 """
 
 import pathlib

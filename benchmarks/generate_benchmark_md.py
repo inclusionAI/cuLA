@@ -16,7 +16,7 @@
 """
 generate_benchmark_md.py — Run existing bench_* scripts and generate BENCHMARK.md
 
-Reuses bench_kda.py and bench_lightning_attn.py to collect results,
+Reuses bench_kda_chunk_fwd_sm100.py and bench_lightning_attn.py to collect results,
 then formats them as BENCHMARK.md.
 
 Usage:
@@ -45,13 +45,13 @@ os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1")) 
 
 import numpy as np  # noqa: E402
 
-from benchmarks.bench_kda import (  # noqa: E402
+from benchmarks.bench_kda_chunk_fwd_sm100 import (  # noqa: E402
     D as KDA_D,
 )
-from benchmarks.bench_kda import (  # noqa: E402
+from benchmarks.bench_kda_chunk_fwd_sm100 import (  # noqa: E402
     H as KDA_H,
 )
-from benchmarks.bench_kda import (  # noqa: E402
+from benchmarks.bench_kda_chunk_fwd_sm100 import (  # noqa: E402
     main as kda_main,
 )
 from benchmarks.bench_la_decode_vs_fla import (  # noqa: E402
@@ -79,11 +79,11 @@ LA_H = 64  # for display only
 
 
 def run_kda_benchmarks(heads=None, hv=None):
-    """Run bench_kda.main() with programmatic args and return (fixed, varlen) results."""
-    print("\n>>> Running KDA benchmarks (via bench_kda.main)...")
-    # bench_kda.main() parses sys.argv — override it temporarily
+    """Run bench_kda_chunk_fwd_sm100.main() with programmatic args and return (fixed, varlen) results."""
+    print("\n>>> Running KDA chunk forward benchmarks (via bench_kda_chunk_fwd_sm100.main)...")
+    # bench_kda_chunk_fwd_sm100.main() parses sys.argv — override it temporarily
     orig_argv = sys.argv
-    argv = ["bench_kda.py", "--mode", "both"]
+    argv = ["bench_kda_chunk_fwd_sm100.py", "--mode", "both"]
     if heads is not None:
         argv += ["--heads", str(heads)]
     if hv is not None:
@@ -197,7 +197,7 @@ def format_benchmark_md(env, kda_fixed, kda_varlen, la_standard, la_varlen, la_d
 
     w("\nTo reproduce:\n")
     w("```bash")
-    w("python benchmarks/bench_kda.py --mode both")
+    w("python benchmarks/bench_kda_chunk_fwd_sm100.py --mode both")
     w("```\n")
 
     # -------------------------------------------------------------------

@@ -48,11 +48,11 @@ cuLA/
 │       └── include/              # Shared C++ header utilities
 │
 ├── benchmarks/                   # Performance benchmarks
-│   ├── bench_kda.py              # KDA fixed + varlen benchmark
+│   ├── bench_kda_chunk_fwd_sm100.py  # KDA SM100 chunk forward benchmark
 │   ├── bench_lightning_attn.py   # Lightning Attention prefill + varlen
 │   ├── bench_la_decode_vs_fla.py # Decode: la_decode vs fla fused_recurrent
 │   ├── bench_kda_fused_fwd.py    # KDA fused forward benchmark
-│   ├── bench_kda_chunk_intra.py  # KDA chunk intra benchmark
+│   ├── bench_kda_chunk_fwd_intra_sm100.py  # KDA SM100 chunk forward intra benchmark
 │   ├── bench_chunk_delta_h.py    # Chunk delta-H benchmark
 │   ├── bench_fwd_o.py            # Forward output benchmark
 │   ├── bench_linear_attn.py      # Linear attention benchmark
