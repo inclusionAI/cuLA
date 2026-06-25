@@ -108,7 +108,10 @@ def run_kda_e2e(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens,
         disable_recompute=DISABLE_RECOMPUTE,
     )
     if PHASE == "e2e":
-        out.backward(do)
+        loss = (out * do).sum()
+        if ht is not None and dht is not None:
+            loss = loss + (ht * dht).sum()
+        loss.backward()
     return out, ht
 
 
@@ -565,6 +568,11 @@ def main():
         action="store_true",
         help="Disable recompute in both FLA and cuLA (pre-compute QG)",
     )
+    parser.add_argument(
+        "--skip-determinism",
+        action="store_true",
+        help="Skip the pre-benchmark determinism check",
+    )
     global H
     parser.add_argument(
         "--heads",
@@ -596,13 +604,15 @@ def main():
         print("[Disable recompute] pre-compute QG in forward")
     PHASE = args.phase
 
-    if not (args.ncu or args.sanitizer):
+    if not (args.ncu or args.sanitizer or args.skip_determinism):
         det_configs = [(5, 1024), (10, 4096), (10, 8192), (10, 16384)]
         print("\n[Determinism Check] cuLA chunk_kda E2E ...")
         for num_seqs, T in det_configs:
             result = check_determinism(num_seqs=num_seqs, T=T, iters=1000)
             print(f"  num_seqs={num_seqs}  T={T:5d}  {'PASS' if result else 'FAIL'}")
         print("[Determinism Check] All passed.\n")
+    elif args.skip_determinism:
+        print("[Determinism Check] Skipped.")
 
     fixed_configs = [
         # (B, T)

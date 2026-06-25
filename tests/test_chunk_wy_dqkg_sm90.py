@@ -155,7 +155,19 @@ def _assert_outputs_match_fla(sm90_outputs, fla_outputs, case_id, *, max_err=0.0
         assert err_ratio < max_err, f"{case_id}: {name} vs FLA err_ratio={err_ratio:.6f} too high"
 
 
-def _run_matches_fla_fixed(B=1, T=64, H=4, K=128, V=128, BT=64, verbose=False, bk=32, bv=64, min_occupancy=2):
+def _run_matches_fla_fixed(
+    B=1,
+    T=64,
+    H=4,
+    K=128,
+    V=128,
+    BT=64,
+    verbose=False,
+    bk=32,
+    bv=64,
+    min_occupancy=2,
+    beta_dtype=torch.float32,
+):
     """Verify SM90 fused outputs on fixed-length inputs against FLA."""
     device = "cuda"
     dtype = torch.bfloat16
@@ -173,10 +185,10 @@ def _run_matches_fla_fixed(B=1, T=64, H=4, K=128, V=128, BT=64, verbose=False, b
     dv_tensor = torch.randn(B, T, H, V, dtype=dtype, device=device)
     v_tensor = torch.randn(B, T, H, V, dtype=dtype, device=device)
     A_tensor = torch.randn(B, T, H, BT, dtype=dtype, device=device)
-    beta_tensor = torch.rand(B, T, H, dtype=torch.float32, device=device) * 0.5 + 0.5
+    beta_tensor = (torch.rand(B, T, H, dtype=torch.float32, device=device) * 0.5 + 0.5).to(beta_dtype)
 
     if verbose:
-        print(f"=== inputs: B={B} T={T} H={H} K={K} V={V} BT={BT} NT={NT} ===", flush=True)
+        print(f"=== inputs: B={B} T={T} H={H} K={K} V={V} BT={BT} NT={NT} beta={beta_dtype} ===", flush=True)
 
     if verbose:
         print("=== invoking FLA Triton baseline ===", flush=True)
@@ -231,8 +243,9 @@ def _run_matches_fla_fixed(B=1, T=64, H=4, K=128, V=128, BT=64, verbose=False, b
 
 @pytest.mark.sm90_only
 @pytest.mark.parametrize("B, T, H, K, V, BT", [(1, 64, 4, 128, 128, 64)])
-def test_matches_fla_fixed(B, T, H, K, V, BT):
-    _run_matches_fla_fixed(B, T, H, K, V, BT)
+@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
+def test_matches_fla_fixed(B, T, H, K, V, BT, beta_dtype):
+    _run_matches_fla_fixed(B, T, H, K, V, BT, beta_dtype=beta_dtype)
 
 
 def _run_matches_fla_uniform_varlen(

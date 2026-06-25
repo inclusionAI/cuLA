@@ -1764,7 +1764,7 @@ def chunk_gla_fwd_o(
     v: torch.Tensor,
     g: torch.Tensor,
     h: torch.Tensor,
-    o: torch.Tensor,
+    o: torch.Tensor | None,
     A: torch.Tensor,
     scale: float,
     chunk_size: int = 64,
@@ -1772,7 +1772,7 @@ def chunk_gla_fwd_o(
     chunk_indices: torch.Tensor = None,
     is_varlen: bool = False,
     persistent: bool = True,
-) -> None:
+) -> torch.Tensor:
     """
     ChunkGlaFwdO forward pass with compile cache and TVM-FFI.
 
@@ -1790,7 +1790,7 @@ def chunk_gla_fwd_o(
         v: value tensor — [B, T, HV, V] bf16 (HV = value heads, HV >= H)
         g: gate tensor — [B, T, HV, K] fp32
         h: state tensor — [B, NT, HV, K, V] bf16 (B=1 for varlen)
-        o: output tensor (pre-allocated) — [B, T, HV, V] bf16
+        o: output tensor — [B, T, HV, V] bf16. If None, this wrapper allocates it.
         A: attention matrix — [B, T, HV, BT] bf16
         scale: attention scale factor
         chunk_size: chunk size (default: 64)
@@ -1799,6 +1799,10 @@ def chunk_gla_fwd_o(
         is_varlen: whether to use varlen mode
         persistent: whether to use persistent kernel (default: True)
     """
+    if o is None:
+        # Ensure zeroed padding positions for callers that consume padded output.
+        o = torch.zeros_like(v)
+
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
 
@@ -1859,6 +1863,7 @@ def chunk_gla_fwd_o(
         ps,
         Int32(total_nt_val),
     )
+    return o
 
 
 # =====================================================================

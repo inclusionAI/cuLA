@@ -12,10 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "0.1.0"
+from __future__ import annotations
 
-from cula.ops.lightning_attn_sm100 import LinearAttentionChunkwiseDecay
+from importlib import import_module
+from typing import Any
+
+__version__ = "0.1.0"
 
 __all__ = [
     "LinearAttentionChunkwiseDecay",
 ]
+
+_LAZY_EXPORTS = {
+    "LinearAttentionChunkwiseDecay": (
+        "cula.ops.lightning_attn_sm100",
+        "LinearAttentionChunkwiseDecay",
+    ),
+}
+
+
+def __getattr__(name: str) -> Any:
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = _LAZY_EXPORTS[name]
+    value = getattr(import_module(module_name), attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

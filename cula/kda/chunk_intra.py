@@ -13,17 +13,34 @@
 # limitations under the License.
 
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-
+import functools
+import importlib
 
 import torch
 import triton
 import triton.language as tl
+from fla.ops.kda.chunk_intra import (
+    chunk_kda_bwd_intra as chunk_kda_bwd_intra_triton,
+)
+from fla.ops.kda.chunk_intra import (
+    chunk_kda_fwd_intra as chunk_kda_fwd_intra_triton,
+)
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2, gather
 from fla.utils import IS_GATHER_SUPPORTED, autotune_cache_kwargs
 
-import cula.cudac as cula_cuda
-from cula.utils import prepare_uniform_cu_seqlens
+
+@functools.cache
+def _get_cula_cuda():
+    return importlib.import_module("cula.cudac")
+
+
+def _get_device_sm_version(device: torch.device):
+    return importlib.import_module("cula.utils").get_device_sm_version(device)
+
+
+def _prepare_uniform_cu_seqlens(*args, **kwargs):
+    return importlib.import_module("cula.utils").prepare_uniform_cu_seqlens(*args, **kwargs)
 
 
 @triton.heuristics(
@@ -320,6 +337,27 @@ def chunk_kda_fwd_intra(
     unified_gref: bool = False,  # Set True for ~5% extra perf (slightly lower precision)
 ):
     assert safe_gate, "Only safe_gate=True is supported in chunk_kda_fwd_intra for now"
+    major, minor = _get_device_sm_version(q.device)
+    if major == 9 and minor == 0:
+        return chunk_kda_fwd_intra_triton(
+            q=q,
+            k=k,
+            v=v,
+            gk=gk,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            safe_gate=safe_gate,
+            disable_recompute=disable_recompute,
+        )
+    if not (major == 10 and minor in (0, 3)):
+        raise RuntimeError(
+            f"Unsupported CUDA compute capability sm_{major}{minor}. "
+            f"Only sm90a (Hopper) and Blackwell (SM100/SM103) are supported."
+        )
+
     B, T, H, K = k.shape
     # GVA: g/beta/v live in h_v head space; q/k live in h_qk head space.
     HV = v.size(2)
@@ -327,7 +365,7 @@ def chunk_kda_fwd_intra(
     BT = chunk_size
 
     if cu_seqlens is None:
-        cu_seqlens = prepare_uniform_cu_seqlens(B, T, q.device, torch.int32)
+        cu_seqlens = _prepare_uniform_cu_seqlens(B, T, q.device, torch.int32)
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
@@ -342,6 +380,7 @@ def chunk_kda_fwd_intra(
     Akk = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
 
     tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
+    cula_cuda = _get_cula_cuda()
     cula_cuda.chunk_kda_fwd_intra_cuda(
         q, k, gk, beta, cu_seqlens, chunk_indices, Aqk, Akk, tile_counter, scale, chunk_size, use_tf32_inverse, unified_gref
     )
@@ -375,6 +414,25 @@ def chunk_kda_bwd_intra(
     chunk_size: int = 64,
     safe_gate: bool = False,
 ):
+    major, minor = _get_device_sm_version(q.device)
+    if major == 9 and minor == 0:
+        return chunk_kda_bwd_intra_triton(
+            q=q,
+            k=k,
+            g=g,
+            beta=beta,
+            dAqk=dAqk,
+            dAkk=dAkk,
+            dq=dq,
+            dk=dk,
+            db=db,
+            dg=dg,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_size=chunk_size,
+            safe_gate=safe_gate,
+        )
+
     B, T, H, K, HV = *k.shape, g.shape[2]
     BT = chunk_size
     BC = min(16, BT)

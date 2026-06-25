@@ -158,6 +158,11 @@ COMPILE_OPTIONS = "--enable-tvm-ffi --generate-line-info --ptxas-options '--verb
 BFloat16 = cutlass.BFloat16
 Float32 = cutlass.Float32
 
+_torch_to_cutlass_dtype = {
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
+}
+
 
 @cute.jit
 def smem_load_bf16x8_sw128(raw_ptr: cute.Pointer, row: Int32, col_base: Int32):
@@ -279,7 +284,7 @@ class ChunkKdaBwdWyDqkgFusedSM90:
         dA_out: cute.Tensor,  # [B, T, H, BT] fp32
         dv2_out: cute.Tensor,  # [B, T, H, V] bf16
         db_out: cute.Tensor,  # [B, T, H] fp32 — gradient of beta
-        beta_in: cute.Tensor,  # [B, T, H] fp32 — per-token decay scalar
+        beta_in: cute.Tensor,  # [B, T, H] fp32/bf16 — per-token decay scalar
         cu_seqlens_in: cute.Tensor,  # [N+1] int32
         chunk_indices_in: cute.Tensor,  # [NT, 2] int32
         problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
@@ -435,7 +440,7 @@ class ChunkKdaBwdWyDqkgFusedSM90:
             (1, 1, 1),
             tiler_mn=(self.BT, self.BT),
         )
-        # dA post GEMM1: sA(MN-major) @ M(K-major) → (BT,BT), always m64n64
+        # dA post GEMM: sA(MN-major) @ scratch(K-major) → (BT,BT), always m64n64
         dA_post1_tiled_mma = sm90_utils.make_trivial_tiled_mma(
             self.io_dtype,
             self.io_dtype,
@@ -1487,19 +1492,6 @@ class ChunkKdaBwdWyDqkgFusedSM90:
         sQ = storage.buf_q.get_tensor(tk_smem_layout.outer, swizzle=tk_smem_layout.inner)
         sK = storage.buf_k.get_tensor(tk_smem_layout.outer, swizzle=tk_smem_layout.inner)
         sA = storage.buf_A.get_tensor(A_smem_layout.outer, swizzle=A_smem_layout.inner)
-        sA_ldsm = cute.make_tensor(
-            cute.recast_ptr(
-                cute.make_ptr(
-                    self.io_dtype,
-                    storage.buf_A.data_ptr().toint(),
-                    cute.AddressSpace.smem,
-                    assumed_align=128,
-                ),
-                swizzle_=A_smem_layout.inner,
-                dtype=self.io_dtype,
-            ),
-            A_smem_layout.outer,
-        )
         sA_row = storage.buf_A.get_tensor(A_smem_layout_row.outer, swizzle=A_smem_layout_row.inner)
         sDw = storage.buf_dw.get_tensor(dw_smem_layout.outer, swizzle=dw_smem_layout.inner)
         # Write view (BT, BK) for stmatrix.trans — same physical buffer
@@ -2248,13 +2240,6 @@ class ChunkKdaBwdWyDqkgFusedSM90:
             elif warp_idx == 3:
                 dg_ready_cs = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_dg_stages)
 
-                c_pipeline_w3 = pipeline.PipelineTmaStore.create(
-                    num_stages=1,
-                    producer_group=pipeline.CooperativeGroup(
-                        pipeline.Agent.Thread,
-                        1,
-                    ),
-                )
                 tidx_in_warp = cute.arch.thread_idx()[0] % Int32(32)
                 universal_copy_bits = 128
                 epi_copy_elems_f32 = universal_copy_bits // self.acc_dtype.width
@@ -2336,8 +2321,8 @@ class ChunkKdaBwdWyDqkgFusedSM90:
                                     bSG_sDg[(None, gmem_coord)],
                                     bSG_gDg[(None, gmem_coord)],
                                 )
-                                c_pipeline_w3.producer_commit()
-                                c_pipeline_w3.producer_acquire()
+                                cute.arch.cp_async_bulk_commit_group()
+                                cute.arch.cp_async_bulk_wait_group(0, read=True)
                             else:
                                 gmem_col_base = k_iter * Int32(BK) + epi_idx * Int32(32)
                                 copy_partial_epi_tile_gmem_f32(
@@ -2380,8 +2365,8 @@ class ChunkKdaBwdWyDqkgFusedSM90:
                                     bSG_sDg_r[(None, gmem_coord)],
                                     bSG_gDg_r[(None, gmem_coord)],
                                 )
-                                c_pipeline_w3.producer_commit()
-                                c_pipeline_w3.producer_acquire()
+                                cute.arch.cp_async_bulk_commit_group()
+                                cute.arch.cp_async_bulk_wait_group(0, read=True)
                         else:
                             # Tail chunks cannot use a full 64-row TMA reduce_add:
                             # the physical packed buffer may end before the tile does.
@@ -2409,8 +2394,6 @@ class ChunkKdaBwdWyDqkgFusedSM90:
                                         gmem_store_f32x4(gmem_addr, out_f32)
                         pipeline_dg_ready.consumer_release(dg_ready_cs)
                         dg_ready_cs.advance()
-
-                    c_pipeline_w3.producer_tail()
 
             # DMA WG done — load warp and store warp both finish here.
             # No CTA-wide sync: store warp communicates with MMA WG
@@ -2631,9 +2614,9 @@ class ChunkKdaBwdWyDqkgFusedSM90:
             thr_copy_s2r_A_zero = tiled_copy_s2r_A_zero.get_slice(mma_tidx)
             thr_copy_r2s_A_zero = tiled_copy_r2s_A_zero.get_slice(mma_tidx)
             thr_mma_A_zero = tiled_mma_A_zero.get_slice(mma_tidx)
-            tAZ_sA = thr_copy_s2r_A_zero.partition_S(sA_ldsm)
-            tAZ_sA_store = thr_copy_r2s_A_zero.partition_D(sA_ldsm)
-            tAZ_rA_proto = thr_mma_A_zero.make_fragment_A(thr_mma_A_zero.partition_A(sA_ldsm))
+            tAZ_sA = thr_copy_s2r_A_zero.partition_S(sA)
+            tAZ_sA_store = thr_copy_r2s_A_zero.partition_D(sA)
+            tAZ_rA_proto = thr_mma_A_zero.make_fragment_A(thr_mma_A_zero.partition_A(sA))
             tAZ_rA = cute.make_fragment_like(tAZ_rA_proto, self.io_dtype)
             cA_zero = cute.make_identity_tensor((BT, BT))
             tAZ_cA = thr_mma_A_zero.partition_A(cA_zero)
@@ -3258,9 +3241,9 @@ class ChunkKdaBwdWyDqkgFusedSM90:
 
                 # ═══════════════════════════════════════════════
                 # dA post-processing via WGMMA:
-                # dA_final = -lower_tri(sA @ lower_tri(dA_raw * beta) @ sA)
-                # GEMM 1: sA @ M  (dkgb pattern: sA as A, M in sDw as B)
-                # GEMM 2: temp @ sA  (dwkg pattern: RMEM A, sA_row as B)
+                # dA_final = -lower_tri(sA @ (lower_tri(dA_raw * beta) @ sA))
+                # GEMM 1: M @ sA  (dwkg pattern: RMEM A, sA_row as B)
+                # GEMM 2: sA @ temp  (dkgb pattern: sA as A, temp in sDw as B)
                 # ═══════════════════════════════════════════════
 
                 # Step 1: mask + beta in dA_acc
@@ -3276,26 +3259,18 @@ class ChunkKdaBwdWyDqkgFusedSM90:
                     else:
                         tRS_rAcc_dA[j] = cutlass.Float32(0.0)
 
-                # Step 1b: write M (in dA_acc) → bf16 → sDw_wide via stmatrix.trans
-                tRS_rAcc_dA_dw = tiled_copy_r2s_dA_dw.retile(dA_acc)
-                rM_shape = cute.shape(thr_copy_r2s_dA_dw.partition_S(sDw_write_wide))
-                tRS_rM = cute.make_rmem_tensor_like(cute.make_layout(rM_shape[:3]), self.io_dtype)
-                for idx in cutlass.range_constexpr(cute.size(tRS_rM)):
-                    tRS_rM[idx] = cutlass.BFloat16(tRS_rAcc_dA_dw[idx])
-                cute.copy(tiled_copy_r2s_dA_dw, tRS_rM, tRS_sDw_wide)
-                cute.arch.fence_view_async_shared()
-                pipeline.NamedBarrier(barrier_id=BARRIER_DB_SYNC, num_threads=128).sync()
-
-                # Step 2: GEMM 1 — sA @ M → dA_acc (always m64n64)
+                # Step 2: GEMM 1 — M @ sA_row via dwkg_tiled_mma
+                # Convert M (dA_acc, C layout) → A operand for dwkg.
+                m_as_a = self.make_acc_into_op(dA_acc, dwkg_tiled_mma)
                 dA_acc.fill(0.0)
-                dA_post1_tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
+                dwkg_tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
                 warpgroup.fence()
-                for k_block_idx in cutlass.range_constexpr(num_k_blocks_post1):
+                for k_block_idx in cutlass.range_constexpr(num_k_blocks_post2):
                     cute.gemm(
-                        dA_post1_tiled_mma,
+                        dwkg_tiled_mma,
                         dA_acc,
-                        tCrA_post1[(None, None, k_block_idx)],
-                        tCrDw_post1[(None, None, k_block_idx)],
+                        m_as_a[(None, None, k_block_idx)],
+                        tCrA_row_post[(None, None, k_block_idx)],
                         dA_acc,
                     )
                 warpgroup.commit_group()
@@ -3322,24 +3297,33 @@ class ChunkKdaBwdWyDqkgFusedSM90:
                 if compute_tidx < sub_seq_len:
                     db_gmem[(chunk_tok_offset + compute_tidx, (head_idx, Int32(0)))] = sDb[(compute_tidx,)]
 
-                # Step 3: GEMM 2 — temp @ sA_row via dwkg_tiled_mma
-                # Convert GEMM 1 result (dA_acc, C layout) → A operand for dwkg
-                gemm1_as_a = self.make_acc_into_op(dA_acc, dwkg_tiled_mma)
+                # Step 3: write temp (in dA_acc) → bf16 → sDw_wide via stmatrix.trans.
+                # temp becomes the K-major B operand for GEMM 2.
+                tRS_rAcc_dA_dw = tiled_copy_r2s_dA_dw.retile(dA_acc)
+                rM_shape = cute.shape(thr_copy_r2s_dA_dw.partition_S(sDw_write_wide))
+                tRS_rM = cute.make_rmem_tensor_like(cute.make_layout(rM_shape[:3]), self.io_dtype)
+                for idx in cutlass.range_constexpr(cute.size(tRS_rM)):
+                    tRS_rM[idx] = cutlass.BFloat16(tRS_rAcc_dA_dw[idx])
+                cute.copy(tiled_copy_r2s_dA_dw, tRS_rM, tRS_sDw_wide)
+                cute.arch.fence_view_async_shared()
+                pipeline.NamedBarrier(barrier_id=BARRIER_DB_SYNC, num_threads=128).sync()
+
+                # Step 4: GEMM 2 — sA @ temp → dA_acc (always m64n64)
                 dA_acc.fill(0.0)
-                dwkg_tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
+                dA_post1_tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
                 warpgroup.fence()
-                for k_block_idx in cutlass.range_constexpr(num_k_blocks_post2):
+                for k_block_idx in cutlass.range_constexpr(num_k_blocks_post1):
                     cute.gemm(
-                        dwkg_tiled_mma,
+                        dA_post1_tiled_mma,
                         dA_acc,
-                        gemm1_as_a[(None, None, k_block_idx)],
-                        tCrA_row_post[(None, None, k_block_idx)],
+                        tCrA_post1[(None, None, k_block_idx)],
+                        tCrDw_post1[(None, None, k_block_idx)],
                         dA_acc,
                     )
                 warpgroup.commit_group()
                 warpgroup.wait_group(0)
 
-                # Step 4: mask + negate
+                # Step 5: mask + negate
                 tRS_rAcc_dA = tiled_copy_r2s_dA_fp32.retile(dA_acc)
                 cD_dA = cute.make_identity_tensor((BT, BT))
                 tRS_cD_dA = thr_copy_r2s_dA.partition_D(cD_dA)
@@ -3396,6 +3380,7 @@ def _compile_bwd_wy_variant(
     V: int,
     scale: float,
     chunk_size: int,
+    beta_dtype: type[cutlass.Numeric],
     use_fast_math: bool,
     bk: int = 32,
     bv: int = 64,
@@ -3450,7 +3435,7 @@ def _compile_bwd_wy_variant(
     )
     dv2_fake = make_fake_compact_tensor(cutlass.BFloat16, (1, sym_b, H, V), stride_order=(3, 2, 1, 0), assumed_align=128)
     db_fake = make_fake_compact_tensor(cutlass.Float32, (1, sym_b, H), stride_order=(2, 1, 0), assumed_align=128)
-    beta_fake = make_fake_compact_tensor(cutlass.Float32, (1, sym_b, H), stride_order=(2, 1, 0), assumed_align=128)
+    beta_fake = make_fake_compact_tensor(beta_dtype, (1, sym_b, H), stride_order=(2, 1, 0), assumed_align=128)
 
     dg_fake = make_fake_compact_tensor(cutlass.Float32, (1, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
     compiled_fn = cute.compile(
@@ -3488,11 +3473,12 @@ def _get_compiled_bwd_wy(
     V: int,
     scale: float,
     chunk_size: int,
+    beta_dtype: torch.dtype,
     bk: int = 32,
     bv: int = 64,
     min_occupancy: int = 2,
 ):
-    key = (H, K, V, scale, chunk_size, USE_FAST_MATH, bk, bv, min_occupancy)
+    key = (H, K, V, scale, chunk_size, beta_dtype, USE_FAST_MATH, bk, bv, min_occupancy)
     if key not in _bwd_wy_kernel_cache:
         _bwd_wy_kernel_cache[key] = _compile_bwd_wy_variant(
             H,
@@ -3500,6 +3486,7 @@ def _get_compiled_bwd_wy(
             V,
             scale,
             chunk_size,
+            _torch_to_cutlass_dtype[beta_dtype],
             USE_FAST_MATH,
             bk=bk,
             bv=bv,
@@ -3563,7 +3550,7 @@ def chunk_kda_bwd_wy_dqkg_fused(
     assert q.dtype == torch.bfloat16
     assert k.dtype == torch.bfloat16
     assert A.dtype == torch.bfloat16
-    assert beta.dtype == torch.float32, "SM90 kernel only supports fp32 beta"
+    assert beta.dtype in _torch_to_cutlass_dtype, f"SM90 kernel only supports fp32/bf16 beta, got {beta.dtype}"
 
     T_total = B * T
     num_seqs = cu_seqlens.shape[0] - 1
@@ -3590,7 +3577,7 @@ def chunk_kda_bwd_wy_dqkg_fused(
         A = A.reshape(1, T_total, H, BT)
         beta = beta.reshape(1, T_total, H)
 
-    compiled_fn = _get_compiled_bwd_wy(H, K, V, scale, chunk_size, bk=bk, bv=bv, min_occupancy=min_occupancy)
+    compiled_fn = _get_compiled_bwd_wy(H, K, V, scale, chunk_size, beta.dtype, bk=bk, bv=bv, min_occupancy=min_occupancy)
 
     compiled_fn(
         do,
