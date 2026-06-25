@@ -21,7 +21,7 @@
 
 using OptionalTensor = std::optional<torch::Tensor>;
 
-std::tuple<torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, OptionalTensor>
 kda_fwd_prefill(
     OptionalTensor output_,
     OptionalTensor output_state_,
@@ -34,30 +34,47 @@ kda_fwd_prefill(
     torch::Tensor const& cu_seqlens,
     torch::Tensor workspace_buffer,
     float scale,
+    bool output_final_state,
     bool safe_gate) {
-    // Q, K, V: [packed_seq, H, D] (already packed by Python layer)
+    // Q, K: [packed_seq, num_qk_heads, D]
+    // V/O/g: [packed_seq, num_v_heads, D]   (GVA: num_v_heads is a positive integer multiple of num_qk_heads)
     auto packed_seq = q.size(0);
-    auto num_heads = q.size(1);
+    auto num_qk_heads = q.size(1);
+    auto num_v_heads = v.size(1);
     auto head_size = q.size(2);
     auto num_seqs = cu_seqlens.size(0) - 1;
 
-    // KDA constraint: all head counts must be the same
-    TORCH_CHECK(num_heads == k.size(1), "KDA requires num_q_heads == num_k_heads, got ", num_heads, " vs ", k.size(1));
-    TORCH_CHECK(num_heads == v.size(1), "KDA requires num_q_heads == num_v_heads, got ", num_heads, " vs ", v.size(1));
+    // GVA contract on the C++ side. Order matters: check positivity *before* the modulo to
+    // avoid % 0 / division-by-zero UB in case the Python layer passed a degenerate shape.
+    TORCH_CHECK(num_qk_heads > 0, "KDA requires num_qk_heads > 0, got ", num_qk_heads);
+    TORCH_CHECK(num_v_heads > 0, "KDA requires num_v_heads > 0, got ", num_v_heads);
+    TORCH_CHECK(
+        num_qk_heads == k.size(1), "KDA requires num_q_heads == num_k_heads, got ", num_qk_heads, " vs ", k.size(1));
+    TORCH_CHECK(
+        num_v_heads % num_qk_heads == 0,
+        "KDA GVA requires num_v_heads to be a positive multiple of num_qk_heads, got num_v_heads=",
+        num_v_heads,
+        ", num_qk_heads=",
+        num_qk_heads);
     TORCH_CHECK(head_size == v.size(2), "KDA requires Q and V head dim to match, got ", head_size, " vs ", v.size(2));
 
     // Allocate output if not provided
     torch::Tensor output = output_.has_value() ? output_.value()
                                                : torch::empty(
-                                                     {packed_seq, num_heads, head_size},
+                                                     {packed_seq, num_v_heads, head_size},
                                                      torch::TensorOptions().dtype(q.dtype()).device(q.device()));
 
-    // Allocate output state if not provided
-    torch::Tensor output_state = output_state_.has_value()
-                                     ? output_state_.value()
-                                     : torch::zeros(
-                                           {num_seqs, num_heads, head_size, head_size},
-                                           torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+    // output_final_state controls the API side effect. If it is false, ignore
+    // even an explicitly provided output_state_ buffer so the kernel skips the
+    // final-state store.
+    OptionalTensor output_state = std::nullopt;
+    if (output_final_state) {
+        output_state = output_state_.has_value()
+                           ? output_state_.value()
+                           : torch::zeros(
+                                 {num_seqs, num_v_heads, head_size, head_size},
+                                 torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
+    }
 
     // Validate dtypes
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
@@ -70,7 +87,10 @@ kda_fwd_prefill(
     TORCH_CHECK(k.is_contiguous(), "k must be contiguous");
     TORCH_CHECK(v.is_contiguous(), "v must be contiguous");
     TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
-    TORCH_CHECK(output_state.is_contiguous(), "output_state must be contiguous");
+    if (output_state.has_value()) {
+        TORCH_CHECK(output_state->dtype() == torch::kFloat32, "output_state must be float32");
+        TORCH_CHECK(output_state->is_contiguous(), "output_state must be contiguous");
+    }
     TORCH_CHECK(cu_seqlens.is_contiguous(), "cu_seqlens must be contiguous");
     TORCH_CHECK(workspace_buffer.is_contiguous(), "workspace_buffer must be contiguous");
 
@@ -83,10 +103,12 @@ kda_fwd_prefill(
         TORCH_CHECK(alpha.dtype() == torch::kFloat32, "alpha must be float32");
         TORCH_CHECK(alpha.is_contiguous(), "alpha must be contiguous");
         TORCH_CHECK(
-            alpha.size(0) == packed_seq && alpha.size(1) == num_heads && alpha.size(2) == head_size,
-            "alpha shape must be [packed_seq, num_heads, head_size]");
+            alpha.size(0) == packed_seq && alpha.size(1) == num_v_heads && alpha.size(2) == head_size,
+            "alpha shape must be [packed_seq, num_v_heads, head_size]");
         alpha_ptr = alpha.data_ptr<float>();
     }
+
+    float* output_state_ptr = output_state.has_value() ? output_state->data_ptr<float>() : nullptr;
     if (beta_.has_value()) {
         auto& beta = beta_.value();
         TORCH_CHECK(
@@ -95,12 +117,17 @@ kda_fwd_prefill(
             beta.dtype());
         TORCH_CHECK(beta.is_contiguous(), "beta must be contiguous");
         TORCH_CHECK(
-            beta.size(0) == packed_seq && beta.size(1) == num_heads, "beta shape must be [packed_seq, num_heads]");
+            beta.size(0) == packed_seq && beta.size(1) == num_v_heads, "beta shape must be [packed_seq, num_v_heads]");
     }
     if (input_state_.has_value()) {
         auto& input_state = input_state_.value();
         TORCH_CHECK(input_state.dtype() == torch::kFloat32, "input_state must be float32");
         TORCH_CHECK(input_state.is_contiguous(), "input_state must be contiguous");
+        // Defense in depth: also enforce shape on the C++ side (Python layer should already check).
+        TORCH_CHECK(
+            input_state.dim() == 4 && input_state.size(0) == num_seqs && input_state.size(1) == num_v_heads &&
+                input_state.size(2) == head_size && input_state.size(3) == head_size,
+            "input_state shape must be [num_seqs, num_v_heads, head_size, head_size]");
         input_state_ptr = input_state.data_ptr<float>();
     }
 
@@ -121,7 +148,7 @@ kda_fwd_prefill(
         kda::sm90::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float, bf16>(
             stream,
             reinterpret_cast<bf16*>(output.data_ptr()),
-            output_state.data_ptr<float>(),
+            output_state_ptr,
             reinterpret_cast<bf16 const*>(q.data_ptr()),
             reinterpret_cast<bf16 const*>(k.data_ptr()),
             reinterpret_cast<bf16 const*>(v.data_ptr()),
@@ -131,7 +158,8 @@ kda_fwd_prefill(
             cu_seqlens.data_ptr<int32_t>(),
             workspace_buffer.data_ptr<uint8_t>(),
             static_cast<int32_t>(num_seqs),
-            static_cast<int32_t>(num_heads),
+            static_cast<int32_t>(num_qk_heads),
+            static_cast<int32_t>(num_v_heads),
             static_cast<int32_t>(head_size),
             static_cast<int64_t>(packed_seq),
             scale,
@@ -142,7 +170,7 @@ kda_fwd_prefill(
         kda::sm90::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float, float>(
             stream,
             reinterpret_cast<bf16*>(output.data_ptr()),
-            output_state.data_ptr<float>(),
+            output_state_ptr,
             reinterpret_cast<bf16 const*>(q.data_ptr()),
             reinterpret_cast<bf16 const*>(k.data_ptr()),
             reinterpret_cast<bf16 const*>(v.data_ptr()),
@@ -152,7 +180,8 @@ kda_fwd_prefill(
             cu_seqlens.data_ptr<int32_t>(),
             workspace_buffer.data_ptr<uint8_t>(),
             static_cast<int32_t>(num_seqs),
-            static_cast<int32_t>(num_heads),
+            static_cast<int32_t>(num_qk_heads),
+            static_cast<int32_t>(num_v_heads),
             static_cast<int32_t>(head_size),
             static_cast<int64_t>(packed_seq),
             scale,

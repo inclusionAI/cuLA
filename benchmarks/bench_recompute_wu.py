@@ -12,26 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+bench_recompute_wu.py — Benchmark: cuLA vs FLA Triton for recompute_w_u
+
+Supports both standard (HV=H) and GVA (HV > H) modes.
+In GVA mode both FLA (v0.5.0+) and cuLA accept compact q/k in HQK space natively.
+
+Usage:
+  python bench_recompute_wu.py [--heads H] [--hv HV] [--disable_recompute]
+"""
+
 import argparse
 import os
 import pathlib
 import sys
 
 import torch
-import triton
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 
-from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra as fla_chunk_kda_fwd_intra
 from fla.ops.kda.wy_fast import recompute_w_u_fwd as fla_recompute_w_u_fwd
-from fla.utils import get_abs_err, get_err_ratio
 
 import cula.cudac as cula_cuda
-from benchmarks.utils import SEED, exclusive_cumsum, generate_random_seq_lens, prepare_intra_inputs
+from benchmarks.utils import (
+    SEED,
+    exclusive_cumsum,
+    generate_random_seq_lens,
+    prepare_intra_inputs,
+    relative_rms_error,
+    relative_rms_error_rel_max_mean_abs_rhs,
+    triton_bench_fn,
+)
+from cula.kda.chunk_intra import chunk_kda_fwd_intra as cula_chunk_kda_fwd_intra
 
 # Constant params
 B, H, D = 2, 64, 128
+HV = H  # overridable via --hv; HV > H enables GVA mode
 BT = 64  # chunk size
 
 # Varlen benchmark params
@@ -43,30 +60,21 @@ VARIANCE = 1.0
 DISABLE_RECOMPUTE = False  # Whether to disable recompute (compute QG in forward)
 
 
-def accuracy_stats(a, b):
-    """Compute RMSE, relative max diff, and mean absolute difference."""
-    a, b = a.float(), b.float()
-    diff = a - b
-    rmse = diff.pow(2).mean().sqrt().item()
-    max_diff = diff.abs().max().item()
-    denom = b.abs().max().item()
-    rel_max = max_diff / denom if denom > 0 else 0.0
-    mean_diff = diff.abs().mean().item()
-    return rmse, rel_max, mean_diff
+def get_abs_err(ref: torch.Tensor, out: torch.Tensor) -> float:
+    return (ref.float() - out.float()).abs().max().item()
 
 
-def prepare_recompute_wu_inputs(B, T, H, D, device, cu_seqlens=None, chunk_size=BT):
-    """Prepare inputs for recompute_w_u benchmarking.
+def prepare_recompute_wu_inputs(B, T, device, cu_seqlens=None, chunk_size=BT):
+    """Prepare inputs for recompute_w_u benchmarking (handles both MHA and GVA).
 
-    Runs chunk_kda_fwd_intra (FLA) to produce Akk, then returns
-    all tensors needed for recompute_w_u_fwd / recompute_w_u_cuda.
+    Uses cuLA's GVA-aware chunk_kda_fwd_intra to produce Akk in HV head space,
+    which is valid for both MHA (HV=H) and GVA (HV>H) layouts.
     """
     q, k, v, g, beta, scale, cu_seqlens, chunk_indices = prepare_intra_inputs(
-        B, T, H, D, device, cu_seqlens=cu_seqlens, chunk_size=chunk_size
+        B, T, H, D, device, cu_seqlens=cu_seqlens, chunk_size=chunk_size, num_v_heads=HV
     )
 
-    # Run FLA chunk_kda_fwd_intra to get Akk (shared input for both impls)
-    _, _, _, _, Aqk, Akk = fla_chunk_kda_fwd_intra(
+    _, _, _, _, _, Akk = cula_chunk_kda_fwd_intra(
         q=q,
         k=k,
         v=v,
@@ -84,7 +92,7 @@ def prepare_recompute_wu_inputs(B, T, H, D, device, cu_seqlens=None, chunk_size=
 
 
 def run_fla_recompute_wu(k, v, beta, Akk, q, gk, cu_seqlens, chunk_indices, disable_recompute):
-    """Run FLA recompute_w_u_fwd."""
+    """FLA recompute_w_u reference (handles both MHA and GVA natively as of v0.5.0)."""
     return fla_recompute_w_u_fwd(
         k=k,
         v=v,
@@ -98,11 +106,12 @@ def run_fla_recompute_wu(k, v, beta, Akk, q, gk, cu_seqlens, chunk_indices, disa
 
 
 def run_cula_recompute_wu(k, v, beta, Akk, q, gk, cu_seqlens, chunk_indices, chunk_size, disable_recompute):
-    """Run cuLA recompute_w_u_cuda."""
-    w = torch.empty_like(k)
+    """cuLA recompute_w_u (handles both MHA and GVA; w/u/qg/kg allocated in HV head space)."""
+    B_flat, T, HV_out, Dv = v.shape
+    w = torch.empty_like(v)
     u = torch.empty_like(v)
-    qg = torch.empty_like(q) if disable_recompute else None
-    kg = torch.empty_like(k) if gk is not None else None
+    qg = torch.empty(B_flat, T, HV_out, Dv, device=q.device, dtype=q.dtype) if disable_recompute else None
+    kg = torch.empty_like(v) if gk is not None else None
 
     cula_cuda.recompute_w_u_cuda(
         k, v, beta, Akk, gk, cu_seqlens, chunk_indices, w, u, kg, chunk_size, q if disable_recompute else None, qg
@@ -111,29 +120,32 @@ def run_cula_recompute_wu(k, v, beta, Akk, q, gk, cu_seqlens, chunk_indices, chu
 
 
 # ==============================================================================
-# Uniform seqlen benchmark
+# Unified uniform seqlen benchmark (handles both standard and GVA)
 # ==============================================================================
 def benchmark_recompute_wu_uniform():
     device = torch.device("cuda")
     chunk_size = BT
+    gva_mode = HV > H
+    gva_note = f"HQK={H} HV={HV} (group_size={HV // H})" if gva_mode else f"H={H}"
     T_vals = [512, 1024, 4096, 8192, 16384, 32768]
 
-    print("=" * 90)
+    print("=" * 100)
     print(
-        f"  Uniform-Length RecomputeWU Benchmark: cuLA vs FLA Triton  B={B} H={H} D={D}  disable_recompute={DISABLE_RECOMPUTE}"
+        f"  Uniform-Length RecomputeWU Benchmark: cuLA vs FLA Triton  "
+        f"B={B} {gva_note} D={D}  disable_recompute={DISABLE_RECOMPUTE}"
     )
-    print("=" * 90)
+    print("=" * 100)
     print(
-        f"{'B':>4} {'T':>7} │ {'RMSE':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
+        f"{'B':>4} {'T':>7} │ {'rel_rmse':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
     )
-    print("─" * 90)
+    print("─" * 100)
 
     for T in T_vals:
         seq_lens = [T] * B
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
         q, k, v, g, beta, Akk, cu_seqlens, chunk_indices = prepare_recompute_wu_inputs(
-            B, T, H, D, device, cu_seqlens=cu_seqlens, chunk_size=chunk_size
+            B, T, device, cu_seqlens=cu_seqlens, chunk_size=chunk_size
         )
 
         # Accuracy: run once and compare
@@ -144,7 +156,6 @@ def benchmark_recompute_wu_uniform():
             k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, chunk_size, DISABLE_RECOMPUTE
         )
 
-        # Compare w, u, qg, kg
         stats = {}
         for name, t_fla, t_cula in [
             ("w", w_fla, w_cula),
@@ -153,46 +164,49 @@ def benchmark_recompute_wu_uniform():
             ("kg", kg_fla, kg_cula),
         ]:
             if t_fla is not None and t_cula is not None:
-                stats[name] = accuracy_stats(t_fla, t_cula)
-        # Use max across all outputs for display
-        rmse = max(s[0] for s in stats.values())
+                stats[name] = relative_rms_error_rel_max_mean_abs_rhs(t_fla, t_cula)
+        # Use max across all outputs for display.
+        relative_rms_error_value = max(s[0] for s in stats.values())
         rel_max = max(s[1] for s in stats.values())
         mean_diff = max(s[2] for s in stats.values())
 
         # Performance
-        ms_fla = triton.testing.do_bench(
+        ms_fla = triton_bench_fn(
             lambda: run_fla_recompute_wu(k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, DISABLE_RECOMPUTE),
         )
-        ms_cula = triton.testing.do_bench(
+        ms_cula = triton_bench_fn(
             lambda: run_cula_recompute_wu(k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, chunk_size, DISABLE_RECOMPUTE),
         )
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         print(
-            f"{B:>4} {T:>7} │ {rmse:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
+            f"{B:>4} {T:>7} │ {relative_rms_error_value:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
         )
 
-    print("─" * 90)
+    print("─" * 100)
 
 
 # ==============================================================================
-# Varlen benchmark
+# Unified varlen benchmark (handles both standard and GVA)
 # ==============================================================================
 def benchmark_recompute_wu_varlen():
     device = torch.device("cuda")
     chunk_size = BT
+    gva_mode = HV > H
+    gva_note = f"HQK={H} HV={HV} (group_size={HV // H})" if gva_mode else f"H={H}"
     total_len_vals = [8192, 16384, 32768, 65536]
 
     print()
-    print("=" * 100)
+    print("=" * 110)
     print(
-        f"  Varlen RecomputeWU Benchmark: cuLA vs FLA Triton  NUM_SEQS={NUM_SEQS} H={H} D={D}  disable_recompute={DISABLE_RECOMPUTE}"
+        f"  Varlen RecomputeWU Benchmark: cuLA vs FLA Triton  "
+        f"NUM_SEQS={NUM_SEQS} {gva_note} D={D}  disable_recompute={DISABLE_RECOMPUTE}"
     )
-    print("=" * 100)
+    print("=" * 110)
     print(
-        f"{'total_len':>10} │ {'RMSE':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
+        f"{'total_len':>10} │ {'rel_rmse':>10} {'rel_max':>10} {'mean_diff':>12} │ {'FLA(ms)':>9} {'cuLA(ms)':>9} {'Speedup':>8}"
     )
-    print("─" * 100)
+    print("─" * 110)
 
     for total_len in total_len_vals:
         seq_lens = generate_random_seq_lens(NUM_SEQS, total_len, MIN_SEQ_LEN, VARIANCE, SEED)
@@ -200,7 +214,7 @@ def benchmark_recompute_wu_varlen():
         cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
         q, k, v, g, beta, Akk, cu_seqlens, chunk_indices = prepare_recompute_wu_inputs(
-            1, T, H, D, device, cu_seqlens=cu_seqlens, chunk_size=chunk_size
+            1, T, device, cu_seqlens=cu_seqlens, chunk_size=chunk_size
         )
 
         # Accuracy
@@ -211,7 +225,6 @@ def benchmark_recompute_wu_varlen():
             k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, chunk_size, DISABLE_RECOMPUTE
         )
 
-        # Compare w, u, qg, kg
         stats = {}
         for name, t_fla, t_cula in [
             ("w", w_fla, w_cula),
@@ -220,26 +233,26 @@ def benchmark_recompute_wu_varlen():
             ("kg", kg_fla, kg_cula),
         ]:
             if t_fla is not None and t_cula is not None:
-                stats[name] = accuracy_stats(t_fla, t_cula)
-        # Use max across all outputs for display
-        rmse = max(s[0] for s in stats.values())
+                stats[name] = relative_rms_error_rel_max_mean_abs_rhs(t_fla, t_cula)
+        # Use max across all outputs for display.
+        relative_rms_error_value = max(s[0] for s in stats.values())
         rel_max = max(s[1] for s in stats.values())
         mean_diff = max(s[2] for s in stats.values())
 
         # Performance
-        ms_fla = triton.testing.do_bench(
+        ms_fla = triton_bench_fn(
             lambda: run_fla_recompute_wu(k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, DISABLE_RECOMPUTE),
         )
-        ms_cula = triton.testing.do_bench(
+        ms_cula = triton_bench_fn(
             lambda: run_cula_recompute_wu(k, v, beta, Akk, q, g, cu_seqlens, chunk_indices, chunk_size, DISABLE_RECOMPUTE),
         )
         speedup = ms_fla / ms_cula if ms_cula > 0 else float("inf")
 
         print(
-            f"{total_len:>10} │ {rmse:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
+            f"{total_len:>10} │ {relative_rms_error_value:>10.6f} {rel_max:>10.6f} {mean_diff:>12.8f} │ {ms_fla:>9.4f} {ms_cula:>9.4f} {speedup:>7.2f}x"
         )
 
-    print("─" * 100)
+    print("─" * 110)
 
 
 def check_determinism(num_seqs=NUM_SEQS, T=2001, H=H, iters=1000):
@@ -251,7 +264,7 @@ def check_determinism(num_seqs=NUM_SEQS, T=2001, H=H, iters=1000):
     cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int32, device=device)
 
     q, k, v, g, beta, Akk, cu_seqlens, chunk_indices = prepare_recompute_wu_inputs(
-        B=1, T=T, H=H, D=D, device=device, cu_seqlens=cu_seqlens, chunk_size=chunk_size
+        B=1, T=T, device=device, cu_seqlens=cu_seqlens, chunk_size=chunk_size
     )
 
     ref_w, ref_u, ref_qg, ref_kg = run_cula_recompute_wu(
@@ -265,19 +278,19 @@ def check_determinism(num_seqs=NUM_SEQS, T=2001, H=H, iters=1000):
 
         if not torch.equal(w, ref_w):
             print(f"Iteration {i}: w mismatch")
-            print(f"{get_abs_err(ref_w, w):.6f} absolute error, {get_err_ratio(ref_w, w):.6f} relative error")
+            print(f"{get_abs_err(ref_w, w):.6f} absolute error, {relative_rms_error(ref_w, w):.6f} relative_rms_error")
             raise AssertionError("Non-deterministic output detected in w")
         if not torch.equal(u, ref_u):
             print(f"Iteration {i}: u mismatch")
-            print(f"{get_abs_err(ref_u, u):.6f} absolute error, {get_err_ratio(ref_u, u):.6f} relative error")
+            print(f"{get_abs_err(ref_u, u):.6f} absolute error, {relative_rms_error(ref_u, u):.6f} relative_rms_error")
             raise AssertionError("Non-deterministic output detected in u")
         if kg is not None and not torch.equal(kg, ref_kg):
             print(f"Iteration {i}: kg mismatch")
-            print(f"{get_abs_err(ref_kg, kg):.6f} absolute error, {get_err_ratio(ref_kg, kg):.6f} relative error")
+            print(f"{get_abs_err(ref_kg, kg):.6f} absolute error, {relative_rms_error(ref_kg, kg):.6f} relative_rms_error")
             raise AssertionError("Non-deterministic output detected in kg")
         if qg is not None and not torch.equal(qg, ref_qg):
             print(f"Iteration {i}: qg mismatch")
-            print(f"{get_abs_err(ref_qg, qg):.6f} absolute error, {get_err_ratio(ref_qg, qg):.6f} relative error")
+            print(f"{get_abs_err(ref_qg, qg):.6f} absolute error, {relative_rms_error(ref_qg, qg):.6f} relative_rms_error")
             raise AssertionError("Non-deterministic output detected in qg")
 
 
@@ -288,11 +301,37 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable recompute in both FLA and cuLA (pre-compute QG)",
     )
+    parser.add_argument(
+        "--heads",
+        type=int,
+        default=None,
+        help=f"Override number of Q/K heads (H). Default: {H}.",
+    )
+    parser.add_argument(
+        "--hv",
+        type=int,
+        default=None,
+        help="Override number of V heads (HV). Default: H (no GVA). Set HV > H to enable GVA mode.",
+    )
     args = parser.parse_args()
 
     if args.disable_recompute:
         DISABLE_RECOMPUTE = True
         print("[Disable recompute] pre-compute QG in forward")
+
+    if args.heads is not None:
+        if args.heads <= 0:
+            raise ValueError(f"--heads must be a positive integer, got {args.heads}")
+        H = args.heads
+        HV = H  # reset HV to new H before --hv override
+
+    if args.hv is not None:
+        if args.hv < H or args.hv % H != 0:
+            raise ValueError(f"--hv must be a positive multiple of H ({H}), got {args.hv}")
+        HV = args.hv
+
+    if HV > H:
+        print(f"[GVA] HV={HV} (H={H}, group_size={HV // H}x)")
 
     check_determinism(iters=100000)
 

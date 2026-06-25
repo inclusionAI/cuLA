@@ -135,7 +135,10 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
         int32_t const* cu_seqlens;
         int64_t total_seqlen;
         int32_t num_seqs;
-        int32_t num_heads;  // Q, K, V, O all share the same head count in KDA
+        // GVA: Q/K share num_qk_heads; V, g, beta, O, state are sized by num_v_heads.
+        // Constraint: num_v_heads % num_qk_heads == 0; heads_per_group = num_v_heads / num_qk_heads.
+        int32_t num_qk_heads;
+        int32_t num_v_heads;
         int32_t head_size;  // d
     };
     using ProblemShape = VarlenProblemShape;

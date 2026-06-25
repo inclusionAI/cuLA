@@ -405,14 +405,15 @@ class LinearAttentionChunkwiseDecay:
         v = cute.make_tensor(v_in.iterator, v_layout)
         o = cute.make_tensor(o_in.iterator, o_layout)
 
-        # Initial state / final state: [B, H, D, D] stored as row-major FP32
+        # Initial state / final state: [B, H, D, D] in BHVK layout (K-contiguous)
+        # CuTe shape (V, K, (H, B)) with strides (D, 1, ...) for K-contiguous access.
         # When has_initial_state / output_final_state is False, None is passed
         # and the parameter is eliminated at compile time via const_expr guards.
         # For varlen: state pool is [pool_size, H, D, D]. We use B (=N) as the
         # pool dimension — strides are correct regardless of actual pool_size.
         fstate_layout = cute.make_layout(
             (D, D, (H, B)),
-            stride=(1, D, (D * D, D * D * H)),
+            stride=(D, 1, (D * D, D * D * H)),
         )
         if cutlass.const_expr(self.has_initial_state):
             initial_state = cute.make_tensor(initial_state_in.iterator, fstate_layout)
@@ -720,6 +721,15 @@ class LinearAttentionChunkwiseDecay:
             sWorkIdx: cute.struct.MemRange[Int32, 2]
             # Double-buffered scheduling mbarriers (count=1 each, Load warp elect_one arrives)
             sched_mbar: cute.struct.MemRange[Int64, 2]
+            # State transpose buffer for coalesced BHVK state load/store.
+            # Sized for 64 V-rows × (D+4) K-values in f32 (~33KB for D=128).
+            # Padding of 4 elements per row eliminates SMEM bank conflicts
+            # (stride 132 mod 32 = 4 → consecutive rows hit distinct banks).
+            # Used in 2 strips to load/store the D×D state with coalesced GMEM access.
+            sStateBuf: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, 64 * (self.K + 4)],
+                self.buffer_align_bytes,
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -946,6 +956,8 @@ class LinearAttentionChunkwiseDecay:
         sK_weighted = storage.sK_weighted.get_tensor(kv_k_smem_layout_single.outer, swizzle=kv_k_smem_layout_single.inner)
         # Decay lookup table
         sDecayLUT = cute.make_tensor(storage.sDecayLUT.data_ptr(), cute.make_layout(self.chunk_size))
+        # State transpose buffer (SMEM) for coalesced BHVK GMEM access
+        state_buf_ptr = storage.sStateBuf.data_ptr()
         # (((64,2),16),1,4,2):(((1,4096),64),0,1024,8192)>
         sV = storage.sV.get_tensor(v_smem_layout_staged.outer, swizzle=v_smem_layout_staged.inner)
         # (MMA, MMA_N, MMA_K, STAGE)
@@ -1700,11 +1712,48 @@ class LinearAttentionChunkwiseDecay:
                 decay_s_cuda = decay_tensor_cuda[hidx]
                 block_decay = cute.exp(-decay_s_cuda * cutlass.Float32(C), fastmath=self.use_fast_math)
 
-                # -------------- Initial State Loading (h0) ----------------
+                # -------------- Initial State Loading (h0) via SMEM transpose -----
+                # VK GMEM layout is K-contiguous but non-coalesced across threads.
+                # We load cooperatively (all threads, coalesced) to SMEM, then
+                # each thread reads its V-row from SMEM.  2 strips of 64 V-rows.
                 if cutlass.const_expr(self.has_initial_state):
                     gState_h0 = initial_state[None, None, (hidx, state_idx)]
-                    gRow_h0 = cute.make_tensor(gState_h0.iterator + local_tidx, cute.make_layout(_D, stride=_D))
-                    cute.autovec_copy(gRow_h0, init_flat)
+                    _STRIP = 64
+                    _PAD = 4
+                    _VEC = 4
+                    _SMEM_STRIDE = _D + _PAD  # 132 — eliminates bank conflicts
+                    _CE_THREADS = self.threads_per_warp * len(self.cuda_warp_ids)
+                    _COLS_PER_THREAD = _D // _VEC  # 32 threads cover one row
+                    _ROWS_PER_ITER = _CE_THREADS // _COLS_PER_THREAD  # 4 rows
+                    _NUM_ITERS = _STRIP // _ROWS_PER_ITER  # 16
+                    row_in_iter = local_tidx // _COLS_PER_THREAD
+                    col_base = (local_tidx % _COLS_PER_THREAD) * _VEC
+                    for strip_idx in cutlass.range(_D // _STRIP):
+                        strip_base = strip_idx * (_STRIP * _D)
+                        # Cooperative coalesced GMEM → padded SMEM (row-by-row)
+                        for ci in cutlass.range(_NUM_ITERS, unroll_full=True):
+                            row = ci * _ROWS_PER_ITER + row_in_iter
+                            g_vec = cute.make_tensor(
+                                gState_h0.iterator + strip_base + row * _D + col_base,
+                                cute.make_layout(_VEC),
+                            )
+                            s_vec = cute.make_tensor(
+                                state_buf_ptr + row * _SMEM_STRIDE + col_base,
+                                cute.make_layout(_VEC),
+                            )
+                            cute.autovec_copy(g_vec, s_vec)
+                        cute.arch.barrier(barrier_id=5, number_of_threads=_CE_THREADS)
+                        # Each thread reads its V-row from padded SMEM
+                        strip_start = strip_idx * _STRIP
+                        if local_tidx >= strip_start:
+                            if local_tidx < strip_start + _STRIP:
+                                local_v = local_tidx - strip_start
+                                s_row = cute.make_tensor(
+                                    state_buf_ptr + local_v * _SMEM_STRIDE,
+                                    cute.make_layout(_D),
+                                )
+                                cute.autovec_copy(s_row, init_flat)
+                        cute.arch.barrier(barrier_id=5, number_of_threads=_CE_THREADS)
 
                     # Store raw h0 as BF16 to kv16 TMEM for SQ MMA at idx=0
                     tmem_store_rAccKVAsBF16.store(tTR_rKV.load().to(self.io_dtype))
@@ -1877,10 +1926,45 @@ class LinearAttentionChunkwiseDecay:
                         gState_ht = initial_state[None, None, (hidx, state_idx)]
                     else:
                         gState_ht = final_state[None, None, (hidx, state_idx)]
-                    gRow_ht = cute.make_tensor(gState_ht.iterator + local_tidx, cute.make_layout(_D, stride=_D))
 
+                    # Store via SMEM transpose for coalesced GMEM writes
                     out_flat = cute.make_tensor(tTR_rKV.iterator, layout=cute.make_layout(_D))
-                    cute.autovec_copy(out_flat, gRow_ht)
+                    _STRIP = 64
+                    _PAD = 4
+                    _VEC = 4
+                    _SMEM_STRIDE = _D + _PAD
+                    _CE_THREADS = self.threads_per_warp * len(self.cuda_warp_ids)
+                    _COLS_PER_THREAD = _D // _VEC
+                    _ROWS_PER_ITER = _CE_THREADS // _COLS_PER_THREAD
+                    _NUM_ITERS = _STRIP // _ROWS_PER_ITER
+                    row_in_iter = local_tidx // _COLS_PER_THREAD
+                    col_base = (local_tidx % _COLS_PER_THREAD) * _VEC
+                    for strip_idx in cutlass.range(_D // _STRIP):
+                        strip_base = strip_idx * (_STRIP * _D)
+                        strip_start = strip_idx * _STRIP
+                        # Each thread writes its V-row to padded SMEM
+                        if local_tidx >= strip_start:
+                            if local_tidx < strip_start + _STRIP:
+                                local_v = local_tidx - strip_start
+                                s_row = cute.make_tensor(
+                                    state_buf_ptr + local_v * _SMEM_STRIDE,
+                                    cute.make_layout(_D),
+                                )
+                                cute.autovec_copy(out_flat, s_row)
+                        cute.arch.barrier(barrier_id=5, number_of_threads=_CE_THREADS)
+                        # Cooperative coalesced padded SMEM → GMEM (row-by-row)
+                        for ci in cutlass.range(_NUM_ITERS, unroll_full=True):
+                            row = ci * _ROWS_PER_ITER + row_in_iter
+                            s_vec = cute.make_tensor(
+                                state_buf_ptr + row * _SMEM_STRIDE + col_base,
+                                cute.make_layout(_VEC),
+                            )
+                            g_vec = cute.make_tensor(
+                                gState_ht.iterator + strip_base + row * _D + col_base,
+                                cute.make_layout(_VEC),
+                            )
+                            cute.autovec_copy(s_vec, g_vec)
+                        cute.arch.barrier(barrier_id=5, number_of_threads=_CE_THREADS)
 
                 # Advance k_stage_offset by number of chunks in this WU
                 # so next WU's k_stage_idx stays in sync with the K pipeline.
@@ -2895,12 +2979,12 @@ def lightning_attn_fwd(
         V: (B, S, H, D) bf16 value
         decay: (H,) f32 per-head decay coefficients
         scale: attention scale factor (default: 1.0)
-        initial_state: (B, H, D, D) f32 initial state or None
+        initial_state: (B, H, D, D) f32 initial state in BHVK layout, or None
         output_final_state: whether to output final state
         chunk_size: chunk size (default: 64)
 
     Returns:
-        (O, ht): output tensor (B,S,H,D) bf16, final state (B,H,D,D) f32 or None
+        (O, ht): output tensor (B,S,H,D) bf16, final state (B,H,D,D) f32 in BHVK layout or None
     """
     B, S, H, D = Q.shape
     O = torch.zeros_like(Q)
@@ -3111,7 +3195,7 @@ def lightning_attn_fwd_varlen(
         decay: (H,) f32 per-head decay coefficients
         cu_seqlens: (N+1,) int32 cumulative sequence lengths
         scale: attention scale factor (default: 1.0)
-        state_pool: (pool_size, H, D, D) f32 state pool, or None
+        state_pool: (pool_size, H, D, D) f32 state pool in BHVK layout, or None
             If None, a zero state pool is allocated with pool_size=N.
             States are updated in-place (INPLACE_UPDATE).
         initial_state_indices: (N,) int32 indices into state_pool per sequence.

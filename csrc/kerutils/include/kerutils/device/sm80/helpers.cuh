@@ -38,6 +38,7 @@ void _store_256b(
                 :: "l"(gmem_addr), "r"(src0), "r"(src1), "r"(src2), "r"(src3), "r"(src4), "r"(src5), "r"(src6), "r"(src7));
 }
 
+// reference: https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/copy_sm100.hpp#L70
 CUTE_DEVICE
 void store_256b(void *src, void *dst) {
     uint32_t *src_ptr = reinterpret_cast<uint32_t *>(src);

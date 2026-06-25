@@ -12,28 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import importlib
 import os
-from collections.abc import Callable
 
 import torch
-from fla.ops.common.chunk_delta_h import (
-    chunk_gated_delta_rule_fwd_h as fla_chunk_gated_delta_rule_fwd_h,
-)
+from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as _triton_chunk_gated_delta_rule_fwd_h
 from fla.ops.cp import FLACPContext
 from fla.ops.cp.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h_pre_process,
     compress_h0,
 )
+from fla.ops.gla.chunk import chunk_gla_fwd_o_gk as _triton_chunk_gla_fwd_o_gk
 from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 
 from cula.kda.chunk_intra import chunk_kda_fwd_intra
-from cula.utils import assert_blackwell
 
 _USE_FLA_DELTA_H_ENV = "CULA_USE_FLA_DELTA_H"
-_cute_chunk_gated_delta_rule_fwd_h: Callable | None = None
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -49,22 +46,100 @@ def _env_flag_enabled(name: str, default: bool = False) -> bool:
     raise ValueError(f"{name} must be one of 1/0, true/false, yes/no, or on/off; got {value!r}.")
 
 
-def _get_chunk_delta_h_fwd() -> tuple[Callable, bool]:
-    """Return the selected delta-h implementation and whether it is the FLA fallback."""
+def _triton_chunk_gated_delta_rule_fwd_h_exp2(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    persistent: bool = True,
+    _no_cp: bool = False,
+    cu_seqlens_cpu: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    del persistent, _no_cp
+    return _triton_chunk_gated_delta_rule_fwd_h(
+        k=k,
+        w=w,
+        u=u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        chunk_indices=chunk_indices,
+        use_exp2=True,
+        transpose_state_layout=False,
+    )
 
-    global _cute_chunk_gated_delta_rule_fwd_h
-    use_fla_delta_h = _env_flag_enabled(_USE_FLA_DELTA_H_ENV)
-    if use_fla_delta_h:
-        return fla_chunk_gated_delta_rule_fwd_h, True
 
-    if _cute_chunk_gated_delta_rule_fwd_h is None:
-        delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h")
-        _cute_chunk_gated_delta_rule_fwd_h = delta_h_mod.chunk_gated_delta_rule_fwd_h
-    return _cute_chunk_gated_delta_rule_fwd_h, False
+def _sm90_triton_chunk_gla_fwd_o(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    h: torch.Tensor,
+    o: torch.Tensor | None,
+    A: torch.Tensor,
+    scale: float,
+    chunk_size: int = 64,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    is_varlen: bool = False,
+    persistent: bool = True,
+) -> torch.Tensor:
+    del is_varlen, persistent
+    h_fla = h.flatten(0, 1) if h.dim() == 5 else h
+    out = _triton_chunk_gla_fwd_o_gk(
+        q=q,
+        v=v,
+        g=g,
+        A=A,
+        h=h_fla,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+        use_exp2=True,
+        transpose_state_layout=False,
+    )
+    if o is not None:
+        o.copy_(out)
+        return o
+    return out
 
 
-_fwd_o_mod = importlib.import_module("cula.ops.fwd_o")
-chunk_gla_fwd_o = _fwd_o_mod.chunk_gla_fwd_o
+@functools.cache
+def _get_fwd_kernels_for_sm(major: int, minor: int, use_fla_delta_h: bool):
+    if major == 10 and minor in (0, 3):
+        fwd_o_mod = importlib.import_module("cula.ops.fwd_o_sm100")
+        if use_fla_delta_h:
+            return _triton_chunk_gated_delta_rule_fwd_h_exp2, fwd_o_mod.chunk_gla_fwd_o
+        delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h_sm100")
+        return delta_h_mod.chunk_gated_delta_rule_fwd_h, fwd_o_mod.chunk_gla_fwd_o
+    elif major == 9 and minor == 0:
+        return _triton_chunk_gated_delta_rule_fwd_h_exp2, _sm90_triton_chunk_gla_fwd_o
+    else:
+        raise RuntimeError(
+            f"Unsupported CUDA compute capability sm_{major}{minor}. "
+            f"Only sm90a (Hopper) and Blackwell (SM100/SM103) are supported."
+        )
+
+
+def _get_device_sm_version(device: torch.device):
+    return importlib.import_module("cula.utils").get_device_sm_version(device)
+
+
+def _get_fwd_kernels(device: torch.device):
+    major, minor = _get_device_sm_version(device)
+    return _get_fwd_kernels_for_sm(major, minor, _env_flag_enabled(_USE_FLA_DELTA_H_ENV))
 
 
 def chunk_kda_fwd(
@@ -90,9 +165,8 @@ def chunk_kda_fwd(
     cp_context: FLACPContext | None = None,
     use_tf32_inverse: bool = True,
     unified_gref: bool = False,  # Set True for ~5% extra perf (slightly lower precision)
-    chunk_offsets: torch.IntTensor | None = None,
 ):
-    assert_blackwell(q.device)
+    chunk_gated_delta_rule_fwd_h, chunk_gla_fwd_o = _get_fwd_kernels(q.device)
 
     # Apply gate activation
     g_org = None
@@ -140,23 +214,18 @@ def chunk_kda_fwd(
             use_exp2=True,
         )
 
-    delta_h_fwd, use_fla_delta_h = _get_chunk_delta_h_fwd()
-    delta_h_kwargs = {
-        "k": kg,
-        "w": w,
-        "u": u,
-        "gk": g,
-        "initial_state": initial_state,
-        "output_final_state": output_final_state,
-        "cu_seqlens": cu_seqlens,
-        "chunk_indices": chunk_indices,
-        # chunk_offsets=chunk_offsets,
-    }
-    if use_fla_delta_h:
-        delta_h_kwargs["use_exp2"] = True  # FLA impl expects log2-space gates.
-    else:
-        delta_h_kwargs["chunk_size"] = chunk_size
-    h, v_new, final_state = delta_h_fwd(**delta_h_kwargs)
+    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+        k=kg,
+        w=w,
+        u=u,
+        gk=g,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+    )
 
     if cp_context is not None:
         # In Context Parallel (CP) mode, global initial states are not supported at the entry point.
@@ -165,15 +234,13 @@ def chunk_kda_fwd(
         # only the first state in the tensor is relevant. We compress it to optimize memory for `save_for_backward`.
         initial_state = compress_h0(initial_state, context=cp_context)
 
-    # Please ensure zeros, since vllm will use padding v
-    o = torch.zeros_like(v)
-    chunk_gla_fwd_o(
+    o = chunk_gla_fwd_o(
         q=q,
         v=v_new,
         g=g,
         A=Aqk,
         h=h,
-        o=o,
+        o=None,
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,

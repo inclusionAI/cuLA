@@ -12,12 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from cula.kda.chunk import chunk_kda
-from cula.kda.hopper_fused_fwd import cula_kda_prefill as kda_prefill_hopper
-from cula.kda.kda_decode import kda_decode
+from __future__ import annotations
+
+from importlib import import_module
+from typing import Any
 
 __all__ = [
     "chunk_kda",
+    "kda_prefill_blackwell",
     "kda_decode",
+    "fused_sigmoid_gating_delta_rule_update",
     "kda_prefill_hopper",
 ]
+
+_LAZY_EXPORTS = {
+    "chunk_kda": ("cula.kda.chunk", "chunk_kda"),
+    "kda_prefill_blackwell": ("cula.kda.blackwell_fused_fwd", "flash_kda_prefill"),
+    "kda_decode": ("cula.ops.kda_decode", "kda_decode"),
+    "fused_sigmoid_gating_delta_rule_update": (
+        "cula.ops.kda_decode",
+        "fused_sigmoid_gating_delta_rule_update",
+    ),
+    "kda_prefill_hopper": ("cula.kda.hopper_fused_fwd", "cula_kda_prefill"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = _LAZY_EXPORTS[name]
+    value = getattr(import_module(module_name), attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

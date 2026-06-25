@@ -226,9 +226,13 @@ struct KdaChunkFwdIntraMainloopSm100 {
     };
 
     // ===================== TMA Params =====================
-    template <typename ShapeQKG, typename TMA_Q, typename TMA_K, typename TMA_G>
+    // GVA: Q/K live in h_qk head space (shape_qk), while G lives in h_v
+    // head space (shape_vg). When h_v == h_qk both shapes coincide and the
+    // TMA descriptors degrade to the pre-GVA behaviour.
+    template <typename ShapeQK, typename ShapeVG, typename TMA_Q, typename TMA_K, typename TMA_G>
     struct TmaParams {
-        ShapeQKG shape_qkg;
+        ShapeQK shape_qk;
+        ShapeVG shape_vg;
         TMA_Q tma_q;
         TMA_K tma_k;
         TMA_G tma_g;
@@ -317,7 +321,10 @@ struct KdaChunkFwdIntraMainloopSm100 {
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
 
-            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
+            // head_idx here is the v-head index (Aqk/Akk/beta/g live in v-head space).
+            // qk_head_idx is only consumed by the TMA load warp for Q/K slicing.
+            auto blk_coord = TileScheduler::decode_tile_coord(
+                tid, params.h_v, params.heads_per_group, chunk_indices_ptr, cu_seqlens_ptr);
             int batch_idx = get<0>(blk_coord);
             int head_idx = get<1>(blk_coord);
             int tile_idx = get<2>(blk_coord);
@@ -501,7 +508,8 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 int token_offset = cu_seqlens_ptr[batch_idx];
                 int row = idx_in_warpgroup % 64;
                 int BT = TileT;
-                int H = params.h;
+                // Aqk is laid out per v-head: row-stride is h_v * BT, head slot offset is head_idx * BT.
+                int H = params.h_v;
                 __nv_bfloat16* Aqk_base = reinterpret_cast<__nv_bfloat16*>(params.Aqk_out_ptr);
                 __nv_bfloat16* qk_out_row =
                     Aqk_base + static_cast<int64_t>(token_offset + tile_idx * TileT + row) * H * BT + head_idx * BT;
@@ -567,7 +575,10 @@ struct KdaChunkFwdIntraMainloopSm100 {
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
 
-            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
+            // MMA loop does not actually consume head_idx, but we decode to advance the
+            // same tile space as the other warps (num_blocks * num_v_heads).
+            auto blk_coord = TileScheduler::decode_tile_coord(
+                tid, params.h_v, params.heads_per_group, chunk_indices_ptr, cu_seqlens_ptr);
             int batch_idx = get<0>(blk_coord);
             int head_idx = get<1>(blk_coord);
             int tile_idx = get<2>(blk_coord);
@@ -702,21 +713,24 @@ struct KdaChunkFwdIntraMainloopSm100 {
             for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
                 int tid = tile_scheduler.get_current_tile_id();
 
-                // Decode tile coordinates
-                auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
+                // Decode tile coordinates. head_idx is the v-head index (used for G),
+                // and qk_head_idx is the companion Q/K head (computed from heads_per_group).
+                auto blk_coord = TileScheduler::decode_tile_coord(
+                    tid, params.h_v, params.heads_per_group, chunk_indices_ptr, cu_seqlens_ptr);
                 int batch_idx = get<0>(blk_coord);
-                int head_idx = get<1>(blk_coord);
+                int head_idx = get<1>(blk_coord);  // v-head index
                 int tile_idx = get<2>(blk_coord);
+                int qk_head_idx = get<3>(blk_coord);  // == head_idx / heads_per_group
                 int token_offset = cu_seqlens_ptr[batch_idx];
                 int seq_len = cu_seqlens_ptr[batch_idx + 1] - cu_seqlens_ptr[batch_idx];
                 int sub_seq_len = min(TileT, seq_len - tile_idx * TileT);
 
                 Tensor mQ = domain_offset(
-                    make_coord(token_offset, _0{}, _0{}), tma_params.tma_q.get_tma_tensor(tma_params.shape_qkg));
+                    make_coord(token_offset, _0{}, _0{}), tma_params.tma_q.get_tma_tensor(tma_params.shape_qk));
                 Tensor mK = domain_offset(
-                    make_coord(token_offset, _0{}, _0{}), tma_params.tma_k.get_tma_tensor(tma_params.shape_qkg));
+                    make_coord(token_offset, _0{}, _0{}), tma_params.tma_k.get_tma_tensor(tma_params.shape_qk));
                 Tensor mG = domain_offset(
-                    make_coord(token_offset, _0{}, _0{}), tma_params.tma_g.get_tma_tensor(tma_params.shape_qkg));
+                    make_coord(token_offset, _0{}, _0{}), tma_params.tma_g.get_tma_tensor(tma_params.shape_vg));
 
                 // TMA load body (Q, K, G — unified pipeline, single barrier per stage)
                 CUTE_NO_UNROLL
@@ -726,12 +740,13 @@ struct KdaChunkFwdIntraMainloopSm100 {
                     Tensor sK = make_tensor(make_smem_ptr(shared_plan->k[buf_idx].data()), SmemLayoutInputBF16{});
                     Tensor sG = make_tensor(make_smem_ptr(shared_plan->g[buf_idx].data()), SmemLayoutInputFP32{});
 
+                    // GVA: K and Q are sliced by qk_head_idx; G is sliced by head_idx (v-head).
                     Tensor gK = local_tile(
-                        mK(_, _, head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, k_idx));
+                        mK(_, _, qk_head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, k_idx));
                     Tensor gG = local_tile(
                         mG(_, _, head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, k_idx));
                     Tensor gQ = local_tile(
-                        mQ(_, _, head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, k_idx));
+                        mQ(_, _, qk_head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, k_idx));
 
                     // Single acquire for all three TMA copies
                     qkg_load_pipeline.producer_acquire(qkg_load_pipe_state_write);
@@ -768,7 +783,9 @@ struct KdaChunkFwdIntraMainloopSm100 {
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
 
-            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
+            // Akk is laid out per v-head (params.shape_Akk uses h_v), so we index by head_idx.
+            auto blk_coord = TileScheduler::decode_tile_coord(
+                tid, params.h_v, params.heads_per_group, chunk_indices_ptr, cu_seqlens_ptr);
             int batch_idx = get<0>(blk_coord);
             int head_idx = get<1>(blk_coord);
             int tile_idx = get<2>(blk_coord);
@@ -881,7 +898,9 @@ struct KdaChunkFwdIntraMainloopSm100 {
         for (; tile_scheduler.is_valid(); tile_scheduler.advance()) {
             int tid = tile_scheduler.get_current_tile_id();
 
-            auto blk_coord = TileScheduler::decode_tile_coord(tid, params.h, chunk_indices_ptr, cu_seqlens_ptr);
+            // beta is per v-head: layout (total_seqlen, h_v), row stride = h_v.
+            auto blk_coord = TileScheduler::decode_tile_coord(
+                tid, params.h_v, params.heads_per_group, chunk_indices_ptr, cu_seqlens_ptr);
             int batch_idx = get<0>(blk_coord);
             int head_idx = get<1>(blk_coord);
             int tile_idx = get<2>(blk_coord);
@@ -895,7 +914,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 shared_plan->beta_smem[beta_pipe_state_write.index()][thread_idx] =
                     (thread_idx < sub_seq_len)
                         ? float(reinterpret_cast<ElementBeta*>(
-                              params.beta_ptr)[(token_offset + tile_idx * TileT + thread_idx) * params.h + head_idx])
+                              params.beta_ptr)[(token_offset + tile_idx * TileT + thread_idx) * params.h_v + head_idx])
                         : float(0);
             }
             fence_view_async_shared();

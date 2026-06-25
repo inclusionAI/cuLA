@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import importlib.util
 
 _spec = importlib.util.spec_from_file_location(
-    "chunk_delta_h", os.path.join(os.path.dirname(__file__), "..", "cula", "ops", "chunk_delta_h.py")
+    "chunk_delta_h_sm100", os.path.join(os.path.dirname(__file__), "..", "cula", "ops", "chunk_delta_h_sm100.py")
 )
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)

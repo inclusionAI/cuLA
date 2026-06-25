@@ -1,6 +1,6 @@
 # ChunkGlaFwdO Pipeline
 
-> 文件: `cula/ops/fwd_o.py`  
+> 文件: `cula/ops/fwd_o_sm100.py`
 > 类名: `ChunkGlaFwdO`
 
 ## 计算公式
