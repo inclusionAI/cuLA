@@ -21,8 +21,90 @@ from fla.ops.cp import FLACPContext
 from fla.ops.utils.index import prepare_chunk_indices
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
+import cula.cudac as cula_cuda
+import cula.kda.chunk_bwd as cula_chunk_bwd
+import cula.kda.chunk_intra as cula_chunk_intra
 from cula.kda.chunk_bwd import chunk_kda_bwd
 from cula.kda.chunk_fwd import chunk_kda_fwd
+from cula.utils import prepare_uniform_cu_seqlens
+
+_BWD_INTRA_PATCHED = False
+
+
+def _try_patch_bwd_intra_with_cuda_impl() -> None:
+    """Force patch bwd_intra with CUDA implementation."""
+
+    global _BWD_INTRA_PATCHED
+    if _BWD_INTRA_PATCHED:
+        return
+
+    try:
+        cuda_kda_bwd_intra = cula_cuda.chunk_kda_bwd_intra_cuda
+    except Exception as exc:
+        raise RuntimeError(
+            "Required CUDA bwd_intra implementation `cula.cudac.chunk_kda_bwd_intra_cuda` is unavailable. "
+            "Please build/install the CUDA extension before running backward."
+        ) from exc
+
+    def _patched_bwd_intra(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        dAqk: torch.Tensor,
+        dAkk: torch.Tensor,
+        dq: torch.Tensor,
+        dk: torch.Tensor,
+        db: torch.Tensor,
+        dg: torch.Tensor,
+        cu_seqlens: torch.IntTensor | None = None,
+        chunk_indices: torch.IntTensor | None = None,
+        chunk_size: int = 64,
+        safe_gate: bool = False,
+    ):
+        del safe_gate  # External CUDA kernel currently does not use this flag.
+
+        # External CUDA kernel expects varlen metadata. Build fixed-length metadata when absent.
+        if cu_seqlens is None:
+            B, T = q.shape[0], q.shape[1]
+            cu_seqlens = prepare_uniform_cu_seqlens(B, T, q.device, torch.int32)
+        if chunk_indices is None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+
+        # csrc kernel writes dq_out/dk_out as bf16 (see __nv_bfloat16* casts in kernel).
+        dq_out = torch.empty_like(dq, dtype=torch.bfloat16)
+        dk_out = torch.empty_like(dk, dtype=torch.bfloat16)
+        db_out = torch.empty_like(db, dtype=torch.float)
+        dg_out = torch.empty_like(dg, dtype=torch.float)
+
+        tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
+        cuda_kda_bwd_intra(
+            q,
+            k,
+            g,
+            beta,
+            dAqk,
+            dAkk,
+            dq,
+            dk,
+            db,
+            dg,
+            cu_seqlens,
+            chunk_indices,
+            dq_out,
+            dk_out,
+            db_out,
+            dg_out,
+            tile_counter,
+            chunk_size,
+        )
+        return dq_out, dk_out, db_out, dg_out
+
+    # `chunk_bwd` imports `chunk_kda_bwd_intra` directly, so patching only
+    # `chunk_intra` is insufficient.
+    cula_chunk_intra.chunk_kda_bwd_intra = _patched_bwd_intra
+    cula_chunk_bwd.chunk_kda_bwd_intra = _patched_bwd_intra
+    _BWD_INTRA_PATCHED = True
 
 
 class ChunkKDAFunction(torch.autograd.Function):
@@ -133,6 +215,8 @@ class ChunkKDAFunction(torch.autograd.Function):
         do: torch.Tensor,
         dht: torch.Tensor,
     ):
+        _try_patch_bwd_intra_with_cuda_impl()
+
         (
             q,
             q_rstd,
