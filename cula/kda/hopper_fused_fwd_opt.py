@@ -24,7 +24,7 @@ from fla.ops.utils.index import prepare_chunk_indices
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 import cula.cudac as cula_cuda
-from cula.kda.cp_context import intra_card_cp_preprocess
+from cula.kda.cp_context import intra_card_cp_preprocess, is_dominant_long_seq
 from cula.kda.gate_l2norm_fused import gate_l2norm_fused_fwd
 from cula.kda.l2norm_qk_fused import l2norm_fwd_qk
 from cula.utils import _get_cache_buf, assert_hopper, get_device_sm_count, prepare_uniform_cu_seqlens
@@ -149,6 +149,20 @@ def _inference_forward(
 
     cp_seq_map = None
     raw_cu_seqlens_for_cp = None
+
+    def _dominant_long_seq_gate() -> bool:
+        if cu_seqlens is None:
+            return False
+        N_ = cu_seqlens.numel() - 1
+        if N_ <= 1 or N_ * num_v_heads <= 16:
+            return False  # falls under the main branch
+        if num_v_heads > 16 or packed_seq < 8192:
+            return False
+        cu_src = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
+        cu_list = cu_src.tolist()
+        seqlens = [cu_list[i + 1] - cu_list[i] for i in range(N_)]
+        return is_dominant_long_seq(seqlens, num_v_heads)
+
     cp_would_fire = auto_cp and (
         # Multi-seq varlen: CP only when grid is starved AND total T amortizes.
         (
@@ -157,6 +171,8 @@ def _inference_forward(
             and (cu_seqlens.numel() - 1) * num_v_heads <= 16
             and packed_seq >= 8192
         )
+        # Multi-seq dominant-seq exception.
+        or _dominant_long_seq_gate()
         or
         # Single sequence: per-H T thresholds matching _calc_cp_seqs.
         (

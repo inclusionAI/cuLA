@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+from cula.kda.cp_context import is_dominant_long_seq
 from cula.kda.hopper_fused_fwd import cula_kda_prefill as _basic
 from cula.kda.hopper_fused_fwd_opt import FUSED_GATE_L2NORM_TH_VARLEN
 from cula.kda.hopper_fused_fwd_opt import cula_kda_prefill_opt as _opt
@@ -19,7 +20,14 @@ def _should_use_opt(q: torch.Tensor, cu_seqlens: torch.Tensor | None) -> bool:
             packed_T = q.shape[1]
             if packed_T * H <= FUSED_GATE_L2NORM_TH_VARLEN:
                 return True
-            return N * H <= 16 and T >= 8192
+            if N * H <= 16 and T >= 8192:
+                return True
+            if H <= 16 and T >= 32768 + N - 1:
+                cu_list = cu_seqlens.tolist()
+                seqlens = [cu_list[i + 1] - cu_list[i] for i in range(N)]
+                if is_dominant_long_seq(seqlens, H):
+                    return True
+            return False
         # N == 1 falls through to the single-sequence logic below.
 
     # Fused gate+l2norm reliably wins at very small T*H even with B>1.

@@ -13,28 +13,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""bench_intracard_cp_sm90.py — CP-on vs CP-off for SM90 KDA prefill.
+"""bench_intracard_cp_sm90.py — CP-on vs CP-off (vs FLA baseline) for SM90 KDA prefill.
 
 Mirrors benchmarks/bench_intracard_cp.py (SM100 version) but for the Hopper
 (SM90) path:
 
     CP_on  : cula.kda.kda_prefill_hopper_auto
     CP_off : cula.kda.kda_prefill_hopper
+    FLA    : fla.ops.kda.chunk_kda (Triton baseline)
 
 Reports per-config `pred` (would CP fire?) and `n_sub` (CP-chunk count). When
-`pred=N` we still measure CP_on to confirm the bypass adds no regression.
+`pred=N` we still measure CP_on to confirm the bypass adds no regression. The
+`CP_on/FLA` column shows the speedup of cuLA's optimized (CP-on) kernel over
+the FLA Triton baseline.
 
 Usage:
   python benchmarks/bench_intracard_cp_sm90.py [--ncu] [--sanitizer]
 """
 
 import argparse
+import os
 import pathlib
 import sys
 
 import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))
+os.environ.setdefault("FLA_INTRACARD_CP", "1")
+
+from fla.ops.common.intracard_cp import compute_subseq_len, prepare_subseq_cu_seqlens
+from fla.ops.kda import chunk_kda as fla_chunk_kda
 
 from benchmarks.utils import (
     SEED,
@@ -45,7 +54,7 @@ from benchmarks.utils import (
 )
 from cula.kda import kda_prefill_hopper, kda_prefill_hopper_auto
 from cula.kda.auto_route import _should_use_opt
-from cula.kda.cp_context import _calc_cp_seqs
+from cula.kda.cp_context import _calc_cp_seqs, is_dominant_long_seq
 from cula.kda.hopper_fused_fwd_opt import FUSED_GATE_L2NORM_VARLEN_AVG_SEQ, _fused_gate_l2norm_threshold
 from cula.utils import get_device_sm_count
 
@@ -126,6 +135,29 @@ def run_call(q, k, v, g, beta, scale, A_log, dt_bias, cu_seqlens, lower_bound, *
     return out
 
 
+def run_fla_call(q, k, v, g, beta, scale, A_log, dt_bias, cu_seqlens, lower_bound, *, return_state=False):
+    # FLA's chunk_kda fuses A_log + dt_bias internally when use_gate_in_kernel=True; pass them via kwargs.
+    # Wrap in inference_mode so FLA's IntraCardCPBackend gate (intracard.py) activates.
+    with torch.inference_mode():
+        return fla_chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=None,
+            output_final_state=return_state,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            safe_gate=False,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            A_log=A_log,
+            dt_bias=dt_bias,
+        )
+
+
 def accuracy(ref, got):
     if ref is None or got is None:
         return float("nan"), float("nan")
@@ -139,7 +171,9 @@ def predict_cp(seq_lens, H, num_sms, device):
     packed_seq = sum(seq_lens)
 
     if raw_batch > 1:
-        cp_wf = raw_batch * H <= 16 and packed_seq >= 8192
+        cp_wf = (raw_batch * H <= 16 and packed_seq >= 8192) or (
+            packed_seq >= 8192 and H <= 16 and is_dominant_long_seq(seq_lens, H)
+        )
     else:
         cp_wf = (H <= 8 and packed_seq >= 4096) or (H <= 16 and packed_seq >= 4096) or (H <= 32 and packed_seq >= 16384)
     if not cp_wf:
@@ -152,6 +186,22 @@ def predict_cp(seq_lens, H, num_sms, device):
     if n_sub == raw_batch:  # no-op split
         return False, 0
     return True, n_sub
+
+
+def predict_fla_cp(seq_lens, H, num_sms):
+    """Mirror fla.ops.common.intracard_cp.intracard_fwd_h gating to predict
+    whether FLA's intracard CP fires and how many sub-sequences result.
+    HV (num_v_heads) maps to H here."""
+    cu = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
+    seq_lens_t = torch.diff(cu)
+    max_seq_len = int(seq_lens_t.max().item())
+    subseq_len = compute_subseq_len(max_seq_len, num_sms, H, BT)
+    if (seq_lens_t < 2 * subseq_len).all():
+        return False, 0
+    _, split_info, total_subseqs = prepare_subseq_cu_seqlens(cu, subseq_len, BT)
+    if not split_info:
+        return False, 0
+    return True, total_subseqs
 
 
 def predict_fused_all_pre(q, v, cu_seqlens_for_opt, *, cu_seqlens_is_none, use_gate_in_kernel, use_qk_l2norm_in_kernel):
@@ -177,28 +227,30 @@ def predict_fused_all_pre(q, v, cu_seqlens_for_opt, *, cu_seqlens_is_none, use_g
 # ============================================================
 # Benchmark
 # ============================================================
-SEP = "  " + "─" * 138
+SEP = "  " + "─" * 180
 ROW_HEADER = (
-    f"  {'config':<24s} {'T':>7s}  {'pred':>4s} {'sub':>4s} {'fused_pre':>5s}"
+    f"  {'config':<24s} {'T':>7s}  {'pred':>4s} {'sub':>4s} {'fla_cp':>6s} {'fla_sub':>7s} {'fused_pre':>5s}"
     f"  │  {'o max/mean':>17s}  {'ht max/mean':>17s}"
-    f"  │  {'CP_off(ms)':>10s}  {'CP_on(ms)':>10s}  {'Speedup':>8s}"
+    f"  │  {'FLA(ms)':>9s}  {'CP_off(ms)':>10s}  {'CP_on(ms)':>10s}  {'CP_on/off':>8s}  {'CP_on/FLA':>9s}"
 )
 
 
 def _format_row(r):
     pred_s = "Y" if r["pred"] else "N"
+    fla_pred_s = "Y" if r["fla_pred"] else "N"
     fused_s = "Y" if r["fused_all_pre"] else "N"
     return (
-        f"  {r['tag']:<24s} {r['total_T']:>7d}     {pred_s}  {r['n_sub']:>4d}     {fused_s}"
+        f"  {r['tag']:<24s} {r['total_T']:>7d}     {pred_s}  {r['n_sub']:>4d}      {fla_pred_s}    {r['fla_n_sub']:>4d}     {fused_s}"
         f"  │  {r['o_max']:>7.1e}/{r['o_mean']:>7.1e}  {r['ht_max']:>7.1e}/{r['ht_mean']:>7.1e}"
-        f"  │  {r['ms_off']:>10.4f}  {r['ms_on']:>10.4f}  {r['speedup']:>7.2f}x"
+        f"  │  {r['ms_fla']:>9.4f}  {r['ms_off']:>10.4f}  {r['ms_on']:>10.4f}"
+        f"  {r['speedup']:>7.2f}x  {r['speedup_vs_fla']:>8.2f}x"
     )
 
 
 def bench_cp(h_values, configs):
     print("\n" + "=" * 110)
     print("                       BENCHMARK REPORT: Intracard CP (SM90)")
-    print("                       CP-on (kda_prefill_hopper_auto) vs CP-off (kda_prefill_hopper)")
+    print("                       CP-on (kda_prefill_hopper_auto) vs CP-off (kda_prefill_hopper) vs FLA (chunk_kda)")
     print(f"                       D={D}  dtype=bf16  safe_gate=True")
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
@@ -228,6 +280,7 @@ def bench_cp(h_values, configs):
             scale, lower_bound = inputs["scale"], inputs["lower_bound"]
 
             pred, n_sub = predict_cp(seq_lens, H, num_sms, device)
+            fla_pred, fla_n_sub = predict_fla_cp(seq_lens, H, num_sms)
             fused_all_pre = predict_fused_all_pre(
                 q,
                 v,
@@ -260,8 +313,15 @@ def bench_cp(h_values, configs):
                 ms_off = time_cuda_fn(lambda: run_call(**common, enable_cp=False), *_bench_warmup_iters())
                 ms_on = time_cuda_fn(lambda: run_call(**common, enable_cp=True), *_bench_warmup_iters())
                 speedup = ms_off / ms_on if ms_on > 0 else float("inf")
+                try:
+                    ms_fla = time_cuda_fn(lambda: run_fla_call(**common), *_bench_warmup_iters())
+                    speedup_vs_fla = ms_fla / ms_on if ms_on > 0 else float("inf")
+                except Exception:
+                    ms_fla = float("nan")
+                    speedup_vs_fla = float("nan")
             except torch.cuda.OutOfMemoryError:
                 ms_off = ms_on = speedup = float("nan")
+                ms_fla = speedup_vs_fla = float("nan")
                 o_max = o_mean = ht_max = ht_mean = float("nan")
 
             row = {
@@ -270,10 +330,14 @@ def bench_cp(h_values, configs):
                 "total_T": total_T,
                 "pred": pred,
                 "n_sub": n_sub,
+                "fla_pred": fla_pred,
+                "fla_n_sub": fla_n_sub,
                 "fused_all_pre": fused_all_pre,
                 "ms_off": ms_off,
                 "ms_on": ms_on,
+                "ms_fla": ms_fla,
                 "speedup": speedup,
+                "speedup_vs_fla": speedup_vs_fla,
                 "o_max": o_max,
                 "o_mean": o_mean,
                 "ht_max": ht_max,
@@ -322,6 +386,28 @@ def print_report(results, h_values):
                 f"  CP bypassed  ({len(bypassed)} configs): "
                 f"mean overhead={sum(ratios) / len(ratios):.3f}x  max={max(ratios):.3f}x  "
                 f"(1.00 = no regression)"
+            )
+
+    # cuLA (CP-on) vs FLA speedups
+    fla_speedups = [r["speedup_vs_fla"] for r in results if r["speedup_vs_fla"] == r["speedup_vs_fla"]]
+    if fla_speedups:
+        geo = 1.0
+        for s in fla_speedups:
+            geo *= s
+        geo = geo ** (1 / len(fla_speedups))
+        print(
+            f"  cuLA (CP-on) vs FLA  ({len(fla_speedups)} configs): "
+            f"geo-mean={geo:.2f}x  best={max(fla_speedups):.2f}x  worst={min(fla_speedups):.2f}x"
+        )
+        tri_fla = [r["speedup_vs_fla"] for r in triggered if r["speedup_vs_fla"] == r["speedup_vs_fla"]]
+        if tri_fla:
+            geo_t = 1.0
+            for s in tri_fla:
+                geo_t *= s
+            geo_t = geo_t ** (1 / len(tri_fla))
+            print(
+                f"    └─ CP-triggered subset ({len(tri_fla)} configs): "
+                f"geo-mean={geo_t:.2f}x  best={max(tri_fla):.2f}x  worst={min(tri_fla):.2f}x"
             )
 
     o_maxes = [r["o_max"] for r in results if r["o_max"] == r["o_max"]]

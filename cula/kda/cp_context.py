@@ -24,6 +24,31 @@ _CP_SEQS_CACHE: dict = {}
 _SLOT_MAP_CACHE: dict = {}
 
 
+DOMINANT_LONG_SEQ_MIN_LEN = 32768
+DOMINANT_LONG_SEQ_MAX_H = 16
+
+
+def is_dominant_long_seq(
+    seqlens: list[int],
+    H: int,
+    min_long_len: int = DOMINANT_LONG_SEQ_MIN_LEN,
+    max_H: int = DOMINANT_LONG_SEQ_MAX_H,
+) -> bool:
+    if not seqlens or max_H < H:
+        return False
+    longest = max(seqlens)
+    if longest < min_long_len:
+        return False
+    return 2 * longest >= sum(seqlens)
+
+
+def _seqlens_from_cu(cu_seqlens: torch.Tensor, cu_seqlens_cpu: torch.Tensor | None = None) -> list[int]:
+    """Return per-seq lengths from a cu_seqlens tensor (CPU sync if no CPU copy)."""
+    src = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
+    cu_list = src.tolist()
+    return [cu_list[i + 1] - cu_list[i] for i in range(len(cu_list) - 1)]
+
+
 def _get_slot_map(cp_cu_seqlens: torch.Tensor, T: int, chunk_size: int) -> torch.Tensor:
     key = (id(cp_cu_seqlens), T, chunk_size)
     hit = _SLOT_MAP_CACHE.get(key)
@@ -129,11 +154,12 @@ def _calc_cp_seqs(
     elif use_cp and raw_batch_size > 1:
         T_packed = sum(seqlens)
         native_grid = raw_batch_size * H
+        dominant_exception = is_dominant_long_seq(seqlens, H)
 
         unaligned = any(s % chunk_size != 0 for s in seqlens[:-1]) or (raw_cu_seqlens_list[-1] % chunk_size != 0)
         if unaligned:
             use_cp = False
-        elif native_grid > 16:
+        elif native_grid > 16 and not dominant_exception:
             # Native grid already big enough that CP's lift is marginal.
             use_cp = False
         elif T_packed * H <= 32768:
