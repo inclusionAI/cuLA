@@ -11,11 +11,20 @@ reduce-over-K) mirrors the production vk kernel for apples-to-apples comparison.
 Chunkwise math (state S0[v,k], decay-first; matches the recurrent op):
     g_t[k]  = exp(-exp(A_log) * softplus(a_t[k] + dt_bias[k]))    # per channel
     b_t[k]  = prod_{i<=t} g_i[k]                                  # cumulative decay
-    kdec_t  = k_norm_t * b_t ; kinv_t = k_norm_t / b_t ; qdec_t = q_scaled_t * b_t
-    A[t,i]  = <kdec_t, kinv_i> (i<t)       P[t,i] = <qdec_t, kinv_i> (i<=t)
+    kdec_t  = k_norm_t * b_t ;  qdec_t = q_scaled_t * b_t
+    r(t,i)  = b_t / b_i = prod_{i<j<=t} g_j <= 1                  # decay ratio
+    A[t,i]  = sum_k kn_t kn_i r(t,i) (i<t)   P[t,i] = sum_k qn_t kn_i r(t,i) (i<=t)
     u_t[v]  = beta_t * (v_t[v] - (S0 @ kdec_t)[v] - sum_{i<t} A[t,i] u_i[v])
     o_t[v]  = (S0 @ qdec_t)[v] + sum_{i<=t} P[t,i] u_i[v]
-    S_T[v,k]= b_{T-1}[k] * (S0[v,k] + sum_i u_i[v] kinv_i[k])     # full accept
+    ksuf_t  = k_norm_t * prod_{j>t} g_j                           # suffix-decayed key
+    S_T[v,k]= b_{T-1}[k] * S0[v,k] + sum_i u_i[v] ksuf_i[k]       # full accept
+
+Numerical form: every decay factor is an ORDERED product bounded by 1 — there is
+no division by the cumulative gate product (the earlier kinv_t = k/b_t form
+overflowed to inf/NaN once b_t underflowed, which unbounded softplus gates hit on
+real activations). This makes the op valid for both softplus and safe-gate models.
+The scratch stores raw (u_i, k_i, g_i) per token — the same triplet as ReplaySSM's
+(d, k, g) ring — and the flush rebuilds S_m with descending suffix products.
 """
 
 import logging
@@ -61,8 +70,9 @@ def _select_kvb_tile_v(V, N, HV):
     return 8
 
 
-# flush kernel: read the compact u-buffer from verify, rank-m update over the first m accepted tokens:
-#   S_m[v,k] = b_m[k] * (S0[v,k] + sum_{i<m} u_i[v] * kinv_i[k])
+# flush kernel: read the compact (u, k, g) scratch from verify, rank-m update over
+# the first m accepted tokens (descending suffix products, all factors <= 1):
+#   S_m[v,k] = prod_{j<m} g_j[k] * S0[v,k] + sum_{i<m} u_i[v] * k_i[k] * prod_{i<j<m} g_j[k]
 # Pure Phase-D (no gating/l2norm/reduce/solve). lane=K + vk, grid/layout match verify.
 # m (accept length) is per-request and read at runtime from m_buf[i_n], so this compiles
 # exactly one kernel per (shape, BV) instead of one per accept-length value.
@@ -70,8 +80,8 @@ def _select_kvb_tile_v(V, N, HV):
 def kda_flush_kvbuffer_vk_kernel(
     h0_source: cute.Tensor,  # [pool*HV, V, K] fp32
     u_buf: cute.Tensor,  # [N, T, HV, V] fp32
-    kinv_buf: cute.Tensor,  # [N, T, HV, K] fp32
-    b_buf: cute.Tensor,  # [N, T, HV, K] fp32
+    kinv_buf: cute.Tensor,  # [N, T, HV, K] fp32 raw normalized key k_t
+    b_buf: cute.Tensor,  # [N, T, HV, K] fp32 per-step gate g_t
     h0_indices: cute.Tensor,
     m_buf: cute.Tensor,  # [N] int32 per-request accept length (first m tokens)
     vec_size: cutlass.Constexpr[int],
@@ -96,38 +106,41 @@ def kda_flush_kvbuffer_vk_kernel(
         flat_state_idx = cache_idx * HV + i_hv
         m_n = m_buf[i_n]  # this request's accept length (runtime; 1 <= m_n <= T)
 
-        r_h = cute.make_rmem_tensor(cute.make_layout((BV * vec_size,), stride=(1,)), cutlass.Float32)
+        r_acc = cute.make_rmem_tensor(cute.make_layout((BV * vec_size,), stride=(1,)), cutlass.Float32)
         r_h4 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
-        r_bm = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
-        r_kinv = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+        r_suf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+        r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+        r_g = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
 
-        # load S0 (this lane's vec_size K channels x BV v-cols)
+        # Overflow-safe rebuild (scratch holds raw per-token k and gate g):
+        #   S_m = prod_{j<m} g_j * S0 + sum_{i<m} u_i k_i * suf(i),
+        #   suf(i) = prod_{i<j<m} g_j, accumulated descending so every factor
+        #   stays <= 1 (no division by the cumulative gate product).
+        for c in cutlass.range_constexpr(vec_size):
+            r_suf[c] = cutlass.Float32(1.0)
+        for j in cutlass.range_constexpr(BV * vec_size):
+            r_acc[j] = cutlass.Float32(0.0)
+        for tt in cutlass.range_constexpr(T):
+            i_i = T - 1 - tt
+            if i_i < m_n:
+                k_tile = cute.local_tile(kinv_buf, (1, 1, 1, vec_size), (i_n, i_i, i_hv, lane))
+                cute.autovec_copy(k_tile, r_k)
+                g_tile = cute.local_tile(b_buf, (1, 1, 1, vec_size), (i_n, i_i, i_hv, lane))
+                cute.autovec_copy(g_tile, r_g)
+                for vv in cutlass.range_constexpr(BV):
+                    uval = cutlass.Float32(u_buf[i_n, i_i, i_hv, i_v * BV + vv])
+                    for c in cutlass.range_constexpr(vec_size):
+                        r_acc[vv * vec_size + c] += uval * r_k[c] * r_suf[c]
+                for c in cutlass.range_constexpr(vec_size):
+                    r_suf[c] = r_suf[c] * r_g[c]
+
+        # S_m = prefix * S0 + acc, write back (contiguous float4)
         for vv in cutlass.range_constexpr(BV):
             v_global = i_v * BV + vv
             h_tile = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_global, lane))
             cute.autovec_copy(h_tile, r_h4)
             for c in cutlass.range_constexpr(vec_size):
-                r_h[vv * vec_size + c] = r_h4[c]
-
-        # b_m: cumulative decay at token m-1 (this lane's channels)
-        bm_tile = cute.local_tile(b_buf, (1, 1, 1, vec_size), (i_n, m_n - 1, i_hv, lane))
-        cute.autovec_copy(bm_tile, r_bm)
-
-        # accumulate sum_{i<m} u_i[v] * kinv_i[k]: static-unroll T, runtime-mask i_i < m_n
-        for i_i in cutlass.range_constexpr(T):
-            if i_i < m_n:
-                kinv_tile = cute.local_tile(kinv_buf, (1, 1, 1, vec_size), (i_n, i_i, i_hv, lane))
-                cute.autovec_copy(kinv_tile, r_kinv)
-                for vv in cutlass.range_constexpr(BV):
-                    uval = cutlass.Float32(u_buf[i_n, i_i, i_hv, i_v * BV + vv])
-                    for c in cutlass.range_constexpr(vec_size):
-                        r_h[vv * vec_size + c] += uval * r_kinv[c]
-
-        # S_m = b_m * (S0 + sum ...), write back (contiguous float4)
-        for vv in cutlass.range_constexpr(BV):
-            v_global = i_v * BV + vv
-            for c in cutlass.range_constexpr(vec_size):
-                r_h4[c] = r_bm[c] * r_h[vv * vec_size + c]
+                r_h4[c] = r_suf[c] * r_h4[c] + r_acc[vv * vec_size + c]
             h_out = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_global, lane))
             cute.autovec_copy(r_h4, h_out)
 
@@ -284,34 +297,38 @@ def kda_flush_kvbuffer_vk_ml_kernel(
         flat_state_idx = cache_idx * HV + i_hv
         m_n = m_buf[i_n]
 
-        r_h = cute.make_rmem_tensor(cute.make_layout((BV * vec_size,), stride=(1,)), cutlass.Float32)
+        r_acc = cute.make_rmem_tensor(cute.make_layout((BV * vec_size,), stride=(1,)), cutlass.Float32)
         r_h4 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
-        r_bm = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
-        r_kinv = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+        r_suf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+        r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+        r_g = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+
+        # Overflow-safe rebuild via descending suffix products (see single-layer
+        # flush kernel); scratch holds raw per-token k and gate g.
+        for c in cutlass.range_constexpr(vec_size):
+            r_suf[c] = cutlass.Float32(1.0)
+        for j in cutlass.range_constexpr(BV * vec_size):
+            r_acc[j] = cutlass.Float32(0.0)
+        for tt in cutlass.range_constexpr(T):
+            i_i = T - 1 - tt
+            if i_i < m_n:
+                k_tile = cute.local_tile(kinv_buf, (1, 1, 1, 1, vec_size), (i_l, i_n, i_i, i_hv, lane))
+                cute.autovec_copy(k_tile, r_k)
+                g_tile = cute.local_tile(b_buf, (1, 1, 1, 1, vec_size), (i_l, i_n, i_i, i_hv, lane))
+                cute.autovec_copy(g_tile, r_g)
+                for vv in cutlass.range_constexpr(BV):
+                    uval = cutlass.Float32(u_buf[i_l, i_n, i_i, i_hv, i_v * BV + vv])
+                    for c in cutlass.range_constexpr(vec_size):
+                        r_acc[vv * vec_size + c] += uval * r_k[c] * r_suf[c]
+                for c in cutlass.range_constexpr(vec_size):
+                    r_suf[c] = r_suf[c] * r_g[c]
 
         for vv in cutlass.range_constexpr(BV):
             v_global = i_v * BV + vv
             h_tile = cute.local_tile(h0_source, (1, 1, 1, vec_size), (i_l, flat_state_idx, v_global, lane))
             cute.autovec_copy(h_tile, r_h4)
             for c in cutlass.range_constexpr(vec_size):
-                r_h[vv * vec_size + c] = r_h4[c]
-
-        bm_tile = cute.local_tile(b_buf, (1, 1, 1, 1, vec_size), (i_l, i_n, m_n - 1, i_hv, lane))
-        cute.autovec_copy(bm_tile, r_bm)
-
-        for i_i in cutlass.range_constexpr(T):
-            if i_i < m_n:
-                kinv_tile = cute.local_tile(kinv_buf, (1, 1, 1, 1, vec_size), (i_l, i_n, i_i, i_hv, lane))
-                cute.autovec_copy(kinv_tile, r_kinv)
-                for vv in cutlass.range_constexpr(BV):
-                    uval = cutlass.Float32(u_buf[i_l, i_n, i_i, i_hv, i_v * BV + vv])
-                    for c in cutlass.range_constexpr(vec_size):
-                        r_h[vv * vec_size + c] += uval * r_kinv[c]
-
-        for vv in cutlass.range_constexpr(BV):
-            v_global = i_v * BV + vv
-            for c in cutlass.range_constexpr(vec_size):
-                r_h4[c] = r_bm[c] * r_h[vv * vec_size + c]
+                r_h4[c] = r_suf[c] * r_h4[c] + r_acc[vv * vec_size + c]
             h_out = cute.local_tile(h0_source, (1, 1, 1, vec_size), (i_l, flat_state_idx, v_global, lane))
             cute.autovec_copy(r_h4, h_out)
 
@@ -455,8 +472,8 @@ def kda_mtp_tp_kvbuffer_kernel(
     o: cute.Tensor,
     h0_indices: cute.Tensor,
     u_buf: cute.Tensor,  # [N, T, HV, V] fp32
-    kinv_buf: cute.Tensor,  # [N, T, HV, K] fp32
-    b_buf: cute.Tensor,  # [N, T, HV, K] fp32
+    kinv_buf: cute.Tensor,  # [N, T, HV, K] fp32 raw normalized key k_t
+    b_buf: cute.Tensor,  # [N, T, HV, K] fp32 per-step gate g_t
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
@@ -497,11 +514,11 @@ def kda_mtp_tp_kvbuffer_kernel(
     # SMEM. sKdec/sQdec double as staging for k_norm/q_scaled between Stage 1 and 2.
     smem = cutlass.utils.SmemAllocator()
     sKdec = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
-    sKinv = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
+    sKn = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
     sQdec = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
     sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
+    sBrun = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
     sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T,)), 16)
-    sBlast = smem.allocate_tensor(cutlass.Float32, cute.make_layout((K,)), 16)  # b_{T-1}[k]
     sA = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, T), stride=(T, 1)), 16)
     sP = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, T), stride=(T, 1)), 16)
     sW = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, T), stride=(T, 1)), 16)
@@ -581,21 +598,25 @@ def kda_mtp_tp_kvbuffer_kernel(
                     )
         cute.arch.barrier()
 
-        # ---- Stage 2: K-parallel prefix-product scan (thread = one channel) ----
+        # ---- Stage 2: K-parallel prefix-product scan (thread = one channel).
+        # Overflow-safe form: no division by the running gate product. sKn keeps
+        # the raw normalized key (for ratio-chain scoring and the suffix-product
+        # state update), sBrun the prefix product b_run(t) <= 1, sKdec the
+        # prefix-decayed key kn*b_run(t). The scratch stores (k, g) raw so the
+        # flush can rebuild any rank via bounded suffix products. ----
         kc = tidx  # requires K == 128 == block size
         b_run_s = cutlass.Float32(1.0)
         for i_t in cutlass.range_constexpr(T):
             kn = sKdec[i_t, kc]
-            b_run_s = b_run_s * sG[i_t, kc]
-            kinv_v = kn / b_run_s
+            g_t = sG[i_t, kc]
+            b_run_s = b_run_s * g_t
             sKdec[i_t, kc] = kn * b_run_s
-            sKinv[i_t, kc] = kinv_v
-            sQdec[i_t, kc] = sQdec[i_t, kc] * b_run_s
+            sKn[i_t, kc] = kn
+            sBrun[i_t, kc] = b_run_s
             if cutlass.const_expr(write_ubuf):
                 if i_v == 0:
-                    kinv_buf[i_n, i_t, i_hv, kc] = kinv_v
-                    b_buf[i_n, i_t, i_hv, kc] = b_run_s
-        sBlast[kc] = b_run_s
+                    kinv_buf[i_n, i_t, i_hv, kc] = kn  # raw key (was k/b_run)
+                    b_buf[i_n, i_t, i_hv, kc] = g_t  # per-step gate (was b_run)
         cute.arch.barrier()
 
         # ---- Stage 3: (t,i)-parallel A/P, T^2 pairs round-robined over 4 warps,
@@ -608,7 +629,12 @@ def kda_mtp_tp_kvbuffer_kernel(
                 if warp_idx == p_ctr % num_warps:
                     s = cutlass.Float32(0.0)
                     for c in cutlass.range_constexpr(vec_size):
-                        s += sKdec[i_t, k_start + c] * sKinv[i_i, k_start + c]
+                        # decay ratio b_run(t)/b_run(i) = prod_{i<j<=t} g_j <= 1,
+                        # accumulated as an ordered product (no division).
+                        ratio = cutlass.Float32(1.0)
+                        for j in cutlass.range_constexpr(i_t - i_i):
+                            ratio = ratio * sG[i_i + 1 + j, k_start + c]
+                        s += sKn[i_t, k_start + c] * sKn[i_i, k_start + c] * ratio
                     r_red[p_ctr // num_warps] = s
                 p_ctr += 1
         for i_t in cutlass.range_constexpr(T):
@@ -616,7 +642,10 @@ def kda_mtp_tp_kvbuffer_kernel(
                 if warp_idx == p_ctr % num_warps:
                     s = cutlass.Float32(0.0)
                     for c in cutlass.range_constexpr(vec_size):
-                        s += sQdec[i_t, k_start + c] * sKinv[i_i, k_start + c]
+                        ratio = cutlass.Float32(1.0)
+                        for j in cutlass.range_constexpr(i_t - i_i):
+                            ratio = ratio * sG[i_i + 1 + j, k_start + c]
+                        s += sQdec[i_t, k_start + c] * sKn[i_i, k_start + c] * ratio
                     r_red[p_ctr // num_warps] = s
                 p_ctr += 1
         for off in [16, 8, 4, 2, 1]:
@@ -689,7 +718,7 @@ def kda_mtp_tp_kvbuffer_kernel(
                     for i_t in cutlass.range_constexpr(T):
                         s = cutlass.Float32(0.0)
                         for c in cutlass.range_constexpr(vec_size):
-                            s += r_h[r, c] * sQdec[i_t, k_start + c]
+                            s += r_h[r, c] * sQdec[i_t, k_start + c] * sBrun[i_t, k_start + c]
                         r_part[r, i_t] = s
                 for off in [16, 8, 4, 2, 1]:
                     for r in cutlass.range_constexpr(ilp_rows):
@@ -704,14 +733,19 @@ def kda_mtp_tp_kvbuffer_kernel(
                             ov += sP[i_t, i_i] * r_u[r, i_i]
                         if lane_id == 0:
                             o[(i_n, i_t, i_hv, v_base + r)] = cutlass.BFloat16(ov)
-            # final state S_T[v,k] = b_{T-1}[k]*(S0[v,k] + sum_t u_t kinv_t[k])
+            # final state S_T[v,k] = b_{T-1}[k]*S0[v,k] + sum_t u_t k_t[k]*suf(t)[k],
+            # suf(t) = prod_{j>t} g_j accumulated descending (bounded <= 1; the
+            # running product ends as the full prefix for the S0 term).
             if cutlass.const_expr(not disable_state_update):
                 for r in cutlass.range_constexpr(ilp_rows):
                     for c in cutlass.range_constexpr(vec_size):
-                        acc = r_h[r, c]
-                        for i_t in cutlass.range_constexpr(T):
-                            acc += r_u[r, i_t] * sKinv[i_t, k_start + c]
-                        r_tmp[c] = sBlast[k_start + c] * acc
+                        acc = cutlass.Float32(0.0)
+                        suf = cutlass.Float32(1.0)
+                        for tt in cutlass.range_constexpr(T):
+                            i_t = T - 1 - tt
+                            acc += r_u[r, i_t] * sKn[i_t, k_start + c] * suf
+                            suf = suf * sG[i_t, k_start + c]
+                        r_tmp[c] = suf * r_h[r, c] + acc
                     h_out = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_base + r, lane_id))
                     cute.autovec_copy(r_tmp, h_out)
 
@@ -756,9 +790,8 @@ def run_kda_mtp_tp_kvbuffer_kernel(
     num_v_tiles = cute.ceil_div(V, tile_v)
     grid_size = n_indices * HV * num_v_tiles
     smem_bytes = (
-        4 * 4 * T * (K + 8)  # sKdec/sKinv/sQdec/sG
+        5 * 4 * T * (K + 8)  # sKdec/sKn/sQdec/sG/sBrun
         + 4 * T  # sBeta
-        + 4 * K  # sBlast
         + 3 * 4 * T * T  # sA/sP/sW
         + 256  # alignment slack
     )
@@ -1427,7 +1460,8 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
     smem = cutlass.utils.SmemAllocator()
     # stacked feature maps: rows 0..7 = kdec(tokens, pad-zeroed), rows 8..15 = qdec
     sKQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((2 * BT, K), stride=(K + 4, 1)), 16)
-    sKinv = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT, K), stride=(K + 8, 1)), 16)
+    # suffix-decayed keys ksuf_t = kn_t * prod_{j>t} g_j (bounded; replaces kinv)
+    sKsuf = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT, K), stride=(K + 8, 1)), 16)
     sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT, K), stride=(K + 8, 1)), 16)
     sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT,)), 16)
     sBlast = smem.allocate_tensor(cutlass.Float32, cute.make_layout((K,)), 16)
@@ -1446,6 +1480,9 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
     r_qf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_kf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_s = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    # P2a pair partials: ceil(2*T*T/4) per warp
+    ppw_cg: cutlass.Constexpr[int] = (2 * T * T + num_warps - 1) // num_warps
+    r_red = cute.make_rmem_tensor(cute.make_layout((ppw_cg,), stride=(1,)), cutlass.Float32)
 
     if cache_idx >= 0:
         k_start = lane_id * vec_size
@@ -1506,67 +1543,87 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
         for rp in cutlass.range_constexpr(BT - T):
             sKQ[T + rp, tidx] = cutlass.Float32(0.0)
             sKQ[BT + T + rp, tidx] = cutlass.Float32(0.0)
-            sKinv[T + rp, tidx] = cutlass.Float32(0.0)
+            sKsuf[T + rp, tidx] = cutlass.Float32(0.0)
         if tidx >= T:
             if tidx < BT:
                 sBeta[tidx] = cutlass.Float32(0.0)
         cute.arch.barrier()
 
-        # ---- P2: K-parallel prefix-product scan (thread = channel kc) ----
-        kc = tidx  # requires K == 128 == block size
-        bcum = cutlass.Float32(1.0)
+        # ---- P2a: T*T scores in plain fp32 with bounded decay-ratio chains.
+        # Runs BEFORE the prefix scaling so sKQ still holds raw kn/q_scaled:
+        #   A[t,i] = sum_k kn_t kn_i * r(t,i),  P[t,i] = sum_k qn_t kn_i * r(t,i),
+        #   r(t,i) = prod_{i<j<=t} g_j <= 1 (ordered product, no division).
+        # T*T pairs round-robined over 4 warps, one butterfly per warp
+        # (vec_size channels per lane, 32 lanes = K). ----
+        for j in cutlass.range_constexpr(ppw_cg):
+            r_red[j] = cutlass.Float32(0.0)
+        p_ctr = 0
         for i_t in cutlass.range_constexpr(T):
-            bcum = bcum * sG[i_t, kc]
-            binv = cutlass.Float32(1.0) / bcum
-            kn = sKQ[i_t, kc]
-            kinv_v = kn * binv
-            sKQ[i_t, kc] = kn * bcum
-            sKQ[BT + i_t, kc] = sKQ[BT + i_t, kc] * bcum
-            sKinv[i_t, kc] = kinv_v
-            if cutlass.const_expr(write_ubuf):
-                if i_v == 0:
-                    kinv_buf[i_n, i_t, i_hv, kc] = kinv_v
-                    b_buf[i_n, i_t, i_hv, kc] = bcum
-        sBlast[kc] = bcum
+            for i_i in cutlass.range_constexpr(i_t):  # A[t,i], i<t
+                if warp_idx == p_ctr % num_warps:
+                    s = cutlass.Float32(0.0)
+                    for c in cutlass.range_constexpr(vec_size):
+                        ratio = cutlass.Float32(1.0)
+                        for j in cutlass.range_constexpr(i_t - i_i):
+                            ratio = ratio * sG[i_i + 1 + j, k_start + c]
+                        s += sKQ[i_t, k_start + c] * sKQ[i_i, k_start + c] * ratio
+                    r_red[p_ctr // num_warps] = s
+                p_ctr += 1
+        for i_t in cutlass.range_constexpr(T):
+            for i_i in cutlass.range_constexpr(i_t + 1):  # P[t,i], i<=t
+                if warp_idx == p_ctr % num_warps:
+                    s = cutlass.Float32(0.0)
+                    for c in cutlass.range_constexpr(vec_size):
+                        ratio = cutlass.Float32(1.0)
+                        for j in cutlass.range_constexpr(i_t - i_i):
+                            ratio = ratio * sG[i_i + 1 + j, k_start + c]
+                        s += sKQ[BT + i_t, k_start + c] * sKQ[i_i, k_start + c] * ratio
+                    r_red[p_ctr // num_warps] = s
+                p_ctr += 1
+        for off in [16, 8, 4, 2, 1]:
+            for j in cutlass.range_constexpr(ppw_cg):
+                r_red[j] = r_red[j] + cute.arch.shuffle_sync_bfly(r_red[j], offset=off, mask=-1, mask_and_clamp=31)
+        # zero-init L/P (covers padding rows), then scatter the pair results
+        if tidx < BT * BT:
+            sL[tidx // BT, tidx % BT] = cutlass.Float32(0.0)
+            sP[tidx // BT, tidx % BT] = cutlass.Float32(0.0)
+        cute.arch.barrier()
+        p_ctr = 0
+        for i_t in cutlass.range_constexpr(T):
+            for i_i in cutlass.range_constexpr(i_t):
+                if warp_idx == p_ctr % num_warps:
+                    if lane_id == 0:
+                        sL[i_t, i_i] = -sBeta[i_t] * r_red[p_ctr // num_warps]
+                p_ctr += 1
+        for i_t in cutlass.range_constexpr(T):
+            for i_i in cutlass.range_constexpr(i_t + 1):
+                if warp_idx == p_ctr % num_warps:
+                    if lane_id == 0:
+                        sP[i_t, i_i] = r_red[p_ctr // num_warps]
+                p_ctr += 1
         cute.arch.barrier()
 
-        # ---- P3: stacked [kdec; qdec] @ kinv^T — 16 k-slabs, 4 per warp, partials in SMEM ----
-        c0 = cutlass.Float32(0.0)
-        c1 = cutlass.Float32(0.0)
-        c2 = cutlass.Float32(0.0)
-        c3 = cutlass.Float32(0.0)
-        for ks in cutlass.range_constexpr(K // 8 // num_warps):
-            kb = (warp_idx * (K // 8 // num_warps) + ks) * 8
-            a0 = sKQ[gid, kb + tig]
-            a1 = sKQ[gid + 8, kb + tig]
-            a2 = sKQ[gid, kb + tig + 4]
-            a3 = sKQ[gid + 8, kb + tig + 4]
-            b0 = sKinv[gid, kb + tig]
-            b1 = sKinv[gid, kb + tig + 4]
-            c0, c1, c2, c3 = _mma_m16n8k8_3xtf32(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3)
-        for fi in cutlass.range_constexpr(4):
-            row = gid + (fi // 2) * 8
-            col = 2 * tig + (fi % 2)
-            cv = c0
-            if cutlass.const_expr(fi == 1):
-                cv = c1
-            if cutlass.const_expr(fi == 2):
-                cv = c2
-            if cutlass.const_expr(fi == 3):
-                cv = c3
-            sPart[warp_idx * 16 + row, col] = cv
-        cute.arch.barrier()
-        # reduce 4 partials; top half -> L (strict lower, -beta), bottom -> P (lower)
-        rr = tidx // 8
-        cc = tidx % 8
-        psum = sPart[rr, cc] + sPart[16 + rr, cc] + sPart[32 + rr, cc] + sPart[48 + rr, cc]
-        if rr < BT:
-            keep = cutlass.Float32(1.0) if rr > cc else cutlass.Float32(0.0)
-            sL[rr, cc] = -sBeta[rr] * psum * keep
-        else:
-            tr = rr - BT
-            keep = cutlass.Float32(1.0) if tr >= cc else cutlass.Float32(0.0)
-            sP[tr, cc] = psum * keep
+        # ---- P2b: K-parallel scans (thread = channel kc). Backward suffix pass
+        # first (raw kn still in sKQ) -> sKsuf; then forward prefix scaling
+        # kdec/qdec; scratch stores raw (k, g) for the bounded flush rebuild. ----
+        kc = tidx  # requires K == 128 == block size
+        suf_s = cutlass.Float32(1.0)
+        for tt in cutlass.range_constexpr(T):
+            i_t = T - 1 - tt
+            sKsuf[i_t, kc] = sKQ[i_t, kc] * suf_s
+            suf_s = suf_s * sG[i_t, kc]
+        bcum = cutlass.Float32(1.0)
+        for i_t in cutlass.range_constexpr(T):
+            g_t = sG[i_t, kc]
+            bcum = bcum * g_t
+            kn = sKQ[i_t, kc]
+            sKQ[i_t, kc] = kn * bcum
+            sKQ[BT + i_t, kc] = sKQ[BT + i_t, kc] * bcum
+            if cutlass.const_expr(write_ubuf):
+                if i_v == 0:
+                    kinv_buf[i_n, i_t, i_hv, kc] = kn  # raw key (was k/b_run)
+                    b_buf[i_n, i_t, i_hv, kc] = g_t  # per-step gate (was b_run)
+        sBlast[kc] = bcum
         cute.arch.barrier()
         if tidx < BT * BT:
             ri = tidx // BT
@@ -1667,7 +1724,8 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
                     o[(i_n, gid, i_hv, v_base + vc0)] = cutlass.BFloat16(ov0)
                     o[(i_n, gid, i_hv, v_base + vc1)] = cutlass.BFloat16(ov1)
 
-            # state: S_T = b_last * (S0 + u^T @ kinv), M = v rows, single k-slab
+            # state: S_T = b_last * S0 + u^T @ ksuf (ksuf bounded; b_last only
+            # rescales the S0 term), M = v rows, single k-slab
             if cutlass.const_expr(not disable_state_update):
                 m_tiles: cutlass.Constexpr[int] = BV // 16
                 pairs: cutlass.Constexpr[int] = m_tiles * (K // 8)
@@ -1686,8 +1744,8 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
                         a1 = sU[tig, mb + gid + 8]
                         a2 = sU[tig + 4, mb + gid]
                         a3 = sU[tig + 4, mb + gid + 8]
-                        b0 = sKinv[tig, nb + gid]
-                        b1 = sKinv[tig + 4, nb + gid]
+                        b0 = sKsuf[tig, nb + gid]
+                        b1 = sKsuf[tig + 4, nb + gid]
                         g0, g1, g2, g3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, g0, g1, g2, g3)
                         for fi in cutlass.range_constexpr(4):
                             vrow = mb + gid + (fi // 2) * 8
@@ -1699,7 +1757,7 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
                                 gv = g2
                             if cutlass.const_expr(fi == 3):
                                 gv = g3
-                            h0_source[(flat_state_idx, v_base + vrow, kcol)] = sBlast[kcol] * (sS0[vrow, kcol] + gv)
+                            h0_source[(flat_state_idx, v_base + vrow, kcol)] = sBlast[kcol] * sS0[vrow, kcol] + gv
             cute.arch.barrier()
 
 
@@ -1743,7 +1801,7 @@ def run_kda_mtp_gemm_kvbuffer_cute_kernel(
     grid_size = n_indices * HV * num_v_tiles
     smem_bytes = (
         2 * 4 * BT * (K + 8)  # sKQ (stacked)
-        + 2 * 4 * BT * (K + 8)  # sKinv + sG
+        + 2 * 4 * BT * (K + 8)  # sKsuf + sG
         + 4 * BT
         + 4 * K  # sBeta + sBlast
         + 4 * 64 * 12  # sPart
