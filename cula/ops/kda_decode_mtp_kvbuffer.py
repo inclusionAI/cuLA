@@ -1746,7 +1746,9 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
                         a3 = sU[tig + 4, mb + gid + 8]
                         b0 = sKsuf[tig, nb + gid]
                         b1 = sKsuf[tig + 4, nb + gid]
-                        g0, g1, g2, g3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, g0, g1, g2, g3)
+                        # 3xTF32 for near-fp32 state precision; only the dsu=0
+                        # path hits this GEMM (serving verify commits via flush).
+                        g0, g1, g2, g3 = _mma_m16n8k8_3xtf32(a0, a1, a2, a3, b0, b1, g0, g1, g2, g3)
                         for fi in cutlass.range_constexpr(4):
                             vrow = mb + gid + (fi // 2) * 8
                             kcol = nb + 2 * tig + (fi % 2)
