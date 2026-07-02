@@ -47,7 +47,6 @@ from cula.ops.kda_decode import (
 from cula.ops.kda_decode_mtp import (
     VEC_SIZE,
     _normalize_mtp_a,
-    _select_vk_bv,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,6 +67,19 @@ def _select_kvb_tile_v(V, N, HV):
         if V % tv == 0:
             return tv
     return 8
+
+
+# flush BV: always the smallest tile. The flush kernel is DRAM-latency bound with
+# no data reuse to amortize per CTA, so more/smaller CTAs (higher memory-level
+# parallelism) win at every work-unit count on H200 (back-to-back (bv, warps)
+# sweep: bv=8 beats bv=32 by 17-20% at large N*HV, ties small; multi-warp CTAs
+# only lose). _select_vk_bv is tuned for the compute-heavier vk verify kernel and
+# picks 32 exactly where flush wants 8.
+def _select_flush_bv(V):
+    for bv in (8, 16, 32):
+        if V % bv == 0:
+            return bv
+    raise ValueError(f"V={V} must be divisible by 8, 16 or 32")
 
 
 # flush kernel: read the compact (u, k, g) scratch from verify, rank-m update over
@@ -239,8 +251,7 @@ def kda_flush_kvbuffer(
         m_buf = torch.full((N,), m, dtype=torch.int32, device=u_buffer.device)
 
     if bv <= 0:
-        num_sms = torch.cuda.get_device_properties(initial_state_source.device).multi_processor_count
-        bv = _select_vk_bv(N * HV, V, num_sms)
+        bv = _select_flush_bv(V)
     assert bv in (8, 16, 32) and V % bv == 0, f"flush bv must be 8/16/32 and divide V, got bv={bv}, V={V}"
 
     h0_source, pool_size, _ = _normalize_state_source(
@@ -425,8 +436,7 @@ def kda_flush_kvbuffer_all_layers(
         m_buf = torch.full((N,), m, dtype=torch.int32, device=u_buffer.device)
 
     if bv <= 0:
-        num_sms = torch.cuda.get_device_properties(initial_state_source.device).multi_processor_count
-        bv = _select_vk_bv(N * HV, V, num_sms)
+        bv = _select_flush_bv(V)
     assert bv in (8, 16, 32) and V % bv == 0, f"flush bv must be 8/16/32 and divide V, got bv={bv}, V={V}"
 
     pool_size = initial_state_source.shape[1]
