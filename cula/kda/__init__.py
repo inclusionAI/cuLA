@@ -20,6 +20,7 @@ __all__ = [
     "kda_decode_mtp",
     "kda_decode_mtp_recurrent",
     "kda_decode_mtp_recurrent_ws",
+    "kda_packed_decode",
     "fused_sigmoid_gating_delta_rule_update",
     "kda_prefill_hopper",
     "kda_prefill_hopper_opt",
@@ -36,6 +37,7 @@ _LAZY = {
         "cula.ops.kda.decode.mtp",
         "kda_decode_mtp_recurrent_ws",
     ),
+    "kda_packed_decode": ("cula.ops.kda.decode.cute", "kda_packed_decode"),
     "fused_sigmoid_gating_delta_rule_update": (
         "cula.ops.kda.decode.cute",
         "fused_sigmoid_gating_delta_rule_update",
