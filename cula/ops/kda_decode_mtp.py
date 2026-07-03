@@ -1585,9 +1585,19 @@ def kda_decode_mtp_small_batch(
 
     o = _prepare_output_tensor(q, out, (N, T, HV, V))
 
-    q = q if q.is_contiguous() else q.contiguous()
-    k = k if k.is_contiguous() else k.contiguous()
-    v = v if v.is_contiguous() else v.contiguous()
+    # dyn-stride (vk only): keep K-contiguous strided q/k/v views as-is and
+    # compile the dynamic-layout kernel variant instead of copying. Auto:
+    # contiguous inputs keep the compact (byte-identical) kernel.
+    _dyn_vk = (
+        variant == "vk"
+        and not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous())
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and v.stride(-1) == 1
+    )
+    q = q if (_dyn_vk or q.is_contiguous()) else q.contiguous()
+    k = k if (_dyn_vk or k.is_contiguous()) else k.contiguous()
+    v = v if (_dyn_vk or v.is_contiguous()) else v.contiguous()
     a = a if a.is_contiguous() else a.contiguous()
     b = b if b.is_contiguous() else b.contiguous()
 
@@ -1654,6 +1664,7 @@ def kda_decode_mtp_small_batch(
             cache_intermediate_states=cache_intermediate_states,
             use_lower_bound=lower_bound is not None,
             lower_bound=(0.0 if lower_bound is None else float(lower_bound)),
+            dyn_stride=_dyn_vk,
         )
 
     if variant == "vk":
@@ -1983,6 +1994,7 @@ def _get_compiled_mtp_vk_kernel(
     cache_intermediate_states=False,
     use_lower_bound=False,
     lower_bound=0.0,
+    dyn_stride=False,
 ):
     key = (
         T,
@@ -2001,6 +2013,7 @@ def _get_compiled_mtp_vk_kernel(
         fast_math,
         use_lower_bound,
         lower_bound,
+        dyn_stride,
     )
     if key in _compiled_mtp_vk_kernels:
         return _compiled_mtp_vk_kernels[key]
@@ -2022,9 +2035,17 @@ def _get_compiled_mtp_vk_kernel(
 
     # dynamic-N: mark the batch axis (dim 0) dynamic so one cubin serves all N.
     # Explicit stride_order: at N=1/T=1 the size-1 dims make auto-deduction ambiguous.
-    q_t = from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=q.dim_order())
-    k_t = from_dlpack(k, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=k.dim_order())
-    v_t = from_dlpack(v, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=v.dim_order())
+    if dyn_stride:
+        # dyn-stride: q/k/v arrive as K-contiguous strided views (the caller
+        # skipped the contiguous copy). Mark shape AND strides dynamic with
+        # the innermost K axis static so vectorized loads stay legal.
+        q_t = from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        k_t = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        v_t = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+    else:
+        q_t = from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=q.dim_order())
+        k_t = from_dlpack(k, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=k.dim_order())
+        v_t = from_dlpack(v, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=v.dim_order())
     a_t = from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=a.dim_order())
     b_t = from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b.dim_order())
     o_t = from_dlpack(o, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=o.dim_order())
