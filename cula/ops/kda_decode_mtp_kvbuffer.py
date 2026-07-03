@@ -52,8 +52,7 @@ from cula.ops.kda_decode_mtp import (
 logger = logging.getLogger(__name__)
 
 
-# tile_v by work-units WU=N*HV (= CTA count, grid=N*HV*(V/tile_v)), not N alone:
-# WU<=32->16, <256->32, >=256->64 (H200 sweep; >=256 fixes the HV=64 N=4 case).
+# tile_v by WU=N*HV: <=32->16, <256->32, >=256->64 (H200 sweep).
 def _select_kvb_tile_v(V, N, HV):
     """work-unit (N*HV) dependent tile_v. Returns the first candidate that divides V."""
     wu = N * HV
@@ -69,12 +68,7 @@ def _select_kvb_tile_v(V, N, HV):
     return 8
 
 
-# flush BV: always the smallest tile. The flush kernel is DRAM-latency bound with
-# no data reuse to amortize per CTA, so more/smaller CTAs (higher memory-level
-# parallelism) win at every work-unit count on H200 (back-to-back (bv, warps)
-# sweep: bv=8 beats bv=32 by 17-20% at large N*HV, ties small; multi-warp CTAs
-# only lose). _select_vk_bv is tuned for the compute-heavier vk verify kernel and
-# picks 32 exactly where flush wants 8.
+# flush BV = smallest tile (DRAM-latency bound; bv=8 > bv=32 ~18% at large N*HV).
 def _select_flush_bv(V):
     for bv in (8, 16, 32):
         if V % bv == 0:
@@ -82,18 +76,14 @@ def _select_flush_bv(V):
     raise ValueError(f"V={V} must be divisible by 8, 16 or 32")
 
 
-# flush kernel: read the compact (u, k, g) scratch from verify, rank-m update over
-# the first m accepted tokens (descending suffix products, all factors <= 1):
+# flush kernel: rank-m rebuild of S_m from compact (u,k,g) scratch (Phase-D, lane=K+vk):
 #   S_m[v,k] = prod_{j<m} g_j[k] * S0[v,k] + sum_{i<m} u_i[v] * k_i[k] * prod_{i<j<m} g_j[k]
-# Pure Phase-D (no gating/l2norm/reduce/solve). lane=K + vk, grid/layout match verify.
-# m (accept length) is per-request and read at runtime from m_buf[i_n], so this compiles
-# exactly one kernel per (shape, BV) instead of one per accept-length value.
 @cute.kernel
 def kda_flush_kvbuffer_vk_kernel(
     h0_source: cute.Tensor,  # [pool*HV, V, K] fp32
-    u_buf: cute.Tensor,  # [N, T, HV, V] fp32
-    kinv_buf: cute.Tensor,  # [N, T, HV, K] fp32 raw normalized key k_t
-    b_buf: cute.Tensor,  # [N, T, HV, K] fp32 per-step gate g_t
+    d_buf: cute.Tensor,  # [N, T, HV, V] fp32
+    k_buf: cute.Tensor,  # [N, T, HV, K] fp32 raw normalized key k_t
+    g_buf: cute.Tensor,  # [N, T, HV, K] fp32 per-step gate g_t
     h0_indices: cute.Tensor,
     m_buf: cute.Tensor,  # [N] int32 per-request accept length (first m tokens)
     vec_size: cutlass.Constexpr[int],
@@ -124,10 +114,7 @@ def kda_flush_kvbuffer_vk_kernel(
         r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
         r_g = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
 
-        # Overflow-safe rebuild (scratch holds raw per-token k and gate g):
-        #   S_m = prod_{j<m} g_j * S0 + sum_{i<m} u_i k_i * suf(i),
-        #   suf(i) = prod_{i<j<m} g_j, accumulated descending so every factor
-        #   stays <= 1 (no division by the cumulative gate product).
+        # Overflow-safe rebuild: descending suffix products (all factors <=1, no division).
         for c in cutlass.range_constexpr(vec_size):
             r_suf[c] = cutlass.Float32(1.0)
         for j in cutlass.range_constexpr(BV * vec_size):
@@ -135,12 +122,12 @@ def kda_flush_kvbuffer_vk_kernel(
         for tt in cutlass.range_constexpr(T):
             i_i = T - 1 - tt
             if i_i < m_n:
-                k_tile = cute.local_tile(kinv_buf, (1, 1, 1, vec_size), (i_n, i_i, i_hv, lane))
+                k_tile = cute.local_tile(k_buf, (1, 1, 1, vec_size), (i_n, i_i, i_hv, lane))
                 cute.autovec_copy(k_tile, r_k)
-                g_tile = cute.local_tile(b_buf, (1, 1, 1, vec_size), (i_n, i_i, i_hv, lane))
+                g_tile = cute.local_tile(g_buf, (1, 1, 1, vec_size), (i_n, i_i, i_hv, lane))
                 cute.autovec_copy(g_tile, r_g)
                 for vv in cutlass.range_constexpr(BV):
-                    uval = cutlass.Float32(u_buf[i_n, i_i, i_hv, i_v * BV + vv])
+                    uval = cutlass.Float32(d_buf[i_n, i_i, i_hv, i_v * BV + vv])
                     for c in cutlass.range_constexpr(vec_size):
                         r_acc[vv * vec_size + c] += uval * r_k[c] * r_suf[c]
                 for c in cutlass.range_constexpr(vec_size):
@@ -160,9 +147,9 @@ def kda_flush_kvbuffer_vk_kernel(
 @cute.jit
 def run_kda_flush_kvbuffer_vk_kernel(
     h0_source: cute.Tensor,
-    u_buf: cute.Tensor,
-    kinv_buf: cute.Tensor,
-    b_buf: cute.Tensor,
+    d_buf: cute.Tensor,
+    k_buf: cute.Tensor,
+    g_buf: cute.Tensor,
     h0_indices: cute.Tensor,
     m_buf: cute.Tensor,
     vec_size: cutlass.Constexpr[int],
@@ -178,9 +165,9 @@ def run_kda_flush_kvbuffer_vk_kernel(
     grid_size = n_indices * HV * num_v_tiles
     kda_flush_kvbuffer_vk_kernel(
         h0_source,
-        u_buf,
-        kinv_buf,
-        b_buf,
+        d_buf,
+        k_buf,
+        g_buf,
         h0_indices,
         m_buf,
         vec_size,
@@ -202,18 +189,18 @@ def _get_compiled_flush_kvbuffer_kernel(N, T, HV, K, V, pool_size, BV, opt_level
         return _compiled_flush_kvbuffer_kernels[key]
 
     h0_source = torch.zeros(pool_size * HV, V, K, dtype=torch.float32, device="cuda")
-    u_buf = torch.zeros(N, T, HV, V, dtype=torch.float32, device="cuda")
-    kinv_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
-    b_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
+    d_buf = torch.zeros(N, T, HV, V, dtype=torch.float32, device="cuda")
+    k_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
+    g_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
     h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
     m_buf = torch.zeros(N, dtype=torch.int32, device="cuda")
 
     compiled = cute.compile(
         run_kda_flush_kvbuffer_vk_kernel,
         from_dlpack(h0_source, assumed_align=16),
-        from_dlpack(u_buf, assumed_align=16),
-        from_dlpack(kinv_buf, assumed_align=16),
-        from_dlpack(b_buf, assumed_align=16),
+        from_dlpack(d_buf, assumed_align=16),
+        from_dlpack(k_buf, assumed_align=16),
+        from_dlpack(g_buf, assumed_align=16),
         from_dlpack(h0_indices, assumed_align=16),
         from_dlpack(m_buf, assumed_align=16),
         vec_size=VEC_SIZE,
@@ -233,22 +220,22 @@ def _get_compiled_flush_kvbuffer_kernel(N, T, HV, K, V, pool_size, BV, opt_level
 def kda_flush_kvbuffer(
     initial_state_source: torch.Tensor,
     initial_state_indices: torch.Tensor,
-    u_buffer: torch.Tensor,
-    kinv_buffer: torch.Tensor,
-    b_buffer: torch.Tensor,
+    d_buffer: torch.Tensor,
+    k_buffer: torch.Tensor,
+    g_buffer: torch.Tensor,
     accept_len,  # int (broadcast to all N) OR per-request [N] int tensor; each in [1, T]
     bv: int = -1,
     opt_level: int = 3,
 ) -> torch.Tensor:
-    N, T, HV, V = u_buffer.shape
-    K = kinv_buffer.shape[3]
+    N, T, HV, V = d_buffer.shape
+    K = k_buffer.shape[3]
     if isinstance(accept_len, torch.Tensor):
         assert accept_len.numel() == N, f"per-request accept_len must have N={N} entries, got {accept_len.numel()}"
-        m_buf = accept_len.to(device=u_buffer.device, dtype=torch.int32).contiguous()
+        m_buf = accept_len.to(device=d_buffer.device, dtype=torch.int32).contiguous()
     else:
         m = int(accept_len)
         assert 1 <= m <= T, f"accept_len must be in [1,{T}], got {m}"
-        m_buf = torch.full((N,), m, dtype=torch.int32, device=u_buffer.device)
+        m_buf = torch.full((N,), m, dtype=torch.int32, device=d_buffer.device)
 
     if bv <= 0:
         bv = _select_flush_bv(V)
@@ -270,20 +257,18 @@ def kda_flush_kvbuffer(
 
     h0_source_flat = h0_source.view(pool_size * HV, V, K)
     compiled = _get_compiled_flush_kvbuffer_kernel(N, T, HV, K, V, pool_size, bv, opt_level=opt_level)
-    compiled(h0_source_flat, u_buffer, kinv_buffer, b_buffer, initial_state_indices, m_buf, stream)
+    compiled(h0_source_flat, d_buffer, k_buffer, g_buffer, initial_state_indices, m_buf, stream)
     return initial_state_source
 
 
 # ===========================================================================
-# MULTILAYER_FLUSH_PATCH: all-layers batched flush, dynamic-N (2D grid x=single-
-# layer grid / y=layer; N not a compile const). cute.compile traces the real,
-# already-allocated tensors (it only reads shape/stride, does NOT execute).
+# MULTILAYER_FLUSH_PATCH: all-layers batched flush, dynamic-N (2D grid x=layer-grid, y=layer).
 @cute.kernel
 def kda_flush_kvbuffer_vk_ml_kernel(
     h0_source: cute.Tensor,
-    u_buf: cute.Tensor,
-    kinv_buf: cute.Tensor,
-    b_buf: cute.Tensor,
+    d_buf: cute.Tensor,
+    k_buf: cute.Tensor,
+    g_buf: cute.Tensor,
     h0_indices: cute.Tensor,
     m_buf: cute.Tensor,
     vec_size: cutlass.Constexpr[int],
@@ -314,8 +299,7 @@ def kda_flush_kvbuffer_vk_ml_kernel(
         r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
         r_g = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
 
-        # Overflow-safe rebuild via descending suffix products (see single-layer
-        # flush kernel); scratch holds raw per-token k and gate g.
+        # Overflow-safe rebuild via descending suffix products (see single-layer flush).
         for c in cutlass.range_constexpr(vec_size):
             r_suf[c] = cutlass.Float32(1.0)
         for j in cutlass.range_constexpr(BV * vec_size):
@@ -323,12 +307,12 @@ def kda_flush_kvbuffer_vk_ml_kernel(
         for tt in cutlass.range_constexpr(T):
             i_i = T - 1 - tt
             if i_i < m_n:
-                k_tile = cute.local_tile(kinv_buf, (1, 1, 1, 1, vec_size), (i_l, i_n, i_i, i_hv, lane))
+                k_tile = cute.local_tile(k_buf, (1, 1, 1, 1, vec_size), (i_l, i_n, i_i, i_hv, lane))
                 cute.autovec_copy(k_tile, r_k)
-                g_tile = cute.local_tile(b_buf, (1, 1, 1, 1, vec_size), (i_l, i_n, i_i, i_hv, lane))
+                g_tile = cute.local_tile(g_buf, (1, 1, 1, 1, vec_size), (i_l, i_n, i_i, i_hv, lane))
                 cute.autovec_copy(g_tile, r_g)
                 for vv in cutlass.range_constexpr(BV):
-                    uval = cutlass.Float32(u_buf[i_l, i_n, i_i, i_hv, i_v * BV + vv])
+                    uval = cutlass.Float32(d_buf[i_l, i_n, i_i, i_hv, i_v * BV + vv])
                     for c in cutlass.range_constexpr(vec_size):
                         r_acc[vv * vec_size + c] += uval * r_k[c] * r_suf[c]
                 for c in cutlass.range_constexpr(vec_size):
@@ -347,9 +331,9 @@ def kda_flush_kvbuffer_vk_ml_kernel(
 @cute.jit
 def run_kda_flush_kvbuffer_vk_ml_kernel(
     h0_source: cute.Tensor,
-    u_buf: cute.Tensor,
-    kinv_buf: cute.Tensor,
-    b_buf: cute.Tensor,
+    d_buf: cute.Tensor,
+    k_buf: cute.Tensor,
+    g_buf: cute.Tensor,
     h0_indices: cute.Tensor,
     m_buf: cute.Tensor,
     vec_size: cutlass.Constexpr[int],
@@ -366,9 +350,9 @@ def run_kda_flush_kvbuffer_vk_ml_kernel(
     gx = n_indices * HV * num_v_tiles
     kda_flush_kvbuffer_vk_ml_kernel(
         h0_source,
-        u_buf,
-        kinv_buf,
-        b_buf,
+        d_buf,
+        k_buf,
+        g_buf,
         h0_indices,
         m_buf,
         vec_size,
@@ -385,7 +369,7 @@ _compiled_flush_kvbuffer_ml_kernels: dict[tuple, object] = {}
 
 
 def _get_compiled_flush_kvbuffer_ml_kernel(
-    L, T, HV, K, V, pool_size, kvb_pool, BV, h0_source, u_buf, kinv_buf, b_buf, h0_indices, m_buf, opt_level=3
+    L, T, HV, K, V, pool_size, kvb_pool, BV, h0_source, d_buf, k_buf, g_buf, h0_indices, m_buf, opt_level=3
 ):
     # Trace on the tensors passed in. N not in key (index layout-dynamic).
     key = (L, T, HV, K, V, pool_size, kvb_pool, BV, opt_level)
@@ -395,9 +379,9 @@ def _get_compiled_flush_kvbuffer_ml_kernel(
     compiled = cute.compile(
         run_kda_flush_kvbuffer_vk_ml_kernel,
         from_dlpack(h0_source, assumed_align=16),
-        from_dlpack(u_buf, assumed_align=16),
-        from_dlpack(kinv_buf, assumed_align=16),
-        from_dlpack(b_buf, assumed_align=16),
+        from_dlpack(d_buf, assumed_align=16),
+        from_dlpack(k_buf, assumed_align=16),
+        from_dlpack(g_buf, assumed_align=16),
         from_dlpack(h0_indices, assumed_align=16).mark_layout_dynamic(),
         from_dlpack(m_buf, assumed_align=16).mark_layout_dynamic(),
         vec_size=VEC_SIZE,
@@ -417,23 +401,23 @@ def _get_compiled_flush_kvbuffer_ml_kernel(
 def kda_flush_kvbuffer_all_layers(
     initial_state_source: torch.Tensor,
     initial_state_indices: torch.Tensor,
-    u_buffer: torch.Tensor,
-    kinv_buffer: torch.Tensor,
-    b_buffer: torch.Tensor,
+    d_buffer: torch.Tensor,
+    k_buffer: torch.Tensor,
+    g_buffer: torch.Tensor,
     accept_len,
     bv: int = -1,
     opt_level: int = 3,
 ) -> torch.Tensor:
-    L, kvb_pool, T, HV, V = u_buffer.shape
-    K = kinv_buffer.shape[4]
+    L, kvb_pool, T, HV, V = d_buffer.shape
+    K = k_buffer.shape[4]
     N = initial_state_indices.shape[0]
     if isinstance(accept_len, torch.Tensor):
         assert accept_len.numel() == N, f"per-request accept_len must have N={N} entries, got {accept_len.numel()}"
-        m_buf = accept_len.to(device=u_buffer.device, dtype=torch.int32).contiguous()
+        m_buf = accept_len.to(device=d_buffer.device, dtype=torch.int32).contiguous()
     else:
         m = int(accept_len)
         assert 1 <= m <= T, f"accept_len must be in [1,{T}], got {m}"
-        m_buf = torch.full((N,), m, dtype=torch.int32, device=u_buffer.device)
+        m_buf = torch.full((N,), m, dtype=torch.int32, device=d_buffer.device)
 
     if bv <= 0:
         bv = _select_flush_bv(V)
@@ -454,23 +438,23 @@ def kda_flush_kvbuffer_all_layers(
         kvb_pool,
         bv,
         h0_source_flat,
-        u_buffer,
-        kinv_buffer,
-        b_buffer,
+        d_buffer,
+        k_buffer,
+        g_buffer,
         idx,
         m_buf,
         opt_level=opt_level,
     )
-    compiled(h0_source_flat, u_buffer, kinv_buffer, b_buffer, idx, m_buf, stream)
+    compiled(h0_source_flat, d_buffer, k_buffer, g_buffer, idx, m_buf, stream)
     return initial_state_source
 
 
 # ---------------------------------------------------------------------------
-# tp-kvbuffer: token-parallel chunkwise verify (structure B). UT-transform
+# shuffle-kvbuffer: token-parallel chunkwise verify (structure B). UT-transform
 # W = L^{-1} diag(beta) makes the consumer solve dependence-free: u = W @ (v - S0 kdec).
 # ---------------------------------------------------------------------------
 @cute.kernel
-def kda_mtp_tp_kvbuffer_kernel(
+def kda_mtp_shuffle_kvbuffer_kernel(
     h0_source: cute.Tensor,  # [pool*HV, V, K] fp32 (vk)
     A_log: cute.Tensor,
     a: cute.Tensor,
@@ -481,9 +465,9 @@ def kda_mtp_tp_kvbuffer_kernel(
     b: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
-    u_buf: cute.Tensor,  # [N, T, HV, V] fp32
-    kinv_buf: cute.Tensor,  # [N, T, HV, K] fp32 raw normalized key k_t
-    b_buf: cute.Tensor,  # [N, T, HV, K] fp32 per-step gate g_t
+    d_buf: cute.Tensor,  # [N, T, HV, V] fp32
+    k_buf: cute.Tensor,  # [N, T, HV, K] fp32 raw normalized key k_t
+    g_buf: cute.Tensor,  # [N, T, HV, K] fp32 per-step gate g_t
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
@@ -609,11 +593,6 @@ def kda_mtp_tp_kvbuffer_kernel(
         cute.arch.barrier()
 
         # ---- Stage 2: K-parallel prefix-product scan (thread = one channel).
-        # Overflow-safe form: no division by the running gate product. sKn keeps
-        # the raw normalized key (for ratio-chain scoring and the suffix-product
-        # state update), sBrun the prefix product b_run(t) <= 1, sKdec the
-        # prefix-decayed key kn*b_run(t). The scratch stores (k, g) raw so the
-        # flush can rebuild any rank via bounded suffix products. ----
         kc = tidx  # requires K == 128 == block size
         b_run_s = cutlass.Float32(1.0)
         for i_t in cutlass.range_constexpr(T):
@@ -625,8 +604,8 @@ def kda_mtp_tp_kvbuffer_kernel(
             sBrun[i_t, kc] = b_run_s
             if cutlass.const_expr(write_ubuf):
                 if i_v == 0:
-                    kinv_buf[i_n, i_t, i_hv, kc] = kn  # raw key (was k/b_run)
-                    b_buf[i_n, i_t, i_hv, kc] = g_t  # per-step gate (was b_run)
+                    k_buf[i_n, i_t, i_hv, kc] = kn  # raw key (was k/b_run)
+                    g_buf[i_n, i_t, i_hv, kc] = g_t  # per-step gate (was b_run)
         cute.arch.barrier()
 
         # ---- Stage 3: (t,i)-parallel A/P, T^2 pairs round-robined over 4 warps,
@@ -721,7 +700,7 @@ def kda_mtp_tp_kvbuffer_kernel(
                 if lane_id == 0:
                     for r in cutlass.range_constexpr(ilp_rows):
                         for i_t in cutlass.range_constexpr(T):
-                            u_buf[i_n, i_t, i_hv, v_base + r] = r_u[r, i_t]
+                            d_buf[i_n, i_t, i_hv, v_base + r] = r_u[r, i_t]
             # o_t = Sqdec_t + sum_{i<=t} P[t,i] u_i (Sqdec batched butterfly into r_part)
             if cutlass.const_expr(emit_output):
                 for r in cutlass.range_constexpr(ilp_rows):
@@ -761,7 +740,7 @@ def kda_mtp_tp_kvbuffer_kernel(
 
 
 @cute.jit
-def run_kda_mtp_tp_kvbuffer_kernel(
+def run_kda_mtp_shuffle_kvbuffer_kernel(
     h0_source: cute.Tensor,
     A_log: cute.Tensor,
     a: cute.Tensor,
@@ -772,9 +751,9 @@ def run_kda_mtp_tp_kvbuffer_kernel(
     b: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
-    u_buf: cute.Tensor,
-    kinv_buf: cute.Tensor,
-    b_buf: cute.Tensor,
+    d_buf: cute.Tensor,
+    k_buf: cute.Tensor,
+    g_buf: cute.Tensor,
     vec_size: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
     ilp_rows: cutlass.Constexpr[int],
@@ -795,7 +774,7 @@ def run_kda_mtp_tp_kvbuffer_kernel(
     lower_bound: cutlass.Constexpr[float],
     stream: cuda.CUstream,
 ):
-    """tp-kvbuffer launcher: grid = N*HV*(V//tile_v), block = 128 (4 warps)."""
+    """shuffle-kvbuffer launcher: grid = N*HV*(V//tile_v), block = 128 (4 warps)."""
     n_indices = h0_indices.layout.shape[0]
     num_v_tiles = cute.ceil_div(V, tile_v)
     grid_size = n_indices * HV * num_v_tiles
@@ -805,7 +784,7 @@ def run_kda_mtp_tp_kvbuffer_kernel(
         + 3 * 4 * T * T  # sA/sP/sW
         + 256  # alignment slack
     )
-    kda_mtp_tp_kvbuffer_kernel(
+    kda_mtp_shuffle_kvbuffer_kernel(
         h0_source,
         A_log,
         a,
@@ -816,9 +795,9 @@ def run_kda_mtp_tp_kvbuffer_kernel(
         b,
         o,
         h0_indices,
-        u_buf,
-        kinv_buf,
-        b_buf,
+        d_buf,
+        k_buf,
+        g_buf,
         vec_size,
         num_v_tiles,
         tile_v,
@@ -841,10 +820,10 @@ def run_kda_mtp_tp_kvbuffer_kernel(
     ).launch(grid=(grid_size, 1, 1), block=[128, 1, 1], smem=smem_bytes, stream=stream)
 
 
-_compiled_mtp_tp_kvbuffer_kernels: dict[tuple, object] = {}
+_compiled_mtp_shuffle_kvbuffer_kernels: dict[tuple, object] = {}
 
 
-def _get_compiled_mtp_tp_kvbuffer_kernel(
+def _get_compiled_mtp_shuffle_kvbuffer_kernel(
     N,
     T,
     H,
@@ -886,8 +865,8 @@ def _get_compiled_mtp_tp_kvbuffer_kernel(
         use_lower_bound,
         lower_bound,
     )
-    if key in _compiled_mtp_tp_kvbuffer_kernels:
-        return _compiled_mtp_tp_kvbuffer_kernels[key]
+    if key in _compiled_mtp_shuffle_kvbuffer_kernels:
+        return _compiled_mtp_shuffle_kvbuffer_kernels[key]
 
     q = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
     k = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
@@ -899,12 +878,12 @@ def _get_compiled_mtp_tp_kvbuffer_kernel(
     dt_bias = torch.zeros(HV, K, dtype=torch.float32, device="cuda")
     h0_source = torch.zeros(pool_size * HV, V, K, dtype=torch.float32, device="cuda")
     h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
-    u_buf = torch.zeros(N, T, HV, V, dtype=torch.float32, device="cuda")
-    kinv_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
-    b_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
+    d_buf = torch.zeros(N, T, HV, V, dtype=torch.float32, device="cuda")
+    k_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
+    g_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
 
     compiled_kernel = cute.compile(
-        run_kda_mtp_tp_kvbuffer_kernel,
+        run_kda_mtp_shuffle_kvbuffer_kernel,
         from_dlpack(h0_source, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=h0_source.dim_order()),
         from_dlpack(A_log, assumed_align=16),
         from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=a.dim_order()),
@@ -915,9 +894,9 @@ def _get_compiled_mtp_tp_kvbuffer_kernel(
         from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b.dim_order()),
         from_dlpack(o, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=o.dim_order()),
         from_dlpack(h0_indices, assumed_align=16).mark_layout_dynamic(),
-        from_dlpack(u_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=u_buf.dim_order()),
-        from_dlpack(kinv_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=kinv_buf.dim_order()),
-        from_dlpack(b_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b_buf.dim_order()),
+        from_dlpack(d_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=d_buf.dim_order()),
+        from_dlpack(k_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=k_buf.dim_order()),
+        from_dlpack(g_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=g_buf.dim_order()),
         vec_size=VEC_SIZE,
         tile_v=tile_v,
         ilp_rows=ilp_rows,
@@ -939,16 +918,16 @@ def _get_compiled_mtp_tp_kvbuffer_kernel(
         stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
     )
-    _compiled_mtp_tp_kvbuffer_kernels[key] = compiled_kernel
+    _compiled_mtp_shuffle_kvbuffer_kernels[key] = compiled_kernel
     logger.info(
-        "CuTe DSL KDA MTP tp-KVBuffer kernel compiled: "
+        "CuTe DSL KDA MTP shuffle-KVBuffer kernel compiled: "
         f"N={N}, T={T}, HV={HV}, K={K}, V={V}, tile_v={tile_v}, ilp_rows={ilp_rows}, "
         f"opt_level={opt_level}, fast_math={fast_math}"
     )
     return compiled_kernel
 
 
-def _select_tp_kvb_ilp_rows(tile_v, T):
+def _select_shuffle_kvb_ilp_rows(tile_v, T):
     """Largest ilp_rows in {4,2,1} dividing rows_per_group with ilp_rows*T <= 16 — the consumer
     holds two (ilp_rows, T) fp32 register arrays (r_part + r_u), so cap their footprint."""
     rows_per_group = tile_v // 4
@@ -958,7 +937,7 @@ def _select_tp_kvb_ilp_rows(tile_v, T):
     return 1
 
 
-def kda_decode_mtp_tp_kvbuffer(
+def kda_decode_mtp_shuffle_kvbuffer(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     q: torch.Tensor,
@@ -975,39 +954,39 @@ def kda_decode_mtp_tp_kvbuffer(
     out: torch.Tensor | None = None,
     disable_state_update: bool = True,
     emit_output: bool = True,
-    u_buffer: torch.Tensor | None = None,
-    kinv_buffer: torch.Tensor | None = None,
-    b_buffer: torch.Tensor | None = None,
+    d_buffer: torch.Tensor | None = None,
+    k_buffer: torch.Tensor | None = None,
+    g_buffer: torch.Tensor | None = None,
     tile_v: int = -1,
     ilp_rows: int = -1,
     opt_level: int = 3,
     fast_math: bool = True,
     lower_bound: float | None = None,
 ) -> torch.Tensor:
-    """KDA MTP tp-KVBuffer verify (token-parallel chunkwise; flush reuses kda_flush_kvbuffer)."""
+    """KDA MTP shuffle-KVBuffer verify (token-parallel chunkwise; flush reuses kda_flush_kvbuffer)."""
     N, T, H, K = q.shape
     HV = v.shape[2]
     V = v.shape[3]
-    write_ubuf = u_buffer is not None
+    write_ubuf = d_buffer is not None
 
     if scale is None:
         scale = K**-0.5
     else:
         assert scale > 0, f"scale must be positive, got {scale}"
 
-    assert K == TILE_K, f"tp-kvbuffer requires K={TILE_K}, got {K}"
-    assert K == 128, f"tp-kvbuffer Stage-2 scan maps 128 threads to K channels; needs K=128, got {K}"
-    assert T <= 32, f"tp-kvbuffer W-build uses one lane per token column; needs T<=32, got {T}"
+    assert K == TILE_K, f"shuffle-kvbuffer requires K={TILE_K}, got {K}"
+    assert K == 128, f"shuffle-kvbuffer Stage-2 scan maps 128 threads to K channels; needs K=128, got {K}"
+    assert T <= 32, f"shuffle-kvbuffer W-build uses one lane per token column; needs T<=32, got {T}"
 
     if tile_v <= 0:
         tile_v = _select_kvb_tile_v(V, N, HV)
-    assert V % tile_v == 0, f"tp-kvbuffer requires V % tile_v == 0, got V={V}, tile_v={tile_v}"
-    assert tile_v % 4 == 0, f"tp-kvbuffer requires tile_v % 4 == 0 (4 warps), got {tile_v}"
+    assert V % tile_v == 0, f"shuffle-kvbuffer requires V % tile_v == 0, got V={V}, tile_v={tile_v}"
+    assert tile_v % 4 == 0, f"shuffle-kvbuffer requires tile_v % 4 == 0 (4 warps), got {tile_v}"
     rows_per_group = tile_v // 4
     if ilp_rows <= 0:
-        ilp_rows = _select_tp_kvb_ilp_rows(tile_v, T)
+        ilp_rows = _select_shuffle_kvb_ilp_rows(tile_v, T)
     assert rows_per_group % ilp_rows == 0, (
-        f"tp-kvbuffer requires (tile_v/4) % ilp_rows == 0, got tile_v={tile_v}, ilp_rows={ilp_rows}"
+        f"shuffle-kvbuffer requires (tile_v/4) % ilp_rows == 0, got tile_v={tile_v}, ilp_rows={ilp_rows}"
     )
 
     h0_source, pool_size, _ = _normalize_state_source(
@@ -1037,20 +1016,20 @@ def kda_decode_mtp_tp_kvbuffer(
     initial_state_indices = _normalize_state_indices(initial_state_indices, N=N, pool_size=pool_size, device=q.device)
 
     if write_ubuf:
-        if tuple(u_buffer.shape) != (N, T, HV, V):
-            raise ValueError(f"u_buffer shape must be {(N, T, HV, V)}, got {tuple(u_buffer.shape)}")
-        if tuple(kinv_buffer.shape) != (N, T, HV, K) or tuple(b_buffer.shape) != (N, T, HV, K):
-            raise ValueError(f"kinv_buffer/b_buffer shape must be {(N, T, HV, K)}")
-        u_buf, kinv_buf, b_buf = u_buffer, kinv_buffer, b_buffer
+        if tuple(d_buffer.shape) != (N, T, HV, V):
+            raise ValueError(f"d_buffer shape must be {(N, T, HV, V)}, got {tuple(d_buffer.shape)}")
+        if tuple(k_buffer.shape) != (N, T, HV, K) or tuple(g_buffer.shape) != (N, T, HV, K):
+            raise ValueError(f"k_buffer/g_buffer shape must be {(N, T, HV, K)}")
+        d_buf, k_buf, g_buf = d_buffer, k_buffer, g_buffer
     else:
-        u_buf = torch.empty(N, T, HV, V, dtype=torch.float32, device=q.device)
-        kinv_buf = torch.empty(N, T, HV, K, dtype=torch.float32, device=q.device)
-        b_buf = torch.empty(N, T, HV, K, dtype=torch.float32, device=q.device)
+        d_buf = torch.empty(N, T, HV, V, dtype=torch.float32, device=q.device)
+        k_buf = torch.empty(N, T, HV, K, dtype=torch.float32, device=q.device)
+        g_buf = torch.empty(N, T, HV, K, dtype=torch.float32, device=q.device)
 
     stream = _get_cached_stream(q.device)
 
     h0_source_flat = h0_source.view(pool_size * HV, V, K)
-    compiled_kernel = _get_compiled_mtp_tp_kvbuffer_kernel(
+    compiled_kernel = _get_compiled_mtp_shuffle_kvbuffer_kernel(
         N,
         T,
         H,
@@ -1083,16 +1062,16 @@ def kda_decode_mtp_tp_kvbuffer(
         b,
         o,
         initial_state_indices,
-        u_buf,
-        kinv_buf,
-        b_buf,
+        d_buf,
+        k_buf,
+        g_buf,
         stream,
     )
     return o
 
 
 # ===========================================================================
-# gemm-kvbuffer (CuTe sm_90 tensor-core, flat-in-T): every reduction on warp-level
+# tensor_core-kvbuffer (CuTe sm_90 tensor-core, flat-in-T): every reduction on warp-level
 # mma.sync.m16n8k8.tf32 (llvm.inline_asm wrapper); verify = the BT=8 stacked kernel below.
 #
 # mma.sync m16n8k8 fragment mapping (PTX ISA), gid = lane>>2, tig = lane&3:
@@ -1172,10 +1151,10 @@ def _mma_m16n8k8_3xtf32(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=
     return c0, c1, c2, c3
 
 
-_compiled_gemm_kvbuffer_cute_kernels: dict[tuple, object] = {}
+_compiled_tensor_core_kvbuffer_kernels: dict[tuple, object] = {}
 
 
-def _get_compiled_gemm_kvbuffer_cute_kernel(
+def _get_compiled_tensor_core_kvbuffer_kernel(
     N,
     T,
     H,
@@ -1217,8 +1196,8 @@ def _get_compiled_gemm_kvbuffer_cute_kernel(
         use_lower_bound,
         lower_bound,
     )
-    if key in _compiled_gemm_kvbuffer_cute_kernels:
-        return _compiled_gemm_kvbuffer_cute_kernels[key]
+    if key in _compiled_tensor_core_kvbuffer_kernels:
+        return _compiled_tensor_core_kvbuffer_kernels[key]
 
     q = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
     k = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
@@ -1230,11 +1209,11 @@ def _get_compiled_gemm_kvbuffer_cute_kernel(
     dt_bias = torch.zeros(HV, K, dtype=torch.float32, device="cuda")
     h0_source = torch.zeros(pool_size * HV, V, K, dtype=torch.float32, device="cuda")
     h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
-    u_buf = torch.zeros(N, T, HV, V, dtype=torch.float32, device="cuda")
-    kinv_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
-    b_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
+    d_buf = torch.zeros(N, T, HV, V, dtype=torch.float32, device="cuda")
+    k_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
+    g_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
 
-    run_fn = run_kda_mtp_gemm_kvbuffer_cute_kernel
+    run_fn = run_kda_mtp_tensor_core_kvbuffer_kernel
     compiled_kernel = cute.compile(
         run_fn,
         from_dlpack(h0_source, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=h0_source.dim_order()),
@@ -1247,9 +1226,9 @@ def _get_compiled_gemm_kvbuffer_cute_kernel(
         from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b.dim_order()),
         from_dlpack(o, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=o.dim_order()),
         from_dlpack(h0_indices, assumed_align=16).mark_layout_dynamic(),
-        from_dlpack(u_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=u_buf.dim_order()),
-        from_dlpack(kinv_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=kinv_buf.dim_order()),
-        from_dlpack(b_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b_buf.dim_order()),
+        from_dlpack(d_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=d_buf.dim_order()),
+        from_dlpack(k_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=k_buf.dim_order()),
+        from_dlpack(g_buf, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=g_buf.dim_order()),
         vec_size=VEC_SIZE,
         BV=bv,
         num_v_tiles=num_v_tiles,
@@ -1271,15 +1250,15 @@ def _get_compiled_gemm_kvbuffer_cute_kernel(
         stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
     )
-    _compiled_gemm_kvbuffer_cute_kernels[key] = compiled_kernel
+    _compiled_tensor_core_kvbuffer_kernels[key] = compiled_kernel
     logger.info(
-        "CuTe DSL KDA MTP gemm-KVBuffer (sm90 mma) kernel compiled: "
+        "CuTe DSL KDA MTP tensor_core-KVBuffer (sm90 mma) kernel compiled: "
         f"N={N}, T={T}, HV={HV}, K={K}, V={V}, BV={bv}, num_v_tiles={num_v_tiles}, opt_level={opt_level}"
     )
     return compiled_kernel
 
 
-def kda_decode_mtp_gemm_kvbuffer_cute(
+def kda_decode_mtp_tensor_core_kvbuffer(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     q: torch.Tensor,
@@ -1296,9 +1275,9 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
     out: torch.Tensor | None = None,
     disable_state_update: bool = True,
     emit_output: bool = True,
-    u_buffer: torch.Tensor | None = None,
-    kinv_buffer: torch.Tensor | None = None,
-    b_buffer: torch.Tensor | None = None,
+    d_buffer: torch.Tensor | None = None,
+    k_buffer: torch.Tensor | None = None,
+    g_buffer: torch.Tensor | None = None,
     bv: int = 32,
     num_v_tiles: int = -1,
     opt_level: int = 3,
@@ -1309,13 +1288,13 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
     N, T, H, K = q.shape
     HV = v.shape[2]
     V = v.shape[3]
-    write_ubuf = u_buffer is not None
+    write_ubuf = d_buffer is not None
 
     if scale is None:
         scale = K**-0.5
-    assert K == TILE_K == 128, f"cute-gemm-kvbuffer requires K=128, got {K}"
-    assert T <= 8, f"cute-gemm-kvbuffer (BT stacked) needs T<=8, got {T}"
-    assert bv == 32, f"cute-gemm-kvbuffer (BT) requires bv=32 (one n-tile per warp), got {bv}"
+    assert K == TILE_K == 128, f"tensor_core-kvbuffer requires K=128, got {K}"
+    assert T <= 8, f"tensor_core-kvbuffer (BT stacked) needs T<=8, got {T}"
+    assert bv == 32, f"tensor_core-kvbuffer (BT) requires bv=32 (one n-tile per warp), got {bv}"
     assert V % bv == 0 and bv % 16 == 0, f"bv must divide V and be 16-aligned, got {bv}"
     if num_v_tiles <= 0:
         # auto: split V across CTAs until the grid reaches ~512 (fills H200's 132 SMs
@@ -1348,19 +1327,19 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
     initial_state_indices = _normalize_state_indices(initial_state_indices, N=N, pool_size=pool_size, device=q.device)
 
     if write_ubuf:
-        if tuple(u_buffer.shape) != (N, T, HV, V):
-            raise ValueError(f"u_buffer shape must be {(N, T, HV, V)}, got {tuple(u_buffer.shape)}")
-        if tuple(kinv_buffer.shape) != (N, T, HV, K) or tuple(b_buffer.shape) != (N, T, HV, K):
-            raise ValueError(f"kinv_buffer/b_buffer shape must be {(N, T, HV, K)}")
-        u_buf, kinv_buf, b_buf = u_buffer, kinv_buffer, b_buffer
+        if tuple(d_buffer.shape) != (N, T, HV, V):
+            raise ValueError(f"d_buffer shape must be {(N, T, HV, V)}, got {tuple(d_buffer.shape)}")
+        if tuple(k_buffer.shape) != (N, T, HV, K) or tuple(g_buffer.shape) != (N, T, HV, K):
+            raise ValueError(f"k_buffer/g_buffer shape must be {(N, T, HV, K)}")
+        d_buf, k_buf, g_buf = d_buffer, k_buffer, g_buffer
     else:
-        u_buf = torch.empty(N, T, HV, V, dtype=torch.float32, device=q.device)
-        kinv_buf = torch.empty(N, T, HV, K, dtype=torch.float32, device=q.device)
-        b_buf = torch.empty(N, T, HV, K, dtype=torch.float32, device=q.device)
+        d_buf = torch.empty(N, T, HV, V, dtype=torch.float32, device=q.device)
+        k_buf = torch.empty(N, T, HV, K, dtype=torch.float32, device=q.device)
+        g_buf = torch.empty(N, T, HV, K, dtype=torch.float32, device=q.device)
 
     stream = _get_cached_stream(q.device)
     h0_source_flat = h0_source.view(pool_size * HV, V, K)
-    compiled_kernel = _get_compiled_gemm_kvbuffer_cute_kernel(
+    compiled_kernel = _get_compiled_tensor_core_kvbuffer_kernel(
         N,
         T,
         H,
@@ -1393,16 +1372,16 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
         b,
         o,
         initial_state_indices,
-        u_buf,
-        kinv_buf,
-        b_buf,
+        d_buf,
+        k_buf,
+        g_buf,
         stream,
     )
     return o
 
 
 # ---------------------------------------------------------------------------
-# BT=8 stacked variant of the cute-gemm kernel (T <= 8). mma.sync m16n8k8 has a
+# BT=8 stacked variant of the tensor_core kernel (T <= 8). mma.sync m16n8k8 has a
 # hard M=16, so instead of padding tokens to 16 the spare 8 M-rows carry a
 # SECOND matrix — pad waste becomes a ~2x instruction saving:
 #   P3: [kdec; qdec] @ kinv^T   -> A (top) and P (bottom) in one GEMM chain
@@ -1416,7 +1395,7 @@ BT = 8
 
 
 @cute.kernel
-def kda_mtp_gemm_kvbuffer_cute_kernel(
+def kda_mtp_tensor_core_kvbuffer_kernel(
     h0_source: cute.Tensor,
     A_log: cute.Tensor,
     a: cute.Tensor,
@@ -1427,9 +1406,9 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
     b: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
-    u_buf: cute.Tensor,
-    kinv_buf: cute.Tensor,
-    b_buf: cute.Tensor,
+    d_buf: cute.Tensor,
+    k_buf: cute.Tensor,
+    g_buf: cute.Tensor,
     vec_size: cutlass.Constexpr[int],
     BV: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
@@ -1491,8 +1470,8 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
     r_kf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_s = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     # P2a pair partials: ceil(2*T*T/4) per warp
-    ppw_cg: cutlass.Constexpr[int] = (2 * T * T + num_warps - 1) // num_warps
-    r_red = cute.make_rmem_tensor(cute.make_layout((ppw_cg,), stride=(1,)), cutlass.Float32)
+    ppw_tc: cutlass.Constexpr[int] = (2 * T * T + num_warps - 1) // num_warps
+    r_red = cute.make_rmem_tensor(cute.make_layout((ppw_tc,), stride=(1,)), cutlass.Float32)
 
     if cache_idx >= 0:
         k_start = lane_id * vec_size
@@ -1565,7 +1544,7 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
         #   r(t,i) = prod_{i<j<=t} g_j <= 1 (ordered product, no division).
         # T*T pairs round-robined over 4 warps, one butterfly per warp
         # (vec_size channels per lane, 32 lanes = K). ----
-        for j in cutlass.range_constexpr(ppw_cg):
+        for j in cutlass.range_constexpr(ppw_tc):
             r_red[j] = cutlass.Float32(0.0)
         p_ctr = 0
         for i_t in cutlass.range_constexpr(T):
@@ -1591,7 +1570,7 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
                     r_red[p_ctr // num_warps] = s
                 p_ctr += 1
         for off in [16, 8, 4, 2, 1]:
-            for j in cutlass.range_constexpr(ppw_cg):
+            for j in cutlass.range_constexpr(ppw_tc):
                 r_red[j] = r_red[j] + cute.arch.shuffle_sync_bfly(r_red[j], offset=off, mask=-1, mask_and_clamp=31)
         # zero-init L/P (covers padding rows), then scatter the pair results
         if tidx < BT * BT:
@@ -1631,8 +1610,8 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
             sKQ[BT + i_t, kc] = sKQ[BT + i_t, kc] * bcum
             if cutlass.const_expr(write_ubuf):
                 if i_v == 0:
-                    kinv_buf[i_n, i_t, i_hv, kc] = kn  # raw key (was k/b_run)
-                    b_buf[i_n, i_t, i_hv, kc] = g_t  # per-step gate (was b_run)
+                    k_buf[i_n, i_t, i_hv, kc] = kn  # raw key (was k/b_run)
+                    g_buf[i_n, i_t, i_hv, kc] = g_t  # per-step gate (was b_run)
         sBlast[kc] = bcum
         cute.arch.barrier()
         if tidx < BT * BT:
@@ -1719,8 +1698,8 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
             sU[gid, vc1] = f1
             if cutlass.const_expr(write_ubuf):
                 if gid < T:
-                    u_buf[i_n, gid, i_hv, v_base + vc0] = f0
-                    u_buf[i_n, gid, i_hv, v_base + vc1] = f1
+                    d_buf[i_n, gid, i_hv, v_base + vc0] = f0
+                    d_buf[i_n, gid, i_hv, v_base + vc1] = f1
             cute.arch.barrier()
             # o = Sqdec + P@u combined in exact fp32 from sU (16 FMA/lane — removes the
             # extra tf32 hop that the stacked [inv;Pinv]@x route put on the output path)
@@ -1774,7 +1753,7 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
 
 
 @cute.jit
-def run_kda_mtp_gemm_kvbuffer_cute_kernel(
+def run_kda_mtp_tensor_core_kvbuffer_kernel(
     h0_source: cute.Tensor,
     A_log: cute.Tensor,
     a: cute.Tensor,
@@ -1785,9 +1764,9 @@ def run_kda_mtp_gemm_kvbuffer_cute_kernel(
     b: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
-    u_buf: cute.Tensor,
-    kinv_buf: cute.Tensor,
-    b_buf: cute.Tensor,
+    d_buf: cute.Tensor,
+    k_buf: cute.Tensor,
+    g_buf: cute.Tensor,
     vec_size: cutlass.Constexpr[int],
     BV: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
@@ -1808,7 +1787,7 @@ def run_kda_mtp_gemm_kvbuffer_cute_kernel(
     lower_bound: cutlass.Constexpr[float],
     stream: cuda.CUstream,
 ):
-    """BT=8 stacked cute-gemm launcher: grid = N*HV*num_v_tiles, block = 128."""
+    """BT=8 stacked tensor_core launcher: grid = N*HV*num_v_tiles, block = 128."""
     n_indices = h0_indices.layout.shape[0]
     grid_size = n_indices * HV * num_v_tiles
     smem_bytes = (
@@ -1822,7 +1801,7 @@ def run_kda_mtp_gemm_kvbuffer_cute_kernel(
         + 4 * BV * (K + 8)  # sS0
         + 512
     )
-    kda_mtp_gemm_kvbuffer_cute_kernel(
+    kda_mtp_tensor_core_kvbuffer_kernel(
         h0_source,
         A_log,
         a,
@@ -1833,9 +1812,9 @@ def run_kda_mtp_gemm_kvbuffer_cute_kernel(
         b,
         o,
         h0_indices,
-        u_buf,
-        kinv_buf,
-        b_buf,
+        d_buf,
+        k_buf,
+        g_buf,
         vec_size,
         BV,
         num_v_tiles,
@@ -1860,6 +1839,25 @@ def run_kda_mtp_gemm_kvbuffer_cute_kernel(
 # ---------------------------------------------------------------------------
 # KVBuffer verify dispatch: route between the two kvbuffer verify ops by T.
 # ---------------------------------------------------------------------------
+def _kvbuffer_prefer_tensor_core(N: int, HV: int, T: int) -> bool:
+    """tensor_core (CuTe tensor-core GEMM, flat-in-T) vs shuffle (token-parallel SIMT)
+    crossover from the kernel-level chain bench (HV in {8,16,32,64}, N in {1..128},
+    T in {2,3,4,6}, K=V=128). Within the kvbuffer family the tensor_core-wins boundary
+    collapses onto the work size S = HV * N: tensor_core overtakes shuffle at T >= 3 for
+    S >= 256, T >= 4 for 64 <= S < 256, and T >= 6 for 32 <= S < 64; shuffle wins across
+    the measured T range for S < 32 (small batch, small HV). True routes to tensor_core."""
+    S = N * HV
+    if S >= 256:
+        t_tc = 3
+    elif S >= 64:
+        t_tc = 4
+    elif S >= 32:
+        t_tc = 6
+    else:
+        t_tc = 7  # shuffle wins through T=6; tensor_core only at even higher T
+    return T >= t_tc
+
+
 def kda_decode_mtp_kvbuffer(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -1877,19 +1875,24 @@ def kda_decode_mtp_kvbuffer(
     out: torch.Tensor | None = None,
     disable_state_update: bool = True,
     emit_output: bool = True,
-    u_buffer: torch.Tensor | None = None,
-    kinv_buffer: torch.Tensor | None = None,
-    b_buffer: torch.Tensor | None = None,
-    t_crossover: int = 3,
+    d_buffer: torch.Tensor | None = None,
+    k_buffer: torch.Tensor | None = None,
+    g_buffer: torch.Tensor | None = None,
+    t_crossover: int | None = None,
     opt_level: int = 3,
     fast_math: bool = True,
     lower_bound: float | None = None,
 ) -> torch.Tensor:
-    """KDA MTP KVBuffer verify dispatch by T: < t_crossover (default 3) -> tp-kvbuffer
-    (token-parallel SIMT), else gemm-kvbuffer (CuTe tensor-core, flat-in-T; crossover T~3
-    from H200). Routes only among kvbuffer ops; recurrent fallback is a higher-layer concern.
+    """KDA MTP KVBuffer verify dispatch between shuffle-kvbuffer (token-parallel SIMT) and
+    tensor_core-kvbuffer (CuTe tensor-core GEMM, flat-in-T). With ``t_crossover=None``
+    (default) the choice follows the kernel-level chain bench via
+    ``_kvbuffer_prefer_tensor_core`` (a function of the work size S = HV*N and T); pass an
+    int to force the legacy T-only rule (tensor_core iff T >= t_crossover). Routes only
+    among kvbuffer ops; the recurrent fallback is a higher-layer concern.
     """
     T = q.shape[1]
+    N = q.shape[0]
+    HV = v.shape[2]
     common = dict(
         A_log=A_log,
         dt_bias=dt_bias,
@@ -1907,13 +1910,17 @@ def kda_decode_mtp_kvbuffer(
         out=out,
         disable_state_update=disable_state_update,
         emit_output=emit_output,
-        u_buffer=u_buffer,
-        kinv_buffer=kinv_buffer,
-        b_buffer=b_buffer,
+        d_buffer=d_buffer,
+        k_buffer=k_buffer,
+        g_buffer=g_buffer,
         opt_level=opt_level,
         fast_math=fast_math,
         lower_bound=lower_bound,
     )
-    if t_crossover <= T:
-        return kda_decode_mtp_gemm_kvbuffer_cute(**common)
-    return kda_decode_mtp_tp_kvbuffer(**common)
+    if t_crossover is None:
+        use_tensor_core = _kvbuffer_prefer_tensor_core(N, HV, T)
+    else:
+        use_tensor_core = t_crossover <= T
+    if use_tensor_core:
+        return kda_decode_mtp_tensor_core_kvbuffer(**common)
+    return kda_decode_mtp_shuffle_kvbuffer(**common)

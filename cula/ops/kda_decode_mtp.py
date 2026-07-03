@@ -1,28 +1,13 @@
 """CuTe DSL KDA MTP decode
 
-Production KDA MTP decode kernel. Public entry point: ``kda_decode_mtp_ws``
-(warp-spec). The defining feature is KDA's per-K-channel decay gate ``g_t in R^K``
-(``beta`` stays a per-(head, token) scalar); the whole kernel is built around that
-channel axis.
-
-Grid = N*HV*num_v_tiles, one CTA per (i_n, i_hv, i_v V-tile). State is
-register-resident across the T tokens; the K-reduce is a full-warp shuffle. The
-recurrence uses the DECAY-FIRST order (decay the whole state, then dot with raw k);
-bf16 rounding differs slightly from the single-token ``kda_decode`` (accumulation
-order), both validated against the fp32 torch oracle at atol 3e-2 / rtol 2e-2.
-
-Scope (this file):
-- Warp-spec variant. ``ilp_rows in {2, 4}``: ilp=2 covers every
-  tile_v in {8,16,32,64}; ilp=4 fuses steps 1+2 and 4+5 with double accumulators +
-  packed F32x2 FMA on SM100 (scalar ``fma_pair`` fallback elsewhere) and requires
-  ``tile_v % 16 == 0`` (so {16,32,64}).
-- ``vk`` state layout only.
-- ``use_smem_v`` (Stage C): preload the v-tile into SMEM + coalesced merged output
-  writeback. Constexpr, off unless the heuristic / an explicit arg turns it on.
-- ``cache_intermediate_states`` (Stage D): when an ``intermediate_states_buffer``
-  ([N, T, HV, V, K] vk) is passed, snapshot every token's post-state to GMEM
-  (sequence-indexed) for speculative-decoding rollback. Produce-only.
-- ``disable_state_update`` supported (default False = always write back).
+Recurrent KDA MTP verify/decode kernels. ``kda_decode_mtp`` dispatches to the
+single-warp ``vk`` (lane=K, Triton-identical K-reduce; production verify variant) and
+``kv`` (lane=V) kernels. KDA's decay gate ``g_t in R^K`` is per-K-channel (``beta`` is
+a per-(head, token) scalar). State is register-resident across the T tokens
+(full-warp-shuffle K-reduce, DECAY-FIRST recurrence); validated vs the fp32 torch
+oracle at atol 3e-2 / rtol 2e-2. An ``intermediate_states_buffer`` ([N,T,HV,V,K] vk)
+snapshots per-token post-states to GMEM for spec-decode rollback;
+``disable_state_update`` skips the final write-back.
 
 Math per token t (decay-first, per-channel g):
     g_t   = exp(-exp(A_log) * softplus(a_t + dt_bias))       # (K,) per-channel
@@ -58,7 +43,7 @@ logger = logging.getLogger(__name__)
 # vec_size = 4 -> 32 threads/group = a full warp, 4 groups (warps) per block.
 VEC_SIZE_MTP = 4
 
-_compiled_mtp_ws_kernels: dict[tuple, object] = {}
+_compiled_mtp_recurrent_ws_kernels: dict[tuple, object] = {}
 
 
 def _normalize_mtp_a(a: torch.Tensor, *, N: int, T: int, HV: int, K: int) -> torch.Tensor:
@@ -123,7 +108,7 @@ def fma_pair(a1, a2, b1, b2, c1, c2):
 
 
 @cute.kernel
-def kda_verify_kernel_mtp_ws(
+def kda_verify_kernel_mtp_recurrent_ws(
     h0_source: cute.Tensor,  # [pool_size * HV, V, K] fp32, K-last (VK layout)
     intermediate_states: cute.Tensor,  # [N*T*HV, V, K] fp32 snapshot cache (or dummy)
     vec_size: cutlass.Constexpr[int],
@@ -209,7 +194,25 @@ def kda_verify_kernel_mtp_ws(
         rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
         flat_state_idx = cache_idx * HV + i_hv  # row in [pool*HV, V, K]
 
-        # ============ Phase 1: warp specialization ============
+        # ---- Phase 1a: all 4 warps compute the per-K-channel decay gate ----
+        g_ch = warp_idx * threads_per_group + lane_in_group
+        for i_t in cutlass.range_constexpr(T):
+            x = cutlass.Float32(a[i_n, i_t, i_hv, g_ch]) + cutlass.Float32(dt_bias[i_hv, g_ch])
+            if cutlass.const_expr(use_lower_bound):
+                # safe gate: g = lower_bound * sigmoid(exp(A_log) * x)
+                sigmoid_ax = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-r_exp_A * x, fastmath=fast_math))
+                sG[(i_t, g_ch)] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
+            else:
+                beta_x = softplus_beta * x
+                exp_beta_x = cute.exp(beta_x, fastmath=fast_math)
+                softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                    cutlass.Float32(1.0) + exp_beta_x, fastmath=fast_math
+                )
+                use_softplus = cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
+                softplus_x = use_softplus * softplus_val + (cutlass.Float32(1.0) - use_softplus) * x
+                sG[(i_t, g_ch)] = cute.exp(-r_exp_A * softplus_x, fastmath=fast_math)
+
+        # ============ Phase 1b: warp 0 q/k+beta, warps 1-3 state prefetch ============
         if warp_idx == 0:
             # Warp 0 computes q/k/g/beta for all T tokens, broadcasts via SMEM.
             for i_t in cutlass.range_constexpr(T):
@@ -244,25 +247,6 @@ def kda_verify_kernel_mtp_ws(
                 for i in cutlass.range_constexpr(vec_size):
                     sQ[(i_t, k_start + i)] = r_q[i]
                     sK[(i_t, k_start + i)] = r_k[i]
-
-                # KDA per-channel decay gate: each lane computes g for its own
-                # vec_size channels. g[kk] = exp(-exp(A_log) * softplus(a+dt_bias)).
-                for i in cutlass.range_constexpr(vec_size):
-                    kk = k_start + i
-                    x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(dt_bias[i_hv, kk])
-                    if cutlass.const_expr(use_lower_bound):
-                        # safe gate: g = lower_bound * sigmoid(exp(A_log) * x)
-                        sigmoid_ax = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-r_exp_A * x, fastmath=fast_math))
-                        sG[(i_t, kk)] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
-                    else:
-                        beta_x = softplus_beta * x
-                        exp_beta_x = cute.exp(beta_x, fastmath=fast_math)
-                        softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                            cutlass.Float32(1.0) + exp_beta_x, fastmath=fast_math
-                        )
-                        use_softplus = cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
-                        softplus_x = use_softplus * softplus_val + (cutlass.Float32(1.0) - use_softplus) * x
-                        sG[(i_t, kk)] = cute.exp(-r_exp_A * softplus_x, fastmath=fast_math)
 
                 # Update gate beta is a per-(head, token) scalar (warp-uniform).
                 r_b = cutlass.Float32(b[i_n, i_t, i_hv])
@@ -764,7 +748,7 @@ def kda_verify_kernel_mtp_ws(
 
 
 @cute.jit
-def run_kda_verify_kernel_mtp_ws(
+def run_kda_verify_kernel_mtp_recurrent_ws(
     h0_source: cute.Tensor,
     intermediate_states: cute.Tensor,
     A_log: cute.Tensor,
@@ -816,7 +800,7 @@ def run_kda_verify_kernel_mtp_ws(
         smem_bytes += 4 * T * tile_v  # sVdata (fp32)
         smem_bytes += 2 * T * tile_v  # sOutput (bf16)
 
-    kda_verify_kernel_mtp_ws(
+    kda_verify_kernel_mtp_recurrent_ws(
         h0_source,
         intermediate_states,
         vec_size,
@@ -856,7 +840,7 @@ def run_kda_verify_kernel_mtp_ws(
     )
 
 
-def _get_compiled_mtp_ws_kernel(
+def _get_compiled_mtp_recurrent_ws_kernel(
     N,
     T,
     H,
@@ -904,8 +888,8 @@ def _get_compiled_mtp_ws_kernel(
         use_lower_bound,
         lower_bound,
     )
-    if key in _compiled_mtp_ws_kernels:
-        return _compiled_mtp_ws_kernels[key]
+    if key in _compiled_mtp_recurrent_ws_kernels:
+        return _compiled_mtp_recurrent_ws_kernels[key]
 
     q = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
     k = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
@@ -945,7 +929,7 @@ def _get_compiled_mtp_ws_kernel(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compiled_kernel = cute.compile(
-        run_kda_verify_kernel_mtp_ws,
+        run_kda_verify_kernel_mtp_recurrent_ws,
         h0_source_tensor,
         intermediate_states_tensor,
         A_log_tensor,
@@ -980,7 +964,7 @@ def _get_compiled_mtp_ws_kernel(
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
     )
 
-    _compiled_mtp_ws_kernels[key] = compiled_kernel
+    _compiled_mtp_recurrent_ws_kernels[key] = compiled_kernel
     logger.info(
         "CuTe DSL KDA MTP warp-spec kernel compiled: "
         f"N={N}, T={T}, H={H}, HV={HV}, K={K}, V={V}, pool_size={pool_size}, "
@@ -990,7 +974,7 @@ def _get_compiled_mtp_ws_kernel(
     return compiled_kernel
 
 
-def kda_decode_mtp_ws(
+def kda_decode_mtp_recurrent_ws(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     q: torch.Tensor,
@@ -1044,7 +1028,7 @@ def kda_decode_mtp_ws(
             use_smem_v = sel_use_smem_v
 
     if ilp_rows not in (2, 4):
-        raise NotImplementedError(f"kda_decode_mtp_ws implements ilp_rows in {{2, 4}}, got {ilp_rows}")
+        raise NotImplementedError(f"kda_decode_mtp_recurrent_ws implements ilp_rows in {{2, 4}}, got {ilp_rows}")
 
     # packed F32x2 FMA exists only on SM100+ (Blackwell）
     if use_packed_fma is None:
@@ -1056,7 +1040,7 @@ def kda_decode_mtp_ws(
 
     state_layout = _canonicalize_state_layout(state_layout)
     if state_layout != "vk":
-        raise NotImplementedError(f"kda_decode_mtp_ws only supports state_layout='vk'; got {state_layout!r}")
+        raise NotImplementedError(f"kda_decode_mtp_recurrent_ws only supports state_layout='vk'; got {state_layout!r}")
 
     assert tile_v % 4 == 0, f"KDA MTP (ws) requires tile_v % 4 == 0, got tile_v={tile_v}"
     assert V % tile_v == 0, f"KDA MTP (ws) requires V % tile_v == 0, got V={V}, tile_v={tile_v}"
@@ -1114,7 +1098,7 @@ def kda_decode_mtp_ws(
 
     stream = _get_cached_stream(q.device)
 
-    compiled_kernel = _get_compiled_mtp_ws_kernel(
+    compiled_kernel = _get_compiled_mtp_recurrent_ws_kernel(
         N,
         T,
         H,
@@ -1155,18 +1139,18 @@ def kda_decode_mtp_ws(
 
 
 # ============================================================================
-# small_batch kernel (1-warp/program):kv layout(lane=V)+ vk layout(lane=K)
+# recurrent kernel (1-warp/program):kv layout(lane=V)+ vk layout(lane=K)
 # ============================================================================
 
 
 WARP_BV = 32
 VEC_SIZE = 4
 
-_compiled_mtp_small_batch_kernels: dict[tuple, object] = {}
+_compiled_mtp_recurrent_kernels: dict[tuple, object] = {}
 
 
 @cute.kernel
-def kda_mtp_small_batch_kernel(
+def kda_mtp_recurrent_kernel(
     h0_source: cute.Tensor,  # [pool*HV, K, V] fp32 (kv, V-last)
     A_log: cute.Tensor,  # [HV] fp32
     a: cute.Tensor,  # [N, T, HV, K]
@@ -1320,7 +1304,7 @@ def kda_mtp_small_batch_kernel(
 
 
 @cute.jit
-def run_kda_mtp_small_batch_kernel(
+def run_kda_mtp_recurrent_kernel(
     h0_source: cute.Tensor,
     A_log: cute.Tensor,
     a: cute.Tensor,
@@ -1355,7 +1339,7 @@ def run_kda_mtp_small_batch_kernel(
 
     smem_bytes = 3 * K * 4 + 256  # sQ + sK + sG
 
-    kda_mtp_small_batch_kernel(
+    kda_mtp_recurrent_kernel(
         h0_source,
         A_log,
         a,
@@ -1391,7 +1375,7 @@ def run_kda_mtp_small_batch_kernel(
     )
 
 
-def _get_compiled_mtp_small_batch_kernel(
+def _get_compiled_mtp_recurrent_kernel(
     N,
     T,
     H,
@@ -1429,8 +1413,8 @@ def _get_compiled_mtp_small_batch_kernel(
         use_lower_bound,
         lower_bound,
     )
-    if key in _compiled_mtp_small_batch_kernels:
-        return _compiled_mtp_small_batch_kernels[key]
+    if key in _compiled_mtp_recurrent_kernels:
+        return _compiled_mtp_recurrent_kernels[key]
 
     q = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
     k = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
@@ -1460,7 +1444,7 @@ def _get_compiled_mtp_small_batch_kernel(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compiled_kernel = cute.compile(
-        run_kda_mtp_small_batch_kernel,
+        run_kda_mtp_recurrent_kernel,
         h0_source_t,
         A_log_t,
         a_t,
@@ -1491,7 +1475,7 @@ def _get_compiled_mtp_small_batch_kernel(
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
     )
 
-    _compiled_mtp_small_batch_kernels[key] = compiled_kernel
+    _compiled_mtp_recurrent_kernels[key] = compiled_kernel
     logger.info(
         "CuTe DSL KDA MTP small-batch kernel compiled: "
         f"N={N}, T={T}, H={H}, HV={HV}, K={K}, V={V}, pool_size={pool_size}, BV={BV}, "
@@ -1512,7 +1496,7 @@ def _select_k_split(work_units, V, num_sms):
     return 1
 
 
-def kda_decode_mtp_small_batch(
+def kda_decode_mtp_recurrent(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     q: torch.Tensor,
@@ -1546,12 +1530,12 @@ def kda_decode_mtp_small_batch(
     else:
         assert scale > 0, f"scale must be positive, got {scale}"
 
-    assert K == TILE_K, f"KDA MTP (small_batch) requires K={TILE_K}, got {K}"
-    assert K % VEC_SIZE == 0 and K // VEC_SIZE == 32, f"small_batch assumes K//vec_size==32, got K={K}, vec_size={VEC_SIZE}"
+    assert K == TILE_K, f"KDA MTP (recurrent) requires K={TILE_K}, got {K}"
+    assert K % VEC_SIZE == 0 and K // VEC_SIZE == 32, f"recurrent assumes K//vec_size==32, got K={K}, vec_size={VEC_SIZE}"
 
     if variant == "kv":
         state_layout = "kv"
-        assert bv == WARP_BV, f"small_batch(kv) supports 1 warp,bv must be {WARP_BV},got {bv}"
+        assert bv == WARP_BV, f"recurrent(kv) supports 1 warp,bv must be {WARP_BV},got {bv}"
         if k_split <= 0:
             num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
             k_split = _select_k_split(N * HV, V, num_sms)
@@ -1560,7 +1544,7 @@ def kda_decode_mtp_small_batch(
             f"requires bv%k_split==0 and K%k_split==0, got bv={bv}, K={K}, k_split={k_split}"
         )
         vcols = bv // k_split
-        assert V % vcols == 0, f"small_batch(kv) requires V % (bv//k_split) == 0, got V={V}, vcols={vcols}"
+        assert V % vcols == 0, f"recurrent(kv) requires V % (bv//k_split) == 0, got V={V}, vcols={vcols}"
     else:  # vk
         state_layout = "vk"
         if bv <= 0:
@@ -1623,7 +1607,7 @@ def kda_decode_mtp_small_batch(
 
     if variant == "kv":
         h0_source_flat = h0_source.view(pool_size * HV, K, V)  # kv
-        compiled_kernel = _get_compiled_mtp_small_batch_kernel(
+        compiled_kernel = _get_compiled_mtp_recurrent_kernel(
             N,
             T,
             H,
@@ -1701,7 +1685,7 @@ def kda_decode_mtp_small_batch(
 
 
 @cute.kernel
-def kda_mtp_small_batch_vk_kernel(
+def kda_mtp_recurrent_vk_kernel(
     h0_source: cute.Tensor,  # [pool*HV, V, K] fp32 (vk)
     A_log: cute.Tensor,
     a: cute.Tensor,
@@ -1900,7 +1884,7 @@ def kda_mtp_small_batch_vk_kernel(
 
 
 @cute.jit
-def run_kda_mtp_small_batch_vk_kernel(
+def run_kda_mtp_recurrent_vk_kernel(
     h0_source: cute.Tensor,
     A_log: cute.Tensor,
     a: cute.Tensor,
@@ -1935,7 +1919,7 @@ def run_kda_mtp_small_batch_vk_kernel(
     num_v_tiles = cute.ceil_div(V, BV)
     grid_size = n_indices * HV * num_v_tiles
 
-    kda_mtp_small_batch_vk_kernel(
+    kda_mtp_recurrent_vk_kernel(
         h0_source,
         A_log,
         a,
@@ -2064,7 +2048,7 @@ def _get_compiled_mtp_vk_kernel(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compiled_kernel = cute.compile(
-        run_kda_mtp_small_batch_vk_kernel,
+        run_kda_mtp_recurrent_vk_kernel,
         h0_source_t,
         A_log_t,
         a_t,
@@ -2112,6 +2096,11 @@ def _select_vk_bv(work_units, V, num_sms):
     return 32
 
 
+# T>4 recurrent dispatch: below this work-unit (N*HV) count the single-warp vk kernel
+# still beats warp-spec at high T; at/above it vk hits the DRAM-bandwidth wall (kernel bench).
+_WS_WORK_UNIT_THRESHOLD = 2048
+
+
 def kda_decode_mtp(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -2152,11 +2141,12 @@ def kda_decode_mtp(
         intermediate_states_buffer=intermediate_states_buffer,
     )
     if state_layout == "kv":
-        return kda_decode_mtp_small_batch(**common, variant="kv", k_split=-1)  # k_split auto
-    # T=1 single-token decode: vk small_batch is fastest at every batch (beats
-    # ws/packed across all N, see bench_kda_decode_t1_vs_sgl) -> route T=1 to vk.
+        return kda_decode_mtp_recurrent(**common, variant="kv", k_split=-1)  # k_split auto
     T = q.shape[1]
     work_units = q.shape[0] * v.shape[2]  # N * HV
-    if T == 1 or work_units <= 512:
-        return kda_decode_mtp_small_batch(**common, variant="vk", bv=-1)  # bv auto
-    return kda_decode_mtp_ws(**common, state_layout="vk")
+    # T <= 4: single-warp vk wins everywhere. T > 4: vk still wins except in the large
+    # batch x large HV regime (N*HV >= _WS_WORK_UNIT_THRESHOLD) where the single-warp
+    # kernel hits the DRAM-bandwidth wall (~0.42x); route only that regime to recurrent_ws.
+    if T <= 4 or work_units < _WS_WORK_UNIT_THRESHOLD:
+        return kda_decode_mtp_recurrent(**common, variant="vk", bv=-1)  # bv auto
+    return kda_decode_mtp_recurrent_ws(**common, state_layout="vk")

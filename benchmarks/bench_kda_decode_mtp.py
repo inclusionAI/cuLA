@@ -2,8 +2,8 @@
 
 Unified bench (supersedes the old forward-only bench_kda_decode_mtp and
 bench_kda_kvbuffer). Variants, selectable via --only / --profile:
-  recurrent verify: vk / ws / tri (official Triton), all writing T*d^2 states;
-  kvbuffer verify:  tpkvb (token-parallel) / cgkvb (CuTe sm_90 tensor-core GEMM
+  recurrent verify: vk / tri (official Triton), all writing T*d^2 states;
+  kvbuffer verify:  shuffle (token-parallel) / tcore (CuTe sm_90 tensor-core GEMM
                     form, flat-in-T), both writing the compact u-buffer;
   forward-only baselines (no rollback cost, breakdown table only): kv / auto / loop.
 
@@ -25,26 +25,26 @@ import torch
 from cula.ops.kda_decode import kda_decode
 from cula.ops.kda_decode_mtp import (
     kda_decode_mtp,
-    kda_decode_mtp_small_batch,
-    kda_decode_mtp_ws,
+    kda_decode_mtp_recurrent,
+    kda_decode_mtp_recurrent_ws,
 )
 from cula.ops.kda_decode_mtp_kvbuffer import kda_flush_kvbuffer
 
-# tp-kvbuffer (token-parallel, structure B) is optional too.
+# shuffle-kvbuffer (token-parallel, structure B) is optional too.
 try:
-    from cula.ops.kda_decode_mtp_kvbuffer import kda_decode_mtp_tp_kvbuffer
+    from cula.ops.kda_decode_mtp_kvbuffer import kda_decode_mtp_shuffle_kvbuffer
 
-    _HAVE_TPKVB = True
+    _HAVE_SHUFFLE = True
 except Exception:
-    _HAVE_TPKVB = False
+    _HAVE_SHUFFLE = False
 
-# gemm-kvbuffer (CuTe sm_90 tensor-core, flat-in-T verify).
+# tensor_core-kvbuffer (CuTe sm_90 tensor-core, flat-in-T verify).
 try:
-    from cula.ops.kda_decode_mtp_kvbuffer import kda_decode_mtp_gemm_kvbuffer_cute
+    from cula.ops.kda_decode_mtp_kvbuffer import kda_decode_mtp_tensor_core_kvbuffer
 
-    _HAVE_CGKVB = True
+    _HAVE_TCORE = True
 except Exception:
-    _HAVE_CGKVB = False
+    _HAVE_TCORE = False
 
 
 def _load_from_file(path, attr):
@@ -130,7 +130,7 @@ def make_triton_call(
     cache_steps=None,
 ):
     """Official sglang recurrent verify. In verify mode (inter_buf set) it writes the T·d²
-    intermediate_states_buffer, same rollback cost as our production vk_v/ws_v."""
+    intermediate_states_buffer, same rollback cost as our production vk_v."""
 
     def call():
         return fused_sigmoid_gating_delta_rule_update(
@@ -204,7 +204,7 @@ def make_vk_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, inte
     intermediate_states_buffer — the rollback cost kvbuffer replaces with a u-buffer."""
 
     def call():
-        return kda_decode_mtp_small_batch(
+        return kda_decode_mtp_recurrent(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,
@@ -227,11 +227,11 @@ def make_vk_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, inte
     return call
 
 
-def make_ws_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, inter_buf=None):
-    """Production recurrent ws. In verify mode (inter_buf set) it also writes T·d² states."""
+def make_recurrent_ws_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, inter_buf=None):
+    """Production warp-spec recurrent (recurrent_ws). In verify mode (inter_buf set) it also writes T*d^2 states."""
 
     def call():
-        return kda_decode_mtp_ws(
+        return kda_decode_mtp_recurrent_ws(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,
@@ -252,15 +252,15 @@ def make_ws_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, inte
     return call
 
 
-def make_tpkvb_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, ubufs=None):
-    """tp-kvbuffer (token-parallel chunkwise, structure B) — target: verify latency ~flat in T.
-    tile_v / ilp_rows overridable via env KDA_TPKVB_TILE_V / KDA_TPKVB_ILP_ROWS (-1 = auto)."""
-    u_buf, kinv_buf, b_buf = ubufs if ubufs is not None else (None, None, None)
-    _tv = int(os.environ.get("KDA_TPKVB_TILE_V", "-1"))
-    _ilp = int(os.environ.get("KDA_TPKVB_ILP_ROWS", "-1"))
+def make_shuffle_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, ubufs=None):
+    """shuffle-kvbuffer (token-parallel chunkwise, structure B) — target: verify latency ~flat in T.
+    tile_v / ilp_rows overridable via env KDA_SHUFFLE_TILE_V / KDA_SHUFFLE_ILP_ROWS (-1 = auto)."""
+    d_buf, k_buf, g_buf = ubufs if ubufs is not None else (None, None, None)
+    _tv = int(os.environ.get("KDA_SHUFFLE_TILE_V", "-1"))
+    _ilp = int(os.environ.get("KDA_SHUFFLE_ILP_ROWS", "-1"))
 
     def call():
-        return kda_decode_mtp_tp_kvbuffer(
+        return kda_decode_mtp_shuffle_kvbuffer(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,
@@ -276,9 +276,9 @@ def make_tpkvb_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, u
             softplus_threshold=20.0,
             disable_state_update=dsu,
             emit_output=True,
-            u_buffer=u_buf,
-            kinv_buffer=kinv_buf,
-            b_buffer=b_buf,
+            d_buffer=d_buf,
+            k_buffer=k_buf,
+            g_buffer=g_buf,
             tile_v=_tv,
             ilp_rows=_ilp,
         )
@@ -286,14 +286,14 @@ def make_tpkvb_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, u
     return call
 
 
-def make_cgkvb_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, ubufs=None):
-    """CuTe sm_90 tensor-core gemm-kvbuffer. env KDA_CGKVB_BV / KDA_CGKVB_NUM_V_TILES (-1 = auto)."""
-    u_buf, kinv_buf, b_buf = ubufs if ubufs is not None else (None, None, None)
-    _bv = int(os.environ.get("KDA_CGKVB_BV", "32"))
-    _num_v_tiles = int(os.environ.get("KDA_CGKVB_NUM_V_TILES", "-1"))
+def make_tcore_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, ubufs=None):
+    """CuTe sm_90 tensor-core tensor_core-kvbuffer. env KDA_TCORE_BV / KDA_TCORE_NUM_V_TILES (-1 = auto)."""
+    d_buf, k_buf, g_buf = ubufs if ubufs is not None else (None, None, None)
+    _bv = int(os.environ.get("KDA_TCORE_BV", "32"))
+    _num_v_tiles = int(os.environ.get("KDA_TCORE_NUM_V_TILES", "-1"))
 
     def call():
-        return kda_decode_mtp_gemm_kvbuffer_cute(
+        return kda_decode_mtp_tensor_core_kvbuffer(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,
@@ -309,9 +309,9 @@ def make_cgkvb_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, u
             softplus_threshold=20.0,
             disable_state_update=dsu,
             emit_output=True,
-            u_buffer=u_buf,
-            kinv_buffer=kinv_buf,
-            b_buffer=b_buf,
+            d_buffer=d_buf,
+            k_buffer=k_buf,
+            g_buffer=g_buf,
             bv=_bv,
             num_v_tiles=_num_v_tiles,
         )
@@ -320,11 +320,11 @@ def make_cgkvb_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, u
 
 
 def make_kv_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu):
-    """Forward-only production kv (lane=V small_batch; no intermediate-state support)."""
+    """Forward-only production kv (lane=V recurrent; no intermediate-state support)."""
     state_kv = state.transpose(-2, -1).contiguous()  # vk->kv once, outside timing
 
     def call():
-        return kda_decode_mtp_small_batch(
+        return kda_decode_mtp_recurrent(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,
@@ -346,7 +346,7 @@ def make_kv_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu):
 
 
 def make_auto_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, inter_buf=None):
-    """kda_decode_mtp dispatch (small_batch vk for N*HV<=512, else ws)."""
+    """kda_decode_mtp dispatch (recurrent vk)."""
 
     def call():
         return kda_decode_mtp(
@@ -435,10 +435,10 @@ def make_gather_commit_call(state_pool, inter_buf, m):
 
 def make_flush_call(state_pool, indices, ubufs, m):
     """KVBuffer flush: read the compact u-buffer, rank-m rebuild S_m (no recompute)."""
-    u_b, kinv_b, b_b = ubufs
+    d_b, k_b, g_b = ubufs
 
     def call():
-        return kda_flush_kvbuffer(state_pool, indices, u_b, kinv_b, b_b, m)
+        return kda_flush_kvbuffer(state_pool, indices, d_b, k_b, g_b, m)
 
     return call
 
@@ -472,12 +472,12 @@ def _profile_one(args, DSU, device):
     p = args.profile
     if p == "vk":
         fn = make_vk_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)
-    elif p == "ws":
-        fn = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)
-    elif p == "tpkvb":
-        fn = make_tpkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
-    elif p == "cgkvb":
-        fn = make_cgkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
+    elif p == "recurrent_ws":
+        fn = make_recurrent_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)
+    elif p == "shuffle":
+        fn = make_shuffle_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
+    elif p == "tcore":
+        fn = make_tcore_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
     elif p == "triton":
         qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
         tri_idx = torch.arange(N, device=device, dtype=torch.int32)
@@ -494,7 +494,7 @@ def _profile_one(args, DSU, device):
     elif p == "loop":
         fn = make_loop_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU)
     elif p == "flush":
-        make_tpkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)()
+        make_shuffle_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)()
         fn = make_flush_call(state0.clone(), indices, ubufs, m)
     for _ in range(5):
         fn()
@@ -545,7 +545,7 @@ def main():
         "--only",
         nargs="+",
         default=[],
-        choices=["vk", "ws", "tri", "tpkvb", "cgkvb", "kv", "auto", "loop"],
+        choices=["vk", "recurrent_ws", "tri", "shuffle", "tcore", "kv", "auto", "loop"],
         help="restrict check/timing to these verify variants (default: all). REC/spd columns show n/a for skipped baselines.",
     )
     ap.add_argument("--check", action="store_true", help="numerical check only, no timing")
@@ -553,7 +553,7 @@ def main():
     ap.add_argument(
         "--profile",
         default="",
-        choices=["", "vk", "ws", "tpkvb", "cgkvb", "triton", "commit", "flush", "kv", "auto", "loop"],
+        choices=["", "vk", "recurrent_ws", "shuffle", "tcore", "triton", "commit", "flush", "kv", "auto", "loop"],
         help="ncu profile mode: run one method's kernel in a loop (uses batch-sizes[0], Ts[0])",
     )
     ap.add_argument("--profile-iters", type=int, default=20, help="kernel launches in the profiled loop")
@@ -569,14 +569,14 @@ def main():
         _profile_one(args, DSU, device)
         return
     print(f"GPU: {torch.cuda.get_device_name()}")
-    print(f"shape H={args.H} HV={args.HV} K={args.K} V={args.V}  dsu={DSU} tpkvb_impl={_HAVE_TPKVB} cgkvb_impl={_HAVE_CGKVB}")
+    print(f"shape H={args.H} HV={args.HV} K={args.K} V={args.V}  dsu={DSU} shuffle_impl={_HAVE_SHUFFLE} tcore_impl={_HAVE_TCORE}")
 
     # ---------------- numerical check (vs Triton recurrent) ----------------
     if not _HAVE_TRITON:
         print(f"[warn] Triton baseline unavailable ({_TRITON_ERR}); skipping numerical check.")
     else:
         print(f"\n=== numerical check (max|Δ| vs Triton recurrent, threshold {args.atol}) ===")
-        print(f"{'N':>4} {'T':>3} | {'Δ vk':>10} | {'Δ ws':>10} | {'Δ tpkvb':>10} | {'Δ cgkvb':>10} | flag")
+        print(f"{'N':>4} {'T':>3} | {'Δ vk':>10} | {'Δ rec_ws':>10} | {'Δ shuffle':>10} | {'Δ tcore':>10} | flag")
         for N in args.batch_sizes:
             for T in args.Ts:
                 q, k, v, a, b, A_log, dt_bias, state0, indices = make_dense_inputs(
@@ -586,24 +586,25 @@ def main():
                 qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
                 o_tri = make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias, state0.clone(), indices, scale, True)()
                 o_tri = o_tri.reshape(N, T, args.HV, args.V)
-                d_vk = d_ws = float("nan")
+                d_vk = float("nan")
                 if _want("vk"):
                     o_vk = make_vk_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True)()
                     d_vk = (o_vk - o_tri).abs().max().item()
-                if _want("ws"):
-                    o_ws = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True)()
-                    d_ws = (o_ws - o_tri).abs().max().item()
-                d_tpkvb = float("nan")
-                if _HAVE_TPKVB and _want("tpkvb"):
-                    o_tpkvb = make_tpkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True)()
-                    d_tpkvb = (o_tpkvb - o_tri).abs().max().item()
-                d_cgkvb = float("nan")
-                if _HAVE_CGKVB and _want("cgkvb"):
-                    o_cgkvb = make_cgkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True)()
-                    d_cgkvb = (o_cgkvb - o_tri).abs().max().item()
-                cand = [x for x in (d_vk, d_ws, d_tpkvb, d_cgkvb) if x == x]
+                d_recws = float("nan")
+                if _want("recurrent_ws"):
+                    o_recws = make_recurrent_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True)()
+                    d_recws = (o_recws - o_tri).abs().max().item()
+                d_shuffle = float("nan")
+                if _HAVE_SHUFFLE and _want("shuffle"):
+                    o_shuffle = make_shuffle_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True)()
+                    d_shuffle = (o_shuffle - o_tri).abs().max().item()
+                d_tcore = float("nan")
+                if _HAVE_TCORE and _want("tcore"):
+                    o_tcore = make_tcore_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True)()
+                    d_tcore = (o_tcore - o_tri).abs().max().item()
+                cand = [x for x in (d_vk, d_recws, d_shuffle, d_tcore) if x == x]
                 flag = ("OK" if max(cand) < args.atol else "DIFF!") if cand else "n/a"
-                print(f"{N:>4} {T:>3} | {d_vk:>10.2e} | {d_ws:>10.2e} | {d_tpkvb:>10.2e} | {d_cgkvb:>10.2e} | {flag}")
+                print(f"{N:>4} {T:>3} | {d_vk:>10.2e} | {d_recws:>10.2e} | {d_shuffle:>10.2e} | {d_tcore:>10.2e} | {flag}")
 
     if args.check:
         return
@@ -613,9 +614,9 @@ def main():
 
 def _timing_verify_chain(args, DSU, device):
     """Fair spec-decode verify CHAIN (each segment timed in its own CUDA graph, summed). All verify
-    kernels run dsu=1 + verify-mode: recurrent vk/ws/triton write the T·d² intermediate states,
+    kernels run dsu=1 + verify-mode: recurrent vk/triton write the T·d² intermediate states,
     kvbuffer writes its compact u-buffer. REC = recurrent verify + commit; KVB = kvbuffer verify +
-    flush. spd_vk/spd_ws = REC/KVB vs production vk/ws; spd_vkbf/spd_wsbf = official triton REC chain
+    flush. spd_vk = REC/KVB vs production vk; spd_vkbf = official triton REC chain
     / kvbuffer KVB chain. Prints chain totals + speedups first, per-segment breakdown after."""
 
     def us(x):
@@ -655,31 +656,31 @@ def _timing_verify_chain(args, DSU, device):
                 tg["vk_v"] = time_seg(
                     make_vk_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)
                 )
-            if _want("vk") or _want("ws") or _want("tri"):
+            if _want("recurrent_ws"):
+                tg["recws_v"] = time_seg(
+                    make_recurrent_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)
+                )
+            if _want("vk") or _want("recurrent_ws") or _want("tri"):
                 if args.commit == "scatter":
                     fn_cmt = make_scatter_commit_call(state0.clone(), inter_buf, m, N, T, args.HV, args.V, args.K)
                 else:
                     fn_cmt = make_gather_commit_call(state0.clone(), inter_buf, m)
                 tg["cmt"] = time_seg(fn_cmt)
-            if _want("ws"):
-                tg["ws_v"] = time_seg(
-                    make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)
-                )
             # kvbuffer verify (dsu=1, writes u-buffer) + flush
-            if _want("tpkvb") or _want("cgkvb"):
+            if _want("shuffle") or _want("tcore"):
                 # flush needs a populated u-buffer: run one kvbuffer verify first to fill it
-                if _HAVE_TPKVB and _want("tpkvb"):
-                    make_tpkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)()
-                elif _HAVE_CGKVB and _want("cgkvb"):
-                    make_cgkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)()
+                if _HAVE_SHUFFLE and _want("shuffle"):
+                    make_shuffle_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)()
+                elif _HAVE_TCORE and _want("tcore"):
+                    make_tcore_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)()
                 tg["flush"] = time_seg(make_flush_call(state0.clone(), indices, ubufs, m))
-            if _HAVE_TPKVB and _want("tpkvb"):
-                tg["tpkvb_v"] = time_seg(
-                    make_tpkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
+            if _HAVE_SHUFFLE and _want("shuffle"):
+                tg["shuffle_v"] = time_seg(
+                    make_shuffle_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
                 )
-            if _HAVE_CGKVB and _want("cgkvb"):
-                tg["cgkvb_v"] = time_seg(
-                    make_cgkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
+            if _HAVE_TCORE and _want("tcore"):
+                tg["tcore_v"] = time_seg(
+                    make_tcore_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
                 )
             # official triton recurrent verify (dsu=1, writes T·d² states)
             if _HAVE_TRITON and _want("tri"):
@@ -698,41 +699,41 @@ def _timing_verify_chain(args, DSU, device):
                 return tg[av] + tg[bv] if (av in tg and bv in tg) else None
 
             r["REC_vk"] = _sum("vk_v", "cmt")
-            r["REC_ws"] = _sum("ws_v", "cmt")
-            r["KVB_tp"] = _sum("tpkvb_v", "flush")
-            r["KVB_cg"] = _sum("cgkvb_v", "flush")
+            r["REC_rws"] = _sum("recws_v", "cmt")
+            r["KVB_shuffle"] = _sum("shuffle_v", "flush")
+            r["KVB_tcore"] = _sum("tcore_v", "flush")
             r["REC_tri"] = _sum("tri_v", "cmt")
             results.append(r)
 
     # ---- table 1: chain totals + speedups ----
     print(f"\n=== verify-CHAIN total latency (us) + speedup — accept m={args.accept} commit={args.commit} ===")
     print("  REC_* = recurrent verify (writes T·d² states) + commit;  KVB_* = kvbuffer verify (u-buffer) + flush")
-    print("  spd_(vk/ws/tp/cg) = REC_tri (official triton) / (REC_vk/REC_ws/KVB_tp/KVB_cg) -- chain speedup over triton")
+    print("  spd_(vk/rws/shuffle/tcore) = REC_tri (official triton) / (REC_vk/REC_rws/KVB_shuffle/KVB_tcore) -- chain speedup over triton")
     hdr = (
-        f"{'N':>4} {'T':>3} {'m':>3} | {'REC_vk':>7} {'REC_ws':>7} {'REC_tri':>7} | {'KVB_tp':>7} {'KVB_cg':>7} | "
-        f"{'spd_vk':>7} {'spd_ws':>7} {'spd_tp':>7} {'spd_cg':>7}"
+        f"{'N':>4} {'T':>3} {'m':>3} | {'REC_vk':>7} {'REC_rws':>7} {'REC_tri':>7} | {'KVB_shuffle':>11} {'KVB_tcore':>9} | "
+        f"{'spd_vk':>7} {'spd_rws':>7} {'spd_shuffle':>11} {'spd_tcore':>9}"
     )
     print(hdr)
     print("-" * len(hdr))
     for r in results:
         print(
-            f"{r['N']:>4} {r['T']:>3} {r['m']:>3} | {us(r['REC_vk']):>7} {us(r['REC_ws']):>7} {us(r['REC_tri']):>7} | "
-            f"{us(r['KVB_tp']):>7} {us(r['KVB_cg']):>7} | "
-            f"{rat(r['REC_tri'], r['REC_vk']):>7} {rat(r['REC_tri'], r['REC_ws']):>7} {rat(r['REC_tri'], r['KVB_tp']):>7} {rat(r['REC_tri'], r['KVB_cg']):>7}"
+            f"{r['N']:>4} {r['T']:>3} {r['m']:>3} | {us(r['REC_vk']):>7} {us(r['REC_rws']):>7} {us(r['REC_tri']):>7} | "
+            f"{us(r['KVB_shuffle']):>11} {us(r['KVB_tcore']):>9} | "
+            f"{rat(r['REC_tri'], r['REC_vk']):>7} {rat(r['REC_tri'], r['REC_rws']):>7} {rat(r['REC_tri'], r['KVB_shuffle']):>11} {rat(r['REC_tri'], r['KVB_tcore']):>9}"
         )
 
     # ---- table 2: per-segment breakdown ----
     print("\n=== per-segment breakdown (us) — verify kernels + shared commit/flush ===")
     hdr2 = (
-        f"{'N':>4} {'T':>3} | {'vk_v':>6} {'ws_v':>6} {'tri_v':>6} | {'tpkvb_v':>7} {'cgkvb_v':>7} | {'cmt':>5} {'flush':>6}"
+        f"{'N':>4} {'T':>3} | {'vk_v':>6} {'recws_v':>7} {'tri_v':>6} | {'shuffle_v':>9} {'tcore_v':>7} | {'cmt':>5} {'flush':>6}"
     )
     print(hdr2)
     print("-" * len(hdr2))
     for r in results:
         tg = r["tg"]
         print(
-            f"{r['N']:>4} {r['T']:>3} | {us(tg.get('vk_v')):>6} {us(tg.get('ws_v')):>6} {us(tg.get('tri_v')):>6} | "
-            f"{us(tg.get('tpkvb_v')):>7} {us(tg.get('cgkvb_v')):>7} | "
+            f"{r['N']:>4} {r['T']:>3} | {us(tg.get('vk_v')):>6} {us(tg.get('recws_v')):>7} {us(tg.get('tri_v')):>6} | "
+            f"{us(tg.get('shuffle_v')):>9} {us(tg.get('tcore_v')):>7} | "
             f"{us(tg.get('cmt')):>5} {us(tg.get('flush')):>6}"
         )
 

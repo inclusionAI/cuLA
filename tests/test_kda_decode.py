@@ -33,7 +33,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from cula.kda import fused_sigmoid_gating_delta_rule_update, kda_decode
+from cula.ops import fused_sigmoid_gating_delta_rule_update, kda_decode
 
 
 # ---------------------------------------------------------------------------
