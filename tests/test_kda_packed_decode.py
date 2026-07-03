@@ -568,6 +568,122 @@ def test_packed_mixed_qkv_allows_padded_row_stride():
     _assert_close("state", state_ref, state_p)
 
 
+def test_packed_mixed_qkv_allows_padded_row_stride_n1():
+    N, H, HV, V = 1, 8, 16, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs(N, H, HV, K, V)
+
+    mixed = _pack_mixed_qkv(q, k, v, N)
+    padded = torch.empty(N, mixed.shape[1] + 8, device="cuda", dtype=torch.bfloat16)
+    mixed_padded_view = padded[:, : mixed.shape[1]]
+    mixed_padded_view.copy_(mixed)
+    assert mixed_padded_view.stride(-1) == 1
+    assert mixed_padded_view.stride(0) != mixed.shape[1]
+
+    indices = torch.arange(N, device="cuda", dtype=torch.int32)
+    state_p = state.clone()
+    o_p = kda_packed_decode(
+        mixed_padded_view,
+        a.unsqueeze(1).contiguous(),
+        b.unsqueeze(1).contiguous(),
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state=state_p,
+        state_indices=indices,
+        scale=scale,
+    ).squeeze(1)
+
+    state_ref = state.clone()
+    o_ref = kda_decode(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q.unsqueeze(1).contiguous(),
+        k=k.unsqueeze(1).contiguous(),
+        v=v.unsqueeze(1).contiguous(),
+        a=a.unsqueeze(1).contiguous(),
+        b=b.unsqueeze(1).contiguous(),
+        initial_state_source=state_ref,
+        initial_state_indices=indices,
+        scale=scale,
+    ).squeeze(1)
+
+    _assert_close("output", o_ref.float(), o_p.float())
+    _assert_close("state", state_ref, state_p)
+
+
+@pytest.mark.parametrize("is_varlen", [False, True])
+def test_packed_general_path_accepts_noncontiguous_a_b(is_varlen):
+    N, H, HV, V = 4, 8, 16, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs(N, H, HV, K, V)
+    mixed = _pack_mixed_qkv(q, k, v, N)
+
+    a_flat = a.reshape(N, HV * K)
+    a_padded = torch.empty(N, HV * K + 1, device="cuda", dtype=torch.bfloat16)
+    a_arg = a_padded[:, : HV * K]
+    a_arg.copy_(a_flat)
+    b_padded = torch.empty(N, HV + 1, device="cuda", dtype=torch.bfloat16)
+    b_arg = b_padded[:, :HV]
+    b_arg.copy_(b)
+    assert not a_arg.is_contiguous()
+    assert not b_arg.is_contiguous()
+
+    state_p = state.clone()
+    if is_varlen:
+        o_p = kda_packed_decode(
+            mixed,
+            a_arg,
+            b_arg,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            state=state_p,
+            state_indices=torch.arange(N, device="cuda", dtype=torch.int32),
+            cu_seqlens=torch.arange(N + 1, device="cuda", dtype=torch.int32),
+            scale=scale,
+        ).squeeze(0)
+        state_ref = state.clone()
+        o_ref = kda_decode(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q.unsqueeze(0).contiguous(),
+            k=k.unsqueeze(0).contiguous(),
+            v=v.unsqueeze(0).contiguous(),
+            a=a.contiguous(),
+            b=b.contiguous(),
+            initial_state_source=state_ref,
+            initial_state_indices=torch.arange(N, device="cuda", dtype=torch.int32),
+            cu_seqlens=torch.arange(N + 1, device="cuda", dtype=torch.int32),
+            scale=scale,
+        ).squeeze(0)
+    else:
+        o_p = kda_packed_decode(
+            mixed,
+            a_arg,
+            b_arg,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            state=state_p,
+            state_indices=torch.arange(N, device="cuda", dtype=torch.int32),
+            scale=scale,
+        ).squeeze(1)
+        state_ref = state.clone()
+        o_ref = kda_decode(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q.unsqueeze(1).contiguous(),
+            k=k.unsqueeze(1).contiguous(),
+            v=v.unsqueeze(1).contiguous(),
+            a=a.unsqueeze(1).contiguous(),
+            b=b.unsqueeze(1).contiguous(),
+            initial_state_source=state_ref,
+            initial_state_indices=torch.arange(N, device="cuda", dtype=torch.int32),
+            scale=scale,
+        ).squeeze(1)
+
+    _assert_close("output", o_ref.float(), o_p.float())
+    _assert_close("state", state_ref, state_p)
+
+
 # ---------------------------------------------------------------------------
 # Padded batch + CUDA graph capture/replay
 # ---------------------------------------------------------------------------

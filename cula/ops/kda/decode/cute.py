@@ -328,7 +328,7 @@ def _try_fast_dense_packed_decode(
         mixed_qkv.ndim != 2
         or mixed_qkv.shape != (N, qkv_dim)
         or mixed_qkv.stride(-1) != 1
-        or (N > 1 and mixed_qkv.stride(0) < qkv_dim)
+        or mixed_qkv.stride(0) < qkv_dim
         or mixed_qkv.device.type != "cuda"
         or mixed_qkv.dtype != torch.bfloat16
     ):
@@ -406,7 +406,7 @@ def _try_fast_dense_packed_decode(
     elif scale <= 0:
         return None
 
-    # Construct strided q/k/v views (row stride = qkv_dim, last dim contiguous)
+    # Construct strided q/k/v views (row stride may include padding, last dim contiguous)
     # and the matching output. Shapes align with the compile-time mock in the
     # packed compile paths: varlen -> [1,N,...], dense -> [N,1,...].
     if is_varlen_decode:
@@ -448,7 +448,7 @@ def _try_fast_dense_packed_decode(
         HV,
         K,
         V,
-        mixed_qkv.stride(0) if N > 1 else qkv_dim,
+        mixed_qkv.stride(0),
         initial_state_source.shape[0],
         use_small_batch,
         is_varlen_decode,
@@ -2453,7 +2453,7 @@ def kda_packed_decode(
 
     Takes a packed ``mixed_qkv`` of shape ``[N, qkv_dim]`` laid out as
     ``[Q(H·K) | K(H·K) | V(HV·V)]`` (head-major, last dim contiguous, row stride
-    = qkv_dim) and feeds the existing CuTe DSL KDA decode kernel q/k/v as
+    >= qkv_dim) and feeds the existing CuTe DSL KDA decode kernel q/k/v as
     strided views directly — avoiding the q/k/v materialization and the
     ``.contiguous()`` copy that ``kda_decode`` performs.
 
@@ -2521,7 +2521,7 @@ def kda_packed_decode(
     is_varlen_decode = cu_seqlens is not None
     if mixed_qkv.shape[0] != N:
         raise ValueError(f"mixed_qkv batch size {mixed_qkv.shape[0]} must match state_indices length {N}")
-    row_stride = mixed_qkv.stride(0) if N > 1 else qkv_dim
+    row_stride = mixed_qkv.stride(0)
     if mixed_qkv.stride(-1) != 1 or row_stride < qkv_dim:
         raise ValueError(
             f"mixed_qkv must use packed-row layout with stride(-1)=1 and stride(0)>=qkv_dim={qkv_dim}; "
@@ -2573,6 +2573,7 @@ def kda_packed_decode(
         state_layout=state_layout_canonical,
     )
     a_kernel = _normalize_kda_a(a, is_varlen_decode=is_varlen_decode, N=N, HV=HV, K=K)
+    a_kernel = a_kernel if a_kernel.is_contiguous() else a_kernel.contiguous()
     if is_varlen_decode:
         if b.dim() == 3:
             b_kernel = b.squeeze(0)
@@ -2583,6 +2584,7 @@ def kda_packed_decode(
             b_kernel = b.unsqueeze(1)
         else:
             b_kernel = b
+    b_kernel = b_kernel if b_kernel.is_contiguous() else b_kernel.contiguous()
     A_log_n = _normalize_A_log(A_log, HV)
     dt_bias_n = _normalize_dt_bias(dt_bias, HV, K)
     indices_n = _normalize_state_indices(state_indices, N=N, pool_size=pool_size, device=mixed_qkv.device)
