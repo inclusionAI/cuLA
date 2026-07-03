@@ -3,7 +3,7 @@
 Unified bench (supersedes the old forward-only bench_kda_decode_mtp and
 bench_kda_kvbuffer). Variants, selectable via --only / --profile:
   recurrent verify: vk / tri (official Triton), all writing T*d^2 states;
-  kvbuffer verify:  shuffle (token-parallel) / tcore (CuTe sm_90 tensor-core GEMM
+  kvbuffer verify:  shuffle (token-parallel) / tensor_core (CuTe sm_90 tensor-core GEMM
                     form, flat-in-T), both writing the compact u-buffer;
   forward-only baselines (no rollback cost, breakdown table only): kv / auto / loop.
 
@@ -130,7 +130,7 @@ def make_triton_call(
     cache_steps=None,
 ):
     """Official sglang recurrent verify. In verify mode (inter_buf set) it writes the T·d²
-    intermediate_states_buffer, same rollback cost as our production vk_v."""
+    intermediate_states_buffer, same rollback cost as our production recurrent_v."""
 
     def call():
         return fused_sigmoid_gating_delta_rule_update(
@@ -470,13 +470,13 @@ def _profile_one(args, DSU, device):
         torch.empty(N, T, args.HV, args.K, dtype=torch.float32, device=device),
     )
     p = args.profile
-    if p == "vk":
+    if p == "recurrent":
         fn = make_vk_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)
     elif p == "recurrent_ws":
         fn = make_recurrent_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)
     elif p == "shuffle":
         fn = make_shuffle_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
-    elif p == "tcore":
+    elif p == "tensor_core":
         fn = make_tcore_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
     elif p == "triton":
         qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
@@ -487,7 +487,7 @@ def _profile_one(args, DSU, device):
     elif p == "commit":
         make_vk_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)()
         fn = make_scatter_commit_call(state0.clone(), inter_buf, m, N, T, args.HV, args.V, args.K)
-    elif p == "kv":
+    elif p == "recurrent_kv":
         fn = make_kv_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU)
     elif p == "auto":
         fn = make_auto_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU)
@@ -545,7 +545,7 @@ def main():
         "--only",
         nargs="+",
         default=[],
-        choices=["vk", "recurrent_ws", "tri", "shuffle", "tcore", "kv", "auto", "loop"],
+        choices=["recurrent", "recurrent_ws", "triton", "shuffle", "tensor_core", "recurrent_kv", "auto", "loop"],
         help="restrict check/timing to these verify variants (default: all). REC/spd columns show n/a for skipped baselines.",
     )
     ap.add_argument("--check", action="store_true", help="numerical check only, no timing")
@@ -553,7 +553,7 @@ def main():
     ap.add_argument(
         "--profile",
         default="",
-        choices=["", "vk", "recurrent_ws", "shuffle", "tcore", "triton", "commit", "flush", "kv", "auto", "loop"],
+        choices=["", "recurrent", "recurrent_ws", "shuffle", "tensor_core", "triton", "commit", "flush", "recurrent_kv", "auto", "loop"],
         help="ncu profile mode: run one method's kernel in a loop (uses batch-sizes[0], Ts[0])",
     )
     ap.add_argument("--profile-iters", type=int, default=20, help="kernel launches in the profiled loop")
@@ -569,14 +569,14 @@ def main():
         _profile_one(args, DSU, device)
         return
     print(f"GPU: {torch.cuda.get_device_name()}")
-    print(f"shape H={args.H} HV={args.HV} K={args.K} V={args.V}  dsu={DSU} shuffle_impl={_HAVE_SHUFFLE} tcore_impl={_HAVE_TCORE}")
+    print(f"shape H={args.H} HV={args.HV} K={args.K} V={args.V}  dsu={DSU} shuffle_impl={_HAVE_SHUFFLE} tensor_core_impl={_HAVE_TCORE}")
 
     # ---------------- numerical check (vs Triton recurrent) ----------------
     if not _HAVE_TRITON:
         print(f"[warn] Triton baseline unavailable ({_TRITON_ERR}); skipping numerical check.")
     else:
         print(f"\n=== numerical check (max|Δ| vs Triton recurrent, threshold {args.atol}) ===")
-        print(f"{'N':>4} {'T':>3} | {'Δ vk':>10} | {'Δ rec_ws':>10} | {'Δ shuffle':>10} | {'Δ tcore':>10} | flag")
+        print(f"{'N':>4} {'T':>3} | {'Δ recurrent':>10} | {'Δ recurrent_ws':>10} | {'Δ shuffle':>10} | {'Δ tensor_core':>10} | flag")
         for N in args.batch_sizes:
             for T in args.Ts:
                 q, k, v, a, b, A_log, dt_bias, state0, indices = make_dense_inputs(
@@ -586,25 +586,25 @@ def main():
                 qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
                 o_tri = make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias, state0.clone(), indices, scale, True)()
                 o_tri = o_tri.reshape(N, T, args.HV, args.V)
-                d_vk = float("nan")
-                if _want("vk"):
-                    o_vk = make_vk_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True)()
-                    d_vk = (o_vk - o_tri).abs().max().item()
-                d_recws = float("nan")
+                d_recurrent = float("nan")
+                if _want("recurrent"):
+                    o_recurrent = make_vk_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True)()
+                    d_recurrent = (o_recurrent - o_tri).abs().max().item()
+                d_recurrent_ws = float("nan")
                 if _want("recurrent_ws"):
-                    o_recws = make_recurrent_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True)()
-                    d_recws = (o_recws - o_tri).abs().max().item()
+                    o_recurrent_ws = make_recurrent_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True)()
+                    d_recurrent_ws = (o_recurrent_ws - o_tri).abs().max().item()
                 d_shuffle = float("nan")
                 if _HAVE_SHUFFLE and _want("shuffle"):
                     o_shuffle = make_shuffle_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True)()
                     d_shuffle = (o_shuffle - o_tri).abs().max().item()
-                d_tcore = float("nan")
-                if _HAVE_TCORE and _want("tcore"):
-                    o_tcore = make_tcore_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True)()
-                    d_tcore = (o_tcore - o_tri).abs().max().item()
-                cand = [x for x in (d_vk, d_recws, d_shuffle, d_tcore) if x == x]
+                d_tensor_core = float("nan")
+                if _HAVE_TCORE and _want("tensor_core"):
+                    o_tensor_core = make_tcore_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True)()
+                    d_tensor_core = (o_tensor_core - o_tri).abs().max().item()
+                cand = [x for x in (d_recurrent, d_recurrent_ws, d_shuffle, d_tensor_core) if x == x]
                 flag = ("OK" if max(cand) < args.atol else "DIFF!") if cand else "n/a"
-                print(f"{N:>4} {T:>3} | {d_vk:>10.2e} | {d_recws:>10.2e} | {d_shuffle:>10.2e} | {d_tcore:>10.2e} | {flag}")
+                print(f"{N:>4} {T:>3} | {d_recurrent:>10.2e} | {d_recurrent_ws:>10.2e} | {d_shuffle:>10.2e} | {d_tensor_core:>10.2e} | {flag}")
 
     if args.check:
         return
@@ -616,7 +616,7 @@ def _timing_verify_chain(args, DSU, device):
     """Fair spec-decode verify CHAIN (each segment timed in its own CUDA graph, summed). All verify
     kernels run dsu=1 + verify-mode: recurrent vk/triton write the T·d² intermediate states,
     kvbuffer writes its compact u-buffer. REC = recurrent verify + commit; KVB = kvbuffer verify +
-    flush. spd_vk = REC/KVB vs production vk; spd_vkbf = official triton REC chain
+    flush. spd_recurrent = REC/KVB vs production recurrent; spd_bf = official triton REC chain
     / kvbuffer KVB chain. Prints chain totals + speedups first, per-segment breakdown after."""
 
     def us(x):
@@ -652,42 +652,42 @@ def _timing_verify_chain(args, DSU, device):
                 return t_graph_ms(fn, args.warmup, args.rep, gc)
 
             # recurrent verify (dsu=1, writes T·d² states) + commit
-            if _want("vk"):
-                tg["vk_v"] = time_seg(
+            if _want("recurrent"):
+                tg["recurrent_v"] = time_seg(
                     make_vk_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)
                 )
             if _want("recurrent_ws"):
-                tg["recws_v"] = time_seg(
+                tg["recurrent_ws_v"] = time_seg(
                     make_recurrent_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)
                 )
-            if _want("vk") or _want("recurrent_ws") or _want("tri"):
+            if _want("recurrent") or _want("recurrent_ws") or _want("triton"):
                 if args.commit == "scatter":
                     fn_cmt = make_scatter_commit_call(state0.clone(), inter_buf, m, N, T, args.HV, args.V, args.K)
                 else:
                     fn_cmt = make_gather_commit_call(state0.clone(), inter_buf, m)
                 tg["cmt"] = time_seg(fn_cmt)
             # kvbuffer verify (dsu=1, writes u-buffer) + flush
-            if _want("shuffle") or _want("tcore"):
+            if _want("shuffle") or _want("tensor_core"):
                 # flush needs a populated u-buffer: run one kvbuffer verify first to fill it
                 if _HAVE_SHUFFLE and _want("shuffle"):
                     make_shuffle_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)()
-                elif _HAVE_TCORE and _want("tcore"):
+                elif _HAVE_TCORE and _want("tensor_core"):
                     make_tcore_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)()
                 tg["flush"] = time_seg(make_flush_call(state0.clone(), indices, ubufs, m))
             if _HAVE_SHUFFLE and _want("shuffle"):
                 tg["shuffle_v"] = time_seg(
                     make_shuffle_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
                 )
-            if _HAVE_TCORE and _want("tcore"):
-                tg["tcore_v"] = time_seg(
+            if _HAVE_TCORE and _want("tensor_core"):
+                tg["tensor_core_v"] = time_seg(
                     make_tcore_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
                 )
             # official triton recurrent verify (dsu=1, writes T·d² states)
-            if _HAVE_TRITON and _want("tri"):
+            if _HAVE_TRITON and _want("triton"):
                 qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
                 tri_inter = torch.empty(N, T, args.HV, args.V, args.K, dtype=torch.float32, device=device)
                 tri_idx = torch.arange(N, device=device, dtype=torch.int32)
-                tg["tri_v"] = time_seg(
+                tg["triton_v"] = time_seg(
                     make_triton_call(
                         qt, kt, vt, at, bt, cu, A_log, dt_bias, state0.clone(), indices, scale, DSU, tri_inter, tri_idx, T
                     )
@@ -698,42 +698,42 @@ def _timing_verify_chain(args, DSU, device):
             def _sum(av, bv):
                 return tg[av] + tg[bv] if (av in tg and bv in tg) else None
 
-            r["REC_vk"] = _sum("vk_v", "cmt")
-            r["REC_rws"] = _sum("recws_v", "cmt")
+            r["REC_recurrent"] = _sum("recurrent_v", "cmt")
+            r["REC_recurrent_ws"] = _sum("recurrent_ws_v", "cmt")
             r["KVB_shuffle"] = _sum("shuffle_v", "flush")
-            r["KVB_tcore"] = _sum("tcore_v", "flush")
-            r["REC_tri"] = _sum("tri_v", "cmt")
+            r["KVB_tensor_core"] = _sum("tensor_core_v", "flush")
+            r["REC_triton"] = _sum("triton_v", "cmt")
             results.append(r)
 
     # ---- table 1: chain totals + speedups ----
     print(f"\n=== verify-CHAIN total latency (us) + speedup — accept m={args.accept} commit={args.commit} ===")
     print("  REC_* = recurrent verify (writes T·d² states) + commit;  KVB_* = kvbuffer verify (u-buffer) + flush")
-    print("  spd_(vk/rws/shuffle/tcore) = REC_tri (official triton) / (REC_vk/REC_rws/KVB_shuffle/KVB_tcore) -- chain speedup over triton")
+    print("  spd_(recurrent/recurrent_ws/shuffle/tensor_core) = REC_triton (official triton) / (REC_recurrent/REC_recurrent_ws/KVB_shuffle/KVB_tensor_core) -- chain speedup over triton")
     hdr = (
-        f"{'N':>4} {'T':>3} {'m':>3} | {'REC_vk':>7} {'REC_rws':>7} {'REC_tri':>7} | {'KVB_shuffle':>11} {'KVB_tcore':>9} | "
-        f"{'spd_vk':>7} {'spd_rws':>7} {'spd_shuffle':>11} {'spd_tcore':>9}"
+        f"{'N':>4} {'T':>3} {'m':>3} | {'REC_recurrent':>7} {'REC_recurrent_ws':>7} {'REC_triton':>7} | {'KVB_shuffle':>11} {'KVB_tensor_core':>9} | "
+        f"{'spd_recurrent':>7} {'spd_recurrent_ws':>7} {'spd_shuffle':>11} {'spd_tensor_core':>9}"
     )
     print(hdr)
     print("-" * len(hdr))
     for r in results:
         print(
-            f"{r['N']:>4} {r['T']:>3} {r['m']:>3} | {us(r['REC_vk']):>7} {us(r['REC_rws']):>7} {us(r['REC_tri']):>7} | "
-            f"{us(r['KVB_shuffle']):>11} {us(r['KVB_tcore']):>9} | "
-            f"{rat(r['REC_tri'], r['REC_vk']):>7} {rat(r['REC_tri'], r['REC_rws']):>7} {rat(r['REC_tri'], r['KVB_shuffle']):>11} {rat(r['REC_tri'], r['KVB_tcore']):>9}"
+            f"{r['N']:>4} {r['T']:>3} {r['m']:>3} | {us(r['REC_recurrent']):>7} {us(r['REC_recurrent_ws']):>7} {us(r['REC_triton']):>7} | "
+            f"{us(r['KVB_shuffle']):>11} {us(r['KVB_tensor_core']):>9} | "
+            f"{rat(r['REC_triton'], r['REC_recurrent']):>7} {rat(r['REC_triton'], r['REC_recurrent_ws']):>7} {rat(r['REC_triton'], r['KVB_shuffle']):>11} {rat(r['REC_triton'], r['KVB_tensor_core']):>9}"
         )
 
     # ---- table 2: per-segment breakdown ----
     print("\n=== per-segment breakdown (us) — verify kernels + shared commit/flush ===")
     hdr2 = (
-        f"{'N':>4} {'T':>3} | {'vk_v':>6} {'recws_v':>7} {'tri_v':>6} | {'shuffle_v':>9} {'tcore_v':>7} | {'cmt':>5} {'flush':>6}"
+        f"{'N':>4} {'T':>3} | {'recurrent_v':>6} {'recurrent_ws_v':>7} {'triton_v':>6} | {'shuffle_v':>9} {'tensor_core_v':>7} | {'cmt':>5} {'flush':>6}"
     )
     print(hdr2)
     print("-" * len(hdr2))
     for r in results:
         tg = r["tg"]
         print(
-            f"{r['N']:>4} {r['T']:>3} | {us(tg.get('vk_v')):>6} {us(tg.get('recws_v')):>7} {us(tg.get('tri_v')):>6} | "
-            f"{us(tg.get('shuffle_v')):>9} {us(tg.get('tcore_v')):>7} | "
+            f"{r['N']:>4} {r['T']:>3} | {us(tg.get('recurrent_v')):>6} {us(tg.get('recurrent_ws_v')):>7} {us(tg.get('triton_v')):>6} | "
+            f"{us(tg.get('shuffle_v')):>9} {us(tg.get('tensor_core_v')):>7} | "
             f"{us(tg.get('cmt')):>5} {us(tg.get('flush')):>6}"
         )
 

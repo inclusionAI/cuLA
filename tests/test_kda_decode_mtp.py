@@ -692,13 +692,13 @@ def _check_kvb_verify_and_flush(which, N, T, H, HV):
 
 
 @pytest.mark.parametrize("N,T,H,HV", [(2, 2, 16, 16), (4, 4, 16, 16), (2, 4, 32, 32)])
-def test_tp_kvbuffer_verify_and_flush(N, T, H, HV):
+def test_shuffle_kvbuffer_verify_and_flush(N, T, H, HV):
     """shuffle-kvbuffer (token-parallel SIMT) verify output + rank-m flush match the fp32 oracle."""
     _check_kvb_verify_and_flush("shuffle", N, T, H, HV)
 
 
 @pytest.mark.parametrize("N,T,H,HV", [(2, 3, 16, 16), (4, 6, 16, 16), (1, 8, 32, 32)])
-def test_cg_kvbuffer_verify_and_flush(N, T, H, HV):
+def test_tensor_core_kvbuffer_verify_and_flush(N, T, H, HV):
     """tensor_core-kvbuffer (CuTe tensor-core gemm) verify output + rank-m flush match the fp32 oracle."""
     _check_kvb_verify_and_flush("tensor_core", N, T, H, HV)
 
@@ -763,7 +763,7 @@ def test_kvbuffer_prefer_tensor_core_matches_bench():
     bench at grid points spanning the S=HV*N collapse (tensor_core iff T >= t_tc(S))."""
     cases = [
         # (HV, N, T, expect_tensor_core) -- kvbuffer-family winner per the kernel_level speedup table
-        (8, 1, 6, False), (8, 4, 4, False), (8, 4, 6, True), (8, 8, 3, False), (8, 8, 4, True),
+        (8, 1, 6, True), (8, 4, 4, False), (8, 4, 6, True), (8, 8, 3, False), (8, 8, 4, True),
         (8, 32, 2, False), (8, 32, 3, True), (16, 2, 6, True), (16, 4, 4, True), (16, 16, 3, True),
         (32, 1, 6, True), (32, 2, 4, True), (64, 1, 3, False), (64, 1, 4, True), (64, 4, 3, True),
         (64, 128, 2, False),

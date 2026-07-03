@@ -1009,21 +1009,18 @@ def kda_decode_mtp_recurrent_ws(
 
     assert K == TILE_K, f"KDA MTP (ws) kernel requires K={TILE_K}, got {K}"
 
-    # Resolve tile_v / ilp_rows / use_smem_v from the work_units=N*HV heuristic
-    # where not given explicitly. An explicit tile_v can make the heuristic's ilp=4
-    # illegal (needs tile_v % 16 == 0); the auto path then falls back to ilp=2.
     if tile_v is None or ilp_rows is None or use_smem_v is None:
         sel_tile_v, sel_ilp_rows, sel_use_smem_v = _select_mtp_config(N, HV, V, T, disable_state_update=disable_state_update)
+        write_bound_verify = intermediate_states_buffer is not None and N >= 8 and V % 16 == 0
         if tile_v is None:
-            if intermediate_states_buffer is not None and N >= 8 and V % 16 == 0:
-                # write-bound: smaller tile = more CTAs = more in-flight DRAM requests
-                tile_v = 16
-            else:
-                tile_v = sel_tile_v
+            tile_v = 16 if write_bound_verify else sel_tile_v
         if ilp_rows is None:
-            ilp_rows = sel_ilp_rows
-            if ilp_rows == 4 and tile_v % 16 != 0:
+            if write_bound_verify and T > 4 and N * HV >= _WS_WORK_UNIT_THRESHOLD:
                 ilp_rows = 2
+            else:
+                ilp_rows = sel_ilp_rows
+                if ilp_rows == 4 and tile_v % 16 != 0:
+                    ilp_rows = 2
         if use_smem_v is None:
             use_smem_v = sel_use_smem_v
 

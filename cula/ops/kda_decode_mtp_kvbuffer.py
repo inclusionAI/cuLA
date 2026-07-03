@@ -1839,23 +1839,21 @@ def run_kda_mtp_tensor_core_kvbuffer_kernel(
 # ---------------------------------------------------------------------------
 # KVBuffer verify dispatch: route between the two kvbuffer verify ops by T.
 # ---------------------------------------------------------------------------
+def _select_kvb_variant(N: int, HV: int, T: int) -> str:
+    """Pick "shuffle" or "tensor_core" kvbuffer variant; wu = N*HV."""
+    wu = N * HV
+    if T <= 2:
+        return "shuffle"
+    if T == 3:
+        return "shuffle" if wu <= 64 else "tensor_core"
+    if T == 4:
+        return "shuffle" if wu <= 32 else "tensor_core"
+    return "tensor_core"
+
+
 def _kvbuffer_prefer_tensor_core(N: int, HV: int, T: int) -> bool:
-    """tensor_core (CuTe tensor-core GEMM, flat-in-T) vs shuffle (token-parallel SIMT)
-    crossover from the kernel-level chain bench (HV in {8,16,32,64}, N in {1..128},
-    T in {2,3,4,6}, K=V=128). Within the kvbuffer family the tensor_core-wins boundary
-    collapses onto the work size S = HV * N: tensor_core overtakes shuffle at T >= 3 for
-    S >= 256, T >= 4 for 64 <= S < 256, and T >= 6 for 32 <= S < 64; shuffle wins across
-    the measured T range for S < 32 (small batch, small HV). True routes to tensor_core."""
-    S = N * HV
-    if S >= 256:
-        t_tc = 3
-    elif S >= 64:
-        t_tc = 4
-    elif S >= 32:
-        t_tc = 6
-    else:
-        t_tc = 7  # shuffle wins through T=6; tensor_core only at even higher T
-    return T >= t_tc
+    """True iff the kvbuffer dispatch picks tensor_core."""
+    return _select_kvb_variant(N, HV, T) == "tensor_core"
 
 
 def kda_decode_mtp_kvbuffer(
@@ -1918,7 +1916,7 @@ def kda_decode_mtp_kvbuffer(
         lower_bound=lower_bound,
     )
     if t_crossover is None:
-        use_tensor_core = _kvbuffer_prefer_tensor_core(N, HV, T)
+        use_tensor_core = _select_kvb_variant(N, HV, T) == "tensor_core"
     else:
         use_tensor_core = t_crossover <= T
     if use_tensor_core:
