@@ -823,6 +823,14 @@ def run_kda_mtp_shuffle_kvbuffer_kernel(
 _compiled_mtp_shuffle_kvbuffer_kernels: dict[tuple, object] = {}
 
 
+def _dlp_qkv(_t, _dyn):
+    # dyn-stride: K-contiguous strided view -> dynamic-layout tensor (no copy);
+    # contiguous input keeps the compact (byte-identical) descriptor.
+    if _dyn:
+        return from_dlpack(_t, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+    return from_dlpack(_t, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=_t.dim_order())
+
+
 def _get_compiled_mtp_shuffle_kvbuffer_kernel(
     N,
     T,
@@ -844,6 +852,7 @@ def _get_compiled_mtp_shuffle_kvbuffer_kernel(
     fast_math=True,
     use_lower_bound=False,
     lower_bound=0.0,
+    dyn_stride=False,
 ):
     key = (
         T,
@@ -864,6 +873,7 @@ def _get_compiled_mtp_shuffle_kvbuffer_kernel(
         fast_math,
         use_lower_bound,
         lower_bound,
+        dyn_stride,
     )
     if key in _compiled_mtp_shuffle_kvbuffer_kernels:
         return _compiled_mtp_shuffle_kvbuffer_kernels[key]
@@ -888,9 +898,9 @@ def _get_compiled_mtp_shuffle_kvbuffer_kernel(
         from_dlpack(A_log, assumed_align=16),
         from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=a.dim_order()),
         from_dlpack(dt_bias, assumed_align=16),
-        from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=q.dim_order()),
-        from_dlpack(k, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=k.dim_order()),
-        from_dlpack(v, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=v.dim_order()),
+        _dlp_qkv(q, dyn_stride),
+        _dlp_qkv(k, dyn_stride),
+        _dlp_qkv(v, dyn_stride),
         from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b.dim_order()),
         from_dlpack(o, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=o.dim_order()),
         from_dlpack(h0_indices, assumed_align=16).mark_layout_dynamic(),
@@ -1005,9 +1015,10 @@ def kda_decode_mtp_shuffle_kvbuffer(
 
     o = _prepare_output_tensor(q, out, (N, T, HV, V))
 
-    q = q if q.is_contiguous() else q.contiguous()
-    k = k if k.is_contiguous() else k.contiguous()
-    v = v if v.is_contiguous() else v.contiguous()
+    _dyn_kvb = (not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()) and q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1)
+    q = q if (_dyn_kvb or q.is_contiguous()) else q.contiguous()
+    k = k if (_dyn_kvb or k.is_contiguous()) else k.contiguous()
+    v = v if (_dyn_kvb or v.is_contiguous()) else v.contiguous()
     a = a if a.is_contiguous() else a.contiguous()
     b = b if b.is_contiguous() else b.contiguous()
 
@@ -1050,6 +1061,7 @@ def kda_decode_mtp_shuffle_kvbuffer(
         fast_math=fast_math,
         use_lower_bound=lower_bound is not None,
         lower_bound=(0.0 if lower_bound is None else float(lower_bound)),
+        dyn_stride=_dyn_kvb,
     )
     compiled_kernel(
         h0_source_flat,
@@ -1175,6 +1187,7 @@ def _get_compiled_tensor_core_kvbuffer_kernel(
     fast_math=True,
     use_lower_bound=False,
     lower_bound=0.0,
+    dyn_stride=False,
 ):
     key = (
         T,
@@ -1195,6 +1208,7 @@ def _get_compiled_tensor_core_kvbuffer_kernel(
         fast_math,
         use_lower_bound,
         lower_bound,
+        dyn_stride,
     )
     if key in _compiled_tensor_core_kvbuffer_kernels:
         return _compiled_tensor_core_kvbuffer_kernels[key]
@@ -1220,9 +1234,9 @@ def _get_compiled_tensor_core_kvbuffer_kernel(
         from_dlpack(A_log, assumed_align=16),
         from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=a.dim_order()),
         from_dlpack(dt_bias, assumed_align=16),
-        from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=q.dim_order()),
-        from_dlpack(k, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=k.dim_order()),
-        from_dlpack(v, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=v.dim_order()),
+        _dlp_qkv(q, dyn_stride),
+        _dlp_qkv(k, dyn_stride),
+        _dlp_qkv(v, dyn_stride),
         from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b.dim_order()),
         from_dlpack(o, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=o.dim_order()),
         from_dlpack(h0_indices, assumed_align=16).mark_layout_dynamic(),
@@ -1317,9 +1331,10 @@ def kda_decode_mtp_tensor_core_kvbuffer(
     if b.dim() != 3 or tuple(b.shape) != (N, T, HV):
         raise ValueError(f"Unexpected b shape for MTP dense: {tuple(b.shape)}; expected {(N, T, HV)}")
     o = _prepare_output_tensor(q, out, (N, T, HV, V))
-    q = q if q.is_contiguous() else q.contiguous()
-    k = k if k.is_contiguous() else k.contiguous()
-    v = v if v.is_contiguous() else v.contiguous()
+    _dyn_kvb = (not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()) and q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1)
+    q = q if (_dyn_kvb or q.is_contiguous()) else q.contiguous()
+    k = k if (_dyn_kvb or k.is_contiguous()) else k.contiguous()
+    v = v if (_dyn_kvb or v.is_contiguous()) else v.contiguous()
     a = a if a.is_contiguous() else a.contiguous()
     b = b if b.is_contiguous() else b.contiguous()
     A_log = _normalize_A_log(A_log, HV)
@@ -1360,6 +1375,7 @@ def kda_decode_mtp_tensor_core_kvbuffer(
         fast_math=fast_math,
         use_lower_bound=lower_bound is not None,
         lower_bound=(0.0 if lower_bound is None else float(lower_bound)),
+        dyn_stride=_dyn_kvb,
     )
     compiled_kernel(
         h0_source_flat,

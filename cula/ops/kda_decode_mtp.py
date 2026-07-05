@@ -840,6 +840,14 @@ def run_kda_verify_kernel_mtp_recurrent_ws(
     )
 
 
+def _dlp_qkv(_t, _dyn):
+    # dyn-stride: K-contiguous strided view -> dynamic-layout tensor (no copy);
+    # contiguous input keeps the compact (byte-identical) descriptor.
+    if _dyn:
+        return from_dlpack(_t, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+    return from_dlpack(_t, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=_t.dim_order())
+
+
 def _get_compiled_mtp_recurrent_ws_kernel(
     N,
     T,
@@ -862,6 +870,7 @@ def _get_compiled_mtp_recurrent_ws_kernel(
     fast_math=True,
     use_lower_bound=False,
     lower_bound=0.0,
+    dyn_stride=False,
 ):
     """Get or lazily compile the warp-spec MTP kernel for one shape/config.
 
@@ -887,6 +896,7 @@ def _get_compiled_mtp_recurrent_ws_kernel(
         fast_math,
         use_lower_bound,
         lower_bound,
+        dyn_stride,
     )
     if key in _compiled_mtp_recurrent_ws_kernels:
         return _compiled_mtp_recurrent_ws_kernels[key]
@@ -908,9 +918,9 @@ def _get_compiled_mtp_recurrent_ws_kernel(
         intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device="cuda")
 
     # dynamic-N (flashinfer-aligned): batch + pool axes dynamic -> one cubin per shape config.
-    q_tensor = from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=q.dim_order())
-    k_tensor = from_dlpack(k, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=k.dim_order())
-    v_tensor = from_dlpack(v, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=v.dim_order())
+    q_tensor = _dlp_qkv(q, dyn_stride)
+    k_tensor = _dlp_qkv(k, dyn_stride)
+    v_tensor = _dlp_qkv(v, dyn_stride)
     a_tensor = from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=a.dim_order())
     b_tensor = from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=b.dim_order())
     A_log_tensor = from_dlpack(A_log, assumed_align=16)
@@ -1065,9 +1075,10 @@ def kda_decode_mtp_recurrent_ws(
 
     o = _prepare_output_tensor(q, out, (N, T, HV, V))
 
-    q = q if q.is_contiguous() else q.contiguous()
-    k = k if k.is_contiguous() else k.contiguous()
-    v = v if v.is_contiguous() else v.contiguous()
+    _dyn_ws = (not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()) and q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1)
+    q = q if (_dyn_ws or q.is_contiguous()) else q.contiguous()
+    k = k if (_dyn_ws or k.is_contiguous()) else k.contiguous()
+    v = v if (_dyn_ws or v.is_contiguous()) else v.contiguous()
     a = a if a.is_contiguous() else a.contiguous()
     b = b if b.is_contiguous() else b.contiguous()
 
@@ -1115,6 +1126,7 @@ def kda_decode_mtp_recurrent_ws(
         cache_intermediate_states=cache_intermediate_states,
         use_lower_bound=lower_bound is not None,
         lower_bound=(0.0 if lower_bound is None else float(lower_bound)),
+        dyn_stride=_dyn_ws,
     )
 
     compiled_kernel(
