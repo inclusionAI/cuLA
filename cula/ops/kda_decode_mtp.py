@@ -4,8 +4,7 @@ Recurrent KDA MTP verify/decode kernels. ``kda_decode_mtp`` dispatches to the
 single-warp ``vk`` (lane=K, Triton-identical K-reduce; production verify variant) and
 ``kv`` (lane=V) kernels. KDA's decay gate ``g_t in R^K`` is per-K-channel (``beta`` is
 a per-(head, token) scalar). State is register-resident across the T tokens
-(full-warp-shuffle K-reduce, DECAY-FIRST recurrence); validated vs the fp32 torch
-oracle at atol 3e-2 / rtol 2e-2. An ``intermediate_states_buffer`` ([N,T,HV,V,K] vk)
+(full-warp-shuffle K-reduce, DECAY-FIRST recurrence). An ``intermediate_states_buffer`` ([N,T,HV,V,K] vk)
 snapshots per-token post-states to GMEM for spec-decode rollback;
 ``disable_state_update`` skips the final write-back.
 

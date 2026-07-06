@@ -12,7 +12,7 @@ Chunkwise math (state S0[v,k], decay-first; matches the recurrent op):
     g_t[k]  = exp(-exp(A_log) * softplus(a_t[k] + dt_bias[k]))    # per channel
     b_t[k]  = prod_{i<=t} g_i[k]                                  # cumulative decay
     kdec_t  = k_norm_t * b_t ;  qdec_t = q_scaled_t * b_t
-    r(t,i)  = b_t / b_i = prod_{i<j<=t} g_j <= 1                  # decay ratio
+    r(t,i)  = prod_{i<j<=t} g_j <= 1                  # decay ratio
     A[t,i]  = sum_k kn_t kn_i r(t,i) (i<t)   P[t,i] = sum_k qn_t kn_i r(t,i) (i<=t)
     u_t[v]  = beta_t * (v_t[v] - (S0 @ kdec_t)[v] - sum_{i<t} A[t,i] u_i[v])
     o_t[v]  = (S0 @ qdec_t)[v] + sum_{i<=t} P[t,i] u_i[v]
@@ -20,9 +20,9 @@ Chunkwise math (state S0[v,k], decay-first; matches the recurrent op):
     S_T[v,k]= b_{T-1}[k] * S0[v,k] + sum_i u_i[v] ksuf_i[k]       # full accept
 
 Numerical form: every decay factor is an ORDERED product bounded by 1 — there is
-no division by the cumulative gate product (the earlier kinv_t = k/b_t form
-overflowed to inf/NaN once b_t underflowed, which unbounded softplus gates hit on
-real activations). This makes the op valid for both softplus and safe-gate models.
+no division by the cumulative gate product (which can underflow to 0 in fp32
+under unbounded softplus gates). The op is valid for both softplus and safe-gate
+models.
 The scratch stores raw (u_i, k_i, g_i) per token — the same triplet as ReplaySSM's
 (d, k, g) ring — and the flush rebuilds S_m with descending suffix products.
 """
