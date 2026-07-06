@@ -26,7 +26,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # for sibling 
 
 from test_kda_decode import torch_kda_decode_ref  # trusted single-token reference
 
-from cula.ops import kda_decode
+from cula.kda import kda_decode
 from cula.ops.kda_decode_mtp import (
     _select_mtp_config,
     _select_mtp_tile_v,
@@ -37,9 +37,9 @@ from cula.ops.kda_decode_mtp_kvbuffer import (
     _kvbuffer_prefer_tensor_core,
     _select_kvb_tile_v,
     _select_shuffle_kvb_ilp_rows,
-    kda_decode_mtp_tensor_core_kvbuffer,
     kda_decode_mtp_kvbuffer,
     kda_decode_mtp_shuffle_kvbuffer,
+    kda_decode_mtp_tensor_core_kvbuffer,
     kda_flush_kvbuffer,
 )
 
@@ -183,7 +183,7 @@ def run_recurrent(
     st = state.clone().contiguous()
     if variant == "kv":
         st = st.transpose(-2, -1).contiguous()  # vk -> kv
-    sb_kwargs = dict(
+    rec_kwargs = dict(
         A_log=A_log,
         dt_bias=dt_bias,
         q=q.to(torch.bfloat16),
@@ -202,8 +202,8 @@ def run_recurrent(
         lower_bound=lower_bound,
     )
     if variant == "vk":
-        sb_kwargs["bv"] = bv  # kv is fixed 1-warp; bv stays at the WARP_BV default
-    o = kda_decode_mtp_recurrent(**sb_kwargs)
+        rec_kwargs["bv"] = bv  # kv is fixed 1-warp; bv stays at the WARP_BV default
+    o = kda_decode_mtp_recurrent(**rec_kwargs)
     state_vk = st.transpose(-2, -1).contiguous() if variant == "kv" else st
     return (o, state_vk, inter) if intermediate else (o, state_vk)
 
@@ -278,12 +278,14 @@ def test_recurrent_decode(N, T, H, HV, variant, bv, k_split):
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
     o_loop, st_loop = run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scale)
     o_sb, st_sb = run_recurrent(q, k, v, a, b, A_log, dt_bias, state, scale, variant=variant, bv=bv, k_split=k_split)
-    tag = f"sb {variant} bv={bv} ks={k_split}"
+    tag = f"recurrent {variant} bv={bv} ks={k_split}"
     _assert_close(f"{tag} output", o_loop.float(), o_sb.float())
     _assert_close(f"{tag} final state", st_loop, st_sb)
 
 
-@pytest.mark.parametrize("kernel", ["recurrent_ws", "recurrent_ws_ilp4", "recurrent_ws_smem_v", "sb_vk", "sb_kv"])
+@pytest.mark.parametrize(
+    "kernel", ["recurrent_ws", "recurrent_ws_ilp4", "recurrent_ws_smem_v", "recurrent_vk", "recurrent_kv"]
+)
 @pytest.mark.parametrize(
     "N,T,H,HV",
     [
@@ -323,16 +325,16 @@ def test_lower_bound_safe_gate(kernel, N, T, H, HV):
         o, st = run_recurrent_ws(
             q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=32, ilp_rows=4, use_smem_v=True, lower_bound=lower_bound
         )
-    elif kernel == "sb_vk":
+    elif kernel == "recurrent_vk":
         o, st = run_recurrent(q, k, v, a, b, A_log, dt_bias, state, scale, variant="vk", lower_bound=lower_bound)
-    else:  # sb_kv
+    else:  # recurrent_kv
         o, st = run_recurrent(q, k, v, a, b, A_log, dt_bias, state, scale, variant="kv", lower_bound=lower_bound)
     tag = f"lb {kernel} N={N} T={T} HV={HV}"
     _assert_close(f"{tag} output", o_ref, o.float())
     _assert_close(f"{tag} final state", st_ref, st)
 
 
-@pytest.mark.parametrize("kernel", ["recurrent_ws", "recurrent_ws_ilp4", "sb_vk", "sb_kv"])
+@pytest.mark.parametrize("kernel", ["recurrent_ws", "recurrent_ws_ilp4", "recurrent_vk", "recurrent_kv"])
 def test_disable_state_update(kernel):
     """disable_state_update leaves the state pool unchanged while output still matches the loop."""
     N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
@@ -345,14 +347,14 @@ def test_disable_state_update(kernel):
     elif kernel == "recurrent_ws_ilp4":
         o, st = run_recurrent_ws(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=32, ilp_rows=4, disable_state_update=True)
     else:
-        variant = "vk" if kernel == "sb_vk" else "kv"
+        variant = "vk" if kernel == "recurrent_vk" else "kv"
         o, st = run_recurrent(q, k, v, a, b, A_log, dt_bias, state, scale, variant=variant, disable_state_update=True)
 
     assert torch.equal(st, state), f"{kernel}: state pool modified despite disable_state_update=True"
     _assert_close(f"{kernel} dsu output", o_loop.float(), o.float())
 
 
-@pytest.mark.parametrize("kernel", ["recurrent_ws", "recurrent_ws_smem_v", "sb_vk", "sb_kv"])
+@pytest.mark.parametrize("kernel", ["recurrent_ws", "recurrent_ws_smem_v", "recurrent_vk", "recurrent_kv"])
 def test_determinism(kernel):
     """Bit-exact determinism: repeat the state-writeback launch, assert identical output + state."""
     N, T, H, HV, K, V = 16, 4, 8, 16, 128, 128
@@ -366,12 +368,12 @@ def test_determinism(kernel):
             return run_recurrent_ws(
                 q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=64, ilp_rows=4, use_packed_fma=False, use_smem_v=True
             )
-        variant = "vk" if kernel == "sb_vk" else "kv"
+        variant = "vk" if kernel == "recurrent_vk" else "kv"
         return run_recurrent(q, k, v, a, b, A_log, dt_bias, state, scale, variant=variant)
 
     o_ref, st_ref = launch()
     o_ref = o_ref.clone()
-    n_iters = int(os.environ.get("KDA_MTP_DET_ITERS", "10000"))
+    n_iters = int(os.environ.get("KDA_MTP_DET_ITERS", "100000"))
     for i in range(n_iters):
         o_i, st_i = launch()
         assert torch.equal(o_i, o_ref), f"{kernel} output non-deterministic at iter {i}"
@@ -520,7 +522,9 @@ def test_recurrent_ws_decode(N, T, H, HV, tile_v, ilp_rows, use_smem_v):
     scale = K**-0.5
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
     o_loop, st_loop = run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scale)
-    o_ws, st_ws = run_recurrent_ws(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=tile_v, ilp_rows=ilp_rows, use_smem_v=use_smem_v)
+    o_ws, st_ws = run_recurrent_ws(
+        q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=tile_v, ilp_rows=ilp_rows, use_smem_v=use_smem_v
+    )
     tag = f"ws tv={tile_v} ilp={ilp_rows} smem={use_smem_v}"
     _assert_close(f"{tag} output", o_loop.float(), o_ws.float())
     _assert_close(f"{tag} final state", st_loop, st_ws)
@@ -763,9 +767,21 @@ def test_kvbuffer_prefer_tensor_core_matches_bench():
     bench at grid points spanning the S=HV*N collapse (tensor_core iff T >= t_tc(S))."""
     cases = [
         # (HV, N, T, expect_tensor_core) -- kvbuffer-family winner per the kernel_level speedup table
-        (8, 1, 6, True), (8, 4, 4, False), (8, 4, 6, True), (8, 8, 3, False), (8, 8, 4, True),
-        (8, 32, 2, False), (8, 32, 3, True), (16, 2, 6, True), (16, 4, 4, True), (16, 16, 3, True),
-        (32, 1, 6, True), (32, 2, 4, True), (64, 1, 3, False), (64, 1, 4, True), (64, 4, 3, True),
+        (8, 1, 6, True),
+        (8, 4, 4, False),
+        (8, 4, 6, True),
+        (8, 8, 3, False),
+        (8, 8, 4, True),
+        (8, 32, 2, False),
+        (8, 32, 3, True),
+        (16, 2, 6, True),
+        (16, 4, 4, True),
+        (16, 16, 3, True),
+        (32, 1, 6, True),
+        (32, 2, 4, True),
+        (64, 1, 3, False),
+        (64, 1, 4, True),
+        (64, 4, 3, True),
         (64, 128, 2, False),
     ]
     for hv, n, t, exp in cases:
@@ -780,7 +796,7 @@ def test_kvbuffer_verify_determinism(which, N, T, H, HV):
     scale = K_DIM**-0.5
     ub_ref = _alloc_ubufs(N, T, HV, V)
     o_ref = _kvb_verify(which, q, k, v, a, b, A_log, dt_bias, state, scale, ubufs=ub_ref)
-    for i in range(3):
+    for i in range(int(os.environ.get("KDA_MTP_DET_ITERS", "100000"))):
         ub_i = _alloc_ubufs(N, T, HV, V)
         o_i = _kvb_verify(which, q, k, v, a, b, A_log, dt_bias, state, scale, ubufs=ub_i)
         assert torch.equal(o_i, o_ref), f"{which} verify output non-deterministic at iter {i}"
@@ -798,7 +814,7 @@ def test_kvbuffer_flush_determinism(which, N, T, H, HV):
     _kvb_verify(which, q, k, v, a, b, A_log, dt_bias, state, scale, ubufs=ubufs)
     pool_ref = state.clone().contiguous()
     kda_flush_kvbuffer(pool_ref, indices, ubufs[0], ubufs[1], ubufs[2], accept_len=T)
-    for i in range(3):
+    for i in range(int(os.environ.get("KDA_MTP_DET_ITERS", "100000"))):
         pool_i = state.clone().contiguous()
         kda_flush_kvbuffer(pool_i, indices, ubufs[0], ubufs[1], ubufs[2], accept_len=T)
         assert torch.equal(pool_i, pool_ref), f"{which} flush state non-deterministic at iter {i}"

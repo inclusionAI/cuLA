@@ -1015,7 +1015,12 @@ def kda_decode_mtp_shuffle_kvbuffer(
 
     o = _prepare_output_tensor(q, out, (N, T, HV, V))
 
-    _dyn_kvb = (not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()) and q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1)
+    _dyn_kvb = (
+        not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous())
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and v.stride(-1) == 1
+    )
     q = q if (_dyn_kvb or q.is_contiguous()) else q.contiguous()
     k = k if (_dyn_kvb or k.is_contiguous()) else k.contiguous()
     v = v if (_dyn_kvb or v.is_contiguous()) else v.contiguous()
@@ -1083,7 +1088,7 @@ def kda_decode_mtp_shuffle_kvbuffer(
 
 
 # ===========================================================================
-# tensor_core-kvbuffer (CuTe sm_90 tensor-core, flat-in-T): every reduction on warp-level
+# tensor_core-kvbuffer (CuTe tensor-core, flat-in-T): every reduction on warp-level
 # mma.sync.m16n8k8.tf32 (llvm.inline_asm wrapper); verify = the BT=8 stacked kernel below.
 #
 # mma.sync m16n8k8 fragment mapping (PTX ISA), gid = lane>>2, tig = lane&3:
@@ -1266,7 +1271,7 @@ def _get_compiled_tensor_core_kvbuffer_kernel(
     )
     _compiled_tensor_core_kvbuffer_kernels[key] = compiled_kernel
     logger.info(
-        "CuTe DSL KDA MTP tensor_core-KVBuffer (sm90 mma) kernel compiled: "
+        "CuTe DSL KDA MTP tensor_core-KVBuffer (tensor-core mma) kernel compiled: "
         f"N={N}, T={T}, HV={HV}, K={K}, V={V}, BV={bv}, num_v_tiles={num_v_tiles}, opt_level={opt_level}"
     )
     return compiled_kernel
@@ -1298,7 +1303,7 @@ def kda_decode_mtp_tensor_core_kvbuffer(
     fast_math: bool = True,
     lower_bound: float | None = None,
 ) -> torch.Tensor:
-    """KDA MTP decode — CuTe sm_90 tensor-core kvbuffer VERIFY (port of the Triton gemm op)."""
+    """KDA MTP decode — CuTe tensor-core kvbuffer VERIFY (port of the Triton gemm op)."""
     N, T, H, K = q.shape
     HV = v.shape[2]
     V = v.shape[3]
@@ -1331,7 +1336,12 @@ def kda_decode_mtp_tensor_core_kvbuffer(
     if b.dim() != 3 or tuple(b.shape) != (N, T, HV):
         raise ValueError(f"Unexpected b shape for MTP dense: {tuple(b.shape)}; expected {(N, T, HV)}")
     o = _prepare_output_tensor(q, out, (N, T, HV, V))
-    _dyn_kvb = (not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()) and q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1)
+    _dyn_kvb = (
+        not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous())
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and v.stride(-1) == 1
+    )
     q = q if (_dyn_kvb or q.is_contiguous()) else q.contiguous()
     k = k if (_dyn_kvb or k.is_contiguous()) else k.contiguous()
     v = v if (_dyn_kvb or v.is_contiguous()) else v.contiguous()

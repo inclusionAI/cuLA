@@ -1075,7 +1075,12 @@ def kda_decode_mtp_recurrent_ws(
 
     o = _prepare_output_tensor(q, out, (N, T, HV, V))
 
-    _dyn_ws = (not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()) and q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1)
+    _dyn_ws = (
+        not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous())
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and v.stride(-1) == 1
+    )
     q = q if (_dyn_ws or q.is_contiguous()) else q.contiguous()
     k = k if (_dyn_ws or k.is_contiguous()) else k.contiguous()
     v = v if (_dyn_ws or v.is_contiguous()) else v.contiguous()
