@@ -2157,9 +2157,7 @@ def kda_decode_mtp(
         return kda_decode_mtp_recurrent(**common, variant="kv", k_split=-1)  # k_split auto
     T = q.shape[1]
     work_units = q.shape[0] * v.shape[2]  # N * HV
-    # T <= 4: single-warp vk wins everywhere. T > 4: vk still wins except in the large
-    # batch x large HV regime (N*HV >= _WS_WORK_UNIT_THRESHOLD) where the single-warp
-    # kernel hits the DRAM-bandwidth wall (~0.42x); route only that regime to recurrent_ws.
-    if T <= 4 or work_units < _WS_WORK_UNIT_THRESHOLD:
+    # N*HV >= _WS_WORK_UNIT_THRESHOLD: single-warp vk is DRAM-bandwidth-bound (worse under dyn-stride) -> warp-spec.
+    if T < 4 or work_units < _WS_WORK_UNIT_THRESHOLD:
         return kda_decode_mtp_recurrent(**common, variant="vk", bv=-1)  # bv auto
     return kda_decode_mtp_recurrent_ws(**common, state_layout="vk")
