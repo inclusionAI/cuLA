@@ -59,7 +59,7 @@ from cula.utils import get_device_sm_count
 # ============================================================
 BT, D = 64, 128
 H_VALUES = [4, 8]
-WARMUP = 10
+WARMUP = 25
 N_ITERS = 100
 NCU_MODE = False
 SANITIZER_MODE = False
