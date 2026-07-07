@@ -18,7 +18,6 @@ BV must be a multiple of 64 (tcgen05.mma.ws M-mode constraint for bf16).
 """
 
 import argparse
-import os as _os
 
 import cutlass
 import cutlass.cute as cute
@@ -36,19 +35,10 @@ from cutlass.cutlass_dsl import T as _T
 from fla.ops.utils import prepare_chunk_indices, prepare_lens
 from fla.utils import tensor_cache
 
-from cula.utils import USE_FAST_MATH, assert_blackwell
+from cula.ops.kda.policy import sm100_intracard_cp_decision
+from cula.utils import USE_FAST_MATH, assert_blackwell, get_device_sm_count
 
 COMPILE_OPTIONS = "--enable-tvm-ffi --generate-line-info --ptxas-options '--verbose'"
-
-
-# Intracard CP auto-dispatch
-def _intracard_cp_enabled() -> bool:
-    """Return whether intracard-CP is currently enabled (runtime check).
-
-    Env var truthiness matches FLA: any value other than "0" enables it.
-    Default (unset) is "0" → disabled.
-    """
-    return _os.environ.get("CULA_INTRACARD_CP", "0") != "0"
 
 
 # in FLA, cumsum returns int64 tensor by default
@@ -2028,6 +2018,7 @@ def chunk_gated_delta_rule_fwd_h(
     persistent: bool = True,
     _no_cp: bool = False,
     cu_seqlens_cpu: torch.Tensor | None = None,
+    use_intracard_cp=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     ChunkDeltaRuleFwdH forward pass — FLA-compatible API.
@@ -2059,19 +2050,23 @@ def chunk_gated_delta_rule_fwd_h(
         v_new:       [B, T, HV, V] bf16      (or None if save_new_value=False)
         final_state: [N, HV, K, V] fp32      (or None if output_final_state=False)
     """
-    # --- Intracard CP auto-dispatch ---
-    if _intracard_cp_enabled() and not _no_cp and cu_seqlens is not None and g is None and torch.is_inference_mode_enabled():
-        from cula.ops.cp.chunk_delta_h import intracard_fwd_h, should_use_intracard_cp
-        from cula.utils import get_device_sm_count
+    # --- Intracard CP dispatch (policy: cula.ops.kda.policy) ---
+    cp_decision = sm100_intracard_cp_decision(
+        mode=use_intracard_cp,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        g=g,
+        num_qk_heads=k.shape[2],
+        chunk_size=chunk_size,
+        is_inference=torch.is_inference_mode_enabled(),
+        sm_count_provider=lambda: get_device_sm_count(k.device),
+        no_cp=_no_cp,
+    )
+    if cp_decision.enabled:
+        from cula.ops.kda.policy import NotSplittableError
+        from cula.ops.kda.sm100.cp.chunk_delta_h import intracard_fwd_h
 
-        # Materialize cu_seqlens_cpu once here to avoid repeated D2H sync inside intracard_fwd_h.
-        _cu_seqlens_cpu = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens.cpu()
-        if should_use_intracard_cp(
-            _cu_seqlens_cpu,
-            get_device_sm_count(k.device),
-            k.shape[2],
-            chunk_size,
-        ):
+        try:
             return intracard_fwd_h(
                 k=k,
                 w=w,
@@ -2083,8 +2078,12 @@ def chunk_gated_delta_rule_fwd_h(
                 save_new_value=save_new_value,
                 cu_seqlens=cu_seqlens,
                 chunk_indices=chunk_indices,
-                cu_seqlens_cpu=_cu_seqlens_cpu,
+                cu_seqlens_cpu=cu_seqlens_cpu,
             )
+        except NotSplittableError:
+            if cp_decision.force:
+                raise
+            # "auto" path: shape not splittable -- fall through to the serial body below.
 
     B, T, H, K_dim = k.shape
     HV = u.shape[2]

@@ -32,13 +32,13 @@ if str(_REPO_ROOT) not in sys.path:
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as fla_fwd_h  # noqa: E402
 from fla.utils import assert_close  # noqa: E402  (RMSE-relative + atol short-circuit + NaN check)
 
-from cula.ops.chunk_delta_h_sm100 import chunk_gated_delta_rule_fwd_h  # noqa: E402
-from cula.ops.cp.chunk_delta_h import (  # noqa: E402
+from cula.ops.kda.sm100.cp.chunk_delta_h import (  # noqa: E402
     compute_subseq_len,
     intracard_fwd_h,
     prepare_subseq_cu_seqlens,
     should_use_intracard_cp,
 )
+from cula.ops.kda.sm100.delta_h import chunk_gated_delta_rule_fwd_h  # noqa: E402
 from cula.utils import get_device_sm_count  # noqa: E402
 
 # Constants & tolerances — aligned with existing cuLA tests (see below).
@@ -128,19 +128,40 @@ def run_cula_cp(k, w, u, gk, h0, cu, **kw):
 
 
 def run_intracard_direct(k, w, u, gk, h0, cu, *, output_final_state=True, save_new_value=True):
-    """Direct CP call — skips the auto-dispatch heuristic."""
-    return intracard_fwd_h(
-        k=k,
-        w=w,
-        u=u,
-        gk=gk,
-        initial_state=h0,
-        output_final_state=output_final_state,
-        chunk_size=BT,
-        save_new_value=save_new_value,
-        cu_seqlens=cu,
-        cu_seqlens_cpu=cu.cpu(),
-    )
+    """Direct CP call — skips the auto-dispatch heuristic.
+
+    intracard_fwd_h is a pure executor that raises NotSplittableError when the
+    post-split occupancy guard rejects; mirror the production caller's graceful
+    fallback to the serial path so configs that don't engage CP still return.
+    """
+    from cula.ops.kda.policy import NotSplittableError
+
+    try:
+        return intracard_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            gk=gk,
+            initial_state=h0,
+            output_final_state=output_final_state,
+            chunk_size=BT,
+            save_new_value=save_new_value,
+            cu_seqlens=cu,
+            cu_seqlens_cpu=cu.cpu(),
+        )
+    except NotSplittableError:
+        return chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            gk=gk,
+            initial_state=h0,
+            output_final_state=output_final_state,
+            chunk_size=BT,
+            save_new_value=save_new_value,
+            cu_seqlens=cu,
+            _no_cp=True,
+        )
 
 
 def run_fla(k, w, u, gk, h0, cu, **kw):
@@ -232,6 +253,19 @@ def assert_cp_splits(cu, H, total_T):
     subseq_len = compute_subseq_len(max_seq, num_sms, H, BT, num_seqs=len(cu_cpu) - 1)
     _, split_info, _ = prepare_subseq_cu_seqlens(cu_cpu, subseq_len, BT)
     assert split_info, "config must exercise the split path"
+
+
+def test_forced_cp_not_splittable_raises():
+    """use_intracard_cp=True on an unsplittable shape must raise NotSplittableError."""
+    from cula.ops.kda.policy import NotSplittableError
+
+    # A single one-chunk sequence cannot be meaningfully split.
+    cu = torch.tensor([0, BT], dtype=torch.int32, device=DEVICE)
+    k = torch.randn(1, BT, 1, K, device=DEVICE, dtype=torch.bfloat16)
+    w = torch.randn(1, BT, 1, K, device=DEVICE, dtype=torch.bfloat16)
+    u = torch.randn(1, BT, 1, V, device=DEVICE, dtype=torch.bfloat16)
+    with torch.inference_mode(), pytest.raises(NotSplittableError):
+        chunk_gated_delta_rule_fwd_h(k=k, w=w, u=u, cu_seqlens=cu, use_intracard_cp=True)
 
 
 # ====================== Dispatch path: CP vs no-CP ======================

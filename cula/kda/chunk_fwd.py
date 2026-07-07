@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
+"""SM100 modular chunk KDA forward orchestration"""
 
 import torch
 
@@ -28,12 +28,6 @@ from fla.ops.utils.constant import RCP_LN2
 
 from cula.kda.chunk_intra import chunk_kda_fwd_intra
 from cula.utils import assert_blackwell
-
-# ─── CuTe DSL wrapper (TVM-FFI compile cache) ───
-_delta_h_mod = importlib.import_module("cula.ops.chunk_delta_h_sm100")
-chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
-_fwd_o_mod = importlib.import_module("cula.ops.fwd_o_sm100")
-chunk_gla_fwd_o = _fwd_o_mod.chunk_gla_fwd_o
 
 
 def chunk_kda_fwd(
@@ -57,10 +51,14 @@ def chunk_kda_fwd(
     disable_recompute: bool = False,
     return_intermediate_states: bool = False,
     cp_context: FLACPContext | None = None,
+    use_intracard_cp=None,
     use_tf32_inverse: bool = True,
     unified_gref: bool = False,  # Set True for ~5% extra perf (slightly lower precision)
 ):
     assert_blackwell(q.device)
+
+    from cula.ops.kda.sm100.delta_h import chunk_gated_delta_rule_fwd_h
+    from cula.ops.kda.sm100.fwd_o import chunk_gla_fwd_o
 
     # Apply gate activation
     g_org = None
@@ -118,6 +116,7 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         cu_seqlens_cpu=cu_seqlens_cpu,
+        use_intracard_cp=use_intracard_cp,
     )
 
     if cp_context is not None:

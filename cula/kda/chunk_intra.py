@@ -14,6 +14,7 @@
 
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+"""SM100 modular chunk KDA intra-chunk wrapper and helpers"""
 
 import torch
 import triton

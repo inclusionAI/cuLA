@@ -47,7 +47,7 @@ from benchmarks.utils import (
     set_seed,
 )
 from cula.kda.chunk_fwd import chunk_kda_fwd
-from cula.ops.cp.chunk_delta_h import (
+from cula.ops.kda.sm100.cp.chunk_delta_h import (
     compute_subseq_len,
     prepare_subseq_cu_seqlens,
     should_use_intracard_cp,

@@ -50,7 +50,7 @@ from benchmarks.utils import (
     relative_rms_error_rel_max_mean_abs,
     set_seed,
 )
-from cula.ops.chunk_wy_dqkg_sm100 import chunk_kda_bwd_wy_dqkg_fused as cula_chunk_kda_bwd_wy_dqkg_fused
+from cula.ops.kda.sm100.bwd_wy_dqkg import chunk_kda_bwd_wy_dqkg_fused as cula_chunk_kda_bwd_wy_dqkg_fused
 
 torch.backends.cuda.matmul.allow_tf32 = True
 

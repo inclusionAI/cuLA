@@ -12,11 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from cula.ops.kda_decode import fused_sigmoid_gating_delta_rule_update, kda_decode
-from cula.ops.la_decode import linear_attention_decode
-
 __all__ = [
     "kda_decode",
     "fused_sigmoid_gating_delta_rule_update",
     "linear_attention_decode",
 ]
+
+_LAZY = {
+    "kda_decode": ("cula.ops.kda.decode.cute", "kda_decode"),
+    "fused_sigmoid_gating_delta_rule_update": (
+        "cula.ops.kda.decode.cute",
+        "fused_sigmoid_gating_delta_rule_update",
+    ),
+    "linear_attention_decode": ("cula.ops.lightning.decode", "linear_attention_decode"),
+}
+
+
+def __getattr__(name):
+    target = _LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    return getattr(importlib.import_module(target[0]), target[1])
+
+
+def __dir__():
+    return sorted(__all__)

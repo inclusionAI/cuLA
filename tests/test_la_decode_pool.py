@@ -28,7 +28,7 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from cula.ops.la_decode import linear_attention_decode
+from cula.ops.lightning.decode import linear_attention_decode
 
 
 def torch_la_decode_ref(q, k, v, state, decay_scales, scale):

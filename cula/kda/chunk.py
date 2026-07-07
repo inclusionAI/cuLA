@@ -15,6 +15,10 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # Related files are modified and supported by the Moonshot AI Team
 
+"""SM100 modular chunk KDA public API and autograd wrapper"""
+
+from typing import Literal
+
 import torch
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.ops.cp import FLACPContext
@@ -23,6 +27,7 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 from cula.kda.chunk_bwd import chunk_kda_bwd
 from cula.kda.chunk_fwd import chunk_kda_fwd
+from cula.ops.kda.policy import IntracardCPMode, resolve_intracard_cp_mode
 
 
 class ChunkKDAFunction(torch.autograd.Function):
@@ -50,6 +55,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         disable_recompute: bool = False,
         return_intermediate_states: bool = False,
         cp_context: FLACPContext | None = None,
+        use_intracard_cp: IntracardCPMode | None = None,
     ):
         chunk_size = 64
 
@@ -85,6 +91,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             disable_recompute=disable_recompute,
             return_intermediate_states=return_intermediate_states,
             cp_context=cp_context,
+            use_intracard_cp=use_intracard_cp,
         )
 
         if return_intermediate_states:
@@ -211,6 +218,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -233,6 +241,7 @@ def chunk_kda(
     disable_recompute: bool = False,
     return_intermediate_states: bool = False,
     cp_context: FLACPContext = None,
+    use_intracard_cp: Literal["auto"] | bool | None = None,
     **kwargs,
 ):
     r"""
@@ -345,7 +354,15 @@ def chunk_kda(
         )
     """
 
+    # just for backward compatibility, resolve the deprecated `use_cp` argument
+    # TODO: maybe we can remove this in the future
+    use_cp_alias = kwargs.pop("use_cp", None)
+    use_intracard_cp = resolve_intracard_cp_mode(use_intracard_cp, use_cp_alias)
+
     if cp_context is not None:
+        if use_intracard_cp is True:
+            raise ValueError("use_intracard_cp=True cannot be combined with FLA cp_context.")
+        use_intracard_cp = False
         assert initial_state is None, "Initial state is not supported for CP"
         assert output_final_state is False, "Output final state is not supported for CP"
         assert cp_context.cu_seqlens is not None, "cu_seqlens is required for CP"
@@ -353,6 +370,11 @@ def chunk_kda(
         cu_seqlens = cp_context.cu_seqlens
         if cp_context.cu_seqlens_cpu is not None:
             cu_seqlens_cpu = cp_context.cu_seqlens_cpu
+
+    if return_intermediate_states:
+        if use_intracard_cp is True:
+            raise ValueError("use_intracard_cp=True is not supported with return_intermediate_states=True.")
+        use_intracard_cp = False
 
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -414,4 +436,5 @@ def chunk_kda(
         disable_recompute,
         return_intermediate_states,
         cp_context,
+        use_intracard_cp,
     )

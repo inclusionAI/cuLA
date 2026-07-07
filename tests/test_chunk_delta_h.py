@@ -21,8 +21,10 @@ from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as fla_fwd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import importlib.util
 
+pytestmark = pytest.mark.sm100_only
+
 _spec = importlib.util.spec_from_file_location(
-    "chunk_delta_h_sm100", os.path.join(os.path.dirname(__file__), "..", "cula", "ops", "chunk_delta_h_sm100.py")
+    "chunk_delta_h", os.path.join(os.path.dirname(__file__), "..", "cula", "ops", "kda", "sm100", "delta_h.py")
 )
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)

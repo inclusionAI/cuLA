@@ -42,7 +42,7 @@ To run this example:
 
 .. code-block:: bash
 
-    python examples/blackwell/linear_attn_sm100.py \\
+    python examples/blackwell/linear_attn.py \\
       --batch_size 4 --seq_len 1024 --num_heads 8 --head_dim 64 \\
       --chunk_size 64 --decay 0.95
 
