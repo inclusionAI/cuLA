@@ -23,92 +23,44 @@ namespace kda::sm90 {
 using namespace cute;
 using bf16 = cute::bfloat16_t;
 
-// SafeGate=true, InitState=false
-template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, cutlass::arch::Sm90, bf16, bf16, float>(
-    cudaStream_t,
-    bf16*,
-    float*,
-    bf16 const*,
-    bf16 const*,
-    bf16 const*,
-    float const*,
-    float const*,
-    float const*,
-    int32_t const*,
-    uint8_t*,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int64_t,
-    float,
-    int32_t);
+#define INSTANTIATE_GBAI(NeedsBeta, NeedsAlpha, InitState, SafeGate, TBeta) \
+    template void launch_kda_fwd_prefill_kernel_gbai<                       \
+        NeedsBeta,                                                          \
+        NeedsAlpha,                                                         \
+        InitState,                                                          \
+        SafeGate,                                                           \
+        cutlass::arch::Sm90,                                                \
+        bf16,                                                               \
+        bf16,                                                               \
+        float,                                                              \
+        TBeta>(                                                             \
+        cudaStream_t,                                                       \
+        bf16*,                                                              \
+        float*,                                                             \
+        bf16 const*,                                                        \
+        bf16 const*,                                                        \
+        bf16 const*,                                                        \
+        float const*,                                                       \
+        float const*,                                                       \
+        TBeta const*,                                                       \
+        int32_t const*,                                                     \
+        uint8_t*,                                                           \
+        int32_t,                                                            \
+        int32_t,                                                            \
+        int32_t,                                                            \
+        int32_t,                                                            \
+        int64_t,                                                            \
+        float,                                                              \
+        int32_t,                                                            \
+        int32_t const*,                                                     \
+        int32_t const*,                                                     \
+        int32_t)
 
-// SafeGate=true, InitState=true
-template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, cutlass::arch::Sm90, bf16, bf16, float>(
-    cudaStream_t,
-    bf16*,
-    float*,
-    bf16 const*,
-    bf16 const*,
-    bf16 const*,
-    float const*,
-    float const*,
-    float const*,
-    int32_t const*,
-    uint8_t*,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int64_t,
-    float,
-    int32_t);
+INSTANTIATE_GBAI(true, true, false, true, float);
+INSTANTIATE_GBAI(true, true, true, true, float);
+INSTANTIATE_GBAI(true, true, false, true, bf16);
+INSTANTIATE_GBAI(true, true, true, true, bf16);
 
-// SafeGate=true, InitState=false, BetaBF16
-template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, false, true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
-    cudaStream_t,
-    bf16*,
-    float*,
-    bf16 const*,
-    bf16 const*,
-    bf16 const*,
-    float const*,
-    float const*,
-    bf16 const*,
-    int32_t const*,
-    uint8_t*,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int64_t,
-    float,
-    int32_t);
-
-// SafeGate=true, InitState=true, BetaBF16
-template void
-launch_kda_fwd_prefill_kernel_gbai<true, true, true, true, cutlass::arch::Sm90, bf16, bf16, float, bf16>(
-    cudaStream_t,
-    bf16*,
-    float*,
-    bf16 const*,
-    bf16 const*,
-    bf16 const*,
-    float const*,
-    float const*,
-    bf16 const*,
-    int32_t const*,
-    uint8_t*,
-    int32_t,
-    int32_t,
-    int32_t,
-    int32_t,
-    int64_t,
-    float,
-    int32_t);
+#undef INSTANTIATE_GBAI
 
 }  // namespace kda::sm90

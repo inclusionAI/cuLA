@@ -140,6 +140,11 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
         int32_t num_qk_heads;
         int32_t num_v_heads;
         int32_t head_size;  // d
+
+        // For intra-card CP
+        int32_t const* cp_seq_map = nullptr;
+        int32_t const* raw_cu_seqlens = nullptr;
+        int32_t raw_num_seqs = 0;
     };
     using ProblemShape = VarlenProblemShape;
 

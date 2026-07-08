@@ -25,7 +25,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from cula.ops.kda_decode import (
+from cula.ops.kda.decode.cute import (
     NUM_THREADS,
     TILE_K,
     _canonicalize_state_layout,

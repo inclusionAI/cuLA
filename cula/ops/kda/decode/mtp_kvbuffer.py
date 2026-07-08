@@ -35,7 +35,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from cula.ops.kda_decode import (
+from cula.ops.kda.decode.cute import (
     TILE_K,
     _get_cached_stream,
     _normalize_A_log,
@@ -44,7 +44,7 @@ from cula.ops.kda_decode import (
     _normalize_state_source,
     _prepare_output_tensor,
 )
-from cula.ops.kda_decode_mtp import (
+from cula.ops.kda.decode.mtp import (
     VEC_SIZE,
     _normalize_mtp_a,
 )

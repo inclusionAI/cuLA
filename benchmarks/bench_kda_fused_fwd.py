@@ -18,7 +18,7 @@ bench_kda_fused_fwd.py — Benchmark: cuLA fully-fused KDA forward vs FLA Triton
 
 Automatically selects the cuLA fully-fused implementation based on the current
 GPU architecture:
-    - sm100 (Blackwell) → cula.kda.blackwell_fused_fwd.flash_kda_prefill
+    - sm100 (Blackwell) → cula.ops.kda.experimental.sm100_fused.wrapper.flash_kda_prefill
   - sm90  (Hopper)    → cula.kda.hopper_fused_fwd.cula_kda_prefill
 
 Compares:

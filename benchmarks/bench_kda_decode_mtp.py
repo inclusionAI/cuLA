@@ -22,17 +22,17 @@ import os
 
 import torch
 
-from cula.ops.kda_decode import kda_decode
-from cula.ops.kda_decode_mtp import (
+from cula.ops.kda.decode.cute import kda_decode
+from cula.ops.kda.decode.mtp import (
     kda_decode_mtp,
     kda_decode_mtp_recurrent,
     kda_decode_mtp_recurrent_ws,
 )
-from cula.ops.kda_decode_mtp_kvbuffer import kda_flush_kvbuffer
+from cula.ops.kda.decode.mtp_kvbuffer import kda_flush_kvbuffer
 
 # shuffle-kvbuffer (token-parallel, structure B) is optional too.
 try:
-    from cula.ops.kda_decode_mtp_kvbuffer import kda_decode_mtp_shuffle_kvbuffer
+    from cula.ops.kda.decode.mtp_kvbuffer import kda_decode_mtp_shuffle_kvbuffer
 
     _HAVE_SHUFFLE = True
 except Exception:
@@ -40,7 +40,7 @@ except Exception:
 
 # tensor_core-kvbuffer (CuTe tensor-core, flat-in-T verify).
 try:
-    from cula.ops.kda_decode_mtp_kvbuffer import kda_decode_mtp_tensor_core_kvbuffer
+    from cula.ops.kda.decode.mtp_kvbuffer import kda_decode_mtp_tensor_core_kvbuffer
 
     _HAVE_TCORE = True
 except Exception:

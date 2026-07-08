@@ -12,17 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pathlib
-import sys
+"""[experimental] Unwired SM100 fully fused KDA prefill dead-path wrapper;arch=SM100"""
+
 import warnings
-
-import torch
-
-sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
+import torch
 from cutlass.cute.runtime import from_dlpack
 from fla.modules.l2norm import l2norm_fwd
 
@@ -32,7 +29,7 @@ from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
-from cula.ops.kda_fully_fused_sm100_wip import KDAChunkwise
+from cula.ops.kda.experimental.sm100_fused.kda_fully_fused_wip import KDAChunkwise
 from cula.utils import USE_FAST_MATH, assert_blackwell
 
 # Global kernel cache
@@ -44,7 +41,7 @@ COMPILE_OPTIONS = "--generate-line-info --ptxas-options '--verbose'"
 _dummy_cache = {}
 
 
-class ChunkKDAFunction(torch.autograd.Function):
+class BlackwellFusedKDAFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
     @autocast_custom_fwd
@@ -311,7 +308,7 @@ def flash_kda_prefill(
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    o, final_state = ChunkKDAFunction.apply(
+    o, final_state = BlackwellFusedKDAFunction.apply(
         q,
         k,
         v,

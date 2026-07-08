@@ -65,7 +65,9 @@ kda_fwd_prefill(
     torch::Tensor workspace_buffer,
     float scale,
     bool output_final_state,
-    bool safe_gate);
+    bool safe_gate,
+    std::optional<torch::Tensor> cp_seq_map_,
+    std::optional<torch::Tensor> raw_cu_seqlens_);
 #endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -75,6 +77,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("recompute_w_u_cuda", &ChunkKDAFwdRecompWU);
 #endif
 #if defined(CULA_SM90A_ENABLED)
-    m.def("kda_fwd_prefill", &kda_fwd_prefill);
+    m.def(
+        "kda_fwd_prefill",
+        &kda_fwd_prefill,
+        pybind11::arg("output_"),
+        pybind11::arg("output_state_"),
+        pybind11::arg("q"),
+        pybind11::arg("k"),
+        pybind11::arg("v"),
+        pybind11::arg("input_state_"),
+        pybind11::arg("alpha_"),
+        pybind11::arg("beta_"),
+        pybind11::arg("cu_seqlens"),
+        pybind11::arg("workspace_buffer"),
+        pybind11::arg("scale"),
+        pybind11::arg("output_final_state"),
+        pybind11::arg("safe_gate"),
+        pybind11::arg("cp_seq_map_") = std::nullopt,
+        pybind11::arg("raw_cu_seqlens_") = std::nullopt);
 #endif
 }

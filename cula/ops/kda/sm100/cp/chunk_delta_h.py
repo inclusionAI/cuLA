@@ -26,7 +26,7 @@ Pipeline (3 stages):
 Reference:
     - FLA intra-card CP: fla/ops/common/intracard_cp.py
     - FLA CP kernels:    fla/ops/cp/chunk_delta_h.py
-    - cuLA chunk_delta_h: cula/ops/chunk_delta_h.py
+    - cuLA chunk_delta_h: cula/ops/kda/sm100/delta_h.py
 """
 
 from __future__ import annotations
@@ -40,14 +40,14 @@ import torch
 
 from cula.utils import get_device_sm_count, get_pre_scan
 
-# Lazy import to avoid circular dependency with cula.ops.chunk_delta_h
+# Lazy import to avoid circular dependency with cula.ops.kda.sm100.delta_h
 _chunk_gated_delta_rule_fwd_h = None
 
 
 def _get_fwd_h():
     global _chunk_gated_delta_rule_fwd_h
     if _chunk_gated_delta_rule_fwd_h is None:
-        from cula.ops.chunk_delta_h_sm100 import chunk_gated_delta_rule_fwd_h
+        from cula.ops.kda.sm100.delta_h import chunk_gated_delta_rule_fwd_h
 
         _chunk_gated_delta_rule_fwd_h = chunk_gated_delta_rule_fwd_h
     return _chunk_gated_delta_rule_fwd_h
@@ -347,12 +347,12 @@ def intracard_merge(
     For split seq [s0, s1, ..., s_{n-1}]: h0_sj = m_{j-1} @ h0_{j-1} + he_{j-1}.
     Returns (initial_states_merge [num_non_first, H, K, V] fp32, num_non_first).
     """
-    from cula.ops.cp.merge import merge_fwd
+    from cula.ops.kda.sm100.cp.merge import launch_merge
 
     if num_non_first == 0:
         return None, 0
 
-    initial_states_merge = merge_fwd(
+    initial_states_merge = launch_merge(
         hm=hm,
         seq_starts=merge_seq_starts,
         seq_counts=merge_seq_counts,
@@ -414,10 +414,12 @@ def intracard_fwd_h(
     chunk_indices: torch.Tensor | None = None,
     max_splits: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Intra-card CP chunk_delta_h forward; drop-in replacement for chunk_gated_delta_rule_fwd_h.
+    """Intra-card CP chunk_delta_h forward; splits long sequences and runs
+    pre_scan -> merge -> fwd_h on the sub-sequences.
 
-    Splits long sequences, runs pre_scan → merge → fwd_h on sub-sequences.
-    Falls back to the non-CP path when guards indicate no benefit.
+    Pure CP executor: raises NotSplittableError when the shape cannot be
+    meaningfully split. The caller owns the fallback-vs-raise policy (the
+    pre-split heuristic lives in sm100_intracard_cp_decision, not here).
     """
     assert cu_seqlens is not None, "intracard_fwd_h requires cu_seqlens (varlen mode)"
 
@@ -428,21 +430,6 @@ def intracard_fwd_h(
 
     if cu_seqlens_cpu is None:
         cu_seqlens_cpu = cu_seqlens.cpu()
-
-    if not should_use_intracard_cp(cu_seqlens_cpu, num_sms, H, chunk_size):
-        return _get_fwd_h()(
-            k=k,
-            w=w,
-            u=u,
-            gk=gk,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            chunk_size=chunk_size,
-            save_new_value=save_new_value,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            _no_cp=True,
-        )
 
     cu_list = cu_seqlens_cpu.tolist()
     num_seqs = len(cu_list) - 1
@@ -473,19 +460,9 @@ def intracard_fwd_h(
         split_info = False
 
     if not split_info:
-        return _get_fwd_h()(
-            k=k,
-            w=w,
-            u=u,
-            gk=gk,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            chunk_size=chunk_size,
-            save_new_value=save_new_value,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            _no_cp=True,
-        )
+        from cula.ops.kda.policy import NotSplittableError
+
+        raise NotSplittableError("SM100 intracard CP is not meaningfully splittable for this shape.")
 
     N_orig = len(cu_seqlens_cpu) - 1
 

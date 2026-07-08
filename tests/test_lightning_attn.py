@@ -35,7 +35,7 @@ pytestmark = pytest.mark.sm100_only
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from cula.ops.lightning_attn_sm100 import lightning_attn_fwd, lightning_attn_fwd_varlen  # noqa: E402
+from cula.ops.lightning.prefill_sm100 import lightning_attn_fwd, lightning_attn_fwd_varlen  # noqa: E402
 
 try:
     from fla.ops.simple_gla import chunk_simple_gla

@@ -58,7 +58,10 @@ launch_kda_fwd_prefill_kernel_gbai(
     int32_t head_size,
     int64_t total_seqlen,
     float scale,
-    int32_t sm_count) {
+    int32_t sm_count,
+    int32_t const* cp_seq_map = nullptr,
+    int32_t const* raw_cu_seqlens = nullptr,
+    int32_t raw_num_seqs = 0) {
 #if defined(CULA_SM90A_ENABLED)
     constexpr bool HopperSupported = true;
 #else
@@ -123,6 +126,9 @@ launch_kda_fwd_prefill_kernel_gbai(
                     .num_qk_heads = num_qk_heads,
                     .num_v_heads = num_v_heads,
                     .head_size = head_size,
+                    .cp_seq_map = cp_seq_map,
+                    .raw_cu_seqlens = raw_cu_seqlens,
+                    .raw_num_seqs = raw_num_seqs,
                 },
             .mainloop =
                 {

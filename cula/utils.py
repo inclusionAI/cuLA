@@ -83,8 +83,8 @@ def assert_hopper(device: torch.device | str | int | None = None) -> None:
 def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callable:
     """Return the appropriate ``kda_prefill`` implementation for *device*.
 
-    - sm100/sm103 (Blackwell) → cula.kda.blackwell_fused_fwd.flash_kda_prefill
-    - sm90  (Hopper)          → cula.kda.kda_prefill_hopper
+    - sm100/sm103 (Blackwell) → cula.ops.kda.experimental.sm100_fused (WIP)
+    - sm90  (Hopper)          → cula.kda.hopper_fused_fwd
 
     Args:
         device: CUDA device to query.  Defaults to the currently active device.
@@ -94,13 +94,13 @@ def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callabl
     """
     major, minor = get_device_sm_version(device)
     if major == 10 and minor in (0, 3):
-        from cula.kda import kda_prefill_blackwell
+        from cula.ops.kda.experimental.sm100_fused.wrapper import flash_kda_prefill
 
-        return kda_prefill_blackwell
+        return flash_kda_prefill
     elif major == 9 and minor == 0:
-        from cula.kda import kda_prefill_hopper
+        from cula.kda.hopper_fused_fwd import cula_kda_prefill
 
-        return kda_prefill_hopper
+        return cula_kda_prefill
     else:
         raise RuntimeError(
             f"Unsupported CUDA compute capability sm_{major}{minor}. "
@@ -109,29 +109,16 @@ def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callabl
 
 
 def get_pre_scan(device: torch.device | str | int | None = None) -> Callable:
-    """Return the appropriate ``chunk_delta_rule_pre_scan`` implementation for *device*.
-
-    - sm100/sm103 (Blackwell) → cula.ops.cp.pre_scan (CuTeDSL SM100 kernel)
-    - sm90  (Hopper)          → cula.ops.cp.pre_scan_sm90 (to be implemented)
-
-    Args:
-        device: CUDA device to query.  Defaults to the currently active device.
-
-    Raises:
-        RuntimeError: If the device architecture is not supported.
-    """
+    """Return the intracard-CP pre_scan implementation for *device*."""
     major, minor = get_device_sm_version(device)
     if major == 10 and minor in (0, 3):
-        from cula.ops.cp.pre_scan import chunk_delta_rule_pre_scan
+        from cula.ops.kda.sm100.cp.pre_scan import chunk_delta_rule_pre_scan
 
         return chunk_delta_rule_pre_scan
-    elif major == 9 and minor == 0:
-        raise NotImplementedError("The Hopper (SM90) implementation of pre_scan is not yet available.")
-    else:
-        raise RuntimeError(
-            f"Unsupported CUDA compute capability sm_{major}{minor}. "
-            f"Only sm90a (Hopper) and Blackwell (SM100/SM103) are supported."
-        )
+    raise RuntimeError(
+        f"Unsupported CUDA compute capability sm_{major}{minor}. "
+        "Intracard CP pre_scan is currently available only on SM100/SM103."
+    )
 
 
 @cute.jit

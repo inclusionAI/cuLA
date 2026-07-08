@@ -137,7 +137,7 @@ import os
 os.environ["CULA_INTRACARD_CP"] = "1"
 
 import torch
-from cula.ops.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from cula.ops.kda.sm100.delta_h import chunk_gated_delta_rule_fwd_h
 
 B, T, H, K, V = 1, 65536, 8, 128, 128
 device = 'cuda'

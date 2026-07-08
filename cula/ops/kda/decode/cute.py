@@ -144,7 +144,6 @@ def _try_fast_dense_decode(
     softplus_threshold: float,
     out: torch.Tensor | None,
     state_layout: str | None,
-    opt_level: int = 1,
 ):
     """Fast path for the common dense decode case used by the benchmark.
 
@@ -268,7 +267,6 @@ def _try_fast_dense_decode(
         dense_small_hv_parallel=dense_small_hv_parallel,
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
-        opt_level=opt_level,
     )
     compiled_kernel(
         cu_seqlens_to_use,
@@ -1554,18 +1552,12 @@ def _get_compiled_kernel(
     dense_small_hv_parallel,
     softplus_beta,
     softplus_threshold,
-    opt_level=1,
 ):
     """Get or lazily compile one CuteDSL decode kernel variant.
 
     Compile-time specialization is still important here, so we cache the result
     by shape, layout, and constexpr options. The compiled function is emitted
     with TVM-FFI enabled so runtime calls can pass torch tensors directly.
-
-    ``opt_level`` selects the CuTe DSL ``--opt-level`` (codegen optimization;
-    NOT a kernel constexpr). It is part of the cache key so the same shape can
-    be compiled at multiple opt-levels without colliding. Default 1 keeps the
-    historical behavior; 2/3 are experiments (see issue 17 compile-knob tuning).
     """
     global _compiled_kernels
 
@@ -1586,7 +1578,6 @@ def _get_compiled_kernel(
         dense_small_hv_parallel,
         softplus_beta,
         softplus_threshold,
-        opt_level,
     )
     if key in _compiled_kernels:
         return _compiled_kernels[key]
@@ -1665,7 +1656,7 @@ def _get_compiled_kernel(
         num_blocks_per_state_small=num_blocks_per_state_small,
         dense_small_hv_parallel=dense_small_hv_parallel,
         stream=stream,
-        options=f"--enable-tvm-ffi --opt-level {opt_level}",
+        options="--enable-tvm-ffi --opt-level 1",
     )
 
     _compiled_kernels[key] = compiled_kernel
@@ -1818,7 +1809,6 @@ def fused_sigmoid_gating_delta_rule_update(
     is_kda: bool = False,
     out: torch.Tensor | None = None,
     state_layout: str = "vk",
-    opt_level: int = 1,
 ):
     """Public cuLA decode API backed by CuTe DSL.
 
@@ -1849,7 +1839,6 @@ def fused_sigmoid_gating_delta_rule_update(
         softplus_threshold=softplus_threshold,
         out=out,
         state_layout=state_layout,
-        opt_level=opt_level,
     )
 
 
@@ -1870,7 +1859,6 @@ def kda_decode(
     softplus_threshold: float = 20.0,
     out: torch.Tensor | None = None,
     state_layout: str = "vk",
-    opt_level: int = 1,
 ) -> torch.Tensor:
     """CuTe DSL implementation of fused sigmoid gating KDA update.
 
@@ -1923,7 +1911,6 @@ def kda_decode(
         softplus_threshold,
         out,
         state_layout,
-        opt_level,
     )
     if fast_dense_out is not None:
         return fast_dense_out
@@ -2087,7 +2074,6 @@ def kda_decode(
         dense_small_hv_parallel=dense_small_hv_parallel,
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
-        opt_level=opt_level,
     )
 
     # With TVM-FFI enabled at compile time, the runtime launch can pass torch

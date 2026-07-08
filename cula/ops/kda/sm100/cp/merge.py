@@ -23,88 +23,10 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 import torch
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor, make_fake_stream
-from cutlass.cutlass_dsl import T as _T
 
-
-# ---------------------------------------------------------------------------
-# Inline PTX helpers: SM80 warp-level TF32 MMA (mma.sync.m16n8k8.tf32.tf32.f32)
-# ---------------------------------------------------------------------------
-def _to_ir(v, loc=None, ip=None):
-    """Convert DSL Numeric to an MLIR Value; pass through if already a Value."""
-    if hasattr(v, "ir_value"):
-        return v.ir_value(loc=loc, ip=ip)
-    return v
-
-
-@cutlass.dsl_user_op
-def _cvt_f32_to_tf32(f, *, loc=None, ip=None):
-    """Round-to-nearest convert fp32 -> tf32 (stored as i32 bit pattern)."""
-    f_ir = _to_ir(f, loc=loc, ip=ip)
-    result = _llvm.inline_asm(
-        _T.i32(),
-        [f_ir],
-        "cvt.rna.tf32.f32 $0, $1;",
-        "=r,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return cutlass.Int32(result)
-
-
-@cutlass.dsl_user_op
-def _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=None):
-    """One mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 instruction.
-
-    Inputs:
-      a0..a3: tf32 bits (Int32) — A fragment of 16x8 tile
-      b0..b1: tf32 bits (Int32) — B fragment of 8x8 tile
-      c0..c3: Float32 — accumulator in
-    Returns:
-      (d0, d1, d2, d3) Float32 — accumulator out
-    """
-    ins = [
-        _to_ir(a0, loc=loc, ip=ip),
-        _to_ir(a1, loc=loc, ip=ip),
-        _to_ir(a2, loc=loc, ip=ip),
-        _to_ir(a3, loc=loc, ip=ip),
-        _to_ir(b0, loc=loc, ip=ip),
-        _to_ir(b1, loc=loc, ip=ip),
-        _to_ir(c0, loc=loc, ip=ip),
-        _to_ir(c1, loc=loc, ip=ip),
-        _to_ir(c2, loc=loc, ip=ip),
-        _to_ir(c3, loc=loc, ip=ip),
-    ]
-    struct_ty = ir.Type.parse("!llvm.struct<(f32, f32, f32, f32)>")
-    ret = _llvm.inline_asm(
-        struct_ty,
-        ins,
-        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
-        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};",
-        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    d0 = _llvm.extractvalue(_T.f32(), ret, [0], loc=loc, ip=ip)
-    d1 = _llvm.extractvalue(_T.f32(), ret, [1], loc=loc, ip=ip)
-    d2 = _llvm.extractvalue(_T.f32(), ret, [2], loc=loc, ip=ip)
-    d3 = _llvm.extractvalue(_T.f32(), ret, [3], loc=loc, ip=ip)
-    return (
-        cutlass.Float32(d0),
-        cutlass.Float32(d1),
-        cutlass.Float32(d2),
-        cutlass.Float32(d3),
-    )
-
+from cula.ops.ptx import cvt_f32_to_tf32, mma_m16n8k8_tf32
 
 # ---------------------------------------------------------------------------
 # Compile-time constants (thread/vector layout)
@@ -116,7 +38,7 @@ _NUM_THREADS = _M_THR * _N_THR  # 128
 _VEC = 4  # 128-bit vectorized fp32 cp.async
 
 
-class ChunkDeltaRuleMerge:
+class Merge:
     """Prefix-scan merge kernel.
 
     H/K/V/BV kept as Python ints on ``self`` so layout construction is static.
@@ -364,21 +286,21 @@ class ChunkDeltaRuleMerge:
                 for mi in cutlass.range_constexpr(M_TILES):
                     row_a = warp_id * 32 + mi * 16 + q
                     row_b = row_a + 8
-                    a_frag[mi, 0] = _cvt_f32_to_tf32(sM[row_a, k_base + rp])
-                    a_frag[mi, 1] = _cvt_f32_to_tf32(sM[row_b, k_base + rp])
-                    a_frag[mi, 2] = _cvt_f32_to_tf32(sM[row_a, k_base + rp + 4])
-                    a_frag[mi, 3] = _cvt_f32_to_tf32(sM[row_b, k_base + rp + 4])
+                    a_frag[mi, 0] = cvt_f32_to_tf32(sM[row_a, k_base + rp])
+                    a_frag[mi, 1] = cvt_f32_to_tf32(sM[row_b, k_base + rp])
+                    a_frag[mi, 2] = cvt_f32_to_tf32(sM[row_a, k_base + rp + 4])
+                    a_frag[mi, 3] = cvt_f32_to_tf32(sM[row_b, k_base + rp + 4])
                 # Pre-load + cvt B. For m16n8k8 TF32, B[8x8] per-lane (col-major):
                 #   b0: (rp,   q)
                 #   b1: (rp+4, q)
                 for nj in cutlass.range_constexpr(N_TILES):
                     col_b = nj * 8 + q
-                    b_frag[nj, 0] = _cvt_f32_to_tf32(sH[k_base + rp, col_b])
-                    b_frag[nj, 1] = _cvt_f32_to_tf32(sH[k_base + rp + 4, col_b])
+                    b_frag[nj, 0] = cvt_f32_to_tf32(sH[k_base + rp, col_b])
+                    b_frag[nj, 1] = cvt_f32_to_tf32(sH[k_base + rp + 4, col_b])
                 # MMAs
                 for mi in cutlass.range_constexpr(M_TILES):
                     for nj in cutlass.range_constexpr(N_TILES):
-                        d0, d1, d2, d3 = _mma_m16n8k8_tf32(
+                        d0, d1, d2, d3 = mma_m16n8k8_tf32(
                             a_frag[mi, 0],
                             a_frag[mi, 1],
                             a_frag[mi, 2],
@@ -430,7 +352,7 @@ class ChunkDeltaRuleMerge:
 # Compile cache
 # ---------------------------------------------------------------------------
 def _compile_merge_variant(H: int, K: int, V: int, has_h0: int):
-    kernel_obj = ChunkDeltaRuleMerge(H=H, K=K, V=V, BV=_BV_DEFAULT, has_h0=has_h0)
+    kernel_obj = Merge(H=H, K=K, V=V, BV=_BV_DEFAULT, has_h0=has_h0)
 
     sym_s = cute.sym_int()
     sym_nnf = cute.sym_int()
@@ -485,7 +407,7 @@ def _get_compiled_merge(H: int, K: int, V: int, has_h0: int):
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-def merge_fwd(
+def launch_merge(
     hm: torch.Tensor,
     seq_starts: list[int],
     seq_counts: list[int],

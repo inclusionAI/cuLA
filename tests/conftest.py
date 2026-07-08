@@ -1,4 +1,5 @@
 import re
+
 import pytest
 import torch
 
@@ -56,9 +57,5 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_slow)
             continue
         callspec = getattr(item, "callspec", None)
-        if (
-            callspec is not None
-            and callspec.params.get("disable_recompute")
-            and "kda_fast_norecomp" not in item.keywords
-        ):
+        if callspec is not None and callspec.params.get("disable_recompute") and "kda_fast_norecomp" not in item.keywords:
             item.add_marker(skip_fast_norecomp)

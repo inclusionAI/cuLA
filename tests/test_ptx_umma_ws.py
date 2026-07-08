@@ -16,7 +16,7 @@ things simple we use a two-TMEM-column approach:
   - tmem region 0: accumulator for both phases
   - tmem region 1: holds A data for TS phase (populated via R2T store)
 
-SMEM layout follows the same conventions as test_ptx_umma_masked.py.
+SMEM layout follows the same conventions as test_ptx_umma_masked.
 """
 
 import pathlib
@@ -30,6 +30,7 @@ import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+import pytest
 import torch
 from cutlass.cute.arch import (
     elect_one,
@@ -46,18 +47,17 @@ from cutlass.cute.nvgpu.tcgen05 import (
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import BFloat16, Float32, Int32, Int64, TFloat32
 
-from cula.ops.intrinsics_sm100 import (
-    store_256b,
-    subvec,
-    tcgen05_ld_32x32b,
-)
-from cula.ops.ptx_umma_ext import (
+from cula.ops.ptx import store_256b, subvec
+from cula.ops.sm100.ptx import (
     CollectorBBuffer,
     CollectorOp,
     Tcgen05SmemDescriptor,
+    tcgen05_ld_32x32b,
     tcgen05mma_ws_ss_f16,
     tcgen05mma_ws_ss_tf32,
 )
+
+pytestmark = pytest.mark.sm100_only
 
 M_DIM, N_DIM = 64, 64
 # TODO: support arbitrary K

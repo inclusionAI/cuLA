@@ -27,13 +27,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # for sibling 
 from test_kda_decode import torch_kda_decode_ref  # trusted single-token reference
 
 from cula.kda import kda_decode
-from cula.ops.kda_decode_mtp import (
+from cula.ops.kda.decode.mtp import (
     _select_mtp_config,
     _select_mtp_tile_v,
     kda_decode_mtp_recurrent,
     kda_decode_mtp_recurrent_ws,
 )
-from cula.ops.kda_decode_mtp_kvbuffer import (
+from cula.ops.kda.decode.mtp_kvbuffer import (
     _kvbuffer_prefer_tensor_core,
     _select_kvb_tile_v,
     _select_shuffle_kvb_ilp_rows,
@@ -93,7 +93,7 @@ def make_inputs_mtp(N, T, H, HV, K, V, device="cuda", seed=42):
     return q, k, v, a, b, A_log, dt_bias, state
 
 
-def run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scale, opt_level=1):
+def run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scale):
     """The "loop" baseline: T sequential single-token kda_decode calls, state carried across tokens."""
     N, T, H, K = q.shape
     HV, V = v.shape[2], v.shape[3]
@@ -118,7 +118,6 @@ def run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scal
             initial_state_indices=indices,
             scale=scale,
             use_qk_l2norm_in_kernel=True,
-            opt_level=opt_level,
         )
         o_all[:, t] = o_t.squeeze(1)
     return o_all, state_source

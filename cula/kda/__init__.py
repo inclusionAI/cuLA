@@ -12,23 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from cula.kda.blackwell_fused_fwd import flash_kda_prefill as kda_prefill_blackwell
-from cula.kda.chunk import chunk_kda
-from cula.kda.hopper_fused_fwd import cula_kda_prefill as kda_prefill_hopper
-from cula.ops.kda_decode import fused_sigmoid_gating_delta_rule_update, kda_decode
-from cula.ops.kda_decode_mtp import (
-    kda_decode_mtp,
-    kda_decode_mtp_recurrent,
-    kda_decode_mtp_recurrent_ws,
-)
+"""Public KDA API exports for chunk, prefill, and decode"""
 
 __all__ = [
     "chunk_kda",
-    "kda_prefill_blackwell",
     "kda_decode",
     "kda_decode_mtp",
     "kda_decode_mtp_recurrent",
     "kda_decode_mtp_recurrent_ws",
     "fused_sigmoid_gating_delta_rule_update",
     "kda_prefill_hopper",
+    "kda_prefill_hopper_opt",
+    "kda_prefill_hopper_auto",
 ]
+
+_LAZY = {
+    "chunk_kda": ("cula.kda.chunk", "chunk_kda"),
+    "kda_prefill_hopper": ("cula.kda.hopper_fused_fwd", "cula_kda_prefill"),
+    "kda_decode": ("cula.ops.kda.decode.cute", "kda_decode"),
+    "kda_decode_mtp": ("cula.ops.kda.decode.mtp", "kda_decode_mtp"),
+    "kda_decode_mtp_recurrent": ("cula.ops.kda.decode.mtp", "kda_decode_mtp_recurrent"),
+    "kda_decode_mtp_recurrent_ws": (
+        "cula.ops.kda.decode.mtp",
+        "kda_decode_mtp_recurrent_ws",
+    ),
+    "fused_sigmoid_gating_delta_rule_update": (
+        "cula.ops.kda.decode.cute",
+        "fused_sigmoid_gating_delta_rule_update",
+    ),
+}
+
+
+def __getattr__(name):
+    target = _LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    return getattr(importlib.import_module(target[0]), target[1])
+
+
+def __dir__():
+    return sorted(__all__)
