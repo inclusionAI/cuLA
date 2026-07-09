@@ -15,7 +15,7 @@
 
 """Unit tests for the fused causal-conv1d + MTP verify decode kernel.
 
-Covers both dispatch variants (vk small-batch, ws warp-spec large-batch) against
+Covers both dispatch variants (small_batch small/medium-batch, large_batch warp-spec large-batch) against
 a pure-torch reference (depthwise causal conv1d + SiLU + loop delta-rule
 recurrence + per-step conv-window/SSM snapshots). Shapes follow the real KDA
 config where num_q_heads == num_v_heads (H == HV); H=HV=8 is the TP=4 per-GPU
@@ -23,6 +23,7 @@ shape and H=HV=32 the full model. GVA (H=8, HV=16) is included for robustness
 (the kernel supports HV >= H even though the model uses H == HV).
 """
 
+import os
 import pathlib
 import sys
 
@@ -170,18 +171,18 @@ def _check(N, T, H, HV, variant, gate, seed=0):
 
 
 # --------------------------------------------------------------------------- #
-# real KDA shape: H == HV. vk (small batch) and ws (large batch) variants.
+# real KDA shape: H == HV. small_batch (small/medium batch) and large_batch (large batch) variants.
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("H,HV", [(8, 8), (32, 32)], ids=["h8", "h32"])
 @pytest.mark.parametrize("N,T", [(4, 4), (8, 4), (2, 2), (4, 8)])
-@pytest.mark.parametrize("variant", ["vk", "ws"])
+@pytest.mark.parametrize("variant", ["small_batch", "large_batch"])
 def test_conv_mtp_hv_eq_h_safe(N, T, H, HV, variant):
     _check(N, T, H, HV, variant, "safe")
 
 
 @pytest.mark.parametrize("H,HV", [(8, 8), (32, 32)], ids=["h8", "h32"])
 @pytest.mark.parametrize("N,T", [(4, 4), (8, 4)])
-@pytest.mark.parametrize("variant", ["vk", "ws"])
+@pytest.mark.parametrize("variant", ["small_batch", "large_batch"])
 def test_conv_mtp_hv_eq_h_softplus(N, T, H, HV, variant):
     _check(N, T, H, HV, variant, "softplus")
 
@@ -189,28 +190,28 @@ def test_conv_mtp_hv_eq_h_softplus(N, T, H, HV, variant):
 # --------------------------------------------------------------------------- #
 # GVA robustness: HV > H (kernel supports HV>=H even though the model uses H==HV).
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("variant", ["vk", "ws"])
+@pytest.mark.parametrize("variant", ["small_batch", "large_batch"])
 @pytest.mark.parametrize("gate", ["safe", "softplus"])
 def test_conv_mtp_gva(variant, gate):
     _check(N=8, T=4, H=8, HV=16, variant=variant, gate=gate)
 
 
 # --------------------------------------------------------------------------- #
-# vk and ws must agree (same math, different threading).
+# small_batch and large_batch must agree (same math, different threading).
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("H,HV", [(8, 8), (32, 32)], ids=["h8", "h32"])
 def test_conv_mtp_vk_ws_agree(H, HV):
     N, T, K, V = 8, 4, 128, 128
     scale = K ** -0.5
     inp = _make_inputs(N, T, H, HV, K, V, "safe", seed=1)
-    vk = _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, "vk")
-    ws = _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, "ws")
-    _assert_close("vk_vs_ws_o", vk["o"], ws["o"], 2e-2, 1e-2)
-    _assert_close("vk_vs_ws_conv_state", vk["conv_state"], ws["conv_state"], 0.0, 0.0)
+    small_batch = _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, "small_batch")
+    large_batch = _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, "large_batch")
+    _assert_close("vk_vs_ws_o", small_batch["o"], large_batch["o"], 2e-2, 1e-2)
+    _assert_close("vk_vs_ws_conv_state", small_batch["conv_state"], large_batch["conv_state"], 0.0, 0.0)
 
 
 # --------------------------------------------------------------------------- #
-# auto dispatch: small batch -> vk, large batch -> ws (both correct).
+# auto dispatch: small/medium batch -> small_batch, large batch -> large_batch (both correct).
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("N", [1, 4, 32])
 def test_conv_mtp_auto_dispatch(N):
@@ -222,19 +223,29 @@ def test_conv_mtp_auto_dispatch(N):
 # A residual race (e.g. on the shared conv_state) would surface as non-determinism.
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("H,HV", [(8, 8), (32, 32), (8, 16)], ids=["h8", "h32", "gva"])
-@pytest.mark.parametrize("variant", ["vk", "ws"])
+@pytest.mark.parametrize("variant", ["small_batch", "large_batch"])
 def test_conv_mtp_determinism(variant, H, HV):
     N, T, K, V = 16, 4, 128, 128
     scale = K ** -0.5
     inp = _make_inputs(N, T, H, HV, K, V, "safe", seed=7)
     ref = _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, variant)
-    for r in range(6):
+    for r in range(int(os.environ.get("KDA_DET_ITERS", "6"))):
         act = _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, variant)
         for name in ("o", "inter_states", "conv_state", "conv_window"):
             assert torch.equal(ref[name], act[name]), f"{name} not deterministic (run {r})"
 
 
-def test_nwarp_is_four():
-    # 8-warp CTAs give no occupancy benefit (occupancy is per-SM register-limited);
-    # the ws design is fixed at the standard 4 warps/CTA.
-    assert NWARP == 4
+
+# --------------------------------------------------------------------------- #
+# large_batch extreme small batch: work_units=8 -> bvw=1 (tile_v=8), the smallest v-tile
+# (only lane 0 computes v-conv + broadcast). Correctness at the NWARP=8 edge.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("gate", ["safe", "softplus"])
+def test_conv_mtp_ws_bvw1(gate):
+    _check(N=1, T=4, H=8, HV=8, variant="large_batch", gate=gate)
+
+
+def test_nwarp_is_eight():
+    # large_batch fixed at NWARP=8 (2026-07-14): 8 warps/CTA raise occupancy at the
+    # grid=128-CTA tiers (work=64 valley filled) with no shared-q/k redundancy.
+    assert NWARP == 8

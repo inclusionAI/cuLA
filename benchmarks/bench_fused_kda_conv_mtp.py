@@ -352,8 +352,9 @@ def main():
                     help="clear TRITON_CACHE_DIR before loading Triton (fresh "
                          "compile + autotune; use a dedicated cache dir)")
     ap.add_argument("--which", choices=["triton", "cula", "both"], default="both")
-    ap.add_argument("--bv", type=int, default=-1, help="cuLA vk v-tile size (8/16/32; -1=auto)")
-    ap.add_argument("--variant", choices=["auto", "vk", "ws"], default="auto")
+    ap.add_argument("--bv", type=int, default=-1, help="cuLA small_batch v-tile size (8/16/32; -1=auto)")
+    ap.add_argument("--bvw", type=int, default=-1, help="cuLA large_batch v-cols/warp; -1=auto")
+    ap.add_argument("--variant", choices=["auto", "small_batch", "large_batch"], default="auto")
     args = ap.parse_args()
 
     if args.rm_triton_cache and args.which in ("triton", "both"):
@@ -439,7 +440,7 @@ def main():
             dt_bias=inp["dt_bias"], ssm_states=ssm, cache_indices=idx,
             intermediate_states_buffer=istate, scale=scale, T=T, num_q_heads=H,
             num_v_heads=HV, head_k_dim=K, head_v_dim=V, lower_bound=lower_bound,
-            bv=args.bv, variant=args.variant, out=oo)
+            bv=args.bv, bvw=args.bvw, variant=args.variant, out=oo)
         print(f"cuLA fused(var={args.variant},bv={args.bv}): {bench(call):.2f} us  "
               f"(graph, rep={args.rep} gc={gc})")
 
