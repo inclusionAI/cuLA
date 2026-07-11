@@ -18,6 +18,7 @@
 #include "qwen35_scalar_kda_mainloop.hpp"
 
 #include <cute/tensor.hpp>
+#include <cutlass/arch/barrier.h>
 
 namespace cula::qwen35::decode::kernel {
 
@@ -28,6 +29,28 @@ CUTE_DEVICE void cp_async_ca_shared_global(void* smem_ptr, const void* gmem_ptr)
   static_assert(kBytes == 16, "Only 16-byte cp.async copies are supported here.");
   const unsigned smem_addr = static_cast<unsigned>(__cvta_generic_to_shared(smem_ptr));
   asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" ::"r"(smem_addr), "l"(gmem_ptr));
+}
+
+CUTE_DEVICE void cp_async_bulk_shared_global(
+    void* smem_ptr,
+    const void* gmem_ptr,
+    uint32_t bytes,
+    cutlass::arch::ClusterTransactionBarrier::ValueType* barrier) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  const uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+  const uint32_t barrier_addr = cute::cast_smem_ptr_to_uint(barrier);
+  asm volatile(
+      "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
+      "[%0], [%1], %2, [%3];\n"
+      :
+      : "r"(smem_addr), "l"(gmem_ptr), "r"(bytes), "r"(barrier_addr)
+      : "memory");
+#else
+  (void)smem_ptr;
+  (void)gmem_ptr;
+  (void)bytes;
+  (void)barrier;
+#endif
 }
 
 CUTE_DEVICE void cp_async_commit_group() {
@@ -671,8 +694,8 @@ __global__ void qwen35_layout_scalar_kda_decode_long_kernel(
 }
 
 
-template <typename scalar_t, int kLocalQKHeads, int kLocalVHeads>
-__global__ void qwen35_layout_scalar_kda_decode_long_v32_kernel(
+template <typename scalar_t, int kLocalQKHeads, int kLocalVHeads, int kTileV>
+__global__ void qwen35_layout_scalar_kda_decode_long_vtile_kernel(
     const scalar_t* __restrict__ mixed_qkv_conv,
     const scalar_t* __restrict__ a,
     const scalar_t* __restrict__ b,
@@ -688,29 +711,34 @@ __global__ void qwen35_layout_scalar_kda_decode_long_v32_kernel(
   constexpr int kLocalKDim = Shape::kLocalKDim;
   constexpr int kLocalMixedQKVDim = Shape::kLocalMixedQKVDim;
   constexpr int kWarpSize = 32;
-  constexpr int kThreads = 32;
-  constexpr int kTileV = 32;
+  constexpr int kThreads = kTileV;
+  constexpr int kWarps = kThreads / kWarpSize;
+  constexpr int kVTiles = kHeadDimV / kTileV;
   constexpr int kKPerThread = kHeadDimQK / kThreads;
-  constexpr int kVecFloats = 4;
 
   static_assert(kLocalQKHeads == Shape::kLocalQKHeads);
   static_assert(kHeadDimQK == 128);
   static_assert(kHeadDimV == 128);
+  static_assert(kTileV == 32 || kTileV == 64);
+  static_assert(kHeadDimV % kTileV == 0);
   static_assert(kHeadDimQK % kThreads == 0);
 
   __shared__ float q_smem[kHeadDimQK];
   __shared__ float k_smem[kHeadDimQK];
   __shared__ float state_smem[kHeadDimQK][kTileV];
   __shared__ float norm_smem[3];
+  __shared__ float warp_reduce_smem[2 * kWarps];
+  __shared__ cutlass::arch::ClusterTransactionBarrier::ValueType state_barrier;
 
   const int hv_tile = static_cast<int>(blockIdx.x);
   const int token_idx = static_cast<int>(blockIdx.y);
-  const int hv = hv_tile >> 2;
-  const int v_tile = hv_tile & 3;
+  const int hv = hv_tile / kVTiles;
+  const int v_tile = hv_tile - hv * kVTiles;
   const int tid = static_cast<int>(threadIdx.x);
   const int lane = tid & (kWarpSize - 1);
+  const int warp_id = tid / kWarpSize;
   const int mapped_h = hv / kRepeatFactor;
-  const int v_row = v_tile * kTileV + lane;
+  const int v_row = v_tile * kTileV + tid;
 
   auto qk_src_layout = make_layout(
       make_shape(token_count, Int<kLocalQKHeads>{}, Int<kHeadDimQK>{}),
@@ -769,8 +797,19 @@ __global__ void qwen35_layout_scalar_kda_decode_long_v32_kernel(
   q_norm_sq = Qwen35ScalarKdaDecodeMainloop<scalar_t>::warp_sum(q_norm_sq);
   k_norm_sq = Qwen35ScalarKdaDecodeMainloop<scalar_t>::warp_sum(k_norm_sq);
   if (lane == 0) {
-    norm_smem[0] = rsqrtf(q_norm_sq + 1e-6f) * rsqrtf(static_cast<float>(kHeadDimQK));
-    norm_smem[1] = rsqrtf(k_norm_sq + 1e-6f);
+    warp_reduce_smem[warp_id] = q_norm_sq;
+    warp_reduce_smem[kWarps + warp_id] = k_norm_sq;
+  }
+  __syncthreads();
+  if (warp_id == 0) {
+    float q_block_sum = lane < kWarps ? warp_reduce_smem[lane] : 0.f;
+    float k_block_sum = lane < kWarps ? warp_reduce_smem[kWarps + lane] : 0.f;
+    q_block_sum = Qwen35ScalarKdaDecodeMainloop<scalar_t>::warp_sum(q_block_sum);
+    k_block_sum = Qwen35ScalarKdaDecodeMainloop<scalar_t>::warp_sum(k_block_sum);
+    if (lane == 0) {
+      norm_smem[0] = rsqrtf(q_block_sum + 1e-6f) * rsqrtf(static_cast<float>(kHeadDimQK));
+      norm_smem[1] = rsqrtf(k_block_sum + 1e-6f);
+    }
   }
   __syncthreads();
 
@@ -786,7 +825,15 @@ __global__ void qwen35_layout_scalar_kda_decode_long_v32_kernel(
   }
   qk_dot = Qwen35ScalarKdaDecodeMainloop<scalar_t>::warp_sum(qk_dot);
   if (lane == 0) {
-    norm_smem[2] = qk_dot;
+    warp_reduce_smem[warp_id] = qk_dot;
+  }
+  __syncthreads();
+  if (warp_id == 0) {
+    float qk_block_sum = lane < kWarps ? warp_reduce_smem[lane] : 0.f;
+    qk_block_sum = Qwen35ScalarKdaDecodeMainloop<scalar_t>::warp_sum(qk_block_sum);
+    if (lane == 0) {
+      norm_smem[2] = qk_block_sum;
+    }
   }
   __syncthreads();
 
@@ -797,8 +844,26 @@ __global__ void qwen35_layout_scalar_kda_decode_long_v32_kernel(
   const float decay = expf(g);
   const float beta = 1.f / (1.f + expf(-b_val));
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  if (tid == 0) {
+    cutlass::arch::ClusterTransactionBarrier::init(&state_barrier, 1);
+    cutlass::arch::ClusterTransactionBarrier::arrive_and_expect_tx(
+        &state_barrier, kHeadDimQK * kTileV * sizeof(float));
+  }
+  __syncthreads();
 #pragma unroll 1
-  for (int elem = tid * kVecFloats; elem < kHeadDimQK * kTileV; elem += kThreads * kVecFloats) {
+  for (int k_idx = tid; k_idx < kHeadDimQK; k_idx += kThreads) {
+    cp_async_bulk_shared_global(
+        &state_smem[k_idx][0],
+        &state_vk(v_tile * kTileV, k_idx),
+        kTileV * sizeof(float),
+        &state_barrier);
+  }
+  cutlass::arch::ClusterTransactionBarrier::wait(&state_barrier, 0);
+  __syncthreads();
+#else
+#pragma unroll 1
+  for (int elem = tid * 4; elem < kHeadDimQK * kTileV; elem += kThreads * 4) {
     const int k_idx = elem / kTileV;
     const int v_base = elem - k_idx * kTileV;
     cp_async_ca_shared_global<16>(
@@ -808,6 +873,7 @@ __global__ void qwen35_layout_scalar_kda_decode_long_v32_kernel(
   cp_async_commit_group();
   cp_async_wait_all();
   __syncthreads();
+#endif
 
   float proj_acc0 = 0.f;
   float proj_acc1 = 0.f;
@@ -827,14 +893,14 @@ __global__ void qwen35_layout_scalar_kda_decode_long_v32_kernel(
   float out_acc7 = 0.f;
 #pragma unroll 1
   for (int k_idx = 0; k_idx < kHeadDimQK; k_idx += 8) {
-    const float state0 = state_smem[k_idx + 0][lane];
-    const float state1 = state_smem[k_idx + 1][lane];
-    const float state2 = state_smem[k_idx + 2][lane];
-    const float state3 = state_smem[k_idx + 3][lane];
-    const float state4 = state_smem[k_idx + 4][lane];
-    const float state5 = state_smem[k_idx + 5][lane];
-    const float state6 = state_smem[k_idx + 6][lane];
-    const float state7 = state_smem[k_idx + 7][lane];
+    const float state0 = state_smem[k_idx + 0][tid];
+    const float state1 = state_smem[k_idx + 1][tid];
+    const float state2 = state_smem[k_idx + 2][tid];
+    const float state3 = state_smem[k_idx + 3][tid];
+    const float state4 = state_smem[k_idx + 4][tid];
+    const float state5 = state_smem[k_idx + 5][tid];
+    const float state6 = state_smem[k_idx + 6][tid];
+    const float state7 = state_smem[k_idx + 7][tid];
     const float k0 = k_smem[k_idx + 0];
     const float k1 = k_smem[k_idx + 1];
     const float k2 = k_smem[k_idx + 2];
@@ -881,14 +947,14 @@ __global__ void qwen35_layout_scalar_kda_decode_long_v32_kernel(
 
 #pragma unroll 1
   for (int k_idx = 0; k_idx < kHeadDimQK; k_idx += 8) {
-    const float state0 = state_smem[k_idx + 0][lane];
-    const float state1 = state_smem[k_idx + 1][lane];
-    const float state2 = state_smem[k_idx + 2][lane];
-    const float state3 = state_smem[k_idx + 3][lane];
-    const float state4 = state_smem[k_idx + 4][lane];
-    const float state5 = state_smem[k_idx + 5][lane];
-    const float state6 = state_smem[k_idx + 6][lane];
-    const float state7 = state_smem[k_idx + 7][lane];
+    const float state0 = state_smem[k_idx + 0][tid];
+    const float state1 = state_smem[k_idx + 1][tid];
+    const float state2 = state_smem[k_idx + 2][tid];
+    const float state3 = state_smem[k_idx + 3][tid];
+    const float state4 = state_smem[k_idx + 4][tid];
+    const float state5 = state_smem[k_idx + 5][tid];
+    const float state6 = state_smem[k_idx + 6][tid];
+    const float state7 = state_smem[k_idx + 7][tid];
     const float state_new0 = decay * state0 + v_new_row * k_smem[k_idx + 0];
     const float state_new1 = decay * state1 + v_new_row * k_smem[k_idx + 1];
     const float state_new2 = decay * state2 + v_new_row * k_smem[k_idx + 2];
@@ -924,9 +990,11 @@ void launch_qwen35_layout_scalar_kda_decode_long_kernel(
   constexpr int kWarpTileV = 32;
   (void)kWarpTileV;
   if (token_count == 64 || token_count == 128) {
-    dim3 grid(kLocalVHeads * 4, token_count, 1);
-    dim3 block(32, 1, 1);
-    qwen35_layout_scalar_kda_decode_long_v32_kernel<scalar_t, kLocalQKHeads, kLocalVHeads><<<grid, block, 0, stream>>>(
+    constexpr int kLongTileV = 64;
+    dim3 grid(kLocalVHeads * (kHeadDimV / kLongTileV), token_count, 1);
+    dim3 block(kLongTileV, 1, 1);
+    qwen35_layout_scalar_kda_decode_long_vtile_kernel<scalar_t, kLocalQKHeads, kLocalVHeads, kLongTileV>
+        <<<grid, block, 0, stream>>>(
         mixed_qkv_conv,
         a,
         b,

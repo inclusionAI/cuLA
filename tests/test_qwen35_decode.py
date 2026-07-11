@@ -526,6 +526,44 @@ def test_qwen35_fused_layout_kda_cudac_matches_reference_unfused_and_triton(toke
         assert torch.allclose(state_triton, state_fused, atol=3e-5, rtol=3e-5)
 
 
+@pytest.mark.skipif(
+    not _has_qwen35_fused_layout_kda_cudac(),
+    reason="Qwen3.5 fused layout+KDA CUDA backend is not available",
+)
+@pytest.mark.parametrize("tokens", [64, 128])
+def test_qwen35_fused_layout_kda_cudac_long_matches_reference(tokens: int):
+    mixed_qkv, a, b, conv_weight, conv_state, recurrent_state, A_log, dt_bias, state_indices = make_inputs(
+        tokens=tokens,
+        pool_size=tokens,
+        device=torch.device("cuda"),
+    )
+    conv_out, _ = qwen35_conv1d_decode_update(
+        mixed_qkv,
+        conv_state,
+        conv_weight,
+        activation="silu",
+        backend="cudac",
+    )
+    out_ref, state_ref = manual_qwen35_layout_scalar_kda_reference(
+        conv_out, a, b, A_log, dt_bias, recurrent_state, state_indices
+    )
+    out_fused, state_fused = qwen35_layout_scalar_kda_decode(
+        mixed_qkv_conv=conv_out,
+        a=a,
+        b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        recurrent_state=recurrent_state,
+        state_indices=state_indices,
+        config=DEFAULT_QWEN35_LINEAR_ATTN_CONFIG,
+        backend="cudac",
+    )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_fused.float(), out_ref.float(), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(state_fused, state_ref, atol=3e-5, rtol=3e-5)
+
+
 @pytest.mark.skipif(not _has_qwen35_fused_layout_kda_cudac(), reason="Qwen3.5 fused layout+KDA CUDA backend is not available")
 @pytest.mark.parametrize("local_v_heads", [48, 24, 12, 6])
 def test_qwen35_layout_scalar_kda_cudac_supports_local_tp_shards(local_v_heads: int):
