@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import importlib.util
 
 _spec = importlib.util.spec_from_file_location(
-    "fwd_o_sm100", os.path.join(os.path.dirname(__file__), "..", "cula", "ops", "fwd_o_sm100.py")
+    "fwd_o", os.path.join(os.path.dirname(__file__), "..", "cula", "ops", "kda", "sm100", "fwd_o.py")
 )
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
@@ -48,6 +48,8 @@ build_chunk_indices = _mod.build_chunk_indices
 build_chunk_offsets = _mod.build_chunk_offsets
 
 from fla.ops.gla.chunk import chunk_gla_fwd_o_gk as triton_chunk_gla_fwd_o_gk  # noqa: E402
+
+pytestmark = pytest.mark.sm100_only
 
 # ── Constants ──
 K, V, BT = 128, 128, 64

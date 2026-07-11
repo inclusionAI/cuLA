@@ -35,7 +35,8 @@ from cutlass.cutlass_dsl import T as _T
 from fla.ops.utils import prepare_chunk_indices, prepare_lens
 from fla.utils import tensor_cache
 
-from cula.utils import USE_FAST_MATH, assert_blackwell
+from cula.ops.kda.policy import sm100_intracard_cp_decision
+from cula.utils import USE_FAST_MATH, assert_blackwell, get_device_sm_count
 
 COMPILE_OPTIONS = "--enable-tvm-ffi --generate-line-info --ptxas-options '--verbose'"
 
@@ -2015,6 +2016,9 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     persistent: bool = True,
+    _no_cp: bool = False,
+    cu_seqlens_cpu: torch.Tensor | None = None,
+    use_intracard_cp=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     ChunkDeltaRuleFwdH forward pass — FLA-compatible API.
@@ -2046,6 +2050,41 @@ def chunk_gated_delta_rule_fwd_h(
         v_new:       [B, T, HV, V] bf16      (or None if save_new_value=False)
         final_state: [N, HV, K, V] fp32      (or None if output_final_state=False)
     """
+    # --- Intracard CP dispatch (policy: cula.ops.kda.policy) ---
+    cp_decision = sm100_intracard_cp_decision(
+        mode=use_intracard_cp,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        g=g,
+        num_qk_heads=k.shape[2],
+        chunk_size=chunk_size,
+        is_inference=torch.is_inference_mode_enabled(),
+        sm_count_provider=lambda: get_device_sm_count(k.device),
+        no_cp=_no_cp,
+    )
+    if cp_decision.enabled:
+        from cula.ops.kda.policy import NotSplittableError
+        from cula.ops.kda.sm100.cp.chunk_delta_h import intracard_fwd_h
+
+        try:
+            return intracard_fwd_h(
+                k=k,
+                w=w,
+                u=u,
+                gk=gk,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                chunk_size=chunk_size,
+                save_new_value=save_new_value,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+            )
+        except NotSplittableError:
+            if cp_decision.force:
+                raise
+            # "auto" path: shape not splittable -- fall through to the serial body below.
+
     B, T, H, K_dim = k.shape
     HV = u.shape[2]
     V_dim = u.shape[3]

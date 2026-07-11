@@ -46,13 +46,15 @@ def detect_gpu_archs() -> tuple[bool, bool, bool]:
 def resolve_disable_flag(env_name: str, detected: bool) -> bool:
     """
     Resolve whether to disable a given SM target.
+    - If CULA_BUILD_ALL_ARCHS is set, all targets are enabled unconditionally.
     - If the environment variable is explicitly set, honour it.
     - Otherwise, disable the target when no matching GPU is detected.
     """
+    if os.getenv("CULA_BUILD_ALL_ARCHS", "0") == "1":
+        return False
     env_val = os.getenv(env_name)
     if env_val is not None:
         return env_val.lower() in ["true", "1", "y", "yes"]
-    # Auto-detect: disable if no matching device found
     disable = not detected
     if disable:
         print(f"  No matching GPU detected; auto-setting {env_name}=1 (disable). Set {env_name}=0 to override.")
@@ -66,7 +68,11 @@ def get_features_args():
 
 USE_FAST_MATH = os.getenv("CULA_USE_FAST_MATH", "1") == "1"
 
-print("Detecting GPU architectures...")
+if os.getenv("CULA_BUILD_ALL_ARCHS", "0") == "1":
+    print("CULA_BUILD_ALL_ARCHS=1: enabling all SM targets (sm90a, sm100a, sm103a)")
+else:
+    print("Detecting GPU architectures...")
+
 _has_sm100, _has_sm103, _has_sm90 = detect_gpu_archs()
 DISABLE_SM100 = resolve_disable_flag("CULA_DISABLE_SM100", _has_sm100)
 DISABLE_SM103 = resolve_disable_flag("CULA_DISABLE_SM103", _has_sm103)
@@ -111,26 +117,6 @@ def assert_blackwell_build_env() -> None:
         )
 
 
-def get_arch_flags():
-    major, minor = get_nvcc_version()
-    print(f"Compiling using NVCC {major}.{minor}")
-
-    # Validate Blackwell build environment
-    assert_blackwell_build_env()
-
-    arch_flags = []
-    if not DISABLE_SM100:
-        arch_flags.extend(["-gencode", "arch=compute_100a,code=sm_100a"])
-        arch_flags.extend(["-DCULA_SM100_ENABLED"])
-    if not DISABLE_SM103:
-        arch_flags.extend(["-gencode", "arch=compute_103a,code=sm_103a"])
-        arch_flags.extend(["-DCULA_SM103_ENABLED"])
-    if not DISABLE_SM90:
-        arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
-        arch_flags.extend(["-DCULA_SM90A_ENABLED"])
-    return arch_flags
-
-
 def get_nvcc_thread_args():
     nvcc_threads = os.getenv("NVCC_THREADS") or "32"
     return ["--threads", nvcc_threads]
@@ -145,61 +131,84 @@ if IS_WINDOWS:
 else:
     cxx_args = ["-O3", "-std=c++20", "-DNDEBUG", "-Wno-deprecated-declarations"]
 
-cuda_sources = [
-    "csrc/api/pybind.cu",
+nvcc_common_args = [
+    "-O3",
+    "-std=c++20",
+    "-DNDEBUG",
+    # "-D_USE_MATH_DEFINES",
+    "-Wno-deprecated-declarations",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "-lineinfo",
+    "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
+    "-diag-suppress=3189",
 ]
-if not DISABLE_SM100 or not DISABLE_SM103:
-    cuda_sources.extend(
-        [
-            "csrc/api/kda_sm100.cu",
-            "csrc/kda/sm100/kda_fwd_sm100.cu",
-        ]
-    )
-if not DISABLE_SM90:
-    cuda_sources.extend(
-        [
-            "csrc/api/kda_sm90.cu",
-            "csrc/kda/sm90/kda_fwd_sm90.cu",
-            "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu",
-        ]
-    )
+
+include_dirs = [
+    Path(this_dir) / "csrc",
+    Path(this_dir) / "csrc" / "kerutils" / "include",
+    Path(this_dir) / "csrc" / "cutlass" / "include",
+    Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
+]
+
+major, minor = get_nvcc_version()
+print(f"Compiling using NVCC {major}.{minor}")
+assert_blackwell_build_env()
 
 ext_modules = []
-ext_modules.append(
-    CUDAExtension(
-        name="cula.cudac",
-        sources=cuda_sources,
-        extra_compile_args={
-            "cxx": cxx_args + get_features_args(),
-            "nvcc": [
-                "-O3",
-                "-std=c++20",
-                "-DNDEBUG",
-                # "-D_USE_MATH_DEFINES",
-                "-Wno-deprecated-declarations",
-                "-U__CUDA_NO_HALF_OPERATORS__",
-                "-U__CUDA_NO_HALF_CONVERSIONS__",
-                "-U__CUDA_NO_HALF2_OPERATORS__",
-                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                "--expt-relaxed-constexpr",
-                "--expt-extended-lambda",
-                "-lineinfo",
-                "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
-                "-diag-suppress=3189",  # suppress the warning of torch in C++ 20
-            ]
-            + get_features_args()
-            + get_arch_flags()
-            + get_nvcc_thread_args()
-            + (["--use_fast_math"] if USE_FAST_MATH else []),
-        },
-        include_dirs=[
-            Path(this_dir) / "csrc",
-            Path(this_dir) / "csrc" / "kerutils" / "include",
-            Path(this_dir) / "csrc" / "cutlass" / "include",
-            Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
-        ],
+
+if not DISABLE_SM100 or not DISABLE_SM103:
+    sm100_arch_flags = []
+    if not DISABLE_SM100:
+        sm100_arch_flags.extend(["-gencode", "arch=compute_100a,code=sm_100a"])
+    if not DISABLE_SM103:
+        sm100_arch_flags.extend(["-gencode", "arch=compute_103a,code=sm_103a"])
+
+    ext_modules.append(
+        CUDAExtension(
+            name="cula._cudac_sm100",
+            sources=[
+                "csrc/api/kda_sm100.cu",
+                "csrc/kda/sm100/kda_fwd_sm100.cu",
+            ],
+            extra_compile_args={
+                "cxx": cxx_args + get_features_args(),
+                "nvcc": nvcc_common_args
+                + get_features_args()
+                + sm100_arch_flags
+                + get_nvcc_thread_args()
+                + (["--use_fast_math"] if USE_FAST_MATH else []),
+            },
+            include_dirs=include_dirs,
+        )
     )
-)
+
+if not DISABLE_SM90:
+    sm90_arch_flags = ["-gencode", "arch=compute_90a,code=sm_90a", "-DCULA_SM90A_ENABLED"]
+
+    ext_modules.append(
+        CUDAExtension(
+            name="cula._cudac_sm90",
+            sources=[
+                "csrc/api/kda_sm90.cu",
+                "csrc/kda/sm90/kda_fwd_sm90.cu",
+                "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu",
+            ],
+            extra_compile_args={
+                "cxx": cxx_args + get_features_args(),
+                "nvcc": nvcc_common_args
+                + get_features_args()
+                + sm90_arch_flags
+                + get_nvcc_thread_args()
+                + (["--use_fast_math"] if USE_FAST_MATH else []),
+            },
+            include_dirs=include_dirs,
+        )
+    )
 
 setup(
     name="cuda-linear-attention",

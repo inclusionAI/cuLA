@@ -24,6 +24,16 @@ cuLA supports both **Hopper (SM90)** and **Blackwell (SM10X)** GPUs.
 
 > **Note:** The PyTorch CUDA version must match your system CUDA Toolkit version. Check with `nvcc --version` and `python -c "import torch; print(torch.version.cuda)"`.
 
+### Pre-built Wheels
+
+Pre-built fat-binary wheels (SM90 + SM100 + SM103) are available on [GitHub Releases](https://github.com/inclusionAI/cuLA/releases). Linux wheels target `manylinux_2_28` and require glibc 2.28 or newer:
+
+    pip install "cuda-linear-attention==<VERSION>+<CUDA_TAG>" -f https://github.com/inclusionAI/cuLA/releases/expanded_assets/<TAG>
+
+Replace `<TAG>` with the release tag (e.g., `v0.2.0`), `<VERSION>` with the base version (e.g., `0.2.0`), and `<CUDA_TAG>` with your PyTorch CUDA build tag (e.g., `cu129` or `cu130`). Or download the `.whl` file directly from the [Releases page](https://github.com/inclusionAI/cuLA/releases) and install it with `pip install <filename>.whl`.
+
+### Build from Source
+
 **Clone cuLA & dependencies:**
 
 ```bash
@@ -45,6 +55,12 @@ pip install -e third_party/flash-linear-attention
 
 # Install cuLA
 pip install -e . --no-build-isolation
+```
+
+**Build fat wheel (SM90 + SM100 + SM103):**
+
+```bash
+CULA_BUILD_ALL_ARCHS=1 python -m build --wheel --no-isolation
 ```
 
 ## Quick Start
@@ -108,7 +124,7 @@ FLA baseline: [flash-linear-attention v0.5.0](https://github.com/fla-org/flash-l
 **Blackwell (SM10X)**
 
 See [BENCHMARK_GB200_CUDA_130.md](BENCHMARK_GB200_CUDA_130.md) tested with CUDA 13.0 for detailed results.
- 
+
 **Hopper (SM90)**
 
 See [BENCHMARK_H200.md](BENCHMARK_H200.md) tested with CUDA 12.9 for detailed results.
@@ -142,6 +158,14 @@ python -m pytest tests/test_kda_fused_fwd.py -v
 python tests/test_lightning_attn.py
 # Tests for Lightning Attention decode
 python -m pytest tests/test_la_decode.py -v
+
+# test_kda.py and test_kda_compare_fla.py support a fast/slow split.
+# Fast (default) — representative correctness paths for default CI and local iteration
+python -m pytest tests/test_kda.py tests/test_kda_compare_fla.py -v
+# Slow — broader stress coverage for nightly or manual runs
+python -m pytest -m kda_slow tests/test_kda.py tests/test_kda_compare_fla.py -v
+# Full sweep (fast + slow) — run before submitting a PR
+python -m pytest -m kda_full tests/test_kda.py tests/test_kda_compare_fla.py -v
 ```
 
 <details>

@@ -930,14 +930,26 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                     v_head_idx);
                 return;
             }
+            // Intra-card CP
+            int32_t out_seq_idx = seq_idx;
+            int32_t out_num_seqs = problem_size.num_seqs;
+            if (problem_size.cp_seq_map != nullptr) {
+                out_seq_idx = problem_size.cp_seq_map[seq_idx];
+                out_num_seqs = problem_size.raw_num_seqs;
+                int32_t this_end = problem_size.cu_seqlens[seq_idx + 1];
+                int32_t raw_end = problem_size.raw_cu_seqlens[out_seq_idx + 1];
+                if (this_end != raw_end) {
+                    return;
+                }
+            }
             DPRINTF0_WG("[%d,%d,%d,%d]>> save tKVrKV -> tKVgKV\n", seq_idx, q_head_idx, k_head_idx, v_head_idx);
             // GVA: state is stored per V/O head.
             int num_state_heads = problem_size.num_v_heads;
             int state_head_idx = work_desc.o_head_idx();
             auto gKV = make_tensor(
                 make_gmem_ptr(params.ptr_output_state),
-                make_layout(make_shape(Int<HeadSizeQK>{}, Int<HeadSizeV>{}, num_state_heads, problem_size.num_seqs)))(
-                _, _, state_head_idx, seq_idx);  // (KDim, VDim), K-contiguous
+                make_layout(make_shape(Int<HeadSizeQK>{}, Int<HeadSizeV>{}, num_state_heads, out_num_seqs)))(
+                _, _, state_head_idx, out_seq_idx);  // (KDim, VDim), K-contiguous
 
             auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, ElementAlpha>{}, kv_tiled_mma);
             auto thr_copy_kv = tiled_copy_kv.get_thread_slice(thread_idx);
@@ -1371,10 +1383,18 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
         if constexpr (!kInitStateFromInput) {
             clear(tKVrKV);
-            compute_loop_body(0, /*is_first_block_=*/cute::true_type{}, /*is_final_block_=*/cute::false_type{});
+            if (num_blocks == 1) {
+                compute_loop_body(0, /*is_first_block_=*/cute::true_type{}, /*is_final_block_=*/cute::true_type{});
+            } else {
+                compute_loop_body(0, /*is_first_block_=*/cute::true_type{}, /*is_final_block_=*/cute::false_type{});
+            }
         } else {
             kv_load(tKVrKV);  // GMEM -> Register, only once at the beginning
-            compute_loop_body(0, /*is_first_block_=*/cute::false_type{}, /*is_final_block_=*/cute::false_type{});
+            if (num_blocks == 1) {
+                compute_loop_body(0, /*is_first_block_=*/cute::false_type{}, /*is_final_block_=*/cute::true_type{});
+            } else {
+                compute_loop_body(0, /*is_first_block_=*/cute::false_type{}, /*is_final_block_=*/cute::false_type{});
+            }
         }
         CUTE_NO_UNROLL
         for (int blk = 1; blk < num_blocks - 1; ++blk) {

@@ -285,6 +285,199 @@ def _try_fast_dense_decode(
     return o
 
 
+def _try_fast_dense_packed_decode(
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    N: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    is_varlen_decode: bool,
+    cu_seqlens: torch.Tensor | None,
+    scale: float | None,
+    use_qk_l2norm_in_kernel: bool,
+    softplus_beta: float,
+    softplus_threshold: float,
+    out: torch.Tensor | None,
+    state_layout: str | None,
+):
+    """Fast path for packed-QKV decode.
+
+    Mirrors ``_try_fast_dense_decode`` but takes a packed ``mixed_qkv`` of shape
+    ``[N, qkv_dim]`` (``= [Q(H·K) | K(H·K) | V(HV·V)]``, head-major, last dim
+    contiguous) and constructs the q/k/v as strided views instead of requiring
+    three separate contiguous tensors — so no q/k/v materialization or
+    ``.contiguous()`` copy is needed.
+
+    Returns ``None`` (falling back to the general path) when the inputs are not
+    already in the exact kernel-ready layout/dtype; never raises on shape/dtype
+    mismatches.
+    """
+    if K != TILE_K or V % TILE_V_SMALL != 0 or V % TILE_V != 0:
+        return None
+
+    qkv_dim = 2 * H * K + HV * V
+    if (
+        mixed_qkv.ndim != 2
+        or mixed_qkv.shape != (N, qkv_dim)
+        or mixed_qkv.stride(-1) != 1
+        or mixed_qkv.stride(0) < qkv_dim
+        or mixed_qkv.device.type != "cuda"
+        or mixed_qkv.dtype != torch.bfloat16
+    ):
+        return None
+
+    if (
+        initial_state_source.dtype != torch.float32
+        or initial_state_indices.dtype != torch.int32
+        or initial_state_indices.shape != (N,)
+        or A_log.dtype != torch.float32
+        or dt_bias.dtype != torch.float32
+    ):
+        return None
+
+    if not (
+        initial_state_source.is_contiguous()
+        and initial_state_indices.is_contiguous()
+        and A_log.is_contiguous()
+        and dt_bias.is_contiguous()
+    ):
+        return None
+    if A_log.numel() != HV or dt_bias.shape != (HV, K):
+        return None
+
+    normalized_layout = "vk" if state_layout is None else str(state_layout).strip().lower()
+    if normalized_layout == "vk":
+        if initial_state_source.ndim != 4 or initial_state_source.shape[1:] != (HV, V, K):
+            return None
+        state_layout_is_kv = False
+    elif normalized_layout == "kv":
+        if initial_state_source.ndim != 4 or initial_state_source.shape[1:] != (HV, K, V):
+            return None
+        state_layout_is_kv = True
+    else:
+        return None
+
+    if not a.is_contiguous() or a.device != mixed_qkv.device or a.dtype != torch.bfloat16:
+        return None
+    if is_varlen_decode:
+        # varlen kernel compiled a shape: (N, HV, K) -- 3D
+        if a.dim() == 3 and a.shape == (N, HV, K):
+            a_kernel = a
+        else:
+            return None
+    else:
+        # dense kernel compiled a shape: (N, 1, HV, K) -- 4D
+        if a.dim() == 4 and a.shape == (N, 1, HV, K):
+            a_kernel = a
+        elif a.dim() == 3 and a.shape == (N, 1, HV * K):
+            a_kernel = a.view(N, 1, HV, K)
+        elif a.dim() == 3 and a.shape == (N, HV, K):
+            a_kernel = a.unsqueeze(1)
+        else:
+            return None
+
+    if b.device != mixed_qkv.device or b.dtype != torch.bfloat16 or not b.is_contiguous():
+        return None
+    if is_varlen_decode:
+        # varlen b compiled: (N, HV) -- 2D
+        if b.dim() == 2 and b.shape == (N, HV):
+            b_kernel = b
+        else:
+            return None
+    else:
+        # dense b compiled: (N, 1, HV) -- 3D
+        if b.dim() == 3 and b.shape == (N, 1, HV):
+            b_kernel = b
+        elif b.dim() == 2 and b.shape == (N, HV):
+            b_kernel = b.unsqueeze(1)
+        else:
+            return None
+
+    if scale is None:
+        scale = K**-0.5
+    elif scale <= 0:
+        return None
+
+    # Construct strided q/k/v views (row stride may include padding, last dim contiguous)
+    # and the matching output. Shapes align with the compile-time mock in the
+    # packed compile paths: varlen -> [1,N,...], dense -> [N,1,...].
+    if is_varlen_decode:
+        q_view = mixed_qkv.narrow(1, 0, H * K).view(1, N, H, K)
+        k_view = mixed_qkv.narrow(1, H * K, H * K).view(1, N, H, K)
+        v_view = mixed_qkv.narrow(1, 2 * H * K, HV * V).view(1, N, HV, V)
+        o = _prepare_output_tensor(mixed_qkv, out, (1, N, HV, V))
+    else:
+        q_view = mixed_qkv.narrow(1, 0, H * K).view(N, 1, H, K)
+        k_view = mixed_qkv.narrow(1, H * K, H * K).view(N, 1, H, K)
+        v_view = mixed_qkv.narrow(1, 2 * H * K, HV * V).view(N, 1, HV, V)
+        o = _prepare_output_tensor(mixed_qkv, out, (N, 1, HV, V))
+
+    if cu_seqlens is not None:
+        if cu_seqlens.dtype != torch.int32 or cu_seqlens.numel() != N + 1 or not cu_seqlens.is_contiguous():
+            return None
+        cu_seqlens_to_use = cu_seqlens
+    else:
+        cache_key = (N, str(mixed_qkv.device))
+        if cache_key not in _cu_seqlens_cache:
+            _cu_seqlens_cache[cache_key] = torch.arange(N + 1, dtype=torch.int32, device=mixed_qkv.device)
+        cu_seqlens_to_use = _cu_seqlens_cache[cache_key]
+
+    use_small_batch = N < SMALL_BATCH_THRESHOLD
+    if is_varlen_decode:
+        dense_small_hv_parallel = False
+    else:
+        dense_small_hv_parallel_head_threshold = (
+            N4_DENSE_SMALL_HV_PARALLEL_HEAD_THRESHOLD if N <= 4 else DENSE_SMALL_HV_PARALLEL_HEAD_THRESHOLD
+        )
+        dense_small_hv_parallel = (
+            use_small_batch and dense_small_hv_parallel_head_threshold >= H and N <= DENSE_SMALL_HV_PARALLEL_MAX_N
+        )
+    num_blocks_per_state_small = _select_small_blocks_per_state(N, H, HV, V)
+
+    compiled_kernel = _get_compiled_packed_kernel(
+        N,
+        H,
+        HV,
+        K,
+        V,
+        mixed_qkv.stride(0),
+        initial_state_source.shape[0],
+        use_small_batch,
+        is_varlen_decode,
+        scale=scale,
+        use_qk_l2norm=use_qk_l2norm_in_kernel,
+        state_layout_is_kv=state_layout_is_kv,
+        precomputed_decay_beta=False,
+        num_blocks_per_state_small=num_blocks_per_state_small,
+        dense_small_hv_parallel=dense_small_hv_parallel,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+    )
+    compiled_kernel(
+        cu_seqlens_to_use,
+        q_view,
+        k_view,
+        v_view,
+        a_kernel,
+        b_kernel,
+        A_log,
+        dt_bias,
+        initial_state_source,
+        initial_state_indices,
+        o,
+        _get_cached_stream(mixed_qkv.device),
+    )
+    return o
+
+
 def _define_kernels():
     """Define CuTe DSL kernels for KDA normal and varlen decode modes."""
 
@@ -1668,6 +1861,149 @@ def _get_compiled_kernel(
     return compiled_kernel
 
 
+def _get_compiled_packed_kernel(
+    N,
+    H,
+    HV,
+    K,
+    V,
+    row_stride,
+    pool_size,
+    use_small_batch,
+    is_varlen_decode,
+    scale,
+    use_qk_l2norm,
+    state_layout_is_kv,
+    precomputed_decay_beta,
+    num_blocks_per_state_small,
+    dense_small_hv_parallel,
+    softplus_beta,
+    softplus_threshold,
+):
+    """Get or lazily compile a packed-QKV kernel with static packed strides.
+
+    The q/k/v mock tensors are strided views sliced from a packed
+    ``mixed_qkv`` mock, so their row stride is the compile-time constant
+    ``row_stride``. Runtime packed views with the same shape/stride can then
+    use the static layout specialization while still avoiding q/k/v
+    materialization.
+    """
+    global _compiled_kernels
+
+    qkv_dim = 2 * H * K + HV * V
+    key = (
+        N,
+        H,
+        HV,
+        K,
+        V,
+        qkv_dim,
+        row_stride,
+        pool_size,
+        use_small_batch,
+        is_varlen_decode,
+        scale,
+        use_qk_l2norm,
+        state_layout_is_kv,
+        precomputed_decay_beta,
+        num_blocks_per_state_small,
+        dense_small_hv_parallel,
+        softplus_beta,
+        softplus_threshold,
+        "packed_qkv",
+    )
+    if key in _compiled_kernels:
+        return _compiled_kernels[key]
+
+    cu_seqlens = torch.zeros(N + 1, dtype=torch.int32, device="cuda")
+    if row_stride < qkv_dim:
+        raise ValueError(f"row_stride={row_stride} must be >= qkv_dim={qkv_dim}")
+    mixed_qkv = torch.zeros(N, row_stride, dtype=torch.bfloat16, device="cuda")
+
+    if is_varlen_decode:
+        q = mixed_qkv.narrow(1, 0, H * K).view(1, N, H, K)
+        k = mixed_qkv.narrow(1, H * K, H * K).view(1, N, H, K)
+        v = mixed_qkv.narrow(1, 2 * H * K, HV * V).view(1, N, HV, V)
+        a = torch.zeros(N, HV, K, dtype=torch.bfloat16, device="cuda")
+        b = torch.zeros(N, HV, dtype=torch.bfloat16, device="cuda")
+        o = torch.zeros(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
+    else:
+        q = mixed_qkv.narrow(1, 0, H * K).view(N, 1, H, K)
+        k = mixed_qkv.narrow(1, H * K, H * K).view(N, 1, H, K)
+        v = mixed_qkv.narrow(1, 2 * H * K, HV * V).view(N, 1, HV, V)
+        a = torch.zeros(N, 1, HV, K, dtype=torch.bfloat16, device="cuda")
+        b = torch.zeros(N, 1, HV, dtype=torch.bfloat16, device="cuda")
+        o = torch.zeros(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
+
+    A_log = torch.zeros(HV, dtype=torch.float32, device="cuda")
+    dt_bias = torch.zeros(HV, K, dtype=torch.float32, device="cuda")
+    if state_layout_is_kv:
+        h0_source = torch.zeros(pool_size, HV, K, V, dtype=torch.float32, device="cuda")
+    else:
+        h0_source = torch.zeros(pool_size, HV, V, K, dtype=torch.float32, device="cuda")
+    h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
+
+    cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
+    q_tensor = from_dlpack(q, assumed_align=16)
+    k_tensor = from_dlpack(k, assumed_align=16)
+    v_tensor = from_dlpack(v, assumed_align=16)
+    a_tensor = from_dlpack(a, assumed_align=16)
+    b_tensor = from_dlpack(b, assumed_align=16)
+    A_log_tensor = from_dlpack(A_log, assumed_align=16)
+    dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
+    h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+    h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
+    o_tensor = from_dlpack(o, assumed_align=16)
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    run_small, run_small_varlen, run_large, run_large_varlen = _get_jit_functions()
+    if use_small_batch:
+        kernel_func = run_small_varlen if is_varlen_decode else run_small
+    else:
+        kernel_func = run_large_varlen if is_varlen_decode else run_large
+
+    compiled_kernel = cute.compile(
+        kernel_func,
+        cu_seqlens_tensor,
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        a_tensor,
+        b_tensor,
+        A_log_tensor,
+        dt_bias_tensor,
+        h0_source_tensor,
+        h0_indices_tensor,
+        o_tensor,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        scale=scale,
+        B=1 if is_varlen_decode else N,
+        T=N if is_varlen_decode else 1,
+        H=H,
+        K=K,
+        V=V,
+        HV=HV,
+        use_initial_state=True,
+        use_qk_l2norm=use_qk_l2norm,
+        state_layout_is_kv=state_layout_is_kv,
+        precomputed_decay_beta=precomputed_decay_beta,
+        num_blocks_per_state_small=num_blocks_per_state_small,
+        dense_small_hv_parallel=dense_small_hv_parallel,
+        stream=stream,
+        options="--enable-tvm-ffi --opt-level 1",
+    )
+
+    _compiled_kernels[key] = compiled_kernel
+    logger.info(
+        "CuTe DSL KDA packed static-stride kernel compiled: "
+        f"N={N}, H={H}, HV={HV}, K={K}, V={V}, qkv_dim={qkv_dim}, row_stride={row_stride}, pool_size={pool_size}, "
+        f"small_batch={use_small_batch}, varlen={is_varlen_decode}"
+    )
+    return compiled_kernel
+
+
 def _normalize_A_log(A_log: torch.Tensor, HV: int) -> torch.Tensor:
     if A_log.numel() != HV:
         raise ValueError(f"Unexpected A_log shape: {A_log.shape}; expected numel={HV}")
@@ -2093,4 +2429,228 @@ def kda_decode(
         stream,
     )
 
+    return o
+
+
+def kda_packed_decode(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    out: torch.Tensor | None = None,
+    scale: float | None = None,
+    use_qk_l2norm_in_kernel: bool = True,
+    softplus_beta: float = 1.0,
+    softplus_threshold: float = 20.0,
+    cu_seqlens: torch.Tensor | None = None,
+    state_layout: str = "vk",
+) -> torch.Tensor:
+    """Packed-QKV variant of :func:`kda_decode`.
+
+    Takes a packed ``mixed_qkv`` of shape ``[N, qkv_dim]`` laid out as
+    ``[Q(H·K) | K(H·K) | V(HV·V)]`` (head-major, last dim contiguous, row stride
+    >= qkv_dim) and feeds the existing CuTe DSL KDA decode kernel q/k/v as
+    strided views directly — avoiding the q/k/v materialization and the
+    ``.contiguous()`` copy that ``kda_decode`` performs.
+
+    Numerics match ``kda_decode`` on the same inputs repacked, since the kernel
+    body is unchanged. The packed static-stride compile path builds q/k/v mock
+    tensors with the same row stride as runtime packed views, so the kernel
+    accepts the non-contiguous views without dynamic layout.
+
+    Args:
+        mixed_qkv: ``[N, qkv_dim]`` bf16, last dim contiguous.
+        a: gate, dense ``(N,1,HV,K)`` / ``(N,HV,K)`` / varlen-compatible; see
+            ``_normalize_kda_a``.
+        b: ``(N,1,HV)`` (dense) or ``(N,HV)`` (varlen), bf16.
+        A_log: ``(HV,)`` fp32.
+        dt_bias: ``(HV,K)`` fp32.
+        state: ``(num_slots, HV, V, K)`` for ``state_layout='vk'`` or
+            ``(num_slots, HV, K, V)`` for ``'kv'``, fp32.
+        state_indices: ``(N,)`` int32, ``-1`` marks dummy slots.
+        out: optional preallocated output, dense ``(N,1,HV,V)`` or varlen
+            ``(1,N,HV,V)``, bf16, contiguous.
+        cu_seqlens: when not None, varlen decode (otherwise dense).
+        state_layout: ``"vk"`` (default) or ``"kv"``.
+
+    Returns:
+        Output tensor of shape ``(N,1,HV,V)`` (dense) or ``(1,N,HV,V)``
+        (varlen). ``state`` is updated in place.
+    """
+    state_layout_canonical = _canonicalize_state_layout(state_layout)
+    state_layout_is_kv = state_layout_canonical == "kv"
+
+    if state.dim() != 4:
+        raise ValueError(f"Unexpected state shape: {state.shape}; expected a 4D state tensor")
+
+    if state_layout_is_kv:
+        pool_size, HV, K, V = state.shape
+    else:
+        pool_size, HV, V, K = state.shape
+
+    if K != TILE_K:
+        raise ValueError(f"Current CuTe DSL KDA kernel requires K={TILE_K}, got K={K}")
+    if V % TILE_V_SMALL != 0 or V % TILE_V != 0:
+        raise ValueError(f"Current CuTe DSL KDA kernel requires V % {TILE_V_SMALL} == 0 and V % {TILE_V} == 0, got V={V}")
+
+    if mixed_qkv.ndim != 2:
+        raise ValueError(f"mixed_qkv must be 2D [N, qkv_dim], got shape {mixed_qkv.shape}")
+    qkv_dim = mixed_qkv.shape[1]
+    qk_dim = qkv_dim - HV * V
+    if qk_dim % 2 != 0:
+        raise ValueError(
+            f"mixed_qkv q/k segment (qkv_dim - HV*V = {qk_dim}) must be even for equal Q|K, got qkv_dim={qkv_dim}"
+        )
+    H = (qk_dim // 2) // K
+    if H <= 0 or qk_dim // 2 != H * K:
+        raise ValueError(
+            f"Inconsistent mixed_qkv layout: q/k segment {qk_dim // 2} not divisible by K={K}, got qkv_dim={qkv_dim}"
+        )
+    if HV % H != 0:
+        raise ValueError(f"HV={HV} must be divisible by H={H} (grouped-head mapping)")
+    if qkv_dim != 2 * H * K + HV * V:
+        raise ValueError(
+            f"mixed_qkv qkv_dim={qkv_dim} != 2*H*K + HV*V = {2 * H * K + HV * V} for H={H}, HV={HV}, K={K}, V={V}"
+        )
+
+    N = state_indices.shape[0]
+    is_varlen_decode = cu_seqlens is not None
+    if mixed_qkv.shape[0] != N:
+        raise ValueError(f"mixed_qkv batch size {mixed_qkv.shape[0]} must match state_indices length {N}")
+    row_stride = mixed_qkv.stride(0)
+    if mixed_qkv.stride(-1) != 1 or row_stride < qkv_dim:
+        raise ValueError(
+            f"mixed_qkv must use packed-row layout with stride(-1)=1 and stride(0)>=qkv_dim={qkv_dim}; "
+            f"got stride={mixed_qkv.stride()}"
+        )
+
+    if scale is None:
+        scale = K**-0.5
+    elif scale <= 0:
+        raise ValueError(f"scale must be positive, got {scale}")
+
+    fast_out = _try_fast_dense_packed_decode(
+        A_log,
+        dt_bias,
+        mixed_qkv,
+        a,
+        b,
+        N=N,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        initial_state_source=state,
+        initial_state_indices=state_indices,
+        is_varlen_decode=is_varlen_decode,
+        cu_seqlens=cu_seqlens,
+        scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        out=out,
+        state_layout=state_layout_canonical,
+    )
+    if fast_out is not None:
+        return fast_out
+
+    # --- General path: normalize then launch the packed static-stride kernel. ---
+    # We deliberately do NOT route through kda_decode's slow path, which would
+    # .contiguous()-copy the q/k/v (defeating packed) and requires separate
+    # q/k/v tensors. We normalize the meta tensors (a/b/A_log/dt_bias/state/
+    # indices) but feed q/k/v as strided views into the packed kernel directly.
+    h0_source, pool_size, _ = _normalize_state_source(
+        state,
+        N=N,
+        HV=HV,
+        K=K,
+        V=V,
+        device=mixed_qkv.device,
+        state_layout=state_layout_canonical,
+    )
+    a_kernel = _normalize_kda_a(a, is_varlen_decode=is_varlen_decode, N=N, HV=HV, K=K)
+    a_kernel = a_kernel if a_kernel.is_contiguous() else a_kernel.contiguous()
+    if is_varlen_decode:
+        if b.dim() == 3:
+            b_kernel = b.squeeze(0)
+        else:
+            b_kernel = b
+    else:
+        if b.dim() == 2:
+            b_kernel = b.unsqueeze(1)
+        else:
+            b_kernel = b
+    b_kernel = b_kernel if b_kernel.is_contiguous() else b_kernel.contiguous()
+    A_log_n = _normalize_A_log(A_log, HV)
+    dt_bias_n = _normalize_dt_bias(dt_bias, HV, K)
+    indices_n = _normalize_state_indices(state_indices, N=N, pool_size=pool_size, device=mixed_qkv.device)
+
+    if is_varlen_decode:
+        q_view = mixed_qkv.narrow(1, 0, H * K).view(1, N, H, K)
+        k_view = mixed_qkv.narrow(1, H * K, H * K).view(1, N, H, K)
+        v_view = mixed_qkv.narrow(1, 2 * H * K, HV * V).view(1, N, HV, V)
+        o = _prepare_output_tensor(mixed_qkv, out, (1, N, HV, V))
+    else:
+        q_view = mixed_qkv.narrow(1, 0, H * K).view(N, 1, H, K)
+        k_view = mixed_qkv.narrow(1, H * K, H * K).view(N, 1, H, K)
+        v_view = mixed_qkv.narrow(1, 2 * H * K, HV * V).view(N, 1, HV, V)
+        o = _prepare_output_tensor(mixed_qkv, out, (N, 1, HV, V))
+
+    if cu_seqlens is not None:
+        cu_seqlens_to_use = cu_seqlens.contiguous()
+    else:
+        cache_key = (N, str(mixed_qkv.device))
+        if cache_key not in _cu_seqlens_cache:
+            _cu_seqlens_cache[cache_key] = torch.arange(N + 1, dtype=torch.int32, device=mixed_qkv.device)
+        cu_seqlens_to_use = _cu_seqlens_cache[cache_key]
+
+    use_small_batch = N < SMALL_BATCH_THRESHOLD
+    if is_varlen_decode:
+        dense_small_hv_parallel = False
+    else:
+        dense_small_hv_parallel_head_threshold = (
+            N4_DENSE_SMALL_HV_PARALLEL_HEAD_THRESHOLD if N <= 4 else DENSE_SMALL_HV_PARALLEL_HEAD_THRESHOLD
+        )
+        dense_small_hv_parallel = (
+            use_small_batch and dense_small_hv_parallel_head_threshold >= H and N <= DENSE_SMALL_HV_PARALLEL_MAX_N
+        )
+    num_blocks_per_state_small = _select_small_blocks_per_state(N, H, HV, V)
+
+    compiled_kernel = _get_compiled_packed_kernel(
+        N,
+        H,
+        HV,
+        K,
+        V,
+        row_stride,
+        pool_size,
+        use_small_batch,
+        is_varlen_decode,
+        scale=scale,
+        use_qk_l2norm=use_qk_l2norm_in_kernel,
+        state_layout_is_kv=state_layout_is_kv,
+        precomputed_decay_beta=False,
+        num_blocks_per_state_small=num_blocks_per_state_small,
+        dense_small_hv_parallel=dense_small_hv_parallel,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+    )
+    compiled_kernel(
+        cu_seqlens_to_use,
+        q_view,
+        k_view,
+        v_view,
+        a_kernel,
+        b_kernel,
+        A_log_n,
+        dt_bias_n,
+        h0_source,
+        indices_n,
+        o,
+        _get_cached_stream(mixed_qkv.device),
+    )
     return o

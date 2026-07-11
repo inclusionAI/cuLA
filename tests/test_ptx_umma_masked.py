@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Standalone CuteDSL test for ptx_umma_masked.py inline PTX MMA wrappers.
+Standalone CuteDSL test for SM100 masked MMA inline PTX wrappers.
 
 Tests:
   1. tcgen05mma_ss_no_mask  -- M=64, N=64, K=8, TF32, all rows active → matches torch.mm
@@ -16,7 +16,7 @@ SMEM layout:
 
 All descriptor values are computed via make_umma_smem_desc / smem_descriptor_to_int
 (proven correct in test_umma_ptx_jit.py). Wrapped in Tcgen05SmemDescriptor for API
-compatibility with ptx_umma_masked.py convenience wrappers.
+compatibility with cula.ops.sm100.ptx convenience wrappers.
 """
 
 import pathlib
@@ -30,6 +30,7 @@ import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+import pytest
 import torch
 from cutlass.cute.arch import (
     elect_one,
@@ -48,12 +49,14 @@ from cutlass.cute.nvgpu.tcgen05 import (
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int32, Int64, TFloat32
 
-from cula.ops.ptx_umma_ext import (
+from cula.ops.sm100.ptx import (
     Tcgen05SmemDescriptor,
     tcgen05mma_ss_mask0,
     tcgen05mma_ss_mask1,
     tcgen05mma_ss_no_mask,
 )
+
+pytestmark = pytest.mark.sm100_only
 
 M_DIM, N_DIM, K_DIM = 64, 64, 8
 TMEM_COLS = 64

@@ -33,7 +33,7 @@ import cutlass.torch as cutlass_torch  # noqa: E402
 from cutlass.cute.runtime import from_dlpack  # noqa: E402
 
 # Our implementation
-from cula.ops.chunk_delta_h_sm100 import ChunkDeltaRuleFwdH  # noqa: E402
+from cula.ops.kda.sm100.delta_h import ChunkDeltaRuleFwdH  # noqa: E402
 
 
 def fla_reference_chunk_fwd_h(

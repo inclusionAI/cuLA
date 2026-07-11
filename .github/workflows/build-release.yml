@@ -1,0 +1,158 @@
+name: Build & Release Wheels
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-wheel:
+    name: "wheel / ${{ matrix.cuda }} / cp312 / ${{ matrix.arch }}"
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda:
+          - cu129
+          - cu130
+        arch:
+          - x86_64
+          - aarch64
+    container:
+      # UBI 8 provides the glibc 2.28 baseline required by manylinux_2_28.
+      image: "nvidia/cuda:${{ matrix.cuda == 'cu129' && '12.9.0' || '13.0.0' }}-devel-ubi8"
+
+    steps:
+      - name: Free disk space
+        run: |
+          rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet \
+                 /usr/local/share/boost /opt/ghc 2>/dev/null || true
+          dnf clean all 2>/dev/null || true
+          df -h / || true
+
+      - name: Install system dependencies
+        run: |
+          dnf install -y \
+            git \
+            gcc-toolset-13-gcc \
+            gcc-toolset-13-gcc-c++ \
+            python3.12 \
+            python3.12-devel \
+            python3.12-pip
+          dnf clean all
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Configure git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install Python dependencies
+        run: |
+          python3.12 -m pip install --no-cache-dir --upgrade pip
+          python3.12 -m pip install --no-cache-dir torch==2.9.1 --index-url ${{ matrix.cuda == 'cu129' && 'https://download.pytorch.org/whl/cu129' || 'https://download.pytorch.org/whl/cu130' }}
+          python3.12 -m pip install --no-cache-dir setuptools wheel "setuptools_scm>=6.0" build ninja auditwheel patchelf
+
+      - name: Expose PyTorch CUDA libraries
+        # The nvidia/cuda devel image ships the CUDA toolkit but not cuDNN.
+        # torch's pip wheels bundle cuDNN inside site-packages/nvidia/*/lib/,
+        # which is not on the linker search path — add it so torch._C can load.
+        run: |
+          LIB_DIRS="$(python3.12 <<'EOF'
+          import glob, os, site
+          dirs = []
+          for sp in site.getsitepackages():
+              for p in [os.path.join(sp, "torch", "lib")] + glob.glob(os.path.join(sp, "nvidia", "*", "lib")):
+                  if os.path.isdir(p):
+                      dirs.append(p)
+          print(":".join(dirs))
+          EOF
+          )"
+          echo "LD_LIBRARY_PATH=${LIB_DIRS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+      - name: Compute version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            BASE="${GITHUB_REF#refs/tags/v}"
+          else
+            # Strip any local segment (+gXXX) so we get a clean base
+            BASE=$(python3.12 -c "from setuptools_scm import get_version; print(get_version().split('+')[0])")
+          fi
+          echo "version=${BASE}+${{ matrix.cuda }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build fat-binary wheel
+        env:
+          CC: /opt/rh/gcc-toolset-13/root/usr/bin/gcc
+          CXX: /opt/rh/gcc-toolset-13/root/usr/bin/g++
+          CUDAHOSTCXX: /opt/rh/gcc-toolset-13/root/usr/bin/g++
+          CULA_BUILD_ALL_ARCHS: "1"
+          SETUPTOOLS_SCM_PRETEND_VERSION: "${{ steps.version.outputs.version }}"
+          NVCC_THREADS: "4"
+          MAX_JOBS: "4"
+        run: |
+          "$CC" --version
+          "$CXX" --version
+          python3.12 -m build --wheel --no-isolation --outdir dist-raw
+
+      - name: Repair wheel for manylinux_2_28
+        run: |
+          # These libraries are supplied by the NVIDIA driver, PyTorch, or
+          # PyTorch's CUDA runtime dependency and must remain external.
+          python3.12 -m auditwheel repair \
+            --plat manylinux_2_28_${{ matrix.arch }} \
+            --exclude libcuda.so.1 \
+            --exclude 'libcudart.so.*' \
+            --exclude 'libc10*.so' \
+            --exclude 'libtorch*.so' \
+            --wheel-dir dist \
+            dist-raw/*.whl
+
+      - name: Verify wheel
+        run: |
+          echo "Built wheel:"
+          ls -lh dist/*.whl
+          ls dist/*.whl | grep -q "+${{ matrix.cuda }}" \
+            || { echo "ERROR: wheel name missing +${{ matrix.cuda }} suffix"; exit 1; }
+          ls dist/*.whl | grep -q "manylinux_2_28_${{ matrix.arch }}" \
+            || { echo "ERROR: wheel is not tagged manylinux_2_28_${{ matrix.arch }}"; exit 1; }
+          python3.12 -m auditwheel show dist/*.whl
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheel-${{ matrix.cuda }}-${{ matrix.arch }}
+          path: dist/*.whl
+
+  release:
+    name: Create GitHub Release
+    needs: [build-wheel]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            artifacts/wheel-*/*.whl
+          generate_release_notes: true
+          draft: true
+          prerelease: ${{ contains(github.ref, 'rc') || contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}

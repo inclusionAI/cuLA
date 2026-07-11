@@ -14,7 +14,11 @@
 
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-# Precision Tests for FlashKDA implementation compared with FLA Triton baselin
+# Precision Tests for FlashKDA implementation compared with FLA Triton baseline
+# Test modes (see issue #78):
+#     default:            fast subset (kda_fast cases only)
+#     pytest -m kda_slow: slow stress traces and wider parameter grids
+#     pytest -m kda_full: full sweep (fast + slow)
 
 import pytest
 import torch
@@ -26,8 +30,108 @@ from cula.kda import chunk_kda as cula_chunk_kda
 
 pytestmark = pytest.mark.sm100_only
 
+_FAST = [pytest.mark.kda_fast]
+_FAST_NR = [pytest.mark.kda_fast, pytest.mark.kda_fast_norecomp]
+_SLOW = [pytest.mark.kda_slow]
 
-@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
+# (B, T, H, HV, D, gln, mask_p, l2norm, gate, safe_gate, dtype), marks
+_FIXED_CONFIGS = [
+    ((1, 63, 1, 1, 128, 1, 0, False, False, True, torch.bfloat16), _FAST_NR),  # small fixed (+ no_recomp)
+    ((2, 500, 3, 3, 128, 1, 0, False, False, True, torch.bfloat16), _SLOW),
+    ((2, 1000, 3, 3, 128, 1, 0.5, False, False, True, torch.bfloat16), _SLOW),
+    ((3, 1024, 4, 4, 128, 0.1, 0, False, False, True, torch.bfloat16), _SLOW),
+    ((4, 1024, 4, 4, 128, 1, 0, False, False, True, torch.bfloat16), _SLOW),
+    ((4, 1024, 4, 4, 128, 1, 0, True, False, True, torch.bfloat16), _FAST),  # l2norm medium
+    ((2, 1500, 4, 4, 128, 10, 0, False, True, True, torch.bfloat16), _FAST_NR),  # gated (+ no_recomp)
+    ((4, 2048, 8, 8, 128, 1, 0, False, True, True, torch.bfloat16), _SLOW),
+    # GVA cases: HV > H
+    ((2, 1024, 4, 8, 128, 1, 0, True, False, True, torch.bfloat16), _FAST),  # GVA medium
+    ((2, 1500, 2, 4, 128, 10, 0, False, True, True, torch.bfloat16), _SLOW),
+    ((2, 2048, 4, 8, 128, 1, 0, False, True, True, torch.bfloat16), _SLOW),
+]
+
+# (H, HV, D, mask_p, cu_seqlens, dtype, safe_gate), marks
+_VARLEN_CONFIGS = [
+    ((4, 4, 128, 0.1, [0, 15], torch.bfloat16, True), _FAST),  # short varlen smoke
+    ((4, 4, 128, 0.9, [0, 256, 500, 1000], torch.bfloat16, True), _SLOW),
+    ((4, 4, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True), _SLOW),
+    ((4, 4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16, True), _FAST),  # multi-batch varlen
+    ((4, 4, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True), _SLOW),
+    # ======Varlen test with simulated trace=======
+    (
+        (
+            32,
+            32,
+            128,
+            0,
+            [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192],
+            torch.bfloat16,
+            True,
+        ),
+        _SLOW,
+    ),
+    (
+        (
+            32,
+            32,
+            128,
+            0,
+            [0, 652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236, 5543, 6255, 6480, 6947, 7616, 8192],
+            torch.bfloat16,
+            True,
+        ),
+        _SLOW,
+    ),
+    (
+        (
+            32,
+            32,
+            128,
+            0,
+            [0, 315, 973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459, 6318, 6669, 6979, 7583, 8192],
+            torch.bfloat16,
+            True,
+        ),
+        _SLOW,
+    ),
+    (
+        (
+            32,
+            32,
+            128,
+            0,
+            [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
+            torch.bfloat16,
+            True,
+        ),
+        _SLOW,
+    ),
+    # ======GVA varlen cases: HV > H=======
+    ((2, 4, 128, 0.1, [0, 15], torch.bfloat16, True), _FAST),  # GVA varlen smoke
+    ((4, 8, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True), _SLOW),
+    ((4, 8, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True), _SLOW),
+    (
+        (
+            8,
+            32,
+            128,
+            0,
+            [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
+            torch.bfloat16,
+            True,
+        ),
+        _SLOW,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "beta_dtype",
+    [
+        pytest.param(torch.float32, id="beta_fp32", marks=pytest.mark.kda_slow),
+        pytest.param(torch.bfloat16, id="beta_bf16"),
+    ],
+)
 @pytest.mark.parametrize("disable_recompute", [True, False], ids=["no_recomp", "recomp"])
 @pytest.mark.parametrize(
     (
@@ -45,23 +149,11 @@ pytestmark = pytest.mark.sm100_only
     ),
     [
         pytest.param(
-            *test,
-            id="B{}-T{}-H{}-HV{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-{}".format(*test),
+            *params,
+            id="B{}-T{}-H{}-HV{}-D{}-gln{}-mask_p{}-l2norm{}-gate{}-safe_gate{}-{}".format(*params),
+            marks=marks,
         )
-        for test in [
-            (1, 63, 1, 1, 128, 1, 0, False, False, True, torch.bfloat16),
-            (2, 500, 3, 3, 128, 1, 0, False, False, True, torch.bfloat16),
-            (2, 1000, 3, 3, 128, 1, 0.5, False, False, True, torch.bfloat16),
-            (3, 1024, 4, 4, 128, 0.1, 0, False, False, True, torch.bfloat16),
-            (4, 1024, 4, 4, 128, 1, 0, False, False, True, torch.bfloat16),
-            (4, 1024, 4, 4, 128, 1, 0, True, False, True, torch.bfloat16),
-            (2, 1500, 4, 4, 128, 10, 0, False, True, True, torch.bfloat16),
-            (4, 2048, 8, 8, 128, 1, 0, False, True, True, torch.bfloat16),
-            # GVA cases: HV > H
-            (2, 1024, 4, 8, 128, 1, 0, True, False, True, torch.bfloat16),
-            (2, 1500, 2, 4, 128, 10, 0, False, True, True, torch.bfloat16),
-            (2, 2048, 4, 8, 128, 1, 0, False, True, True, torch.bfloat16),
-        ]
+        for params, marks in _FIXED_CONFIGS
     ],
 )
 def test_safe_gate_chunk(
@@ -122,7 +214,7 @@ def test_safe_gate_chunk(
         lower_bound=lower_bound,
         disable_recompute=disable_recompute,
     )
-    ((ref * do).sum() + (ref_ht * dht).sum()).backward(retain_graph=True)
+    ((ref * do).sum() + (ref_ht * dht).sum()).backward()
     if use_gate_in_kernel:
         ref_dA, A_log.grad = A_log.grad, None
         ref_dbias, dt_bias.grad = dt_bias.grad, None
@@ -145,7 +237,7 @@ def test_safe_gate_chunk(
         lower_bound=lower_bound,
         disable_recompute=disable_recompute,
     )
-    ((tri * do).sum() + (tri_ht * dht).sum()).backward(retain_graph=True)
+    ((tri * do).sum() + (tri_ht * dht).sum()).backward()
     if use_gate_in_kernel:
         tri_dA, A_log.grad = A_log.grad, None
         tri_dbias, dt_bias.grad = dt_bias.grad, None
@@ -165,69 +257,23 @@ def test_safe_gate_chunk(
     assert_close("dh0", ref_dh0, tri_dh0, 0.008)
 
 
-@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16], ids=["beta_fp32", "beta_bf16"])
+@pytest.mark.parametrize(
+    "beta_dtype",
+    [
+        pytest.param(torch.float32, id="beta_fp32", marks=pytest.mark.kda_slow),
+        pytest.param(torch.bfloat16, id="beta_bf16"),
+    ],
+)
 @pytest.mark.parametrize("disable_recompute", [True, False], ids=["no_recomp", "recomp"])
 @pytest.mark.parametrize(
     ("H", "HV", "D", "mask_p", "cu_seqlens", "dtype", "safe_gate"),
     [
-        pytest.param(*test, id="H{}-HV{}-D{}-mask_p{}-cu_seqlens{}-{}-safe_gate{}".format(*test))
-        for test in [
-            (4, 4, 128, 0.1, [0, 15], torch.bfloat16, True),
-            (4, 4, 128, 0.9, [0, 256, 500, 1000], torch.bfloat16, True),
-            (4, 4, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True),
-            (4, 4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16, True),
-            (4, 4, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True),
-            # ======Varlen test with simulated trace=======
-            (
-                32,
-                32,
-                128,
-                0,
-                [0, 247, 699, 982, 1688, 1985, 2383, 3081, 3526, 3973, 4096, 4824, 5101, 5919, 6426, 7137, 7392, 7800, 8192],
-                torch.bfloat16,
-                True,
-            ),
-            (
-                32,
-                32,
-                128,
-                0,
-                [0, 652, 1255, 1600, 2083, 2345, 2756, 3172, 3767, 4096, 4891, 5236, 5543, 6255, 6480, 6947, 7616, 8192],
-                torch.bfloat16,
-                True,
-            ),
-            (
-                32,
-                32,
-                128,
-                0,
-                [0, 315, 973, 1283, 2162, 2459, 2678, 2998, 3781, 4096, 4503, 5459, 6318, 6669, 6979, 7583, 8192],
-                torch.bfloat16,
-                True,
-            ),
-            (
-                32,
-                32,
-                128,
-                0,
-                [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
-                torch.bfloat16,
-                True,
-            ),
-            # ======GVA varlen cases: HV > H=======
-            (2, 4, 128, 0.1, [0, 15], torch.bfloat16, True),
-            (4, 8, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True),
-            (4, 8, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True),
-            (
-                8,
-                32,
-                128,
-                0,
-                [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
-                torch.bfloat16,
-                True,
-            ),
-        ]
+        pytest.param(
+            *params,
+            id="H{}-HV{}-D{}-mask_p{}-cu_seqlens{}-{}-safe_gate{}".format(*params),
+            marks=marks,
+        )
+        for params, marks in _VARLEN_CONFIGS
     ],
 )
 def test_safe_gate_chunk_varlen(
@@ -277,7 +323,7 @@ def test_safe_gate_chunk_varlen(
         lower_bound=-5.0 if safe_gate else None,
         disable_recompute=disable_recompute,
     )
-    ((tri * do).sum() + (tri_ht * dht).sum()).backward(retain_graph=True)
+    ((tri * do).sum() + (tri_ht * dht).sum()).backward()
     tri_dq, tri_dk, tri_dv, tri_dg, tri_db, tri_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
     q.grad = k.grad = v.grad = g.grad = beta.grad = h0.grad = None
 
@@ -295,7 +341,7 @@ def test_safe_gate_chunk_varlen(
         lower_bound=-5.0 if safe_gate else None,
         disable_recompute=disable_recompute,
     )
-    ((ref * do).sum() + (ref_ht * dht).sum()).backward(retain_graph=True)
+    ((ref * do).sum() + (ref_ht * dht).sum()).backward()
     ref_dq, ref_dk, ref_dv, ref_dg, ref_db, ref_dh0 = q.grad, k.grad, v.grad, g.grad, beta.grad, h0.grad
 
     assert_close("o", ref, tri, 0.005)

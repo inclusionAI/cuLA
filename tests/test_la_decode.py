@@ -30,7 +30,7 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 
-from cula.ops.la_decode import linear_attention_decode
+from cula.ops.lightning.decode import linear_attention_decode
 
 try:
     from fla.ops.common.fused_recurrent import fused_recurrent_fwd
@@ -299,10 +299,11 @@ def test_gva_vs_fla(B):
 
 # End-to-End Prefill -> Decode Test
 # ---------------------------------------------------------------------------
+@pytest.mark.sm100_only
 @pytest.mark.parametrize("H, HV", [(8, 8), (4, 8)])
 def test_prefill_decode_e2e(H, HV):
     """Verify prefill output state passes directly into decode without transpose."""
-    from cula.ops.lightning_attn_sm100 import lightning_attn_fwd
+    from cula.ops.lightning.prefill_sm100 import lightning_attn_fwd
 
     B, S, D = 2, 64, 128
     scale = D**-0.5

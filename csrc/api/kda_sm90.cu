@@ -35,7 +35,9 @@ kda_fwd_prefill(
     torch::Tensor workspace_buffer,
     float scale,
     bool output_final_state,
-    bool safe_gate) {
+    bool safe_gate,
+    OptionalTensor cp_seq_map_,
+    OptionalTensor raw_cu_seqlens_) {
     // Q, K: [packed_seq, num_qk_heads, D]
     // V/O/g: [packed_seq, num_v_heads, D]   (GVA: num_v_heads is a positive integer multiple of num_qk_heads)
     auto packed_seq = q.size(0);
@@ -43,6 +45,31 @@ kda_fwd_prefill(
     auto num_v_heads = v.size(1);
     auto head_size = q.size(2);
     auto num_seqs = cu_seqlens.size(0) - 1;
+
+    // Intra-card CP plumbing.
+    int32_t const* cp_seq_map_ptr = nullptr;
+    int32_t const* raw_cu_seqlens_ptr = nullptr;
+    int32_t raw_num_seqs = static_cast<int32_t>(num_seqs);
+    if (cp_seq_map_.has_value()) {
+        TORCH_CHECK(raw_cu_seqlens_.has_value(), "raw_cu_seqlens must be provided alongside cp_seq_map");
+        auto const& cp_seq_map = cp_seq_map_.value();
+        auto const& raw_cu_seqlens = raw_cu_seqlens_.value();
+        TORCH_CHECK(cp_seq_map.device() == q.device(), "cp_seq_map must be on the same device as q");
+        TORCH_CHECK(raw_cu_seqlens.device() == q.device(), "raw_cu_seqlens must be on the same device as q");
+        TORCH_CHECK(cp_seq_map.dtype() == torch::kInt32, "cp_seq_map must be int32");
+        TORCH_CHECK(raw_cu_seqlens.dtype() == torch::kInt32, "raw_cu_seqlens must be int32");
+        TORCH_CHECK(cp_seq_map.is_contiguous(), "cp_seq_map must be contiguous");
+        TORCH_CHECK(raw_cu_seqlens.is_contiguous(), "raw_cu_seqlens must be contiguous");
+        TORCH_CHECK(
+            cp_seq_map.size(0) == num_seqs,
+            "cp_seq_map.size(0) must equal cu_seqlens.size(0)-1, got ",
+            cp_seq_map.size(0),
+            " vs ",
+            num_seqs);
+        cp_seq_map_ptr = cp_seq_map.data_ptr<int32_t>();
+        raw_cu_seqlens_ptr = raw_cu_seqlens.data_ptr<int32_t>();
+        raw_num_seqs = static_cast<int32_t>(raw_cu_seqlens.size(0) - 1);
+    }
 
     // GVA contract on the C++ side. Order matters: check positivity *before* the modulo to
     // avoid % 0 / division-by-zero UB in case the Python layer passed a degenerate shape.
@@ -64,15 +91,15 @@ kda_fwd_prefill(
                                                      {packed_seq, num_v_heads, head_size},
                                                      torch::TensorOptions().dtype(q.dtype()).device(q.device()));
 
-    // output_final_state controls the API side effect. If it is false, ignore
-    // even an explicitly provided output_state_ buffer so the kernel skips the
-    // final-state store.
+    // Allocate output state if not provided. In CP mode the state is keyed
+    // by raw_num_seqs (one slot per original sequence), not the inflated
+    // CP-chunk count.
     OptionalTensor output_state = std::nullopt;
     if (output_final_state) {
         output_state = output_state_.has_value()
                            ? output_state_.value()
                            : torch::zeros(
-                                 {num_seqs, num_v_heads, head_size, head_size},
+                                 {raw_num_seqs, num_v_heads, head_size, head_size},
                                  torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
     }
 
@@ -123,7 +150,7 @@ kda_fwd_prefill(
         auto& input_state = input_state_.value();
         TORCH_CHECK(input_state.dtype() == torch::kFloat32, "input_state must be float32");
         TORCH_CHECK(input_state.is_contiguous(), "input_state must be contiguous");
-        // Defense in depth: also enforce shape on the C++ side (Python layer should already check).
+        // In CP mode the leading dim is the CP-chunk count (== num_seqs), otherwise it is the raw num_seqs.
         TORCH_CHECK(
             input_state.dim() == 4 && input_state.size(0) == num_seqs && input_state.size(1) == num_v_heads &&
                 input_state.size(2) == head_size && input_state.size(3) == head_size,
@@ -164,7 +191,10 @@ kda_fwd_prefill(
             static_cast<int64_t>(packed_seq),
             scale,
             safe_gate,
-            static_cast<int32_t>(sm_count));
+            static_cast<int32_t>(sm_count),
+            cp_seq_map_ptr,
+            raw_cu_seqlens_ptr,
+            raw_num_seqs);
     } else {
         float const* beta_ptr = beta_.has_value() ? beta_.value().data_ptr<float>() : nullptr;
         kda::sm90::launch_kda_fwd_prefill_kernel<Sm90, bf16, bf16, float, float>(
@@ -186,8 +216,16 @@ kda_fwd_prefill(
             static_cast<int64_t>(packed_seq),
             scale,
             safe_gate,
-            static_cast<int32_t>(sm_count));
+            static_cast<int32_t>(sm_count),
+            cp_seq_map_ptr,
+            raw_cu_seqlens_ptr,
+            raw_num_seqs);
     }
 
     return {output, output_state};
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.doc() = "cuLA SM90 kernels";
+    m.def("kda_fwd_prefill", &kda_fwd_prefill);
 }

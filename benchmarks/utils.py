@@ -61,7 +61,14 @@ def set_seed(seed: int):
 
 
 def benchmark_cuda_fn(fn, *, setup_fn=None, warmup=30, rep=200, aggregate="iqr_mean"):
-    """Benchmark a CUDA callable with events and return milliseconds per call."""
+    """Benchmark a CUDA callable with CUDA events; return milliseconds per call.
+
+    Args:
+        aggregate: How to summarize ``rep`` timed iterations.
+            ``"iqr_mean"`` (default) — mean of the middle 50% after sorting
+            (robust to outliers; used by la_decode / MTP benchmarks).
+            ``"mean"`` — arithmetic mean of all iterations.
+    """
     for _ in range(warmup):
         if setup_fn is not None:
             setup_fn()
