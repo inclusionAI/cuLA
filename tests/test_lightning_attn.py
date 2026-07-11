@@ -534,7 +534,9 @@ def test_varlen_multi_seq(seq_lens=None, H=4, HV=None, D=128, C=64, decay_val=0.
     return all_pass
 
 
-def test_varlen_with_initial_state(seq_lens=None, H=4, HV=None, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True) -> bool:
+def test_varlen_with_initial_state(
+    seq_lens=None, H=4, HV=None, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True
+) -> bool:
     """Varlen with initial state from state pool (non-contiguous indices)."""
     HV = H if HV is None else HV
     if seq_lens is None:

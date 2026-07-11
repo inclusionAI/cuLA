@@ -758,8 +758,12 @@ def generate_report(all_results, modes, args):
             f.write(f"## Mode: {mode}\n\n")
 
             if mode == "varlen":
-                f.write("| N | T | H | HV | Dist | Persist(ms) | NonPer(ms) | FLA_vl(ms) | P/NP | P/FLAvl | O diff | ht diff |\n")
-                f.write("|---|---|---|----|------|-------------|------------|------------|------|---------|--------|--------|\n")
+                f.write(
+                    "| N | T | H | HV | Dist | Persist(ms) | NonPer(ms) | FLA_vl(ms) | P/NP | P/FLAvl | O diff | ht diff |\n"
+                )
+                f.write(
+                    "|---|---|---|----|------|-------------|------------|------------|------|---------|--------|--------|\n"
+                )
                 for r in mr:
                     p = f"{r['persistent_ms']:.3f}" if _valid(r.get("persistent_ms", float("nan"))) else "-"
                     np_ = f"{r['nonpersistent_ms']:.3f}" if _valid(r.get("nonpersistent_ms", float("nan"))) else "-"
@@ -873,7 +877,9 @@ def parse_args():
         "--seq-lens", type=int, nargs="+", default=[256, 1024, 4096, 8192, 32768], help="Sequence lengths for standard modes"
     )
     p.add_argument("--num-heads", type=int, nargs="+", default=[64], help="Number of heads to test")
-    p.add_argument("--num-v-heads", type=int, nargs="+", default=None, help="Number of value heads to test (default: same as H)")
+    p.add_argument(
+        "--num-v-heads", type=int, nargs="+", default=None, help="Number of value heads to test (default: same as H)"
+    )
     p.add_argument("--head-dim", type=int, default=128)
     p.add_argument("--layer-idx", type=int, default=12)
     p.add_argument("--num-layers", type=int, default=24)
