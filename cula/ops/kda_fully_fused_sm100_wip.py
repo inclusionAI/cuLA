@@ -56,6 +56,7 @@ Mathematical formulation (chunkwise KDA):
 
 import argparse
 import time
+from types import SimpleNamespace
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -68,6 +69,14 @@ import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64
+
+# CUTLASS DSL 4.3+ changed fence_proxy() from exported enum arguments to
+# string literals. Keep the existing call sites compatible with both APIs.
+if not hasattr(cute.arch, "ProxyKind"):
+    cute.arch.ProxyKind = SimpleNamespace(async_shared="async.shared")
+if not hasattr(cute.arch, "SharedSpace"):
+    cute.arch.SharedSpace = SimpleNamespace(shared_cta="cta")
+
 try:
     from fla.modules.l2norm import l2norm_fwd
 except ImportError:
@@ -373,7 +382,7 @@ class KDAChunkwise:
         final_state_iter: cute.Pointer,  # Final state [B, H, D, D], float32 or nullptr
         cu_seqlens_iter: cute.Pointer,  # Cumulative seq lengths [num_seqs+1], int32 (varlen)
         workspace_iter: cute.Pointer,  # Workspace buffer for TMA descriptor modification
-        problem_size: tuple[Int32, Int32, Int32, Int32],  # (B/num_seqs, S/total_tokens, H, D)
+        problem_size: tuple[Int32, Int32, Int32, Int32, Int32],  # (B/num_seqs, S/total_tokens, H, HV, D)
         stream: cuda.CUstream,
         options=None,  # compile options
     ):
@@ -393,11 +402,11 @@ class KDAChunkwise:
             final_state_iter: Final state [N, H, D, D] or nullptr
             cu_seqlens_iter: Cumulative seq lengths [num_seqs+1], int32 (varlen only)
             workspace_iter: Workspace buffer for TMA descriptor modification (varlen tail tiles)
-            problem_size: (N, S, H, D) where N=B or num_seqs, S=seq_len or total_tokens
+            problem_size: (N, S, H, HV, D) where N=B or num_seqs, S=seq_len or total_tokens
             stream: CUDA stream
             options: compile options for the kernel
         """
-        B, S, H, D = problem_size
+        B, S, H, HV, D = problem_size
 
         # Setup attributes
         self._setup_attributes()
@@ -433,36 +442,36 @@ class KDAChunkwise:
         kt = cute.make_tensor(k_iter, kt_layout)
         # v
         v_layout = cute.make_layout(
-            (D, S, (H, data_B)),
-            stride=(1, D * H, (D, D * H * S)),
+            (D, S, (HV, data_B)),
+            stride=(1, D * HV, (D, D * HV * S)),
         )
         v = cute.make_tensor(v_iter, v_layout)
 
         # g (gate) - NEW for KDA, same layout as Q/K
         g_layout = cute.make_layout(
-            (S, D, (H, data_B)),
-            stride=(D * H, 1, (D, D * H * S)),
+            (S, D, (HV, data_B)),
+            stride=(D * HV, 1, (D, D * HV * S)),
         )
         g = cute.make_tensor(g_iter, g_layout)
 
         # beta - NEW for KDA, shape (B, S, H) or (1, total_tokens, H) for varlen
         beta_layout = cute.make_layout(
-            (S, (H, data_B)),
-            stride=(H, (1, H * S)),
+            (S, (HV, data_B)),
+            stride=(HV, (1, HV * S)),
         )
         beta = cute.make_tensor(beta_iter, beta_layout)
 
         o_layout = cute.make_layout(
-            (D, S, (H, data_B)),
-            stride=(1, D * H, (D, D * H * S)),
+            (D, S, (HV, data_B)),
+            stride=(1, D * HV, (D, D * HV * S)),
         )
         o = cute.make_tensor(o_iter, o_layout)
 
         # Initial state / final state: [N, H, D, D] stored as row-major
         # N = B (non-varlen) or num_seqs (varlen). Always uses B from problem_size.
         fstate_layout = cute.make_layout(
-            (D, D, (H, B)),
-            stride=(1, D, (D * D, D * D * H)),
+            (D, D, (HV, B)),
+            stride=(1, D, (D * D, D * D * HV)),
         )
         initial_state = cute.make_tensor(initial_state_iter, fstate_layout)
         final_state = cute.make_tensor(final_state_iter, fstate_layout)
@@ -837,7 +846,7 @@ class KDAChunkwise:
 
         self.shared_storage = SharedStorage
         if cutlass.const_expr(self.is_varlen):
-            self.grid = (1, H, B)
+            self.grid = (1, HV, B)
             # TensorMapManager for TMA descriptor modification in varlen tail tiles
             self._tensormap_mgr = utils.TensorMapManager(utils.TensorMapUpdateMode.GMEM, 128)
         else:
@@ -931,7 +940,7 @@ class KDAChunkwise:
         cu_seqlens: cute.Tensor,  # int32 tensor for varlen
         o_gmem: cute.Tensor,  # raw GMEM output tensor (D, S, (H, data_B)) for tail tile handling
         workspace_iter: cute.Pointer,  # workspace buffer for TMA descriptor modification
-        problem_size: tuple[Int32, Int32, Int32, Int32],  # (B, S, H, D)
+        problem_size: tuple[Int32, Int32, Int32, Int32, Int32],  # (B, S, H, HV, D)
     ):
         """
         KDA Kernel - Step 1: Gate processing
@@ -1381,7 +1390,8 @@ class KDAChunkwise:
         )
 
         (_, hidx, bidx) = cute.arch.block_idx()
-        B, S, H, D = problem_size
+        B, S, H, HV, D = problem_size
+        qk_hidx = hidx // (HV // H)
         C = self.chunk_size
 
         # Varlen: compute per-CTA sequence boundary and domain offsets
@@ -1546,6 +1556,7 @@ class KDAChunkwise:
                 operand_mode="A",
                 debug_name="Q",
                 batch_idx=data_bidx,
+                head_idx=qk_hidx,
             )
 
             tKsK, tKgK = self.tma_partition_for_mma_operand(
@@ -1557,6 +1568,7 @@ class KDAChunkwise:
                 operand_mode="B",
                 debug_name="K",
                 batch_idx=data_bidx,
+                head_idx=qk_hidx,
             )
 
             tVsV, tVgV = self.tma_partition_for_mma_operand(
@@ -4098,8 +4110,8 @@ class KDAChunkwise:
                     o_tail = cute.make_tensor(
                         o_gmem.iterator,
                         cute.make_layout(
-                            (D, new_S, (H, Int32(1))),
-                            stride=(Int32(1), D * H, (D, D * H * S)),
+                            (D, new_S, (HV, Int32(1))),
+                            stride=(Int32(1), D * HV, (D, D * HV * S)),
                         ),
                     )
                     # Initialize: copy original TMA descriptor to workspace
@@ -4157,8 +4169,8 @@ class KDAChunkwise:
                 if cutlass.const_expr(self.is_varlen):
                     beta_v = cute.domain_offset((tok_offset, (0, 0)), beta)
                 beta_chunk = beta_v[(None, (hidx, data_bidx))]
-                beta_chunk_layout = cute.make_layout((C, 1), stride=(H, 0))
-                beta_chunk = cute.make_tensor(beta_chunk.iterator + s_idx * H, layout=beta_chunk_layout)
+                beta_chunk_layout = cute.make_layout((C, 1), stride=(HV, 0))
+                beta_chunk = cute.make_tensor(beta_chunk.iterator + s_idx * HV, layout=beta_chunk_layout)
 
                 if cutlass.const_expr(PRINT_DEBUG):
                     print(f"sBeta: {sBeta}")
@@ -5513,10 +5525,13 @@ class KDAChunkwise:
         debug_name=None,
         no_cta_coord=False,
         batch_idx=None,
+        head_idx=None,
     ):
         _, hidx, bidx = cute.arch.block_idx()
         if batch_idx is not None:
             bidx = batch_idx
+        if cutlass.const_expr(head_idx is not None):
+            hidx = head_idx
         # Local_tile partition global tensors
         # x: (0,0,0,0) o (M,K,(H,B)):(1@1,1@0,(1@2,1@3))
         # (MMATile_M, MMATile_K, TILES_M, TILES_K, (H, B))
@@ -5570,6 +5585,7 @@ class KDAChunkwise:
         operand_mode,
         debug_name=None,
         batch_idx=None,
+        head_idx=None,
     ):
         tCgX = self.local_tile_partition_for_mma_operand(
             tensor_x=tma_tensor_x,
@@ -5578,6 +5594,7 @@ class KDAChunkwise:
             operand_mode=operand_mode,
             debug_name=debug_name,
             batch_idx=batch_idx,
+            head_idx=head_idx,
         )
         # Partition shared tensor with regard to TMA
         # ((ATOM_V, REST_V), INPUT_STAGE)

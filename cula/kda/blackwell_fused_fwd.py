@@ -115,11 +115,13 @@ class ChunkKDAFunction(torch.autograd.Function):
         chunk_indices: torch.IntTensor | None = None,
     ):
         chunk_size = 64
-        assert q.shape[-2] == v.shape[-2] == k.shape[-2], "Number of heads must be the same for q, k, v."
+        assert q.shape == k.shape, "q and k must have the same shape."
 
         global compiled_kernel_cache
 
         B, S, H, D = q.shape
+        HV = v.shape[-2]
+        assert HV % H == 0, f"HV ({HV}) must be a multiple of H ({H})."
         is_varlen = cu_seqlens is not None
         if is_varlen:
             assert B == 1, "For varlen, batch size must be 1. Flatten variable-length inputs first."
@@ -168,7 +170,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         g_cute = from_dlpack(g.detach())
         beta_cute = from_dlpack(beta.detach())
 
-        o = torch.empty_like(q)
+        o = torch.empty_like(v)
         o_cute = from_dlpack(o.detach())
 
         stream = cutlass_torch.default_stream()
@@ -227,13 +229,13 @@ class ChunkKDAFunction(torch.autograd.Function):
             initial_state_cute = _dummy_cache[q.device]["state_cute"]
 
         if output_final_state:
-            final_state_f32 = torch.zeros(num_seqs, H, D, D, dtype=torch.float32, device=q.device)
+            final_state_f32 = torch.zeros(num_seqs, HV, D, D, dtype=torch.float32, device=q.device)
             final_state_cute = from_dlpack(final_state_f32.detach())
         else:
             final_state_f32 = None
             final_state_cute = _dummy_cache[q.device]["state_cute"]
 
-        problem_size = (num_seqs, S, H, D)
+        problem_size = (num_seqs, S, H, HV, D)
 
         if cache_key in compiled_kernel_cache:
             compiled_kernel = compiled_kernel_cache[cache_key]

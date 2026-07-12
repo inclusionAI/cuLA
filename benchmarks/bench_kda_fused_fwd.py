@@ -176,13 +176,22 @@ def bench_fixed(configs):
             cu_seqlens=cu_seqlens,
             lower_bound=lower_bound,
         )
+        common_cula = dict(common)
+        if init_state is not None:
+            common_cula["init_state"] = init_state.transpose(-1, -2).contiguous()
 
         # Accuracy
-        o_fla, _ = run_fla(**common)
-        o_cula, _ = run_cula(**common)
+        o_fla, ht_fla = run_fla(**common)
+        o_cula, ht_cula_vk = run_cula(**common_cula)
         torch.cuda.synchronize()
 
         relative_rms_error, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs(o_fla, o_cula)
+        if ht_fla is not None and ht_cula_vk is not None:
+            ht_cula = ht_cula_vk.transpose(-1, -2)
+            state_rms, state_max, state_mean = relative_rms_error_rel_max_mean_abs(ht_fla, ht_cula)
+            relative_rms_error = max(relative_rms_error, state_rms)
+            rel_max = max(rel_max, state_max)
+            mean_diff = max(mean_diff, state_mean)
 
         # Performance
         ms_fla = benchmark_cuda_mode_fn(
@@ -193,7 +202,7 @@ def bench_fixed(configs):
             sanitizer_mode=SANITIZER_MODE,
         )
         ms_cula = benchmark_cuda_mode_fn(
-            lambda: run_cula(**common),
+            lambda: run_cula(**common_cula),
             default_warmup=WARMUP,
             default_rep=N_ITERS,
             ncu_mode=NCU_MODE,
@@ -216,7 +225,7 @@ def bench_fixed(configs):
             }
         )
 
-        del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
+        del o_fla, o_cula, ht_fla, ht_cula_vk, q, k, v, g, beta, A_log, dt_bias, inputs
         torch.cuda.empty_cache()
 
     return results
@@ -267,13 +276,22 @@ def bench_varlen(configs):
             cu_seqlens=cu_seqlens,
             lower_bound=lower_bound,
         )
+        common_cula = dict(common)
+        if init_state is not None:
+            common_cula["init_state"] = init_state.transpose(-1, -2).contiguous()
 
         # Accuracy
-        o_fla, _ = run_fla(**common)
-        o_cula, _ = run_cula(**common)
+        o_fla, ht_fla = run_fla(**common)
+        o_cula, ht_cula_vk = run_cula(**common_cula)
         torch.cuda.synchronize()
 
         relative_rms_error, rel_max, mean_diff = relative_rms_error_rel_max_mean_abs(o_fla, o_cula)
+        if ht_fla is not None and ht_cula_vk is not None:
+            ht_cula = ht_cula_vk.transpose(-1, -2)
+            state_rms, state_max, state_mean = relative_rms_error_rel_max_mean_abs(ht_fla, ht_cula)
+            relative_rms_error = max(relative_rms_error, state_rms)
+            rel_max = max(rel_max, state_max)
+            mean_diff = max(mean_diff, state_mean)
 
         # Performance
         ms_fla = benchmark_cuda_mode_fn(
@@ -284,7 +302,7 @@ def bench_varlen(configs):
             sanitizer_mode=SANITIZER_MODE,
         )
         ms_cula = benchmark_cuda_mode_fn(
-            lambda: run_cula(**common),
+            lambda: run_cula(**common_cula),
             default_warmup=WARMUP,
             default_rep=N_ITERS,
             ncu_mode=NCU_MODE,
@@ -314,7 +332,7 @@ def bench_varlen(configs):
             }
         )
 
-        del o_fla, o_cula, q, k, v, g, beta, A_log, dt_bias, inputs
+        del o_fla, o_cula, ht_fla, ht_cula_vk, q, k, v, g, beta, A_log, dt_bias, inputs
         torch.cuda.empty_cache()
 
     return results
