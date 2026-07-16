@@ -24,7 +24,7 @@ written once) is written by the LAST CTA in the sharing group (largest bidx),
 so its epilogue write lands after every earlier-dispatched non-owner has read
 the history -> race-free, same rolled output as the reference.
 
-Dispatch (variant="auto"): large_batch if N*HV>=768 else small_batch (graph-timed crossover, L20X).
+Dispatch (variant="auto"): large_batch if N*HV>=512 or (T>=8 and N*HV>=64), else small_batch (graph-timed, L20X).
 """
 
 import logging
@@ -145,7 +145,7 @@ def kda_conv_verify_kernel(
         # producer raw double-buffer: prefetch token t+1's q/k/v while computing t
         r_xq = [cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]
         r_xk = [cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]
-        r_xv = [cute.make_rmem_tensor(cute.make_layout((BV,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]
+        r_xv = [cute.make_rmem_tensor(cute.make_layout((1,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]
 
         if warp == 0:
             # vectorized preamble: this lane's adjacent q/k channels load their conv
@@ -189,8 +189,9 @@ def kda_conv_verify_kernel(
             cute.autovec_copy(xq0, r_xq[0])
             xk0 = cute.local_tile(mixed_qkv, (1, vec_size), (i_n * T, k_base // vec_size + lane))
             cute.autovec_copy(xk0, r_xk[0])
-            xv0 = cute.local_tile(mixed_qkv, (1, BV), (i_n * T, v_base // BV))
-            cute.autovec_copy(xv0, r_xv[0])
+            if lane < BV:
+                xv0 = cute.coalesce(cute.local_tile(mixed_qkv, (1, 1), (i_n * T, v_base + lane)))
+                cute.autovec_copy(xv0, r_xv[0])
 
         # ---- consumer (warp 1) recurrence registers + state preamble ----
         r_h = cute.make_rmem_tensor(cute.make_layout((BV * vec_size,), stride=(1,)), cutlass.Float32)
@@ -223,111 +224,109 @@ def kda_conv_verify_kernel(
         # release needs 64 threads; producer may run up to 2 tokens ahead of consumer.
         if warp == 0:
             for i_t in cutlass.range_constexpr(T):
-                if cutlass.const_expr(True):
-                    ps = i_t % 2
-                    # wait for the consumer to free slot ps (first two writes are free)
-                    if cutlass.const_expr(i_t >= 2):
-                        cute.arch.barrier(barrier_id=3 + ps, number_of_threads=64)
-                    # prefetch token i_t+1's raw into the other buffer (loads overlap this
-                    # token's conv/silu + the concurrent consumer recurrence)
-                    if cutlass.const_expr(i_t + 1 < T):
-                        nps = (i_t + 1) % 2
-                        rown = i_n * T + i_t + 1
-                        xqn = cute.local_tile(mixed_qkv, (1, vec_size), (rown, q_base // vec_size + lane))
-                        cute.autovec_copy(xqn, r_xq[nps])
-                        xkn = cute.local_tile(mixed_qkv, (1, vec_size), (rown, k_base // vec_size + lane))
-                        cute.autovec_copy(xkn, r_xk[nps])
-                        xvn = cute.local_tile(mixed_qkv, (1, BV), (rown, v_base // BV))
-                        cute.autovec_copy(xvn, r_xv[nps])
-                    for c in cutlass.range_constexpr(vec_size):
-                        qch = q_base + vec_size * lane + c
-                        xq = cutlass.Float32(r_xq[ps][c])
-                        acc = r_qb[c]
-                        if cutlass.const_expr(weights_in_smem):
-                            acc = acc + r_qhist[c, 0] * sWq[(lane, c, 0)]
-                            acc = acc + r_qhist[c, 1] * sWq[(lane, c, 1)]
-                            acc = acc + r_qhist[c, 2] * sWq[(lane, c, 2)]
-                            acc = acc + xq * sWq[(lane, c, 3)]
-                        else:
-                            acc = acc + r_qhist[c, 0] * r_qw[c, 0]
-                            acc = acc + r_qhist[c, 1] * r_qw[c, 1]
-                            acc = acc + r_qhist[c, 2] * r_qw[c, 2]
-                            acc = acc + xq * r_qw[c, 3]
-                        r_qhist[c, 0] = r_qhist[c, 1]
-                        r_qhist[c, 1] = r_qhist[c, 2]
-                        r_qhist[c, 2] = xq
-                        if cutlass.const_expr(save_conv_window):
-                            if is_qk_owner:
-                                inter_conv_window[iw_idx, i_t, qch, 0] = r_qhist[c, 0]
-                                inter_conv_window[iw_idx, i_t, qch, 1] = r_qhist[c, 1]
-                                inter_conv_window[iw_idx, i_t, qch, 2] = r_qhist[c, 2]
-                        silu = acc * (cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-acc, fastmath=fast_math)))
-                        r_pq[c] = cutlass.Float32(cutlass.BFloat16(silu))
-                    for c in cutlass.range_constexpr(vec_size):
-                        kch = k_base + vec_size * lane + c
-                        xk = cutlass.Float32(r_xk[ps][c])
-                        acc = r_kb[c]
-                        if cutlass.const_expr(weights_in_smem):
-                            acc = acc + r_khist[c, 0] * sWk[(lane, c, 0)]
-                            acc = acc + r_khist[c, 1] * sWk[(lane, c, 1)]
-                            acc = acc + r_khist[c, 2] * sWk[(lane, c, 2)]
-                            acc = acc + xk * sWk[(lane, c, 3)]
-                        else:
-                            acc = acc + r_khist[c, 0] * r_kw[c, 0]
-                            acc = acc + r_khist[c, 1] * r_kw[c, 1]
-                            acc = acc + r_khist[c, 2] * r_kw[c, 2]
-                            acc = acc + xk * r_kw[c, 3]
-                        r_khist[c, 0] = r_khist[c, 1]
-                        r_khist[c, 1] = r_khist[c, 2]
-                        r_khist[c, 2] = xk
-                        if cutlass.const_expr(save_conv_window):
-                            if is_qk_owner:
-                                inter_conv_window[iw_idx, i_t, kch, 0] = r_khist[c, 0]
-                                inter_conv_window[iw_idx, i_t, kch, 1] = r_khist[c, 1]
-                                inter_conv_window[iw_idx, i_t, kch, 2] = r_khist[c, 2]
-                        silu = acc * (cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-acc, fastmath=fast_math)))
-                        r_pk[c] = cutlass.Float32(cutlass.BFloat16(silu))
-                    if cutlass.const_expr(use_qk_l2norm):
-                        sum_q = cutlass.Float32(0.0)
-                        sum_k = cutlass.Float32(0.0)
-                        for c in cutlass.range_constexpr(vec_size):
-                            sum_q += r_pq[c] * r_pq[c]
-                            sum_k += r_pk[c] * r_pk[c]
-                        for off in [16, 8, 4, 2, 1]:
-                            sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=off, mask=-1, mask_and_clamp=31)
-                            sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=off, mask=-1, mask_and_clamp=31)
-                        inv_q = cute.rsqrt(sum_q + 1e-6, fastmath=fast_math) * scale
-                        inv_k = cute.rsqrt(sum_k + 1e-6, fastmath=fast_math)
-                        for c in cutlass.range_constexpr(vec_size):
-                            r_pq[c] = r_pq[c] * inv_q
-                            r_pk[c] = r_pk[c] * inv_k
-                    else:
-                        for c in cutlass.range_constexpr(vec_size):
-                            r_pq[c] = r_pq[c] * scale
-                    for c in cutlass.range_constexpr(vec_size):
-                        sQ[(ps, vec_size * lane + c)] = r_pq[c]
-                        sK[(ps, vec_size * lane + c)] = r_pk[c]
+                ps = i_t % 2
+                # wait for the consumer to free slot ps (first two writes are free)
+                if cutlass.const_expr(i_t >= 2):
+                    cute.arch.barrier(barrier_id=3 + ps, number_of_threads=64)
+                # prefetch token i_t+1's raw into the other buffer (loads overlap this
+                # token's conv/silu + the concurrent consumer recurrence)
+                if cutlass.const_expr(i_t + 1 < T):
+                    nps = (i_t + 1) % 2
+                    rown = i_n * T + i_t + 1
+                    xqn = cute.local_tile(mixed_qkv, (1, vec_size), (rown, q_base // vec_size + lane))
+                    cute.autovec_copy(xqn, r_xq[nps])
+                    xkn = cute.local_tile(mixed_qkv, (1, vec_size), (rown, k_base // vec_size + lane))
+                    cute.autovec_copy(xkn, r_xk[nps])
                     if lane < BV:
-                        vch = v_base + lane
-                        xv = cutlass.Float32(0.0)
-                        for vv in cutlass.range_constexpr(BV):
-                            xv = cutlass.Float32(r_xv[ps][vv]) if lane == vv else xv
-                        acc = r_vb[0]
-                        acc = acc + r_vhist[0] * r_vw[0]
-                        acc = acc + r_vhist[1] * r_vw[1]
-                        acc = acc + r_vhist[2] * r_vw[2]
-                        acc = acc + xv * r_vw[3]
-                        r_vhist[0] = r_vhist[1]
-                        r_vhist[1] = r_vhist[2]
-                        r_vhist[2] = xv
-                        if cutlass.const_expr(save_conv_window):
-                            inter_conv_window[iw_idx, i_t, vch, 0] = r_vhist[0]
-                            inter_conv_window[iw_idx, i_t, vch, 1] = r_vhist[1]
-                            inter_conv_window[iw_idx, i_t, vch, 2] = r_vhist[2]
-                        silu = acc * (cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-acc, fastmath=fast_math)))
-                        sV[(ps, lane)] = cutlass.Float32(cutlass.BFloat16(silu))
-                    # publish slot ps to the consumer
-                    cute.arch.barrier_arrive(barrier_id=1 + ps, number_of_threads=64)
+                        xvn = cute.coalesce(cute.local_tile(mixed_qkv, (1, 1), (rown, v_base + lane)))
+                        cute.autovec_copy(xvn, r_xv[nps])
+                for c in cutlass.range_constexpr(vec_size):
+                    qch = q_base + vec_size * lane + c
+                    xq = cutlass.Float32(r_xq[ps][c])
+                    acc = r_qb[c]
+                    if cutlass.const_expr(weights_in_smem):
+                        acc = acc + r_qhist[c, 0] * sWq[(lane, c, 0)]
+                        acc = acc + r_qhist[c, 1] * sWq[(lane, c, 1)]
+                        acc = acc + r_qhist[c, 2] * sWq[(lane, c, 2)]
+                        acc = acc + xq * sWq[(lane, c, 3)]
+                    else:
+                        acc = acc + r_qhist[c, 0] * r_qw[c, 0]
+                        acc = acc + r_qhist[c, 1] * r_qw[c, 1]
+                        acc = acc + r_qhist[c, 2] * r_qw[c, 2]
+                        acc = acc + xq * r_qw[c, 3]
+                    r_qhist[c, 0] = r_qhist[c, 1]
+                    r_qhist[c, 1] = r_qhist[c, 2]
+                    r_qhist[c, 2] = xq
+                    if cutlass.const_expr(save_conv_window):
+                        if is_qk_owner:
+                            inter_conv_window[iw_idx, i_t, qch, 0] = r_qhist[c, 0]
+                            inter_conv_window[iw_idx, i_t, qch, 1] = r_qhist[c, 1]
+                            inter_conv_window[iw_idx, i_t, qch, 2] = r_qhist[c, 2]
+                    silu = acc * (cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-acc, fastmath=fast_math)))
+                    r_pq[c] = cutlass.Float32(cutlass.BFloat16(silu))
+                for c in cutlass.range_constexpr(vec_size):
+                    kch = k_base + vec_size * lane + c
+                    xk = cutlass.Float32(r_xk[ps][c])
+                    acc = r_kb[c]
+                    if cutlass.const_expr(weights_in_smem):
+                        acc = acc + r_khist[c, 0] * sWk[(lane, c, 0)]
+                        acc = acc + r_khist[c, 1] * sWk[(lane, c, 1)]
+                        acc = acc + r_khist[c, 2] * sWk[(lane, c, 2)]
+                        acc = acc + xk * sWk[(lane, c, 3)]
+                    else:
+                        acc = acc + r_khist[c, 0] * r_kw[c, 0]
+                        acc = acc + r_khist[c, 1] * r_kw[c, 1]
+                        acc = acc + r_khist[c, 2] * r_kw[c, 2]
+                        acc = acc + xk * r_kw[c, 3]
+                    r_khist[c, 0] = r_khist[c, 1]
+                    r_khist[c, 1] = r_khist[c, 2]
+                    r_khist[c, 2] = xk
+                    if cutlass.const_expr(save_conv_window):
+                        if is_qk_owner:
+                            inter_conv_window[iw_idx, i_t, kch, 0] = r_khist[c, 0]
+                            inter_conv_window[iw_idx, i_t, kch, 1] = r_khist[c, 1]
+                            inter_conv_window[iw_idx, i_t, kch, 2] = r_khist[c, 2]
+                    silu = acc * (cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-acc, fastmath=fast_math)))
+                    r_pk[c] = cutlass.Float32(cutlass.BFloat16(silu))
+                if cutlass.const_expr(use_qk_l2norm):
+                    sum_q = cutlass.Float32(0.0)
+                    sum_k = cutlass.Float32(0.0)
+                    for c in cutlass.range_constexpr(vec_size):
+                        sum_q += r_pq[c] * r_pq[c]
+                        sum_k += r_pk[c] * r_pk[c]
+                    for off in [16, 8, 4, 2, 1]:
+                        sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=off, mask=-1, mask_and_clamp=31)
+                        sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=off, mask=-1, mask_and_clamp=31)
+                    inv_q = cute.rsqrt(sum_q + 1e-6, fastmath=fast_math) * scale
+                    inv_k = cute.rsqrt(sum_k + 1e-6, fastmath=fast_math)
+                    for c in cutlass.range_constexpr(vec_size):
+                        r_pq[c] = r_pq[c] * inv_q
+                        r_pk[c] = r_pk[c] * inv_k
+                else:
+                    for c in cutlass.range_constexpr(vec_size):
+                        r_pq[c] = r_pq[c] * scale
+                for c in cutlass.range_constexpr(vec_size):
+                    sQ[(ps, vec_size * lane + c)] = r_pq[c]
+                    sK[(ps, vec_size * lane + c)] = r_pk[c]
+                if lane < BV:
+                    vch = v_base + lane
+                    xv = cutlass.Float32(r_xv[ps][0])
+                    acc = r_vb[0]
+                    acc = acc + r_vhist[0] * r_vw[0]
+                    acc = acc + r_vhist[1] * r_vw[1]
+                    acc = acc + r_vhist[2] * r_vw[2]
+                    acc = acc + xv * r_vw[3]
+                    r_vhist[0] = r_vhist[1]
+                    r_vhist[1] = r_vhist[2]
+                    r_vhist[2] = xv
+                    if cutlass.const_expr(save_conv_window):
+                        inter_conv_window[iw_idx, i_t, vch, 0] = r_vhist[0]
+                        inter_conv_window[iw_idx, i_t, vch, 1] = r_vhist[1]
+                        inter_conv_window[iw_idx, i_t, vch, 2] = r_vhist[2]
+                    silu = acc * (cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-acc, fastmath=fast_math)))
+                    sV[(ps, lane)] = cutlass.Float32(cutlass.BFloat16(silu))
+                # publish slot ps to the consumer
+                cute.arch.barrier_arrive(barrier_id=1 + ps, number_of_threads=64)
             # producer epilogue: conv_state writeback (overlaps consumer drain)
             if is_qk_owner:
                 qh_out = cute.coalesce(cute.local_tile(conv_state, (1, vec_size, W - 1), (cs_idx, q_base // vec_size + lane, 0)))
@@ -825,8 +824,11 @@ def kda_conv_verify_large_batch_kernel(
             for off in [16, 8, 4, 2, 1]:
                 for vv in cutlass.range_constexpr(BVW):
                     r_red[vv] = r_red[vv] + cute.arch.shuffle_sync_bfly(r_red[vv], offset=off, mask=-1, mask_and_clamp=31)
+            ov = cutlass.Float32(0.0)
             for vv in cutlass.range_constexpr(BVW):
-                o[(i_n, i_t, i_hv, v_col0 + vv)] = cutlass.BFloat16(r_red[vv])
+                ov = r_red[vv] if lane == vv else ov
+            if lane < BVW:
+                o[(i_n, i_t, i_hv, v_col0 + lane)] = cutlass.BFloat16(ov)
             if cutlass.const_expr(cache_intermediate_states):
                 flat_idx = i_n * T * HV + i_t * HV + i_hv
                 for vv in cutlass.range_constexpr(BVW):
@@ -966,6 +968,9 @@ def _get_compiled_large_batch(N, T, H, HV, K, V, D, pool_size, lines, BVW, tile_
     return compiled
 
 
+_zero_conv_bias_cache: dict = {}
+
+
 def kda_conv_decode_mtp_verify(
     mixed_qkv: torch.Tensor,      # [N*T, D] bf16
     conv_weight: torch.Tensor,    # [D, W] fp32
@@ -1006,7 +1011,10 @@ def kda_conv_decode_mtp_verify(
     if variant == "auto":
         # small/medium -> small_batch (2-warp: conv producer overlaps recurrence consumer);
         # large -> large_batch (8-warp, shared q/k, bandwidth-bound). Per-tier bv/wis knobs below.
-        if work_units >= 512 and V % (NWARP * bvw) == 0:
+        tile_ok = (V % NWARP == 0) if bvw <= 0 else (V % (NWARP * bvw) == 0)
+        # T>=8: small_batch bv=16 tier (work>=64) spills regs (9-stage full unroll)
+        # -> crossover moves to work=64; T<=6 stays at 512.
+        if (work_units >= 512 or (T >= 8 and work_units >= 64)) and tile_ok:
             variant = "large_batch"
         else:
             variant = "small_batch"
@@ -1023,7 +1031,14 @@ def kda_conv_decode_mtp_verify(
         inter_states_flat = torch.empty(1, 1, 1, dtype=torch.float32, device=mixed_qkv.device)
 
     has_bias = conv_bias is not None
-    conv_bias_t = conv_bias if has_bias else torch.zeros(D, dtype=torch.float32, device=mixed_qkv.device)
+    if has_bias:
+        conv_bias_t = conv_bias
+    else:
+        _zb_key = (D, str(mixed_qkv.device))
+        conv_bias_t = _zero_conv_bias_cache.get(_zb_key)
+        if conv_bias_t is None:
+            conv_bias_t = torch.zeros(D, dtype=torch.float32, device=mixed_qkv.device)
+            _zero_conv_bias_cache[_zb_key] = conv_bias_t
 
     A_log = _normalize_A_log(A_log, HV)
     dt_bias = _normalize_dt_bias(dt_bias, HV, K)
