@@ -19,10 +19,10 @@ large_batch variant (large batch): 8 warps/CTA, grid = N*HV*(V//tile_v), tile_v=
   redundant q/k); each warp does BVW v-cols of recurrence+v-conv+snapshot. Low
   state regs (r_h=BVW*vec_size) -> high occupancy -> beats triton at large N.
 
-Shared q/k conv_state (read by every v-tile/v-head sharing a q/k head, rolled +
-written once) is written by the LAST CTA in the sharing group (largest bidx),
-so its epilogue write lands after every earlier-dispatched non-owner has read
-the history -> race-free, same rolled output as the reference.
+Shared q/k conv_state is read by every v-tile/v-head sharing a q/k head. Each
+CTA atomically announces that its read is complete; the last arrival writes the
+rolled q/k history and resets the per-stream counter. This avoids relying on
+unspecified CUDA block scheduling order while preserving single-kernel launch.
 
 Dispatch (variant="auto"): large_batch if N*HV>=512 or (T>=8 and N*HV>=64), else small_batch (graph-timed, L20X).
 """
@@ -33,7 +33,10 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.typing import Int32
+from cutlass.cutlass_dsl import T as _T
 
 from cula.ops.kda.decode.cute import (
     TILE_K,
@@ -41,7 +44,6 @@ from cula.ops.kda.decode.cute import (
     _normalize_A_log,
     _normalize_dt_bias,
     _normalize_state_indices,
-    _normalize_state_source,
     _prepare_output_tensor,
 )
 
@@ -54,6 +56,34 @@ WCONV = 4  # conv width (KDA short_conv_kernel_size)
 NWARP2 = 2
 
 
+@cutlass.dsl_user_op
+def _atomic_add_global_i32(ptr_i64, addend_i32, *, loc=None, ip=None):
+    """Atomically add to a global int32 counter and return its old value."""
+    result = _llvm.inline_asm(
+        _T.i32(),
+        [ptr_i64, addend_i32],
+        "atom.global.add.s32 $0, [$1], $2;",
+        "=r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@cute.jit
+def _announce_qk_read_complete(qk_arrival_counters, counter_idx, expected_arrivals, lane):
+    """Return a warp-uniform flag identifying the last CTA in a q/k group."""
+    arrival = Int32(0)
+    if lane == 0:
+        counter_ptr = qk_arrival_counters.iterator + counter_idx
+        arrival = _atomic_add_global_i32(counter_ptr.toint().ir_value(), Int32(1).ir_value())
+    arrival = cute.arch.shuffle_sync(arrival, 0, mask=-1, mask_and_clamp=31)
+    return arrival == expected_arrivals - 1
+
+
 @cute.kernel
 def kda_conv_verify_kernel(
     mixed_qkv: cute.Tensor,
@@ -61,6 +91,7 @@ def kda_conv_verify_kernel(
     conv_bias: cute.Tensor,
     conv_state: cute.Tensor,
     conv_state_indices: cute.Tensor,
+    qk_arrival_counters: cute.Tensor,
     inter_conv_window: cute.Tensor,
     inter_state_indices: cute.Tensor,
     h0_source: cute.Tensor,
@@ -327,12 +358,19 @@ def kda_conv_verify_kernel(
                     sV[(ps, lane)] = cutlass.Float32(cutlass.BFloat16(silu))
                 # publish slot ps to the consumer
                 cute.arch.barrier_arrive(barrier_id=1 + ps, number_of_threads=64)
-            # producer epilogue: conv_state writeback (overlaps consumer drain)
-            if is_qk_owner:
+            # Last-arrival writeback avoids depending on CUDA block scheduling order.
+            counter_idx = i_n * H + i_h
+            expected_arrivals = num_v_tiles * (HV // H)
+            is_last_qk_cta = _announce_qk_read_complete(
+                qk_arrival_counters, counter_idx, expected_arrivals, lane
+            )
+            if is_last_qk_cta:
                 qh_out = cute.coalesce(cute.local_tile(conv_state, (1, vec_size, W - 1), (cs_idx, q_base // vec_size + lane, 0)))
                 cute.autovec_copy(r_qhist, qh_out)
                 kh_out = cute.coalesce(cute.local_tile(conv_state, (1, vec_size, W - 1), (cs_idx, k_base // vec_size + lane, 0)))
                 cute.autovec_copy(r_khist, kh_out)
+                if lane == 0:
+                    qk_arrival_counters[counter_idx] = Int32(0)
             if lane < BV:
                 vch = v_base + lane
                 vh_out = cute.local_tile(conv_state, (1, 1, W - 1), (cs_idx, vch, 0))
@@ -424,6 +462,7 @@ def run_kda_conv_verify_kernel(
     conv_bias: cute.Tensor,
     conv_state: cute.Tensor,
     conv_state_indices: cute.Tensor,
+    qk_arrival_counters: cute.Tensor,
     inter_conv_window: cute.Tensor,
     inter_state_indices: cute.Tensor,
     h0_source: cute.Tensor,
@@ -463,7 +502,7 @@ def run_kda_conv_verify_kernel(
     if cutlass.const_expr(weights_in_smem):
         smem_bytes = smem_bytes + 2 * 32 * (vec_size * W + 1) * 4  # sWq+sWk lane-major
     kda_conv_verify_kernel(
-        mixed_qkv, conv_weight, conv_bias, conv_state, conv_state_indices,
+        mixed_qkv, conv_weight, conv_bias, conv_state, conv_state_indices, qk_arrival_counters,
         inter_conv_window, inter_state_indices, h0_source, A_log, a, dt_bias, b, o,
         intermediate_states, h0_indices, vec_size, num_v_tiles, BV, softplus_beta,
         softplus_threshold, scale, HV, T, H, K, V, W, use_qk_l2norm,
@@ -491,6 +530,7 @@ def _get_compiled(N, T, H, HV, K, V, D, pool_size, lines, BV, scale, use_qk_l2no
     conv_bias = torch.zeros(D, dtype=torch.float32, device=dev)
     conv_state = torch.zeros(lines, D, WCONV - 1, dtype=torch.float32, device=dev)
     conv_state_indices = torch.zeros(N, dtype=torch.int32, device=dev)
+    qk_arrival_counters = torch.zeros(N * H, dtype=torch.int32, device=dev)
     inter_conv_window = torch.zeros(lines, T, D, WCONV - 1, dtype=torch.float32, device=dev)
     inter_state_indices = torch.zeros(N, dtype=torch.int32, device=dev)
     h0_source = torch.zeros(pool_size * HV, V, K, dtype=torch.float32, device=dev)
@@ -518,7 +558,7 @@ def _get_compiled(N, T, H, HV, K, V, D, pool_size, lines, BV, scale, use_qk_l2no
     compiled = cute.compile(
         run_kda_conv_verify_kernel,
         dl(mixed_qkv, True), dl(conv_weight), dl(conv_bias), dl(conv_state, True),
-        dli(conv_state_indices), dl(inter_conv_window, True), dli(inter_state_indices),
+        dli(conv_state_indices), dli(qk_arrival_counters), dl(inter_conv_window, True), dli(inter_state_indices),
         dl(h0_source, True), dl(A_log), dl(a, True), dl(dt_bias), dl(b, True), dl(o, True),
         dl(inter_states, True) if cache_intermediate_states else dl(inter_states), dli(h0_indices),
         vec_size=VEC_SIZE, BV=BV, softplus_beta=softplus_beta,
@@ -544,6 +584,7 @@ def kda_conv_verify_large_batch_kernel(
     conv_bias: cute.Tensor,
     conv_state: cute.Tensor,
     conv_state_indices: cute.Tensor,
+    qk_arrival_counters: cute.Tensor,
     inter_conv_window: cute.Tensor,
     inter_state_indices: cute.Tensor,
     h0_source: cute.Tensor,
@@ -591,8 +632,8 @@ def kda_conv_verify_large_batch_kernel(
     cs_idx = conv_state_indices[i_n]
     cache_idx = h0_indices[i_n]
     iw_idx = inter_state_indices[i_n]
-    # owner = LAST CTA (largest bidx) sharing this q/k head: its epilogue conv_state
-    # write lands after every non-owner read the history (bidx ~ dispatch order) -> race-free.
+    # A fixed owner writes q/k window snapshots because they are output-only. The
+    # mutable conv_state writeback instead uses an atomic last-arrival protocol.
     is_qk_owner = (i_v == num_v_tiles - 1) and (i_hv % (HV // H) == (HV // H) - 1)
     r_exp_A = cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=fast_math)
 
@@ -837,22 +878,30 @@ def kda_conv_verify_large_batch_kernel(
                     inter_tile = cute.local_tile(intermediate_states, (1, 1, vec_size), (flat_idx, v_col0 + vv, lane))
                     cute.autovec_copy(r_h4, inter_tile)
 
-        # consumer epilogue: conv_state writeback at kernel end (race-free). q/k by
-        # warp-0 owner from mixed_qkv (rolled = last W-1 raw inputs); v by each warp's lanes.
-        if is_qk_owner and warp == 0:
-            # rolled window = last W-1 abs positions p=T-(W-1)+w: p>=0 from mixed_qkv,
-            # p<0 (only T<W-1) from conv_state col p+(W-1); read before overwrite (w ascending).
-            for c in cutlass.range_constexpr(vec_size):
-                qch = q_base + vec_size * lane + c
-                kch = k_base + vec_size * lane + c
-                for w in cutlass.range_constexpr(W - 1):
-                    p = T - (W - 1) + w
-                    if cutlass.const_expr(p >= 0):
-                        conv_state[cs_idx, qch, w] = cutlass.Float32(mixed_qkv[i_n * T + p, qch])
-                        conv_state[cs_idx, kch, w] = cutlass.Float32(mixed_qkv[i_n * T + p, kch])
-                    else:
-                        conv_state[cs_idx, qch, w] = cutlass.Float32(conv_state[cs_idx, qch, p + (W - 1)])
-                        conv_state[cs_idx, kch, w] = cutlass.Float32(conv_state[cs_idx, kch, p + (W - 1)])
+        # One warp per CTA announces completion after all q/k history reads. The
+        # actual last CTA writes the rolled history, independent of block order.
+        if warp == 0:
+            counter_idx = i_n * H + i_h
+            expected_arrivals = num_v_tiles * (HV // H)
+            is_last_qk_cta = _announce_qk_read_complete(
+                qk_arrival_counters, counter_idx, expected_arrivals, lane
+            )
+            if is_last_qk_cta:
+                # rolled window = last W-1 abs positions p=T-(W-1)+w: p>=0 from mixed_qkv,
+                # p<0 (only T<W-1) from conv_state col p+(W-1); read before overwrite.
+                for c in cutlass.range_constexpr(vec_size):
+                    qch = q_base + vec_size * lane + c
+                    kch = k_base + vec_size * lane + c
+                    for w in cutlass.range_constexpr(W - 1):
+                        p = T - (W - 1) + w
+                        if cutlass.const_expr(p >= 0):
+                            conv_state[cs_idx, qch, w] = cutlass.Float32(mixed_qkv[i_n * T + p, qch])
+                            conv_state[cs_idx, kch, w] = cutlass.Float32(mixed_qkv[i_n * T + p, kch])
+                        else:
+                            conv_state[cs_idx, qch, w] = cutlass.Float32(conv_state[cs_idx, qch, p + (W - 1)])
+                            conv_state[cs_idx, kch, w] = cutlass.Float32(conv_state[cs_idx, kch, p + (W - 1)])
+                if lane == 0:
+                    qk_arrival_counters[counter_idx] = Int32(0)
         if lane < BVW:
             vch = 2 * H * K + i_hv * V + v_col0 + lane
             conv_state[cs_idx, vch, 0] = r_vhist[0]
@@ -868,7 +917,7 @@ def kda_conv_verify_large_batch_kernel(
 
 @cute.jit
 def run_kda_conv_verify_large_batch_kernel(
-    mixed_qkv, conv_weight, conv_bias, conv_state, conv_state_indices,
+    mixed_qkv, conv_weight, conv_bias, conv_state, conv_state_indices, qk_arrival_counters,
     inter_conv_window, inter_state_indices, h0_source, A_log, a, dt_bias, b, o,
     intermediate_states, h0_indices,
     vec_size: cutlass.Constexpr[int],
@@ -898,7 +947,7 @@ def run_kda_conv_verify_large_batch_kernel(
     grid_size = n_indices * HV * num_v_tiles
     smem_bytes = 3 * (4 * T * K) + 4 * T + 128  # sQ+sK+sG [T,K] fp32 + sBeta + slack
     kda_conv_verify_large_batch_kernel(
-        mixed_qkv, conv_weight, conv_bias, conv_state, conv_state_indices,
+        mixed_qkv, conv_weight, conv_bias, conv_state, conv_state_indices, qk_arrival_counters,
         inter_conv_window, inter_state_indices, h0_source, A_log, a, dt_bias, b, o,
         intermediate_states, h0_indices,
         vec_size, num_v_tiles, BVW, tile_v, softplus_beta, softplus_threshold, scale,
@@ -925,6 +974,7 @@ def _get_compiled_large_batch(N, T, H, HV, K, V, D, pool_size, lines, BVW, tile_
     conv_bias = torch.zeros(D, dtype=torch.float32, device=dev)
     conv_state = torch.zeros(lines, D, WCONV - 1, dtype=torch.float32, device=dev)
     conv_state_indices = torch.zeros(N, dtype=torch.int32, device=dev)
+    qk_arrival_counters = torch.zeros(N * H, dtype=torch.int32, device=dev)
     inter_conv_window = torch.zeros(lines, T, D, WCONV - 1, dtype=torch.float32, device=dev)
     inter_state_indices = torch.zeros(N, dtype=torch.int32, device=dev)
     h0_source = torch.zeros(pool_size * HV, V, K, dtype=torch.float32, device=dev)
@@ -952,7 +1002,7 @@ def _get_compiled_large_batch(N, T, H, HV, K, V, D, pool_size, lines, BVW, tile_
     compiled = cute.compile(
         run_kda_conv_verify_large_batch_kernel,
         dl(mixed_qkv, True), dl(conv_weight), dl(conv_bias), dl(conv_state, True),
-        dli(conv_state_indices), dl(inter_conv_window, True), dli(inter_state_indices),
+        dli(conv_state_indices), dli(qk_arrival_counters), dl(inter_conv_window, True), dli(inter_state_indices),
         dl(h0_source, True), dl(A_log), dl(a, True), dl(dt_bias), dl(b, True), dl(o, True),
         dl(inter_states, True) if cache_intermediate_states else dl(inter_states), dli(h0_indices),
         vec_size=VEC_SIZE, BVW=BVW, tile_v=tile_v, softplus_beta=softplus_beta,
@@ -969,6 +1019,18 @@ def _get_compiled_large_batch(N, T, H, HV, K, V, D, pool_size, lines, BVW, tile_
 
 
 _zero_conv_bias_cache: dict = {}
+_qk_arrival_counter_cache: dict = {}
+
+
+def _get_qk_arrival_counters(device: torch.device, N: int, H: int) -> torch.Tensor:
+    """Return zero-reset completion counters isolated by CUDA stream."""
+    stream_id = int(torch.cuda.current_stream(device=device).cuda_stream)
+    key = (str(device), stream_id, N, H)
+    counters = _qk_arrival_counter_cache.get(key)
+    if counters is None:
+        counters = torch.zeros(N * H, dtype=torch.int32, device=device)
+        _qk_arrival_counter_cache[key] = counters
+    return counters
 
 
 def kda_conv_decode_mtp_verify(
@@ -1042,8 +1104,19 @@ def kda_conv_decode_mtp_verify(
 
     A_log = _normalize_A_log(A_log, HV)
     dt_bias = _normalize_dt_bias(dt_bias, HV, K)
-    cache_indices = cache_indices.to(torch.int32)
-    intermediate_state_indices = intermediate_state_indices.to(torch.int32)
+    conv_state_indices = _normalize_state_indices(
+        conv_state_indices, N=N, pool_size=lines, device=mixed_qkv.device
+    )
+    cache_indices = _normalize_state_indices(
+        cache_indices, N=N, pool_size=slots, device=mixed_qkv.device
+    )
+    intermediate_state_indices = _normalize_state_indices(
+        intermediate_state_indices,
+        N=N,
+        pool_size=intermediate_conv_window.shape[0],
+        device=mixed_qkv.device,
+    )
+    qk_arrival_counters = _get_qk_arrival_counters(mixed_qkv.device, N, H)
     stream = _get_cached_stream(mixed_qkv.device)
 
     lb_val = 0.0 if lower_bound is None else float(lower_bound)
@@ -1093,7 +1166,8 @@ def kda_conv_decode_mtp_verify(
         raise ValueError(f"unknown variant {variant!r}; supported: 'auto', 'small_batch', 'large_batch'")
 
     compiled(
-        mixed_qkv, conv_weight, conv_bias_t, conv_state, cache_indices,
+        mixed_qkv, conv_weight, conv_bias_t, conv_state, conv_state_indices,
+        qk_arrival_counters,
         intermediate_conv_window, intermediate_state_indices, h0_source, A_log, a,
         dt_bias, b, o, inter_states_flat, cache_indices, stream,
     )

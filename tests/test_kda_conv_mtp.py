@@ -54,17 +54,19 @@ def _torch_reference(inp, N, T, H, HV, K, V, scale, lower_bound,
     dt_bias = inp["dt_bias"]
     ssm0 = inp["ssm_states"].float()
     cidx = inp["cache_indices"]
+    conv_cidx = inp.get("conv_state_indices", cidx)
 
     qk_dim = H * K
     o = torch.zeros(N, T, HV, V, device=dev, dtype=torch.float32)
     ssm_snap = torch.zeros(N, T, HV, V, K, device=dev, dtype=torch.float32)
     win_snap = torch.zeros(N, T, W - 1, D, device=dev, dtype=torch.float32)
-    conv_state_out = torch.zeros_like(hist0)
+    conv_state_out = hist0.clone()
 
     for n in range(N):
         slot = int(cidx[n].item())
+        conv_slot = int(conv_cidx[n].item())
         x = mixed[n * T:(n + 1) * T]
-        hist = hist0[slot]
+        hist = hist0[conv_slot]
         xfull = torch.cat([hist, x], dim=0)  # [W-1+T, D]
 
         y = torch.zeros(T, D, device=dev, dtype=torch.float32)
@@ -75,7 +77,7 @@ def _torch_reference(inp, N, T, H, HV, K, V, scale, lower_bound,
             y[t] = torch.nn.functional.silu(acc)
             win_snap[n, t] = xfull[t + 1:t + 1 + (W - 1)]
         y = y.to(torch.bfloat16).float()  # bf16 round-trip
-        conv_state_out[slot] = xfull[-(W - 1):]
+        conv_state_out[conv_slot] = xfull[-(W - 1):]
 
         qy = y[:, 0:qk_dim].view(T, H, K)
         ky = y[:, qk_dim:2 * qk_dim].view(T, H, K)
@@ -110,8 +112,9 @@ def _torch_reference(inp, N, T, H, HV, K, V, scale, lower_bound,
     return dict(o=o, ssm_snap=ssm_snap, win_snap=win_snap, conv_state_out=conv_state_out)
 
 
-def _make_inputs(N, T, H, HV, K, V, gate, seed, device="cuda"):
+def _make_inputs(N, T, H, HV, K, V, gate, seed, device="cuda", pool_size=None):
     torch.manual_seed(seed)
+    pool_size = N if pool_size is None else pool_size
     D = 2 * H * K + HV * V
     f32, bf16 = torch.float32, torch.bfloat16
     return dict(
@@ -119,30 +122,53 @@ def _make_inputs(N, T, H, HV, K, V, gate, seed, device="cuda"):
         mixed_qkv=(torch.randn(N * T, D, device=device, dtype=f32) * 0.5).to(bf16),
         conv_weight=torch.randn(D, W, device=device, dtype=f32) * 0.3,
         conv_bias=torch.randn(D, device=device, dtype=f32) * 0.1,
-        conv_state_native=torch.randn(N, W - 1, D, device=device, dtype=f32) * 0.3,
+        conv_state_native=torch.randn(pool_size, W - 1, D, device=device, dtype=f32) * 0.3,
         a=(torch.randn(N, T, HV, K, device=device, dtype=f32) * 0.5).to(bf16),
         b=(torch.randn(N, T, HV, device=device, dtype=f32) * 0.5).to(bf16),
         A_log=-torch.rand(HV, device=device, dtype=f32) * 2.0,
         dt_bias=torch.randn(HV, K, device=device, dtype=f32) * 0.1,
-        ssm_states=torch.randn(N, HV, V, K, device=device, dtype=f32) * 0.01,
+        ssm_states=torch.randn(pool_size, HV, V, K, device=device, dtype=f32) * 0.01,
+        conv_state_indices=torch.arange(N, device=device, dtype=torch.int32),
         cache_indices=torch.arange(N, device=device, dtype=torch.int32),
+        intermediate_state_indices=torch.arange(N, device=device, dtype=torch.int32),
     )
 
 
-def _run_cula(inp, N, T, H, HV, K, V, scale, lower_bound, variant):
+def _allocate_run_buffers(inp, N, T, H, HV, K, V):
     dev = inp["mixed_qkv"].device
     D = inp["D"]
-    conv_state = inp["conv_state_native"].permute(0, 2, 1).contiguous()  # [lines, D, W-1]
-    conv_window = torch.zeros(N, T, D, W - 1, device=dev, dtype=torch.float32)
-    inter_states = torch.zeros(N, T, HV, V, K, device=dev, dtype=torch.float32)
+    intermediate_pool_size = inp.get("intermediate_pool_size", N)
+    return dict(
+        conv_state=inp["conv_state_native"].permute(0, 2, 1).contiguous(),
+        conv_window=torch.zeros(
+            intermediate_pool_size, T, D, W - 1, device=dev, dtype=torch.float32
+        ),
+        inter_states=torch.zeros(N, T, HV, V, K, device=dev, dtype=torch.float32),
+        ssm_states=inp["ssm_states"].clone(),
+        o=torch.empty(N, T, HV, V, device=dev, dtype=torch.bfloat16),
+    )
+
+
+def _run_cula(inp, N, T, H, HV, K, V, scale, lower_bound, variant, buffers=None):
+    dev = inp["mixed_qkv"].device
+    buffers = _allocate_run_buffers(inp, N, T, H, HV, K, V) if buffers is None else buffers
+    conv_state = buffers["conv_state"]
+    conv_window = buffers["conv_window"]
+    inter_states = buffers["inter_states"]
     idx = inp["cache_indices"]
+    conv_idx = inp.get("conv_state_indices", idx)
+    intermediate_idx = inp.get(
+        "intermediate_state_indices",
+        torch.arange(N, device=dev, dtype=torch.int32),
+    )
     o = kda_conv_decode_mtp_verify(
         mixed_qkv=inp["mixed_qkv"], conv_weight=inp["conv_weight"], conv_bias=inp["conv_bias"],
-        conv_state=conv_state, conv_state_indices=idx, intermediate_conv_window=conv_window,
-        intermediate_state_indices=idx, a=inp["a"], b=inp["b"], A_log=inp["A_log"],
-        dt_bias=inp["dt_bias"], ssm_states=inp["ssm_states"].clone(), cache_indices=idx,
+        conv_state=conv_state, conv_state_indices=conv_idx, intermediate_conv_window=conv_window,
+        intermediate_state_indices=intermediate_idx, a=inp["a"], b=inp["b"], A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"], ssm_states=buffers["ssm_states"], cache_indices=idx,
         intermediate_states_buffer=inter_states, scale=scale, T=T, num_q_heads=H,
         num_v_heads=HV, head_k_dim=K, head_v_dim=V, lower_bound=lower_bound, variant=variant,
+        out=buffers["o"],
     )
     return dict(o=o.view(N, T, HV, V), conv_state=conv_state, conv_window=conv_window,
                 inter_states=inter_states)
@@ -154,6 +180,19 @@ def _assert_close(name, ref, actual, atol, rtol):
     print(f"    [{name}] max_diff={max_diff:.6e} (atol={atol}, rtol={rtol})")
     assert torch.allclose(ref.float(), actual.float(), atol=atol, rtol=rtol), (
         f"{name}: max_diff={max_diff:.6e}")
+
+
+def _assert_result(prefix, ref, act, intermediate_idx=None):
+    conv_window = act["conv_window"]
+    if intermediate_idx is not None:
+        conv_window = conv_window[intermediate_idx.long()]
+    _assert_close(f"{prefix}_conv_state", ref["conv_state_out"],
+                  act["conv_state"].transpose(-1, -2), 0.0, 0.0)
+    _assert_close(f"{prefix}_conv_window", ref["win_snap"],
+                  conv_window.transpose(-1, -2), 0.0, 0.0)
+    _assert_close(f"{prefix}_o", ref["o"], act["o"], 3e-2, 2e-2)
+    _assert_close(f"{prefix}_inter_ssm", ref["ssm_snap"],
+                  act["inter_states"], 5e-2, 3e-2)
 
 
 def _check(N, T, H, HV, variant, gate, seed=0):
@@ -197,6 +236,105 @@ def test_conv_mtp_gva(variant, gate):
 
 
 # --------------------------------------------------------------------------- #
+# Conv and SSM pools may use distinct request-to-slot mappings.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("variant", ["small_batch", "large_batch"])
+def test_conv_mtp_distinct_state_indices(variant):
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K ** -0.5
+    inp = _make_inputs(N, T, H, HV, K, V, "safe", seed=11, pool_size=7)
+    inp["conv_state_indices"] = torch.tensor(
+        [6, -1, 2, -1, 5, -1, 1], device="cuda", dtype=torch.int64
+    )[::2]
+    inp["cache_indices"] = torch.tensor(
+        [0, -1, 4, -1, 3, -1, 6], device="cuda", dtype=torch.int64
+    )[::2]
+    inp["intermediate_state_indices"] = torch.tensor(
+        [3, -1, 6, -1, 1, -1, 5], device="cuda", dtype=torch.int64
+    )[::2]
+    inp["intermediate_pool_size"] = 7
+
+    ref = _torch_reference(inp, N, T, H, HV, K, V, scale, -5.0)
+    act = _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, variant)
+    _assert_result("distinct_idx", ref, act, inp["intermediate_state_indices"])
+
+
+# --------------------------------------------------------------------------- #
+# Stream-local counters must support concurrent launches.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("variant", ["small_batch", "large_batch"])
+def test_conv_mtp_multistream(variant):
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K ** -0.5
+    warm = _make_inputs(N, T, H, HV, K, V, "safe", seed=20)
+    _run_cula(warm, N, T, H, HV, K, V, scale, -5.0, variant)
+    inputs = [_make_inputs(N, T, H, HV, K, V, "safe", seed=21 + i) for i in range(2)]
+    refs = [_torch_reference(inp, N, T, H, HV, K, V, scale, -5.0) for inp in inputs]
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    acts = []
+    for stream, inp in zip(streams, inputs):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            acts.append(_run_cula(inp, N, T, H, HV, K, V, scale, -5.0, variant))
+    torch.cuda.synchronize()
+    for i, (ref, act) in enumerate(zip(refs, acts)):
+        _assert_result(f"multistream_{i}", ref, act)
+
+
+# --------------------------------------------------------------------------- #
+# Captured launches must reset counters on every replay.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("variant", ["small_batch", "large_batch"])
+def test_conv_mtp_cuda_graph_replay(variant):
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K ** -0.5
+    inp = _make_inputs(N, T, H, HV, K, V, "safe", seed=30)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, variant)
+    stream.synchronize()
+
+    buffers = _allocate_run_buffers(inp, N, T, H, HV, K, V)
+    initial_conv_state = buffers["conv_state"].clone()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        buffers["conv_state"].copy_(initial_conv_state)
+        act = _run_cula(
+            inp, N, T, H, HV, K, V, scale, -5.0, variant, buffers=buffers
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    first = {name: tensor.clone() for name, tensor in act.items()}
+    graph.replay()
+    torch.cuda.synchronize()
+    for name, tensor in act.items():
+        assert torch.equal(first[name], tensor), f"{name} changed across graph replays"
+
+
+# --------------------------------------------------------------------------- #
+# Consecutive segments must consume the previous rolled conv state.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("variant", ["small_batch", "large_batch"])
+def test_conv_mtp_repeated_chain(variant):
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K ** -0.5
+    inp = _make_inputs(N, T, H, HV, K, V, "safe", seed=40)
+    first_ref = _torch_reference(inp, N, T, H, HV, K, V, scale, -5.0)
+    buffers = _allocate_run_buffers(inp, N, T, H, HV, K, V)
+    _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, variant, buffers=buffers)
+
+    next_inp = dict(inp)
+    next_inp["conv_state_native"] = first_ref["conv_state_out"]
+    next_ref = _torch_reference(next_inp, N, T, H, HV, K, V, scale, -5.0)
+    act = _run_cula(
+        inp, N, T, H, HV, K, V, scale, -5.0, variant, buffers=buffers
+    )
+    _assert_result("repeated_chain", next_ref, act)
+
+
+# --------------------------------------------------------------------------- #
 # small_batch and large_batch must agree (same math, different threading).
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("H,HV", [(8, 8), (32, 32)], ids=["h8", "h32"])
@@ -228,9 +366,17 @@ def test_conv_mtp_determinism(variant, H, HV):
     N, T, K, V = 16, 4, 128, 128
     scale = K ** -0.5
     inp = _make_inputs(N, T, H, HV, K, V, "safe", seed=7)
-    ref = _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, variant)
-    for r in range(int(os.environ.get("KDA_DET_ITERS", "6"))):
-        act = _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, variant)
+    buffers = _allocate_run_buffers(inp, N, T, H, HV, K, V)
+    initial_conv_state = buffers["conv_state"].clone()
+    ref = _run_cula(
+        inp, N, T, H, HV, K, V, scale, -5.0, variant, buffers=buffers
+    )
+    ref = {name: tensor.clone() for name, tensor in ref.items()}
+    for r in range(int(os.environ.get("KDA_DET_ITERS", "100000"))):
+        buffers["conv_state"].copy_(initial_conv_state)
+        act = _run_cula(
+            inp, N, T, H, HV, K, V, scale, -5.0, variant, buffers=buffers
+        )
         for name in ("o", "inter_states", "conv_state", "conv_window"):
             assert torch.equal(ref[name], act[name]), f"{name} not deterministic (run {r})"
 

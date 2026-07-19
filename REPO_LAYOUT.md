@@ -38,6 +38,7 @@ cuLA/
 │       │   │   ├── cute.py       #     kda_decode / fused_sigmoid_gating_delta_rule_update (CuTe DSL)
 │       │   │   ├── mtp.py        #     kda_decode_mtp recurrent / recurrent_ws MTP verify (CuTe DSL)
 │       │   │   ├── mtp_kvbuffer.py #   KVBuffer chunkwise MTP verify (shuffle / tensor_core) + flush
+│       │   │   ├── mtp_conv.py   #     fused causal-conv1d + KDA MTP verify (CuTe DSL)
 │       │   │   └── reference_fla.py
 │       │   └── experimental/sm100_fused/   # [exp] unwired fully-fused
 │       │       ├── kda_fully_fused_wip.py   #   KDAChunkwise (~6k lines)
