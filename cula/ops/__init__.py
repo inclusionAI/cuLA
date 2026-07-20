@@ -13,6 +13,7 @@
 # limitations under the License.
 
 __all__ = [
+    "chunk_kda_bwd_wy_dqkg_fused",
     "kda_decode",
     "kda_decode_mtp",
     "kda_decode_mtp_recurrent",
@@ -22,6 +23,10 @@ __all__ = [
 ]
 
 _LAZY = {
+    "chunk_kda_bwd_wy_dqkg_fused": (
+        "cula.ops.kda.sm90.bwd_wy_dqkg",
+        "chunk_kda_bwd_wy_dqkg_fused",
+    ),
     "kda_decode": ("cula.ops.kda.decode.cute", "kda_decode"),
     "kda_decode_mtp": ("cula.ops.kda.decode.mtp", "kda_decode_mtp"),
     "kda_decode_mtp_recurrent": ("cula.ops.kda.decode.mtp", "kda_decode_mtp_recurrent"),

@@ -143,6 +143,9 @@ python benchmarks/generate_benchmark_md.py
 
 # Hopper (SM90)
 python benchmarks/generate_benchmark_hopper_md.py
+
+# Hopper fused WY-DqKG backward vs FLA v0.5.0
+python benchmarks/bench_kda_bwd_wy_dqkg_sm90.py --mode both --heads 32
 ```
 
 ## Tests
