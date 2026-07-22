@@ -65,6 +65,35 @@ CULA_BUILD_ALL_ARCHS=1 python -m build --wheel --no-isolation
 
 ## Quick Start
 
+### Lightning Attention Prefill — Hopper (SM90)
+
+```python
+import torch
+from cula.lightning import lightning_attn_fwd
+
+B, T, H, D = 2, 4096, 64, 128
+q = torch.randn(B, T, H, D, device="cuda", dtype=torch.bfloat16)
+k = torch.randn_like(q)
+v = torch.randn_like(q)
+decay = torch.linspace(0.0, 0.04, H, device="cuda", dtype=torch.float32)
+
+output, final_state = lightning_attn_fwd(
+    q,
+    k,
+    v,
+    decay,
+    scale=D**-0.5,
+    output_final_state=True,
+)
+```
+
+The SM90 CuTe DSL backend supports fixed and packed variable-length prefill,
+optional recurrent state, GVA head mapping, and persistent packed scheduling.
+It uses BF16 Q/K/V, FP32 decay/state, head dimension 128, and chunk size 64.
+See [the SM90 Lightning prefill pipeline](docs/lightning_attn_sm90.md) for the
+warp-group roles, WGMMA dataflow, pipeline stages, recurrent-state placement,
+and fixed/packed scheduling modes.
+
 ### KDA (Kimi Delta Attention) — Blackwell (SM10X)
 
 Just change the import:
@@ -156,8 +185,10 @@ python -m pytest tests/test_kda_sm100_chunk_vs_naive.py -v
 python -m pytest tests/test_kda_fused_fwd.py -v
 # Tests for the SM90 CuTeDSL two-kernel prefill + intracard CP (vs FLA)
 python -m pytest tests/test_kda_sm90_prefill_vs_fla.py tests/test_kda_sm90_intracard_cp.py -v
-# Tests for Lightning Attention prefill
+# Tests for Lightning Attention prefill on SM100
 python tests/test_lightning_sm100_prefill.py
+# Tests for the SM90 Lightning public dispatch, semantics, and kernel structure
+python -m pytest tests/test_lightning_attn_prefill_dispatch.py tests/test_lightning_attn_prefill_sm90.py -v
 # Tests for Lightning Attention decode
 python -m pytest tests/test_lightning_decode.py -v
 
@@ -219,7 +250,7 @@ See [REPO_LAYOUT.md](REPO_LAYOUT.md) for the full directory structure and a summ
 
 **Inference**
 
-* [x] Lightning prefill kernel (SM10X)
+* [x] Lightning prefill kernel (SM90 & SM10X)
 
 * [x] Lightning decode kernel (SM90 & SM10X)
 

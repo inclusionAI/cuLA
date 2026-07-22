@@ -44,6 +44,13 @@ cuLA/
 │       │   ├── decode/                 # Single-token, packed, and MTP decode kernels
 │       │   └── experimental/sm100_fused/ # [exp] unwired fully-fused SM100 prototype
 │       ├── lightning/                  # [non-KDA] Lightning prefill/decode kernels
+│       │   ├── prefill.py              # Public SM90/SM100 architecture dispatch
+│       │   ├── prefill_sm90.py         # SM90 validation, compile cache, and TVM-FFI launch
+│       │   ├── prefill_sm100.py        # SM100 prefill implementation
+│       │   ├── decode.py               # Linear Attention decode
+│       │   └── sm90/                   # SM90 CuTe DSL implementation
+│       │       ├── schedule.py         # Schedule constants and WGMMA fragment helpers
+│       │       └── prefill_kernel.py   # Fixed and packed recurrent prefill kernel
 │       └── experimental/               # [non-KDA] unwired prototypes
 │
 ├── csrc/                               # CUDA C++ / CUTLASS kernels for SM90 and SM100/SM103
@@ -76,5 +83,5 @@ cuLA/
 | `cula/ops/kda/` | Python (CuTeDSL) | CuTeDSL KDA kernels organized into SM100 modular kernels, SM90 FlashKDA K1+K2 and intracard CP, decode, and experimental code. The fully-fused SM90 implementation lives under `csrc/`, not here. |
 | `csrc/kda/{sm90,sm100}/` | CUDA C++ | Hopper fully-fused prefill and Blackwell modular chunk kernels. |
 | `csrc/api/` · `cula/cudac.py` | CUDA C++ / Python | Per-architecture `_cudac_sm90` and `_cudac_sm100` extensions, exposed lazily through the `cula.cudac` compatibility proxy. |
-| `cula/ops/lightning/` · `cula/ops/experimental/` | Python (CuTeDSL) | `[non-KDA]` Lightning/linear-attention kernels and prototypes. |
+| `cula/ops/lightning/` · `cula/ops/experimental/` | Python (CuTeDSL) | `[non-KDA]` Lightning/linear-attention kernels and prototypes. Lightning prefill dispatches to the SM90 or SM100 backend from Q's device capability. |
 | `cula/ops/{inv,ptx}.py` · `cula/ops/sm100/ptx.py` | Python | Shared low-level helpers used across operators. |

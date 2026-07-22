@@ -16,7 +16,7 @@
 """
 generate_benchmark_md.py — Run existing bench_* scripts and generate BENCHMARK.md
 
-Reuses bench_kda.py and bench_lightning_attn.py to collect results,
+Reuses bench_kda.py and bench_lightning_attn_prefill.py to collect results,
 then formats them as BENCHMARK.md.
 
 Usage:
@@ -57,13 +57,13 @@ from benchmarks.bench_kda import (  # noqa: E402
 from benchmarks.bench_la_decode_vs_fla import (  # noqa: E402
     main as la_decode_main,
 )
-from benchmarks.bench_lightning_attn import (  # noqa: E402
+from benchmarks.bench_lightning_attn_prefill import (  # noqa: E402
     D_DEFAULT as LA_D,
 )
-from benchmarks.bench_lightning_attn import (  # noqa: E402
+from benchmarks.bench_lightning_attn_prefill import (  # noqa: E402
     _valid,
 )
-from benchmarks.bench_lightning_attn import (  # noqa: E402
+from benchmarks.bench_lightning_attn_prefill import (  # noqa: E402
     run_benchmark_suite as la_run_suite,
 )
 from benchmarks.utils import get_env_info  # noqa: E402
@@ -121,8 +121,8 @@ def run_la_decode_benchmarks():
 
 
 def run_lightning_attn_benchmarks():
-    """Run bench_lightning_attn.run_benchmark_suite() with programmatic args."""
-    print("\n>>> Running Lightning Attention benchmarks (via bench_lightning_attn)...")
+    """Run the Lightning Attention prefill benchmark with programmatic args."""
+    print("\n>>> Running Lightning Attention prefill benchmarks...")
     args = SimpleNamespace(
         modes=["no_state", "varlen"],
         batch_sizes=[1, 2],
@@ -243,7 +243,7 @@ def format_benchmark_md(env, kda_fixed, kda_varlen, la_standard, la_varlen, la_d
 
     w("To reproduce:\n")
     w("```bash")
-    w("python benchmarks/bench_lightning_attn.py --modes no_state varlen")
+    w("python benchmarks/bench_lightning_attn_prefill.py --modes no_state varlen")
     w("```\n")
 
     # -------------------------------------------------------------------
