@@ -18,15 +18,13 @@ import torch
 
 # from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from fla.ops.cp import FLACPContext
-from fla.ops.cp.chunk_delta_h import (
-    chunk_gated_delta_rule_fwd_h_pre_process,
-    compress_h0,
-)
+from fla.ops.cp.chunk_delta_h import compress_h0
 from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 
 from cula.kda.chunk_intra import chunk_kda_fwd_intra
+from cula.kda.cp_overlap import chunk_gated_delta_rule_fwd_h_pre_process_overlap
 from cula.utils import assert_blackwell
 
 
@@ -95,7 +93,7 @@ def chunk_kda_fwd(
     )
 
     if cp_context is not None:
-        initial_state = chunk_gated_delta_rule_fwd_h_pre_process(
+        initial_state = chunk_gated_delta_rule_fwd_h_pre_process_overlap(
             k=kg,
             w=w,
             u=u,

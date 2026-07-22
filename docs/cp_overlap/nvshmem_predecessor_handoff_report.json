@@ -1,0 +1,93 @@
+{
+  "date": "2026-07-22",
+  "hardware": "2x NVIDIA GB200",
+  "software": {
+    "torch": "2.10.0+cu130",
+    "cuda": "13.0",
+    "nvshmem": "3.4.5",
+    "cula_base_commit": "326a307",
+    "fla_submodule_commit": "3a9ce1c8"
+  },
+  "environment": {
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "NVSHMEM_DISABLE_CUDA_VMM": "1",
+    "NVSHMEM_SYMMETRIC_SIZE": "256M",
+    "NVSHMEM_IB_ENABLE": "0"
+  },
+  "shape": {
+    "world_size": 2,
+    "sequence_length": 8192,
+    "heads": 8,
+    "key_dim": 128,
+    "value_dim": 128,
+    "dtype": "bfloat16"
+  },
+  "protocol": {
+    "warmup": 20,
+    "iterations": 60,
+    "repeats": 5,
+    "repeat_mode": "in_process",
+    "score": "median of repeat rank-max iteration medians"
+  },
+  "correctness": {
+    "sequence_length": 1024,
+    "heads": 4,
+    "forward_and_backward": true,
+    "max_abs_diff": {
+      "output": 0.0,
+      "grad_q": 0.0,
+      "grad_k": 0.0,
+      "grad_v": 0.0,
+      "grad_g": 0.0,
+      "grad_beta": 0.0
+    }
+  },
+  "timing_ms": {
+    "fla_full": {
+      "repeat_rank_max_medians": [0.9580, 0.9409, 0.9400, 0.9360, 0.9829],
+      "median": 0.9409
+    },
+    "cula_fla_cp": {
+      "repeat_rank_max_medians": [0.6325, 0.6144, 0.6076, 0.6059, 0.6065],
+      "median": 0.6076
+    },
+    "cula_nvshmem_cp": {
+      "repeat_rank_max_medians": [0.5806, 0.5695, 0.5636, 0.5547, 0.5542],
+      "median": 0.5636
+    }
+  },
+  "latency_reduction_percent": {
+    "nvshmem_vs_fla_full": 40.10,
+    "nvshmem_vs_cula_fla_cp": 7.24
+  },
+  "locked_cp2_matrix": {
+    "source_commit": "98b55fd",
+    "implementation_commit": "6823a3a",
+    "protocol": {
+      "hosts": 1,
+      "world_size": 2,
+      "dtype": "bfloat16",
+      "warmup": 20,
+      "iterations": 60,
+      "recorded_repeats": 5,
+      "score": "median of five per-run mean rank latencies"
+    },
+    "fairness_checks_passed": true,
+    "timeouts": 0,
+    "timing_ms": [
+      {"sequence_length": 4096, "heads": 8, "mode": "graph", "nvshmem_overlap": 0.1517, "nccl_symmetric_memory": 0.1750, "fla_cp": 0.2400, "vs_nccl_percent": -13.3, "vs_fla_percent": -36.8},
+      {"sequence_length": 4096, "heads": 8, "mode": "non_graph", "nvshmem_overlap": 0.5700, "nccl_symmetric_memory": 0.6731, "fla_cp": 0.7571, "vs_nccl_percent": -15.3, "vs_fla_percent": -24.7},
+      {"sequence_length": 8192, "heads": 8, "mode": "graph", "nvshmem_overlap": 0.2531, "nccl_symmetric_memory": 0.2763, "fla_cp": 0.3663, "vs_nccl_percent": -8.4, "vs_fla_percent": -30.9},
+      {"sequence_length": 8192, "heads": 8, "mode": "non_graph", "nvshmem_overlap": 0.5857, "nccl_symmetric_memory": 0.6762, "fla_cp": 0.7670, "vs_nccl_percent": -13.4, "vs_fla_percent": -23.6},
+      {"sequence_length": 8192, "heads": 16, "mode": "graph", "nvshmem_overlap": 0.3154, "nccl_symmetric_memory": 0.3601, "fla_cp": 0.4643, "vs_nccl_percent": -12.4, "vs_fla_percent": -32.1},
+      {"sequence_length": 8192, "heads": 16, "mode": "non_graph", "nvshmem_overlap": 0.5767, "nccl_symmetric_memory": 0.6770, "fla_cp": 0.7910, "vs_nccl_percent": -14.8, "vs_fla_percent": -27.1}
+    ],
+    "winner_in_all_cells": "nvshmem_overlap"
+  },
+  "notes": [
+    "Only cula_fla_cp versus cula_nvshmem_cp isolates the effect of this change.",
+    "The comparison with fla_full also includes cuLA local-kernel improvements.",
+    "NVSHMEM_DISABLE_CUDA_VMM=0 failed at initialization with cuMemCreate status 800.",
+    "Repeats were measured in one long-lived distributed process."
+  ]
+}
