@@ -106,12 +106,11 @@ def run(args: argparse.Namespace) -> dict:
     dist.barrier()
     candidate = _run_backend(backend="nvshmem", inputs=inputs, cp_context=cp_context, heads=args.heads)
 
-    differences = {
-        name: _global_max((candidate[name].float() - reference[name].float()).abs().max()) for name in reference
-    }
-    passed = differences["output"] <= args.output_atol and max(
-        difference for name, difference in differences.items() if name != "output"
-    ) <= args.gradient_atol
+    differences = {name: _global_max((candidate[name].float() - reference[name].float()).abs().max()) for name in reference}
+    passed = (
+        differences["output"] <= args.output_atol
+        and max(difference for name, difference in differences.items() if name != "output") <= args.gradient_atol
+    )
     result = {
         "world_size": world_size,
         "sequence_length": args.sequence_length,

@@ -1151,6 +1151,7 @@ def chunk_gated_delta_rule_fwd_h_pre_process_overlap(
                 )
                 initial_state[0].copy_(merged)
             else:
+
                 def grid(meta):
                     return (triton.cdiv(V, meta["BV"]), HV)
 
