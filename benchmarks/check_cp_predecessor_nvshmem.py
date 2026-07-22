@@ -10,7 +10,7 @@ from fla.ops.cp import build_cp_context
 from cula.kda import chunk_kda
 
 
-def _init_distributed() -> tuple[int, int]:
+def _init_distributed(expected_world_size: int) -> tuple[int, int, int]:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -18,14 +18,15 @@ def _init_distributed() -> tuple[int, int]:
         dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
     except TypeError:
         dist.init_process_group("nccl")
-    if dist.get_world_size() != 2:
-        raise RuntimeError("This check requires exactly two ranks.")
-    return rank, local_rank
+    world_size = dist.get_world_size()
+    if world_size != expected_world_size:
+        raise RuntimeError(f"This check requires exactly {expected_world_size} ranks, got {world_size}.")
+    return rank, local_rank, world_size
 
 
-def _make_inputs(*, rank: int, device: torch.device, sequence_length: int, heads: int):
+def _make_inputs(*, rank: int, world_size: int, device: torch.device, sequence_length: int, heads: int):
     generator = torch.Generator(device=device).manual_seed(1234 + rank)
-    shape = (1, sequence_length // 2, heads, 128)
+    shape = (1, sequence_length // world_size, heads, 128)
     q = torch.rand(shape, generator=generator, device=device, dtype=torch.bfloat16)
     k = torch.rand(shape, generator=generator, device=device, dtype=torch.bfloat16)
     q = F.normalize(q.float(), p=2, dim=-1).to(torch.bfloat16)
@@ -86,12 +87,18 @@ def _global_max(value: torch.Tensor) -> float:
 
 
 def run(args: argparse.Namespace) -> dict:
-    rank, local_rank = _init_distributed()
+    rank, local_rank, world_size = _init_distributed(args.world_size)
     device = torch.device("cuda", local_rank)
-    if args.sequence_length % 2:
-        raise ValueError("sequence length must be divisible by two")
+    if args.sequence_length % world_size:
+        raise ValueError("sequence length must be divisible by world size")
 
-    inputs = _make_inputs(rank=rank, device=device, sequence_length=args.sequence_length, heads=args.heads)
+    inputs = _make_inputs(
+        rank=rank,
+        world_size=world_size,
+        device=device,
+        sequence_length=args.sequence_length,
+        heads=args.heads,
+    )
     global_cu_seqlens = torch.tensor([0, args.sequence_length], device=device, dtype=torch.long)
     cp_context = build_cp_context(cu_seqlens=global_cu_seqlens, group=dist.group.WORLD)
 
@@ -106,7 +113,7 @@ def run(args: argparse.Namespace) -> dict:
         difference for name, difference in differences.items() if name != "output"
     ) <= args.gradient_atol
     result = {
-        "world_size": 2,
+        "world_size": world_size,
         "sequence_length": args.sequence_length,
         "heads": args.heads,
         "output_atol": args.output_atol,
@@ -121,6 +128,7 @@ def run(args: argparse.Namespace) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--sequence-length", type=int, default=1024)
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--output-atol", type=float, default=1e-2)

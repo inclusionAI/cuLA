@@ -41,8 +41,11 @@ def test_cp_overlap_is_disabled_by_default(monkeypatch):
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Two GPUs are required")
-def test_nvshmem_predecessor_handoff_matches_fla_forward_and_backward():
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_nvshmem_predecessor_handoff_matches_fla_forward_and_backward(world_size):
     pytest.importorskip("nvshmem.core")
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"{world_size} GPUs are required")
     env = os.environ.copy()
     env.update(
         {
@@ -58,8 +61,9 @@ def test_nvshmem_predecessor_handoff_matches_fla_forward_and_backward():
             "-m",
             "torch.distributed.run",
             "--standalone",
-            "--nproc-per-node=2",
+            f"--nproc-per-node={world_size}",
             "benchmarks/check_cp_predecessor_nvshmem.py",
+            f"--world-size={world_size}",
             "--sequence-length=1024",
             "--heads=4",
         ],

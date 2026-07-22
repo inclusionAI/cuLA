@@ -310,8 +310,11 @@ def _maybe_init_nvshmem(group) -> bool:
             dev = _CudaDevice(torch.cuda.current_device())
             dev.set_current()
             init_kwargs["device"] = dev
+        _cp_debug_log(rank, "nvshmem_init_enter")
         _nvshmem_core.init(**init_kwargs)
         _nvshmem_core.barrier_all(stream=ns)
+        current_stream.synchronize()
+        _cp_debug_log(rank, "nvshmem_init_done")
         _NVSHMEM_INIT_OK = True
     except Exception as exc:
         if _cp_allow_fallback():
@@ -336,7 +339,11 @@ def _get_or_create_nvshmem_cache(*, shape: tuple[int, ...], dtype: torch.dtype, 
     cached = _NVSHMEM_COMM_CACHE.get(key)
     if cached is not None:
         return cached
+    if _is_stream_capturing():
+        raise RuntimeError("CUDA graph capture requires NVSHMEM symmetric buffers to be allocated during warmup.")
     world_size = dist.get_world_size(group=group)
+    rank = dist.get_rank(group=group)
+    _cp_debug_log(rank, f"symmetric_cache_alloc_enter shape={shape} dtype={dtype}")
     sym0 = _nvshmem_core.tensor(tuple(shape), dtype=dtype)
     sym1 = _nvshmem_core.tensor(tuple(shape), dtype=dtype)
     peers0 = [_nvshmem_core.get_peer_tensor(sym0, peer_pe=peer) for peer in range(world_size)]
@@ -357,6 +364,11 @@ def _get_or_create_nvshmem_cache(*, shape: tuple[int, ...], dtype: torch.dtype, 
         )
     dummy_i32 = _nvshmem_core.tensor((1,), dtype=torch.int32)
     dummy_i32.zero_()
+    bootstrap_stream = torch.cuda.current_stream()
+    bootstrap_stream.synchronize()
+    _nvshmem_core.barrier_all(stream=_get_nvshmem_stream(bootstrap_stream))
+    bootstrap_stream.synchronize()
+    _cp_debug_log(rank, "symmetric_cache_alloc_done")
     state = {
         "step": 0,
         "epoch": [0, 0],
@@ -889,6 +901,8 @@ def chunk_gated_delta_rule_fwd_h_pre_process_overlap(
     post_num_ranks = int(getattr(context, "post_num_ranks", 0) or 0)
     signal_target_peers = list(range(rank + 1, rank + post_num_ranks + 1)) if post_num_ranks > 0 else []
     allow_signal_mode = (not in_capture) or _cp_nvshmem_ready_wait_in_graph()
+    if not in_capture:
+        comm_stream.wait_stream(torch.cuda.current_stream())
 
     with torch.cuda.stream(comm_stream):
         if comm_start is not None:

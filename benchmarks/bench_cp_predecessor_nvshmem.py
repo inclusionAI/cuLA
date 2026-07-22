@@ -12,7 +12,7 @@ from fla.ops.kda import chunk_kda as fla_chunk_kda
 from cula.kda import chunk_kda as cula_chunk_kda
 
 
-def _init_distributed() -> tuple[int, int]:
+def _init_distributed(expected_world_size: int) -> tuple[int, int, int]:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -20,19 +20,20 @@ def _init_distributed() -> tuple[int, int]:
         dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
     except TypeError:
         dist.init_process_group("nccl")
-    if dist.get_world_size() != 2:
-        raise RuntimeError("This benchmark requires exactly two ranks.")
-    return rank, local_rank
+    world_size = dist.get_world_size()
+    if world_size != expected_world_size:
+        raise RuntimeError(f"This benchmark requires exactly {expected_world_size} ranks, got {world_size}.")
+    return rank, local_rank, world_size
 
 
 def run(args: argparse.Namespace) -> dict:
-    rank, local_rank = _init_distributed()
+    rank, local_rank, world_size = _init_distributed(args.world_size)
     device = torch.device("cuda", local_rank)
-    if args.sequence_length % 2:
-        raise ValueError("sequence length must be divisible by two")
+    if args.sequence_length % world_size:
+        raise ValueError("sequence length must be divisible by world size")
 
     generator = torch.Generator(device=device).manual_seed(1234 + rank)
-    shape = (1, args.sequence_length // 2, args.heads, 128)
+    shape = (1, args.sequence_length // world_size, args.heads, 128)
     q = torch.rand(shape, generator=generator, device=device, dtype=torch.bfloat16)
     k = torch.rand(shape, generator=generator, device=device, dtype=torch.bfloat16)
     q = F.normalize(q.float(), p=2, dim=-1).to(torch.bfloat16)
@@ -91,7 +92,7 @@ def run(args: argparse.Namespace) -> dict:
             times.append(start.elapsed_time(end))
 
         local = torch.tensor(times, device=device)
-        gathered = [torch.empty_like(local) for _ in range(2)]
+        gathered = [torch.empty_like(local) for _ in range(world_size)]
         dist.all_gather(gathered, local)
         all_times = torch.stack(gathered).cpu()
         rank_max = all_times.amax(dim=0).tolist()
@@ -109,7 +110,7 @@ def run(args: argparse.Namespace) -> dict:
     rank_max_p50_values = [repeat["rank_max_median_ms"] for repeat in repeat_results]
     result = {
         "backend": args.backend,
-        "world_size": 2,
+        "world_size": world_size,
         "sequence_length": args.sequence_length,
         "heads": args.heads,
         "warmup": args.warmup,
@@ -126,6 +127,7 @@ def run(args: argparse.Namespace) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--backend", choices=("fla_full", "fla", "nvshmem"), required=True)
     parser.add_argument("--sequence-length", type=int, default=8192)
     parser.add_argument("--heads", type=int, default=8)
