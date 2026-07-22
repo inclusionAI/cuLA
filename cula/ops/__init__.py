@@ -18,6 +18,11 @@ __all__ = [
     "kda_decode_mtp_recurrent",
     "kda_decode_mtp_recurrent_ws",
     "kda_conv_decode_mtp_verify",
+    "kda_conv_decode_mtp_shuffle_kvbuffer",
+    "kda_conv_decode_mtp_tensor_core_kvbuffer",
+    "kda_conv_decode_mtp_kvbuffer",
+    "kda_flush_kvbuffer",
+    "kda_flush_kvbuffer_all_layers",
     "fused_sigmoid_gating_delta_rule_update",
     "linear_attention_decode",
 ]
@@ -33,6 +38,26 @@ _LAZY = {
     "kda_conv_decode_mtp_verify": (
         "cula.ops.kda.decode.mtp_conv",
         "kda_conv_decode_mtp_verify",
+    ),
+    "kda_conv_decode_mtp_shuffle_kvbuffer": (
+        "cula.ops.kda.decode.mtp_conv_kvbuffer",
+        "kda_conv_decode_mtp_shuffle_kvbuffer",
+    ),
+    "kda_conv_decode_mtp_tensor_core_kvbuffer": (
+        "cula.ops.kda.decode.mtp_conv_kvbuffer",
+        "kda_conv_decode_mtp_tensor_core_kvbuffer",
+    ),
+    "kda_conv_decode_mtp_kvbuffer": (
+        "cula.ops.kda.decode.mtp_conv_kvbuffer",
+        "kda_conv_decode_mtp_kvbuffer",
+    ),
+    "kda_flush_kvbuffer": (
+        "cula.ops.kda.decode.mtp_kvbuffer",
+        "kda_flush_kvbuffer",
+    ),
+    "kda_flush_kvbuffer_all_layers": (
+        "cula.ops.kda.decode.mtp_kvbuffer",
+        "kda_flush_kvbuffer_all_layers",
     ),
     "fused_sigmoid_gating_delta_rule_update": (
         "cula.ops.kda.decode.cute",
