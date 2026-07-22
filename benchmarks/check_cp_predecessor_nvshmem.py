@@ -42,7 +42,7 @@ def _make_inputs(*, rank: int, world_size: int, device: torch.device, sequence_l
 def _run_backend(*, backend: str, inputs, cp_context, heads: int):
     os.environ["CULA_CP_COMM_BACKEND"] = backend
     os.environ["CULA_CP_OVERLAP"] = "1" if backend == "nvshmem" else "0"
-    os.environ["CULA_CP_NVSHMEM_READY_WAIT"] = "1"
+    os.environ.setdefault("CULA_CP_NVSHMEM_READY_WAIT", "1")
     q, k, v, g, beta = [tensor.detach().clone().requires_grad_(True) for tensor in inputs]
     a_log = torch.zeros(heads, device=q.device, dtype=torch.float32, requires_grad=True)
     dt_bias = torch.zeros(heads * 128, device=q.device, dtype=torch.float32, requires_grad=True)

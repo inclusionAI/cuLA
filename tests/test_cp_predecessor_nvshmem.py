@@ -49,7 +49,11 @@ def test_nvshmem_predecessor_handoff_matches_fla_forward_and_backward(world_size
     env = os.environ.copy()
     env.update(
         {
-            "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+            "CUDA_DEVICE_MAX_CONNECTIONS": "2",
+            "CULA_CP_COMM_USE_CURRENT_STREAM": "1",
+            "CULA_CP_NVSHMEM_DIRECT_STORE_CONN1_ONLY": "0",
+            "CULA_CP_NVSHMEM_FUSED_REMOTE_MERGE": "1",
+            "CULA_CP_NVSHMEM_READY_WAIT": "0",
             "NVSHMEM_DISABLE_CUDA_VMM": env.get("NVSHMEM_DISABLE_CUDA_VMM", "1"),
             "NVSHMEM_SYMMETRIC_SIZE": "256M",
             "NVSHMEM_IB_ENABLE": "0",

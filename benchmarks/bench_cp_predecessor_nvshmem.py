@@ -49,7 +49,7 @@ def run(args: argparse.Namespace) -> dict:
     cp_context = build_cp_context(cu_seqlens=global_cu_seqlens, group=dist.group.WORLD)
     os.environ["CULA_CP_COMM_BACKEND"] = args.backend
     os.environ["CULA_CP_OVERLAP"] = "1" if args.backend == "nvshmem" else "0"
-    os.environ["CULA_CP_NVSHMEM_READY_WAIT"] = "1"
+    os.environ.setdefault("CULA_CP_NVSHMEM_READY_WAIT", "1")
     implementation = fla_chunk_kda if args.backend == "fla_full" else cula_chunk_kda
     safe_gate = args.backend != "fla_full"
 

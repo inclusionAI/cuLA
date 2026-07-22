@@ -19,6 +19,7 @@ import warnings
 import torch
 import torch.distributed as dist
 import triton
+import triton.language as tl
 from fla.ops.cp.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h_pre_process as _fla_chunk_gated_delta_rule_fwd_h_pre_process,
 )
@@ -76,6 +77,10 @@ def _cp_comm_stream_priority() -> int:
         return -1
 
 
+def _cp_comm_use_current_stream() -> bool:
+    return os.getenv("CULA_CP_COMM_USE_CURRENT_STREAM", "0").lower() in {"1", "true", "on", "yes"}
+
+
 def _get_comm_stream(device: torch.device) -> torch.cuda.Stream:
     idx = device.index if device.index is not None else torch.cuda.current_device()
     stream = _COMM_STREAMS.get(idx)
@@ -131,6 +136,10 @@ def _cp_nvshmem_quiet() -> bool:
 
 def _cp_nvshmem_direct_store() -> bool:
     return os.getenv("CULA_CP_NVSHMEM_DIRECT_STORE", "1").lower() in {"1", "true", "on", "yes"}
+
+
+def _cp_nvshmem_fused_remote_merge() -> bool:
+    return os.getenv("CULA_CP_NVSHMEM_FUSED_REMOTE_MERGE", "0").lower() in {"1", "true", "on", "yes"}
 
 
 def _cp_nvshmem_direct_store_conn1_only() -> bool:
@@ -546,6 +555,93 @@ def _nvshmem_wait_ready_epoch(
         _cp_debug_log(rank, f"wait_ready_signal_done peer={peer} slot={slot} epoch={epoch}")
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BV": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BV": 64}, num_warps=4, num_stages=2),
+    ],
+    key=["H", "K", "V", "NUM_PEERS"],
+)
+@triton.jit
+def _merge_remote_states_kernel(
+    out,
+    peer0,
+    peer1,
+    peer2,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    NUM_PEERS: tl.constexpr,
+):
+    i_v = tl.program_id(0)
+    i_h = tl.program_id(1)
+    state = tl.zeros((BK, BV), dtype=tl.float32)
+    stride = K * (K + V)
+
+    for peer_idx in tl.static_range(NUM_PEERS):
+        if peer_idx == 0:
+            peer = peer0
+        elif peer_idx == 1:
+            peer = peer1
+        else:
+            peer = peer2
+        peer += i_h * stride
+        h_block = tl.make_block_ptr(
+            peer,
+            (K, V),
+            (K + V, 1),
+            (0, i_v * BV),
+            (BK, BV),
+            (1, 0),
+        )
+        m_block = tl.make_block_ptr(
+            peer + V,
+            (K, K),
+            (K + V, 1),
+            (0, 0),
+            (BK, BK),
+            (1, 0),
+        )
+        local_h = tl.load(h_block, boundary_check=(0, 1)).to(tl.float32)
+        local_m = tl.load(m_block, boundary_check=(0, 1)).to(tl.float32)
+        state = tl.dot(local_m, state) + local_h
+
+    out_block = tl.make_block_ptr(
+        out + i_h * K * V,
+        (K, V),
+        (V, 1),
+        (0, i_v * BV),
+        (BK, BV),
+        (1, 0),
+    )
+    tl.store(out_block, state, boundary_check=(0, 1))
+
+
+def _merge_remote_states(out: torch.Tensor, peer_tensors: list[torch.Tensor]) -> None:
+    if not 1 <= len(peer_tensors) <= 3:
+        raise RuntimeError("Fused remote merge supports one to three predecessor peers.")
+    h_dim, k_dim, v_dim = out.shape
+    bk = triton.next_power_of_2(k_dim)
+    padded = peer_tensors + [peer_tensors[0]] * (3 - len(peer_tensors))
+
+    def grid(meta):
+        return (triton.cdiv(v_dim, meta["BV"]), h_dim)
+
+    _merge_remote_states_kernel[grid](
+        out,
+        padded[0],
+        padded[1],
+        padded[2],
+        H=h_dim,
+        K=k_dim,
+        V=v_dim,
+        BK=bk,
+        NUM_PEERS=len(peer_tensors),
+    )
+
+
 def _nvshmem_all_gather_into_tensor(
     inp: torch.Tensor,
     out: torch.Tensor | None,
@@ -559,6 +655,7 @@ def _nvshmem_all_gather_into_tensor(
     allow_signal_mode: bool = True,
     compact_out_layout: bool = False,
     fetch_last_dim: int | None = None,
+    merge_remote_output: bool = False,
 ) -> None:
     world_size = dist.get_world_size(group=group)
     rank = dist.get_rank(group=group)
@@ -613,6 +710,11 @@ def _nvshmem_all_gather_into_tensor(
             stream=ns,
         )
         _cp_debug_log(rank, f"wait_ready_end slot={slot} epoch={epoch} fetch_peers={fetch_peers}")
+    if merge_remote_output:
+        if out is None or out.ndim != 4 or out.shape[0] != 1:
+            raise RuntimeError("Fused remote merge requires an output shaped [1, H, K, V].")
+        _merge_remote_states(out[0], [peers[peer] for peer in fetch_peers])
+        return
     for fetch_idx, peer in enumerate(fetch_peers):
         if out is None:
             raise RuntimeError("out tensor must be provided when fetch_peers is non-empty.")
@@ -852,6 +954,9 @@ def chunk_gated_delta_rule_fwd_h_pre_process_overlap(
         # CUDA Graph capture-safe path: keep communication on the capturing stream.
         comm_stream = torch.cuda.current_stream()
         comm_event = None
+    elif _cp_comm_use_current_stream():
+        comm_stream = torch.cuda.current_stream()
+        comm_event = None
     else:
         comm_stream = _get_comm_stream(hm.device)
         comm_event = _get_comm_event(hm.device)
@@ -864,6 +969,17 @@ def chunk_gated_delta_rule_fwd_h_pre_process_overlap(
         and ((not in_capture) or _cp_direct_pred_fetch_in_graph())
         and (not context.is_first_rank)
     )
+    direct_remote_merge = bool(
+        _cp_nvshmem_fused_remote_merge()
+        and use_nvshmem
+        and _NVSHMEM_INIT_OK
+        and world_size <= 4
+        and pre_num_ranks > 1
+        and not in_capture
+        and not transpose_state_layout
+        and N == 1
+    )
+    direct_initial_state = direct_predecessor_state or direct_remote_merge
 
     initial_state = None
     ag_hm = None
@@ -875,21 +991,25 @@ def chunk_gated_delta_rule_fwd_h_pre_process_overlap(
         comm_end = torch.cuda.Event(enable_timing=True)
     merge_ms = 0.0
     if not context.is_first_rank:
-        _cp_debug_log(rank, f"ag_hm_alloc_enter direct_pred_state={direct_predecessor_state}")
-        if direct_predecessor_state:
-            # Fetch predecessor V-state directly into final output buffer (N=1),
-            # avoiding an extra staging tensor and post-comm copy.
+        _cp_debug_log(
+            rank,
+            f"ag_hm_alloc_enter direct_pred_state={direct_predecessor_state} direct_remote_merge={direct_remote_merge}",
+        )
+        if direct_initial_state:
+            # Materialize the final state directly, avoiding a separate receive
+            # buffer and a second local merge/copy pass.
             initial_state = k.new_empty(N, HV, K, V, dtype=torch.float32)
             ag_hm = initial_state
-            # Keep capture-time cache guard satisfied by materializing the
-            # compact receive cache during warmup.
-            _get_or_create_ag_hm_from_spec(
-                shape=ag_hm_shape,
-                dtype=hm_dtype,
-                num_rows=ag_hm_rows,
-                group=context.group,
-            )
-            _cp_debug_log(rank, "ag_hm_alloc_done direct_pred_state=1")
+            if direct_predecessor_state:
+                # Keep capture-time cache guard satisfied by materializing the
+                # compact receive cache during warmup.
+                _get_or_create_ag_hm_from_spec(
+                    shape=ag_hm_shape,
+                    dtype=hm_dtype,
+                    num_rows=ag_hm_rows,
+                    group=context.group,
+                )
+            _cp_debug_log(rank, "ag_hm_alloc_done direct_initial_state=1")
         else:
             ag_hm = _get_or_create_ag_hm_from_spec(
                 shape=ag_hm_shape,
@@ -901,7 +1021,7 @@ def chunk_gated_delta_rule_fwd_h_pre_process_overlap(
     post_num_ranks = int(getattr(context, "post_num_ranks", 0) or 0)
     signal_target_peers = list(range(rank + 1, rank + post_num_ranks + 1)) if post_num_ranks > 0 else []
     allow_signal_mode = (not in_capture) or _cp_nvshmem_ready_wait_in_graph()
-    if not in_capture:
+    if not in_capture and comm_stream != torch.cuda.current_stream():
         comm_stream.wait_stream(torch.cuda.current_stream())
 
     with torch.cuda.stream(comm_stream):
@@ -963,6 +1083,7 @@ def chunk_gated_delta_rule_fwd_h_pre_process_overlap(
                         allow_signal_mode=allow_signal_mode,
                         compact_out_layout=True,
                         fetch_last_dim=(V if predecessor_only else None),
+                        merge_remote_output=direct_remote_merge,
                     )
                     _cp_debug_log(rank, "comm_fetch_done")
         elif backend in {"auto", "nccl"}:
@@ -1007,14 +1128,14 @@ def chunk_gated_delta_rule_fwd_h_pre_process_overlap(
         assert ag_hm is not None
         merge_rank = pre_num_ranks if compact_ag_hm else rank
         if pre_num_ranks == 1:
-            if not direct_predecessor_state:
+            if not direct_initial_state:
                 source_idx = pre_num_ranks - 1 if compact_ag_hm else (rank - 1)
                 source = ag_hm[source_idx, :, :, :V]
                 if transpose_state_layout:
                     initial_state[0].copy_(source.transpose(-2, -1))
                 else:
                     initial_state[0].copy_(source)
-        else:
+        elif not direct_remote_merge:
             use_compiled_merge = (
                 _cp_merge_impl() == "compile"
                 and (not in_capture or _cp_merge_compile_in_graph())
