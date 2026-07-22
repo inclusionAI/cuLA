@@ -111,6 +111,39 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 - `beta` supports both `float32` and `bfloat16`; `initial_state` must be `float32`.
 - `cu_seqlens` (for variable-length sequences) must be `int32`.
 
+### GDN Prefill — Hopper (SM90)
+
+```python
+import torch
+
+from cula.gdn import chunk_gated_delta_rule
+
+q = torch.randn(8, 2, 128, device="cuda", dtype=torch.bfloat16)
+k = torch.randn_like(q)
+v = torch.randn_like(q)
+g = torch.rand(8, 2, device="cuda", dtype=torch.float32) * 0.1 + 0.85
+beta = torch.rand(8, 2, device="cuda", dtype=torch.float32)
+cu_seqlens = torch.tensor([0, 5, 8], device="cuda", dtype=torch.int64)
+
+output, final_state = chunk_gated_delta_rule(
+    q,
+    k,
+    v,
+    g=g,
+    beta=beta,
+    cu_seqlens=cu_seqlens,
+    output_final_state=True,
+)
+```
+
+This path requires compute capability 9.0 and
+`nvidia-cutlass-dsl==4.5.1`. It supports packed MHA, GQA, and GVA with BF16
+Q/K/V, head size 128, and optional FP32 initial/final state. See the
+[GDN SM90 API guide](docs/gdn_sm90_api.md) for the complete contract,
+unsupported behavior, and canonical 28-row benchmark. The
+[GDN SM90 pipeline](docs/gdn_sm90_pipeline.md) documents the kernel's thread
+roles, pipelines, and recurrent-state dataflow.
+
 ## Usage
 
 See [USAGE.md](USAGE.md) for detailed usage examples and notes.
@@ -143,6 +176,9 @@ python benchmarks/generate_benchmark_md.py
 
 # Hopper (SM90)
 python benchmarks/generate_benchmark_hopper_md.py
+
+# GDN prefill — canonical 28-row SM90 matrix
+python benchmarks/bench_gdn_prefill.py --output gdn-sm90-benchmark.json
 ```
 
 ## Tests

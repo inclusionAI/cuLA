@@ -18,6 +18,10 @@ cuLA/
 │   │   ├── chunk_bwd.py          # chunk_kda_bwd — Triton + FLA + CuTeDSL + C++ mix
 │   │   └── hopper_fused_fwd.py   # cula_kda_prefill (=kda_prefill_hopper) — SM90 prefill via the C++ kernel (cula.cudac)
 │   │
+│   ├── gdn/                      # GDN packed-varlen PUBLIC API (NO kernels)
+│   │   ├── __init__.py           # chunk_gated_delta_rule public export
+│   │   ├── prefill.py            # validation, output allocation, and dispatch
+│   │
 │   ├── lightning/                # [non-KDA] Lightning Attention operator (LinearAttentionChunkwiseDecay, lightning_attn_fwd, linear_attention_decode)
 │   │   └── __init__.py
 │   │
@@ -43,6 +47,9 @@ cuLA/
 │       │       ├── kda_fully_fused_wip.py   #   KDAChunkwise (~6k lines)
 │       │       └── wrapper.py                #   flash_kda_prefill (dead path; raises on SM100 dispatch)
 │       │
+│       ├── gdn/                  # GDN Python backends — by arch
+│       │   └── sm90/             #   512-thread Hopper WGMMA/TMA implementation
+│       │
 │       ├── lightning/            # [non-KDA] Lightning/linear attention kernels
 │       │   ├── prefill_sm100.py  #   Lightning Attn prefill (LinearAttentionChunkwiseDecay, lightning_attn_fwd[_varlen])
 │       │   └── decode.py         #   linear_attention_decode
@@ -67,6 +74,8 @@ cuLA/
 | Directory | Language | Description |
 |-----------|----------|-------------|
 | `cula/kda/` | Python | KDA **public API only** — autograd + dispatch, no kernels. Two prefill entries: modular chunk `chunk_kda` (SM100) and `kda_prefill_hopper` (SM90, driving the C++ kernel). |
+| `cula/gdn/` | Python | Packed-variable-length GDN prefill **public API only** — validation, output allocation, and dispatch. |
+| `cula/ops/gdn/` | Python (CuTe DSL) | **GDN Python backends**, by architecture: `sm90/` contains the 512-thread Hopper WGMMA/TMA implementation. |
 | `cula/ops/kda/` | Python (CuTe DSL) | **KDA Python backends**, by arch: `sm100/` (+cp), `decode/`, `experimental/`, plus `policy.py` (CP dispatch). |
 | `cula/ops/lightning/` · `cula/ops/experimental/` | Python (CuTe DSL) | `[non-KDA]` Lightning/linear attention kernels. |
 | `cula/ops/{inv,ptx}.py`, `cula/ops/sm100/ptx.py` | Python | Shared low-level helpers (kept in place; not KDA-specific). |
