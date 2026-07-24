@@ -1,4 +1,4 @@
-# Copyright (c) 2025 ANTGROUP. All rights reserved.
+# Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -223,9 +223,20 @@ def print_tensor_partial(tensor: cute.Tensor, max_rows: int, max_cols: int):
     cute.printf("----------------------------------\n")
 
 
-@functools.cache
+_uniform_cu_seqlens_cache = {}
+_UNIFORM_CU_SEQLENS_CACHE_MAXSIZE = 64
+
+
 def prepare_uniform_cu_seqlens(batch_size: int, seqlen: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    stream_ptr = int(torch.cuda.current_stream(device).cuda_stream)
+    key = (batch_size, seqlen, device, dtype, stream_ptr)
+    cached = _uniform_cu_seqlens_cache.get(key)
+    if cached is not None:
+        return cached
+    if len(_uniform_cu_seqlens_cache) >= _UNIFORM_CU_SEQLENS_CACHE_MAXSIZE:
+        _uniform_cu_seqlens_cache.pop(next(iter(_uniform_cu_seqlens_cache)))
     cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, device=device, dtype=dtype)
+    _uniform_cu_seqlens_cache[key] = cu_seqlens
     return cu_seqlens
 
 
@@ -235,12 +246,16 @@ def get_device_sm_count(device: torch.device) -> int:
 
 
 _cache_buf = {}
+_CACHE_BUF_MAXSIZE = 64
 
 
 def _get_cache_buf(name: str, nbytes: int, device: torch.device) -> torch.Tensor:
-    key = (name, device)
+    stream_ptr = int(torch.cuda.current_stream(device).cuda_stream)
+    key = (name, device, stream_ptr)
     buf = _cache_buf.get(key)
     if buf is None or buf.size(0) < nbytes:
+        if buf is None and len(_cache_buf) >= _CACHE_BUF_MAXSIZE:
+            _cache_buf.pop(next(iter(_cache_buf)))
         buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
         _cache_buf[key] = buf
     return buf

@@ -33,6 +33,9 @@ Usage:
 
   # Custom varlen workloads
   python benchmarks/bench_lightning_attn.py --modes varlen --num-heads 32 64 --iterations 50
+
+  # GVA (value heads > Q/K heads)
+  python benchmarks/bench_lightning_attn.py --modes no_state h0_ht varlen --num-heads 32 --num-v-heads 64
 """
 
 import argparse
@@ -80,6 +83,17 @@ def compute_decay(H, layer_idx=12, num_layers=24):
     return (8 / H * (1 - layer_idx / num_layers)) * torch.arange(H, dtype=torch.float32, device=DEVICE)
 
 
+def expand_qk_to_value_heads(Q, K, V):
+    """Expand Q/K from H heads to HV heads for FLA and naive references."""
+    H = Q.shape[2]
+    HV = V.shape[2]
+    assert HV >= H and HV % H == 0, f"HV ({HV}) must be >= H ({H}) and divisible by H"
+    if HV == H:
+        return Q, K
+    group_size = HV // H
+    return Q.repeat_interleave(group_size, dim=2), K.repeat_interleave(group_size, dim=2)
+
+
 @torch.no_grad()
 def torch_naive_lightning_attn(Q, K, V, decay, scale=1.0, initial_state=None, output_final_state=False):
     """Recurrent FP32 reference for lightning attention (simple_gla).
@@ -87,15 +101,17 @@ def torch_naive_lightning_attn(Q, K, V, decay, scale=1.0, initial_state=None, ou
     O(B*T*H*D^2) — exact ground truth, all computation in FP32.
     """
     B, T, H, D = Q.shape
+    HV = V.shape[2]
+    Q, K = expand_qk_to_value_heads(Q, K, V)
     q, k, v = Q.float(), K.float(), V.float()
-    decay_factor = torch.exp(-decay.float())  # [H]
+    decay_factor = torch.exp(-decay.float())  # [HV]
 
     S = (
         initial_state.float().clone()
         if initial_state is not None
-        else torch.zeros(B, H, D, D, dtype=torch.float32, device=Q.device)
+        else torch.zeros(B, HV, D, D, dtype=torch.float32, device=Q.device)
     )
-    O = torch.zeros(B, T, H, D, dtype=torch.float32, device=Q.device)
+    O = torch.zeros(B, T, HV, D, dtype=torch.float32, device=Q.device)
 
     for t in range(T):
         S = S * decay_factor[None, :, None, None]
@@ -111,13 +127,14 @@ def torch_naive_lightning_attn(Q, K, V, decay, scale=1.0, initial_state=None, ou
 # =============================================================================
 def run_fla(Q, K, V, decay, initial_state, output_final_state, warmup, iters):
     """Run FLA chunk_simple_gla_fwd (standard, non-varlen)."""
+    Q_fla, K_fla = expand_qk_to_value_heads(Q, K, V)
     g_gamma = -decay
     scale = 1.0
 
     def fn():
         return chunk_simple_gla_fwd(
-            q=Q,
-            k=K,
+            q=Q_fla,
+            k=K_fla,
             v=V,
             g_gamma=g_gamma,
             scale=scale,
@@ -183,13 +200,14 @@ def run_cutedsl_varlen(Q, K, V, decay, cu_seqlens, persistent, warmup, iters):
 
 def run_fla_varlen(Q, K, V, decay, cu_seqlens, warmup, iters):
     """Run FLA native varlen (single launch via cu_seqlens). FAIR baseline."""
+    Q_fla, K_fla = expand_qk_to_value_heads(Q, K, V)
     g_gamma = -decay
     cu_long = cu_seqlens.to(torch.long)
 
     def fn():
         return chunk_simple_gla_fwd(
-            q=Q,
-            k=K,
+            q=Q_fla,
+            k=K_fla,
             v=V,
             g_gamma=g_gamma,
             scale=1.0,
@@ -207,25 +225,26 @@ def run_fla_varlen(Q, K, V, decay, cu_seqlens, warmup, iters):
 # =============================================================================
 # Standard (non-varlen) benchmark
 # =============================================================================
-def benchmark_standard_config(B, T, H, D, layer_idx, num_layers, mode, warmup, iters):
+def benchmark_standard_config(B, T, H, HV, D, layer_idx, num_layers, mode, warmup, iters):
     """Benchmark a single standard (non-varlen) config.
 
     mode: "no_state" — no initial/final state
           "h0_ht"   — provide random h0 and output ht
     """
+    assert HV >= H and HV % H == 0, f"HV ({HV}) must be >= H ({H}) and divisible by H"
     torch.manual_seed(42)
     Q = torch.randn(B, T, H, D, dtype=DTYPE, device=DEVICE)
     K = torch.randn(B, T, H, D, dtype=DTYPE, device=DEVICE)
-    V = torch.randn(B, T, H, D, dtype=DTYPE, device=DEVICE)
-    decay = compute_decay(H, layer_idx, num_layers)
+    V = torch.randn(B, T, HV, D, dtype=DTYPE, device=DEVICE)
+    decay = compute_decay(HV, layer_idx, num_layers)
 
     has_h0 = mode == "h0_ht"
     output_ht = mode == "h0_ht"
-    h0 = torch.randn(B, H, D, D, dtype=torch.float32, device=DEVICE) * 0.01 if has_h0 else None
+    h0 = torch.randn(B, HV, D, D, dtype=torch.float32, device=DEVICE) * 0.01 if has_h0 else None
     h0_fla = h0.clone() if h0 is not None else None
     h0_cute = h0.transpose(-1, -2).contiguous() if h0 is not None else None  # BHVK for CuTe
 
-    result = {"B": B, "T": T, "H": H, "D": D, "mode": mode}
+    result = {"B": B, "T": T, "H": H, "HV": HV, "D": D, "mode": mode}
     ht_fla = None
     ht_cute = None
 
@@ -289,20 +308,22 @@ def benchmark_standard_config(B, T, H, D, layer_idx, num_layers, mode, warmup, i
 # =============================================================================
 # Varlen benchmark
 # =============================================================================
-def benchmark_varlen_config(N, seq_lens, H, D, warmup, iters, dist=""):
+def benchmark_varlen_config(N, seq_lens, H, HV, D, warmup, iters, dist=""):
     """Benchmark a varlen config: persistent vs non-persistent vs FLA varlen."""
+    assert HV >= H and HV % H == 0, f"HV ({HV}) must be >= H ({H}) and divisible by H"
     T = sum(seq_lens)
     torch.manual_seed(42)
     Q = torch.randn(1, T, H, D, dtype=DTYPE, device=DEVICE)
     K = torch.randn(1, T, H, D, dtype=DTYPE, device=DEVICE)
-    V = torch.randn(1, T, H, D, dtype=DTYPE, device=DEVICE)
+    V = torch.randn(1, T, HV, D, dtype=DTYPE, device=DEVICE)
     cu = torch.tensor([0] + list(np.cumsum(seq_lens)), dtype=torch.int32, device=DEVICE)
-    decay = compute_decay(H)
+    decay = compute_decay(HV)
 
     result = {
         "B": N,
         "T": T,
         "H": H,
+        "HV": HV,
         "D": D,
         "mode": "varlen",
         "seq_lens": seq_lens,
@@ -394,7 +415,8 @@ def print_standard_header():
 
 
 def print_standard_result(r):
-    cfg = f"B={r['B']},T={r['T']},H={r['H']}"
+    hv = r.get("HV", r["H"])
+    cfg = f"B={r['B']},T={r['T']},H={r['H']},HV={hv}"
 
     fla = f"{r['fla_ms']:.3f}" if _valid(r.get("fla_ms", float("nan"))) else "ERR"
     dsl = f"{r['cutedsl_ms']:.3f}" if _valid(r.get("cutedsl_ms", float("nan"))) else "ERR"
@@ -437,7 +459,8 @@ def print_varlen_header():
 
 
 def print_varlen_result(r):
-    cfg = f"N={r['B']},T={r['T']},H={r['H']}"
+    hv = r.get("HV", r["H"])
+    cfg = f"N={r['B']},T={r['T']},H={r['H']},HV={hv}"
     dist = r.get("dist", "")
 
     p_ms = f"{r['persistent_ms']:.3f}" if _valid(r.get("persistent_ms", float("nan"))) else "ERR"
@@ -482,6 +505,7 @@ def run_benchmark_suite(args):
     warmup = args.warmup
     iters = args.iterations
     modes = args.modes
+    num_v_heads = getattr(args, "num_v_heads", None)
 
     print("\n" + "=" * 100)
     print("Lightning Attention Benchmark: CuteDSL vs FLA")
@@ -490,6 +514,7 @@ def run_benchmark_suite(args):
     print(f"  Batch sizes:   {args.batch_sizes}")
     print(f"  Seq lengths:   {args.seq_lens}")
     print(f"  Num heads:     {args.num_heads}")
+    print(f"  Num V heads:   {num_v_heads or args.num_heads}")
     print(f"  Head dim:      {D}")
     print(f"  Layer:         {layer_idx}/{num_layers}")
     print(f"  Warmup/Iters:  {warmup}/{iters}")
@@ -505,14 +530,18 @@ def run_benchmark_suite(args):
             for B in args.batch_sizes:
                 for T in args.seq_lens:
                     for H in args.num_heads:
-                        total = B * T * H * D
-                        if total > 2_147_483_648:
-                            continue
-                        if T > 4096 and B > 2:
-                            continue
-                        r = benchmark_standard_config(B, T, H, D, layer_idx, num_layers, mode, warmup, iters)
-                        all_results.append(r)
-                        print_standard_result(r)
+                        for HV in num_v_heads or [H]:
+                            if HV < H or HV % H != 0:
+                                print(f"Skipping invalid GVA config H={H}, HV={HV}")
+                                continue
+                            total = B * T * HV * D
+                            if total > 2_147_483_648:
+                                continue
+                            if T > 4096 and B > 2:
+                                continue
+                            r = benchmark_standard_config(B, T, H, HV, D, layer_idx, num_layers, mode, warmup, iters)
+                            all_results.append(r)
+                            print_standard_result(r)
 
     # ===================== Varlen mode =====================
     if "varlen" in modes:
@@ -542,22 +571,26 @@ def run_benchmark_suite(args):
         workloads = unique
 
         for H in args.num_heads:
-            print(f"\n  --- H={H}, D={D} ---")
-            print_varlen_header()
+            for HV in num_v_heads or [H]:
+                if HV < H or HV % H != 0:
+                    print(f"Skipping invalid GVA config H={H}, HV={HV}")
+                    continue
+                print(f"\n  --- H={H}, HV={HV}, D={D} ---")
+                print_varlen_header()
 
-            for N, T_total, dist in workloads:
-                if dist == "uniform":
-                    seq_lens = gen_uniform(N, T_total)
-                elif dist == "skewed":
-                    seq_lens = gen_skewed(N, T_total)
-                elif dist == "random":
-                    seq_lens = gen_random(N, T_total)
-                else:
-                    raise ValueError(f"Unknown dist: {dist}")
+                for N, T_total, dist in workloads:
+                    if dist == "uniform":
+                        seq_lens = gen_uniform(N, T_total)
+                    elif dist == "skewed":
+                        seq_lens = gen_skewed(N, T_total)
+                    elif dist == "random":
+                        seq_lens = gen_random(N, T_total)
+                    else:
+                        raise ValueError(f"Unknown dist: {dist}")
 
-                r = benchmark_varlen_config(N, seq_lens, H, D, warmup, iters, dist=dist)
-                all_results.append(r)
-                print_varlen_result(r)
+                    r = benchmark_varlen_config(N, seq_lens, H, HV, D, warmup, iters, dist=dist)
+                    all_results.append(r)
+                    print_varlen_result(r)
 
     # ===================== Summary =====================
     print(f"\n{'=' * 100}")
@@ -662,7 +695,7 @@ def plot_results(all_results, modes):
             if not hr:
                 ax.set_title("varlen (no data)")
                 continue
-            labels = [f"N{r['B']}T{r['T']}\n{r.get('dist', '')[:3]}" for r in hr]
+            labels = [f"N{r['B']}T{r['T']}H{r['H']}HV{r.get('HV', r['H'])}\n{r.get('dist', '')[:3]}" for r in hr]
             p_ms = [r["persistent_ms"] for r in hr]
             np_ms = [r["nonpersistent_ms"] for r in hr]
             fla_ms = [r["fla_varlen_ms"] if _valid(r.get("fla_varlen_ms", float("nan"))) else 0 for r in hr]
@@ -676,7 +709,7 @@ def plot_results(all_results, modes):
             if not hr:
                 ax.set_title(f"{mode} (no data)")
                 continue
-            labels = [f"B{r['B']}T{r['T']}H{r['H']}" for r in hr]
+            labels = [f"B{r['B']}T{r['T']}H{r['H']}HV{r.get('HV', r['H'])}" for r in hr]
             fla = [r["fla_ms"] for r in hr]
             dsl = [r["cutedsl_ms"] for r in hr]
             x = np.arange(len(labels))
@@ -703,6 +736,7 @@ def plot_results(all_results, modes):
 def generate_report(all_results, modes, args):
     from datetime import datetime
 
+    num_v_heads = getattr(args, "num_v_heads", None)
     path = os.path.join(os.path.dirname(__file__), "benchmark_report.md")
     with open(path, "w") as f:
         f.write("# Lightning Attention Benchmark Report\n\n")
@@ -712,6 +746,7 @@ def generate_report(all_results, modes, args):
         f.write(f"- Batch sizes: {args.batch_sizes}\n")
         f.write(f"- Seq lengths: {args.seq_lens}\n")
         f.write(f"- Num heads: {args.num_heads}\n")
+        f.write(f"- Num V heads: {num_v_heads or args.num_heads}\n")
         f.write(f"- Head dim: {args.head_dim}\n")
         f.write(f"- Layer: {args.layer_idx}/{args.num_layers}\n")
         f.write(f"- Warmup/Iters: {args.warmup}/{args.iterations}\n\n")
@@ -723,8 +758,12 @@ def generate_report(all_results, modes, args):
             f.write(f"## Mode: {mode}\n\n")
 
             if mode == "varlen":
-                f.write("| N | T | Dist | Persist(ms) | NonPer(ms) | FLA_vl(ms) | P/NP | P/FLAvl | O diff | ht diff |\n")
-                f.write("|---|---|------|-------------|------------|------------|------|---------|--------|--------|\n")
+                f.write(
+                    "| N | T | H | HV | Dist | Persist(ms) | NonPer(ms) | FLA_vl(ms) | P/NP | P/FLAvl | O diff | ht diff |\n"
+                )
+                f.write(
+                    "|---|---|---|----|------|-------------|------------|------------|------|---------|--------|--------|\n"
+                )
                 for r in mr:
                     p = f"{r['persistent_ms']:.3f}" if _valid(r.get("persistent_ms", float("nan"))) else "-"
                     np_ = f"{r['nonpersistent_ms']:.3f}" if _valid(r.get("nonpersistent_ms", float("nan"))) else "-"
@@ -736,7 +775,7 @@ def generate_report(all_results, modes, args):
                     od = f"{r['p_vs_np_O_diff']:.1e}" if not np.isnan(r.get("p_vs_np_O_diff", float("nan"))) else "-"
                     hd = f"{r['p_vs_np_ht_diff']:.1e}" if not np.isnan(r.get("p_vs_np_ht_diff", float("nan"))) else "-"
                     f.write(
-                        f"| {r['B']} | {r['T']} | {r.get('dist', '')} | {p} | {np_} | {fla_vl} | {pvnp} | {pvfla_vl} | {od} | {hd} |\n"
+                        f"| {r['B']} | {r['T']} | {r['H']} | {r.get('HV', r['H'])} | {r.get('dist', '')} | {p} | {np_} | {fla_vl} | {pvnp} | {pvfla_vl} | {od} | {hd} |\n"
                     )
             else:
                 has_ht = mode == "h0_ht"
@@ -753,7 +792,7 @@ def generate_report(all_results, modes, args):
                         "|--------|---------|-------------|---------|---------------------------|----------------------------|\n"
                     )
                 for r in mr:
-                    cfg = f"B={r['B']},T={r['T']},H={r['H']}"
+                    cfg = f"B={r['B']},T={r['T']},H={r['H']},HV={r.get('HV', r['H'])}"
                     sp = f"{r['speedup']:.2f}x" if _valid(r.get("speedup", float("nan"))) else "-"
                     fla = f"{r['fla_ms']:.3f}" if _valid(r.get("fla_ms", float("nan"))) else "-"
                     dsl = f"{r['cutedsl_ms']:.3f}" if _valid(r.get("cutedsl_ms", float("nan"))) else "-"
@@ -838,6 +877,9 @@ def parse_args():
         "--seq-lens", type=int, nargs="+", default=[256, 1024, 4096, 8192, 32768], help="Sequence lengths for standard modes"
     )
     p.add_argument("--num-heads", type=int, nargs="+", default=[64], help="Number of heads to test")
+    p.add_argument(
+        "--num-v-heads", type=int, nargs="+", default=None, help="Number of value heads to test (default: same as H)"
+    )
     p.add_argument("--head-dim", type=int, default=128)
     p.add_argument("--layer-idx", type=int, default=12)
     p.add_argument("--num-layers", type=int, default=24)

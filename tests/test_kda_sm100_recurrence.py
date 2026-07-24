@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2025 ANTGROUP. All rights reserved.
+# Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
 """

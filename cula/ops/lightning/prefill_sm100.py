@@ -1,4 +1,4 @@
-# Copyright (c) 2025 ANTGROUP. All rights reserved.
+# Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
 # Redistribution and use in source and binary forms, with or without
@@ -107,7 +107,8 @@ class LinearAttentionChunkwiseDecay:
         chunk_size: Size of each attention chunk (default: 64)
         acc_dtype: Accumulator data type for all MMA computations (default: Float32)
         io_dtype: Input/output data type (default: BFloat16)
-        H: Number of attention heads
+        H: Number of Q/K heads
+        HV: Number of V/O heads. HV > H enables GVA.
         K: Key head dimension (must be 128)
         V: Value head dimension (must be 128)
         scale: Scaling factor for queries
@@ -121,6 +122,7 @@ class LinearAttentionChunkwiseDecay:
         has_initial_state: bool = False,
         output_final_state: bool = False,
         H: int = 64,
+        HV: int | None = None,
         K: int = 128,
         V: int = 128,
         scale: float = 1.0,
@@ -129,6 +131,8 @@ class LinearAttentionChunkwiseDecay:
         use_fast_math: bool = True,
     ):
         assert K == 128 and V == 128, f"K and V must both be 128, got K={K}, V={V}"
+        HV = H if HV is None else HV
+        assert HV >= H and HV % H == 0, f"HV ({HV}) must be >= H ({H}) and divisible by H"
         assert_blackwell()
         self.use_fast_math = use_fast_math
         self.chunk_size = chunk_size
@@ -145,6 +149,7 @@ class LinearAttentionChunkwiseDecay:
             self.has_initial_state = has_initial_state
             self.output_final_state = output_final_state
         self.H = H
+        self.HV = HV
         self.K = K
         self.V = V
         self.D = K  # Internal shorthand: K == V == D
@@ -349,16 +354,16 @@ class LinearAttentionChunkwiseDecay:
         (zero-copy C-level dlpack). Pass None for initial_state_in / final_state_in
         when has_initial_state / output_final_state is False.
 
-        scale, H, D are compile-time constants stored in self.__init__.
+        scale, H, HV, D are compile-time constants stored in self.__init__.
 
         Args:
             q_in: Query tensor [B, S, H, D] or [1, T, H, D] for varlen
             k_in: Key tensor [B, S, H, D] or [1, T, H, D] for varlen
-            v_in: Value tensor [B, S, H, D] or [1, T, H, D] for varlen
-            o_in: Output tensor [B, S, H, D] or [1, T, H, D] for varlen
-            decay_in: Per-head decay tensor [H] (FP32)
-            initial_state_in: Initial state [B, H, D, D] or state pool [pool, H, D, D] (FP32)
-            final_state_in: Final state [B, H, D, D] (FP32) or None (varlen uses INPLACE_UPDATE)
+            v_in: Value tensor [B, S, HV, D] or [1, T, HV, D] for varlen
+            o_in: Output tensor [B, S, HV, D] or [1, T, HV, D] for varlen
+            decay_in: Per-value-head decay tensor [HV] (FP32)
+            initial_state_in: Initial state [B, HV, D, D] or state pool [pool, HV, D, D] (FP32)
+            final_state_in: Final state [B, HV, D, D] (FP32) or None (varlen uses INPLACE_UPDATE)
             cu_seqlens_in: [N+1] int32 cumulative sequence lengths (varlen only)
             initial_state_indices_in: [N] int32 indices into state pool (varlen only)
             problem_size: (N, T) for varlen or (B, S) dynamic problem dimensions
@@ -366,6 +371,7 @@ class LinearAttentionChunkwiseDecay:
         """
         B, S = problem_size
         H = self.H
+        HV = self.HV
         D = self.D
 
         # Setup attributes
@@ -373,16 +379,16 @@ class LinearAttentionChunkwiseDecay:
 
         self.cta_group = tcgen05.CtaGroup.ONE
 
-        # It's ok since torch tensor is row major, hence we've layout=(B,S,H,D):(DHS, DH, D, 1).
+        # It's ok since torch tensor is row major, hence we've layout=(B,S,H/HV,D):(D*heads, DH, D, 1).
         # Below are just permutation tricks to ease the later processing.
-        # For varlen: input is [1, T, H, D] → view as (T, D, H) with stride (D*H, 1, D)
-        # For non-varlen: input is [B, S, H, D] → view as (S, D, (H,B))
+        # For varlen: Q/K are [1,T,H,D] -> (T,D,H); V/O are [1,T,HV,D] -> (D,T,HV)
+        # For non-varlen: Q/K use (S,D,(H,B)); V/O use (D,S,(HV,B)).
         if cutlass.const_expr(self.is_varlen):
             # Varlen: B=N (num_seqs), S=T (total_tokens), no batch stride
             q_layout = cute.make_layout((S, D, H), stride=(D * H, 1, D))
             k_layout = cute.make_layout((S, D, H), stride=(D * H, 1, D))
-            v_layout = cute.make_layout((D, S, H), stride=(1, D * H, D))
-            o_layout = cute.make_layout((D, S, H), stride=(1, D * H, D))
+            v_layout = cute.make_layout((D, S, HV), stride=(1, D * HV, D))
+            o_layout = cute.make_layout((D, S, HV), stride=(1, D * HV, D))
         else:
             q_layout = cute.make_layout(
                 (S, D, (H, B)),
@@ -393,27 +399,27 @@ class LinearAttentionChunkwiseDecay:
                 stride=(D * H, 1, (D, D * H * S)),
             )
             v_layout = cute.make_layout(
-                (D, S, (H, B)),
-                stride=(1, D * H, (D, D * H * S)),
+                (D, S, (HV, B)),
+                stride=(1, D * HV, (D, D * HV * S)),
             )
             o_layout = cute.make_layout(
-                (D, S, (H, B)),
-                stride=(1, D * H, (D, D * H * S)),
+                (D, S, (HV, B)),
+                stride=(1, D * HV, (D, D * HV * S)),
             )
         q = cute.make_tensor(q_in.iterator, q_layout)
         k = cute.make_tensor(k_in.iterator, k_layout)
         v = cute.make_tensor(v_in.iterator, v_layout)
         o = cute.make_tensor(o_in.iterator, o_layout)
 
-        # Initial state / final state: [B, H, D, D] in BHVK layout (K-contiguous)
-        # CuTe shape (V, K, (H, B)) with strides (D, 1, ...) for K-contiguous access.
+        # Initial state / final state: [B, HV, D, D] in BHVK layout (K-contiguous)
+        # CuTe shape (V, K, (HV, B)) with strides (D, 1, ...) for K-contiguous access.
         # When has_initial_state / output_final_state is False, None is passed
         # and the parameter is eliminated at compile time via const_expr guards.
-        # For varlen: state pool is [pool_size, H, D, D]. We use B (=N) as the
+        # For varlen: state pool is [pool_size, HV, D, D]. We use B (=N) as the
         # pool dimension — strides are correct regardless of actual pool_size.
         fstate_layout = cute.make_layout(
-            (D, D, (H, B)),
-            stride=(D, 1, (D * D, D * D * H)),
+            (D, D, (HV, B)),
+            stride=(D, 1, (D * D, D * D * HV)),
         )
         if cutlass.const_expr(self.has_initial_state):
             initial_state = cute.make_tensor(initial_state_in.iterator, fstate_layout)
@@ -739,8 +745,8 @@ class LinearAttentionChunkwiseDecay:
             sm_count = _torch.cuda.get_device_properties(0).multi_processor_count
             self.grid = (sm_count, 1, 1)
         elif cutlass.const_expr(self.is_varlen):
-            # Varlen grid: (1, H, N) where B = N = num_sequences
-            self.grid = (1, H, B)
+            # Varlen grid: (1, HV, N) where B = N = num_sequences
+            self.grid = (1, HV, B)
         else:
             self.grid = self._compute_grid(
                 o_shape=cute.shape(o),
@@ -1001,26 +1007,30 @@ class LinearAttentionChunkwiseDecay:
 
         B, S = problem_size
         H = self.H
+        HV = self.HV
         D = self.D
         C = self.chunk_size
         scale = cutlass.Float32(self.scale)
+        qk_group_size = HV // H
 
         # ===================== Block indices =====================
         if cutlass.const_expr(self.is_varlen):
             if cutlass.const_expr(self.persistent):
                 # 1D grid work decode: persistent (grid=SM_count)
-                total_work_units = H * B
+                total_work_units = HV * B
                 num_iters = Int32(0)  # not used, while loop controls iteration
                 # Pre-initialize variables reassigned inside persistent loop (CuTe DSL requirement)
                 hidx = Int32(0)
+                i_h = Int32(0)
                 bidx = Int32(0)
                 bos = Int32(0)
                 eos = Int32(0)
                 seq_len = Int32(0)
                 state_idx = Int32(0)
             else:
-                # Non-persistent varlen: 3D grid (1, H, N)
+                # Non-persistent varlen: 3D grid (1, HV, N)
                 (_, hidx, bidx) = cute.arch.block_idx()
+                i_h = hidx // qk_group_size
                 bos = cu_seqlens[bidx]
                 eos = cu_seqlens[bidx + 1]
                 seq_len = eos - bos
@@ -1028,6 +1038,7 @@ class LinearAttentionChunkwiseDecay:
                 num_iters = Int32(1)
         else:
             (_, hidx, bidx) = cute.arch.block_idx()
+            i_h = hidx // qk_group_size
             seq_len = S
             state_idx = bidx
             num_iters = Int32(1)
@@ -1051,7 +1062,7 @@ class LinearAttentionChunkwiseDecay:
             block_decay = Float32(0.0)
         else:
             # Non-varlen and non-persistent varlen: hidx known at CTA start
-            decay_tensor = cute.make_tensor(decay, cute.make_layout(H))
+            decay_tensor = cute.make_tensor(decay, cute.make_layout(HV))
             decay_s = decay_tensor[hidx]
             # Block-level decay: λ^C for inter-chunk state accumulation
             block_decay = cute.exp(-decay_s * cutlass.Float32(C), fastmath=self.use_fast_math)
@@ -1252,8 +1263,9 @@ class LinearAttentionChunkwiseDecay:
             while should_continue:
                 # --- Work decode (persistent only) ---
                 if cutlass.const_expr(self.is_varlen and self.persistent):
-                    hidx = work_idx % H
-                    bidx = work_idx // H
+                    hidx = work_idx % HV
+                    i_h = hidx // qk_group_size
+                    bidx = work_idx // HV
                     bos = cu_seqlens[bidx]
                     eos = cu_seqlens[bidx + 1]
                     seq_len = eos - bos
@@ -1266,7 +1278,7 @@ class LinearAttentionChunkwiseDecay:
                     tma_tensor_q_use = cute.domain_offset((bos, 0, 0), tma_tensor_q)
                     # K: (S, D, H) → offset S (mode 0) by bos
                     tma_tensor_k_use = cute.domain_offset((bos, 0, 0), tma_tensor_k)
-                    # V: (D, S, H) → offset S (mode 1) by bos
+                    # V: (D, S, HV) → offset S (mode 1) by bos
                     tma_tensor_v_use = cute.domain_offset((0, bos, 0), tma_tensor_v)
                 else:
                     tma_tensor_q_use = tma_tensor_q
@@ -1282,7 +1294,7 @@ class LinearAttentionChunkwiseDecay:
                     self.qk_mma_tiler,
                     qk_tiled_mma,
                     operand_mode="A",
-                    hidx=hidx,
+                    hidx=i_h,
                     bidx=bidx,
                     debug_name="Q",
                 )
@@ -1294,7 +1306,7 @@ class LinearAttentionChunkwiseDecay:
                     self.qk_mma_tiler,
                     qk_tiled_mma,
                     operand_mode="B",
-                    hidx=hidx,
+                    hidx=i_h,
                     bidx=bidx,
                     debug_name="K",
                 )
@@ -1384,7 +1396,7 @@ class LinearAttentionChunkwiseDecay:
             while should_continue:
                 # --- Work decode (MMA only needs seq_len) ---
                 if cutlass.const_expr(self.is_varlen and self.persistent):
-                    bidx_mma = work_idx // H
+                    bidx_mma = work_idx // HV
                     seq_len = cu_seqlens[bidx_mma + 1] - cu_seqlens[bidx_mma]
 
                 for chunk_start in cutlass.range(0, seq_len, C, unroll=0):
@@ -1699,8 +1711,9 @@ class LinearAttentionChunkwiseDecay:
             while should_continue:
                 # --- Work decode (persistent only) ---
                 if cutlass.const_expr(self.is_varlen and self.persistent):
-                    hidx = work_idx % H
-                    bidx = work_idx // H
+                    hidx = work_idx % HV
+                    i_h = hidx // qk_group_size
+                    bidx = work_idx // HV
                     bos = cu_seqlens[bidx]
                     eos = cu_seqlens[bidx + 1]
                     seq_len = eos - bos
@@ -1708,7 +1721,7 @@ class LinearAttentionChunkwiseDecay:
 
                 # Load per-head decay parameter to register (s_h > 0)
                 # For persistent: hidx was decoded above; for non-persistent: hidx from block_idx
-                decay_tensor_cuda = cute.make_tensor(decay, cute.make_layout(H))
+                decay_tensor_cuda = cute.make_tensor(decay, cute.make_layout(HV))
                 decay_s_cuda = decay_tensor_cuda[hidx]
                 block_decay = cute.exp(-decay_s_cuda * cutlass.Float32(C), fastmath=self.use_fast_math)
 
@@ -2032,8 +2045,8 @@ class LinearAttentionChunkwiseDecay:
             while should_continue:
                 # --- Work decode (persistent only) ---
                 if cutlass.const_expr(self.is_varlen and self.persistent):
-                    hidx = work_idx % H
-                    bidx = work_idx // H
+                    hidx = work_idx % HV
+                    bidx = work_idx // HV
                     bos = cu_seqlens[bidx]
                     eos = cu_seqlens[bidx + 1]
                     seq_len = eos - bos
@@ -2081,14 +2094,14 @@ class LinearAttentionChunkwiseDecay:
                             tOrO = cute.make_fragment_like(tOsO, self.io_dtype)
                             cute.autovec_copy(tOsO, tOrO)
 
-                            o_chunk_raw = o_tensor.iterator + (bos + chunk_start) * D * H + hidx * D
+                            o_chunk_raw = o_tensor.iterator + (bos + chunk_start) * D * HV + hidx * D
                             o_chunk_ptr = cute.make_ptr(
                                 self.io_dtype,
                                 o_chunk_raw.toint(),
                                 cute.AddressSpace.gmem,
                                 assumed_align=16,
                             )
-                            o_stride_c = D * H
+                            o_stride_c = D * HV
                             gO_chunk = cute.make_tensor(
                                 o_chunk_ptr,
                                 cute.make_layout(
@@ -2803,11 +2816,22 @@ def make_thread_cooperative_group(size: int):
 # Compile cache + TVM-FFI API
 # ---------------------------------------------------------------------------
 
-# Internal cache: maps (has_initial_state, output_final_state, H, D, scale, chunk_size) → compiled_fn
+# Internal cache: maps (has_initial_state, output_final_state, H, HV, D, scale, chunk_size) → compiled_fn
 _kernel_cache: dict = {}
 
 
-def _compile_single_variant(has_initial_state, output_final_state, H, D, scale, chunk_size):
+def _normalize_gva_decay(decay: torch.Tensor, H: int, HV: int) -> torch.Tensor:
+    """Return a contiguous [HV] decay tensor, accepting [H] decay for grouped cases."""
+    if decay.ndim != 1:
+        raise ValueError(f"decay must be a 1D tensor, got shape {tuple(decay.shape)}")
+    if decay.shape[0] == HV:
+        return decay.contiguous()
+    if decay.shape[0] == H and HV != H:
+        return decay.repeat_interleave(HV // H).contiguous()
+    raise ValueError(f"decay must have shape ({HV},) or ({H},), got {tuple(decay.shape)}")
+
+
+def _compile_single_variant(has_initial_state, output_final_state, H, HV, D, scale, chunk_size):
     """Compile one kernel variant. Returns the compiled TVM-FFI callable.
 
     Uses make_fake_compact_tensor and make_fake_stream for compilation with
@@ -2822,6 +2846,7 @@ def _compile_single_variant(has_initial_state, output_final_state, H, D, scale, 
         has_initial_state=has_initial_state,
         output_final_state=output_final_state,
         H=H,
+        HV=HV,
         K=D,
         V=D,
         scale=scale,
@@ -2831,7 +2856,7 @@ def _compile_single_variant(has_initial_state, output_final_state, H, D, scale, 
     sym_b = cute.sym_int()
     sym_s = cute.sym_int()
 
-    # Q, K, V, O: (B, S, H, D) row-major bf16
+    # Q/K: (B, S, H, D); V/O: (B, S, HV, D) row-major bf16
     q_fake = make_fake_compact_tensor(
         cutlass.BFloat16,
         (sym_b, sym_s, H, D),
@@ -2846,29 +2871,29 @@ def _compile_single_variant(has_initial_state, output_final_state, H, D, scale, 
     )
     v_fake = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (sym_b, sym_s, H, D),
+        (sym_b, sym_s, HV, D),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     o_fake = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (sym_b, sym_s, H, D),
+        (sym_b, sym_s, HV, D),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
 
-    # decay: (H,) float32
+    # decay: (HV,) float32
     decay_fake = make_fake_compact_tensor(
         cutlass.Float32,
-        (H,),
+        (HV,),
         assumed_align=128,
     )
 
-    # initial_state / final_state: (B, H, D, D) float32 or None
+    # initial_state / final_state: (B, HV, D, D) float32 or None
     h0_fake = (
         make_fake_compact_tensor(
             cutlass.Float32,
-            (sym_b, H, D, D),
+            (sym_b, HV, D, D),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
@@ -2878,7 +2903,7 @@ def _compile_single_variant(has_initial_state, output_final_state, H, D, scale, 
     ht_fake = (
         make_fake_compact_tensor(
             cutlass.Float32,
-            (sym_b, H, D, D),
+            (sym_b, HV, D, D),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
@@ -2929,7 +2954,7 @@ def _compile_single_variant(has_initial_state, output_final_state, H, D, scale, 
     return compiled_fn
 
 
-def _get_compiled_kernel(has_initial_state, output_final_state, H, D, scale, chunk_size):
+def _get_compiled_kernel(has_initial_state, output_final_state, H, HV, D, scale, chunk_size):
     """Get a compiled kernel with on-demand (lazy) compilation.
 
     Each variant is compiled exactly once and cached.  Compilation is deferred
@@ -2938,14 +2963,15 @@ def _get_compiled_kernel(has_initial_state, output_final_state, H, D, scale, chu
     where a subsequent cute.compile can invalidate previously compiled but
     not-yet-executed functions.
 
-    Cache key: (has_initial_state, output_final_state, H, D, scale, chunk_size, USE_FAST_MATH)
+    Cache key: (has_initial_state, output_final_state, H, HV, D, scale, chunk_size, USE_FAST_MATH)
     """
-    key = (has_initial_state, output_final_state, H, D, scale, chunk_size, USE_FAST_MATH)
+    key = (has_initial_state, output_final_state, H, HV, D, scale, chunk_size, USE_FAST_MATH)
     if key not in _kernel_cache:
         _kernel_cache[key] = _compile_single_variant(
             has_initial_state,
             output_final_state,
             H,
+            HV,
             D,
             scale,
             chunk_size,
@@ -2971,23 +2997,34 @@ def lightning_attn_fwd(
     sym_int() is used for B and S so a single compilation handles all
     batch-size / sequence-length combinations.
 
-    Cache key: (has_initial_state, output_final_state, H, D, scale, chunk_size)
+    Cache key: (has_initial_state, output_final_state, H, HV, D, scale, chunk_size)
 
     Args:
         Q: (B, S, H, D) bf16 query
         K: (B, S, H, D) bf16 key
-        V: (B, S, H, D) bf16 value
-        decay: (H,) f32 per-head decay coefficients
+        V: (B, S, HV, D) bf16 value. HV > H enables GVA.
+        decay: (HV,) f32 per-value-head decay coefficients; (H,) is accepted and expanded
         scale: attention scale factor (default: 1.0)
-        initial_state: (B, H, D, D) f32 initial state in BHVK layout, or None
+        initial_state: (B, HV, D, D) f32 initial state in BHVK layout, or None
         output_final_state: whether to output final state
         chunk_size: chunk size (default: 64)
 
     Returns:
-        (O, ht): output tensor (B,S,H,D) bf16, final state (B,H,D,D) f32 in BHVK layout or None
+        (O, ht): output tensor (B,S,HV,D) bf16, final state (B,HV,D,D) f32 in BHVK layout or None
     """
     B, S, H, D = Q.shape
-    O = torch.zeros_like(Q)
+    if K.shape != Q.shape:
+        raise ValueError(f"K must have the same shape as Q, got K={tuple(K.shape)}, Q={tuple(Q.shape)}")
+    if V.ndim != 4 or V.shape[0] != B or V.shape[1] != S or V.shape[3] != D:
+        raise ValueError(f"V must have shape (B, S, HV, D), got {tuple(V.shape)}")
+    HV = V.shape[2]
+    if HV < H or HV % H != 0:
+        raise ValueError(f"HV ({HV}) must be >= H ({H}) and divisible by H")
+    decay = _normalize_gva_decay(decay, H, HV)
+    if initial_state is not None and initial_state.shape != (B, HV, D, D):
+        raise ValueError(f"initial_state must have shape {(B, HV, D, D)}, got {tuple(initial_state.shape)}")
+
+    O = torch.zeros_like(V)
 
     has_initial_state = initial_state is not None
 
@@ -2995,13 +3032,14 @@ def lightning_attn_fwd(
         has_initial_state,
         output_final_state,
         H,
+        HV,
         D,
         scale,
         chunk_size,
     )
 
     if output_final_state:
-        ht = torch.zeros(B, H, D, D, dtype=torch.float32, device=Q.device)
+        ht = torch.zeros(B, HV, D, D, dtype=torch.float32, device=Q.device)
     else:
         ht = None
 
@@ -3036,7 +3074,7 @@ def lightning_attn_fwd(
 _varlen_kernel_cache: dict = {}
 
 
-def _compile_single_variant_varlen(H, D, scale, chunk_size, persistent=True):
+def _compile_single_variant_varlen(H, HV, D, scale, chunk_size, persistent=True):
     """Compile one varlen kernel variant. Returns the compiled TVM-FFI callable.
 
     Varlen kernel always has initial state and output_final_state (INPLACE_UPDATE).
@@ -3048,6 +3086,7 @@ def _compile_single_variant_varlen(H, D, scale, chunk_size, persistent=True):
         has_initial_state=True,
         output_final_state=True,
         H=H,
+        HV=HV,
         K=D,
         V=D,
         scale=scale,
@@ -3059,7 +3098,7 @@ def _compile_single_variant_varlen(H, D, scale, chunk_size, persistent=True):
     sym_n = cute.sym_int()  # N: number of sequences
     sym_t = cute.sym_int()  # T: total packed tokens
 
-    # Q, K, V, O: [1, T, H, D] row-major bf16
+    # Q/K: [1, T, H, D]; V/O: [1, T, HV, D] row-major bf16
     # For varlen, B=1 in the physical tensor but we view as (T, D, H)
     q_fake = make_fake_compact_tensor(
         cutlass.BFloat16,
@@ -3075,29 +3114,29 @@ def _compile_single_variant_varlen(H, D, scale, chunk_size, persistent=True):
     )
     v_fake = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (1, sym_t, H, D),
+        (1, sym_t, HV, D),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     o_fake = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (1, sym_t, H, D),
+        (1, sym_t, HV, D),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
 
-    # decay: (H,) float32
+    # decay: (HV,) float32
     decay_fake = make_fake_compact_tensor(
         cutlass.Float32,
-        (H,),
+        (HV,),
         assumed_align=128,
     )
 
-    # State pool: [pool_size, H, D, D] float32 — always present for varlen
+    # State pool: [pool_size, HV, D, D] float32 — always present for varlen
     # Use sym_n as pool dimension (actual pool may be larger, strides are correct)
     h0_fake = make_fake_compact_tensor(
         cutlass.Float32,
-        (sym_n, H, D, D),
+        (sym_n, HV, D, D),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
@@ -3149,15 +3188,16 @@ def _compile_single_variant_varlen(H, D, scale, chunk_size, persistent=True):
     return compiled_fn
 
 
-def _get_compiled_kernel_varlen(H, D, scale, chunk_size, persistent=True):
+def _get_compiled_kernel_varlen(H, HV, D, scale, chunk_size, persistent=True):
     """Get a compiled varlen kernel with on-demand compilation.
 
-    Cache key: (H, D, scale, chunk_size, persistent, USE_FAST_MATH)
+    Cache key: (H, HV, D, scale, chunk_size, persistent, USE_FAST_MATH)
     """
-    key = (H, D, scale, chunk_size, persistent, USE_FAST_MATH)
+    key = (H, HV, D, scale, chunk_size, persistent, USE_FAST_MATH)
     if key not in _varlen_kernel_cache:
         _varlen_kernel_cache[key] = _compile_single_variant_varlen(
             H,
+            HV,
             D,
             scale,
             chunk_size,
@@ -3191,11 +3231,11 @@ def lightning_attn_fwd_varlen(
     Args:
         Q: (1, T, H, D) bf16 query — packed tokens from all sequences
         K: (1, T, H, D) bf16 key
-        V: (1, T, H, D) bf16 value
-        decay: (H,) f32 per-head decay coefficients
+        V: (1, T, HV, D) bf16 value. HV > H enables GVA.
+        decay: (HV,) f32 per-value-head decay coefficients; (H,) is accepted and expanded
         cu_seqlens: (N+1,) int32 cumulative sequence lengths
         scale: attention scale factor (default: 1.0)
-        state_pool: (pool_size, H, D, D) f32 state pool in BHVK layout, or None
+        state_pool: (pool_size, HV, D, D) f32 state pool in BHVK layout, or None
             If None, a zero state pool is allocated with pool_size=N.
             States are updated in-place (INPLACE_UPDATE).
         initial_state_indices: (N,) int32 indices into state_pool per sequence.
@@ -3203,15 +3243,25 @@ def lightning_attn_fwd_varlen(
         chunk_size: chunk size (default: 64)
 
     Returns:
-        (O, state_pool): output tensor (1,T,H,D) bf16, updated state pool (pool_size,H,D,D) f32
+        (O, state_pool): output tensor (1,T,HV,D) bf16, updated state pool (pool_size,HV,D,D) f32
     """
     _, T, H, D = Q.shape
+    if K.shape != Q.shape:
+        raise ValueError(f"K must have the same shape as Q, got K={tuple(K.shape)}, Q={tuple(Q.shape)}")
+    if V.ndim != 4 or V.shape[0] != 1 or V.shape[1] != T or V.shape[3] != D:
+        raise ValueError(f"V must have shape (1, T, HV, D), got {tuple(V.shape)}")
+    HV = V.shape[2]
+    if HV < H or HV % H != 0:
+        raise ValueError(f"HV ({HV}) must be >= H ({H}) and divisible by H")
+    decay = _normalize_gva_decay(decay, H, HV)
     N = cu_seqlens.shape[0] - 1
-    O = torch.zeros_like(Q)
+    O = torch.zeros_like(V)
 
     # Allocate state pool if not provided
     if state_pool is None:
-        state_pool = torch.zeros(N, H, D, D, dtype=torch.float32, device=Q.device)
+        state_pool = torch.zeros(N, HV, D, D, dtype=torch.float32, device=Q.device)
+    elif state_pool.ndim != 4 or state_pool.shape[1:] != (HV, D, D):
+        raise ValueError(f"state_pool must have shape (pool_size, {HV}, {D}, {D}), got {tuple(state_pool.shape)}")
 
     # Default indices: identity mapping
     if initial_state_indices is None:
@@ -3221,7 +3271,7 @@ def lightning_attn_fwd_varlen(
     cu_seqlens = cu_seqlens.to(torch.int32)
     initial_state_indices = initial_state_indices.to(torch.int32)
 
-    compiled_fn = _get_compiled_kernel_varlen(H, D, scale, chunk_size, persistent=persistent)
+    compiled_fn = _get_compiled_kernel_varlen(H, HV, D, scale, chunk_size, persistent=persistent)
 
     # Workspace for persistent kernel atomic counter (zeroed before each call)
     workspace = torch.zeros(1, dtype=torch.int32, device=Q.device)
@@ -3253,6 +3303,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
     parser.add_argument("--seq_len", type=int, default=4096, help="Sequence length")
     parser.add_argument("--num_heads", type=int, default=64, help="Number of heads")
+    parser.add_argument("--num_v_heads", type=int, default=None, help="Number of value heads (default: num_heads)")
     parser.add_argument("--head_dim", type=int, default=128, help="Head dimension")
     parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size")
     parser.add_argument("--decay", type=float, default=0.95, help="Decay factor")
@@ -3267,6 +3318,7 @@ def main():
     print(f"  Batch size: {args.batch_size}")
     print(f"  Sequence length: {args.seq_len}")
     print(f"  Number of heads: {args.num_heads}")
+    print(f"  Number of value heads: {args.num_v_heads or args.num_heads}")
     print(f"  Head dimension: {args.head_dim}")
     print(f"  Chunk size: {args.chunk_size}")
     print(f"  Decay factor: {args.decay}")
@@ -3281,14 +3333,15 @@ def main():
 
     # Create inputs
     B, S, H, D = args.batch_size, args.seq_len, args.num_heads, args.head_dim
+    HV = args.num_v_heads if args.num_v_heads is not None else H
 
     # Input tensors in format [B, S, H, D]
     Q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    V = torch.randn(B, S, HV, D, device="cuda", dtype=torch.bfloat16)
 
-    # Per-head decay coefficients [H]
-    decay = torch.full((H,), args.decay, device="cuda", dtype=torch.float32)
+    # Per-value-head decay coefficients [HV]
+    decay = torch.full((HV,), args.decay, device="cuda", dtype=torch.float32)
 
     scale = 1.0 / (D**0.5)
 
@@ -3307,7 +3360,7 @@ def main():
     compilation_time = time.time() - start_time
     print(f"Compilation + first run time: {compilation_time:.4f} seconds")
 
-    print(f"B, S, H, D: {(B, S, H, D)}")
+    print(f"B, S, H, HV, D: {(B, S, H, HV, D)}")
 
     # Warmup (uses cached kernel — no recompilation)
     for _ in range(args.warmup_iterations):

@@ -76,7 +76,7 @@ def la_decode_kernel_small_batch_pretranspose(
     smem_layout_staged: cute.Layout,
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
-    decay_scales: cute.Tensor,  # [H]
+    decay_scales: cute.Tensor,  # [HV]
     q: cute.Tensor,  # [B, T, H, K]
     k: cute.Tensor,  # [B, T, H, K]
     v: cute.Tensor,  # [B, T, HV, V]
@@ -86,6 +86,7 @@ def la_decode_kernel_small_batch_pretranspose(
     B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
+    HV: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
     NUM_WARPS: cutlass.Constexpr[int] = 4,
@@ -94,7 +95,6 @@ def la_decode_kernel_small_batch_pretranspose(
 ):
     """Each block uses pipeline to load one batch and vectorized writeback"""
 
-    HV = H
     tidx, _, _ = cute.arch.thread_idx()
     lane_id = tidx % 32
     warp_idx = cute.arch.warp_idx()
@@ -121,7 +121,7 @@ def la_decode_kernel_small_batch_pretranspose(
     r_q = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_v = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_h = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
-    r_decay_scale = -cutlass.Float32(decay_scales[i_h])
+    r_decay_scale = -cutlass.Float32(decay_scales[i_hv])
     r_decay = cute.exp(r_decay_scale, fastmath=USE_FAST_MATH)
 
     cute.arch.barrier()
@@ -244,7 +244,7 @@ def la_decode_kernel_big_batch_pretranspose(
     smem_layout_staged: cute.Layout,
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
-    decay_scales: cute.Tensor,  # [H]
+    decay_scales: cute.Tensor,  # [HV]
     q: cute.Tensor,  # [B, T, H, K]
     k: cute.Tensor,  # [B, T, H, K]
     v: cute.Tensor,  # [B, T, HV, V]
@@ -254,6 +254,7 @@ def la_decode_kernel_big_batch_pretranspose(
     B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
+    HV: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
     NUM_WARPS: cutlass.Constexpr[int] = 4,
@@ -262,7 +263,6 @@ def la_decode_kernel_big_batch_pretranspose(
 ):
     """Each block uses pipeline to load one batch and vectorized writeback"""
 
-    HV = H
     tidx, _, _ = cute.arch.thread_idx()
     lane_id = tidx % 32
     warp_idx = cute.arch.warp_idx()
@@ -330,7 +330,7 @@ def la_decode_kernel_big_batch_pretranspose(
     for i in cutlass.range_constexpr(vec_size):
         r_q[i] = r_q[i] * scale
 
-    r_g = cute.exp(-cutlass.Float32(decay_scales[i_h]), fastmath=USE_FAST_MATH)
+    r_g = cute.exp(-cutlass.Float32(decay_scales[i_hv]), fastmath=USE_FAST_MATH)
 
     # ===================================================================
     # Mainloop: All threads participate
@@ -404,8 +404,8 @@ def la_decode_kernel_big_batch_pretranspose(
 
 @cute.jit
 def run_la_decode_kernel_big_batch_pretranspose(
-    h0_source: cute.Tensor,  # [B*H, V, K]
-    decay_scales: cute.Tensor,  # [H]
+    h0_source: cute.Tensor,  # [pool_size*HV, V, K]
+    decay_scales: cute.Tensor,  # [HV]
     q: cute.Tensor,
     k: cute.Tensor,
     v: cute.Tensor,
@@ -413,13 +413,14 @@ def run_la_decode_kernel_big_batch_pretranspose(
     h0_indices: cute.Tensor,
     softmax_scale: cutlass.Constexpr[float],
     H: cutlass.Constexpr[int],
+    HV: cutlass.Constexpr[int],
     B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
-    # h0_source: (B*HV, V, K)
+    # h0_source: (pool_size*HV, V, K)
     _pool_dim0, v_dim, _k_dim = (
         h0_source.layout.shape[0],
         h0_source.layout.shape[1],
@@ -473,13 +474,14 @@ def run_la_decode_kernel_big_batch_pretranspose(
         B,
         T,
         H,
+        HV,
         K,
         V,
         NUM_WARPS_BIG,
         TILE_V_BIG,
         NUM_STAGES_BIG,
     ).launch(
-        grid=(B * H, 1, 1),
+        grid=(B * HV, 1, 1),
         block=[NUM_THREADS_BIG, 1, 1],
         smem=smem_bytes,
         stream=stream,
@@ -488,8 +490,8 @@ def run_la_decode_kernel_big_batch_pretranspose(
 
 @cute.jit
 def run_la_decode_kernel_small_batch_pretranspose(
-    h0_source: cute.Tensor,  # [B*H, V, K]
-    decay_scales: cute.Tensor,  # [H]
+    h0_source: cute.Tensor,  # [pool_size*HV, V, K]
+    decay_scales: cute.Tensor,  # [HV]
     q: cute.Tensor,
     k: cute.Tensor,
     v: cute.Tensor,
@@ -497,13 +499,14 @@ def run_la_decode_kernel_small_batch_pretranspose(
     h0_indices: cute.Tensor,
     softmax_scale: cutlass.Constexpr[float],
     H: cutlass.Constexpr[int],
+    HV: cutlass.Constexpr[int],
     B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
-    # h0_source: (B*H, V, K)
+    # h0_source: (pool_size*HV, V, K)
     _pool_dim0, v_dim, _k_dim = (
         h0_source.layout.shape[0],
         h0_source.layout.shape[1],
@@ -557,13 +560,14 @@ def run_la_decode_kernel_small_batch_pretranspose(
         B,
         T,
         H,
+        HV,
         K,
         V,
         NUM_WARPS_SMALL,
         TILE_V_SMALL,
         NUM_STAGES_SMALL,
     ).launch(
-        grid=(B * H * NUM_BLOCKS_PER_STATE, 1, 1),
+        grid=(B * HV * NUM_BLOCKS_PER_STATE, 1, 1),
         block=[NUM_THREADS_SMALL, 1, 1],
         smem=smem_bytes,
         stream=stream,
@@ -572,18 +576,18 @@ def run_la_decode_kernel_small_batch_pretranspose(
 
 @functools.cache
 def _get_compiled_kernel(
-    B: int, T: int, H: int, K: int, V: int, pool_dim0: int, softmax_scale: float, use_fast_math: bool = True
+    B: int, T: int, H: int, HV: int, K: int, V: int, pool_dim0: int, softmax_scale: float, use_fast_math: bool = True
 ):
     """Get or create compiled kernel cache."""
     return {}
 
 
 def linear_attention_decode(
-    q: torch.Tensor,  # [B, 1, H, HEAD_DIM], same as [B, 1, H, K]
-    k: torch.Tensor,  # [B, 1, H, HEAD_DIM], same as [B, 1, H, K]
-    v: torch.Tensor,  # [B, 1, H, HEAD_DIM], same as [B, 1, H, V]
-    s: torch.Tensor,  # [pool_size, heads, V, K]
-    out: torch.Tensor,  # [B, 1, H, HEAD_DIM]
+    q: torch.Tensor,  # [B, H, HEAD_DIM], same as [B, H, K]
+    k: torch.Tensor,  # [B, H, HEAD_DIM], same as [B, H, K]
+    v: torch.Tensor,  # [B, HV, HEAD_DIM], same as [B, HV, V]
+    s: torch.Tensor,  # [pool_size * HV, V, K]
+    out: torch.Tensor,  # [B, HV, HEAD_DIM]
     softmax_scale: float,
     stride_q: int,
     stride_k: int,
@@ -591,7 +595,7 @@ def linear_attention_decode(
     stride_s: int,
     stride_o: int,
     s_offsets: torch.Tensor,  # [B] - state pool indices
-    decay_scales: torch.Tensor,  # [H]
+    decay_scales: torch.Tensor,  # [HV] or [H]
     HEAD_DIM: int,
     K_SPLIT_DIM: int,
     V_SPLIT_DIM: int,
@@ -603,9 +607,9 @@ def linear_attention_decode(
     Args:
         q: Query tensor [B, H, HEAD_DIM]
         k: Key tensor [B, H, HEAD_DIM]
-        v: Value tensor [B, H, HEAD_DIM]
-        s: State pool tensor [pool_size, heads, K*V]
-        out: Output tensor [k_dim_block, length, heads, HEAD_DIM]
+        v: Value tensor [B, HV, HEAD_DIM]
+        s: State pool tensor [pool_size * HV, V, K] in BHVK layout
+        out: Output tensor [B, HV, HEAD_DIM]
         softmax_scale: Softmax scale factor
         stride_q: Stride of q tensor
         stride_k: Stride of k tensor
@@ -613,7 +617,7 @@ def linear_attention_decode(
         stride_s: Stride of s tensor
         stride_o: Stride of out tensor
         s_offsets: State pool indices [B]
-        decay_scales: Decay scales per head [H]
+        decay_scales: Decay scales per value head [HV]. A [H] tensor is accepted and expanded.
         HEAD_DIM: Head dimension
         K_SPLIT_DIM: K split dimension (must be HEAD_DIM for no split)
         V_SPLIT_DIM: V split dimension (must be HEAD_DIM for no split)
@@ -621,8 +625,27 @@ def linear_attention_decode(
     Returns:
         None (modifies out and s in-place)
     """
+    if q.ndim != 3 or q.shape[2] != HEAD_DIM:
+        raise ValueError(f"q must have shape (B, H, HEAD_DIM), got {tuple(q.shape)}")
+    if k.shape != q.shape:
+        raise ValueError(f"k must have the same shape as q, got k={tuple(k.shape)}, q={tuple(q.shape)}")
     B = q.shape[0]
     H = q.shape[1]
+    if v.ndim != 3 or v.shape[0] != B or v.shape[2] != HEAD_DIM:
+        raise ValueError(f"v must have shape (B, HV, HEAD_DIM), got {tuple(v.shape)}")
+    HV = v.shape[1]
+    if out.shape != (B, HV, HEAD_DIM):
+        raise ValueError(f"out must have shape {(B, HV, HEAD_DIM)}, got {tuple(out.shape)}")
+    if HV < H or HV % H != 0:
+        raise ValueError(f"HV ({HV}) must be >= H ({H}) and divisible by H")
+    if decay_scales.ndim != 1:
+        raise ValueError(f"decay_scales must be 1D, got {tuple(decay_scales.shape)}")
+    if decay_scales.shape[0] == H and HV != H:
+        decay_scales = decay_scales.repeat_interleave(HV // H).contiguous()
+    elif decay_scales.shape[0] == HV:
+        decay_scales = decay_scales.contiguous()
+    else:
+        raise ValueError(f"decay_scales must have shape ({HV},) or ({H},), got {tuple(decay_scales.shape)}")
 
     k_dim_block = HEAD_DIM // K_SPLIT_DIM
     if k_dim_block > 1:
@@ -630,13 +653,13 @@ def linear_attention_decode(
 
     # Get compiled kernel (cached)
     pool_dim0 = s.shape[0]
-    cache_key = (B, 1, H, HEAD_DIM, HEAD_DIM, pool_dim0, softmax_scale, USE_FAST_MATH)
+    cache_key = (B, 1, H, HV, HEAD_DIM, HEAD_DIM, pool_dim0, softmax_scale, USE_FAST_MATH)
     cache = _get_compiled_kernel(*cache_key)
 
     h0_source = s
 
     # Validate state pool dimensions
-    assert s.shape[0] % H == 0, f"s.shape[0] must be divisible by H={H}, got {s.shape[0]}"
+    assert s.shape[0] % HV == 0, f"s.shape[0] must be divisible by HV={HV}, got {s.shape[0]}"
     # First-time compilation
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -674,6 +697,7 @@ def linear_attention_decode(
             h0_idx_tensor,
             softmax_scale=softmax_scale,
             H=H,
+            HV=HV,
             B=B,
             T=1,
             K=HEAD_DIM,
@@ -690,11 +714,11 @@ def linear_attention_decode(
 
 
 def seg_la_d_kernel_cute(
-    q: torch.Tensor,  # [B, 1, heads, HEAD_DIM]
-    k: torch.Tensor,  # [B, 1, heads, HEAD_DIM]
-    v: torch.Tensor,  # [B, 1, heads, HEAD_DIM]
-    s: torch.Tensor,  # [pool_size, heads, K*V]
-    out: torch.Tensor,  # [B, 1, heads, HEAD_DIM]
+    q: torch.Tensor,  # [B, H, HEAD_DIM]
+    k: torch.Tensor,  # [B, H, HEAD_DIM]
+    v: torch.Tensor,  # [B, HV, HEAD_DIM]
+    s: torch.Tensor,  # [pool_size * HV, V, K]
+    out: torch.Tensor,  # [B, HV, HEAD_DIM]
     softmax_scale: float,
     stride_q: int,
     stride_k: int,
@@ -702,7 +726,7 @@ def seg_la_d_kernel_cute(
     stride_s: int,
     stride_o: int,
     s_offsets: torch.Tensor,  # [B] - state pool indices
-    decay_scales: torch.Tensor,  # [H]
+    decay_scales: torch.Tensor,  # [HV] or [H]
     HEAD_DIM: int,
     K_SPLIT_DIM: int,
     V_SPLIT_DIM: int,

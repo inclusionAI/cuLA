@@ -224,8 +224,3 @@ kda_fwd_prefill(
 
     return {output, output_state};
 }
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "cuLA SM90 kernels";
-    m.def("kda_fwd_prefill", &kda_fwd_prefill);
-}

@@ -149,23 +149,25 @@ python benchmarks/generate_benchmark_hopper_md.py
 
 ```bash
 # Tests for modular KDA forward against FLA Triton implementation
-python -m pytest tests/test_kda_compare_fla.py -v
+python -m pytest tests/test_kda_sm100_chunk_vs_fla.py -v
 # Tests for modular KDA forward against naive KDA reference
-python -m pytest tests/test_kda.py -v
-# Tests for KDA fused forward
+python -m pytest tests/test_kda_sm100_chunk_vs_naive.py -v
+# Tests for the KDA fused forward (SM90 CUDA C++)
 python -m pytest tests/test_kda_fused_fwd.py -v
-# Tests for Lightning Attention fused forward
-python tests/test_lightning_attn.py
+# Tests for the SM90 CuTeDSL two-kernel prefill + intracard CP (vs FLA)
+python -m pytest tests/test_kda_sm90_prefill_vs_fla.py tests/test_kda_sm90_intracard_cp.py -v
+# Tests for Lightning Attention prefill
+python tests/test_lightning_sm100_prefill.py
 # Tests for Lightning Attention decode
-python -m pytest tests/test_la_decode.py -v
+python -m pytest tests/test_lightning_decode.py -v
 
-# test_kda.py and test_kda_compare_fla.py support a fast/slow split.
+# test_kda_sm100_chunk_vs_naive.py and test_kda_sm100_chunk_vs_fla.py support a fast/slow split.
 # Fast (default) — representative correctness paths for default CI and local iteration
-python -m pytest tests/test_kda.py tests/test_kda_compare_fla.py -v
+python -m pytest tests/test_kda_sm100_chunk_vs_naive.py tests/test_kda_sm100_chunk_vs_fla.py -v
 # Slow — broader stress coverage for nightly or manual runs
-python -m pytest -m kda_slow tests/test_kda.py tests/test_kda_compare_fla.py -v
+python -m pytest -m kda_slow tests/test_kda_sm100_chunk_vs_naive.py tests/test_kda_sm100_chunk_vs_fla.py -v
 # Full sweep (fast + slow) — run before submitting a PR
-python -m pytest -m kda_full tests/test_kda.py tests/test_kda_compare_fla.py -v
+python -m pytest -m kda_full tests/test_kda_sm100_chunk_vs_naive.py tests/test_kda_sm100_chunk_vs_fla.py -v
 ```
 
 <details>

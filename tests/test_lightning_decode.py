@@ -48,45 +48,59 @@ def torch_la_decode_ref(q, k, v, state, decay_scales, scale):
     Pure PyTorch reference for single-token linear attention decode.
 
     Args:
-        q, k, v: [B, H, D] bf16
-        state: [B, H, D, D] fp32  (K x V layout)
-        decay_scales: [H] fp32 (positive values; kernel does exp(-decay))
+        q, k: [B, H, D] bf16
+        v: [B, HV, D] bf16
+        state: [B, HV, D, D] fp32  (K x V layout)
+        decay_scales: [HV] or [H] fp32 (positive values; kernel does exp(-decay))
         scale: float
 
     Returns:
-        o: [B, H, D] bf16
-        state_new: [B, H, D, D] fp32
+        o: [B, HV, D] bf16
+        state_new: [B, HV, D, D] fp32
     """
     B, H, D = q.shape
+    HV = v.shape[1]
+    assert HV >= H and HV % H == 0, f"HV ({HV}) must be >= H ({H}) and divisible by H"
+    group_size = HV // H
+    if group_size > 1:
+        q = q.repeat_interleave(group_size, dim=1)
+        k = k.repeat_interleave(group_size, dim=1)
+    if decay_scales.shape[0] == H and HV != H:
+        decay_scales = decay_scales.repeat_interleave(group_size)
+
     q_f = q.float() * scale
     k_f = k.float()
     v_f = v.float()
 
-    decay = torch.exp(-decay_scales).view(1, H, 1, 1)  # [1, H, 1, 1]
-    state_new = state * decay + k_f.unsqueeze(-1) * v_f.unsqueeze(-2)  # [B,H,D,D]
-    o = torch.einsum("bhk,bhkv->bhv", q_f, state_new)  # [B,H,D]
+    decay = torch.exp(-decay_scales).view(1, HV, 1, 1)  # [1, HV, 1, 1]
+    state_new = state * decay + k_f.unsqueeze(-1) * v_f.unsqueeze(-2)  # [B,HV,D,D]
+    o = torch.einsum("bhk,bhkv->bhv", q_f, state_new)  # [B,HV,D]
     return o.to(torch.bfloat16), state_new
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def make_inputs(B, H, D, device="cuda", seed=42):
+def make_inputs(B, H, D, HV=None, device="cuda", seed=42):
     torch.manual_seed(seed)
+    HV = H if HV is None else HV
     q = torch.randn(B, H, D, device=device, dtype=torch.bfloat16)
     k = torch.randn(B, H, D, device=device, dtype=torch.bfloat16)
-    v = torch.randn(B, H, D, device=device, dtype=torch.bfloat16)
-    state = torch.randn(B, H, D, D, device=device, dtype=torch.float32) * 0.01
+    v = torch.randn(B, HV, D, device=device, dtype=torch.bfloat16)
+    state = torch.randn(B, HV, D, D, device=device, dtype=torch.float32) * 0.01
     return q, k, v, state
 
 
 def run_la_decode(q, k, v, state_4d, decay_scales, scale):
     """Run la_decode with proper state layout conversion."""
-    B, H, D, _ = state_4d.shape
-    # la_decode kernel expects BHVK layout: [B*H, V, K]
-    # Reference/test state is BHKV: [B, H, K, V] → transpose to BHVK
-    state_cute = state_4d.clone().transpose(-1, -2).contiguous().reshape(B * H, D, D)
-    out = torch.zeros(B, H, D, device=q.device, dtype=torch.bfloat16)
+    B, H, D = q.shape
+    HV = v.shape[1]
+    assert state_4d.shape == (B, HV, D, D)
+
+    # la_decode kernel expects BHVK layout: [B*HV, V, K]
+    # Reference/test state is BHKV: [B, HV, K, V] -> transpose to BHVK
+    state_cute = state_4d.clone().transpose(-1, -2).contiguous().reshape(B * HV, D, D)
+    out = torch.zeros(B, HV, D, device=q.device, dtype=torch.bfloat16)
     s_offsets = torch.arange(B, device=q.device, dtype=torch.int32)
 
     linear_attention_decode(
@@ -108,7 +122,7 @@ def run_la_decode(q, k, v, state_4d, decay_scales, scale):
         V_SPLIT_DIM=D,
     )
     # Convert output state back from BHVK to BHKV for comparison
-    state_out = state_cute.reshape(B, H, D, D).transpose(-1, -2).contiguous()
+    state_out = state_cute.reshape(B, HV, D, D).transpose(-1, -2).contiguous()
     return out, state_out
 
 
@@ -156,6 +170,27 @@ def test_different_heads(H):
     state_rmse = torch.sqrt(torch.mean((state_cute - state_ref) ** 2)).item()
     state_max = torch.abs(state_ref).max().item()
     assert state_rmse / (state_max + 1e-8) < 0.001, f"H={H}: state mismatch"
+
+
+@pytest.mark.parametrize("B", [2, 33])
+@pytest.mark.parametrize("decay_head_space", ["qk", "value"])
+def test_gva_output_vs_torch_ref(B, decay_head_space):
+    H, HV, D = 8, 16, 128
+    scale = D**-0.5
+    decay_hv = 0.5 * torch.arange(HV, device="cuda", dtype=torch.float32) / HV
+    decay_scales = decay_hv[:: HV // H] if decay_head_space == "qk" else decay_hv
+
+    q, k, v, state = make_inputs(B, H, D, HV=HV)
+    o_ref, state_ref = torch_la_decode_ref(q, k, v, state, decay_scales, scale)
+    o_cute, state_cute = run_la_decode(q, k, v, state, decay_scales, scale)
+
+    rmse = torch.sqrt(torch.mean((o_cute.float() - o_ref.float()) ** 2)).item()
+    max_ref = torch.abs(o_ref.float()).max().item()
+    assert rmse / (max_ref + 1e-8) < 0.01, f"GVA B={B}: output mismatch"
+
+    state_rmse = torch.sqrt(torch.mean((state_cute - state_ref) ** 2)).item()
+    state_max = torch.abs(state_ref).max().item()
+    assert state_rmse / (state_max + 1e-8) < 0.001, f"GVA B={B}: state mismatch"
 
 
 def test_zero_decay():
@@ -229,21 +264,55 @@ def test_vs_fla(B):
     # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not HAS_FLA, reason="fla not available")
+@pytest.mark.parametrize("B", [2, 33])
+def test_gva_vs_fla(B):
+    H, HV, D = 8, 16, 128
+    scale = D**-0.5
+    g_gamma = -(8 / HV * 0.5) * torch.arange(HV, device="cuda", dtype=torch.float32)
+    decay_scales = -g_gamma
+    group_size = HV // H
+
+    q, k, v, state = make_inputs(B, H, D, HV=HV)
+
+    q_4d = q.repeat_interleave(group_size, dim=1).unsqueeze(1)
+    k_4d = k.repeat_interleave(group_size, dim=1).unsqueeze(1)
+    v_4d = v.unsqueeze(1)
+    with torch.no_grad():
+        o_fla, _ = fused_recurrent_fwd(
+            q_4d,
+            k_4d,
+            v_4d,
+            g_gamma=g_gamma,
+            scale=scale,
+            initial_state=state.clone(),
+            output_final_state=True,
+        )
+    o_fla = o_fla.squeeze(1).to(torch.bfloat16)
+
+    o_cute, _ = run_la_decode(q, k, v, state, decay_scales, scale)
+
+    rmse = torch.sqrt(torch.mean((o_cute.float() - o_fla.float()) ** 2)).item()
+    max_ref = torch.abs(o_fla.float()).max().item()
+    assert rmse / (max_ref + 1e-8) < 0.005, f"GVA B={B}: vs fla mismatch, rel_rmse={rmse / (max_ref + 1e-8):.6f}"
+
+
 # End-to-End Prefill -> Decode Test
 # ---------------------------------------------------------------------------
 @pytest.mark.sm100_only
-def test_prefill_decode_e2e():
+@pytest.mark.parametrize("H, HV", [(8, 8), (4, 8)])
+def test_prefill_decode_e2e(H, HV):
     """Verify prefill output state passes directly into decode without transpose."""
     from cula.ops.lightning.prefill_sm100 import lightning_attn_fwd
 
-    B, S, H, D = 2, 64, 8, 128
+    B, S, D = 2, 64, 128
     scale = D**-0.5
-    decay_scales = 0.5 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+    decay_scales = 0.5 * torch.arange(HV, device="cuda", dtype=torch.float32) / HV
 
     # Dummy prefill tokens
     q_pre = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     k_pre = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    v_pre = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    v_pre = torch.randn(B, S, HV, D, device="cuda", dtype=torch.bfloat16)
 
     # 1. Run Prefill (Generates BHVK ht)
     _, ht = lightning_attn_fwd(q_pre, k_pre, v_pre, decay_scales, scale=scale, output_final_state=True)
@@ -254,7 +323,7 @@ def test_prefill_decode_e2e():
     # Dummy decode tokens
     q_dec = torch.randn(B, H, D, device="cuda", dtype=torch.bfloat16)
     k_dec = torch.randn(B, H, D, device="cuda", dtype=torch.bfloat16)
-    v_dec = torch.randn(B, H, D, device="cuda", dtype=torch.bfloat16)
+    v_dec = torch.randn(B, HV, D, device="cuda", dtype=torch.bfloat16)
 
     # 2. Run Decode (run_la_decode handles BHKV→BHVK internally)
     out_dec, state_new = run_la_decode(q_dec, k_dec, v_dec, ht_kv, decay_scales, scale)

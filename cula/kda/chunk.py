@@ -27,7 +27,7 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 from cula.kda.chunk_bwd import chunk_kda_bwd
 from cula.kda.chunk_fwd import chunk_kda_fwd
-from cula.ops.kda.policy import IntracardCPMode, resolve_intracard_cp_mode
+from cula.ops.kda.cp_mode import CPMode
 
 
 class ChunkKDAFunction(torch.autograd.Function):
@@ -55,7 +55,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         disable_recompute: bool = False,
         return_intermediate_states: bool = False,
         cp_context: FLACPContext | None = None,
-        use_intracard_cp: IntracardCPMode | None = None,
+        use_intracard_cp: CPMode | None = None,
     ):
         chunk_size = 64
 
@@ -354,15 +354,12 @@ def chunk_kda(
         )
     """
 
-    # just for backward compatibility, resolve the deprecated `use_cp` argument
-    # TODO: maybe we can remove this in the future
-    use_cp_alias = kwargs.pop("use_cp", None)
-    use_intracard_cp = resolve_intracard_cp_mode(use_intracard_cp, use_cp_alias)
+    use_intracard_cp = CPMode.parse(use_intracard_cp)
 
     if cp_context is not None:
-        if use_intracard_cp is True:
+        if use_intracard_cp is CPMode.FORCE:
             raise ValueError("use_intracard_cp=True cannot be combined with FLA cp_context.")
-        use_intracard_cp = False
+        use_intracard_cp = CPMode.OFF
         assert initial_state is None, "Initial state is not supported for CP"
         assert output_final_state is False, "Output final state is not supported for CP"
         assert cp_context.cu_seqlens is not None, "cu_seqlens is required for CP"
@@ -372,9 +369,9 @@ def chunk_kda(
             cu_seqlens_cpu = cp_context.cu_seqlens_cpu
 
     if return_intermediate_states:
-        if use_intracard_cp is True:
+        if use_intracard_cp is CPMode.FORCE:
             raise ValueError("use_intracard_cp=True is not supported with return_intermediate_states=True.")
-        use_intracard_cp = False
+        use_intracard_cp = CPMode.OFF
 
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -391,10 +388,11 @@ def chunk_kda(
     if initial_state is not None:
         assert initial_state.dtype == torch.float32, "initial_state must be in float32."
 
-    A_log, dt_bias = None, None
+    A_log, dt_bias = kwargs.pop("A_log", None), kwargs.pop("dt_bias", None)
+    if kwargs:
+        raise TypeError(f"chunk_kda() got unexpected keyword arguments: {sorted(kwargs)}")
     if use_gate_in_kernel:
-        assert "A_log" in kwargs, "A_log must be provided when use_gate_in_kernel=True."
-        A_log, dt_bias = kwargs["A_log"], kwargs.get("dt_bias")
+        assert A_log is not None, "A_log must be provided when use_gate_in_kernel=True."
 
     if safe_gate and use_gate_in_kernel:
         if lower_bound is None:

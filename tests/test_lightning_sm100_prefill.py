@@ -66,16 +66,16 @@ def run_cute_kernel(
     Uses TVM-FFI compile cache: first call per config compiles, subsequent reuse.
 
     Args:
-        Q, K, V: (B, S, H, D) bfloat16 tensors on CUDA
-        decay: (H,) float32 per-head decay parameter s (s > 0)
+        Q, K: (B, S, H, D), V: (B, S, HV, D) bfloat16 tensors on CUDA
+        decay: (HV,) or (H,) float32 per-head decay parameter s (s > 0)
         scale: attention scale factor
         chunk_size: chunk size C
-        initial_state: (B, H, D, D) float32 or None
+        initial_state: (B, HV, D, D) float32 or None
         output_final_state: whether to allocate and return final state
 
     Returns:
-        O: (B, S, H, D) bfloat16 output
-        ht: (B, H, D, D) float32 final state (or None)
+        O: (B, S, HV, D) bfloat16 output
+        ht: (B, HV, D, D) float32 final state (or None)
     """
     O, ht = lightning_attn_fwd(
         Q,
@@ -105,15 +105,15 @@ def run_cute_kernel_varlen(
     """Run the CuTeDSL varlen kernel.
 
     Args:
-        Q, K, V: (1, T, H, D) bfloat16 — packed sequences
-        decay: (H,) float32
+        Q, K: (1, T, H, D), V: (1, T, HV, D) bfloat16 — packed sequences
+        decay: (HV,) or (H,) float32
         cu_seqlens: (N+1,) int32
-        state_pool: (pool_size, H, D, D) float32 or None
+        state_pool: (pool_size, HV, D, D) float32 or None
         initial_state_indices: (N,) int32 or None
 
     Returns:
-        O: (1, T, H, D) bfloat16
-        state_pool: (pool_size, H, D, D) float32
+        O: (1, T, HV, D) bfloat16
+        state_pool: (pool_size, HV, D, D) float32
     """
     O, sp = lightning_attn_fwd_varlen(
         Q,
@@ -135,30 +135,52 @@ def run_cute_kernel_varlen(
 # ---------------------------------------------------------------------------
 
 
+def _expand_qk_to_value_heads(Q, K, V):
+    """Expand Q/K from H heads to HV heads for GVA references."""
+    H = Q.shape[2]
+    HV = V.shape[2]
+    assert HV >= H and HV % H == 0, f"HV ({HV}) must be >= H ({H}) and divisible by H"
+    if HV == H:
+        return Q, K
+    group_size = HV // H
+    return Q.repeat_interleave(group_size, dim=2), K.repeat_interleave(group_size, dim=2)
+
+
+def _normalize_decay_to_value_heads(decay, H, HV):
+    if decay.shape[0] == HV:
+        return decay
+    if decay.shape[0] == H and HV != H:
+        return decay.repeat_interleave(HV // H)
+    raise ValueError(f"decay must have shape ({HV},) or ({H},), got {tuple(decay.shape)}")
+
+
 def pytorch_reference(Q, K, V, decay, chunk_size=64, scale=1.0, initial_state=None, output_final_state=False):
     """PyTorch reference for chunkwise linear attention with exponential decay.
 
     Args:
-        Q, K, V: (B, T, H, D) — any dtype, computed in float32
-        decay: (H,) float32 per-head s (s >= 0)
+        Q, K: (B, T, H, D), V: (B, T, HV, D) — any dtype, computed in float32
+        decay: (HV,) or (H,) float32 per-head s (s >= 0)
         chunk_size: C
         scale: scalar multiplier applied to final output
-        initial_state: (B, H, D, D) float32 or None
+        initial_state: (B, HV, D, D) float32 or None
         output_final_state: bool
 
     Returns:
-        O: (B, T, H, D) float32
-        final_state: (B, H, D, D) float32 or None
+        O: (B, T, HV, D) float32
+        final_state: (B, HV, D, D) float32 or None
     """
     B, T, H, D = Q.shape
+    HV = V.shape[2]
     C = chunk_size
+    Q, K = _expand_qk_to_value_heads(Q, K, V)
+    decay = _normalize_decay_to_value_heads(decay, H, HV)
     Q, K, V = Q.float(), K.float(), V.float()
-    O = torch.zeros(B, T, H, D, device=Q.device, dtype=torch.float32)
+    O = torch.zeros(B, T, HV, D, device=Q.device, dtype=torch.float32)
 
     state = (
         initial_state.clone().float()
         if initial_state is not None
-        else torch.zeros(B, H, D, D, device=Q.device, dtype=torch.float32)
+        else torch.zeros(B, HV, D, D, device=Q.device, dtype=torch.float32)
     )
 
     num_chunks = (T + C - 1) // C
@@ -176,21 +198,21 @@ def pytorch_reference(Q, K, V, decay, chunk_size=64, scale=1.0, initial_state=No
         pos_k = torch.arange(cl, device=Q.device).view(1, cl)
         dist = pos_q - pos_k  # (cl, cl)
 
-        s = decay.view(1, H, 1, 1)
+        s = decay.view(1, HV, 1, 1)
         mask = torch.exp(-s * dist.unsqueeze(0).unsqueeze(0).float())
         mask = mask * (pos_q >= pos_k).unsqueeze(0).unsqueeze(0).float()
         O_intra = torch.einsum("bhts,bshd->bthd", QK * mask, Vc)
 
         # --- inter-chunk: Q @ state with per-position decay ---
         pos_in = torch.arange(cl, device=Q.device).float()
-        per_pos = torch.exp(-decay.view(1, 1, H, 1) * (pos_in.view(1, -1, 1, 1) + 1.0))
+        per_pos = torch.exp(-decay.view(1, 1, HV, 1) * (pos_in.view(1, -1, 1, 1) + 1.0))
         O_inter = torch.einsum("bthd,bhde->bthe", Qc, state) * per_pos
 
         O[:, cs:ce] = (O_intra + O_inter) * scale
 
         # --- state update ---
-        block_decay = torch.exp(-decay.view(1, H, 1, 1) * C)
-        pos_w = torch.exp(-decay.view(1, 1, H, 1) * (C - 1 - pos_in.view(1, -1, 1, 1)))
+        block_decay = torch.exp(-decay.view(1, HV, 1, 1) * C)
+        pos_w = torch.exp(-decay.view(1, 1, HV, 1) * (C - 1 - pos_in.view(1, -1, 1, 1)))
         state = state * block_decay + torch.einsum("bthd,bthe->bhde", Kc * pos_w, Vc)
 
     return O, (state if output_final_state else None)
@@ -270,16 +292,17 @@ def test_different_decay_values():
         return False
 
 
-def test_against_reference(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True):
+def test_against_reference(B=1, S=128, H=4, HV=None, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True):
     """Compare against PyTorch reference (exact match)."""
+    HV = H if HV is None else HV
     if verbose:
-        print(f"\nRef: B={B}, S={S}, H={H}, D={D}, C={C}, decay={decay_val}")
+        print(f"\nRef: B={B}, S={S}, H={H}, HV={HV}, D={D}, C={C}, decay={decay_val}")
 
     torch.manual_seed(42)
     Q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
+    V = torch.randn(B, S, HV, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    decay = torch.full((HV,), decay_val, device="cuda", dtype=torch.float32)
 
     O_ref, _ = pytorch_reference(Q, K, V, decay, chunk_size=C)
     O_ref_bf16 = O_ref.to(torch.bfloat16)
@@ -291,22 +314,23 @@ def test_against_reference(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, atol=5e-
     return passed
 
 
-def test_initial_and_final_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True):
+def test_initial_and_final_state(B=1, S=128, H=4, HV=None, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True):
     """Test h0/ht against PyTorch reference.
 
     NOTE: This test is placed BEFORE FLA tests so that the (has_initial_state=True,
     output_final_state=True) kernel variant is compiled before any Triton/FLA code
     runs.  Running Triton corrupts state needed by cute.compile.
     """
+    HV = H if HV is None else HV
     if verbose:
-        print(f"\nh0/ht: B={B}, S={S}, H={H}, D={D}, C={C}, decay={decay_val}")
+        print(f"\nh0/ht: B={B}, S={S}, H={H}, HV={HV}, D={D}, C={C}, decay={decay_val}")
 
     torch.manual_seed(42)
     Q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
-    h0 = torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
+    V = torch.randn(B, S, HV, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    decay = torch.full((HV,), decay_val, device="cuda", dtype=torch.float32)
+    h0 = torch.randn(B, HV, D, D, device="cuda", dtype=torch.float32) * 0.01
     h0_vk = h0.transpose(-1, -2).contiguous()  # BHVK for CuTe kernel
 
     O_ref, ht_ref = pytorch_reference(
@@ -340,7 +364,7 @@ def test_initial_and_final_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, at
     return passed
 
 
-def test_against_fla(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True):
+def test_against_fla(B=1, S=128, H=4, HV=None, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True):
     """Compare against FLA chunk_simple_gla using g_gamma = -s.
 
     FLA's g_gamma is the per-head log-decay (negative). Our decay parameter s
@@ -350,20 +374,22 @@ def test_against_fla(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, atol=5e-3, rto
         print("\n  ⊘ SKIPPED: fla library not available")
         return True
 
+    HV = H if HV is None else HV
     if verbose:
-        print(f"\nFLA: B={B}, S={S}, H={H}, D={D}, C={C}, decay={decay_val}")
+        print(f"\nFLA: B={B}, S={S}, H={H}, HV={HV}, D={D}, C={C}, decay={decay_val}")
 
     torch.manual_seed(42)
     Q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    V = torch.randn(B, S, HV, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    Q_fla, K_fla = _expand_qk_to_value_heads(Q, K, V)
 
     # Our decay s -> FLA g_gamma = -s
-    decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
+    decay = torch.full((HV,), decay_val, device="cuda", dtype=torch.float32)
     g_gamma = -decay
 
     # FLA reference (scale=1.0 to match our kernel)
-    O_fla, _ = chunk_simple_gla(Q, K, V, g_gamma=g_gamma, scale=1.0)
+    O_fla, _ = chunk_simple_gla(Q_fla, K_fla, V, g_gamma=g_gamma, scale=1.0)
 
     # Our kernel
     O_cute, _ = run_cute_kernel(Q, K, V, decay, scale=1.0, chunk_size=C)
@@ -383,29 +409,31 @@ def test_against_fla(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, atol=5e-3, rto
     return passed
 
 
-def test_against_fla_with_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True):
+def test_against_fla_with_state(B=1, S=128, H=4, HV=None, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True):
     """Compare h0/ht against FLA chunk_simple_gla."""
     if not HAS_FLA:
         print("\n  ⊘ SKIPPED: fla library not available")
         return True
 
+    HV = H if HV is None else HV
     if verbose:
-        print(f"\nFLA h0/ht: B={B}, S={S}, H={H}, D={D}, C={C}, decay={decay_val}")
+        print(f"\nFLA h0/ht: B={B}, S={S}, H={H}, HV={HV}, D={D}, C={C}, decay={decay_val}")
 
     torch.manual_seed(42)
     Q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     K = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    V = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    h0 = torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
+    V = torch.randn(B, S, HV, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    Q_fla, K_fla = _expand_qk_to_value_heads(Q, K, V)
+    h0 = torch.randn(B, HV, D, D, device="cuda", dtype=torch.float32) * 0.01
     h0_vk = h0.transpose(-1, -2).contiguous()  # BHVK for CuTe kernel
 
-    decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
+    decay = torch.full((HV,), decay_val, device="cuda", dtype=torch.float32)
     g_gamma = -decay
 
     # FLA (expects BHKV state)
     O_fla, ht_fla = chunk_simple_gla(
-        Q,
-        K,
+        Q_fla,
+        K_fla,
         V,
         g_gamma=g_gamma,
         scale=1.0,
@@ -440,16 +468,17 @@ def test_against_fla_with_state(B=1, S=128, H=4, D=128, C=64, decay_val=0.1, ato
 # ===========================================================================
 
 
-def test_varlen_single_seq(H=4, S=128, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True) -> bool:
+def test_varlen_single_seq(H=4, HV=None, S=128, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True) -> bool:
     """Varlen with a single sequence vs non-varlen reference."""
+    HV = H if HV is None else HV
     if verbose:
-        print(f"\nVarlen single: S={S}, H={H}, D={D}, C={C}, decay={decay_val}")
+        print(f"\nVarlen single: S={S}, H={H}, HV={HV}, D={D}, C={C}, decay={decay_val}")
 
     torch.manual_seed(42)
     Q = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     K = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    V = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
+    V = torch.randn(1, S, HV, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    decay = torch.full((HV,), decay_val, device="cuda", dtype=torch.float32)
 
     # Non-varlen reference
     O_ref, ht_ref = run_cute_kernel(Q, K, V, decay, chunk_size=C, output_final_state=True)
@@ -465,12 +494,13 @@ def test_varlen_single_seq(H=4, S=128, D=128, C=64, decay_val=0.1, atol=5e-3, rt
     return passed
 
 
-def test_varlen_multi_seq(seq_lens=None, H=4, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True) -> bool:
+def test_varlen_multi_seq(seq_lens=None, H=4, HV=None, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True) -> bool:
     """Varlen with multiple packed sequences vs per-sequence non-varlen reference."""
+    HV = H if HV is None else HV
     if seq_lens is None:
         seq_lens = [128, 64, 192]  # all multiples of C
     if verbose:
-        print(f"\nVarlen multi: seqs={seq_lens}, H={H}, D={D}, C={C}, decay={decay_val}")
+        print(f"\nVarlen multi: seqs={seq_lens}, H={H}, HV={HV}, D={D}, C={C}, decay={decay_val}")
 
     torch.manual_seed(42)
     T = sum(seq_lens)
@@ -482,8 +512,8 @@ def test_varlen_multi_seq(seq_lens=None, H=4, D=128, C=64, decay_val=0.1, atol=5
 
     Q = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     K = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    V = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
+    V = torch.randn(1, T, HV, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    decay = torch.full((HV,), decay_val, device="cuda", dtype=torch.float32)
 
     O_var, sp = run_cute_kernel_varlen(Q, K, V, decay, cu_seqlens, chunk_size=C)
 
@@ -504,12 +534,15 @@ def test_varlen_multi_seq(seq_lens=None, H=4, D=128, C=64, decay_val=0.1, atol=5
     return all_pass
 
 
-def test_varlen_with_initial_state(seq_lens=None, H=4, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True) -> bool:
+def test_varlen_with_initial_state(
+    seq_lens=None, H=4, HV=None, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True
+) -> bool:
     """Varlen with initial state from state pool (non-contiguous indices)."""
+    HV = H if HV is None else HV
     if seq_lens is None:
         seq_lens = [128, 64]
     if verbose:
-        print(f"\nVarlen h0: seqs={seq_lens}, H={H}, D={D}, C={C}, decay={decay_val}")
+        print(f"\nVarlen h0: seqs={seq_lens}, H={H}, HV={HV}, D={D}, C={C}, decay={decay_val}")
 
     torch.manual_seed(42)
     T = sum(seq_lens)
@@ -521,12 +554,12 @@ def test_varlen_with_initial_state(seq_lens=None, H=4, D=128, C=64, decay_val=0.
 
     Q = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     K = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    V = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
+    V = torch.randn(1, T, HV, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    decay = torch.full((HV,), decay_val, device="cuda", dtype=torch.float32)
 
     # State pool with 3 slots, use indices [2, 0] — BHVK layout for CuTe
     pool_size = 3
-    state_pool = torch.randn(pool_size, H, D, D, dtype=torch.float32, device="cuda").transpose(-1, -2).contiguous() * 0.01
+    state_pool = torch.randn(pool_size, HV, D, D, dtype=torch.float32, device="cuda").transpose(-1, -2).contiguous() * 0.01
     indices = torch.tensor([2, 0], dtype=torch.int32, device="cuda")
 
     O_var, sp = run_cute_kernel_varlen(
@@ -569,13 +602,14 @@ def test_varlen_with_initial_state(seq_lens=None, H=4, D=128, C=64, decay_val=0.
 
 
 def test_varlen_against_pytorch_ref(
-    seq_lens=None, H=4, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True
+    seq_lens=None, H=4, HV=None, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True
 ) -> bool:
     """Varlen against the PyTorch reference with initial state."""
+    HV = H if HV is None else HV
     if seq_lens is None:
         seq_lens = [128, 192]
     if verbose:
-        print(f"\nVarlen vs ref: seqs={seq_lens}, H={H}, D={D}, C={C}, decay={decay_val}")
+        print(f"\nVarlen vs ref: seqs={seq_lens}, H={H}, HV={HV}, D={D}, C={C}, decay={decay_val}")
 
     torch.manual_seed(42)
     T = sum(seq_lens)
@@ -588,10 +622,10 @@ def test_varlen_against_pytorch_ref(
 
     Q = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
     K = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    V = torch.randn(1, T, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
-    decay = torch.full((H,), decay_val, device="cuda", dtype=torch.float32)
+    V = torch.randn(1, T, HV, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    decay = torch.full((HV,), decay_val, device="cuda", dtype=torch.float32)
 
-    state_pool = torch.randn(N, H, D, D, dtype=torch.float32, device="cuda") * 0.01
+    state_pool = torch.randn(N, HV, D, D, dtype=torch.float32, device="cuda") * 0.01
     state_pool_vk = state_pool.transpose(-1, -2).contiguous()  # BHVK for CuTe
 
     O_var, sp = run_cute_kernel_varlen(
@@ -675,6 +709,7 @@ def main():
             ("Decay 0.2", dict(B=1, S=128, H=4, D=128, C=64, decay_val=0.2)),
             ("Decay 0.5", dict(B=1, S=128, H=4, D=128, C=64, decay_val=0.5)),
             ("Batch", dict(B=2, S=128, H=4, D=128, C=64, decay_val=0.1)),
+            ("GVA H2-HV4", dict(B=1, S=128, H=2, HV=4, D=128, C=64, decay_val=0.1)),
         ]:
             results.append((f"Ref {tag}", test_against_reference(**kw, verbose=args.verbose)))
 
@@ -694,6 +729,7 @@ def main():
                 ("Decay 0.2", dict(B=1, S=128, H=4, D=128, C=64, decay_val=0.2)),
                 ("Decay 0.5", dict(B=1, S=128, H=4, D=128, C=64, decay_val=0.5)),
                 ("Batch", dict(B=2, S=128, H=4, D=128, C=64, decay_val=0.1)),
+                ("GVA H2-HV4", dict(B=1, S=128, H=2, HV=4, D=128, C=64, decay_val=0.1)),
             ]:
                 results.append((f"FLA {tag}", test_against_fla(**kw, verbose=args.verbose)))
 
@@ -706,6 +742,7 @@ def main():
             ("Small", dict(B=1, S=64, H=2, D=128, C=64, decay_val=0.1)),
             ("Multi-chunk", dict(B=1, S=256, H=4, D=128, C=64, decay_val=0.1)),
             ("Batch", dict(B=2, S=128, H=4, D=128, C=64, decay_val=0.2)),
+            ("GVA H2-HV4", dict(B=1, S=128, H=2, HV=4, D=128, C=64, decay_val=0.1)),
         ]:
             results.append((f"h0/ht {tag}", test_initial_and_final_state(**kw, verbose=args.verbose)))
 
@@ -719,6 +756,7 @@ def main():
                 ("Small", dict(B=1, S=64, H=2, D=128, C=64, decay_val=0.1)),
                 ("Multi-chunk", dict(B=1, S=256, H=4, D=128, C=64, decay_val=0.1)),
                 ("Batch", dict(B=2, S=128, H=4, D=128, C=64, decay_val=0.2)),
+                ("GVA H2-HV4", dict(B=1, S=128, H=2, HV=4, D=128, C=64, decay_val=0.1)),
             ]:
                 results.append((f"FLA h0/ht {tag}", test_against_fla_with_state(**kw, verbose=args.verbose)))
 
@@ -731,6 +769,7 @@ def main():
             ("Single seq", dict(H=4, S=128, D=128, C=64, decay_val=0.1)),
             ("Single long", dict(H=4, S=256, D=128, C=64, decay_val=0.1)),
             ("Decay 0.5", dict(H=4, S=128, D=128, C=64, decay_val=0.5)),
+            ("GVA single", dict(H=2, HV=4, S=128, D=128, C=64, decay_val=0.1)),
         ]:
             results.append((f"Varlen {tag}", test_varlen_single_seq(**kw, verbose=args.verbose)))
 
@@ -738,12 +777,14 @@ def main():
             ("Multi 3-seq", dict(seq_lens=[128, 64, 192], H=4, D=128, C=64, decay_val=0.1)),
             ("Multi 2-seq", dict(seq_lens=[256, 128], H=4, D=128, C=64, decay_val=0.1)),
             ("Multi decay", dict(seq_lens=[128, 128], H=4, D=128, C=64, decay_val=0.5)),
+            ("GVA multi", dict(seq_lens=[128, 64], H=2, HV=4, D=128, C=64, decay_val=0.1)),
         ]:
             results.append((f"Varlen {tag}", test_varlen_multi_seq(**kw, verbose=args.verbose)))
 
         for tag, kw in [
             ("h0 indirect", dict(seq_lens=[128, 64], H=4, D=128, C=64, decay_val=0.1)),
             ("h0 decay 0.2", dict(seq_lens=[128, 64], H=4, D=128, C=64, decay_val=0.2)),
+            ("GVA h0", dict(seq_lens=[128, 64], H=2, HV=4, D=128, C=64, decay_val=0.1)),
         ]:
             results.append((f"Varlen {tag}", test_varlen_with_initial_state(**kw, verbose=args.verbose)))
 
@@ -753,6 +794,7 @@ def main():
         for tag, kw in [
             ("vs ref 2-seq", dict(seq_lens=[128, 192], H=4, D=128, C=64, decay_val=0.1)),
             ("vs ref decay", dict(seq_lens=[64, 128], H=4, D=128, C=64, decay_val=0.5)),
+            ("GVA vs ref", dict(seq_lens=[64, 128], H=2, HV=4, D=128, C=64, decay_val=0.1)),
         ]:
             results.append((f"Varlen {tag}", test_varlen_against_pytorch_ref(**kw, verbose=args.verbose)))
 

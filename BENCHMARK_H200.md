@@ -55,5 +55,5 @@ Summary (28 configs): **avg=1.58x**, min=1.02x, max=2.51x.
 To reproduce:
 
 ```bash
-python benchmarks/bench_kda_fused_fwd.py --mode both
+python benchmarks/bench_kda_sm90_prefill.py --mode both
 ```

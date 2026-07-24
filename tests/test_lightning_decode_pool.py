@@ -32,12 +32,21 @@ from cula.ops.lightning.decode import linear_attention_decode
 
 
 def torch_la_decode_ref(q, k, v, state, decay_scales, scale):
-    """Pure PyTorch reference — state is [B, H, K, V] (BHKV)."""
+    """Pure PyTorch reference; state is [B, HV, K, V] (BHKV)."""
     B, H, D = q.shape
+    HV = v.shape[1]
+    assert HV >= H and HV % H == 0, f"HV ({HV}) must be >= H ({H}) and divisible by H"
+    group_size = HV // H
+    if group_size > 1:
+        q = q.repeat_interleave(group_size, dim=1)
+        k = k.repeat_interleave(group_size, dim=1)
+    if decay_scales.shape[0] == H and HV != H:
+        decay_scales = decay_scales.repeat_interleave(group_size)
+
     q_f = q.float() * scale
     k_f = k.float()
     v_f = v.float()
-    decay = torch.exp(-decay_scales).view(1, H, 1, 1)
+    decay = torch.exp(-decay_scales).view(1, HV, 1, 1)
     state_new = state * decay + k_f.unsqueeze(-1) * v_f.unsqueeze(-2)
     o = torch.einsum("bhk,bhkv->bhv", q_f, state_new)
     return o.to(torch.bfloat16), state_new
@@ -47,15 +56,16 @@ def run_la_decode_with_pool(q, k, v, state_pool_4d, s_offsets, decay_scales, sca
     """
     Run la_decode with a state pool and arbitrary offsets.
 
-    state_pool_4d: [pool_size, H, K, V] — the full pool (BHKV layout)
+    state_pool_4d: [pool_size, HV, K, V] — the full pool (BHKV layout)
     s_offsets: [B] — which pool slot each batch element uses
     """
     B, H, D = q.shape
+    HV = v.shape[1]
     pool_size = state_pool_4d.shape[0]
 
-    # la_decode expects BHVK layout: [pool_size*H, V, K]
-    state_cute = state_pool_4d.clone().transpose(-1, -2).contiguous().reshape(pool_size * H, D, D)
-    out = torch.zeros(B, H, D, device=q.device, dtype=torch.bfloat16)
+    # la_decode expects BHVK layout: [pool_size*HV, V, K]
+    state_cute = state_pool_4d.clone().transpose(-1, -2).contiguous().reshape(pool_size * HV, D, D)
+    out = torch.zeros(B, HV, D, device=q.device, dtype=torch.bfloat16)
 
     linear_attention_decode(
         q,
@@ -76,7 +86,7 @@ def run_la_decode_with_pool(q, k, v, state_pool_4d, s_offsets, decay_scales, sca
         V_SPLIT_DIM=D,
     )
 
-    state_out = state_cute.reshape(pool_size, H, D, D).transpose(-1, -2).contiguous()
+    state_out = state_cute.reshape(pool_size, HV, D, D).transpose(-1, -2).contiguous()
     return out, state_out
 
 
@@ -143,6 +153,35 @@ def test_non_identity_offsets():
     rel_err = rmse / (max_ref + 1e-8)
 
     assert rel_err < 0.01, f"Non-identity offsets {offsets}: rel_err={rel_err:.6f}"
+
+
+def test_gva_non_identity_offsets():
+    """GVA with offsets: q/k use H heads while v/state/out use HV heads."""
+    B = 4
+    POOL_SIZE = 6
+    H, HV, D = 4, 8, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.arange(HV, device="cuda", dtype=torch.float32) / HV
+
+    torch.manual_seed(42)
+    q = torch.randn(B, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, HV, D, device="cuda", dtype=torch.bfloat16)
+    state_pool = torch.randn(POOL_SIZE, HV, D, D, device="cuda", dtype=torch.float32) * 0.1
+
+    offsets = [2, 0, 5, 1]
+    s_offsets = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+
+    out, _ = run_la_decode_with_pool(q, k, v, state_pool, s_offsets, decay_scales, scale)
+
+    state_selected = state_pool[s_offsets.long()]
+    o_ref, _ = torch_la_decode_ref(q, k, v, state_selected, decay_scales, scale)
+
+    rmse = torch.sqrt(torch.mean((out.float() - o_ref.float()) ** 2)).item()
+    max_ref = torch.abs(o_ref.float()).max().item()
+    rel_err = rmse / (max_ref + 1e-8)
+
+    assert rel_err < 0.01, f"GVA non-identity offsets {offsets}: rel_err={rel_err:.6f}"
 
 
 # ---------------------------------------------------------------------------

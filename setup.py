@@ -164,15 +164,16 @@ ext_modules = []
 if not DISABLE_SM100 or not DISABLE_SM103:
     sm100_arch_flags = []
     if not DISABLE_SM100:
-        sm100_arch_flags.extend(["-gencode", "arch=compute_100a,code=sm_100a"])
+        sm100_arch_flags.extend(["-gencode", "arch=compute_100a,code=sm_100a", "-DCULA_SM100_ENABLED"])
     if not DISABLE_SM103:
-        sm100_arch_flags.extend(["-gencode", "arch=compute_103a,code=sm_103a"])
+        sm100_arch_flags.extend(["-gencode", "arch=compute_103a,code=sm_103a", "-DCULA_SM103_ENABLED"])
 
     ext_modules.append(
         CUDAExtension(
             name="cula._cudac_sm100",
             sources=[
                 "csrc/api/kda_sm100.cu",
+                "csrc/api/pybind_sm100.cu",
                 "csrc/kda/sm100/kda_fwd_sm100.cu",
             ],
             extra_compile_args={
@@ -195,6 +196,7 @@ if not DISABLE_SM90:
             name="cula._cudac_sm90",
             sources=[
                 "csrc/api/kda_sm90.cu",
+                "csrc/api/pybind_sm90.cu",
                 "csrc/kda/sm90/kda_fwd_sm90.cu",
                 "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu",
             ],

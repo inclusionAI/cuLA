@@ -269,7 +269,6 @@ def flash_kda_prefill(
     **kwargs,
 ):
     assert_blackwell()
-    assert cu_seqlens is None or q.shape[0] == 1, "For varlen, batch size must be 1. Flatten sequences first."
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(

@@ -115,15 +115,21 @@ def benchmark_cuda_mode_fn(
     ncu_mode=False,
     sanitizer_mode=False,
     setup_fn=None,
+    aggregate="mean",
 ):
-    """Benchmark a CUDA callable using standard repo warmup/repeat mode rules."""
+    """Benchmark a CUDA callable using standard repo warmup/repeat mode rules.
+
+    ``aggregate`` controls how per-iteration times are reduced: ``"mean"`` (default)
+    or ``"iqr_mean"`` (interquartile mean — robust to a stray transient iteration
+    that would otherwise poison the mean).
+    """
     warmup, rep = resolve_benchmark_repeats(
         default_warmup,
         default_rep,
         ncu_mode=ncu_mode,
         sanitizer_mode=sanitizer_mode,
     )
-    return benchmark_cuda_fn(fn, setup_fn=setup_fn, warmup=warmup, rep=rep, aggregate="mean")
+    return benchmark_cuda_fn(fn, setup_fn=setup_fn, warmup=warmup, rep=rep, aggregate=aggregate)
 
 
 def triton_bench_fn(fn, **kwargs):
@@ -440,7 +446,7 @@ def prepare_safe_gate_inputs(
 ):
     """Prepare inputs for safe_gate benchmarks (use_gate_in_kernel=True, safe_gate=True).
 
-    All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
+    Tensors are flattened to (1, B*T, ...) when cu_seqlens is provided.
     """
     HV = H if num_v_heads is None else num_v_heads
     assert HV >= H and HV % H == 0, f"HV ({HV}) must be a positive multiple of H ({H}) with HV >= H."
@@ -463,7 +469,7 @@ def prepare_safe_gate_inputs(
     dt_bias = torch.randn(HV * D, dtype=torch.float, device=device).requires_grad_(False)
 
     # flatten to batch_size=1 for cu_seqlens compatibility
-    if batch_size != 1:
+    if cu_seqlens is not None and batch_size != 1:
         q, k, v, g, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g, beta))
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
