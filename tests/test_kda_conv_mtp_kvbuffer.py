@@ -6,14 +6,8 @@ import os
 import pytest
 import torch
 
-from cula.ops.kda.decode.mtp_conv_kvbuffer import (
-    _select_conv_kvb_variant,
-    kda_conv_decode_mtp_kvbuffer,
-    kda_conv_decode_mtp_shuffle_kvbuffer,
-    kda_conv_decode_mtp_tensor_core_kvbuffer,
-)
+from cula.ops import kda_conv_decode_mtp_kvbuffer
 from cula.ops.kda.decode.mtp_kvbuffer import (
-    kda_decode_mtp_shuffle_kvbuffer,
     kda_decode_mtp_tensor_core_kvbuffer,
     kda_flush_kvbuffer,
 )
@@ -21,11 +15,6 @@ from cula.ops.kda.decode.mtp_kvbuffer import (
 W = 4
 K = 128
 V = 128
-
-
-@pytest.mark.parametrize("T", [9, 16, 32])
-def test_auto_dispatch_uses_shuffle_above_tensor_core_limit(T):
-    assert _select_conv_kvb_variant(N=128, HV=64, T=T) == "shuffle"
 
 
 def _make_inputs(N, T, H, HV, *, seed=0, pool_size=None, dynamic_stride=False):
@@ -96,7 +85,6 @@ def _run_fused(
     T,
     H,
     HV,
-    variant,
     conv_state,
     conv_windows,
     bufs,
@@ -104,16 +92,7 @@ def _run_fused(
     lower_bound=-5.0,
     num_v_tiles=-1,
 ):
-    if variant == "shuffle":
-        fused_op = kda_conv_decode_mtp_shuffle_kvbuffer
-        extra = {}
-    elif variant == "tensor_core":
-        fused_op = kda_conv_decode_mtp_tensor_core_kvbuffer
-        extra = {"num_v_tiles": num_v_tiles}
-    else:
-        fused_op = kda_conv_decode_mtp_kvbuffer
-        extra = {"variant": "auto"}
-    return fused_op(
+    return kda_conv_decode_mtp_kvbuffer(
         mixed_qkv=inp["mixed_qkv"],
         conv_weight=inp["conv_weight"],
         conv_bias=inp["conv_bias"],
@@ -139,7 +118,7 @@ def _run_fused(
         k_buffer=bufs[1],
         g_buffer=bufs[2],
         lower_bound=lower_bound,
-        **extra,
+        num_v_tiles=num_v_tiles,
     )
 
 
@@ -149,7 +128,6 @@ def _run_pair(
     H,
     HV,
     *,
-    variant="shuffle",
     gate="safe",
     bias=True,
     seed=0,
@@ -168,9 +146,7 @@ def _run_pair(
     conv_state = inp["conv_state_native"].transpose(-1, -2).contiguous()
     conv_windows = torch.zeros_like(windows_ref)
 
-    baseline_variant = _select_conv_kvb_variant(N, HV, T) if variant == "auto" else variant
-    baseline_op = kda_decode_mtp_shuffle_kvbuffer if baseline_variant == "shuffle" else kda_decode_mtp_tensor_core_kvbuffer
-    baseline_op(
+    kda_decode_mtp_tensor_core_kvbuffer(
         A_log=inp["A_log"],
         dt_bias=inp["dt_bias"],
         q=q,
@@ -195,7 +171,6 @@ def _run_pair(
         T,
         H,
         HV,
-        variant,
         conv_state,
         conv_windows,
         fused_bufs,
@@ -208,32 +183,9 @@ def _run_pair(
 
 @pytest.mark.parametrize("T", [1, 2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("gate", ["safe", "softplus"])
-@pytest.mark.parametrize("bias", [True, False])
-def test_fused_shuffle_matches_unfused(T, gate, bias):
-    result = _run_pair(2, T, 8, 8, gate=gate, bias=bias, seed=10 + T)
-    _, out_base, out_fused, base_bufs, fused_bufs, conv_state, windows, rolled, windows_ref = result
-    assert torch.equal(conv_state.transpose(-1, -2), rolled)
-    assert torch.equal(windows, windows_ref)
-    torch.testing.assert_close(out_fused, out_base, atol=3e-2, rtol=2e-2)
-    torch.testing.assert_close(fused_bufs[0], base_bufs[0], atol=3e-3, rtol=2e-3)
-    torch.testing.assert_close(fused_bufs[1], base_bufs[1], atol=2e-4, rtol=2e-4)
-    torch.testing.assert_close(fused_bufs[2], base_bufs[2], atol=2e-5, rtol=2e-5)
-
-
-@pytest.mark.parametrize("H,HV", [(8, 16), (16, 16), (32, 32)])
-def test_fused_shuffle_gva_and_heads(H, HV):
-    result = _run_pair(2, 4, H, HV, gate="safe", seed=30 + H + HV)
-    _, out_base, out_fused, base_bufs, fused_bufs, *_ = result
-    torch.testing.assert_close(out_fused, out_base, atol=3e-2, rtol=2e-2)
-    for actual, expected in zip(fused_bufs, base_bufs):
-        torch.testing.assert_close(actual, expected, atol=3e-3, rtol=2e-3)
-
-
-@pytest.mark.parametrize("T", [1, 2, 3, 4, 5, 6, 7, 8])
-@pytest.mark.parametrize("gate", ["safe", "softplus"])
 @pytest.mark.parametrize("H,HV", [(8, 8), (8, 16), (32, 32)])
-def test_fused_tensor_core_matches_unfused(T, gate, H, HV):
-    result = _run_pair(2, T, H, HV, variant="tensor_core", gate=gate, seed=50 + T + HV)
+def test_fused_matches_unfused(T, gate, H, HV):
+    result = _run_pair(2, T, H, HV, gate=gate, seed=50 + T + HV)
     _, out_base, out_fused, base_bufs, fused_bufs, conv_state, windows, rolled, windows_ref = result
     assert torch.equal(conv_state.transpose(-1, -2), rolled)
     assert torch.equal(windows, windows_ref)
@@ -245,8 +197,19 @@ def test_fused_tensor_core_matches_unfused(T, gate, H, HV):
     torch.testing.assert_close(fused_bufs[2], base_bufs[2], atol=2e-5, rtol=2e-5)
 
 
+@pytest.mark.parametrize("gate", ["safe", "softplus"])
+def test_fused_without_conv_bias(gate):
+    result = _run_pair(2, 4, 8, 16, gate=gate, bias=False, seed=63)
+    _, out_base, out_fused, base_bufs, fused_bufs, conv_state, windows, rolled, windows_ref = result
+    assert torch.equal(conv_state.transpose(-1, -2), rolled)
+    assert torch.equal(windows, windows_ref)
+    torch.testing.assert_close(out_fused, out_base, atol=3e-2, rtol=2e-2)
+    for actual, expected in zip(fused_bufs, base_bufs):
+        torch.testing.assert_close(actual, expected, atol=4e-3, rtol=6e-3)
+
+
 def test_fused_tensor_core_single_qk_cta():
-    result = _run_pair(2, 4, 8, 8, variant="tensor_core", num_v_tiles=1, seed=64)
+    result = _run_pair(2, 4, 8, 8, num_v_tiles=1, seed=64)
     _, out_base, out_fused, base_bufs, fused_bufs, conv_state, windows, rolled, windows_ref = result
     assert torch.equal(conv_state.transpose(-1, -2), rolled)
     assert torch.equal(windows, windows_ref)
@@ -256,7 +219,7 @@ def test_fused_tensor_core_single_qk_cta():
 
 
 def test_fused_tensor_core_auto_two_v_tiles():
-    result = _run_pair(4, 8, 32, 32, variant="tensor_core", seed=65)
+    result = _run_pair(4, 8, 32, 32, seed=65)
     _, out_base, out_fused, base_bufs, fused_bufs, conv_state, windows, rolled, windows_ref = result
     assert torch.equal(conv_state.transpose(-1, -2), rolled)
     assert torch.equal(windows, windows_ref)
@@ -265,17 +228,8 @@ def test_fused_tensor_core_auto_two_v_tiles():
         torch.testing.assert_close(actual, expected, atol=4e-3, rtol=6e-3)
 
 
-def test_fused_auto_above_tensor_core_limit_matches_shuffle():
-    result = _run_pair(1, 9, 8, 8, variant="auto", seed=67)
-    _, out_base, out_fused, base_bufs, fused_bufs, *_ = result
-    torch.testing.assert_close(out_fused, out_base, atol=3e-2, rtol=2e-2)
-    for actual, expected in zip(fused_bufs, base_bufs):
-        torch.testing.assert_close(actual, expected, atol=4e-3, rtol=3e-3)
-
-
-@pytest.mark.parametrize("variant", ["shuffle", "tensor_core"])
-def test_fused_kvbuffer_dynamic_mixed_stride(variant):
-    result = _run_pair(2, 4, 8, 16, variant=variant, dynamic_stride=True, seed=66)
+def test_fused_kvbuffer_dynamic_mixed_stride():
+    result = _run_pair(2, 4, 8, 16, dynamic_stride=True, seed=66)
     _, out_base, out_fused, base_bufs, fused_bufs, conv_state, windows, rolled, windows_ref = result
     assert torch.equal(conv_state.transpose(-1, -2), rolled)
     assert torch.equal(windows, windows_ref)
@@ -284,11 +238,10 @@ def test_fused_kvbuffer_dynamic_mixed_stride(variant):
         torch.testing.assert_close(actual, expected, atol=4e-3, rtol=3e-3)
 
 
-@pytest.mark.parametrize("variant", ["shuffle", "tensor_core"])
 @pytest.mark.parametrize("accept_mode", ["scalar", "per_request"])
-def test_fused_kvbuffer_flush_compatible(accept_mode, variant):
+def test_fused_kvbuffer_flush_compatible(accept_mode):
     N, T, H, HV = 3, 6, 8, 16
-    inp, _, _, base_bufs, fused_bufs, *_ = _run_pair(N, T, H, HV, variant=variant, seed=71)
+    inp, _, _, base_bufs, fused_bufs, *_ = _run_pair(N, T, H, HV, seed=71)
     accept_len = 3
     if accept_mode == "per_request":
         accept_len = torch.tensor([1, 3, T], device="cuda", dtype=torch.int64)
@@ -296,14 +249,14 @@ def test_fused_kvbuffer_flush_compatible(accept_mode, variant):
     fused_state = inp["ssm_states"].clone()
     kda_flush_kvbuffer(base_state, inp["cache_indices"], *base_bufs, accept_len=accept_len)
     kda_flush_kvbuffer(fused_state, inp["cache_indices"], *fused_bufs, accept_len=accept_len)
-    torch.testing.assert_close(fused_state, base_state, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(fused_state, base_state, atol=1e-3, rtol=2e-3)
 
 
-def test_fused_shuffle_requires_complete_ubuffer_triplet():
+def test_fused_requires_complete_ubuffer_triplet():
     inp = _make_inputs(1, 2, 8, 8)
     d_buffer, _, _ = _alloc_ubufs(1, 2, 8)
     with pytest.raises(ValueError, match="must be supplied together"):
-        kda_conv_decode_mtp_shuffle_kvbuffer(
+        kda_conv_decode_mtp_kvbuffer(
             mixed_qkv=inp["mixed_qkv"],
             conv_weight=inp["conv_weight"],
             conv_bias=inp["conv_bias"],
@@ -327,8 +280,18 @@ def test_fused_shuffle_requires_complete_ubuffer_triplet():
         )
 
 
-@pytest.mark.parametrize("variant", ["shuffle", "tensor_core", "auto"])
-def test_fused_kvbuffer_cuda_graph_replay(variant):
+def test_fused_rejects_T_above_8():
+    N, T, H, HV = 1, 9, 8, 8
+    inp = _make_inputs(N, T, H, HV)
+    state = inp["conv_state_native"].transpose(-1, -2).contiguous()
+    windows = torch.empty(inp["pool_size"], T, inp["D"], W - 1, device="cuda")
+    bufs = _alloc_ubufs(N, T, HV)
+    out = torch.empty(N, T, HV, V, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="requires 1<=T<=8"):
+        _run_fused(inp, N, T, H, HV, state, windows, bufs, out)
+
+
+def test_fused_kvbuffer_cuda_graph_replay():
     N, T, H, HV = 2, 4, 8, 16
     inp = _make_inputs(N, T, H, HV, seed=81)
     initial_state = inp["conv_state_native"].transpose(-1, -2).contiguous()
@@ -339,13 +302,13 @@ def test_fused_kvbuffer_cuda_graph_replay(variant):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        _run_fused(inp, N, T, H, HV, variant, state, windows, bufs, out)
+        _run_fused(inp, N, T, H, HV, state, windows, bufs, out)
     stream.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         state.copy_(initial_state)
-        _run_fused(inp, N, T, H, HV, variant, state, windows, bufs, out)
+        _run_fused(inp, N, T, H, HV, state, windows, bufs, out)
     graph.replay()
     torch.cuda.synchronize()
     reference = (out.clone(), state.clone(), windows.clone(), *(x.clone() for x in bufs))
@@ -356,11 +319,10 @@ def test_fused_kvbuffer_cuda_graph_replay(variant):
         assert torch.equal(actual, expected), f"{name} changed across graph replays"
 
 
-@pytest.mark.parametrize("variant", ["shuffle", "tensor_core"])
-def test_fused_kvbuffer_multistream(variant):
+def test_fused_kvbuffer_multistream():
     N, T, H, HV = 2, 4, 8, 16
     inputs = [_make_inputs(N, T, H, HV, seed=84 + i) for i in range(2)]
-    expected = [_run_pair(N, T, H, HV, variant=variant, seed=84 + i) for i in range(2)]
+    expected = [_run_pair(N, T, H, HV, seed=84 + i) for i in range(2)]
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     actual = []
     for stream, inp in zip(streams, inputs):
@@ -370,7 +332,7 @@ def test_fused_kvbuffer_multistream(variant):
         out = torch.empty(N, T, HV, V, device="cuda", dtype=torch.bfloat16)
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            _run_fused(inp, N, T, H, HV, variant, state, windows, bufs, out)
+            _run_fused(inp, N, T, H, HV, state, windows, bufs, out)
         actual.append((out, state, windows, bufs))
     torch.cuda.synchronize()
     for got, ref in zip(actual, expected):
@@ -383,22 +345,20 @@ def test_fused_kvbuffer_multistream(variant):
             torch.testing.assert_close(actual_buf, expected_buf, atol=4e-3, rtol=3e-3)
 
 
-@pytest.mark.parametrize("variant", ["shuffle", "tensor_core"])
-def test_fused_kvbuffer_repeated_chain(variant):
+def test_fused_kvbuffer_repeated_chain():
     N, T, H, HV = 2, 4, 8, 16
     inp = _make_inputs(N, T, H, HV, seed=88)
     state = inp["conv_state_native"].transpose(-1, -2).contiguous()
     windows = torch.zeros(inp["pool_size"], T, inp["D"], 3, device="cuda")
     bufs = _alloc_ubufs(N, T, HV)
     out = torch.empty(N, T, HV, V, device="cuda", dtype=torch.bfloat16)
-    _run_fused(inp, N, T, H, HV, variant, state, windows, bufs, out)
+    _run_fused(inp, N, T, H, HV, state, windows, bufs, out)
 
     next_inp = dict(inp, conv_state_native=state.transpose(-1, -2).clone())
     q, k, v, expected_windows, expected_state = _torch_conv(next_inp, N, T, H, HV)
     base_bufs = _alloc_ubufs(N, T, HV)
     base_out = torch.empty_like(out)
-    baseline_op = kda_decode_mtp_shuffle_kvbuffer if variant == "shuffle" else kda_decode_mtp_tensor_core_kvbuffer
-    baseline_op(
+    kda_decode_mtp_tensor_core_kvbuffer(
         A_log=inp["A_log"],
         dt_bias=inp["dt_bias"],
         q=q,
@@ -415,7 +375,7 @@ def test_fused_kvbuffer_repeated_chain(variant):
         g_buffer=base_bufs[2],
         lower_bound=-5.0,
     )
-    _run_fused(inp, N, T, H, HV, variant, state, windows, bufs, out)
+    _run_fused(inp, N, T, H, HV, state, windows, bufs, out)
     assert torch.equal(state.transpose(-1, -2), expected_state)
     assert torch.equal(windows, expected_windows)
     torch.testing.assert_close(out, base_out, atol=3e-2, rtol=2e-2)
@@ -423,9 +383,8 @@ def test_fused_kvbuffer_repeated_chain(variant):
         torch.testing.assert_close(actual_buf, expected_buf, atol=4e-3, rtol=6e-3)
 
 
-@pytest.mark.parametrize("variant", ["shuffle", "tensor_core"])
 @pytest.mark.parametrize("T", [4, 8])
-def test_fused_kvbuffer_deterministic(T, variant):
+def test_fused_kvbuffer_deterministic(T):
     N, H, HV = 4, 8, 16
     inp = _make_inputs(N, T, H, HV, seed=91)
     initial_conv_state = inp["conv_state_native"].transpose(-1, -2).contiguous()
@@ -433,11 +392,11 @@ def test_fused_kvbuffer_deterministic(T, variant):
     windows = torch.zeros(inp["pool_size"], T, inp["D"], 3, device="cuda")
     bufs = _alloc_ubufs(N, T, HV)
     out = torch.empty(N, T, HV, V, device="cuda", dtype=torch.bfloat16)
-    _run_fused(inp, N, T, H, HV, variant, state, windows, bufs, out)
+    _run_fused(inp, N, T, H, HV, state, windows, bufs, out)
     reference = (out.clone(), state.clone(), windows.clone(), *(x.clone() for x in bufs))
     for iteration in range(int(os.environ.get("KDA_CONV_KVB_DET_ITERS", "100000"))):
         state.copy_(initial_conv_state)
-        _run_fused(inp, N, T, H, HV, variant, state, windows, bufs, out)
+        _run_fused(inp, N, T, H, HV, state, windows, bufs, out)
         current = (out, state, windows, *bufs)
         for name, actual, expected in zip(("out", "conv_state", "conv_window", "d", "k", "g"), current, reference):
             assert torch.equal(actual, expected), f"{name} differs at iteration {iteration}"

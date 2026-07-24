@@ -18,8 +18,6 @@ __all__ = [
     "kda_decode_mtp_recurrent",
     "kda_decode_mtp_recurrent_ws",
     "kda_conv_decode_mtp_verify",
-    "kda_conv_decode_mtp_shuffle_kvbuffer",
-    "kda_conv_decode_mtp_tensor_core_kvbuffer",
     "kda_conv_decode_mtp_kvbuffer",
     "kda_flush_kvbuffer",
     "kda_flush_kvbuffer_all_layers",
@@ -38,14 +36,6 @@ _LAZY = {
     "kda_conv_decode_mtp_verify": (
         "cula.ops.kda.decode.mtp_conv",
         "kda_conv_decode_mtp_verify",
-    ),
-    "kda_conv_decode_mtp_shuffle_kvbuffer": (
-        "cula.ops.kda.decode.mtp_conv_kvbuffer",
-        "kda_conv_decode_mtp_shuffle_kvbuffer",
-    ),
-    "kda_conv_decode_mtp_tensor_core_kvbuffer": (
-        "cula.ops.kda.decode.mtp_conv_kvbuffer",
-        "kda_conv_decode_mtp_tensor_core_kvbuffer",
     ),
     "kda_conv_decode_mtp_kvbuffer": (
         "cula.ops.kda.decode.mtp_conv_kvbuffer",

@@ -1,549 +1,695 @@
-"""Benchmark fused KDA conv + MTP verify against a torch reference.
+"""Benchmark fused causal-conv1d + KDA MTP verify and full commit chains.
 
-Usage:
-  python benchmarks/bench_fused_kda_conv_mtp.py --N 128 --T 4 --H 16 --HV 16
-  python benchmarks/bench_fused_kda_conv_mtp.py --sweep --H 16 --HV 16
-
-Set ``KDA_FUSED_TRI_FILE`` to benchmark a compatible Triton implementation:
-  KDA_FUSED_TRI_FILE=/path/to/compatible_triton.py \
-    python benchmarks/bench_fused_kda_conv_mtp.py --sweep --which both
+The unified benchmark covers Triton recurrent verify, cuLA small/large-batch
+recurrent verify, fused KVBuffer verify, and their matching commit/flush path.
+Timing uses CUDA Graphs and events; host overhead, compilation, allocation and
+graph capture are excluded.
 """
 
 import argparse
+import csv
 import importlib.util
 import os
+import pathlib
 import shutil
-import subprocess
 import sys
 
 import torch
 
-W = 4  # conv width (KDA short_conv_kernel_size); fused paths hard-assume 4
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from cula.ops.kda.decode.mtp_conv import kda_conv_decode_mtp_verify
+from cula.ops.kda.decode.mtp_conv_kvbuffer import kda_conv_decode_mtp_kvbuffer
+from cula.ops.kda.decode.mtp_kvbuffer import (
+    kda_decode_mtp_tensor_core_kvbuffer,
+    kda_flush_kvbuffer,
+)
+
+W = 4
+K = 128
+V = 128
 
 
-# CUDA Graph timing
-def t_graph_us(fn, warmup_iters, rep, graph_calls=1):
-    """Measure microseconds per call with CUDA Graph replay."""
-    # Complete compilation and autotuning before capture.
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        for _ in range(warmup_iters):
+def load_file_attr(path, attr, module_name):
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return getattr(module, attr)
+
+
+def load_triton_fused():
+    path = os.environ.get("KDA_FUSED_TRI_FILE")
+    if not path:
+        raise RuntimeError("set KDA_FUSED_TRI_FILE to a compatible Triton fused conv MTP module")
+    return load_file_attr(path, "fused_kda_conv_gating_verify", "_compatible_fused_kda_conv")
+
+
+def load_scatter_commit():
+    path = os.environ.get("KDA_SCATTER_FILE")
+    if not path:
+        raise RuntimeError("set KDA_SCATTER_FILE to a compatible state-commit module")
+    return load_file_attr(path, "fused_mamba_state_scatter_with_mask", "_compatible_mamba_scatter")
+
+
+def load_causal_conv_update():
+    path = os.environ.get("KDA_CAUSAL_CONV_FILE")
+    if not path:
+        raise RuntimeError("set KDA_CAUSAL_CONV_FILE to a compatible causal-conv module")
+    return load_file_attr(path, "causal_conv1d_update", "_compatible_causal_conv")
+
+
+def clear_triton_cache():
+    path = os.environ.get("TRITON_CACHE_DIR")
+    if not path:
+        raise RuntimeError("--rm-triton-cache requires TRITON_CACHE_DIR")
+    root = pathlib.Path(path)
+    if root.is_dir():
+        for child in root.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    print(f"cleared Triton cache: {root}")
+
+
+def graph_time_us(fn, *, warmup=20, rep=200, graph_calls=10):
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(warmup):
             fn()
-    torch.cuda.current_stream().wait_stream(s)
-    torch.cuda.synchronize()
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
         for _ in range(graph_calls):
             fn()
     for _ in range(10):
-        g.replay()
+        graph.replay()
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(rep):
-        g.replay()
+        graph.replay()
     end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / rep / graph_calls * 1e3  # ms -> us
+    end.synchronize()
+    return start.elapsed_time(end) * 1e3 / rep / graph_calls
 
 
-def clear_triton_cache():
-    """Clear the configured Triton cache directory."""
-    d = os.environ.get("TRITON_CACHE_DIR")
-    if not d:
-        print("  [warn] TRITON_CACHE_DIR unset; --rm-triton-cache is a no-op")
-        return
-    if os.path.isdir(d):
-        for name in os.listdir(d):
-            p = os.path.join(d, name)
-            if os.path.isdir(p):
-                shutil.rmtree(p, ignore_errors=True)
-            else:
-                os.remove(p)
-    print(f"  [cache] cleared Triton cache dir: {d}")
-
-
-# Optional Triton loader
-def load_triton_fused():
-    path = os.environ.get("KDA_FUSED_TRI_FILE")
-    if not path or not os.path.exists(path):
-        raise RuntimeError(
-            f"KDA_FUSED_TRI_FILE not set or missing: {path!r}. "
-            "Point it at a compatible standalone Triton implementation."
-        )
-    spec = importlib.util.spec_from_file_location("kda_fused_tri", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.fused_kda_conv_gating_verify
-
-
-# Input generation
-def make_inputs(N, T, H, HV, K, V, pool_size, gate, seed, device="cuda"):
+def make_inputs(N, T, H, HV, seed=0):
     torch.manual_seed(seed)
     D = 2 * H * K + HV * V
-    f32 = torch.float32
-    bf16 = torch.bfloat16
+    mixed = (torch.randn(N, T, D, device="cuda") * 0.5).to(torch.bfloat16)
+    return {
+        "mixed": mixed,
+        "weight": torch.randn(D, W, device="cuda") * 0.3,
+        "bias": torch.randn(D, device="cuda") * 0.1,
+        "conv_state": torch.randn(N, D, W - 1, device="cuda") * 0.3,
+        "a": (torch.randn(N, T, HV, K, device="cuda") * 0.5).to(torch.bfloat16),
+        "b": (torch.randn(N, T, HV, device="cuda") * 0.5).to(torch.bfloat16),
+        "A_log": -torch.rand(HV, device="cuda") * 2.0,
+        "dt_bias": torch.randn(HV, K, device="cuda") * 0.1,
+        "ssm": torch.randn(N, HV, V, K, device="cuda") * 0.01,
+        "indices": torch.arange(N, device="cuda", dtype=torch.int32),
+        "D": D,
+    }
 
-    mixed_qkv = (torch.randn(N * T, D, device=device, dtype=f32) * 0.5).to(bf16)
-    conv_weight = torch.randn(D, W, device=device, dtype=f32) * 0.3
-    conv_bias = torch.randn(D, device=device, dtype=f32) * 0.1
-    # conv_state native [lines, W-1, D]; row 0 = oldest history token.
-    conv_state_native = torch.randn(pool_size, W - 1, D, device=device, dtype=f32) * 0.3
 
-    a = (torch.randn(N, T, HV, K, device=device, dtype=f32) * 0.5).to(bf16)
-    b = (torch.randn(N, T, HV, device=device, dtype=f32) * 0.5).to(bf16)
-    A_log = -torch.rand(HV, device=device, dtype=f32) * 2.0  # A = exp(A_log) < 1
-    dt_bias = torch.randn(HV, K, device=device, dtype=f32) * 0.1
-    ssm_states = torch.randn(pool_size, HV, V, K, device=device, dtype=f32) * 0.01
-
-    # one distinct mamba slot per request (chain verify: cache_indices[:N])
-    cache_indices = torch.arange(N, device=device, dtype=torch.int32)
-
-    return dict(
-        D=D,
-        mixed_qkv=mixed_qkv,
-        conv_weight=conv_weight,
-        conv_bias=conv_bias,
-        conv_state_native=conv_state_native,
-        a=a,
-        b=b,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        ssm_states=ssm_states,
-        cache_indices=cache_indices,
-        gate=gate,
+def alloc_ubufs(N, T, HV):
+    return (
+        torch.empty(N, T, HV, V, device="cuda"),
+        torch.empty(N, T, HV, K, device="cuda"),
+        torch.empty(N, T, HV, K, device="cuda"),
     )
 
 
-# Torch reference
-def torch_reference(inp, N, T, H, HV, K, V, scale, lower_bound,
-                    softplus_beta=1.0, softplus_threshold=20.0):
-    dev = inp["mixed_qkv"].device
-    D = inp["D"]
-    mixed = inp["mixed_qkv"].float()             # [N*T, D]
-    w = inp["conv_weight"]                        # [D, W]
-    bias = inp["conv_bias"]                       # [D]
-    hist0 = inp["conv_state_native"].float()      # [lines, W-1, D]
-    a = inp["a"].float()
-    b = inp["b"].float()
-    A_log = inp["A_log"]
-    dt_bias = inp["dt_bias"]
-    ssm0 = inp["ssm_states"].float()              # [slots, HV, V, K]
-    cidx = inp["cache_indices"]
+def make_conv_only_call(inp, N, T):
+    state = inp["conv_state"].clone()
+    window = torch.empty(N, T, inp["D"], W - 1, device="cuda")
+    conv_update = load_causal_conv_update()
 
-    qk_dim = H * K
-    o = torch.zeros(N, T, HV, V, device=dev, dtype=torch.float32)
-    ssm_snap = torch.zeros(N, T, HV, V, K, device=dev, dtype=torch.float32)   # per-step S
-    win_snap = torch.zeros(N, T, W - 1, D, device=dev, dtype=torch.float32)   # per-step conv window (raw input)
-    conv_state_out = torch.zeros_like(hist0)
+    def call():
+        return conv_update(
+            inp["mixed"].transpose(1, 2),
+            state,
+            inp["weight"],
+            inp["bias"],
+            activation="silu",
+            conv_state_indices=inp["indices"],
+            intermediate_conv_window=window,
+            intermediate_state_indices=inp["indices"],
+        )
 
-    for n in range(N):
-        slot = int(cidx[n].item())
-        x = mixed[n * T:(n + 1) * T]              # [T, D]
-        hist = hist0[slot]                        # [W-1=3, D] oldest..newest
-        xfull = torch.cat([hist, x], dim=0)       # [3+T, D]
-
-        # depthwise causal conv (width 4) + SiLU + bf16 round-trip
-        y = torch.zeros(T, D, device=dev, dtype=torch.float32)
-        for t in range(T):
-            acc = bias.clone()
-            for j in range(W):
-                acc = acc + w[:, j] * xfull[t + j]
-            y[t] = torch.nn.functional.silu(acc)
-            # window snapshot after consuming token t = xfull[t+1 .. t+3] (last 3)
-            win_snap[n, t] = xfull[t + 1:t + 1 + (W - 1)]
-        y = y.to(torch.bfloat16).float()          # round-trip
-
-        # rolled conv_state after all T tokens = last W-1 raw inputs (all-accept temp)
-        conv_state_out[slot] = xfull[-(W - 1):]
-
-        qy = y[:, 0:qk_dim].view(T, H, K)
-        ky = y[:, qk_dim:2 * qk_dim].view(T, H, K)
-        vy = y[:, 2 * qk_dim:2 * qk_dim + HV * V].view(T, HV, V)
-
-        for hv in range(HV):
-            ih = hv // (HV // H)
-            S = ssm0[slot, hv].clone()            # [V, K]
-            eA = torch.exp(A_log[hv])
-            for t in range(T):
-                qb = qy[t, ih].clone()
-                kb = ky[t, ih].clone()
-                vb = vy[t, hv].clone()
-                gx = a[n, t, hv] + dt_bias[hv]    # [K]
-                if lower_bound is not None:
-                    g = lower_bound * torch.sigmoid(eA * gx)
-                else:
-                    beta_x = softplus_beta * gx
-                    sp = torch.where(beta_x <= softplus_threshold,
-                                     (1.0 / softplus_beta) * torch.log1p(torch.exp(beta_x)),
-                                     gx)
-                    g = -eA * sp
-                beta = torch.sigmoid(b[n, t, hv])
-                qb = qb / torch.sqrt((qb * qb).sum() + 1e-6) * scale
-                kb = kb / torch.sqrt((kb * kb).sum() + 1e-6)
-                S = S * torch.exp(g)[None, :]
-                sv = S @ kb                        # [V]
-                v_new = (vb - sv) * beta
-                S = S + v_new[:, None] * kb[None, :]
-                o[n, t, hv] = S @ qb
-                ssm_snap[n, t, hv] = S
-
-    return dict(o=o, ssm_snap=ssm_snap, win_snap=win_snap, conv_state_out=conv_state_out)
+    return call
 
 
-# Triton runner
-def run_triton(fn, inp, N, T, H, HV, K, V, scale, lower_bound, num_warps=4):
-    D = inp["D"]
-    dev = inp["mixed_qkv"].device
-    # Triton expects writable [lines, D, W-1] with stride(1) == 1.
-    conv_state = inp["conv_state_native"].clone().transpose(-1, -2)   # [lines, D, W-1]
-    assert conv_state.stride(1) == 1
-    ssm = inp["ssm_states"].clone()
-    # Dense [lines, steps, D, W-1] snapshots.
-    conv_window = torch.zeros(N, T, D, W - 1, device=dev, dtype=torch.float32)
-    inter_state_indices = inp["cache_indices"].clone()
-    # SSM snapshots with contiguous K.
-    inter_states = torch.zeros(N, T, HV, V, K, device=dev, dtype=torch.float32)
+def make_kvbuffer_only_call(inp, N, T, H, HV):
+    post = make_conv_only_call(inp, N, T)().transpose(1, 2)
+    q_end = H * K
+    q = post[..., :q_end].view(N, T, H, K)
+    k = post[..., q_end : 2 * q_end].view(N, T, H, K)
+    v = post[..., 2 * q_end :].view(N, T, HV, V)
+    ssm = inp["ssm"].clone()
+    out = torch.empty(N, T, HV, V, device="cuda", dtype=torch.bfloat16)
+    bufs = alloc_ubufs(N, T, HV)
+    def call():
+        return kda_decode_mtp_tensor_core_kvbuffer(
+            A_log=inp["A_log"],
+            dt_bias=inp["dt_bias"],
+            q=q,
+            k=k,
+            v=v,
+            a=inp["a"],
+            b=inp["b"],
+            initial_state_source=ssm,
+            initial_state_indices=inp["indices"],
+            scale=K**-0.5,
+            out=out,
+            d_buffer=bufs[0],
+            k_buffer=bufs[1],
+            g_buffer=bufs[2],
+            lower_bound=-5.0,
+        )
 
-    out = fn(
-        mixed_qkv=inp["mixed_qkv"],
-        conv_weight=inp["conv_weight"],
-        conv_bias=inp["conv_bias"],
-        conv_state=conv_state,
-        conv_state_indices=inp["cache_indices"],
-        intermediate_conv_window=conv_window,
-        intermediate_state_indices=inter_state_indices,
-        a=inp["a"],
-        b=inp["b"],
-        A_log=inp["A_log"],
-        dt_bias=inp["dt_bias"],
-        ssm_states=ssm,
-        cache_indices=inp["cache_indices"],
-        intermediate_states_buffer=inter_states,
-        scale=scale,
-        T=T,
-        num_q_heads=H,
-        num_v_heads=HV,
-        head_k_dim=K,
-        head_v_dim=V,
-        lower_bound=lower_bound,
-        num_warps=num_warps,
-    )
-    return dict(o=out.view(N, T, HV, V), conv_state=conv_state, conv_window=conv_window,
-                inter_states=inter_states)
+    return call
 
 
-# cuLA runner
-def run_cula(inp, N, T, H, HV, K, V, scale, lower_bound, bv=-1, variant="auto"):
-    from cula.ops.kda.decode.mtp_conv import kda_conv_decode_mtp_verify
-    D = inp["D"]
-    dev = inp["mixed_qkv"].device
-    # cuLA conv_state: contiguous [lines, D, W-1], value[line,ch,w] = cs_native[line,w,ch]
-    conv_state = inp["conv_state_native"].permute(0, 2, 1).contiguous()  # [lines, D, W-1]
-    ssm = inp["ssm_states"].clone()
-    conv_window = torch.zeros(N, T, D, W - 1, device=dev, dtype=torch.float32)
-    inter_state_indices = inp["cache_indices"].clone()
-    inter_states = torch.zeros(N, T, HV, V, K, device=dev, dtype=torch.float32)
+def make_unfused_call(inp, N, T, H, HV):
+    state = inp["conv_state"].clone()
+    ssm = inp["ssm"].clone()
+    window = torch.empty(N, T, inp["D"], W - 1, device="cuda")
+    conv_update = load_causal_conv_update()
+    q_end = H * K
+    out = torch.empty(N, T, HV, V, device="cuda", dtype=torch.bfloat16)
+    bufs = alloc_ubufs(N, T, HV)
+    def call():
+        post = conv_update(
+            inp["mixed"].transpose(1, 2),
+            state,
+            inp["weight"],
+            inp["bias"],
+            activation="silu",
+            conv_state_indices=inp["indices"],
+            intermediate_conv_window=window,
+            intermediate_state_indices=inp["indices"],
+        ).transpose(1, 2)
+        q = post[..., :q_end].view(N, T, H, K)
+        k = post[..., q_end : 2 * q_end].view(N, T, H, K)
+        v = post[..., 2 * q_end :].view(N, T, HV, V)
+        kda_decode_mtp_tensor_core_kvbuffer(
+            A_log=inp["A_log"],
+            dt_bias=inp["dt_bias"],
+            q=q,
+            k=k,
+            v=v,
+            a=inp["a"],
+            b=inp["b"],
+            initial_state_source=ssm,
+            initial_state_indices=inp["indices"],
+            scale=K**-0.5,
+            out=out,
+            d_buffer=bufs[0],
+            k_buffer=bufs[1],
+            g_buffer=bufs[2],
+            lower_bound=-5.0,
+        )
+        return out
 
-    o = kda_conv_decode_mtp_verify(
-        mixed_qkv=inp["mixed_qkv"],
-        conv_weight=inp["conv_weight"],
-        conv_bias=inp["conv_bias"],
-        conv_state=conv_state,
-        conv_state_indices=inp["cache_indices"],
-        intermediate_conv_window=conv_window,
-        intermediate_state_indices=inter_state_indices,
-        a=inp["a"],
-        b=inp["b"],
-        A_log=inp["A_log"],
-        dt_bias=inp["dt_bias"],
-        ssm_states=ssm,
-        cache_indices=inp["cache_indices"],
-        intermediate_states_buffer=inter_states,
-        scale=scale,
-        T=T,
-        num_q_heads=H,
-        num_v_heads=HV,
-        head_k_dim=K,
-        head_v_dim=V,
-        lower_bound=lower_bound,
-        bv=bv,
-        variant=variant,
-    )
-    return dict(o=o.view(N, T, HV, V), conv_state=conv_state, conv_window=conv_window,
-                inter_states=inter_states)
-
-
-def make_triton_bench_call(fn, inp, N, T, H, HV, K, V, scale, lower_bound):
-    """Build a Triton call with stable buffers for CUDA Graph capture."""
-    D = inp["D"]
-    dev = inp["mixed_qkv"].device
-    cs = inp["conv_state_native"].clone().transpose(-1, -2)
-    cw = torch.zeros(N, T, D, W - 1, device=dev, dtype=torch.float32)
-    istate = torch.zeros(N, T, HV, V, K, device=dev, dtype=torch.float32)
-    ssm = inp["ssm_states"].clone()
-    idx = inp["cache_indices"]
-
-    return lambda: fn(
-        mixed_qkv=inp["mixed_qkv"], conv_weight=inp["conv_weight"],
-        conv_bias=inp["conv_bias"], conv_state=cs, conv_state_indices=idx,
-        intermediate_conv_window=cw, intermediate_state_indices=idx, a=inp["a"],
-        b=inp["b"], A_log=inp["A_log"], dt_bias=inp["dt_bias"], ssm_states=ssm,
-        cache_indices=idx, intermediate_states_buffer=istate, scale=scale, T=T,
-        num_q_heads=H, num_v_heads=HV, head_k_dim=K, head_v_dim=V,
-        lower_bound=lower_bound, num_warps=4,
-    )
+    return call, bufs, ssm
 
 
-def make_cula_bench_call(inp, N, T, H, HV, K, V, scale, lower_bound,
-                         bv=-1, bvw=-1, variant="auto"):
-    """Build a cuLA call with stable buffers for CUDA Graph capture."""
-    from cula.ops.kda.decode.mtp_conv import kda_conv_decode_mtp_verify
+def make_fused_call(inp, N, T, H, HV, num_v_tiles=-1, opt_level=3):
+    state = inp["conv_state"].clone()
+    ssm = inp["ssm"].clone()
+    window = torch.empty(N, T, inp["D"], W - 1, device="cuda")
+    out = torch.empty(N, T, HV, V, device="cuda", dtype=torch.bfloat16)
+    bufs = alloc_ubufs(N, T, HV)
+    def call():
+        return kda_conv_decode_mtp_kvbuffer(
+            mixed_qkv=inp["mixed"].view(N * T, inp["D"]),
+            conv_weight=inp["weight"],
+            conv_bias=inp["bias"],
+            conv_state=state,
+            conv_state_indices=inp["indices"],
+            intermediate_conv_window=window,
+            intermediate_state_indices=inp["indices"],
+            a=inp["a"],
+            b=inp["b"],
+            A_log=inp["A_log"],
+            dt_bias=inp["dt_bias"],
+            ssm_states=ssm,
+            cache_indices=inp["indices"],
+            scale=K**-0.5,
+            T=T,
+            num_q_heads=H,
+            num_v_heads=HV,
+            head_k_dim=K,
+            head_v_dim=V,
+            out=out,
+            d_buffer=bufs[0],
+            k_buffer=bufs[1],
+            g_buffer=bufs[2],
+            lower_bound=-5.0,
+            opt_level=opt_level,
+            num_v_tiles=num_v_tiles,
+        )
 
-    D = inp["D"]
-    dev = inp["mixed_qkv"].device
-    cs = inp["conv_state_native"].permute(0, 2, 1).contiguous()
-    cw = torch.zeros(N, T, D, W - 1, device=dev, dtype=torch.float32)
-    istate = torch.zeros(N, T, HV, V, K, device=dev, dtype=torch.float32)
-    ssm = inp["ssm_states"].clone()
-    idx = inp["cache_indices"]
-    out = torch.empty(N, T, HV, V, device=dev, dtype=torch.bfloat16)
-
-    return lambda: kda_conv_decode_mtp_verify(
-        mixed_qkv=inp["mixed_qkv"], conv_weight=inp["conv_weight"],
-        conv_bias=inp["conv_bias"], conv_state=cs, conv_state_indices=idx,
-        intermediate_conv_window=cw, intermediate_state_indices=idx, a=inp["a"],
-        b=inp["b"], A_log=inp["A_log"], dt_bias=inp["dt_bias"], ssm_states=ssm,
-        cache_indices=idx, intermediate_states_buffer=istate, scale=scale, T=T,
-        num_q_heads=H, num_v_heads=HV, head_k_dim=K, head_v_dim=V,
-        lower_bound=lower_bound, bv=bv, bvw=bvw, variant=variant, out=out,
-    )
+    return call, bufs, ssm
 
 
-def _graph_calls(N, graph_calls):
-    return 1 if N >= 16 else graph_calls
+def make_recurrent_call(inp, N, T, H, HV, variant="auto"):
+    state = inp["conv_state"].clone()
+    ssm = inp["ssm"].clone()
+    window = torch.empty(N, T, inp["D"], W - 1, device="cuda")
+    inter = torch.empty(N, T, HV, V, K, device="cuda")
+    out = torch.empty(N, T, HV, V, device="cuda", dtype=torch.bfloat16)
+
+    def call():
+        return kda_conv_decode_mtp_verify(
+            mixed_qkv=inp["mixed"].view(N * T, inp["D"]),
+            conv_weight=inp["weight"],
+            conv_bias=inp["bias"],
+            conv_state=state,
+            conv_state_indices=inp["indices"],
+            intermediate_conv_window=window,
+            intermediate_state_indices=inp["indices"],
+            a=inp["a"],
+            b=inp["b"],
+            A_log=inp["A_log"],
+            dt_bias=inp["dt_bias"],
+            ssm_states=ssm,
+            cache_indices=inp["indices"],
+            intermediate_states_buffer=inter,
+            scale=K**-0.5,
+            T=T,
+            num_q_heads=H,
+            num_v_heads=HV,
+            head_k_dim=K,
+            head_v_dim=V,
+            lower_bound=-5.0,
+            variant=variant,
+            out=out,
+        )
+
+    return call, inter, ssm
 
 
-def run_triton_one(args):
-    """Subprocess entry for one fresh-cache Triton point."""
-    lower_bound = args.lower_bound if args.gate == "safe" else None
-    inp = make_inputs(
-        args.N, args.T, args.H, args.HV, args.K, args.V, args.N,
-        args.gate, args.seed,
-    )
+def make_triton_fused_call(inp, N, T, H, HV):
     fn = load_triton_fused()
-    call = make_triton_bench_call(
-        fn, inp, args.N, args.T, args.H, args.HV, args.K, args.V,
-        args.K ** -0.5, lower_bound,
+    state = inp["conv_state"].transpose(1, 2).contiguous().transpose(1, 2)
+    ssm = inp["ssm"].clone()
+    window = torch.empty(N, T, inp["D"], W - 1, device="cuda")
+    inter = torch.empty(N, T, HV, V, K, device="cuda")
+
+    def call():
+        return fn(
+            mixed_qkv=inp["mixed"].view(N * T, inp["D"]),
+            conv_weight=inp["weight"],
+            conv_bias=inp["bias"],
+            conv_state=state,
+            conv_state_indices=inp["indices"],
+            intermediate_conv_window=window,
+            intermediate_state_indices=inp["indices"],
+            a=inp["a"],
+            b=inp["b"],
+            A_log=inp["A_log"],
+            dt_bias=inp["dt_bias"],
+            ssm_states=ssm,
+            cache_indices=inp["indices"],
+            intermediate_states_buffer=inter,
+            scale=K**-0.5,
+            T=T,
+            num_q_heads=H,
+            num_v_heads=HV,
+            head_k_dim=K,
+            head_v_dim=V,
+            lower_bound=-5.0,
+            num_warps=4,
+        )
+
+    return call, inter, ssm
+
+
+def chain_call(verify, ssm, indices, bufs, accept, flush_bv=-1):
+    accept_tensor = torch.full((bufs[0].shape[0],), accept, device="cuda", dtype=torch.int32)
+
+    def call():
+        verify()
+        kda_flush_kvbuffer(ssm, indices, *bufs, accept_len=accept_tensor, bv=flush_bv)
+
+    return call
+
+
+def recurrent_chain_call(verify, ssm, inter, accept):
+    scatter = load_scatter_commit()
+    N, T, HV = inter.shape[:3]
+    dst = ssm.view(1, N, HV, V, K)
+    src = inter.view(1, N, T, HV, V, K)
+    dst_idx = torch.arange(N, device=ssm.device, dtype=torch.int32)
+    step_idx = torch.full((N,), accept - 1, device=ssm.device, dtype=torch.int32)
+
+    def call():
+        verify()
+        scatter(dst, src, dst_idx, step_idx)
+
+    return call
+
+
+def bench_one(N, T, H, HV, args):
+    inp = make_inputs(N, T, H, HV, args.seed)
+    graph_calls = args.graph_calls if N < 16 else 1
+    rows = {}
+
+    conv = make_conv_only_call(inp, N, T)
+    kvbuffer = make_kvbuffer_only_call(inp, N, T, H, HV)
+    unfused, unfused_bufs, unfused_ssm = make_unfused_call(inp, N, T, H, HV)
+    fused, fused_bufs, fused_ssm = make_fused_call(
+        inp,
+        N,
+        T,
+        H,
+        HV,
+        num_v_tiles=args.num_v_tiles,
     )
-    us = t_graph_us(
-        call, args.warmup, args.rep, _graph_calls(args.N, args.graph_calls)
+    rows["conv"] = graph_time_us(conv, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls)
+    rows["kvbuffer_tensor_core"] = graph_time_us(
+        kvbuffer, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls
     )
-    print(f"TRITON_US={us:.4f}", flush=True)
-
-
-def _triton_subproc(args, T, N, cache_dir):
-    """Measure one Triton point in a fresh process and dedicated cache."""
-    shutil.rmtree(cache_dir, ignore_errors=True)
-    os.makedirs(cache_dir, exist_ok=True)
-    env = dict(os.environ)
-    env["TRITON_CACHE_DIR"] = cache_dir
-    cmd = [
-        sys.executable, os.path.abspath(__file__), "--triton-one",
-        "--N", str(N), "--T", str(T), "--H", str(args.H),
-        "--HV", str(args.HV), "--K", str(args.K), "--V", str(args.V),
-        "--gate", args.gate, "--lower-bound", str(args.lower_bound),
-        "--seed", str(args.seed), "--rep", str(args.rep),
-        "--warmup", str(args.warmup), "--graph-calls", str(args.graph_calls),
-    ]
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    for line in proc.stdout.splitlines():
-        if line.startswith("TRITON_US="):
-            return float(line.split("=", 1)[1])
-    sys.stderr.write(
-        f"[triton subprocess failed T={T} N={N}] rc={proc.returncode}\n"
-        f"{proc.stdout}\n{proc.stderr[-2000:]}\n"
+    rows["unfused_tensor_core"] = graph_time_us(
+        unfused, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls
     )
-    return float("nan")
-
-
-def run_sweep(args):
-    """Sweep the same benchmark over all requested T and batch sizes."""
-    lower_bound = args.lower_bound if args.gate == "safe" else None
-    want_cula = args.which in ("cula", "both")
-    want_triton = args.which in ("triton", "both")
-    tri_fn = load_triton_fused() if want_triton and args.triton_inproc else None
-    base_cache = os.environ.get("TRITON_CACHE_DIR")
-    tri_cache = args.triton_cache_dir or (
-        f"{base_cache}_convsweep" if base_cache else "/tmp/kda_conv_convsweep_tricache"
+    rows["fused_tensor_core"] = graph_time_us(
+        fused, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls
+    )
+    rows["unfused_tensor_core_chain"] = graph_time_us(
+        chain_call(unfused, unfused_ssm, inp["indices"], unfused_bufs, args.accept or T, args.flush_bv),
+        warmup=args.warmup,
+        rep=args.rep,
+        graph_calls=graph_calls,
+    )
+    rows["fused_tensor_core_chain"] = graph_time_us(
+        chain_call(fused, fused_ssm, inp["indices"], fused_bufs, args.accept or T, args.flush_bv),
+        warmup=args.warmup,
+        rep=args.rep,
+        graph_calls=graph_calls,
     )
 
-    print(f"# H={args.H} HV={args.HV} K={args.K} V={args.V} gate={args.gate}")
-    print(f"# timing=cuda-graph rep={args.rep} warmup={args.warmup} "
-          f"graph_calls(N<16)={args.graph_calls}")
-    if want_triton:
-        mode = "in-process" if args.triton_inproc else f"fresh process/cache {tri_cache}"
-        print(f"# optional Triton baseline: {mode}")
-    print("T,N,triton_us,cula_us,speedup")
-
-    for T in args.Ts:
-        for N in args.batch_sizes:
-            inp = make_inputs(
-                N, T, args.H, args.HV, args.K, args.V, N, args.gate, args.seed,
-            )
-            gc = _graph_calls(N, args.graph_calls)
-            cula_us = float("nan")
-            if want_cula:
-                call = make_cula_bench_call(
-                    inp, N, T, args.H, args.HV, args.K, args.V,
-                    args.K ** -0.5, lower_bound, args.bv, args.bvw, args.variant,
-                )
-                cula_us = t_graph_us(call, args.warmup, args.rep, gc)
-
-            triton_us = float("nan")
-            if want_triton and T >= W - 1:
-                if args.triton_inproc:
-                    call = make_triton_bench_call(
-                        tri_fn, inp, N, T, args.H, args.HV, args.K, args.V,
-                        args.K ** -0.5, lower_bound,
-                    )
-                    triton_us = t_graph_us(call, args.warmup, args.rep, gc)
-                else:
-                    call = None
-                    inp = None
-                    torch.cuda.empty_cache()
-                    triton_us = _triton_subproc(args, T, N, tri_cache)
-
-            speedup = triton_us / cula_us if triton_us == triton_us and cula_us == cula_us else float("nan")
-            tri_text = f"{triton_us:.1f}" if triton_us == triton_us else "NA"
-            cula_text = f"{cula_us:.1f}" if cula_us == cula_us else "NA"
-            speed_text = f"{speedup:.2f}" if speedup == speedup else "NA"
-            print(f"{T},{N},{tri_text},{cula_text},{speed_text}", flush=True)
-            inp = None
-            torch.cuda.empty_cache()
+    for variant in ("small_batch", "large_batch", "auto"):
+        recurrent, inter, recurrent_ssm = make_recurrent_call(inp, N, T, H, HV, variant=variant)
+        rows[f"cula_{variant}"] = graph_time_us(
+            recurrent, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls
+        )
+        rows[f"cula_{variant}_chain"] = graph_time_us(
+            recurrent_chain_call(recurrent, recurrent_ssm, inter, args.accept or T),
+            warmup=args.warmup,
+            rep=args.rep,
+            graph_calls=graph_calls,
+        )
+    if T >= W - 1:
+        triton, tri_inter, tri_ssm = make_triton_fused_call(inp, N, T, H, HV)
+        rows["triton_fused"] = graph_time_us(triton, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls)
+        rows["triton_fused_chain"] = graph_time_us(
+            recurrent_chain_call(triton, tri_ssm, tri_inter, args.accept or T),
+            warmup=args.warmup,
+            rep=args.rep,
+            graph_calls=graph_calls,
+        )
+    else:
+        rows["triton_fused"] = float("nan")
+        rows["triton_fused_chain"] = float("nan")
+    return rows
 
 
-# Compare helper
-def report(name, ref, act, atol, rtol):
-    ref = ref.float()
-    act = act.float()
-    diff = (ref - act).abs()
-    denom = ref.abs().clamp_min(1e-6)
-    max_abs = diff.max().item()
-    max_rel = (diff / denom).max().item()
-    ok = torch.allclose(ref, act, atol=atol, rtol=rtol)
-    print(f"  [{'PASS' if ok else 'FAIL'}] {name:20s} max_abs={max_abs:.3e} max_rel={max_rel:.3e}")
-    return ok
+def bench_summary(N, T, H, HV, args):
+    """Time the three summary rows with their matching commit chain."""
+    inp = make_inputs(N, T, H, HV, args.seed)
+    graph_calls = args.graph_calls if N < 16 else 1
+    rows = {}
+
+    kvbuffer, bufs, kvb_ssm = make_fused_call(
+        inp, N, T, H, HV, num_v_tiles=args.num_v_tiles
+    )
+    rows["kvbuffer"] = graph_time_us(
+        kvbuffer, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls
+    )
+    rows["kvbuffer_chain"] = graph_time_us(
+        chain_call(kvbuffer, kvb_ssm, inp["indices"], bufs, args.accept or T, args.flush_bv),
+        warmup=args.warmup,
+        rep=args.rep,
+        graph_calls=graph_calls,
+    )
+
+    recurrent, inter, recurrent_ssm = make_recurrent_call(inp, N, T, H, HV, variant="auto")
+    rows["non_kvbuffer_auto"] = graph_time_us(
+        recurrent, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls
+    )
+    rows["non_kvbuffer_auto_chain"] = graph_time_us(
+        recurrent_chain_call(recurrent, recurrent_ssm, inter, args.accept or T),
+        warmup=args.warmup,
+        rep=args.rep,
+        graph_calls=graph_calls,
+    )
+
+    if T >= W - 1:
+        triton, inter, triton_ssm = make_triton_fused_call(inp, N, T, H, HV)
+        rows["triton"] = graph_time_us(
+            triton, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls
+        )
+        rows["triton_chain"] = graph_time_us(
+            recurrent_chain_call(triton, triton_ssm, inter, args.accept or T),
+            warmup=args.warmup,
+            rep=args.rep,
+            graph_calls=graph_calls,
+        )
+    else:
+        rows["triton"] = float("nan")
+        rows["triton_chain"] = float("nan")
+    return rows
+
+
+def bench_fused_only(N, T, H, HV, args):
+    """Time only the production fused tensor-core kernel and its flush chain."""
+    inp = make_inputs(N, T, H, HV, args.seed)
+    graph_calls = args.graph_calls if N < 16 else 1
+    fused, bufs, ssm = make_fused_call(inp, N, T, H, HV, num_v_tiles=args.num_v_tiles)
+    verify_us = graph_time_us(fused, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls)
+    chain_us = graph_time_us(
+        chain_call(fused, ssm, inp["indices"], bufs, args.accept or T, args.flush_bv),
+        warmup=args.warmup,
+        rep=args.rep,
+        graph_calls=graph_calls,
+    )
+    return {
+        "fused_tensor_core": verify_us,
+        "fused_tensor_core_chain": chain_us,
+    }
+
+
+def print_row(N, T, rows):
+    fused = rows["fused_tensor_core"]
+    unfused = rows["unfused_tensor_core"]
+    tri = rows["triton_fused"]
+    tri_chain = rows["triton_fused_chain"]
+    print(
+        f"N={N:3d} T={T:2d} | baseline verify us: triton={tri:8.3f} "
+        f"fused-tc={fused:8.3f} ({tri / fused:5.2f}x) "
+        f"cula-auto={rows['cula_auto']:8.3f}"
+    )
+    print(
+        f"             | baseline chain  us: triton={tri_chain:8.3f} "
+        f"fused-tc={rows['fused_tensor_core_chain']:8.3f} "
+        f"({tri_chain / rows['fused_tensor_core_chain']:5.2f}x) "
+        f"cula-auto={rows['cula_auto_chain']:8.3f}"
+    )
+    print(
+        f"             | recurrent verify us: small={rows['cula_small_batch']:8.3f} "
+        f"({tri / rows['cula_small_batch']:5.2f}x) "
+        f"large={rows['cula_large_batch']:8.3f} "
+        f"({tri / rows['cula_large_batch']:5.2f}x)"
+    )
+    print(
+        f"             | recurrent chain  us: small={rows['cula_small_batch_chain']:8.3f} "
+        f"({tri_chain / rows['cula_small_batch_chain']:5.2f}x) "
+        f"large={rows['cula_large_batch_chain']:8.3f} "
+        f"({tri_chain / rows['cula_large_batch_chain']:5.2f}x)"
+    )
+    print(
+        f"             | unfused tensor us: verify={unfused:8.3f} -> {fused:8.3f} "
+        f"({unfused / fused:5.2f}x); chain={rows['unfused_tensor_core_chain']:8.3f} "
+        f"-> {rows['fused_tensor_core_chain']:8.3f}"
+    )
+    print(
+        f"             | breakdown us: conv={rows['conv']:8.3f} "
+        f"kvb-tc={rows['kvbuffer_tensor_core']:8.3f} "
+        f"fused-over-kvb={fused - rows['kvbuffer_tensor_core']:8.3f}"
+    )
+
+
+def print_summary_row(N, T, rows):
+    triton = rows["triton"]
+    triton_chain = rows["triton_chain"]
+    print(
+        f"N={N:3d} T={T:2d} | verify us: triton={triton:8.3f} "
+        f"non-kvb-auto={rows['non_kvbuffer_auto']:8.3f} "
+        f"({triton / rows['non_kvbuffer_auto']:5.2f}x) "
+        f"kvbuffer={rows['kvbuffer']:8.3f} ({triton / rows['kvbuffer']:5.2f}x)"
+    )
+    print(
+        f"             | chain  us: triton={triton_chain:8.3f} "
+        f"non-kvb-auto={rows['non_kvbuffer_auto_chain']:8.3f} "
+        f"({triton_chain / rows['non_kvbuffer_auto_chain']:5.2f}x) "
+        f"kvbuffer={rows['kvbuffer_chain']:8.3f} "
+        f"({triton_chain / rows['kvbuffer_chain']:5.2f}x)"
+    )
+
+
+def profile_one(args):
+    """Run one selected path repeatedly so an external profiler can wrap it."""
+    N = args.batch_sizes[0] if args.batch_sizes else args.N
+    T = args.Ts[0] if args.Ts else args.T
+    inp = make_inputs(N, T, args.H, args.HV, args.seed)
+    accept = args.accept or T
+    name = args.profile.removesuffix("_chain")
+    if name == "conv":
+        verify = make_conv_only_call(inp, N, T)
+        bufs = ssm = None
+    elif name == "kvbuffer_tensor_core":
+        verify = make_kvbuffer_only_call(inp, N, T, args.H, args.HV)
+        bufs = ssm = None
+    elif name == "unfused_tensor_core":
+        verify, bufs, ssm = make_unfused_call(inp, N, T, args.H, args.HV)
+    elif name == "fused_tensor_core":
+        verify, bufs, ssm = make_fused_call(
+            inp, N, T, args.H, args.HV, num_v_tiles=args.num_v_tiles
+        )
+    elif name in ("small_batch", "large_batch", "auto"):
+        verify, inter, ssm = make_recurrent_call(inp, N, T, args.H, args.HV, variant=name)
+        if args.profile.endswith("_chain"):
+            verify = recurrent_chain_call(verify, ssm, inter, accept)
+        bufs = None
+    elif name == "triton_fused":
+        verify, inter, ssm = make_triton_fused_call(inp, N, T, args.H, args.HV)
+        if args.profile.endswith("_chain"):
+            verify = recurrent_chain_call(verify, ssm, inter, accept)
+        bufs = None
+    elif name == "flush":
+        prepare, bufs, ssm = make_fused_call(
+            inp, N, T, args.H, args.HV, num_v_tiles=args.num_v_tiles
+        )
+        prepare()
+        verify = chain_call(lambda: None, ssm, inp["indices"], bufs, accept, args.flush_bv)
+    else:
+        raise ValueError(f"unknown profile path {args.profile}")
+    if args.profile.endswith("_chain") and name not in (
+        "triton_fused",
+        "small_batch",
+        "large_batch",
+        "auto",
+    ):
+        verify = chain_call(verify, ssm, inp["indices"], bufs, accept, args.flush_bv)
+    for _ in range(5):
+        verify()
+    torch.cuda.synchronize()
+    for _ in range(args.profile_iters):
+        verify()
+    torch.cuda.synchronize()
+    print(f"profiled {args.profile} N={N} T={T} H={args.H} HV={args.HV} iters={args.profile_iters}")
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--sweep", action="store_true", help="sweep all --Ts x --batch-sizes")
-    ap.add_argument("--N", type=int, default=128)
-    ap.add_argument("--T", type=int, default=4)
-    ap.add_argument("--batch-sizes", type=int, nargs="+",
-                    default=[1, 2, 4, 8, 16, 32, 64, 128, 256])
-    ap.add_argument("--Ts", type=int, nargs="+", default=[2, 3, 4, 6, 8])
-    ap.add_argument("--H", type=int, default=32)   # real KDA: num_q_heads==num_v_heads (H==HV); 32=full, 8=TP4
-    ap.add_argument("--HV", type=int, default=32)
-    ap.add_argument("--K", type=int, default=128)
-    ap.add_argument("--V", type=int, default=128)
-    ap.add_argument("--gate", choices=["safe", "softplus"], default="safe")
-    ap.add_argument("--lower-bound", type=float, default=-5.0)
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--check", action="store_true", help="run torch ref + correctness")
-    ap.add_argument("--atol", type=float, default=3e-2)
-    ap.add_argument("--rtol", type=float, default=2e-2)
-    ap.add_argument("--rep", type=int, default=300, help="CUDA-graph replays timed")
-    ap.add_argument("--warmup", type=int, default=15, help="warmup iters before capture")
-    ap.add_argument("--graph-calls", type=int, default=20,
-                    help="calls packed per CUDA graph when N<16 to amortize fixed "
-                         "replay overhead at small batch (N>=16 uses 1)")
-    ap.add_argument("--rm-triton-cache", action="store_true",
-                    help="clear TRITON_CACHE_DIR before loading Triton (fresh "
-                         "compile + autotune; use a dedicated cache dir)")
-    ap.add_argument("--triton-cache-dir", default=None,
-                    help="dedicated cache emptied before each Triton sweep point")
-    ap.add_argument("--triton-inproc", action="store_true",
-                    help="measure the optional Triton baseline in process")
-    ap.add_argument("--which", choices=["triton", "cula", "both"], default="cula")
-    ap.add_argument("--bv", type=int, default=-1, help="cuLA small_batch v-tile size (8/16/32; -1=auto)")
-    ap.add_argument("--bvw", type=int, default=-1, help="cuLA large_batch v-cols/warp; -1=auto")
-    ap.add_argument("--variant", choices=["auto", "small_batch", "large_batch"], default="auto")
-    ap.add_argument("--triton-one", action="store_true", help=argparse.SUPPRESS)
-    args = ap.parse_args()
-
-    if args.triton_one:
-        run_triton_one(args)
-        return
-    if args.sweep:
-        run_sweep(args)
-        return
-
-    if args.rm_triton_cache and args.which in ("triton", "both"):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--N", type=int, default=4)
+    parser.add_argument("--T", type=int, default=4)
+    parser.add_argument("--H", type=int, default=8)
+    parser.add_argument("--HV", type=int, default=8)
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=None)
+    parser.add_argument("--Ts", type=int, nargs="+", default=None)
+    parser.add_argument("--accept", type=int, default=0)
+    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--rep", type=int, default=200)
+    parser.add_argument("--graph-calls", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--num-v-tiles", type=int, default=-1, choices=[-1, 1, 2, 4])
+    parser.add_argument("--flush-bv", type=int, default=-1, choices=[-1, 8, 16, 32])
+    parser.add_argument(
+        "--profile",
+        default="",
+        choices=[
+            "",
+            "conv",
+            "kvbuffer_tensor_core",
+            "unfused_tensor_core",
+            "fused_tensor_core",
+            "small_batch",
+            "large_batch",
+            "auto",
+            "triton_fused",
+            "unfused_tensor_core_chain",
+            "fused_tensor_core_chain",
+            "small_batch_chain",
+            "large_batch_chain",
+            "auto_chain",
+            "triton_fused_chain",
+            "flush",
+        ],
+        help="run one path in a profiler-friendly launch loop",
+    )
+    parser.add_argument("--profile-iters", type=int, default=20)
+    parser.add_argument("--rm-triton-cache", action="store_true")
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="time Triton, non-KVBuffer auto and KVBuffer verify+chain",
+    )
+    parser.add_argument(
+        "--fused-only",
+        action="store_true",
+        help="time only fused tensor-core verify and verify+flush chain",
+    )
+    parser.add_argument("--output-csv", type=pathlib.Path, default=None)
+    args = parser.parse_args()
+    for T in args.Ts or [args.T]:
+        if not 1 <= T <= 8:
+            parser.error(f"fused conv KVBuffer requires T in [1, 8], got T={T}")
+        if not 1 <= (args.accept or T) <= T:
+            parser.error(f"--accept must be in [1, T], got accept={args.accept}, T={T}")
+    if args.rm_triton_cache:
         clear_triton_cache()
-
-    dev = "cuda"
-    scale = args.K ** -0.5
-    lower_bound = args.lower_bound if args.gate == "safe" else None
-    pool_size = args.N
-    print(f"config: N={args.N} T={args.T} H={args.H} HV={args.HV} K={args.K} V={args.V} "
-          f"gate={args.gate} D={2*args.H*args.K + args.HV*args.V}")
-
-    inp = make_inputs(args.N, args.T, args.H, args.HV, args.K, args.V, pool_size,
-                      args.gate, args.seed, dev)
-
-    tri_fn = None
-    if args.which in ("triton", "both"):
-        tri_fn = load_triton_fused()
-
-    if args.check:
-        ref = torch_reference(inp, args.N, args.T, args.H, args.HV, args.K, args.V,
-                              scale, lower_bound)
-        print("torch reference computed.")
-        if tri_fn is not None:
-            tri = run_triton(tri_fn, inp, args.N, args.T, args.H, args.HV, args.K, args.V,
-                             scale, lower_bound, num_warps=4)
-            print("triton vs torch-ref:")
-            report("o", ref["o"], tri["o"], args.atol, args.rtol)
-            report("inter_ssm", ref["ssm_snap"], tri["inter_states"], args.atol, args.rtol)
-            report("conv_window", ref["win_snap"],
-                   tri["conv_window"].transpose(-1, -2), args.atol, args.rtol)
-            report("conv_state", ref["conv_state_out"],
-                   tri["conv_state"].transpose(-1, -2), args.atol, args.rtol)
-        if args.which in ("cula", "both"):
-            cula = run_cula(inp, args.N, args.T, args.H, args.HV, args.K, args.V,
-                            scale, lower_bound, bv=args.bv, variant=args.variant)
-            print("cuLA vs torch-ref:")
-            report("o", ref["o"], cula["o"], args.atol, args.rtol)
-            report("inter_ssm", ref["ssm_snap"], cula["inter_states"], args.atol, args.rtol)
-            report("conv_window", ref["win_snap"],
-                   cula["conv_window"].transpose(-1, -2), args.atol, args.rtol)
-            report("conv_state", ref["conv_state_out"],
-                   cula["conv_state"].transpose(-1, -2), args.atol, args.rtol)
-
-    # Reuse stable buffers during CUDA Graph replay.
-    N, T, H, HV, K, V = args.N, args.T, args.H, args.HV, args.K, args.V
-    gc = 1 if N >= 16 else args.graph_calls  # amortize replay overhead at small batch
-
-    def bench(fn_run):
-        return t_graph_us(fn_run, args.warmup, args.rep, gc)
-
-    if tri_fn is not None:
-        call = make_triton_bench_call(
-            tri_fn, inp, N, T, H, HV, K, V, scale, lower_bound,
-        )
-        print(f"triton fused: {bench(call):.2f} us  (graph, rep={args.rep} gc={gc})")
-
-    if args.which in ("cula", "both"):
-        call = make_cula_bench_call(
-            inp, N, T, H, HV, K, V, scale, lower_bound,
-            args.bv, args.bvw, args.variant,
-        )
-        print(f"cuLA fused(var={args.variant},bv={args.bv}): {bench(call):.2f} us  "
-              f"(graph, rep={args.rep} gc={gc})")
+    if args.profile:
+        profile_one(args)
+        return
+    name = torch.cuda.get_device_name(0)
+    print(f"GPU: {name}; H={args.H}, HV={args.HV}, K=V=128")
+    records = []
+    for T in args.Ts or [args.T]:
+        for N in args.batch_sizes or [args.N]:
+            if args.summary_only:
+                rows = bench_summary(N, T, args.H, args.HV, args)
+                print_summary_row(N, T, rows)
+                records.append({"H": args.H, "HV": args.HV, "N": N, "T": T, **rows})
+                continue
+            if args.fused_only:
+                rows = bench_fused_only(N, T, args.H, args.HV, args)
+                print(
+                    f"N={N:3d} T={T:2d} | "
+                    f"verify={rows['fused_tensor_core']:8.3f} us "
+                    f"chain={rows['fused_tensor_core_chain']:8.3f} us"
+                )
+                records.append({"H": args.H, "HV": args.HV, "N": N, "T": T, **rows})
+                continue
+            rows = bench_one(N, T, args.H, args.HV, args)
+            print_row(N, T, rows)
+            records.append({"H": args.H, "HV": args.HV, "N": N, "T": T, **rows})
+    if args.output_csv:
+        if not args.output_csv.parent.is_dir():
+            parser.error(f"CSV parent directory does not exist: {args.output_csv.parent}")
+        with args.output_csv.open("w", newline="") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=list(records[0]))
+            writer.writeheader()
+            writer.writerows(records)
+        print(f"wrote CSV: {args.output_csv}")
 
 
 if __name__ == "__main__":
