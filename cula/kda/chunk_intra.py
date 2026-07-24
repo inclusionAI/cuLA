@@ -94,6 +94,23 @@ def _is_bwd_intra_sm100_supported(
     )
 
 
+def _is_bwd_intra_sm90_cutedsl_supported(
+    q: torch.Tensor,
+    g: torch.Tensor,
+    chunk_size: int,
+    safe_gate: bool,
+) -> bool:
+    major, minor = _get_device_sm_version(q.device)
+    return (
+        major == 9
+        and minor == 0
+        and safe_gate
+        and chunk_size == 64
+        and q.shape[-1] == 128
+        and g.shape[2] == q.shape[2]
+    )
+
+
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
@@ -614,7 +631,11 @@ def _chunk_kda_bwd_intra_cutedsl(
     chunk_size: int = 64,
     safe_gate: bool = False,
 ):
-    if not _is_bwd_intra_sm100_supported(q, g, chunk_size, safe_gate):
+    use_sm90 = _is_bwd_intra_sm90_cutedsl_supported(
+        q, g, chunk_size, safe_gate
+    )
+    use_sm100 = _is_bwd_intra_sm100_supported(q, g, chunk_size, safe_gate)
+    if not use_sm90 and not use_sm100:
         return _chunk_kda_bwd_intra_triton(
             q=q,
             k=k,
@@ -634,17 +655,21 @@ def _chunk_kda_bwd_intra_cutedsl(
     if beta.dtype not in (torch.bfloat16, torch.float32):
         raise TypeError(f"beta must be bfloat16 or float32 for CuTeDSL bwd intra, got {beta.dtype}")
 
-    from cutlass.cute.typing import Int32
-
-    from cula.ops.kda_bwd_intra_sm100 import compile_kda_bwd_intra
-
     B, T, H, K = q.shape
     cu_seqlens, chunk_indices = _prepare_bwd_intra_varlen_metadata(B, T, q.device, cu_seqlens, chunk_indices, chunk_size)
 
-    dq_out = torch.empty_like(dq, dtype=torch.bfloat16)
-    dk_out = torch.empty_like(dk, dtype=torch.bfloat16)
-    db_out = torch.empty_like(db, dtype=torch.float)
-    dg_out = torch.empty_like(dg, dtype=torch.float)
+    dq_out = torch.empty_like(
+        dq, dtype=torch.bfloat16, memory_format=torch.contiguous_format
+    )
+    dk_out = torch.empty_like(
+        dk, dtype=torch.bfloat16, memory_format=torch.contiguous_format
+    )
+    db_out = torch.empty_like(
+        db, dtype=torch.float, memory_format=torch.contiguous_format
+    )
+    dg_out = torch.empty_like(
+        dg, dtype=torch.float, memory_format=torch.contiguous_format
+    )
 
     q = q.contiguous()
     k = k.contiguous()
@@ -656,6 +681,8 @@ def _chunk_kda_bwd_intra_cutedsl(
     dk = dk.contiguous()
     db = db.contiguous()
     dg = dg.contiguous()
+    cu_seqlens = cu_seqlens.contiguous()
+    chunk_indices = chunk_indices.contiguous()
 
     if B != 1:
         q = q.reshape(1, B * T, H, K)
@@ -673,33 +700,60 @@ def _chunk_kda_bwd_intra_cutedsl(
         db_out = db_out.reshape(1, B * T, H)
         dg_out = dg_out.reshape(1, B * T, H, K)
 
-    ci_flat = chunk_indices.reshape(-1).contiguous()
-    num_chunks = ci_flat.shape[0] // 2
-    num_tiles = num_chunks * H
-    tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
+    if use_sm90:
+        from cula.ops.kda_bwd_intra_mma import kda_bwd_intra_mma
 
-    compiled_fn = compile_kda_bwd_intra(H, K=K, BT=chunk_size, beta_dtype=beta.dtype)
-    compiled_fn(
-        q,
-        k,
-        g,
-        dAqk,
-        dAkk,
-        dq,
-        dk,
-        dg,
-        db,
-        beta,
-        dq_out,
-        dk_out,
-        dg_out,
-        db_out,
-        tile_counter,
-        cu_seqlens,
-        ci_flat,
-        (Int32(B * T), Int32(H), Int32(K)),
-        Int32(num_tiles),
-    )
+        kda_bwd_intra_mma(
+            q,
+            k,
+            g,
+            beta,
+            dAqk,
+            dAkk,
+            dq,
+            dk,
+            db,
+            dg,
+            cu_seqlens,
+            chunk_indices,
+            dq_out,
+            dk_out,
+            db_out,
+            dg_out,
+            chunk_size,
+        )
+    else:
+        from cutlass.cute.typing import Int32
+
+        from cula.ops.kda_bwd_intra_sm100 import compile_kda_bwd_intra
+
+        ci_flat = chunk_indices.reshape(-1).contiguous()
+        num_chunks = ci_flat.shape[0] // 2
+        num_tiles = num_chunks * H
+        tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
+
+        compiled_fn = compile_kda_bwd_intra(H, K=K, BT=chunk_size, beta_dtype=beta.dtype)
+        compiled_fn(
+            q,
+            k,
+            g,
+            dAqk,
+            dAkk,
+            dq,
+            dk,
+            dg,
+            db,
+            beta,
+            dq_out,
+            dk_out,
+            dg_out,
+            db_out,
+            tile_counter,
+            cu_seqlens,
+            ci_flat,
+            (Int32(B * T), Int32(H), Int32(K)),
+            Int32(num_tiles),
+        )
 
     if B != 1:
         dq_out = dq_out.reshape(B, T, H, K)

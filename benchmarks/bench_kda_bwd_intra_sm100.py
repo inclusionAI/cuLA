@@ -1,8 +1,8 @@
 """
-Benchmark: KDABwdIntraSM100 (CuTeDSL Blackwell SM100) vs FLA Triton baseline.
+Benchmark: SM100 tcgen05 and portable mma.sync CuTeDSL vs FLA Triton.
 
-Validates correctness and measures performance of the CuTeDSL kda_bwd_intra
-kernel against the FLA Triton reference implementation.
+Validates correctness and measures both CuTeDSL implementations against the
+FLA Triton reference. The mma.sync implementation is shared with SM90.
 
 Input convention (mirrors flashla benchmark):
   - q, k, g:       [1, total_tokens, H, K]  bf16 / f32
@@ -31,6 +31,7 @@ from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra
 from fla.ops.utils import prepare_chunk_indices
 from fla.utils import assert_close
 
+from cula.ops.kda_bwd_intra_mma import kda_bwd_intra_mma
 from cula.ops.kda_bwd_intra_sm100 import compile_kda_bwd_intra
 
 # =============================================================================
@@ -206,6 +207,60 @@ def run_cula_bwd_intra(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, ch
     )
 
 
+def _prepare_mma_bwd_intra(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices):
+    """Prepare the portable mma.sync CuTeDSL kernel and its outputs."""
+    q2 = q.contiguous()
+    k2 = k.contiguous()
+    g2 = g.contiguous()
+    beta2 = beta.contiguous()
+    dAqk2 = dAqk.contiguous()
+    dAkk2 = dAkk.contiguous()
+    dq2 = dq.contiguous()
+    dk2 = dk.contiguous()
+    db2 = db.contiguous()
+    dg2 = dg.contiguous()
+    cu_seqlens2 = cu_seqlens.to(torch.int32).contiguous()
+    chunk_indices2 = chunk_indices.to(torch.int32).contiguous()
+
+    dq_out = torch.empty_like(q2)
+    dk_out = torch.empty_like(k2)
+    db_out = torch.empty_like(db2, dtype=torch.float32)
+    dg_out = torch.empty_like(dg2, dtype=torch.float32)
+
+    def fn():
+        kda_bwd_intra_mma(
+            q2,
+            k2,
+            g2,
+            beta2,
+            dAqk2,
+            dAkk2,
+            dq2,
+            dk2,
+            db2,
+            dg2,
+            cu_seqlens2,
+            chunk_indices2,
+            dq_out,
+            dk_out,
+            db_out,
+            dg_out,
+            BT,
+        )
+
+    return fn, (dq_out, dk_out, db_out, dg_out)
+
+
+def run_mma_bwd_intra(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices):
+    """Run the portable mma.sync CuTeDSL kernel on SM90 or SM100."""
+    fn, outputs = _prepare_mma_bwd_intra(
+        q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices
+    )
+    fn()
+    torch.cuda.synchronize()
+    return outputs
+
+
 def run_fla_bwd_intra(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices):
     """Run FLA Triton kda_bwd_intra."""
     return chunk_kda_bwd_intra(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices, BT, True)
@@ -278,6 +333,14 @@ def _make_bench_cula(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chun
             total_tiles_val,
         )
 
+    return fn
+
+
+def _make_bench_mma(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices):
+    """Factory for benchmarking the portable mma.sync CuTeDSL kernel."""
+    fn, _ = _prepare_mma_bwd_intra(
+        q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices
+    )
     return fn
 
 
@@ -356,6 +419,26 @@ def _check_accuracy(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk
     return acc
 
 
+def _check_mma_accuracy(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices):
+    """Compare the portable mma.sync kernel against FLA."""
+    dq_c, dk_c, db_c, dg_c = run_mma_bwd_intra(
+        q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices
+    )
+    dq_f, dk_f, db_f, dg_f = run_fla_bwd_intra(
+        q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices
+    )
+    acc = {}
+    for name, ref, tri in [
+        ("dq", dq_f, dq_c.float()),
+        ("dk", dk_f, dk_c.float()),
+        ("db", db_f, db_c),
+        ("dg", dg_f, dg_c),
+    ]:
+        _, rel_rmse, _, rel_max = _error_metrics(ref, tri)
+        acc[name] = (rel_rmse, rel_max)
+    return acc
+
+
 def _format_accuracy(acc):
     """Format per-output accuracy dict as a compact sub-line string."""
     parts = []
@@ -382,25 +465,38 @@ def check_correctness(H=4, total_T=512, num_seqs=4, beta_dtype=torch.float32):
     )
 
     dq_c, dk_c, db_c, dg_c = run_cula_bwd_intra(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices)
-    dq_f, dk_f, db_f, dg_f = run_fla_bwd_intra(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices)
+    dq_m, dk_m, db_m, dg_m = run_mma_bwd_intra(
+        q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices
+    )
+    dq_f, dk_f, db_f, dg_f = run_fla_bwd_intra(
+        q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices
+    )
 
     assert_close("dq", dq_f, dq_c.float(), 0.008)
     assert_close("dk", dk_f, dk_c.float(), 0.008)
     assert_close("db", db_f, db_c, 0.02)
     assert_close("dg", dg_f, dg_c, 0.02)
+    assert_close("mma.dq", dq_f, dq_m.float(), 0.008)
+    assert_close("mma.dk", dk_f, dk_m.float(), 0.008)
+    assert_close("mma.db", db_f, db_m, 0.02)
+    assert_close("mma.dg", dg_f, dg_m, 0.02)
 
     # Print detailed error metrics
     pairs = [
-        ("dq", dq_f, dq_c.float()),
-        ("dk", dk_f, dk_c.float()),
-        ("db", db_f, db_c),
-        ("dg", dg_f, dg_c),
+        ("tcgen.dq", dq_f, dq_c.float()),
+        ("tcgen.dk", dk_f, dk_c.float()),
+        ("tcgen.db", db_f, db_c),
+        ("tcgen.dg", dg_f, dg_c),
+        ("mma.dq", dq_f, dq_m.float()),
+        ("mma.dk", dk_f, dk_m.float()),
+        ("mma.db", db_f, db_m),
+        ("mma.dg", dg_f, dg_m),
     ]
     print()
-    print(f"    {'tensor':>6}  {'RMSE':>10}  {'rel_RMSE':>10}  {'maxdiff':>10}  {'rel_maxdiff':>12}")
+    print(f"    {'tensor':>9}  {'RMSE':>10}  {'rel_RMSE':>10}  {'maxdiff':>10}  {'rel_maxdiff':>12}")
     for name, ref, tri in pairs:
         rmse, rel_rmse, abs_max, rel_max = _error_metrics(ref, tri)
-        print(f"    {name:>6}  {rmse:>10.6f}  {rel_rmse:>10.6f}  {abs_max:>10.6f}  {rel_max:>12.6f}")
+        print(f"    {name:>9}  {rmse:>10.6f}  {rel_rmse:>10.6f}  {abs_max:>10.6f}  {rel_max:>12.6f}")
     return True
 
 
@@ -410,7 +506,7 @@ def check_correctness(H=4, total_T=512, num_seqs=4, beta_dtype=torch.float32):
 
 
 def check_determinism(H=4, total_T=512, num_seqs=4, iters=20, beta_dtype=torch.float32):
-    """Verify deterministic outputs across repeated runs."""
+    """Verify both CuTeDSL implementations are deterministic."""
     torch.manual_seed(42)
     seq_lens = generate_balanced_seqlens(total_T, num_seqs)
     q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices = make_bwd_intra_inputs(
@@ -418,6 +514,9 @@ def check_determinism(H=4, total_T=512, num_seqs=4, iters=20, beta_dtype=torch.f
     )
 
     ref_dq, ref_dk, ref_db, ref_dg = run_cula_bwd_intra(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices)
+    ref_mma = run_mma_bwd_intra(
+        q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices
+    )
     for i in range(iters):
         dq_out, dk_out, db_out, dg_out = run_cula_bwd_intra(
             q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices
@@ -426,6 +525,13 @@ def check_determinism(H=4, total_T=512, num_seqs=4, iters=20, beta_dtype=torch.f
         assert torch.equal(dk_out, ref_dk), f"dk mismatch at iter {i}"
         assert torch.equal(db_out, ref_db), f"db mismatch at iter {i}"
         assert torch.equal(dg_out, ref_dg), f"dg mismatch at iter {i}"
+        mma_outputs = run_mma_bwd_intra(
+            q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu_seqlens, chunk_indices
+        )
+        for name, output, reference in zip(
+            ("dq", "dk", "db", "dg"), mma_outputs, ref_mma
+        ):
+            assert torch.equal(output, reference), f"mma.{name} mismatch at iter {i}"
     return True
 
 
@@ -673,6 +779,55 @@ def bench_varlen_8k_16k_vs_fla(H):
     _print_summary(f"H={H}", speedups)
 
 
+def bench_mma_sync_comparison(H):
+    """Compare SM100 tcgen05, portable mma.sync, and FLA directly."""
+    configs = [
+        ("uniform", [8192]),
+        ("uniform", [32768]),
+        ("varlen", generate_quasi_balanced_seqlens(8192, 8)),
+        ("varlen", generate_quasi_balanced_seqlens(32768, 8)),
+    ]
+
+    print(f"\n{'=' * 142}")
+    print(f"  SM100 tcgen05 vs portable mma.sync CuTeDSL vs FLA (H={H})")
+    print(f"{'=' * 142}")
+    print(
+        f"{'Config':<39} {'tcgen05':>10} {'mma.sync':>10} {'FLA':>10} "
+        f"{'tcgen_sp':>9} {'mma_sp':>9} {'mma/tcgen':>11} {'rRMSE':>9} {'rMAX':>9}"
+    )
+    print(f"{'-' * 142}")
+
+    for kind, seq_lens in configs:
+        torch.manual_seed(42)
+        q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu, ci = make_bwd_intra_inputs(
+            seq_lens, H, beta_dtype=torch.bfloat16
+        )
+        tcgen_ms = bench_fn(
+            _make_bench_cula(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu, ci)
+        )[0]
+        mma_ms = bench_fn(
+            _make_bench_mma(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu, ci)
+        )[0]
+        fla_ms = bench_fn(
+            lambda: run_fla_bwd_intra(
+                q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu, ci
+            )
+        )[0]
+        acc = _check_mma_accuracy(
+            q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu, ci
+        )
+        rrmse, rmax = _worst_accuracy(acc)
+        total = sum(seq_lens)
+        config = f"{kind} T={total} N={len(seq_lens)}"
+        print(
+            f"{config:<39} {tcgen_ms:>9.3f}ms {mma_ms:>9.3f}ms "
+            f"{fla_ms:>9.3f}ms {fla_ms / tcgen_ms:>8.2f}x "
+            f"{fla_ms / mma_ms:>8.2f}x {tcgen_ms / mma_ms:>10.2f}x "
+            f"{rrmse:>9.6f} {rmax:>9.6f}"
+        )
+        print(_format_accuracy(acc))
+
+
 # =============================================================================
 # Main runners
 # =============================================================================
@@ -702,6 +857,7 @@ def run_all_benchmarks(H):
     bench_balanced_vs_unbalanced(H)
     bench_realistic_prefill(H)
     bench_varlen_8k_16k_vs_fla(H)
+    bench_mma_sync_comparison(H)
 
 
 def run_correctness_only(H):
@@ -732,6 +888,22 @@ def run_expanded_varlen_only(H):
     bench_varlen_8k_16k_vs_fla(H)
 
 
+def run_mma_sync_only(H):
+    print(f"\n{'#' * 100}")
+    print(f"#  Portable mma.sync comparison on SM100: H={H}, K={K}, BT={BT}")
+    print(f"{'#' * 100}")
+
+    compile_kda_bwd_intra(H, K=K, BT=BT)
+    for beta_dtype in [torch.bfloat16, torch.float32]:
+        print(f"\n  Correctness (H={H}, beta={beta_dtype})...", end="", flush=True)
+        check_correctness(H, beta_dtype=beta_dtype)
+        print(" PASS")
+    print(f"  Determinism (H={H}, beta={torch.bfloat16})...", end="", flush=True)
+    check_determinism(H, beta_dtype=torch.bfloat16)
+    print(" PASS")
+    bench_mma_sync_comparison(H)
+
+
 def run_ncu(H):
     """NCU profiling mode: warmup=1, rep=1 per config. Run under ncu."""
     print(f"\n{'#' * 100}")
@@ -750,18 +922,24 @@ def run_ncu(H):
         total = sum(seq_lens)
         q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu, ci = make_bwd_intra_inputs(seq_lens, H)
         cula_fn = _make_bench_cula(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu, ci)
+        mma_fn = _make_bench_mma(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu, ci)
 
         def fla_fn():
             return run_fla_bwd_intra(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, cu, ci)
 
         # warmup once
         cula_fn()
+        mma_fn()
         fla_fn()
         torch.cuda.synchronize()
 
         # single measured run
         print(f"  [{tag}] T={total} N={len(seq_lens)} running cuLA...", flush=True)
         cula_fn()
+        torch.cuda.synchronize()
+
+        print(f"  [{tag}] T={total} N={len(seq_lens)} running mma.sync...", flush=True)
+        mma_fn()
         torch.cuda.synchronize()
 
         print(f"  [{tag}] T={total} N={len(seq_lens)} running FLA...", flush=True)
@@ -782,7 +960,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark KDABwdIntraSM100 vs FLA Triton")
     parser.add_argument(
         "--suite",
-        choices=["all", "correctness", "expanded_varlen", "ncu"],
+        choices=["all", "correctness", "expanded_varlen", "mma", "ncu"],
         default="all",
         help="Benchmark suite to run (default: all)",
     )
@@ -811,6 +989,8 @@ if __name__ == "__main__":
             run_expanded_varlen_only(H)
         elif args.suite == "ncu":
             run_ncu(H)
+        elif args.suite == "mma":
+            run_mma_sync_only(H)
         else:
             run_all_benchmarks(H)
 
