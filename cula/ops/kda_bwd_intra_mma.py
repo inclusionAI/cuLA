@@ -27,7 +27,9 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass._mlir import ir as _ir
 from cutlass._mlir.dialects import llvm as _llvm
+from cutlass._mlir.dialects import vector as _vector
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int32
 from cutlass.cutlass_dsl import T as _T
@@ -66,6 +68,13 @@ def _as_tf32_register(value, *, loc=None, ip=None):
 
 @cutlass.dsl_user_op
 def _store_bf16x2(pointer, value0, value1, *, loc=None, ip=None):
+    """Round, pack, and store two BF16 values with the required CG policy.
+
+    CuTeDSL 4.4.2 extends the live range of its BF16 vector conversion and
+    raises this kernel from 130 to 136 registers. Keep this one leaf adapter
+    until that lowering is fixed; the other memory helpers use native APIs.
+    """
+
     pointer_i64 = pointer.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
     _llvm.inline_asm(
         None,
@@ -92,94 +101,58 @@ def _store_bf16x2(pointer, value0, value1, *, loc=None, ip=None):
 
 @cutlass.dsl_user_op
 def _store_f32x2(pointer, value0, value1, *, loc=None, ip=None):
-    pointer_i64 = pointer.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
-    _llvm.inline_asm(
-        None,
-        [
-            pointer_i64,
-            Float32(value0).ir_value(loc=loc, ip=ip),
-            Float32(value1).ir_value(loc=loc, ip=ip),
-        ],
-        "st.global.cg.v2.f32 [$0], {$1, $2};",
-        "l,f,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
+    """Issue one native two-element CG store."""
+
+    values = cute.make_rmem_tensor((2,), Float32)
+    values[0] = value0
+    values[1] = value1
+    cute.arch.store(pointer, values.load(), cop="cg")
 
 
 @cutlass.dsl_user_op
 def _store_f32(pointer, value, *, loc=None, ip=None):
-    pointer_i64 = pointer.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
-    _llvm.inline_asm(
-        None,
-        [
-            pointer_i64,
-            Float32(value).ir_value(loc=loc, ip=ip),
-        ],
-        "st.global.cg.f32 [$0], $1;",
-        "l,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
+    """Issue one native scalar CG store."""
+
+    cute.arch.store(pointer, Float32(value), cop="cg")
 
 
 @cutlass.dsl_user_op
 def _load_shared_f32x4(pointer, *, loc=None, ip=None):
-    pointer_i32 = pointer.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
-    result = _llvm.inline_asm(
-        _llvm.StructType.get_literal(
-            [_T.f32(), _T.f32(), _T.f32(), _T.f32()]
+    """Issue one native 128-bit shared-memory load."""
+
+    vector_type = _ir.VectorType.get([4], Float32.mlir_type, loc=loc)
+    values = cute.TensorSSA(
+        cute.arch.load(
+            pointer, vector_type, ss="cta", loc=loc, ip=ip
         ),
-        [pointer_i32],
-        "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];",
-        "=f,=f,=f,=f,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
+        (4,),
+        Float32,
     )
-    return tuple(
-        Float32(_llvm.extractvalue(_T.f32(), result, [idx]))
-        for idx in range(4)
-    )
+    return tuple(Float32(values[idx]) for idx in range(4))
 
 
 @cutlass.dsl_user_op
 def _load_shared_bf16x4(pointer, *, loc=None, ip=None):
-    pointer_i32 = pointer.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
-    result = _llvm.inline_asm(
-        _llvm.StructType.get_literal(
-            [_T.f32(), _T.f32(), _T.f32(), _T.f32()]
-        ),
-        [pointer_i32],
-        (
-            "{ .reg .b32 p0, p1; .reg .b16 h0, h1, h2, h3; "
-            "ld.shared.v2.b32 {p0, p1}, [$4]; "
-            "mov.b32 {h0, h1}, p0; "
-            "mov.b32 {h2, h3}, p1; "
-            "cvt.f32.bf16 $0, h0; "
-            "cvt.f32.bf16 $1, h1; "
-            "cvt.f32.bf16 $2, h2; "
-            "cvt.f32.bf16 $3, h3; }"
-        ),
-        "=f,=f,=f,=f,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
+    """Issue one native 64-bit shared load and widen BF16 values to F32.
+
+    Loading ``vector<4xbf16>`` directly crashes CuTeDSL 4.4.2, so load the
+    same 64 payload bits as two I32 values and use a typed vector bitcast.
+    """
+
+    packed_type = _ir.VectorType.get([2], Int32.mlir_type, loc=loc)
+    bf16_type = _ir.VectorType.get(
+        [4], cutlass.BFloat16.mlir_type, loc=loc
     )
-    return tuple(
-        Float32(_llvm.extractvalue(_T.f32(), result, [idx]))
-        for idx in range(4)
+    packed = cute.arch.load(
+        pointer, packed_type, ss="cta", loc=loc, ip=ip
     )
+    unpacked = _vector.bitcast(
+        bf16_type, packed, loc=loc, ip=ip
+    )
+    values = cute.TensorSSA(
+        unpacked, (4,), cutlass.BFloat16
+    ).to(Float32)
+    return tuple(Float32(values[idx]) for idx in range(4))
 
 
 @cute.jit
