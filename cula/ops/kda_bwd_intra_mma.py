@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Portable mma.sync CuTeDSL implementation of KDA intra-chunk backward.
+"""Portable native-CuTe implementation of KDA intra-chunk backward.
 
-The kernel uses PTX ``mma.sync.m16n8k8`` rather than architecture-specific
-warp-group or tcgen05 operations, so the same implementation runs on SM90
-and SM100/SM103. One 128-thread CTA owns one ``(chunk, head)`` tile, and
-its four warps own the four 16-token subchunks.
+The tensor-core path is described by a ``TiledMma``, its A/B/C thread-value
+fragments, and ``cute.gemm``. CuTe lowers that description to warp-level
+``mma.sync.m16n8k8`` instructions, without WGMMA or tcgen05, so one kernel
+runs on SM90 and SM100/SM103. One 128-thread CTA owns one ``(chunk, head)``
+tile; its four symmetric warps own the four 16-token output blocks.
 """
 
 from __future__ import annotations
@@ -31,28 +32,36 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int32
 from cutlass.cutlass_dsl import T as _T
 
+from ._cute_tf32 import make_tf32_tiled_mma
+
 BT = 64
 BC = 16
 BD = 32
 THREADS = 128
+MMA_ATOM_N = 8
+MMA_ATOM_K = 8
+MMA_N_ATOMS = BD // MMA_ATOM_N
+MMA_K_ATOMS = BC // MMA_ATOM_K
 _cache: dict[tuple[int, ...], object] = {}
 
 
 @cutlass.dsl_user_op
-def _to_tf32_bits(value, *, loc=None, ip=None):
-    result = _llvm.inline_asm(
+def _as_tf32_register(value, *, loc=None, ip=None):
+    """Adapt F32 to CuTeDSL 4.4's integer-backed TF32 fragment storage.
+
+    KDA's established numerical contract uses the CUTLASS
+    ``round_toward_zero`` TF32 encoding. CuTeDSL 4.4 exposes the fragment as
+    I32, so clear the 13 unused F32 mantissa bits with ordinary DSL integer
+    arithmetic. The MMA and its thread-value mapping remain native CuTe.
+    """
+
+    bits = _llvm.bitcast(
         _T.i32(),
-        [Float32(value).ir_value(loc=loc, ip=ip)],
-        "{ .reg .b32 bits; mov.b32 bits, $1; "
-        "and.b32 $0, bits, 0xffffe000; }",
-        "=r,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        Float32(value).ir_value(loc=loc, ip=ip),
         loc=loc,
         ip=ip,
     )
-    return Int32(result)
+    return Int32(bits) & cutlass.Int32(-0x2000)
 
 
 @cutlass.dsl_user_op
@@ -173,58 +182,9 @@ def _load_shared_bf16x4(pointer, *, loc=None, ip=None):
     )
 
 
-@cutlass.dsl_user_op
-def _mma_tf32(
-    c0,
-    c1,
-    c2,
-    c3,
-    a0,
-    a1,
-    a2,
-    a3,
-    b0,
-    b1,
-    *,
-    loc=None,
-    ip=None,
-):
-    result = _llvm.inline_asm(
-        _llvm.StructType.get_literal(
-            [_T.f32(), _T.f32(), _T.f32(), _T.f32()]
-        ),
-        [
-            Float32(c0).ir_value(loc=loc, ip=ip),
-            Float32(c1).ir_value(loc=loc, ip=ip),
-            Float32(c2).ir_value(loc=loc, ip=ip),
-            Float32(c3).ir_value(loc=loc, ip=ip),
-            Int32(a0).ir_value(loc=loc, ip=ip),
-            Int32(a1).ir_value(loc=loc, ip=ip),
-            Int32(a2).ir_value(loc=loc, ip=ip),
-            Int32(a3).ir_value(loc=loc, ip=ip),
-            Int32(b0).ir_value(loc=loc, ip=ip),
-            Int32(b1).ir_value(loc=loc, ip=ip),
-        ],
-        (
-            "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
-            "{$0,$1,$2,$3}, {$8,$9,$10,$11}, {$12,$13}, "
-            "{$4,$5,$6,$7};"
-        ),
-        "=f,=f,=f,=f,f,f,f,f,r,r,r,r,r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return tuple(
-        Float32(_llvm.extractvalue(_T.f32(), result, [idx]))
-        for idx in range(4)
-    )
-
-
 @cute.jit
-def _tf32_gemm_dual(
+def _tf32_gemm_dual_tv(
+    tiled_mma: cute.TiledMma,
     s_daq: cute.Tensor,
     s_dak: cute.Tensor,
     s_b: cute.Tensor,
@@ -237,180 +197,106 @@ def _tf32_gemm_dual(
     sub_len: cutlass.Int32,
     lane: cutlass.Int32,
 ):
-    gid = lane // 4
-    lane4 = lane % 4
-    for kk in cutlass.range_constexpr(2):
-        a_col = kk * 8 + lane4 * 2
-        if cutlass.const_expr(transpose):
-            aq0 = s_daq[
-                (row_block * BC + a_col, col_block * BC + gid)
-            ]
-            aq1 = s_daq[
-                (row_block * BC + a_col, col_block * BC + gid + 8)
-            ]
-            aq2 = s_daq[
-                (row_block * BC + a_col + 1, col_block * BC + gid)
-            ]
-            aq3 = s_daq[
-                (
-                    row_block * BC + a_col + 1,
-                    col_block * BC + gid + 8,
-                )
-            ]
-            ak0 = s_dak[
-                (row_block * BC + a_col, col_block * BC + gid)
-            ]
-            ak1 = s_dak[
-                (row_block * BC + a_col, col_block * BC + gid + 8)
-            ]
-            ak2 = s_dak[
-                (row_block * BC + a_col + 1, col_block * BC + gid)
-            ]
-            ak3 = s_dak[
-                (
-                    row_block * BC + a_col + 1,
-                    col_block * BC + gid + 8,
-                )
-            ]
-        else:
-            aq0 = s_daq[
-                (row_block * BC + gid, col_block * BC + a_col)
-            ]
-            aq1 = s_daq[
-                (row_block * BC + gid + 8, col_block * BC + a_col)
-            ]
-            aq2 = s_daq[
-                (row_block * BC + gid, col_block * BC + a_col + 1)
-            ]
-            aq3 = s_daq[
-                (
-                    row_block * BC + gid + 8,
-                    col_block * BC + a_col + 1,
-                )
-            ]
-            ak0 = s_dak[
-                (row_block * BC + gid, col_block * BC + a_col)
-            ]
-            ak1 = s_dak[
-                (row_block * BC + gid + 8, col_block * BC + a_col)
-            ]
-            ak2 = s_dak[
-                (row_block * BC + gid, col_block * BC + a_col + 1)
-            ]
-            ak3 = s_dak[
-                (
-                    row_block * BC + gid + 8,
-                    col_block * BC + a_col + 1,
-                )
-            ]
-        if cutlass.const_expr(causal):
-            if cutlass.const_expr(transpose):
-                if not (
-                    gid <= a_col
-                    and a_col < sub_len
-                    and gid < sub_len
-                ):
-                    aq0 = 0.0
-                    ak0 = 0.0
-                if not (
-                    gid + 8 <= a_col
-                    and a_col < sub_len
-                    and gid + 8 < sub_len
-                ):
-                    aq1 = 0.0
-                    ak1 = 0.0
-                if not (
-                    gid <= a_col + 1
-                    and a_col + 1 < sub_len
-                    and gid < sub_len
-                ):
-                    aq2 = 0.0
-                    ak2 = 0.0
-                if not (
-                    gid + 8 <= a_col + 1
-                    and a_col + 1 < sub_len
-                    and gid + 8 < sub_len
-                ):
-                    aq3 = 0.0
-                    ak3 = 0.0
-            else:
-                if not (
-                    a_col <= gid
-                    and gid < sub_len
-                    and a_col < sub_len
-                ):
-                    aq0 = 0.0
-                    ak0 = 0.0
-                if not (
-                    a_col <= gid + 8
-                    and gid + 8 < sub_len
-                    and a_col < sub_len
-                ):
-                    aq1 = 0.0
-                    ak1 = 0.0
-                if not (
-                    a_col + 1 <= gid
-                    and gid < sub_len
-                    and a_col + 1 < sub_len
-                ):
-                    aq2 = 0.0
-                    ak2 = 0.0
-                if not (
-                    a_col + 1 <= gid + 8
-                    and gid + 8 < sub_len
-                    and a_col + 1 < sub_len
-                ):
-                    aq3 = 0.0
-                    ak3 = 0.0
-        aq_bits = (
-            _to_tf32_bits(aq0),
-            _to_tf32_bits(aq1),
-            _to_tf32_bits(aq2),
-            _to_tf32_bits(aq3),
+    """Accumulate two GEMMs that share B using CuTe A/B/C TV fragments."""
+
+    row_in_atom = lane // 4
+    reduction_lane = (lane % 4) * 2
+    a_shape = tiled_mma.partition_shape_A((BC, BC))
+    thr_mma = tiled_mma.get_slice(lane)
+    r_aq = tiled_mma.make_fragment_A(a_shape)
+    r_ak = tiled_mma.make_fragment_A(a_shape)
+    r_b = tiled_mma.make_fragment_B(thr_mma.partition_B(s_b))
+
+    # local_tile selects register slots from CuTe's m16n8k8 TV layout. Only
+    # the shared-memory source coordinates stay explicit, because transpose
+    # and causal masking change them at runtime.
+    for k_atom in cutlass.range_constexpr(MMA_K_ATOMS):
+        a_q_atom = cute.local_tile(
+            r_aq, (4, 1, 1), (0, 0, k_atom)
         )
-        ak_bits = (
-            _to_tf32_bits(ak0),
-            _to_tf32_bits(ak1),
-            _to_tf32_bits(ak2),
-            _to_tf32_bits(ak3),
+        a_k_atom = cute.local_tile(
+            r_ak, (4, 1, 1), (0, 0, k_atom)
         )
-        b_k = kk * 8 + lane4 * 2
-        for nt in cutlass.range_constexpr(4):
-            base = nt * 4
-            n_base = nt * 8
-            b0 = _to_tf32_bits(s_b[(n_base + gid, b_k)])
-            b1 = _to_tf32_bits(s_b[(n_base + gid, b_k + 1)])
-            q_result = _mma_tf32(
-                acc_q[base],
-                acc_q[base + 1],
-                acc_q[base + 2],
-                acc_q[base + 3],
-                aq_bits[0],
-                aq_bits[1],
-                aq_bits[2],
-                aq_bits[3],
-                b0,
-                b1,
+        reduction_base = k_atom * MMA_ATOM_K + reduction_lane
+        for reduction_pair in cutlass.range_constexpr(2):
+            reduction = reduction_base + reduction_pair
+            for row_group in cutlass.range_constexpr(2):
+                row = row_in_atom + row_group * (BC // 2)
+                value_idx = reduction_pair * 2 + row_group
+                if cutlass.const_expr(transpose):
+                    aq = s_daq[
+                        (
+                            row_block * BC + reduction,
+                            col_block * BC + row,
+                        )
+                    ]
+                    ak = s_dak[
+                        (
+                            row_block * BC + reduction,
+                            col_block * BC + row,
+                        )
+                    ]
+                else:
+                    aq = s_daq[
+                        (
+                            row_block * BC + row,
+                            col_block * BC + reduction,
+                        )
+                    ]
+                    ak = s_dak[
+                        (
+                            row_block * BC + row,
+                            col_block * BC + reduction,
+                        )
+                    ]
+                aq_bits = _as_tf32_register(aq)
+                ak_bits = _as_tf32_register(ak)
+                if cutlass.const_expr(causal):
+                    if cutlass.const_expr(transpose):
+                        valid = row <= reduction
+                    else:
+                        valid = reduction <= row
+                    valid = (
+                        valid
+                        and row < sub_len
+                        and reduction < sub_len
+                    )
+                    if not valid:
+                        aq_bits = cutlass.Int32(0)
+                        ak_bits = cutlass.Int32(0)
+                a_q_atom[value_idx] = aq_bits
+                a_k_atom[value_idx] = ak_bits
+
+        # B has two lane values for each (N atom, K atom) pair.
+        for n_atom in cutlass.range_constexpr(MMA_N_ATOMS):
+            b_atom = cute.local_tile(
+                r_b, (2, 1, 1), (0, n_atom, k_atom)
             )
-            k_result = _mma_tf32(
-                acc_k[base],
-                acc_k[base + 1],
-                acc_k[base + 2],
-                acc_k[base + 3],
-                ak_bits[0],
-                ak_bits[1],
-                ak_bits[2],
-                ak_bits[3],
-                b0,
-                b1,
-            )
-            for value_idx in cutlass.range_constexpr(4):
-                acc_q[base + value_idx] = q_result[value_idx]
-                acc_k[base + value_idx] = k_result[value_idx]
+            feature_row = n_atom * MMA_ATOM_N + row_in_atom
+            for reduction_pair in cutlass.range_constexpr(2):
+                b = s_b[
+                    (feature_row, reduction_base + reduction_pair)
+                ]
+                b_atom[reduction_pair] = _as_tf32_register(b)
+        cute.gemm(
+            tiled_mma,
+            acc_q,
+            r_aq[(None, None, k_atom)],
+            r_b[(None, None, k_atom)],
+            acc_q,
+        )
+        cute.gemm(
+            tiled_mma,
+            acc_k,
+            r_ak[(None, None, k_atom)],
+            r_b[(None, None, k_atom)],
+            acc_k,
+        )
 
 
 @cute.jit
-def _tf32_gemm_single(
+def _tf32_gemm_single_tv(
+    tiled_mma: cute.TiledMma,
     s_a: cute.Tensor,
     s_b: cute.Tensor,
     acc: cute.Tensor,
@@ -421,123 +307,76 @@ def _tf32_gemm_single(
     sub_len: cutlass.Int32,
     lane: cutlass.Int32,
 ):
-    gid = lane // 4
-    lane4 = lane % 4
-    for kk in cutlass.range_constexpr(2):
-        a_col = kk * 8 + lane4 * 2
-        if cutlass.const_expr(transpose):
-            a0 = s_a[
-                (row_block * BC + a_col, col_block * BC + gid)
-            ]
-            a1 = s_a[
-                (row_block * BC + a_col, col_block * BC + gid + 8)
-            ]
-            a2 = s_a[
-                (row_block * BC + a_col + 1, col_block * BC + gid)
-            ]
-            a3 = s_a[
-                (
-                    row_block * BC + a_col + 1,
-                    col_block * BC + gid + 8,
-                )
-            ]
-        else:
-            a0 = s_a[
-                (row_block * BC + gid, col_block * BC + a_col)
-            ]
-            a1 = s_a[
-                (row_block * BC + gid + 8, col_block * BC + a_col)
-            ]
-            a2 = s_a[
-                (row_block * BC + gid, col_block * BC + a_col + 1)
-            ]
-            a3 = s_a[
-                (
-                    row_block * BC + gid + 8,
-                    col_block * BC + a_col + 1,
-                )
-            ]
-        if cutlass.const_expr(causal):
-            if cutlass.const_expr(transpose):
-                if not (
-                    gid <= a_col
-                    and a_col < sub_len
-                    and gid < sub_len
-                ):
-                    a0 = 0.0
-                if not (
-                    gid + 8 <= a_col
-                    and a_col < sub_len
-                    and gid + 8 < sub_len
-                ):
-                    a1 = 0.0
-                if not (
-                    gid <= a_col + 1
-                    and a_col + 1 < sub_len
-                    and gid < sub_len
-                ):
-                    a2 = 0.0
-                if not (
-                    gid + 8 <= a_col + 1
-                    and a_col + 1 < sub_len
-                    and gid + 8 < sub_len
-                ):
-                    a3 = 0.0
-            else:
-                if not (
-                    a_col <= gid
-                    and gid < sub_len
-                    and a_col < sub_len
-                ):
-                    a0 = 0.0
-                if not (
-                    a_col <= gid + 8
-                    and gid + 8 < sub_len
-                    and a_col < sub_len
-                ):
-                    a1 = 0.0
-                if not (
-                    a_col + 1 <= gid
-                    and gid < sub_len
-                    and a_col + 1 < sub_len
-                ):
-                    a2 = 0.0
-                if not (
-                    a_col + 1 <= gid + 8
-                    and gid + 8 < sub_len
-                    and a_col + 1 < sub_len
-                ):
-                    a3 = 0.0
-        a_bits = (
-            _to_tf32_bits(a0),
-            _to_tf32_bits(a1),
-            _to_tf32_bits(a2),
-            _to_tf32_bits(a3),
+    """Accumulate a 16x32 GEMM through native CuTe TV fragments."""
+
+    row_in_atom = lane // 4
+    reduction_lane = (lane % 4) * 2
+    a_shape = tiled_mma.partition_shape_A((BC, BC))
+    thr_mma = tiled_mma.get_slice(lane)
+    r_a = tiled_mma.make_fragment_A(a_shape)
+    r_b = tiled_mma.make_fragment_B(thr_mma.partition_B(s_b))
+
+    for k_atom in cutlass.range_constexpr(MMA_K_ATOMS):
+        a_atom = cute.local_tile(
+            r_a, (4, 1, 1), (0, 0, k_atom)
         )
-        b_k = kk * 8 + lane4 * 2
-        for nt in cutlass.range_constexpr(4):
-            base = nt * 4
-            n_base = nt * 8
-            b0 = _to_tf32_bits(s_b[(n_base + gid, b_k)])
-            b1 = _to_tf32_bits(s_b[(n_base + gid, b_k + 1)])
-            result = _mma_tf32(
-                acc[base],
-                acc[base + 1],
-                acc[base + 2],
-                acc[base + 3],
-                a_bits[0],
-                a_bits[1],
-                a_bits[2],
-                a_bits[3],
-                b0,
-                b1,
+        reduction_base = k_atom * MMA_ATOM_K + reduction_lane
+        for reduction_pair in cutlass.range_constexpr(2):
+            reduction = reduction_base + reduction_pair
+            for row_group in cutlass.range_constexpr(2):
+                row = row_in_atom + row_group * (BC // 2)
+                value_idx = reduction_pair * 2 + row_group
+                if cutlass.const_expr(transpose):
+                    value = s_a[
+                        (
+                            row_block * BC + reduction,
+                            col_block * BC + row,
+                        )
+                    ]
+                else:
+                    value = s_a[
+                        (
+                            row_block * BC + row,
+                            col_block * BC + reduction,
+                        )
+                    ]
+                value_bits = _as_tf32_register(value)
+                if cutlass.const_expr(causal):
+                    if cutlass.const_expr(transpose):
+                        valid = row <= reduction
+                    else:
+                        valid = reduction <= row
+                    valid = (
+                        valid
+                        and row < sub_len
+                        and reduction < sub_len
+                    )
+                    if not valid:
+                        value_bits = cutlass.Int32(0)
+                a_atom[value_idx] = value_bits
+
+        for n_atom in cutlass.range_constexpr(MMA_N_ATOMS):
+            b_atom = cute.local_tile(
+                r_b, (2, 1, 1), (0, n_atom, k_atom)
             )
-            for value_idx in cutlass.range_constexpr(4):
-                acc[base + value_idx] = result[value_idx]
+            feature_row = n_atom * MMA_ATOM_N + row_in_atom
+            for reduction_pair in cutlass.range_constexpr(2):
+                b = s_b[
+                    (feature_row, reduction_base + reduction_pair)
+                ]
+                b_atom[reduction_pair] = _as_tf32_register(b)
+        cute.gemm(
+            tiled_mma,
+            acc,
+            r_a[(None, None, k_atom)],
+            r_b[(None, None, k_atom)],
+            acc,
+        )
 
 
 @cute.jit
-def _tf32_gemm_two_b(
+def _tf32_gemm_two_b_tv(
+    tiled_mma: cute.TiledMma,
     s_daq: cute.Tensor,
     s_dak: cute.Tensor,
     s_bq: cute.Tensor,
@@ -550,7 +389,10 @@ def _tf32_gemm_two_b(
     sub_len: cutlass.Int32,
     lane: cutlass.Int32,
 ):
-    _tf32_gemm_single(
+    """Accumulate A_q @ B_q and A_k @ B_k into one C TV fragment."""
+
+    _tf32_gemm_single_tv(
+        tiled_mma,
         s_daq,
         s_bq,
         acc,
@@ -561,7 +403,8 @@ def _tf32_gemm_two_b(
         sub_len,
         lane,
     )
-    _tf32_gemm_single(
+    _tf32_gemm_single_tv(
+        tiled_mma,
         s_dak,
         s_bk,
         acc,
@@ -572,229 +415,6 @@ def _tf32_gemm_two_b(
         sub_len,
         lane,
     )
-
-
-@cute.jit
-def _gemm_dual(
-    tiled_mma: cute.TiledMma,
-    s_aq: cute.Tensor,
-    s_ak: cute.Tensor,
-    s_b: cute.Tensor,
-    acc_q: cute.Tensor,
-    acc_k: cute.Tensor,
-    lane: cutlass.Int32,
-):
-    thr_mma = tiled_mma.get_slice(lane)
-    r_aq = tiled_mma.make_fragment_A(thr_mma.partition_A(s_aq))
-    r_ak = tiled_mma.make_fragment_A(thr_mma.partition_A(s_ak))
-    r_b = tiled_mma.make_fragment_B(thr_mma.partition_B(s_b))
-
-    copy_atom = cute.make_copy_atom(
-        cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4),
-        cutlass.BFloat16,
-    )
-    copy_a = cute.make_tiled_copy_A(copy_atom, tiled_mma)
-    copy_b = cute.make_tiled_copy_B(copy_atom, tiled_mma)
-    thr_a = copy_a.get_slice(lane)
-    thr_b = copy_b.get_slice(lane)
-    saq = thr_a.partition_S(s_aq)
-    sak = thr_a.partition_S(s_ak)
-    sb = thr_b.partition_S(s_b)
-    raq = thr_a.retile(r_aq)
-    rak = thr_a.retile(r_ak)
-    rb = thr_b.retile(r_b)
-
-    for kb in cutlass.range_constexpr(cute.size(r_aq, mode=[2])):
-        cute.copy(copy_b, sb[(None, None, kb)], rb[(None, None, kb)])
-        cute.copy(copy_a, saq[(None, None, kb)], raq[(None, None, kb)])
-        cute.gemm(
-            tiled_mma,
-            acc_q,
-            r_aq[(None, None, kb)],
-            r_b[(None, None, kb)],
-            acc_q,
-        )
-        cute.copy(copy_a, sak[(None, None, kb)], rak[(None, None, kb)])
-        cute.gemm(
-            tiled_mma,
-            acc_k,
-            r_ak[(None, None, kb)],
-            r_b[(None, None, kb)],
-            acc_k,
-        )
-
-
-@cute.jit
-def _gemm_two_b(
-    tiled_mma: cute.TiledMma,
-    s_aq: cute.Tensor,
-    s_ak: cute.Tensor,
-    s_bq: cute.Tensor,
-    s_bk: cute.Tensor,
-    acc: cute.Tensor,
-    lane: cutlass.Int32,
-):
-    thr_mma = tiled_mma.get_slice(lane)
-    r_aq = tiled_mma.make_fragment_A(thr_mma.partition_A(s_aq))
-    r_ak = tiled_mma.make_fragment_A(thr_mma.partition_A(s_ak))
-    r_bq = tiled_mma.make_fragment_B(thr_mma.partition_B(s_bq))
-    r_bk = tiled_mma.make_fragment_B(thr_mma.partition_B(s_bk))
-
-    copy_atom = cute.make_copy_atom(
-        cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4),
-        cutlass.BFloat16,
-    )
-    copy_a = cute.make_tiled_copy_A(copy_atom, tiled_mma)
-    copy_b = cute.make_tiled_copy_B(copy_atom, tiled_mma)
-    thr_a = copy_a.get_slice(lane)
-    thr_b = copy_b.get_slice(lane)
-    saq = thr_a.partition_S(s_aq)
-    sak = thr_a.partition_S(s_ak)
-    sbq = thr_b.partition_S(s_bq)
-    sbk = thr_b.partition_S(s_bk)
-    raq = thr_a.retile(r_aq)
-    rak = thr_a.retile(r_ak)
-    rbq = thr_b.retile(r_bq)
-    rbk = thr_b.retile(r_bk)
-
-    for kb in cutlass.range_constexpr(cute.size(r_aq, mode=[2])):
-        cute.copy(copy_a, saq[(None, None, kb)], raq[(None, None, kb)])
-        cute.copy(copy_b, sbq[(None, None, kb)], rbq[(None, None, kb)])
-        cute.gemm(
-            tiled_mma,
-            acc,
-            r_aq[(None, None, kb)],
-            r_bq[(None, None, kb)],
-            acc,
-        )
-        cute.copy(copy_a, sak[(None, None, kb)], rak[(None, None, kb)])
-        cute.copy(copy_b, sbk[(None, None, kb)], rbk[(None, None, kb)])
-        cute.gemm(
-            tiled_mma,
-            acc,
-            r_ak[(None, None, kb)],
-            r_bk[(None, None, kb)],
-            acc,
-        )
-
-
-@cute.jit
-def _stage_a(
-    s_daq: cute.Tensor,
-    s_dak: cute.Tensor,
-    s_aq: cute.Tensor,
-    s_ak: cute.Tensor,
-    row_block: cutlass.Int32,
-    col_block: cutlass.Int32,
-    transpose: cutlass.Constexpr[bool],
-    lane: cutlass.Int32,
-):
-    for item in cutlass.range_constexpr(8):
-        linear = lane + item * 32
-        row = linear // BC
-        col = linear % BC
-        src_row = row_block * BC + row
-        src_col = col_block * BC + col
-        if cutlass.const_expr(transpose):
-            s_aq[(col, row)] = s_daq[(src_row, src_col)]
-            s_ak[(col, row)] = s_dak[(src_row, src_col)]
-        else:
-            s_aq[(row, col)] = s_daq[(src_row, src_col)]
-            s_ak[(row, col)] = s_dak[(src_row, src_col)]
-    cute.arch.sync_warp()
-
-
-@cute.jit
-def _fill_lower_b(
-    s_k: cute.Tensor,
-    s_g: cute.Tensor,
-    s_b: cute.Tensor,
-    source_block: cutlass.Int32,
-    output_block: cutlass.Int32,
-    anchor_row: cutlass.Int32,
-    tile_len: cutlass.Int32,
-    lane: cutlass.Int32,
-):
-    for item in cutlass.range_constexpr(4):
-        row = item * 4 + lane // 8
-        feature = (lane % 8) * 4
-        source_row = source_block * BC + row
-        anchor = output_block * BC + anchor_row
-        for value_idx in cutlass.range_constexpr(4):
-            value = cutlass.Float32(0.0)
-            if source_row < tile_len:
-                gate = cute.math.exp2(
-                    cutlass.Float32(s_g[(anchor, feature + value_idx)])
-                    - cutlass.Float32(
-                        s_g[(source_row, feature + value_idx)]
-                    ),
-                    fastmath=True,
-                )
-                value = (
-                    cutlass.Float32(
-                        s_k[(source_row, feature + value_idx)]
-                    )
-                    * gate
-                )
-            s_b[(feature + value_idx, row)] = cutlass.BFloat16(value)
-    cute.arch.sync_warp()
-
-
-@cute.jit
-def _fill_upper_b(
-    s_q: cute.Tensor,
-    s_k: cute.Tensor,
-    s_g: cute.Tensor,
-    s_beta: cute.Tensor,
-    s_bq: cute.Tensor,
-    s_bk: cute.Tensor,
-    source_block: cutlass.Int32,
-    output_block: cutlass.Int32,
-    anchor_row: cutlass.Int32,
-    tile_len: cutlass.Int32,
-    lane: cutlass.Int32,
-):
-    for item in cutlass.range_constexpr(4):
-        row = item * 4 + lane // 8
-        feature = (lane % 8) * 4
-        source_row = source_block * BC + row
-        anchor = output_block * BC + anchor_row
-        beta_value = cutlass.Float32(0.0)
-        if source_row < tile_len:
-            beta_value = cutlass.Float32(s_beta[source_row])
-        for value_idx in cutlass.range_constexpr(4):
-            q_value = cutlass.Float32(0.0)
-            k_value = cutlass.Float32(0.0)
-            if source_row < tile_len:
-                gate = cute.math.exp2(
-                    cutlass.Float32(
-                        s_g[(source_row, feature + value_idx)]
-                    )
-                    - cutlass.Float32(
-                        s_g[(anchor, feature + value_idx)]
-                    ),
-                    fastmath=True,
-                )
-                q_value = (
-                    cutlass.Float32(
-                        s_q[(source_row, feature + value_idx)]
-                    )
-                    * gate
-                )
-                k_value = (
-                    cutlass.Float32(
-                        cutlass.BFloat16(
-                            cutlass.Float32(
-                                s_k[(source_row, feature + value_idx)]
-                            )
-                            * beta_value
-                        )
-                    )
-                    * gate
-                )
-            s_bq[(feature + value_idx, row)] = cutlass.BFloat16(q_value)
-            s_bk[(feature + value_idx, row)] = cutlass.BFloat16(k_value)
-    cute.arch.sync_warp()
 
 
 @cute.jit
@@ -1111,472 +731,9 @@ def _load_gradient_block(
     cute.arch.cp_async_commit_group()
 
 
-@cute.kernel
-def _kernel(
-    tiled_mma: cute.TiledMma,
-    a_tile_layout: cute.Layout,
-    a_all_layout: cute.Layout,
-    b_tile_layout: cute.Layout,
-    b_all_layout: cute.Layout,
-    q: cute.Tensor,
-    k: cute.Tensor,
-    g: cute.Tensor,
-    beta: cute.Tensor,
-    d_aq: cute.Tensor,
-    d_ak: cute.Tensor,
-    dq: cute.Tensor,
-    dk: cute.Tensor,
-    db: cute.Tensor,
-    dg: cute.Tensor,
-    cu_seqlens: cute.Tensor,
-    chunk_indices: cute.Tensor,
-    dq_out: cute.Tensor,
-    dk_out: cute.Tensor,
-    db_out: cute.Tensor,
-    dg_out: cute.Tensor,
-):
-    tidx, _, _ = cute.arch.thread_idx()
-    chunk_idx, head, _ = cute.arch.block_idx()
-    warp = tidx // 32
-    lane = tidx % 32
-
-    seq_idx = cutlass.Int32(chunk_indices[(chunk_idx, 0)])
-    chunk_in_seq = cutlass.Int32(chunk_indices[(chunk_idx, 1)])
-    seq_start = cutlass.Int32(cu_seqlens[seq_idx])
-    seq_end = cutlass.Int32(cu_seqlens[seq_idx + 1])
-    chunk_start = seq_start + chunk_in_seq * BT
-    tile_len = seq_end - chunk_start
-    if tile_len > BT:
-        tile_len = cutlass.Int32(BT)
-
-    tile_input_layout = cute.make_layout(
-        (1, BT, 1, q.shape[3]),
-        stride=(0, q.shape[2] * q.shape[3], 0, 1),
-    )
-    q_tile = cute.make_tensor(
-        (
-            q.iterator + q.layout((0, chunk_start, head, 0))
-        ).align(16),
-        tile_input_layout,
-    )
-    k_tile = cute.make_tensor(
-        (
-            k.iterator + k.layout((0, chunk_start, head, 0))
-        ).align(16),
-        tile_input_layout,
-    )
-    g_tile = cute.make_tensor(
-        (
-            g.iterator + g.layout((0, chunk_start, head, 0))
-        ).align(16),
-        tile_input_layout,
-    )
-    smem = cutlass.utils.SmemAllocator()
-    qkg_layout = cute.make_layout((BT, BD), stride=(BD, 1))
-    da_layout = cute.make_layout((BT, BT), stride=(BT + 4, 1))
-    s_q = smem.allocate_tensor(cutlass.BFloat16, qkg_layout, 128)
-    s_k = smem.allocate_tensor(cutlass.BFloat16, qkg_layout, 128)
-    s_g = smem.allocate_tensor(cutlass.Float32, qkg_layout, 128)
-    s_beta = smem.allocate_tensor(
-        cutlass.Float32,
-        cute.make_layout((BT,), stride=(1,)),
-        128,
-    )
-    s_daq = smem.allocate_tensor(cutlass.BFloat16, da_layout, 128)
-    s_dak = smem.allocate_tensor(cutlass.BFloat16, da_layout, 128)
-    s_bq_all = smem.allocate_tensor(
-        cutlass.BFloat16, b_all_layout, 128
-    )
-    s_bk_all = smem.allocate_tensor(
-        cutlass.BFloat16, b_all_layout, 128
-    )
-    s_aq_all = smem.allocate_tensor(
-        cutlass.BFloat16, a_all_layout, 128
-    )
-    s_ak_all = smem.allocate_tensor(
-        cutlass.BFloat16, a_all_layout, 128
-    )
-
-    if tidx < BT:
-        value = cutlass.Float32(0.0)
-        if tidx < tile_len:
-            value = cutlass.Float32(beta[(0, chunk_start + tidx, head)])
-        s_beta[tidx] = value
-
-    f32_copy = cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(),
-        cutlass.Float32,
-        num_bits_per_copy=128,
-    )
-    for item in cutlass.range_constexpr(8):
-        group = tidx + item * THREADS
-        row = group // 16
-        col = (group % 16) * 4
-        aq = cute.make_rmem_tensor(
-            cute.make_layout((4,), stride=(1,)),
-            cutlass.Float32,
-        )
-        ak = cute.make_rmem_tensor_like(aq, cutlass.Float32)
-        aq.fill(0.0)
-        ak.fill(0.0)
-        if row < tile_len:
-            token = chunk_start + row
-            gaq = cute.make_tensor(
-                (
-                    d_aq.iterator
-                    + d_aq.layout((0, token, head, col))
-                ).align(16),
-                cute.make_layout((4,), stride=(1,)),
-            )
-            gak = cute.make_tensor(
-                (
-                    d_ak.iterator
-                    + d_ak.layout((0, token, head, col))
-                ).align(16),
-                cute.make_layout((4,), stride=(1,)),
-            )
-            cute.copy(f32_copy, gaq, aq)
-            cute.copy(f32_copy, gak, ak)
-        for value_idx in cutlass.range_constexpr(4):
-            valid = col + value_idx <= row
-            s_daq[(row, col + value_idx)] = (
-                cutlass.BFloat16(aq[value_idx])
-                if valid
-                else cutlass.BFloat16(0.0)
-            )
-            s_dak[(row, col + value_idx)] = (
-                cutlass.BFloat16(ak[value_idx])
-                if valid
-                else cutlass.BFloat16(0.0)
-            )
-    cute.arch.sync_threads()
-
-    s_aq = cute.make_tensor(
-        s_aq_all.iterator + s_aq_all.layout((warp * BC, 0)),
-        a_tile_layout,
-    )
-    s_ak = cute.make_tensor(
-        s_ak_all.iterator + s_ak_all.layout((warp * BC, 0)),
-        a_tile_layout,
-    )
-    s_bq = cute.make_tensor(
-        s_bq_all.iterator + s_bq_all.layout((warp * BD, 0)),
-        b_tile_layout,
-    )
-    s_bk = cute.make_tensor(
-        s_bk_all.iterator + s_bk_all.layout((warp * BD, 0)),
-        b_tile_layout,
-    )
-
-    thr_mma = tiled_mma.get_slice(lane)
-    acc_shape = thr_mma.partition_shape_C((BC, BD))
-    ident = cute.make_identity_tensor((BC, BD))
-    coord = thr_mma.partition_C(ident)
-
-    for feature_tile in cutlass.range(4, unroll=1):
-        feature_start = feature_tile * BD
-        _load_qkg(
-            s_q,
-            s_k,
-            s_g,
-            q_tile,
-            k_tile,
-            g_tile,
-            cutlass.Int32(0),
-            tile_len,
-            cutlass.Int32(0),
-            feature_start,
-        )
-
-        sub_len = tile_len - warp * BC
-        if sub_len > BC:
-            sub_len = cutlass.Int32(BC)
-
-        if sub_len > 0:
-            acc_dq = tiled_mma.make_fragment_C(acc_shape)
-            acc_dkl = tiled_mma.make_fragment_C(acc_shape)
-            acc_dku = tiled_mma.make_fragment_C(acc_shape)
-            acc_dq.fill(0.0)
-            acc_dkl.fill(0.0)
-            acc_dku.fill(0.0)
-
-            for source in cutlass.range(4, unroll=1):
-                if source < warp:
-                    _stage_a(
-                        s_daq,
-                        s_dak,
-                        s_aq,
-                        s_ak,
-                        warp,
-                        source,
-                        False,
-                        lane,
-                    )
-                    _fill_lower_b(
-                        s_k,
-                        s_g,
-                        s_bq,
-                        source,
-                        warp,
-                        cutlass.Int32(0),
-                        tile_len,
-                        lane,
-                    )
-                    _gemm_dual(
-                        tiled_mma,
-                        s_aq,
-                        s_ak,
-                        s_bq,
-                        acc_dq,
-                        acc_dkl,
-                        lane,
-                    )
-                    cute.arch.sync_warp()
-
-            for idx in cutlass.range_constexpr(cute.size(acc_dq)):
-                row, feature = coord[idx]
-                scale = cute.math.exp2(
-                    cutlass.Float32(
-                        s_g[(warp * BC + row, feature)]
-                    )
-                    - cutlass.Float32(s_g[(warp * BC, feature)]),
-                    fastmath=True,
-                )
-                acc_dq[idx] *= scale
-                acc_dkl[idx] *= scale
-
-            mid = cutlass.Int32(BC // 2)
-            if mid >= sub_len:
-                mid = sub_len - 1
-            tmp_q = tiled_mma.make_fragment_C(acc_shape)
-            tmp_k = tiled_mma.make_fragment_C(acc_shape)
-            tmp_q.fill(0.0)
-            tmp_k.fill(0.0)
-            _stage_a(
-                s_daq,
-                s_dak,
-                s_aq,
-                s_ak,
-                warp,
-                warp,
-                False,
-                lane,
-            )
-            _fill_lower_b(
-                s_k,
-                s_g,
-                s_bq,
-                warp,
-                warp,
-                mid,
-                tile_len,
-                lane,
-            )
-            _gemm_dual(
-                tiled_mma,
-                s_aq,
-                s_ak,
-                s_bq,
-                tmp_q,
-                tmp_k,
-                lane,
-            )
-            for idx in cutlass.range_constexpr(cute.size(acc_dq)):
-                row, feature = coord[idx]
-                scale = cute.math.exp2(
-                    cutlass.Float32(
-                        s_g[(warp * BC + row, feature)]
-                    )
-                    - cutlass.Float32(
-                        s_g[(warp * BC + mid, feature)]
-                    ),
-                    fastmath=True,
-                )
-                acc_dq[idx] += tmp_q[idx] * scale
-                acc_dkl[idx] += tmp_k[idx] * scale
-            cute.arch.sync_warp()
-
-            last = sub_len - 1
-            for source in cutlass.range(4, unroll=1):
-                if source > warp and source * BC < tile_len:
-                    _stage_a(
-                        s_daq,
-                        s_dak,
-                        s_aq,
-                        s_ak,
-                        source,
-                        warp,
-                        True,
-                        lane,
-                    )
-                    _fill_upper_b(
-                        s_q,
-                        s_k,
-                        s_g,
-                        s_beta,
-                        s_bq,
-                        s_bk,
-                        source,
-                        warp,
-                        last,
-                        tile_len,
-                        lane,
-                    )
-                    _gemm_two_b(
-                        tiled_mma,
-                        s_aq,
-                        s_ak,
-                        s_bq,
-                        s_bk,
-                        acc_dku,
-                        lane,
-                    )
-                    cute.arch.sync_warp()
-
-            for idx in cutlass.range_constexpr(cute.size(acc_dku)):
-                row, feature = coord[idx]
-                acc_dku[idx] *= cute.math.exp2(
-                    cutlass.Float32(
-                        s_g[(warp * BC + last, feature)]
-                    )
-                    - cutlass.Float32(
-                        s_g[(warp * BC + row, feature)]
-                    ),
-                    fastmath=True,
-                )
-
-            tmp_u = tiled_mma.make_fragment_C(acc_shape)
-            tmp_u.fill(0.0)
-            _stage_a(
-                s_daq,
-                s_dak,
-                s_aq,
-                s_ak,
-                warp,
-                warp,
-                True,
-                lane,
-            )
-            _fill_upper_b(
-                s_q,
-                s_k,
-                s_g,
-                s_beta,
-                s_bq,
-                s_bk,
-                warp,
-                warp,
-                mid,
-                tile_len,
-                lane,
-            )
-            _gemm_two_b(
-                tiled_mma,
-                s_aq,
-                s_ak,
-                s_bq,
-                s_bk,
-                tmp_u,
-                lane,
-            )
-
-            row0 = lane // 4
-            row1 = row0 + 8
-            db0 = cutlass.Float32(0.0)
-            db1 = cutlass.Float32(0.0)
-            for idx in cutlass.range_constexpr(cute.size(acc_dq)):
-                row, feature = coord[idx]
-                upper_scale = cute.math.exp2(
-                    cutlass.Float32(
-                        s_g[(warp * BC + mid, feature)]
-                    )
-                    - cutlass.Float32(
-                        s_g[(warp * BC + row, feature)]
-                    ),
-                    fastmath=True,
-                )
-                dku = cutlass.Float32(acc_dku[idx]) + cutlass.Float32(
-                    tmp_u[idx]
-                ) * upper_scale
-                dqi = cutlass.Float32(acc_dq[idx])
-                dkl = cutlass.Float32(acc_dkl[idx])
-                beta_value = cutlass.Float32(s_beta[warp * BC + row])
-                dkl_beta = dkl * beta_value
-                q_value = cutlass.Float32(
-                    s_q[(warp * BC + row, feature)]
-                )
-                k_value = cutlass.Float32(
-                    s_k[(warp * BC + row, feature)]
-                )
-                token = chunk_start + warp * BC + row
-                dim = feature_start + feature
-
-                dq_out[(0, token, head, dim)] = cutlass.BFloat16(
-                    cutlass.Float32(dq[(0, token, head, dim)]) + dqi
-                )
-                dk_out[(0, token, head, dim)] = cutlass.BFloat16(
-                    cutlass.Float32(dk[(0, token, head, dim)])
-                    + dkl_beta
-                    + dku
-                )
-                dg_out[(0, token, head, dim)] = (
-                    cutlass.Float32(dg[(0, token, head, dim)])
-                    + q_value * dqi
-                    + (dkl_beta - dku) * k_value
-                )
-                contribution = dkl * k_value
-                if row == row0:
-                    db0 += contribution
-                if row == row1:
-                    db1 += contribution
-
-            db0 += cute.arch.shuffle_sync_bfly(
-                db0, offset=1, mask=-1, mask_and_clamp=31
-            )
-            db0 += cute.arch.shuffle_sync_bfly(
-                db0, offset=2, mask=-1, mask_and_clamp=31
-            )
-            db1 += cute.arch.shuffle_sync_bfly(
-                db1, offset=1, mask=-1, mask_and_clamp=31
-            )
-            db1 += cute.arch.shuffle_sync_bfly(
-                db1, offset=2, mask=-1, mask_and_clamp=31
-            )
-            if lane % 4 == 0:
-                token0 = chunk_start + warp * BC + row0
-                value0 = db0
-                if feature_tile == 0:
-                    value0 += cutlass.Float32(db[(0, token0, head)])
-                ptr0 = (
-                    db_out.iterator
-                    + db_out.layout((0, token0, head))
-                )
-                cute.arch.atomic_add(
-                    ptr0.llvm_ptr,
-                    value0,
-                    sem="relaxed",
-                    scope="gpu",
-                )
-                if row1 < sub_len:
-                    token1 = chunk_start + warp * BC + row1
-                    value1 = db1
-                    if feature_tile == 0:
-                        value1 += cutlass.Float32(db[(0, token1, head)])
-                    ptr1 = (
-                        db_out.iterator
-                        + db_out.layout((0, token1, head))
-                    )
-                    cute.arch.atomic_add(
-                        ptr1.llvm_ptr,
-                        value1,
-                        sem="relaxed",
-                        scope="gpu",
-                    )
-        cute.arch.sync_threads()
-
-
 @cute.jit
 def _process_tf32_tile(
+    tiled_mma: cute.TiledMma,
     q: cute.Tensor,
     k: cute.Tensor,
     g: cute.Tensor,
@@ -1596,11 +753,21 @@ def _process_tf32_tile(
     chunk_idx: cutlass.Int32,
     head: cutlass.Int32,
 ):
+    """Process one (64-token chunk, head) tile with four symmetric warps.
+
+    Warp ``w`` owns output rows ``[16*w, 16*(w+1))``. Every warp performs
+    lower/diagonal/upper staging and its own epilogue; there is no dedicated
+    producer/consumer warp specialization. Source-block counts differ by
+    warp, but the tensor-core instruction count stays balanced.
+    """
+
     tidx, _, _ = cute.arch.thread_idx()
     warp = tidx // 32
     lane = tidx % 32
     gid = lane // 4
     lane4 = lane % 4
+    thr_mma = tiled_mma.get_slice(lane)
+    acc_shape = thr_mma.partition_shape_C((BC, BD))
 
     seq_idx = cutlass.Int32(chunk_indices[(chunk_idx, 0)])
     chunk_in_seq = cutlass.Int32(chunk_indices[(chunk_idx, 1)])
@@ -1672,6 +839,8 @@ def _process_tf32_tile(
             value = cutlass.Float32(beta[(0, chunk_start + tidx, head)])
         s_beta[tidx] = value
 
+    # Stage the CTA-wide 64x64 dA matrices. Full chunks use bulk async copy;
+    # tail chunks use predicated vector copies and explicit causal masking.
     if tile_len == BT:
         bulk_copy = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyBulkG2SOp(),
@@ -1812,6 +981,7 @@ def _process_tf32_tile(
             cutlass.Int32(0),
         )
 
+    # Each warp gets private 32x16 B staging buffers for its output block.
     s_bq = cute.make_tensor(
         s_bq_all.iterator + s_bq_all.layout((warp, 0, 0)),
         b_tile_layout,
@@ -1827,6 +997,7 @@ def _process_tf32_tile(
     db0 = cutlass.Float32(0.0)
     db1 = cutlass.Float32(0.0)
 
+    # Stream the 128 feature columns in four 32-column tiles.
     for feature_tile in cutlass.range(4, unroll=1):
         feature_start = feature_tile * BD
         if feature_tile > 0:
@@ -1854,16 +1025,15 @@ def _process_tf32_tile(
                 sub_len,
                 lane,
             )
-            acc_dq = cute.make_rmem_tensor(
-                cute.make_layout((16,), stride=(1,)),
-                cutlass.Float32,
-            )
-            acc_dkl = cute.make_rmem_tensor_like(
-                acc_dq, cutlass.Float32
-            )
-            acc_dq.fill(0.0)
-            acc_dkl.fill(0.0)
+            # The MMA and scalar epilogue both address native C TV fragments;
+            # local_tile selects one 8-column atom without flattening layout.
+            acc_dq_tv = tiled_mma.make_fragment_C(acc_shape)
+            acc_dkl_tv = tiled_mma.make_fragment_C(acc_shape)
+            acc_dq_tv.fill(0.0)
+            acc_dkl_tv.fill(0.0)
 
+            # Earlier source blocks plus the causal diagonal produce dq and
+            # the lower-triangular component of dk.
             for source in cutlass.range(4, unroll=1):
                 if source < warp:
                     _fill_lower_b_f32(
@@ -1876,12 +1046,13 @@ def _process_tf32_tile(
                         tile_len,
                         lane,
                     )
-                    _tf32_gemm_dual(
+                    _tf32_gemm_dual_tv(
+                        tiled_mma,
                         s_daq,
                         s_dak,
                         s_bq,
-                        acc_dq,
-                        acc_dkl,
+                        acc_dq_tv,
+                        acc_dkl_tv,
                         warp,
                         source,
                         False,
@@ -1894,7 +1065,12 @@ def _process_tf32_tile(
             if mid >= sub_len:
                 mid = sub_len - 1
             for nt in cutlass.range_constexpr(4):
-                base = nt * 4
+                acc_dq_atom = cute.local_tile(
+                    acc_dq_tv, (4, 1, 1), (0, 0, nt)
+                )
+                acc_dkl_atom = cute.local_tile(
+                    acc_dkl_tv, (4, 1, 1), (0, 0, nt)
+                )
                 col0 = nt * 8 + lane4 * 2
                 col1 = col0 + 1
                 anchor0 = cutlass.Float32(s_g[(warp * BC, col0)])
@@ -1920,8 +1096,8 @@ def _process_tf32_tile(
                     scale1,
                 )
                 for value_idx in cutlass.range_constexpr(4):
-                    acc_dq[base + value_idx] *= scales[value_idx]
-                    acc_dkl[base + value_idx] *= scales[value_idx]
+                    acc_dq_atom[value_idx] *= scales[value_idx]
+                    acc_dkl_atom[value_idx] *= scales[value_idx]
 
             _fill_lower_b_f32(
                 s_k,
@@ -1933,12 +1109,13 @@ def _process_tf32_tile(
                 tile_len,
                 lane,
             )
-            _tf32_gemm_dual(
+            _tf32_gemm_dual_tv(
+                tiled_mma,
                 s_daq,
                 s_dak,
                 s_bq,
-                acc_dq,
-                acc_dkl,
+                acc_dq_tv,
+                acc_dkl_tv,
                 warp,
                 warp,
                 False,
@@ -1947,7 +1124,12 @@ def _process_tf32_tile(
                 lane,
             )
             for nt in cutlass.range_constexpr(4):
-                base = nt * 4
+                acc_dq_atom = cute.local_tile(
+                    acc_dq_tv, (4, 1, 1), (0, 0, nt)
+                )
+                acc_dkl_atom = cute.local_tile(
+                    acc_dkl_tv, (4, 1, 1), (0, 0, nt)
+                )
                 col0 = nt * 8 + lane4 * 2
                 col1 = col0 + 1
                 anchor0 = cutlass.Float32(
@@ -1987,23 +1169,25 @@ def _process_tf32_tile(
                     ),
                 )
                 for value_idx in cutlass.range_constexpr(4):
-                    acc_dq[base + value_idx] *= scales[value_idx]
-                    acc_dkl[base + value_idx] *= scales[value_idx]
+                    acc_dq_atom[value_idx] *= scales[value_idx]
+                    acc_dkl_atom[value_idx] *= scales[value_idx]
             cute.arch.cp_async_wait_group(0)
             cute.arch.sync_warp()
             for nt in cutlass.range_constexpr(4):
-                base = nt * 4
+                acc_dq_atom = cute.local_tile(
+                    acc_dq_tv, (4, 1, 1), (0, 0, nt)
+                )
                 col0 = nt * 8 + lane4 * 2
                 col1 = col0 + 1
                 if gid < sub_len:
                     token0 = chunk_start + warp * BC + gid
                     value0 = (
                         cutlass.Float32(s_bk[(col0, gid)])
-                        + cutlass.Float32(acc_dq[base])
+                        + cutlass.Float32(acc_dq_atom[0])
                     )
                     value1 = (
                         cutlass.Float32(s_bk[(col1, gid)])
-                        + cutlass.Float32(acc_dq[base + 1])
+                        + cutlass.Float32(acc_dq_atom[1])
                     )
                     destination0 = (
                         dq_out.iterator
@@ -2016,11 +1200,11 @@ def _process_tf32_tile(
                     token1 = chunk_start + warp * BC + gid + 8
                     value2 = (
                         cutlass.Float32(s_bk[(col0, gid + 8)])
-                        + cutlass.Float32(acc_dq[base + 2])
+                        + cutlass.Float32(acc_dq_atom[2])
                     )
                     value3 = (
                         cutlass.Float32(s_bk[(col1, gid + 8)])
-                        + cutlass.Float32(acc_dq[base + 3])
+                        + cutlass.Float32(acc_dq_atom[3])
                     )
                     destination1 = (
                         dq_out.iterator
@@ -2030,10 +1214,10 @@ def _process_tf32_tile(
                     )
                     _store_bf16x2(destination1, value2, value3)
 
-            acc_dku = cute.make_rmem_tensor_like(
-                acc_dq, cutlass.Float32
-            )
-            acc_dku.fill(0.0)
+            # Later source blocks plus the transposed causal diagonal produce
+            # the upper-triangular component of dk and dg.
+            acc_dku_tv = tiled_mma.make_fragment_C(acc_shape)
+            acc_dku_tv.fill(0.0)
             last = sub_len - 1
             for source in cutlass.range(4, unroll=1):
                 if source > warp and source * BC < tile_len:
@@ -2051,12 +1235,13 @@ def _process_tf32_tile(
                         lane,
                         beta.element_type == cutlass.Float32,
                     )
-                    _tf32_gemm_two_b(
+                    _tf32_gemm_two_b_tv(
+                        tiled_mma,
                         s_daq,
                         s_dak,
                         s_bq,
                         s_bk,
-                        acc_dku,
+                        acc_dku_tv,
                         source,
                         warp,
                         True,
@@ -2066,7 +1251,9 @@ def _process_tf32_tile(
                     )
 
             for nt in cutlass.range_constexpr(4):
-                base = nt * 4
+                acc_dku_atom = cute.local_tile(
+                    acc_dku_tv, (4, 1, 1), (0, 0, nt)
+                )
                 col0 = nt * 8 + lane4 * 2
                 col1 = col0 + 1
                 anchor0 = cutlass.Float32(
@@ -2096,7 +1283,7 @@ def _process_tf32_tile(
                     scale1,
                 )
                 for value_idx in cutlass.range_constexpr(4):
-                    acc_dku[base + value_idx] *= scales[value_idx]
+                    acc_dku_atom[value_idx] *= scales[value_idx]
 
             _fill_upper_b_f32(
                 s_q,
@@ -2112,12 +1299,13 @@ def _process_tf32_tile(
                 lane,
                 beta.element_type == cutlass.Float32,
             )
-            _tf32_gemm_two_b(
+            _tf32_gemm_two_b_tv(
+                tiled_mma,
                 s_daq,
                 s_dak,
                 s_bq,
                 s_bk,
-                acc_dku,
+                acc_dku_tv,
                 warp,
                 warp,
                 True,
@@ -2147,7 +1335,9 @@ def _process_tf32_tile(
                 lane,
             )
             for nt in cutlass.range_constexpr(4):
-                base = nt * 4
+                acc_dku_atom = cute.local_tile(
+                    acc_dku_tv, (4, 1, 1), (0, 0, nt)
+                )
                 col0 = nt * 8 + lane4 * 2
                 col1 = col0 + 1
                 anchor0 = cutlass.Float32(
@@ -2187,12 +1377,20 @@ def _process_tf32_tile(
                     ),
                 )
                 for value_idx in cutlass.range_constexpr(4):
-                    acc_dku[base + value_idx] *= upper_scales[value_idx]
+                    acc_dku_atom[value_idx] *= upper_scales[value_idx]
             cute.arch.cp_async_wait_group(0)
             cute.arch.sync_warp()
 
             for nt in cutlass.range_constexpr(4):
-                base = nt * 4
+                acc_dq_atom = cute.local_tile(
+                    acc_dq_tv, (4, 1, 1), (0, 0, nt)
+                )
+                acc_dkl_atom = cute.local_tile(
+                    acc_dkl_tv, (4, 1, 1), (0, 0, nt)
+                )
+                acc_dku_atom = cute.local_tile(
+                    acc_dku_tv, (4, 1, 1), (0, 0, nt)
+                )
                 col0 = nt * 8 + lane4 * 2
                 col1 = col0 + 1
                 for row_group in cutlass.range_constexpr(2):
@@ -2202,22 +1400,22 @@ def _process_tf32_tile(
                         s_beta[warp * BC + row]
                     )
                     dqi0 = cutlass.Float32(
-                        acc_dq[base + value_idx]
+                        acc_dq_atom[value_idx]
                     )
                     dqi1 = cutlass.Float32(
-                        acc_dq[base + value_idx + 1]
+                        acc_dq_atom[value_idx + 1]
                     )
                     dkl0 = cutlass.Float32(
-                        acc_dkl[base + value_idx]
+                        acc_dkl_atom[value_idx]
                     )
                     dkl1 = cutlass.Float32(
-                        acc_dkl[base + value_idx + 1]
+                        acc_dkl_atom[value_idx + 1]
                     )
                     dku0 = cutlass.Float32(
-                        acc_dku[base + value_idx]
+                        acc_dku_atom[value_idx]
                     )
                     dku1 = cutlass.Float32(
-                        acc_dku[base + value_idx + 1]
+                        acc_dku_atom[value_idx + 1]
                     )
                     dkl_beta0 = dkl0 * beta_value
                     dkl_beta1 = dkl1 * beta_value
@@ -2320,6 +1518,7 @@ def _process_tf32_tile(
 
 @cute.kernel
 def _kernel_tf32(
+    tiled_mma: cute.TiledMma,
     q: cute.Tensor,
     k: cute.Tensor,
     g: cute.Tensor,
@@ -2346,6 +1545,7 @@ def _kernel_tf32(
         chunk_idx = tile_id // heads
         head = tile_id % heads
         _process_tf32_tile(
+            tiled_mma,
             q,
             k,
             g,
@@ -2391,7 +1591,9 @@ def _make_jit():
         persistent_ctas: cutlass.Constexpr[int],
         stream: cuda.CUstream,
     ):
+        tiled_mma = make_tf32_tiled_mma()
         _kernel_tf32(
+            tiled_mma,
             q,
             k,
             g,
@@ -2498,7 +1700,7 @@ def kda_bwd_intra_mma(
     chunk_size: int,
     tile_counter: torch.Tensor | None = None,
 ):
-    """Run the portable mma.sync CuTeDSL kernel."""
+    """Run the portable native-TiledMma CuTeDSL kernel."""
     del tile_counter
     if chunk_size != BT:
         raise ValueError("CuTe DSL KDA backward requires chunk_size=64")
@@ -2532,7 +1734,7 @@ def kda_bwd_intra_mma(
     major, minor = torch.cuda.get_device_capability(q.device)
     if (major, minor) not in ((9, 0), (10, 0), (10, 3)):
         raise RuntimeError(
-            "mma.sync CuTeDSL KDA backward requires SM90, SM100, or SM103; "
+            "TiledMma CuTeDSL KDA backward requires SM90, SM100, or SM103; "
             f"got SM{major}{minor}"
         )
 
