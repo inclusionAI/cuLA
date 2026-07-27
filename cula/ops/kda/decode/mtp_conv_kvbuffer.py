@@ -355,12 +355,12 @@ def kda_conv_mtp_tensor_core_kvbuffer_kernel(
                         sG[i_t, k_start + c] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
                     else:
                         beta_x = softplus_beta * x
-                        exp_bx = cute.exp(beta_x, fastmath=fast_math)
-                        sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                            cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
-                        )
-                        use_sp = cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
-                        sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
+                        sp_x = x
+                        if beta_x <= softplus_threshold:
+                            sp_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                                cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=fast_math),
+                                fastmath=fast_math,
+                            )
                         sG[i_t, k_start + c] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
                     sKQ[i_t, k_start + c] = r_kf[c]
                     sKQ[BT + i_t, k_start + c] = r_qf[c]
@@ -977,6 +977,8 @@ def kda_conv_decode_mtp_kvbuffer(
             num_v_tiles = 2
         else:
             num_v_tiles = 1
+    if num_v_tiles > 1 and num_v_tiles % 2 != 0:
+        raise ValueError(f"num_v_tiles must be 1 or even, got {num_v_tiles}")
     if (V // bv) % num_v_tiles != 0:
         raise ValueError(f"num_v_tiles must divide V//bv, got {num_v_tiles=}")
 
@@ -1020,7 +1022,8 @@ def kda_conv_decode_mtp_kvbuffer(
     a = a if a.is_contiguous() else a.contiguous()
     b = b if b.is_contiguous() else b.contiguous()
 
-    # Keep q/k arrival counters stream-local for Graph replay and concurrency.
+    # Each completed launch resets its stream-local counters in-kernel; avoiding a
+    # separate zero_ launch keeps the fused CUDA Graph path launch-minimal.
     qk_arrival_counters = _get_qk_arrival_counters(mixed_qkv.device, N, H)
     h0_source_flat = h0_source.view(pool_size * HV, V, K)
     compiled = _get_compiled_conv_tensor_core_kvbuffer_kernel(

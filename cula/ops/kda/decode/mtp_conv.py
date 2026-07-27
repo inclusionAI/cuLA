@@ -154,10 +154,8 @@ def kda_conv_verify_kernel(
     if cutlass.const_expr(weights_in_smem):
         # q/k conv weights in SMEM (reg relief at bv>=16): lane-major, odd stride
         # vec_size*W+1 so fixed-(c,w) reads across the warp hit distinct banks.
-        sWq = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((32, vec_size, W), stride=(vec_size * W + 1, W, 1)), 16)
-        sWk = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((32, vec_size, W), stride=(vec_size * W + 1, W, 1)), 16)
+        sWq = smem.allocate_tensor(cutlass.Float32, cute.make_layout((32, vec_size, W), stride=(vec_size * W + 1, W, 1)), 16)
+        sWk = smem.allocate_tensor(cutlass.Float32, cute.make_layout((32, vec_size, W), stride=(vec_size * W + 1, W, 1)), 16)
 
     if cache_idx >= 0:
         # ---- producer (warp 0) conv registers + preamble ----
@@ -361,13 +359,15 @@ def kda_conv_verify_kernel(
             # Last-arrival writeback avoids depending on CUDA block scheduling order.
             counter_idx = i_n * H + i_h
             expected_arrivals = num_v_tiles * (HV // H)
-            is_last_qk_cta = _announce_qk_read_complete(
-                qk_arrival_counters, counter_idx, expected_arrivals, lane
-            )
+            is_last_qk_cta = _announce_qk_read_complete(qk_arrival_counters, counter_idx, expected_arrivals, lane)
             if is_last_qk_cta:
-                qh_out = cute.coalesce(cute.local_tile(conv_state, (1, vec_size, W - 1), (cs_idx, q_base // vec_size + lane, 0)))
+                qh_out = cute.coalesce(
+                    cute.local_tile(conv_state, (1, vec_size, W - 1), (cs_idx, q_base // vec_size + lane, 0))
+                )
                 cute.autovec_copy(r_qhist, qh_out)
-                kh_out = cute.coalesce(cute.local_tile(conv_state, (1, vec_size, W - 1), (cs_idx, k_base // vec_size + lane, 0)))
+                kh_out = cute.coalesce(
+                    cute.local_tile(conv_state, (1, vec_size, W - 1), (cs_idx, k_base // vec_size + lane, 0))
+                )
                 cute.autovec_copy(r_khist, kh_out)
                 if lane == 0:
                     qk_arrival_counters[counter_idx] = Int32(0)
@@ -404,11 +404,12 @@ def kda_conv_verify_kernel(
                             r_gbf[gslot][c] = cute.exp(lower_bound * sig, fastmath=fast_math)
                         else:
                             beta_x = softplus_beta * gx
-                            sp = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                                cutlass.Float32(1.0) + cute.exp(softplus_beta * gx, fastmath=fast_math), fastmath=fast_math
-                            )
-                            use_sp = cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
-                            spx = use_sp * sp + (cutlass.Float32(1.0) - use_sp) * gx
+                            spx = gx
+                            if beta_x <= softplus_threshold:
+                                spx = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                                    cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=fast_math),
+                                    fastmath=fast_math,
+                                )
                             r_gbf[gslot][c] = cute.exp(-r_exp_A * spx, fastmath=fast_math)
                     r_betabf[gslot][0] = cutlass.Float32(1.0) / (
                         cutlass.Float32(1.0) + cute.exp(-r_bbf[gslot][0], fastmath=fast_math)
@@ -424,7 +425,9 @@ def kda_conv_verify_kernel(
                         r_red[vv] = sv
                     for off in [16, 8, 4, 2, 1]:
                         for vv in cutlass.range_constexpr(BV):
-                            r_red[vv] = r_red[vv] + cute.arch.shuffle_sync_bfly(r_red[vv], offset=off, mask=-1, mask_and_clamp=31)
+                            r_red[vv] = r_red[vv] + cute.arch.shuffle_sync_bfly(
+                                r_red[vv], offset=off, mask=-1, mask_and_clamp=31
+                            )
                     for vv in cutlass.range_constexpr(BV):
                         v_new = (r_v[vv] - r_red[vv]) * r_beta
                         ovv = cutlass.Float32(0.0)
@@ -434,7 +437,9 @@ def kda_conv_verify_kernel(
                         r_red[vv] = ovv
                     for off in [16, 8, 4, 2, 1]:
                         for vv in cutlass.range_constexpr(BV):
-                            r_red[vv] = r_red[vv] + cute.arch.shuffle_sync_bfly(r_red[vv], offset=off, mask=-1, mask_and_clamp=31)
+                            r_red[vv] = r_red[vv] + cute.arch.shuffle_sync_bfly(
+                                r_red[vv], offset=off, mask=-1, mask_and_clamp=31
+                            )
                     for vv in cutlass.range_constexpr(BV):
                         o[(i_n, ct, i_hv, i_v * BV + vv)] = cutlass.BFloat16(r_red[vv])
                     if cutlass.const_expr(cache_intermediate_states):
@@ -442,7 +447,9 @@ def kda_conv_verify_kernel(
                         for vv in cutlass.range_constexpr(BV):
                             for c in cutlass.range_constexpr(vec_size):
                                 r_h4[c] = r_h[vv * vec_size + c]
-                            inter_tile = cute.local_tile(intermediate_states, (1, 1, vec_size), (flat_idx, i_v * BV + vv, lane))
+                            inter_tile = cute.local_tile(
+                                intermediate_states, (1, 1, vec_size), (flat_idx, i_v * BV + vv, lane)
+                            )
                             cute.autovec_copy(r_h4, inter_tile)
 
         # ---- consumer epilogue (producer writes conv_state at the end of its own loop) ----
@@ -502,26 +509,96 @@ def run_kda_conv_verify_kernel(
     if cutlass.const_expr(weights_in_smem):
         smem_bytes = smem_bytes + 2 * 32 * (vec_size * W + 1) * 4  # sWq+sWk lane-major
     kda_conv_verify_kernel(
-        mixed_qkv, conv_weight, conv_bias, conv_state, conv_state_indices, qk_arrival_counters,
-        inter_conv_window, inter_state_indices, h0_source, A_log, a, dt_bias, b, o,
-        intermediate_states, h0_indices, vec_size, num_v_tiles, BV, softplus_beta,
-        softplus_threshold, scale, HV, T, H, K, V, W, use_qk_l2norm,
-        disable_state_update, cache_intermediate_states, save_conv_window, has_bias,
-        fast_math, use_lower_bound, lower_bound, weights_in_smem,
+        mixed_qkv,
+        conv_weight,
+        conv_bias,
+        conv_state,
+        conv_state_indices,
+        qk_arrival_counters,
+        inter_conv_window,
+        inter_state_indices,
+        h0_source,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        o,
+        intermediate_states,
+        h0_indices,
+        vec_size,
+        num_v_tiles,
+        BV,
+        softplus_beta,
+        softplus_threshold,
+        scale,
+        HV,
+        T,
+        H,
+        K,
+        V,
+        W,
+        use_qk_l2norm,
+        disable_state_update,
+        cache_intermediate_states,
+        save_conv_window,
+        has_bias,
+        fast_math,
+        use_lower_bound,
+        lower_bound,
+        weights_in_smem,
     ).launch(grid=(grid_size, 1, 1), block=[NWARP2 * 32, 1, 1], smem=smem_bytes, stream=stream)
 
 
 _compiled_conv_verify_kernels: dict = {}
 
 
-def _get_compiled(N, T, H, HV, K, V, D, pool_size, lines, BV, scale, use_qk_l2norm,
-                      disable_state_update, cache_intermediate_states, save_conv_window,
-                      has_bias, softplus_beta, softplus_threshold, use_lower_bound,
-                      lower_bound, opt_level=3, fast_math=True, weights_in_smem=False):
-    key = (T, H, HV, K, V, D, BV, scale, use_qk_l2norm, disable_state_update,
-           cache_intermediate_states, save_conv_window, has_bias, softplus_beta,
-           softplus_threshold, use_lower_bound, lower_bound, opt_level, fast_math,
-           weights_in_smem)
+def _get_compiled(
+    N,
+    T,
+    H,
+    HV,
+    K,
+    V,
+    D,
+    pool_size,
+    lines,
+    BV,
+    scale,
+    use_qk_l2norm,
+    disable_state_update,
+    cache_intermediate_states,
+    save_conv_window,
+    has_bias,
+    softplus_beta,
+    softplus_threshold,
+    use_lower_bound,
+    lower_bound,
+    opt_level=3,
+    fast_math=True,
+    weights_in_smem=False,
+):
+    key = (
+        T,
+        H,
+        HV,
+        K,
+        V,
+        D,
+        BV,
+        scale,
+        use_qk_l2norm,
+        disable_state_update,
+        cache_intermediate_states,
+        save_conv_window,
+        has_bias,
+        softplus_beta,
+        softplus_threshold,
+        use_lower_bound,
+        lower_bound,
+        opt_level,
+        fast_math,
+        weights_in_smem,
+    )
     if key in _compiled_conv_verify_kernels:
         return _compiled_conv_verify_kernels[key]
     dev = "cuda"
@@ -557,16 +634,43 @@ def _get_compiled(N, T, H, HV, K, V, D, pool_size, lines, BV, scale, use_qk_l2no
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled = cute.compile(
         run_kda_conv_verify_kernel,
-        dl(mixed_qkv, True), dl(conv_weight), dl(conv_bias), dl(conv_state, True),
-        dli(conv_state_indices), dli(qk_arrival_counters), dl(inter_conv_window, True), dli(inter_state_indices),
-        dl(h0_source, True), dl(A_log), dl(a, True), dl(dt_bias), dl(b, True), dl(o, True),
-        dl(inter_states, True) if cache_intermediate_states else dl(inter_states), dli(h0_indices),
-        vec_size=VEC_SIZE, BV=BV, softplus_beta=softplus_beta,
-        softplus_threshold=softplus_threshold, scale=scale, HV=HV, T=T, H=H, K=K, V=V,
-        W=WCONV, use_qk_l2norm=use_qk_l2norm, disable_state_update=disable_state_update,
-        cache_intermediate_states=cache_intermediate_states, save_conv_window=save_conv_window,
-        has_bias=has_bias, fast_math=fast_math, use_lower_bound=use_lower_bound,
-        lower_bound=lower_bound, weights_in_smem=weights_in_smem, stream=stream,
+        dl(mixed_qkv, True),
+        dl(conv_weight),
+        dl(conv_bias),
+        dl(conv_state, True),
+        dli(conv_state_indices),
+        dli(qk_arrival_counters),
+        dl(inter_conv_window, True),
+        dli(inter_state_indices),
+        dl(h0_source, True),
+        dl(A_log),
+        dl(a, True),
+        dl(dt_bias),
+        dl(b, True),
+        dl(o, True),
+        dl(inter_states, True) if cache_intermediate_states else dl(inter_states),
+        dli(h0_indices),
+        vec_size=VEC_SIZE,
+        BV=BV,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        scale=scale,
+        HV=HV,
+        T=T,
+        H=H,
+        K=K,
+        V=V,
+        W=WCONV,
+        use_qk_l2norm=use_qk_l2norm,
+        disable_state_update=disable_state_update,
+        cache_intermediate_states=cache_intermediate_states,
+        save_conv_window=save_conv_window,
+        has_bias=has_bias,
+        fast_math=fast_math,
+        use_lower_bound=use_lower_bound,
+        lower_bound=lower_bound,
+        weights_in_smem=weights_in_smem,
+        stream=stream,
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
     )
     _compiled_conv_verify_kernels[key] = compiled
@@ -740,8 +844,12 @@ def kda_conv_verify_large_batch_kernel(
                                     inter_conv_window[iw_idx, i_t, qch, wv] = cutlass.Float32(mixed_qkv[bos + pw, qch])
                                     inter_conv_window[iw_idx, i_t, kch, wv] = cutlass.Float32(mixed_qkv[bos + pw, kch])
                                 else:
-                                    inter_conv_window[iw_idx, i_t, qch, wv] = cutlass.Float32(conv_state[cs_idx, qch, pw + (W - 1)])
-                                    inter_conv_window[iw_idx, i_t, kch, wv] = cutlass.Float32(conv_state[cs_idx, kch, pw + (W - 1)])
+                                    inter_conv_window[iw_idx, i_t, qch, wv] = cutlass.Float32(
+                                        conv_state[cs_idx, qch, pw + (W - 1)]
+                                    )
+                                    inter_conv_window[iw_idx, i_t, kch, wv] = cutlass.Float32(
+                                        conv_state[cs_idx, kch, pw + (W - 1)]
+                                    )
                 # l2norm + scale (butterfly within this warp = all K for token i_t)
                 if cutlass.const_expr(use_qk_l2norm):
                     sq = cutlass.Float32(0.0)
@@ -768,11 +876,12 @@ def kda_conv_verify_large_batch_kernel(
                         g = cute.exp(lower_bound * sig, fastmath=fast_math)
                     else:
                         beta_x = softplus_beta * gx
-                        sp = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                            cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=fast_math), fastmath=fast_math
-                        )
-                        use_sp = cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
-                        spx = use_sp * sp + (cutlass.Float32(1.0) - use_sp) * gx
+                        spx = gx
+                        if beta_x <= softplus_threshold:
+                            spx = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                                cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=fast_math),
+                                fastmath=fast_math,
+                            )
                         g = cute.exp(-r_exp_A * spx, fastmath=fast_math)
                     r_g_out[c] = g
                 cute.autovec_copy(r_pq, cute.coalesce(cute.local_tile(sQ, (1, vec_size), (i_t, lane))))
@@ -793,7 +902,6 @@ def kda_conv_verify_large_batch_kernel(
         r_vhist = cute.make_rmem_tensor(cute.make_layout((W - 1,), stride=(1,)), cutlass.Float32)
         r_vw = cute.make_rmem_tensor(cute.make_layout((W,), stride=(1,)), cutlass.Float32)
         r_vb = cute.make_rmem_tensor(cute.make_layout((1,), stride=(1,)), cutlass.Float32)
-
 
         # v-conv preload (Option B within warp: lane < BVW owns v-col `lane`)
         if lane < BVW:
@@ -817,7 +925,6 @@ def kda_conv_verify_large_batch_kernel(
             r_xv[0][0] = mixed_qkv[i_n * T, vch_pf]
 
         for i_t in cutlass.range_constexpr(T):
-            row = i_n * T + i_t
             # v conv (lane<BVW computes its col, shuffle-broadcast within warp)
             my_v = cutlass.Float32(0.0)
             if lane < BVW:
@@ -883,9 +990,7 @@ def kda_conv_verify_large_batch_kernel(
         if warp == 0:
             counter_idx = i_n * H + i_h
             expected_arrivals = num_v_tiles * (HV // H)
-            is_last_qk_cta = _announce_qk_read_complete(
-                qk_arrival_counters, counter_idx, expected_arrivals, lane
-            )
+            is_last_qk_cta = _announce_qk_read_complete(qk_arrival_counters, counter_idx, expected_arrivals, lane)
             if is_last_qk_cta:
                 # rolled window = last W-1 abs positions p=T-(W-1)+w: p>=0 from mixed_qkv,
                 # p<0 (only T<W-1) from conv_state col p+(W-1); read before overwrite.
@@ -917,9 +1022,22 @@ def kda_conv_verify_large_batch_kernel(
 
 @cute.jit
 def run_kda_conv_verify_large_batch_kernel(
-    mixed_qkv, conv_weight, conv_bias, conv_state, conv_state_indices, qk_arrival_counters,
-    inter_conv_window, inter_state_indices, h0_source, A_log, a, dt_bias, b, o,
-    intermediate_states, h0_indices,
+    mixed_qkv,
+    conv_weight,
+    conv_bias,
+    conv_state,
+    conv_state_indices,
+    qk_arrival_counters,
+    inter_conv_window,
+    inter_state_indices,
+    h0_source,
+    A_log,
+    a,
+    dt_bias,
+    b,
+    o,
+    intermediate_states,
+    h0_indices,
     vec_size: cutlass.Constexpr[int],
     BVW: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
@@ -947,25 +1065,96 @@ def run_kda_conv_verify_large_batch_kernel(
     grid_size = n_indices * HV * num_v_tiles
     smem_bytes = 3 * (4 * T * K) + 4 * T + 128  # sQ+sK+sG [T,K] fp32 + sBeta + slack
     kda_conv_verify_large_batch_kernel(
-        mixed_qkv, conv_weight, conv_bias, conv_state, conv_state_indices, qk_arrival_counters,
-        inter_conv_window, inter_state_indices, h0_source, A_log, a, dt_bias, b, o,
-        intermediate_states, h0_indices,
-        vec_size, num_v_tiles, BVW, tile_v, softplus_beta, softplus_threshold, scale,
-        HV, T, H, K, V, W, use_qk_l2norm, disable_state_update, cache_intermediate_states,
-        save_conv_window, has_bias, fast_math, use_lower_bound, lower_bound,
+        mixed_qkv,
+        conv_weight,
+        conv_bias,
+        conv_state,
+        conv_state_indices,
+        qk_arrival_counters,
+        inter_conv_window,
+        inter_state_indices,
+        h0_source,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        o,
+        intermediate_states,
+        h0_indices,
+        vec_size,
+        num_v_tiles,
+        BVW,
+        tile_v,
+        softplus_beta,
+        softplus_threshold,
+        scale,
+        HV,
+        T,
+        H,
+        K,
+        V,
+        W,
+        use_qk_l2norm,
+        disable_state_update,
+        cache_intermediate_states,
+        save_conv_window,
+        has_bias,
+        fast_math,
+        use_lower_bound,
+        lower_bound,
     ).launch(grid=(grid_size, 1, 1), block=[NWARP * 32, 1, 1], smem=smem_bytes, stream=stream)
 
 
 _compiled_conv_verify_large_batch_kernels: dict = {}
 
 
-def _get_compiled_large_batch(N, T, H, HV, K, V, D, pool_size, lines, BVW, tile_v, scale,
-                     use_qk_l2norm, disable_state_update, cache_intermediate_states,
-                     save_conv_window, has_bias, softplus_beta, softplus_threshold,
-                     use_lower_bound, lower_bound, opt_level=3, fast_math=True):
-    key = (T, H, HV, K, V, D, BVW, tile_v, scale, use_qk_l2norm, disable_state_update,
-           cache_intermediate_states, save_conv_window, has_bias, softplus_beta,
-           softplus_threshold, use_lower_bound, lower_bound, opt_level, fast_math)
+def _get_compiled_large_batch(
+    N,
+    T,
+    H,
+    HV,
+    K,
+    V,
+    D,
+    pool_size,
+    lines,
+    BVW,
+    tile_v,
+    scale,
+    use_qk_l2norm,
+    disable_state_update,
+    cache_intermediate_states,
+    save_conv_window,
+    has_bias,
+    softplus_beta,
+    softplus_threshold,
+    use_lower_bound,
+    lower_bound,
+    opt_level=3,
+    fast_math=True,
+):
+    key = (
+        T,
+        H,
+        HV,
+        K,
+        V,
+        D,
+        BVW,
+        tile_v,
+        scale,
+        use_qk_l2norm,
+        disable_state_update,
+        cache_intermediate_states,
+        save_conv_window,
+        has_bias,
+        softplus_beta,
+        softplus_threshold,
+        use_lower_bound,
+        lower_bound,
+        opt_level,
+        fast_math,
+    )
     if key in _compiled_conv_verify_large_batch_kernels:
         return _compiled_conv_verify_large_batch_kernels[key]
     dev = "cuda"
@@ -1001,16 +1190,43 @@ def _get_compiled_large_batch(N, T, H, HV, K, V, D, pool_size, lines, BVW, tile_
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled = cute.compile(
         run_kda_conv_verify_large_batch_kernel,
-        dl(mixed_qkv, True), dl(conv_weight), dl(conv_bias), dl(conv_state, True),
-        dli(conv_state_indices), dli(qk_arrival_counters), dl(inter_conv_window, True), dli(inter_state_indices),
-        dl(h0_source, True), dl(A_log), dl(a, True), dl(dt_bias), dl(b, True), dl(o, True),
-        dl(inter_states, True) if cache_intermediate_states else dl(inter_states), dli(h0_indices),
-        vec_size=VEC_SIZE, BVW=BVW, tile_v=tile_v, softplus_beta=softplus_beta,
-        softplus_threshold=softplus_threshold, scale=scale, HV=HV, T=T, H=H, K=K, V=V,
-        W=WCONV, use_qk_l2norm=use_qk_l2norm, disable_state_update=disable_state_update,
-        cache_intermediate_states=cache_intermediate_states, save_conv_window=save_conv_window,
-        has_bias=has_bias, fast_math=fast_math, use_lower_bound=use_lower_bound,
-        lower_bound=lower_bound, stream=stream,
+        dl(mixed_qkv, True),
+        dl(conv_weight),
+        dl(conv_bias),
+        dl(conv_state, True),
+        dli(conv_state_indices),
+        dli(qk_arrival_counters),
+        dl(inter_conv_window, True),
+        dli(inter_state_indices),
+        dl(h0_source, True),
+        dl(A_log),
+        dl(a, True),
+        dl(dt_bias),
+        dl(b, True),
+        dl(o, True),
+        dl(inter_states, True) if cache_intermediate_states else dl(inter_states),
+        dli(h0_indices),
+        vec_size=VEC_SIZE,
+        BVW=BVW,
+        tile_v=tile_v,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        scale=scale,
+        HV=HV,
+        T=T,
+        H=H,
+        K=K,
+        V=V,
+        W=WCONV,
+        use_qk_l2norm=use_qk_l2norm,
+        disable_state_update=disable_state_update,
+        cache_intermediate_states=cache_intermediate_states,
+        save_conv_window=save_conv_window,
+        has_bias=has_bias,
+        fast_math=fast_math,
+        use_lower_bound=use_lower_bound,
+        lower_bound=lower_bound,
+        stream=stream,
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
     )
     _compiled_conv_verify_large_batch_kernels[key] = compiled
@@ -1023,7 +1239,7 @@ _qk_arrival_counter_cache: dict = {}
 
 
 def _get_qk_arrival_counters(device: torch.device, N: int, H: int) -> torch.Tensor:
-    """Return zero-reset completion counters isolated by CUDA stream."""
+    """Return completion counters isolated by CUDA stream and reset in-kernel."""
     stream_id = int(torch.cuda.current_stream(device=device).cuda_stream)
     key = (str(device), stream_id, N, H)
     counters = _qk_arrival_counter_cache.get(key)
@@ -1034,18 +1250,18 @@ def _get_qk_arrival_counters(device: torch.device, N: int, H: int) -> torch.Tens
 
 
 def kda_conv_decode_mtp_verify(
-    mixed_qkv: torch.Tensor,      # [N*T, D] bf16
-    conv_weight: torch.Tensor,    # [D, W] fp32
+    mixed_qkv: torch.Tensor,  # [N*T, D] bf16
+    conv_weight: torch.Tensor,  # [D, W] fp32
     conv_bias: torch.Tensor | None,
-    conv_state: torch.Tensor,     # [lines, D, W-1] fp32 (dim contiguous)
+    conv_state: torch.Tensor,  # [lines, D, W-1] fp32 (dim contiguous)
     conv_state_indices: torch.Tensor,
     intermediate_conv_window: torch.Tensor,  # [lines, T, D, W-1] fp32
     intermediate_state_indices: torch.Tensor,
-    a: torch.Tensor,              # [N, T, HV, K]
-    b: torch.Tensor,              # [N, T, HV]
+    a: torch.Tensor,  # [N, T, HV, K]
+    b: torch.Tensor,  # [N, T, HV]
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
-    ssm_states: torch.Tensor,     # [slots, HV, V, K] fp32
+    ssm_states: torch.Tensor,  # [slots, HV, V, K] fp32
     cache_indices: torch.Tensor,
     intermediate_states_buffer: torch.Tensor | None,
     scale: float,
@@ -1059,15 +1275,15 @@ def kda_conv_decode_mtp_verify(
     softplus_threshold: float = 20.0,
     use_qk_l2norm_in_kernel: bool = True,
     bv: int = -1,
-    variant: str = "auto",   # "small_batch" (2-warp small/medium-batch) / "large_batch" (8-warp large-batch) / "auto"
-    bvw: int = -1,           # large_batch: v-cols per warp (tile_v = 8*bvw); -1 = auto (8 on L20X)
+    variant: str = "auto",  # "small_batch" (2-warp small/medium-batch) / "large_batch" (8-warp large-batch) / "auto"
+    bvw: int = -1,  # large_batch: v-cols per warp (tile_v = 8*bvw); -1 = auto (8 on L20X)
     out: torch.Tensor | None = None,
 ):
     H, HV, K, V = num_q_heads, num_v_heads, head_k_dim, head_v_dim
     seq_len, D = mixed_qkv.shape
     N = seq_len // T
     assert K == TILE_K, f"requires K={TILE_K}, got {K}"
-    assert D == 2 * H * K + HV * V, f"packed dim mismatch: {D} vs {2*H*K+HV*V}"
+    assert D == 2 * H * K + HV * V, f"packed dim mismatch: {D} vs {2 * H * K + HV * V}"
     work_units = N * HV
 
     if variant == "auto":
@@ -1104,18 +1320,16 @@ def kda_conv_decode_mtp_verify(
 
     A_log = _normalize_A_log(A_log, HV)
     dt_bias = _normalize_dt_bias(dt_bias, HV, K)
-    conv_state_indices = _normalize_state_indices(
-        conv_state_indices, N=N, pool_size=lines, device=mixed_qkv.device
-    )
-    cache_indices = _normalize_state_indices(
-        cache_indices, N=N, pool_size=slots, device=mixed_qkv.device
-    )
+    conv_state_indices = _normalize_state_indices(conv_state_indices, N=N, pool_size=lines, device=mixed_qkv.device)
+    cache_indices = _normalize_state_indices(cache_indices, N=N, pool_size=slots, device=mixed_qkv.device)
     intermediate_state_indices = _normalize_state_indices(
         intermediate_state_indices,
         N=N,
         pool_size=intermediate_conv_window.shape[0],
         device=mixed_qkv.device,
     )
+    # Each completed launch resets its stream-local counters in-kernel; avoiding a
+    # separate zero_ launch keeps the fused CUDA Graph path launch-minimal.
     qk_arrival_counters = _get_qk_arrival_counters(mixed_qkv.device, N, H)
     stream = _get_cached_stream(mixed_qkv.device)
 
@@ -1139,9 +1353,27 @@ def kda_conv_decode_mtp_verify(
         tile_v = NWARP * bvw
         assert V % tile_v == 0, f"large_batch requires V%(8*bvw)==0: V={V} bvw={bvw}"
         compiled = _get_compiled_large_batch(
-            N, T, H, HV, K, V, D, slots, lines, bvw, tile_v, scale, use_qk_l2norm_in_kernel,
-            True, cache_intermediate_states, True, has_bias, softplus_beta,
-            softplus_threshold, use_lb, lb_val,
+            N,
+            T,
+            H,
+            HV,
+            K,
+            V,
+            D,
+            slots,
+            lines,
+            bvw,
+            tile_v,
+            scale,
+            use_qk_l2norm_in_kernel,
+            True,
+            cache_intermediate_states,
+            True,
+            has_bias,
+            softplus_beta,
+            softplus_threshold,
+            use_lb,
+            lb_val,
         )
     elif variant == "small_batch":  # pipelined 2-warp small_batch (small/medium batch)
         if bv <= 0:
@@ -1158,17 +1390,48 @@ def kda_conv_decode_mtp_verify(
         # N*HV=64/128 (~1 wave) but wins at >=256 (multi-wave, occupancy-bound).
         wis = (work_units >= 256) and (bv >= 16)
         compiled = _get_compiled(
-            N, T, H, HV, K, V, D, slots, lines, bv, scale, use_qk_l2norm_in_kernel,
-            True, cache_intermediate_states, True, has_bias, softplus_beta,
-            softplus_threshold, use_lb, lb_val, weights_in_smem=wis,
+            N,
+            T,
+            H,
+            HV,
+            K,
+            V,
+            D,
+            slots,
+            lines,
+            bv,
+            scale,
+            use_qk_l2norm_in_kernel,
+            True,
+            cache_intermediate_states,
+            True,
+            has_bias,
+            softplus_beta,
+            softplus_threshold,
+            use_lb,
+            lb_val,
+            weights_in_smem=wis,
         )
     else:
         raise ValueError(f"unknown variant {variant!r}; supported: 'auto', 'small_batch', 'large_batch'")
 
     compiled(
-        mixed_qkv, conv_weight, conv_bias_t, conv_state, conv_state_indices,
+        mixed_qkv,
+        conv_weight,
+        conv_bias_t,
+        conv_state,
+        conv_state_indices,
         qk_arrival_counters,
-        intermediate_conv_window, intermediate_state_indices, h0_source, A_log, a,
-        dt_bias, b, o, inter_states_flat, cache_indices, stream,
+        intermediate_conv_window,
+        intermediate_state_indices,
+        h0_source,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        o,
+        inter_states_flat,
+        cache_indices,
+        stream,
     )
     return o

@@ -17,10 +17,10 @@ K = 128
 V = 128
 
 
-def _make_inputs(N, T, H, HV, *, seed=0, pool_size=None, dynamic_stride=False):
+def _make_inputs(N, T, H, HV, *, seed=0, pool_size=None, dynamic_stride=False, v_dim=V):
     torch.manual_seed(seed)
     pool_size = N + 3 if pool_size is None else pool_size
-    D = 2 * H * K + HV * V
+    D = 2 * H * K + HV * v_dim
     device = "cuda"
     conv_indices = torch.tensor([pool_size - 1 - i for i in range(N)], device=device, dtype=torch.int32)
     cache_indices = torch.tensor([(2 * i + 1) % pool_size for i in range(N)], device=device, dtype=torch.int32)
@@ -38,7 +38,7 @@ def _make_inputs(N, T, H, HV, *, seed=0, pool_size=None, dynamic_stride=False):
         "b": (torch.randn(N, T, HV, device=device) * 0.5).to(torch.bfloat16),
         "A_log": -torch.rand(HV, device=device) * 2.0,
         "dt_bias": torch.randn(HV, K, device=device) * 0.1,
-        "ssm_states": torch.randn(pool_size, HV, V, K, device=device) * 0.01,
+        "ssm_states": torch.randn(pool_size, HV, v_dim, K, device=device) * 0.01,
         "D": D,
         "pool_size": pool_size,
     }
@@ -71,9 +71,9 @@ def _torch_conv(inp, N, T, H, HV, bias=True):
     return q, k, v, windows, rolled
 
 
-def _alloc_ubufs(N, T, HV):
+def _alloc_ubufs(N, T, HV, v_dim=V):
     return (
-        torch.empty(N, T, HV, V, device="cuda", dtype=torch.float32),
+        torch.empty(N, T, HV, v_dim, device="cuda", dtype=torch.float32),
         torch.empty(N, T, HV, K, device="cuda", dtype=torch.float32),
         torch.empty(N, T, HV, K, device="cuda", dtype=torch.float32),
     )
@@ -91,6 +91,7 @@ def _run_fused(
     out,
     lower_bound=-5.0,
     num_v_tiles=-1,
+    v_dim=V,
 ):
     return kda_conv_decode_mtp_kvbuffer(
         mixed_qkv=inp["mixed_qkv"],
@@ -111,7 +112,7 @@ def _run_fused(
         num_q_heads=H,
         num_v_heads=HV,
         head_k_dim=K,
-        head_v_dim=V,
+        head_v_dim=v_dim,
         out=out,
         disable_state_update=True,
         d_buffer=bufs[0],
@@ -289,6 +290,43 @@ def test_fused_rejects_T_above_8():
     out = torch.empty(N, T, HV, V, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="requires 1<=T<=8"):
         _run_fused(inp, N, T, H, HV, state, windows, bufs, out)
+
+
+def test_fused_rejects_odd_multi_group_num_v_tiles():
+    N, T, H, HV, v_dim = 1, 4, 8, 8, 96
+    inp = _make_inputs(N, T, H, HV, v_dim=v_dim)
+    state = inp["conv_state_native"].transpose(-1, -2).contiguous()
+    windows = torch.empty(inp["pool_size"], T, inp["D"], W - 1, device="cuda")
+    bufs = _alloc_ubufs(N, T, HV, v_dim=v_dim)
+    out = torch.empty(N, T, HV, v_dim, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="num_v_tiles must be 1 or even"):
+        _run_fused(
+            inp,
+            N,
+            T,
+            H,
+            HV,
+            state,
+            windows,
+            bufs,
+            out,
+            num_v_tiles=3,
+            v_dim=v_dim,
+        )
+
+
+def test_fused_softplus_large_input_is_finite():
+    N, T, H, HV = 1, 4, 8, 8
+    inp = _make_inputs(N, T, H, HV, seed=79)
+    inp["a"].fill_(100.0)
+    inp["dt_bias"].zero_()
+    state = inp["conv_state_native"].transpose(-1, -2).contiguous()
+    windows = torch.empty(inp["pool_size"], T, inp["D"], W - 1, device="cuda")
+    bufs = _alloc_ubufs(N, T, HV)
+    out = torch.empty(N, T, HV, V, device="cuda", dtype=torch.bfloat16)
+    _run_fused(inp, N, T, H, HV, state, windows, bufs, out, lower_bound=None)
+    for tensor in (out, *bufs):
+        assert torch.isfinite(tensor).all()
 
 
 def test_fused_kvbuffer_cuda_graph_replay():

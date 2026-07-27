@@ -154,6 +154,7 @@ def make_kvbuffer_only_call(inp, N, T, H, HV):
     ssm = inp["ssm"].clone()
     out = torch.empty(N, T, HV, V, device="cuda", dtype=torch.bfloat16)
     bufs = alloc_ubufs(N, T, HV)
+
     def call():
         return kda_decode_mtp_tensor_core_kvbuffer(
             A_log=inp["A_log"],
@@ -184,6 +185,7 @@ def make_unfused_call(inp, N, T, H, HV):
     q_end = H * K
     out = torch.empty(N, T, HV, V, device="cuda", dtype=torch.bfloat16)
     bufs = alloc_ubufs(N, T, HV)
+
     def call():
         post = conv_update(
             inp["mixed"].transpose(1, 2),
@@ -226,6 +228,7 @@ def make_fused_call(inp, N, T, H, HV, num_v_tiles=-1, opt_level=3):
     window = torch.empty(N, T, inp["D"], W - 1, device="cuda")
     out = torch.empty(N, T, HV, V, device="cuda", dtype=torch.bfloat16)
     bufs = alloc_ubufs(N, T, HV)
+
     def call():
         return kda_conv_decode_mtp_kvbuffer(
             mixed_qkv=inp["mixed"].view(N * T, inp["D"]),
@@ -374,15 +377,9 @@ def bench_one(N, T, H, HV, args):
         num_v_tiles=args.num_v_tiles,
     )
     rows["conv"] = graph_time_us(conv, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls)
-    rows["kvbuffer_tensor_core"] = graph_time_us(
-        kvbuffer, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls
-    )
-    rows["unfused_tensor_core"] = graph_time_us(
-        unfused, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls
-    )
-    rows["fused_tensor_core"] = graph_time_us(
-        fused, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls
-    )
+    rows["kvbuffer_tensor_core"] = graph_time_us(kvbuffer, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls)
+    rows["unfused_tensor_core"] = graph_time_us(unfused, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls)
+    rows["fused_tensor_core"] = graph_time_us(fused, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls)
     rows["unfused_tensor_core_chain"] = graph_time_us(
         chain_call(unfused, unfused_ssm, inp["indices"], unfused_bufs, args.accept or T, args.flush_bv),
         warmup=args.warmup,
@@ -398,9 +395,7 @@ def bench_one(N, T, H, HV, args):
 
     for variant in ("small_batch", "large_batch", "auto"):
         recurrent, inter, recurrent_ssm = make_recurrent_call(inp, N, T, H, HV, variant=variant)
-        rows[f"cula_{variant}"] = graph_time_us(
-            recurrent, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls
-        )
+        rows[f"cula_{variant}"] = graph_time_us(recurrent, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls)
         rows[f"cula_{variant}_chain"] = graph_time_us(
             recurrent_chain_call(recurrent, recurrent_ssm, inter, args.accept or T),
             warmup=args.warmup,
@@ -428,12 +423,8 @@ def bench_summary(N, T, H, HV, args):
     graph_calls = args.graph_calls if N < 16 else 1
     rows = {}
 
-    kvbuffer, bufs, kvb_ssm = make_fused_call(
-        inp, N, T, H, HV, num_v_tiles=args.num_v_tiles
-    )
-    rows["kvbuffer"] = graph_time_us(
-        kvbuffer, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls
-    )
+    kvbuffer, bufs, kvb_ssm = make_fused_call(inp, N, T, H, HV, num_v_tiles=args.num_v_tiles)
+    rows["kvbuffer"] = graph_time_us(kvbuffer, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls)
     rows["kvbuffer_chain"] = graph_time_us(
         chain_call(kvbuffer, kvb_ssm, inp["indices"], bufs, args.accept or T, args.flush_bv),
         warmup=args.warmup,
@@ -442,9 +433,7 @@ def bench_summary(N, T, H, HV, args):
     )
 
     recurrent, inter, recurrent_ssm = make_recurrent_call(inp, N, T, H, HV, variant="auto")
-    rows["non_kvbuffer_auto"] = graph_time_us(
-        recurrent, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls
-    )
+    rows["non_kvbuffer_auto"] = graph_time_us(recurrent, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls)
     rows["non_kvbuffer_auto_chain"] = graph_time_us(
         recurrent_chain_call(recurrent, recurrent_ssm, inter, args.accept or T),
         warmup=args.warmup,
@@ -454,9 +443,7 @@ def bench_summary(N, T, H, HV, args):
 
     if T >= W - 1:
         triton, inter, triton_ssm = make_triton_fused_call(inp, N, T, H, HV)
-        rows["triton"] = graph_time_us(
-            triton, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls
-        )
+        rows["triton"] = graph_time_us(triton, warmup=args.warmup, rep=args.rep, graph_calls=graph_calls)
         rows["triton_chain"] = graph_time_us(
             recurrent_chain_call(triton, triton_ssm, inter, args.accept or T),
             warmup=args.warmup,
@@ -561,9 +548,7 @@ def profile_one(args):
     elif name == "unfused_tensor_core":
         verify, bufs, ssm = make_unfused_call(inp, N, T, args.H, args.HV)
     elif name == "fused_tensor_core":
-        verify, bufs, ssm = make_fused_call(
-            inp, N, T, args.H, args.HV, num_v_tiles=args.num_v_tiles
-        )
+        verify, bufs, ssm = make_fused_call(inp, N, T, args.H, args.HV, num_v_tiles=args.num_v_tiles)
     elif name in ("small_batch", "large_batch", "auto"):
         verify, inter, ssm = make_recurrent_call(inp, N, T, args.H, args.HV, variant=name)
         if args.profile.endswith("_chain"):
@@ -575,9 +560,7 @@ def profile_one(args):
             verify = recurrent_chain_call(verify, ssm, inter, accept)
         bufs = None
     elif name == "flush":
-        prepare, bufs, ssm = make_fused_call(
-            inp, N, T, args.H, args.HV, num_v_tiles=args.num_v_tiles
-        )
+        prepare, bufs, ssm = make_fused_call(inp, N, T, args.H, args.HV, num_v_tiles=args.num_v_tiles)
         prepare()
         verify = chain_call(lambda: None, ssm, inp["indices"], bufs, accept, args.flush_bv)
     else:

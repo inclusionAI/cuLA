@@ -40,8 +40,7 @@ W = 4  # KDA conv width (short_conv_kernel_size)
 # --------------------------------------------------------------------------- #
 # torch reference: conv + loop recurrence + per-step snapshots
 # --------------------------------------------------------------------------- #
-def _torch_reference(inp, N, T, H, HV, K, V, scale, lower_bound,
-                     softplus_beta=1.0, softplus_threshold=20.0):
+def _torch_reference(inp, N, T, H, HV, K, V, scale, lower_bound, softplus_beta=1.0, softplus_threshold=20.0):
     dev = inp["mixed_qkv"].device
     D = 2 * H * K + HV * V
     mixed = inp["mixed_qkv"].float()
@@ -65,7 +64,7 @@ def _torch_reference(inp, N, T, H, HV, K, V, scale, lower_bound,
     for n in range(N):
         slot = int(cidx[n].item())
         conv_slot = int(conv_cidx[n].item())
-        x = mixed[n * T:(n + 1) * T]
+        x = mixed[n * T : (n + 1) * T]
         hist = hist0[conv_slot]
         xfull = torch.cat([hist, x], dim=0)  # [W-1+T, D]
 
@@ -75,13 +74,13 @@ def _torch_reference(inp, N, T, H, HV, K, V, scale, lower_bound,
             for j in range(W):
                 acc = acc + w[:, j] * xfull[t + j]
             y[t] = torch.nn.functional.silu(acc)
-            win_snap[n, t] = xfull[t + 1:t + 1 + (W - 1)]
+            win_snap[n, t] = xfull[t + 1 : t + 1 + (W - 1)]
         y = y.to(torch.bfloat16).float()  # bf16 round-trip
-        conv_state_out[conv_slot] = xfull[-(W - 1):]
+        conv_state_out[conv_slot] = xfull[-(W - 1) :]
 
         qy = y[:, 0:qk_dim].view(T, H, K)
-        ky = y[:, qk_dim:2 * qk_dim].view(T, H, K)
-        vy = y[:, 2 * qk_dim:2 * qk_dim + HV * V].view(T, HV, V)
+        ky = y[:, qk_dim : 2 * qk_dim].view(T, H, K)
+        vy = y[:, 2 * qk_dim : 2 * qk_dim + HV * V].view(T, HV, V)
 
         for hv in range(HV):
             ih = hv // (HV // H)
@@ -96,9 +95,7 @@ def _torch_reference(inp, N, T, H, HV, K, V, scale, lower_bound,
                     g = lower_bound * torch.sigmoid(eA * gx)
                 else:
                     beta_x = softplus_beta * gx
-                    sp = torch.where(beta_x <= softplus_threshold,
-                                     (1.0 / softplus_beta) * torch.log1p(torch.exp(beta_x)),
-                                     gx)
+                    sp = torch.where(beta_x <= softplus_threshold, (1.0 / softplus_beta) * torch.log1p(torch.exp(beta_x)), gx)
                     g = -eA * sp
                 beta = torch.sigmoid(b[n, t, hv])
                 qb = qb / torch.sqrt((qb * qb).sum() + 1e-6) * scale
@@ -140,9 +137,7 @@ def _allocate_run_buffers(inp, N, T, H, HV, K, V):
     intermediate_pool_size = inp.get("intermediate_pool_size", N)
     return dict(
         conv_state=inp["conv_state_native"].permute(0, 2, 1).contiguous(),
-        conv_window=torch.zeros(
-            intermediate_pool_size, T, D, W - 1, device=dev, dtype=torch.float32
-        ),
+        conv_window=torch.zeros(intermediate_pool_size, T, D, W - 1, device=dev, dtype=torch.float32),
         inter_states=torch.zeros(N, T, HV, V, K, device=dev, dtype=torch.float32),
         ssm_states=inp["ssm_states"].clone(),
         o=torch.empty(N, T, HV, V, device=dev, dtype=torch.bfloat16),
@@ -162,42 +157,53 @@ def _run_cula(inp, N, T, H, HV, K, V, scale, lower_bound, variant, buffers=None)
         torch.arange(N, device=dev, dtype=torch.int32),
     )
     o = kda_conv_decode_mtp_verify(
-        mixed_qkv=inp["mixed_qkv"], conv_weight=inp["conv_weight"], conv_bias=inp["conv_bias"],
-        conv_state=conv_state, conv_state_indices=conv_idx, intermediate_conv_window=conv_window,
-        intermediate_state_indices=intermediate_idx, a=inp["a"], b=inp["b"], A_log=inp["A_log"],
-        dt_bias=inp["dt_bias"], ssm_states=buffers["ssm_states"], cache_indices=idx,
-        intermediate_states_buffer=inter_states, scale=scale, T=T, num_q_heads=H,
-        num_v_heads=HV, head_k_dim=K, head_v_dim=V, lower_bound=lower_bound, variant=variant,
+        mixed_qkv=inp["mixed_qkv"],
+        conv_weight=inp["conv_weight"],
+        conv_bias=inp["conv_bias"],
+        conv_state=conv_state,
+        conv_state_indices=conv_idx,
+        intermediate_conv_window=conv_window,
+        intermediate_state_indices=intermediate_idx,
+        a=inp["a"],
+        b=inp["b"],
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        ssm_states=buffers["ssm_states"],
+        cache_indices=idx,
+        intermediate_states_buffer=inter_states,
+        scale=scale,
+        T=T,
+        num_q_heads=H,
+        num_v_heads=HV,
+        head_k_dim=K,
+        head_v_dim=V,
+        lower_bound=lower_bound,
+        variant=variant,
         out=buffers["o"],
     )
-    return dict(o=o.view(N, T, HV, V), conv_state=conv_state, conv_window=conv_window,
-                inter_states=inter_states)
+    return dict(o=o.view(N, T, HV, V), conv_state=conv_state, conv_window=conv_window, inter_states=inter_states)
 
 
 def _assert_close(name, ref, actual, atol, rtol):
     diff = (ref.float() - actual.float()).abs()
     max_diff = diff.max().item()
     print(f"    [{name}] max_diff={max_diff:.6e} (atol={atol}, rtol={rtol})")
-    assert torch.allclose(ref.float(), actual.float(), atol=atol, rtol=rtol), (
-        f"{name}: max_diff={max_diff:.6e}")
+    assert torch.allclose(ref.float(), actual.float(), atol=atol, rtol=rtol), f"{name}: max_diff={max_diff:.6e}"
 
 
 def _assert_result(prefix, ref, act, intermediate_idx=None):
     conv_window = act["conv_window"]
     if intermediate_idx is not None:
         conv_window = conv_window[intermediate_idx.long()]
-    _assert_close(f"{prefix}_conv_state", ref["conv_state_out"],
-                  act["conv_state"].transpose(-1, -2), 0.0, 0.0)
-    _assert_close(f"{prefix}_conv_window", ref["win_snap"],
-                  conv_window.transpose(-1, -2), 0.0, 0.0)
+    _assert_close(f"{prefix}_conv_state", ref["conv_state_out"], act["conv_state"].transpose(-1, -2), 0.0, 0.0)
+    _assert_close(f"{prefix}_conv_window", ref["win_snap"], conv_window.transpose(-1, -2), 0.0, 0.0)
     _assert_close(f"{prefix}_o", ref["o"], act["o"], 3e-2, 2e-2)
-    _assert_close(f"{prefix}_inter_ssm", ref["ssm_snap"],
-                  act["inter_states"], 5e-2, 3e-2)
+    _assert_close(f"{prefix}_inter_ssm", ref["ssm_snap"], act["inter_states"], 5e-2, 3e-2)
 
 
 def _check(N, T, H, HV, variant, gate, seed=0):
     K, V = 128, 128
-    scale = K ** -0.5
+    scale = K**-0.5
     lower_bound = -5.0 if gate == "safe" else None
     inp = _make_inputs(N, T, H, HV, K, V, gate, seed)
     ref = _torch_reference(inp, N, T, H, HV, K, V, scale, lower_bound)
@@ -226,6 +232,18 @@ def test_conv_mtp_hv_eq_h_softplus(N, T, H, HV, variant):
     _check(N, T, H, HV, variant, "softplus")
 
 
+@pytest.mark.parametrize("variant", ["small_batch", "large_batch"])
+def test_conv_mtp_softplus_large_input_is_finite(variant):
+    N, T, H, HV, K, V = 1, 4, 8, 8, 128, 128
+    scale = K**-0.5
+    inp = _make_inputs(N, T, H, HV, K, V, "softplus", seed=10)
+    inp["a"].fill_(100.0)
+    inp["dt_bias"].zero_()
+    act = _run_cula(inp, N, T, H, HV, K, V, scale, None, variant)
+    for tensor in act.values():
+        assert torch.isfinite(tensor).all()
+
+
 # --------------------------------------------------------------------------- #
 # GVA robustness: HV > H (kernel supports HV>=H even though the model uses H==HV).
 # --------------------------------------------------------------------------- #
@@ -241,17 +259,11 @@ def test_conv_mtp_gva(variant, gate):
 @pytest.mark.parametrize("variant", ["small_batch", "large_batch"])
 def test_conv_mtp_distinct_state_indices(variant):
     N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
-    scale = K ** -0.5
+    scale = K**-0.5
     inp = _make_inputs(N, T, H, HV, K, V, "safe", seed=11, pool_size=7)
-    inp["conv_state_indices"] = torch.tensor(
-        [6, -1, 2, -1, 5, -1, 1], device="cuda", dtype=torch.int64
-    )[::2]
-    inp["cache_indices"] = torch.tensor(
-        [0, -1, 4, -1, 3, -1, 6], device="cuda", dtype=torch.int64
-    )[::2]
-    inp["intermediate_state_indices"] = torch.tensor(
-        [3, -1, 6, -1, 1, -1, 5], device="cuda", dtype=torch.int64
-    )[::2]
+    inp["conv_state_indices"] = torch.tensor([6, -1, 2, -1, 5, -1, 1], device="cuda", dtype=torch.int64)[::2]
+    inp["cache_indices"] = torch.tensor([0, -1, 4, -1, 3, -1, 6], device="cuda", dtype=torch.int64)[::2]
+    inp["intermediate_state_indices"] = torch.tensor([3, -1, 6, -1, 1, -1, 5], device="cuda", dtype=torch.int64)[::2]
     inp["intermediate_pool_size"] = 7
 
     ref = _torch_reference(inp, N, T, H, HV, K, V, scale, -5.0)
@@ -265,7 +277,7 @@ def test_conv_mtp_distinct_state_indices(variant):
 @pytest.mark.parametrize("variant", ["small_batch", "large_batch"])
 def test_conv_mtp_multistream(variant):
     N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
-    scale = K ** -0.5
+    scale = K**-0.5
     warm = _make_inputs(N, T, H, HV, K, V, "safe", seed=20)
     _run_cula(warm, N, T, H, HV, K, V, scale, -5.0, variant)
     inputs = [_make_inputs(N, T, H, HV, K, V, "safe", seed=21 + i) for i in range(2)]
@@ -287,7 +299,7 @@ def test_conv_mtp_multistream(variant):
 @pytest.mark.parametrize("variant", ["small_batch", "large_batch"])
 def test_conv_mtp_cuda_graph_replay(variant):
     N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
-    scale = K ** -0.5
+    scale = K**-0.5
     inp = _make_inputs(N, T, H, HV, K, V, "safe", seed=30)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -301,9 +313,7 @@ def test_conv_mtp_cuda_graph_replay(variant):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         buffers["conv_state"].copy_(initial_conv_state)
-        act = _run_cula(
-            inp, N, T, H, HV, K, V, scale, -5.0, variant, buffers=buffers
-        )
+        act = _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, variant, buffers=buffers)
     graph.replay()
     torch.cuda.synchronize()
     first = {name: tensor.clone() for name, tensor in act.items()}
@@ -319,7 +329,7 @@ def test_conv_mtp_cuda_graph_replay(variant):
 @pytest.mark.parametrize("variant", ["small_batch", "large_batch"])
 def test_conv_mtp_repeated_chain(variant):
     N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
-    scale = K ** -0.5
+    scale = K**-0.5
     inp = _make_inputs(N, T, H, HV, K, V, "safe", seed=40)
     first_ref = _torch_reference(inp, N, T, H, HV, K, V, scale, -5.0)
     buffers = _allocate_run_buffers(inp, N, T, H, HV, K, V)
@@ -328,9 +338,7 @@ def test_conv_mtp_repeated_chain(variant):
     next_inp = dict(inp)
     next_inp["conv_state_native"] = first_ref["conv_state_out"]
     next_ref = _torch_reference(next_inp, N, T, H, HV, K, V, scale, -5.0)
-    act = _run_cula(
-        inp, N, T, H, HV, K, V, scale, -5.0, variant, buffers=buffers
-    )
+    act = _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, variant, buffers=buffers)
     _assert_result("repeated_chain", next_ref, act)
 
 
@@ -340,7 +348,7 @@ def test_conv_mtp_repeated_chain(variant):
 @pytest.mark.parametrize("H,HV", [(8, 8), (32, 32)], ids=["h8", "h32"])
 def test_conv_mtp_vk_ws_agree(H, HV):
     N, T, K, V = 8, 4, 128, 128
-    scale = K ** -0.5
+    scale = K**-0.5
     inp = _make_inputs(N, T, H, HV, K, V, "safe", seed=1)
     small_batch = _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, "small_batch")
     large_batch = _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, "large_batch")
@@ -364,22 +372,17 @@ def test_conv_mtp_auto_dispatch(N):
 @pytest.mark.parametrize("variant", ["small_batch", "large_batch"])
 def test_conv_mtp_determinism(variant, H, HV):
     N, T, K, V = 16, 4, 128, 128
-    scale = K ** -0.5
+    scale = K**-0.5
     inp = _make_inputs(N, T, H, HV, K, V, "safe", seed=7)
     buffers = _allocate_run_buffers(inp, N, T, H, HV, K, V)
     initial_conv_state = buffers["conv_state"].clone()
-    ref = _run_cula(
-        inp, N, T, H, HV, K, V, scale, -5.0, variant, buffers=buffers
-    )
+    ref = _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, variant, buffers=buffers)
     ref = {name: tensor.clone() for name, tensor in ref.items()}
     for r in range(int(os.environ.get("KDA_DET_ITERS", "100000"))):
         buffers["conv_state"].copy_(initial_conv_state)
-        act = _run_cula(
-            inp, N, T, H, HV, K, V, scale, -5.0, variant, buffers=buffers
-        )
+        act = _run_cula(inp, N, T, H, HV, K, V, scale, -5.0, variant, buffers=buffers)
         for name in ("o", "inter_states", "conv_state", "conv_window"):
             assert torch.equal(ref[name], act[name]), f"{name} not deterministic (run {r})"
-
 
 
 # --------------------------------------------------------------------------- #

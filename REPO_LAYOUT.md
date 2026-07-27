@@ -41,7 +41,7 @@ cuLA/
 │       │   ├── sm90/                   # Hopper FlashKDA K1+K2 kernels
 │       │   │   ├── fwd.py  k1.py  k2.py
 │       │   │   └── cp/                 # driver, planner, pre-scan, merge
-│       │   ├── decode/                 # Single-token, packed, and MTP decode, including fused causal-conv1d recurrent/KVBuffer
+│       │   ├── decode/                 # Single-token, packed, and MTP decode kernels
 │       │   └── experimental/sm100_fused/ # [exp] unwired fully-fused SM100 prototype
 │       ├── lightning/                  # [non-KDA] Lightning prefill/decode kernels
 │       └── experimental/               # [non-KDA] unwired prototypes
