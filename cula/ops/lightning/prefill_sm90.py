@@ -21,7 +21,7 @@ from cula.ops.lightning.sm90.prefill_kernel import (
     LightningSm90PrefillKernel,
 )
 from cula.ops.lightning.sm90.schedule import TARGET_ARCH
-from cula.utils import get_device_sm_count
+from cula.utils import _get_cache_buf, get_device_sm_count
 
 CHUNK_SIZE = 64
 FIXED_BACKEND_IDENTITY = "cula.lightning.sm90a.cutedsl.prefill.fixed"
@@ -228,6 +228,7 @@ def _compile_fixed_variant(
         final_fake,
         decay_fake,
         decay_fake,
+        decay_fake,
         cutlass.Float32(1.0),
         cutlass.Int32(sequence_length),
         output_fake,
@@ -307,6 +308,11 @@ def _compile_varlen_variant(
     )
     cu_seqlens_fake = _fake_compact(cutlass.Int32, (num_sequences + 1,))
     indices_fake = _fake_compact(cutlass.Int32, (num_sequences,))
+    tensormaps_fake = make_fake_compact_tensor(
+        cutlass.Uint8,
+        (cute.sym_int(),),
+        assumed_align=128,
+    )
     stream_fake = make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile[(cute.GPUArch(TARGET_ARCH), cute.EnableTVMFFI(True))](
         schedule,
@@ -318,6 +324,7 @@ def _compile_varlen_variant(
         state_fake,
         cu_seqlens_fake,
         indices_fake,
+        tensormaps_fake,
         cutlass.Float32(1.0),
         cutlass.Int32(total_length),
         output_fake,
@@ -402,6 +409,7 @@ def lightning_attn_fwd(
         final_arg,
         decay,
         decay,
+        decay,
         cutlass.Float32(float(scale)),
         cutlass.Int32(T),
         output,
@@ -446,7 +454,13 @@ def lightning_attn_fwd_varlen(
     if initial_state_indices is None:
         initial_state_indices = torch.arange(N, dtype=torch.int32, device=Q.device)
     output = torch.empty_like(V)
-    persistent_ctas = min(N * HV, get_device_sm_count(Q.device)) if persistent else None
+    sm_count = get_device_sm_count(Q.device)
+    persistent_ctas = min(N * HV, sm_count) if persistent else None
+    tensormaps = _get_cache_buf(
+        "lightning_sm90_prefill_tensormaps",
+        sm_count * 128,
+        Q.device,
+    )
     compiled = _get_compiled_varlen_variant(
         T,
         H,
@@ -466,6 +480,7 @@ def lightning_attn_fwd_varlen(
         state_pool,
         cu_seqlens,
         initial_state_indices,
+        tensormaps,
         cutlass.Float32(float(scale)),
         cutlass.Int32(T),
         output,

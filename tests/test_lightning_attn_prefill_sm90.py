@@ -173,6 +173,8 @@ def test_output_store_is_head_batch_bounded_and_fully_drained() -> None:
     assert "cute.domain_offset(" in epilogue_text
     assert "cute.zipped_divide(" in epilogue_text
     assert "cpasync.tma_partition(" in epilogue_text
+    assert "cpasync.fence_tma_desc_acquire(tail_gmem_ptr)" in epilogue_text
+    assert "tma_desc_ptr=tail_generic_ptr" in epilogue_text
     assert "tma_store_pipeline.producer_tail()" in epilogue_text
     assert epilogue_text.index("tma_store_pipeline.producer_tail()") < epilogue_text.index("remaining_stages = num_chunks")
     assert "PROBE_EPILOGUE" not in epilogue_text
@@ -289,16 +291,18 @@ def test_packed_mapping_tail_store_and_state_pool_contract() -> None:
     assert "state_idx = initial_state_indices[batch_idx]" in kernel_text
     assert "cute.domain_offset((sequence_bos, cutlass.Int32(0)), q_head)" in kernel_text
     assert "cute.domain_offset((cutlass.Int32(0), sequence_bos), k_head)" in kernel_text
-    assert "use_tma_store = valid_tokens == cutlass.Int32(64)" in epilogue_text
-    assert "local_epilogue_tid = tidx - cutlass.Int32(self.store_warp * 32)" in epilogue_text
-    assert "if token < valid_tokens:" in epilogue_text
-    assert "sequence_bos + chunk * cutlass.Int32(64) + token" in epilogue_text
+    assert "needs_tail_tensormap = sequence_idx < cutlass.Int32(self.num_sequences - 1)" in epilogue_text
+    assert "self.create_tail_tensormap(" in epilogue_text
+    assert "use_tail_tensormap = needs_tail_tensormap and valid_tokens != cutlass.Int32(64)" in epilogue_text
+    assert "local_epilogue_tid" not in epilogue_text
+    assert "if token < valid_tokens:" not in epilogue_text
     assert "cu_seqlens.dtype != torch.int32" in validation_text
     assert "initial_state_indices.dtype != torch.int32" in validation_text
     assert "state_pool.shape[1:] != (HV, VALUE_DIM, HEAD_DIM)" in validation_text
     assert "torch.arange(N, dtype=torch.int32, device=Q.device)" in wrapper_text
     assert "state_pool, state_pool" in wrapper_text
     assert "get_device_sm_count(Q.device)" in wrapper_text
+    assert "_get_cache_buf('lightning_sm90_prefill_tensormaps', sm_count * 128, Q.device)" in wrapper_text
     assert "kernel = self.kernel_varlen_persistent(*kernel_args)" in call_text
     assert "grid = (self.persistent_ctas, 1, 1)" in call_text
     assert "self.run_persistent_scheduler" in persistent_text

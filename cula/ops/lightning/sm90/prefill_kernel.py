@@ -25,12 +25,16 @@ from __future__ import annotations
 
 import cuda.bindings.driver as cuda
 import cutlass
+import cutlass._mlir.dialects.cute as _cute_ir
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.warpgroup as warpgroup
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, warp
+from cutlass.cutlass_dsl import T
+from cutlass.utils.tensormap_manager import TensorMapManager, TensorMapUpdateMode
 
 from .schedule import (
     DYNAMIC_SMEM_ESTIMATE_BYTES,
@@ -70,6 +74,7 @@ from .schedule import (
 
 EXPECTED_CUTLASS_DSL_VERSION = "4.5.1"
 DECAY_LUT_ENTRIES = 65
+TENSORMAP_BYTES = 128
 
 
 @cute.jit
@@ -82,6 +87,37 @@ def _swap_first_two_modes(tensor: cute.Tensor) -> cute.Tensor:
             (tensor.layout.shape[1], tensor.layout.shape[0]) + tensor.layout.shape[2:],
             stride=(tensor.layout.stride[1], tensor.layout.stride[0]) + tensor.layout.stride[2:],
         ),
+    )
+
+
+@cute.jit
+def _smid():
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [],
+            "mov.u32 $0, %smid;",
+            "=r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def _tensormap_replace_global_dim_1(
+    tensormap_ptr: cute.Pointer,
+    new_extent: cutlass.Int32,
+):
+    llvm.inline_asm(
+        None,
+        [tensormap_ptr.toint().ir_value(), new_extent.ir_value()],
+        "tensormap.replace.tile.global_dim.global.b1024.b32 [$0], 1, $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
 
@@ -190,6 +226,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         final_state_in: cute.Tensor,
         cu_seqlens_in: cute.Tensor,
         initial_state_indices_in: cute.Tensor,
+        tensormaps_in: cute.Tensor,
         scale: cutlass.Float32,
         sequence_length: cutlass.Int32,
         output_in: cute.Tensor,
@@ -212,6 +249,8 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
                 raise TypeError("cu_seqlens must use INT32 elements")
             if cutlass.const_expr(initial_state_indices_in.element_type != cutlass.Int32):
                 raise TypeError("initial_state_indices must use INT32 elements")
+            if cutlass.const_expr(tensormaps_in.element_type != cutlass.Uint8):
+                raise TypeError("TensorMap workspace must use UINT8 elements")
         if cutlass.const_expr(output_in.element_type != cutlass.BFloat16):
             raise TypeError("output must use BF16 elements")
 
@@ -469,6 +508,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
             final_state,
             cu_seqlens_in,
             initial_state_indices_in,
+            tensormaps_in,
             scale,
             sequence_length,
             qk_ss_mma,
@@ -486,7 +526,6 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
             v_tma_tensor,
             o_tma_atom,
             o_tma_tensor,
-            output,
             q_layout_staged,
             k_state_layout_staged,
             k_qk_layout_staged,
@@ -519,6 +558,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         final_state: cute.Tensor,
         cu_seqlens: cute.Tensor,
         initial_state_indices: cute.Tensor,
+        g_tensormaps: cute.Tensor,
         scale: cutlass.Float32,
         sequence_length: cutlass.Int32,
         qk_ss_mma: cute.TiledMma,
@@ -536,7 +576,6 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         v_tma_tensor: cute.Tensor,
         o_tma_atom: cute.CopyAtom,
         o_tma_tensor: cute.Tensor,
-        output_tensor: cute.Tensor,
         q_layout_staged: cute.ComposedLayout,
         k_state_layout_staged: cute.ComposedLayout,
         k_qk_layout_staged: cute.ComposedLayout,
@@ -746,9 +785,10 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
                     o_epilogue_barrier,
                     o_tma_atom,
                     o_tma_tensor,
-                    output_tensor,
                     value_head_idx,
                     tensor_batch_idx,
+                    batch_idx,
+                    g_tensormaps,
                     s_o,
                 )
         else:
@@ -794,6 +834,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         final_state: cute.Tensor,
         cu_seqlens: cute.Tensor,
         initial_state_indices: cute.Tensor,
+        g_tensormaps: cute.Tensor,
         scale: cutlass.Float32,
         sequence_length: cutlass.Int32,
         qk_ss_mma: cute.TiledMma,
@@ -811,7 +852,6 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         v_tma_tensor: cute.Tensor,
         o_tma_atom: cute.CopyAtom,
         o_tma_tensor: cute.Tensor,
-        output_tensor: cute.Tensor,
         q_layout_staged: cute.ComposedLayout,
         k_state_layout_staged: cute.ComposedLayout,
         k_qk_layout_staged: cute.ComposedLayout,
@@ -860,6 +900,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
             final_state,
             cu_seqlens,
             initial_state_indices,
+            g_tensormaps,
             scale,
             qk_ss_mma,
             state_rs_mma,
@@ -876,7 +917,6 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
             v_tma_tensor,
             o_tma_atom,
             o_tma_tensor,
-            output_tensor,
             s_decay_lut,
             s_q,
             s_k_state,
@@ -902,6 +942,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         final_state: cute.Tensor,
         cu_seqlens: cute.Tensor,
         initial_state_indices: cute.Tensor,
+        g_tensormaps: cute.Tensor,
         scale: cutlass.Float32,
         qk_ss_mma: cute.TiledMma,
         state_rs_mma: cute.TiledMma,
@@ -918,7 +959,6 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         v_tma_tensor: cute.Tensor,
         o_tma_atom: cute.CopyAtom,
         o_tma_tensor: cute.Tensor,
-        output_tensor: cute.Tensor,
         s_decay_lut: cute.Tensor,
         s_q: cute.Tensor,
         s_k_state: cute.Tensor,
@@ -947,6 +987,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
                 final_state,
                 cu_seqlens,
                 initial_state_indices,
+                g_tensormaps,
                 scale,
                 qk_ss_mma,
                 state_rs_mma,
@@ -963,7 +1004,6 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
                 v_tma_tensor,
                 o_tma_atom,
                 o_tma_tensor,
-                output_tensor,
                 s_decay_lut,
                 s_q,
                 s_k_state,
@@ -995,6 +1035,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         final_state: cute.Tensor,
         cu_seqlens: cute.Tensor,
         initial_state_indices: cute.Tensor,
+        g_tensormaps: cute.Tensor,
         scale: cutlass.Float32,
         qk_ss_mma: cute.TiledMma,
         state_rs_mma: cute.TiledMma,
@@ -1011,7 +1052,6 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         v_tma_tensor: cute.Tensor,
         o_tma_atom: cute.CopyAtom,
         o_tma_tensor: cute.Tensor,
-        output_tensor: cute.Tensor,
         s_decay_lut: cute.Tensor,
         s_q: cute.Tensor,
         s_k_state: cute.Tensor,
@@ -1202,9 +1242,10 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
                     o_epilogue_barrier,
                     o_tma_atom,
                     o_tma_tensor,
-                    output_tensor,
                     value_head_idx,
                     cutlass.Int32(0),
+                    sequence_idx,
+                    g_tensormaps,
                     s_o,
                 )
         else:
@@ -1506,6 +1547,35 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         cute.copy(tiled_copy, state_accumulator, destination)
 
     @cute.jit
+    def tail_tensormap_gmem_ptr(self, g_tensormaps: cute.Tensor):
+        manager = TensorMapManager(TensorMapUpdateMode.GMEM, TENSORMAP_BYTES)
+        return manager.get_tensormap_ptr(g_tensormaps.iterator + _smid() * cutlass.Int32(TENSORMAP_BYTES))
+
+    @cute.jit
+    def tail_tensormap_generic_ptr(self, g_tensormaps: cute.Tensor):
+        manager = TensorMapManager(TensorMapUpdateMode.GMEM, TENSORMAP_BYTES)
+        return manager.get_tensormap_ptr(
+            g_tensormaps.iterator + _smid() * cutlass.Int32(TENSORMAP_BYTES),
+            address_space=_cute_ir.AddressSpace.generic,
+        )
+
+    @cute.jit
+    def create_tail_tensormap(
+        self,
+        o_tma_atom: cute.CopyAtom,
+        g_tensormaps: cute.Tensor,
+        sequence_end: cutlass.Int32,
+    ):
+        tail_ptr = self.tail_tensormap_gmem_ptr(g_tensormaps)
+        with cute.arch.elect_one():
+            cpasync.copy_tensormap(o_tma_atom, tail_ptr)
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            _tensormap_replace_global_dim_1(tail_ptr, sequence_end)
+        cute.arch.sync_warp()
+        cpasync.fence_tma_desc_release()
+
+    @cute.jit
     def run_epilogue_store(
         self,
         tidx: cutlass.Int32,
@@ -1520,21 +1590,30 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         o_epilogue_barrier: pipeline.NamedBarrier,
         o_tma_atom: cute.CopyAtom,
         o_tma_tensor: cute.Tensor,
-        output_tensor: cute.Tensor,
         head_idx: cutlass.Int32,
         batch_idx: cutlass.Int32,
+        sequence_idx: cutlass.Int32,
+        g_tensormaps: cute.Tensor,
         s_o: cute.Tensor,
     ):
         output_head = o_tma_tensor[(None, None, (head_idx, batch_idx))]
-        output_head_raw = output_tensor[(None, None, (head_idx, batch_idx))]
+        needs_tail_tensormap = False
+        if cutlass.const_expr(self.is_varlen):
+            needs_tail_tensormap = sequence_idx < cutlass.Int32(self.num_sequences - 1) and sequence_length % cutlass.Int32(
+                64
+            ) != cutlass.Int32(0)
+            if needs_tail_tensormap:
+                self.create_tail_tensormap(
+                    o_tma_atom,
+                    g_tensormaps,
+                    sequence_bos + sequence_length,
+                )
         for chunk in cutlass.range(num_chunks, unroll=1):
             valid_tokens = sequence_length - chunk * cutlass.Int32(64)
             if chunk < num_chunks - cutlass.Int32(1):
                 valid_tokens = cutlass.Int32(64)
-            use_tma_store = True
-            if cutlass.const_expr(self.is_varlen):
-                use_tma_store = valid_tokens == cutlass.Int32(64)
-            if warp_idx == self.store_warp and use_tma_store:
+            use_tail_tensormap = needs_tail_tensormap and valid_tokens != cutlass.Int32(64)
+            if warp_idx == self.store_warp:
                 tma_store_pipeline.producer_acquire()
             o_epilogue_barrier.sync()
             if chunk >= O_STAGES:
@@ -1544,7 +1623,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
             o_pipeline.consumer_wait(wait_state)
             cute.arch.fence_view_async_shared()
             o_epilogue_barrier.sync()
-            if warp_idx == self.store_warp and use_tma_store:
+            if warp_idx == self.store_warp:
                 output_tile = cute.domain_offset(
                     (
                         cutlass.Int32(0),
@@ -1565,28 +1644,19 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
                     cute.group_modes(s_o[(None, None, wait_state.index)], 0, 2),
                     cute.group_modes(output_tile, 0, 2),
                 )
-                cute.copy(o_tma_atom, o_smem, o_gmem)
-                tma_store_pipeline.producer_commit()
-            if cutlass.const_expr(self.is_varlen):
-                if not use_tma_store:
-                    local_epilogue_tid = tidx - cutlass.Int32(
-                        self.store_warp * 32,
+                if use_tail_tensormap:
+                    tail_gmem_ptr = self.tail_tensormap_gmem_ptr(g_tensormaps)
+                    tail_generic_ptr = self.tail_tensormap_generic_ptr(g_tensormaps)
+                    cpasync.fence_tma_desc_acquire(tail_gmem_ptr)
+                    cute.copy(
+                        o_tma_atom,
+                        o_smem,
+                        o_gmem,
+                        tma_desc_ptr=tail_generic_ptr,
                     )
-                    for linear in cutlass.range(
-                        local_epilogue_tid,
-                        cutlass.Int32(VALUE_DIM * 64),
-                        cutlass.Int32(EPILOGUE_THREADS),
-                        unroll=1,
-                    ):
-                        value = linear // cutlass.Int32(64)
-                        token = linear % cutlass.Int32(64)
-                        if token < valid_tokens:
-                            output_head_raw[
-                                (
-                                    value,
-                                    sequence_bos + chunk * cutlass.Int32(64) + token,
-                                )
-                            ] = s_o[(value, token, wait_state.index)]
+                else:
+                    cute.copy(o_tma_atom, o_smem, o_gmem)
+                tma_store_pipeline.producer_commit()
             o_epilogue_barrier.sync()
             wait_state.advance()
 
