@@ -550,6 +550,52 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
             min_blocks_per_mp=1,
         )
 
+    @cute.jit
+    def populate_decay_lut(
+        self,
+        tidx: cutlass.Int32,
+        decay_s: cute.Tensor,
+        decay_head_idx: cutlass.Int32,
+        decay_lut: cute.Tensor,
+    ):
+        """Build ``lambda**k`` with the frozen C++ warp-scan rounding order."""
+
+        if tidx < cutlass.Int32(32):
+            lane_id = tidx % cutlass.Int32(32)
+            decay_lambda = cutlass.Float32(0.0)
+            if lane_id == cutlass.Int32(0):
+                decay_lambda = cute.exp(
+                    -decay_s[decay_head_idx],
+                    fastmath=False,
+                )
+            decay_lambda = cute.arch.shuffle_sync(
+                decay_lambda,
+                0,
+                mask=-1,
+                mask_and_clamp=31,
+            )
+
+            for base in [0, 32, 64]:
+                product = decay_lambda
+                for offset in [1, 2, 4, 8, 16]:
+                    shuffled = cute.arch.shuffle_sync_bfly(
+                        product,
+                        offset=offset,
+                        mask=-1,
+                        mask_and_clamp=31,
+                    )
+                    if lane_id > cutlass.Int32(offset):
+                        product = product * shuffled
+
+                if lane_id == cutlass.Int32(0):
+                    product = cutlass.Float32(1.0)
+                if cutlass.const_expr(base != 0):
+                    product = product * (decay_lambda * decay_lut[cutlass.Int32(base - 1)])
+
+                index = cutlass.Int32(base) + lane_id
+                if index < cutlass.Int32(DECAY_LUT_ENTRIES):
+                    decay_lut[index] = product
+
     @cute.kernel
     def kernel_nonpersistent(
         self,
@@ -623,11 +669,12 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         # One CTA owns one value/state head, so the decay load is CTA-uniform.
         # Compute k=0..64 before register redistribution; the shared LUT then
         # has no live register dependency across either role branch.
-        if tidx < cutlass.Int32(DECAY_LUT_ENTRIES):
-            s_decay_lut[tidx] = cute.exp(
-                -decay_s[decay_head_idx] * cutlass.Float32(tidx),
-                fastmath=False,
-            )
+        self.populate_decay_lut(
+            tidx,
+            decay_s,
+            decay_head_idx,
+            s_decay_lut,
+        )
         cute.arch.sync_threads()
 
         q_head = q_tma_tensor[(None, None, (qk_head_idx, tensor_batch_idx))]
@@ -1082,11 +1129,12 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         # proxies; this local rendezvous makes the generic shared-memory
         # read-to-write handoff explicit at the reuse site as well.
         cute.arch.sync_threads()
-        if tidx < cutlass.Int32(DECAY_LUT_ENTRIES):
-            s_decay_lut[tidx] = cute.exp(
-                -decay_s[decay_head_idx] * cutlass.Float32(tidx),
-                fastmath=False,
-            )
+        self.populate_decay_lut(
+            tidx,
+            decay_s,
+            decay_head_idx,
+            s_decay_lut,
+        )
         cute.arch.sync_threads()
 
         load_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
@@ -1345,6 +1393,14 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         state_thread = state_rs_mma.get_slice(local_math_tid)
         o1_thread = o1_rs_mma.get_slice(local_math_tid)
         o2_thread = o2_rs_mma.get_slice(local_math_tid)
+        o_r2s_atom = cute.make_copy_atom(
+            warp.StMatrix8x8x16bOp(
+                transpose=True,
+                num_matrices=4,
+            ),
+            cutlass.BFloat16,
+        )
+        o_r2s_tiled_copy = cute.make_tiled_copy_C(o_r2s_atom, o1_rs_mma)
 
         state_accumulator = state_thread.make_fragment_C(
             state_thread.partition_shape_C(STATE_SHAPE),
@@ -1460,9 +1516,29 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
                     qk_consumed_barrier.arrive_unaligned()
 
             o_pipeline.producer_acquire(o_state)
-            for item in cutlass.range_constexpr(cute.size(o_accumulator)):
-                coordinate = o_coordinates[item]
-                s_o[(coordinate[0], coordinate[1], o_state.index)] = cutlass.BFloat16(o_accumulator[item] * scale)
+            o_copy_thread = o_r2s_tiled_copy.get_slice(local_math_tid)
+            o_copy_source = o_copy_thread.retile(o_accumulator)
+            o_publication_fragment = cute.make_fragment_like(
+                o_copy_source,
+                cutlass.BFloat16,
+            )
+            for item in cutlass.range_constexpr(cute.size(o_copy_source)):
+                o_publication_fragment[item] = cutlass.BFloat16(o_copy_source[item] * scale)
+            o_copy_destination_staged = o_copy_thread.partition_D(s_o)
+            o_copy_destination = o_copy_destination_staged[(None, None, None, o_state.index)]
+            # SharedStorage aligns the O ring to 1024 bytes, and every 16 KiB
+            # stage preserves the 16-byte alignment required by STSM.  Retain
+            # that proof after partitioning and runtime stage selection, where
+            # the CuTe type would otherwise fall back to element alignment.
+            o_copy_destination = cute.make_tensor(
+                o_copy_destination.iterator.align(16),
+                o_copy_destination.layout,
+            )
+            cute.copy(
+                o_r2s_tiled_copy,
+                o_publication_fragment,
+                o_copy_destination,
+            )
             cute.arch.fence_view_async_shared()
             o_pipeline.producer_commit(o_state)
             o_state.advance()

@@ -112,8 +112,10 @@ def test_real_bthd_views_head_batch_grid_and_exact_tma_rings() -> None:
 def test_kernel_uses_one_cta_per_head_zero_state_and_kernel_decay_lut() -> None:
     _, tree = _parse()
     backend = _class(tree, "LightningSm90PrefillKernel")
+    decay_lut = _method(backend, "populate_decay_lut")
     kernel = _method(backend, "kernel_nonpersistent")
     math = _method(backend, "run_math")
+    decay_lut_text = ast.unparse(decay_lut)
     kernel_text = ast.unparse(kernel)
     math_text = ast.unparse(math)
 
@@ -122,7 +124,12 @@ def test_kernel_uses_one_cta_per_head_zero_state_and_kernel_decay_lut() -> None:
     assert kernel_text.count("cute.local_tile(") == 3
     assert kernel_text.count("[None, None, (qk_head_idx, tensor_batch_idx)]") == 2
     assert kernel_text.count("[None, None, (value_head_idx, tensor_batch_idx)]") == 1
-    assert "s_decay_lut[tidx] = cute.exp(-decay_s[decay_head_idx] * cutlass.Float32(tidx), fastmath=False)" in kernel_text
+    assert "self.populate_decay_lut(tidx, decay_s, decay_head_idx, s_decay_lut)" in kernel_text
+    assert "decay_lambda = cute.exp(-decay_s[decay_head_idx], fastmath=False)" in decay_lut_text
+    assert "for base in [0, 32, 64]:" in decay_lut_text
+    assert "for offset in [1, 2, 4, 8, 16]:" in decay_lut_text
+    assert "cute.arch.shuffle_sync_bfly" in decay_lut_text
+    assert "product = product * (decay_lambda * decay_lut[cutlass.Int32(base - 1)])" in decay_lut_text
     assert kernel_text.index("cute.arch.sync_threads()") < kernel_text.index("if warp_group_idx == 0:")
     assert "cute.arch.setmaxregister_decrease(self.register_targets[0])" in kernel_text
     assert "cute.arch.setmaxregister_increase(self.register_targets[1])" in kernel_text
@@ -168,7 +175,8 @@ def test_math_preserves_current_token_recurrence_and_pipeline_lifetimes() -> Non
     )
     assert math_text.index("k_handle.release()") > math_text.index("self.issue_wgmma_rs_accumulate(state_rs_mma")
     assert math_text.index("v_handle.release()") > math_text.index("self.issue_wgmma_rs_accumulate(state_rs_mma")
-    assert ("s_o[coordinate[0], coordinate[1], o_state.index] = cutlass.BFloat16(o_accumulator[item] * scale)") in math_text
+    assert "o_publication_fragment[item] = cutlass.BFloat16(o_copy_source[item] * scale)" in math_text
+    assert "cute.copy(o_r2s_tiled_copy, o_publication_fragment, o_copy_destination)" in math_text
 
 
 def test_output_store_is_head_batch_bounded_and_fully_drained() -> None:
@@ -242,7 +250,7 @@ def test_scale_changes_only_output_publication() -> None:
         if isinstance(node, ast.Name) and node.id == "scale" and isinstance(node.ctx, ast.Load)
     ]
     assert len(scale_sites) == 1
-    assert "cutlass.BFloat16(o_accumulator[item] * scale)" in math_text
+    assert "cutlass.BFloat16(o_copy_source[item] * scale)" in math_text
     state_tail = math_text[math_text.index("state_accumulator[item] = state_accumulator[item] * decay_lut") :]
     assert "* scale" not in state_tail
 
