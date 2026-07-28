@@ -1453,7 +1453,11 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
             warpgroup.commit_group()
             warpgroup.wait_group(0)
 
-            qk_consumed_barrier.sync()
+            if chunk < num_chunks - cutlass.Int32(1):
+                if warp_group_idx == MATH0_WARP_GROUP_INDEX:
+                    qk_consumed_barrier.wait_unaligned()
+                else:
+                    qk_consumed_barrier.arrive_unaligned()
 
             o_pipeline.producer_acquire(o_state)
             for item in cutlass.range_constexpr(cute.size(o_accumulator)):

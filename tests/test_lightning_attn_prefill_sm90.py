@@ -151,7 +151,14 @@ def test_math_preserves_current_token_recurrence_and_pipeline_lifetimes() -> Non
     for name in ("q", "k", "v"):
         assert f"{name}_handle = {name}_consumer.wait_and_advance()" in math_text
     assert "qk_published_barrier.sync()" in math_text
-    assert "qk_consumed_barrier.sync()" in math_text
+    assert "if chunk < num_chunks - cutlass.Int32(1):" in math_text
+    assert "if warp_group_idx == MATH0_WARP_GROUP_INDEX:" in math_text
+    assert "qk_consumed_barrier.wait_unaligned()" in math_text
+    assert "qk_consumed_barrier.arrive_unaligned()" in math_text
+    assert "qk_consumed_barrier.sync()" not in math_text
+    assert math_text.index(
+        "warpgroup.wait_group(0)", math_text.index("self.issue_wgmma_rs_accumulate(o2_rs_mma")
+    ) < math_text.index("qk_consumed_barrier.wait_unaligned()")
     assert "self.issue_wgmma_rs_zero(o1_rs_mma" in math_text
     assert "self.issue_wgmma_rs_accumulate(o2_rs_mma" in math_text
     assert "self.issue_wgmma_rs_accumulate(state_rs_mma" in math_text
