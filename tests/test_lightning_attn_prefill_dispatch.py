@@ -30,7 +30,13 @@ def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
 
 def test_sm90_dispatch_imports_only_the_selected_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     imports: list[str] = []
-    sm90 = SimpleNamespace(get_sm90_lightning_attn_prefill_backend_identity=lambda **_: "sm90-exact")
+    identity_calls: list[dict] = []
+
+    def identity(**kwargs):
+        identity_calls.append(kwargs)
+        return "sm90-exact"
+
+    sm90 = SimpleNamespace(get_sm90_lightning_attn_prefill_backend_identity=identity)
 
     monkeypatch.setattr(dispatch, "_device_capability", lambda _: (9, 0))
 
@@ -47,6 +53,7 @@ def test_sm90_dispatch_imports_only_the_selected_backend(monkeypatch: pytest.Mon
     assert module is sm90
     assert imports == ["cula.ops.lightning.prefill_sm90"]
     assert dispatch.get_lightning_attn_prefill_backend_identity(torch.device("cuda:0")) == "sm90-exact"
+    assert identity_calls == [{"varlen": False, "persistent": False}]
 
 
 @pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
@@ -89,6 +96,85 @@ def test_backend_identity_reports_the_selected_execution_variant(
         )
         == dispatch.SM100_VARLEN_NONPERSISTENT_BACKEND_IDENTITY
     )
+
+
+def test_sm90_backend_identity_resolves_default_and_explicit_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    def identity(**kwargs):
+        calls.append(kwargs)
+        return "sm90-exact"
+
+    module = SimpleNamespace(get_sm90_lightning_attn_prefill_backend_identity=identity)
+    monkeypatch.setattr(dispatch, "_backend_module", lambda _: ("sm90", module))
+    device = torch.device("cuda:0")
+
+    for persistent in (None, True, False):
+        assert (
+            dispatch.get_lightning_attn_prefill_backend_identity(
+                device,
+                varlen=True,
+                persistent=persistent,
+            )
+            == "sm90-exact"
+        )
+
+    assert calls == [
+        {"varlen": True, "persistent": False},
+        {"varlen": True, "persistent": True},
+        {"varlen": True, "persistent": False},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("backend", "persistent", "expected"),
+    [
+        ("sm90", None, False),
+        ("sm100", None, True),
+        ("sm90", True, True),
+        ("sm100", False, False),
+    ],
+)
+def test_packed_dispatch_resolves_architecture_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    persistent: bool | None,
+    expected: bool,
+) -> None:
+    calls: list[dict] = []
+
+    def varlen(*args, **kwargs):
+        calls.append(kwargs)
+        return "output", "state"
+
+    module = SimpleNamespace(lightning_attn_fwd_varlen=varlen)
+    monkeypatch.setattr(dispatch, "_backend_module", lambda _: (backend, module))
+    tensors = (object(),) * 5
+
+    assert dispatch.lightning_attn_fwd_varlen(*tensors, persistent=persistent) == ("output", "state")
+    assert calls == [
+        {
+            "scale": 1.0,
+            "state_pool": None,
+            "initial_state_indices": None,
+            "chunk_size": 64,
+            "persistent": expected,
+        }
+    ]
+
+
+@pytest.mark.parametrize("persistent", [0, 1, "persistent", object()])
+def test_packed_dispatch_rejects_invalid_scheduler_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    persistent: object,
+) -> None:
+    module = SimpleNamespace(lightning_attn_fwd_varlen=lambda *_args, **_kwargs: pytest.fail("unexpected launch"))
+    monkeypatch.setattr(dispatch, "_backend_module", lambda _: ("sm90", module))
+
+    with pytest.raises(TypeError, match="persistent must be boolean or None"):
+        dispatch.lightning_attn_fwd_varlen(*(object(),) * 5, persistent=persistent)
 
 
 def test_unsupported_device_is_a_hard_error_before_backend_import(monkeypatch: pytest.MonkeyPatch) -> None:

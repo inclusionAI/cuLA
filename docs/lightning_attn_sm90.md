@@ -139,6 +139,11 @@ explicit logical transpose.
 
 ## Fixed and packed scheduling
 
+The public `lightning_attn_fwd_varlen` API accepts
+`persistent: bool | None = None`. On SM90, `None` selects the non-persistent
+scheduler; on SM100 and SM103 it preserves the persistent default. Passing
+`True` or `False` always selects that scheduler explicitly.
+
 ### Fixed length
 
 The launch grid is `(1, value_heads, batch)`. Each CTA owns one

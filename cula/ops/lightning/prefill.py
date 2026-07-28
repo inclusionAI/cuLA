@@ -50,17 +50,28 @@ def _backend_module(value: torch.Tensor | torch.device | str | int):
     return backend, importlib.import_module(module_name)
 
 
+def _resolve_persistent(backend: str, persistent: bool | None) -> bool:
+    """Resolve the architecture-specific packed scheduler policy."""
+
+    if persistent is not None and not isinstance(persistent, bool):
+        raise TypeError("persistent must be boolean or None")
+    if persistent is None:
+        return backend != "sm90"
+    return persistent
+
+
 def get_lightning_attn_prefill_backend_identity(
     device: torch.Tensor | torch.device | str | int,
     *,
     varlen: bool = False,
-    persistent: bool = True,
+    persistent: bool | None = None,
 ) -> str:
     """Resolve the exact backend identity from a CUDA tensor or device."""
 
-    if not isinstance(varlen, bool) or not isinstance(persistent, bool):
-        raise TypeError("varlen and persistent must be boolean")
+    if not isinstance(varlen, bool):
+        raise TypeError("varlen must be boolean")
     backend, module = _backend_module(device)
+    persistent = _resolve_persistent(backend, persistent)
     if backend == "sm90":
         return module.get_sm90_lightning_attn_prefill_backend_identity(
             varlen=varlen,
@@ -106,11 +117,17 @@ def lightning_attn_fwd_varlen(
     state_pool: torch.Tensor | None = None,
     initial_state_indices: torch.Tensor | None = None,
     chunk_size: int = 64,
-    persistent: bool = True,
+    persistent: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dispatch packed-varlen Lightning Attention by ``Q.device``."""
+    """Dispatch packed-varlen Lightning Attention by ``Q.device``.
 
-    _, module = _backend_module(Q)
+    ``None`` selects the nonpersistent scheduler on SM90 and preserves the
+    persistent scheduler default on SM100. Pass a boolean to select a scheduler
+    explicitly.
+    """
+
+    backend, module = _backend_module(Q)
+    persistent = _resolve_persistent(backend, persistent)
     return module.lightning_attn_fwd_varlen(
         Q,
         K,
