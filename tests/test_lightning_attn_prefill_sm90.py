@@ -291,6 +291,8 @@ def test_packed_mapping_tail_store_and_state_pool_contract() -> None:
     persistent_text = ast.unparse(_method(backend, "kernel_varlen_persistent"))
     persistent_scheduler_text = ast.unparse(_method(backend, "run_persistent_scheduler"))
     persistent_work_text = ast.unparse(_method(backend, "run_persistent_work_unit"))
+    tail_gmem_text = ast.unparse(_method(backend, "tail_tensormap_gmem_ptr"))
+    tail_generic_text = ast.unparse(_method(backend, "tail_tensormap_generic_ptr"))
 
     wrapper_values = _literal_assignments(wrapper_tree)
     assert wrapper_values["VARLEN_NONPERSISTENT_BACKEND_IDENTITY"] == (
@@ -302,6 +304,9 @@ def test_packed_mapping_tail_store_and_state_pool_contract() -> None:
     assert "cute.size(cu_seqlens_in) != self.num_sequences + 1" in call_text
     assert "grid = (1, HV, self.num_sequences)" in call_text
     assert "sequence_bos = cu_seqlens[batch_idx]" in kernel_text
+    assert "tensormap_workspace_slot = cutlass.Int32(0)" in kernel_text
+    assert "if cutlass.const_expr(self.is_varlen):" in kernel_text
+    assert "tensormap_workspace_slot = batch_idx * cutlass.Int32(self.value_heads) + value_head_idx" in kernel_text
     assert "sequence_length_use = cu_seqlens[batch_idx + cutlass.Int32(1)] - sequence_bos" in kernel_text
     assert "state_idx = initial_state_indices[batch_idx]" in kernel_text
     assert "cute.domain_offset((sequence_bos, cutlass.Int32(0)), q_head)" in kernel_text
@@ -317,13 +322,18 @@ def test_packed_mapping_tail_store_and_state_pool_contract() -> None:
     assert "torch.arange(N, dtype=torch.int32, device=Q.device)" in wrapper_text
     assert "state_pool, state_pool" in wrapper_text
     assert "get_device_sm_count(Q.device)" in wrapper_text
-    assert "_get_cache_buf('lightning_sm90_prefill_tensormaps', sm_count * 128, Q.device)" in wrapper_text
+    assert "work_units = N * HV" in wrapper_text
+    assert "persistent_ctas = min(work_units, sm_count)" in wrapper_text
+    assert "workspace_slots = persistent_ctas" in wrapper_text
+    assert "workspace_slots = work_units" in wrapper_text
+    assert "_get_cache_buf('lightning_sm90_prefill_tensormaps', workspace_slots * TENSORMAP_BYTES, Q.device)" in wrapper_text
     assert "kernel = self.kernel_varlen_persistent(*kernel_args)" in call_text
     assert "grid = (self.persistent_ctas, 1, 1)" in call_text
     assert "self.run_persistent_scheduler" in persistent_text
     assert "work_idx = cutlass.Int32(cta_idx)" in persistent_scheduler_text
     assert "work_idx = work_idx + work_stride" in persistent_scheduler_text
     assert "while work_idx < total_work_units:" in persistent_scheduler_text
+    assert "self.run_persistent_work_unit(tidx, warp_idx, warp_group_idx, work_idx, cta_idx" in (persistent_scheduler_text)
     assert "cute.arch.fence_view_async_shared()" in persistent_scheduler_text
     assert "cute.arch.sync_threads()" in persistent_scheduler_text
     assert "self.run_persistent_work_unit" in persistent_scheduler_text
@@ -333,11 +343,37 @@ def test_packed_mapping_tail_store_and_state_pool_contract() -> None:
     assert "self.run_tma_load_producer" in persistent_work_text
     assert "self.run_math" in persistent_work_text
     assert "self.run_epilogue_store" in persistent_work_text
+    assert "sequence_idx, tensormap_workspace_slot, g_tensormaps" in persistent_work_text
+    assert "workspace_slot * cutlass.Int32(TENSORMAP_BYTES)" in tail_gmem_text
+    assert "workspace_slot * cutlass.Int32(TENSORMAP_BYTES)" in tail_generic_text
+    assert "%smid" not in source
+    assert "_smid" not in source
     assert persistent_work_text.count("q_pipeline = pipeline.PipelineTmaAsync.create") == 1
     assert "torch.cuda.synchronize" not in wrapper_text
     assert not _calls(validation, "torch.Tensor.item")
     assert not _calls(wrapper, "torch.Tensor.item")
     assert "triton" not in (source + wrapper_source).lower()
+
+
+@pytest.mark.parametrize(("num_sequences", "value_heads"), [(2, 1), (10, 64), (20, 64)])
+def test_packed_tensormap_workspace_slots_are_unique_and_bounded(
+    num_sequences: int,
+    value_heads: int,
+) -> None:
+    work_units = num_sequences * value_heads
+    nonpersistent_slots = [
+        sequence_idx * value_heads + value_head_idx
+        for sequence_idx in range(num_sequences)
+        for value_head_idx in range(value_heads)
+    ]
+
+    assert nonpersistent_slots == list(range(work_units))
+    assert max(nonpersistent_slots) < work_units
+
+    persistent_ctas = min(work_units, 78)
+    persistent_slots = list(range(persistent_ctas))
+    assert len(set(persistent_slots)) == persistent_ctas
+    assert max(persistent_slots) < persistent_ctas
 
 
 def test_reference_gva_continuation_scale_and_basis_orientation() -> None:

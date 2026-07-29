@@ -33,7 +33,6 @@ import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, warp
-from cutlass.cutlass_dsl import T
 from cutlass.utils.tensormap_manager import TensorMapManager, TensorMapUpdateMode
 
 from .schedule import (
@@ -87,21 +86,6 @@ def _swap_first_two_modes(tensor: cute.Tensor) -> cute.Tensor:
             (tensor.layout.shape[1], tensor.layout.shape[0]) + tensor.layout.shape[2:],
             stride=(tensor.layout.stride[1], tensor.layout.stride[0]) + tensor.layout.stride[2:],
         ),
-    )
-
-
-@cute.jit
-def _smid():
-    return cutlass.Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [],
-            "mov.u32 $0, %smid;",
-            "=r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
     )
 
 
@@ -633,6 +617,10 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         warp_group_idx = cute.arch.make_warp_uniform(tidx // THREADS_PER_WARP_GROUP)
         _, value_head_idx, batch_idx = cute.arch.block_idx()
+        tensormap_workspace_slot = cutlass.Int32(0)
+        if cutlass.const_expr(self.is_varlen):
+            # The (sequence, value-head) work-unit ID is unique in grid (1, HV, N).
+            tensormap_workspace_slot = batch_idx * cutlass.Int32(self.value_heads) + value_head_idx
         tensor_batch_idx = batch_idx
         state_idx = batch_idx
         sequence_bos = cutlass.Int32(0)
@@ -835,6 +823,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
                     value_head_idx,
                     tensor_batch_idx,
                     batch_idx,
+                    tensormap_workspace_slot,
                     g_tensormaps,
                     s_o,
                 )
@@ -912,6 +901,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         warp_group_idx = cute.arch.make_warp_uniform(tidx // THREADS_PER_WARP_GROUP)
         cta_idx, _, _ = cute.arch.block_idx()
+        # The launch-time CTA ID owns one descriptor slot across its drained work units.
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -1029,6 +1019,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
                 warp_idx,
                 warp_group_idx,
                 work_idx,
+                cta_idx,
                 decay_s,
                 initial_state,
                 final_state,
@@ -1077,6 +1068,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         warp_idx: cutlass.Int32,
         warp_group_idx: cutlass.Int32,
         work_idx: cutlass.Int32,
+        tensormap_workspace_slot: cutlass.Int32,
         decay_s: cute.Tensor,
         initial_state: cute.Tensor,
         final_state: cute.Tensor,
@@ -1293,6 +1285,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
                     value_head_idx,
                     cutlass.Int32(0),
                     sequence_idx,
+                    tensormap_workspace_slot,
                     g_tensormaps,
                     s_o,
                 )
@@ -1627,15 +1620,23 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         cute.copy(tiled_copy, state_accumulator, destination)
 
     @cute.jit
-    def tail_tensormap_gmem_ptr(self, g_tensormaps: cute.Tensor):
+    def tail_tensormap_gmem_ptr(
+        self,
+        g_tensormaps: cute.Tensor,
+        workspace_slot: cutlass.Int32,
+    ):
         manager = TensorMapManager(TensorMapUpdateMode.GMEM, TENSORMAP_BYTES)
-        return manager.get_tensormap_ptr(g_tensormaps.iterator + _smid() * cutlass.Int32(TENSORMAP_BYTES))
+        return manager.get_tensormap_ptr(g_tensormaps.iterator + workspace_slot * cutlass.Int32(TENSORMAP_BYTES))
 
     @cute.jit
-    def tail_tensormap_generic_ptr(self, g_tensormaps: cute.Tensor):
+    def tail_tensormap_generic_ptr(
+        self,
+        g_tensormaps: cute.Tensor,
+        workspace_slot: cutlass.Int32,
+    ):
         manager = TensorMapManager(TensorMapUpdateMode.GMEM, TENSORMAP_BYTES)
         return manager.get_tensormap_ptr(
-            g_tensormaps.iterator + _smid() * cutlass.Int32(TENSORMAP_BYTES),
+            g_tensormaps.iterator + workspace_slot * cutlass.Int32(TENSORMAP_BYTES),
             address_space=_cute_ir.AddressSpace.generic,
         )
 
@@ -1644,9 +1645,10 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         self,
         o_tma_atom: cute.CopyAtom,
         g_tensormaps: cute.Tensor,
+        workspace_slot: cutlass.Int32,
         sequence_end: cutlass.Int32,
     ):
-        tail_ptr = self.tail_tensormap_gmem_ptr(g_tensormaps)
+        tail_ptr = self.tail_tensormap_gmem_ptr(g_tensormaps, workspace_slot)
         with cute.arch.elect_one():
             cpasync.copy_tensormap(o_tma_atom, tail_ptr)
         cute.arch.sync_warp()
@@ -1673,6 +1675,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
         head_idx: cutlass.Int32,
         batch_idx: cutlass.Int32,
         sequence_idx: cutlass.Int32,
+        tensormap_workspace_slot: cutlass.Int32,
         g_tensormaps: cute.Tensor,
         s_o: cute.Tensor,
     ):
@@ -1686,6 +1689,7 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
                 self.create_tail_tensormap(
                     o_tma_atom,
                     g_tensormaps,
+                    tensormap_workspace_slot,
                     sequence_bos + sequence_length,
                 )
         for chunk in cutlass.range(num_chunks, unroll=1):
@@ -1725,8 +1729,14 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
                     cute.group_modes(output_tile, 0, 2),
                 )
                 if use_tail_tensormap:
-                    tail_gmem_ptr = self.tail_tensormap_gmem_ptr(g_tensormaps)
-                    tail_generic_ptr = self.tail_tensormap_generic_ptr(g_tensormaps)
+                    tail_gmem_ptr = self.tail_tensormap_gmem_ptr(
+                        g_tensormaps,
+                        tensormap_workspace_slot,
+                    )
+                    tail_generic_ptr = self.tail_tensormap_generic_ptr(
+                        g_tensormaps,
+                        tensormap_workspace_slot,
+                    )
                     cpasync.fence_tma_desc_acquire(tail_gmem_ptr)
                     cute.copy(
                         o_tma_atom,

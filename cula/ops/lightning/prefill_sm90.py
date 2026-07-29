@@ -17,6 +17,7 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cula.ops.lightning.sm90.prefill_kernel import (
     EXPECTED_CUTLASS_DSL_VERSION,
     HEAD_DIM,
+    TENSORMAP_BYTES,
     VALUE_DIM,
     LightningSm90PrefillKernel,
 )
@@ -455,10 +456,17 @@ def lightning_attn_fwd_varlen(
         initial_state_indices = torch.arange(N, dtype=torch.int32, device=Q.device)
     output = torch.empty_like(V)
     sm_count = get_device_sm_count(Q.device)
-    persistent_ctas = min(N * HV, sm_count) if persistent else None
+    work_units = N * HV
+    if persistent:
+        persistent_ctas = min(work_units, sm_count)
+        workspace_slots = persistent_ctas
+    else:
+        persistent_ctas = None
+        workspace_slots = work_units
+    # Match the device's stable logical CTA-slot ownership for tail TensorMaps.
     tensormaps = _get_cache_buf(
         "lightning_sm90_prefill_tensormaps",
-        sm_count * 128,
+        workspace_slots * TENSORMAP_BYTES,
         Q.device,
     )
     compiled = _get_compiled_varlen_variant(
