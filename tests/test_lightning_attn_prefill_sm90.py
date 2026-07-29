@@ -130,6 +130,9 @@ def test_kernel_uses_one_cta_per_head_zero_state_and_kernel_decay_lut() -> None:
     assert "for offset in [1, 2, 4, 8, 16]:" in decay_lut_text
     assert "cute.arch.shuffle_sync_bfly" in decay_lut_text
     assert "product = product * (decay_lambda * decay_lut[cutlass.Int32(base - 1)])" in decay_lut_text
+    assert "if cutlass.const_expr(base != 64):" in decay_lut_text
+    assert decay_lut_text.count("cute.arch.sync_warp()") == 1
+    assert decay_lut_text.index("decay_lut[index] = product") < decay_lut_text.index("cute.arch.sync_warp()")
     assert kernel_text.index("cute.arch.sync_threads()") < kernel_text.index("if warp_group_idx == 0:")
     assert "cute.arch.setmaxregister_decrease(self.register_targets[0])" in kernel_text
     assert "cute.arch.setmaxregister_increase(self.register_targets[1])" in kernel_text

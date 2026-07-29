@@ -579,6 +579,9 @@ class LightningSm90PrefillKernel(LightningSm90PrefillSchedule):
                 index = cutlass.Int32(base) + lane_id
                 if index < cutlass.Int32(DECAY_LUT_ENTRIES):
                     decay_lut[index] = product
+                if cutlass.const_expr(base != 64):
+                    # Order the shared carry before the next segment reads it.
+                    cute.arch.sync_warp()
 
     @cute.kernel
     def kernel_nonpersistent(
