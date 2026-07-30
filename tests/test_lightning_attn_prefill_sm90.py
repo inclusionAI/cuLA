@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 import torch
 from lightning_attn_reference import chunkwise_lightning_reference, tokenwise_lightning_reference
+from packaging.specifiers import SpecifierSet
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_PATH = REPO_ROOT / "cula/ops/lightning/sm90/prefill_kernel.py"
@@ -80,7 +81,11 @@ def test_kernel_exposes_only_production_entrypoints() -> None:
     backend = _class(tree, "LightningSm90PrefillKernel")
 
     assert [_qualified_name(base) for base in backend.bases] == ["LightningSm90PrefillSchedule"]
-    assert values["EXPECTED_CUTLASS_DSL_VERSION"] == "4.5.1"
+    specifier = values["SUPPORTED_CUTLASS_DSL_SPECIFIER"]
+    assert specifier == ">=4.4.2,<4.7,!=4.5.0"
+    accepted = SpecifierSet(specifier)
+    assert all(version in accepted for version in ("4.4.2", "4.5.1", "4.5.2", "4.5.3", "4.6.0", "4.6.1"))
+    assert all(version not in accepted for version in ("4.4.1", "4.5.0", "4.7.0"))
     assert values["DECAY_LUT_ENTRIES"] == 65
     assert SCHEDULE_PATH.exists()
     assert not any(isinstance(node, ast.FunctionDef) and node.name.startswith("launch_") for node in tree.body)

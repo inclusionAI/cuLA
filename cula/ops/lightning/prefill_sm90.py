@@ -13,10 +13,11 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from packaging.specifiers import SpecifierSet
 
 from cula.ops.lightning.sm90.prefill_kernel import (
-    EXPECTED_CUTLASS_DSL_VERSION,
     HEAD_DIM,
+    SUPPORTED_CUTLASS_DSL_SPECIFIER,
     TENSORMAP_BYTES,
     VALUE_DIM,
     LightningSm90PrefillKernel,
@@ -31,6 +32,7 @@ VARLEN_PERSISTENT_BACKEND_IDENTITY = "cula.lightning.sm90a.cutedsl.prefill.varle
 
 _compiled_fixed_variants: dict[tuple[int, int, int, int, int, bool, bool], object] = {}
 _compiled_varlen_variants: dict[tuple[int, int, int, int, int, int, bool, int | None], object] = {}
+_supported_cutlass_dsl_versions = SpecifierSet(SUPPORTED_CUTLASS_DSL_SPECIFIER)
 
 
 def _require_chunk_size(chunk_size: int) -> None:
@@ -48,10 +50,9 @@ def _require_sm90_environment(device: torch.device) -> None:
     if device.type != "cuda":
         raise ValueError("SM90 Lightning prefill requires CUDA tensors")
     installed_version = version("nvidia-cutlass-dsl")
-    if installed_version != EXPECTED_CUTLASS_DSL_VERSION:
+    if installed_version not in _supported_cutlass_dsl_versions:
         raise RuntimeError(
-            "SM90 Lightning prefill is pinned to "
-            f"nvidia-cutlass-dsl=={EXPECTED_CUTLASS_DSL_VERSION}, found {installed_version}"
+            f"SM90 Lightning prefill requires nvidia-cutlass-dsl{SUPPORTED_CUTLASS_DSL_SPECIFIER}, found {installed_version}"
         )
     capability = torch.cuda.get_device_capability(device)
     if capability != (9, 0):

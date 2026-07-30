@@ -71,7 +71,7 @@ from .schedule import (
     LightningSm90PrefillSchedule,
 )
 
-EXPECTED_CUTLASS_DSL_VERSION = "4.5.1"
+SUPPORTED_CUTLASS_DSL_SPECIFIER = ">=4.4.2,<4.7,!=4.5.0"
 DECAY_LUT_ENTRIES = 65
 TENSORMAP_BYTES = 128
 
