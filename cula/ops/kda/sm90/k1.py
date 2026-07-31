@@ -529,6 +529,8 @@ def k1_kernel(
             smem_thr_store_C.retile(tCrInvC_bf16),
             smem_thr_store_C.partition_D(sINV_bf16),
         )
+    # Generic-proxy smem writes -> visible to the async proxy.
+    cute.arch.fence_view_async_shared()
     cute.arch.barrier()
 
     # TMA bulk store all 5 workspace tensors (one elect_one, one thread).
