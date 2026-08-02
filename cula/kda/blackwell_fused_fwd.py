@@ -14,6 +14,7 @@
 
 import pathlib
 import sys
+import types
 import warnings
 
 import torch
@@ -33,6 +34,8 @@ try:
     from fla.ops.utils import chunk_local_cumsum
     from fla.ops.utils.constant import RCP_LN2
     from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+    from cula.ops.l2norm_triton import l2norm_fwd, l2norm_qk_fwd
+
 except ImportError:
     RCP_LN2 = 1.4426950408889634
 
@@ -48,6 +51,11 @@ except ImportError:
     def l2norm_fwd(x: torch.Tensor):
         rstd = torch.rsqrt(x.float().square().sum(dim=-1, keepdim=True).clamp_min(1.0e-12))
         return (x.float() * rstd).to(x.dtype), rstd
+
+    def l2norm_qk_fwd(q: torch.Tensor, k: torch.Tensor):
+        q_out, q_rstd = l2norm_fwd(q)
+        k_out, k_rstd = l2norm_fwd(k)
+        return q_out, k_out, q_rstd, k_rstd
 
     def kda_gate_fwd(*args, **kwargs):
         raise ImportError("fla is required for use_gate_in_kernel=True in blackwell_fused_fwd")
@@ -111,6 +119,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         safe_gate: bool = False,
         lower_bound: float | None = None,
         g_is_cumsum: bool = False,
+        scalar_gate: bool = False,
         cu_seqlens: torch.IntTensor | None = None,
         chunk_indices: torch.IntTensor | None = None,
     ):
@@ -128,6 +137,16 @@ class ChunkKDAFunction(torch.autograd.Function):
             num_seqs = cu_seqlens.shape[0] - 1
         else:
             num_seqs = B
+        split_value_tiles = (
+            scalar_gate
+            and safe_gate
+            and not is_varlen
+            and B == 1
+            and H == 16
+            and HV == 48
+            and D == 128
+            and v.shape[-1] == 128
+        )
 
         g_org = None
         if use_gate_in_kernel:
@@ -155,14 +174,22 @@ class ChunkKDAFunction(torch.autograd.Function):
                     A_log=A_log,
                     dt_bias=dt_bias,
                 )
-        if not g_is_cumsum and not (safe_gate and use_gate_in_kernel):
+        fuse_scalar_cumsum = (
+            scalar_gate
+            and not g_is_cumsum
+            and not use_gate_in_kernel
+        )
+        if (
+            not g_is_cumsum
+            and not (safe_gate and use_gate_in_kernel)
+            and not fuse_scalar_cumsum
+        ):
             g = chunk_local_cumsum(
                 g=g, chunk_size=chunk_size, scale=RCP_LN2, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
             )
         q_rstd, k_rstd = None, None
         if use_qk_l2norm_in_kernel:
-            q, q_rstd = l2norm_fwd(q)
-            k, k_rstd = l2norm_fwd(k)
+            q, k, q_rstd, k_rstd = l2norm_qk_fwd(q, k)
 
         q_cute = from_dlpack(q.detach())
         k_cute = from_dlpack(k.detach())
@@ -176,7 +203,24 @@ class ChunkKDAFunction(torch.autograd.Function):
         stream = cutlass_torch.default_stream()
 
         has_initial_state = initial_state is not None
-        cache_key = (has_initial_state, output_final_state, safe_gate, is_varlen, scale, chunk_size, D, USE_FAST_MATH)
+        # H/HV affect the compiled tensor layouts and GVA head mapping. Without
+        # them, a process exercising multiple Qwen model/TP shapes can reuse a
+        # kernel compiled for a different head configuration.
+        cache_key = (
+            has_initial_state,
+            output_final_state,
+            safe_gate,
+            scalar_gate,
+            fuse_scalar_cumsum,
+            split_value_tiles,
+            is_varlen,
+            scale,
+            chunk_size,
+            H,
+            HV,
+            D,
+            USE_FAST_MATH,
+        )
 
         if is_varlen:
             cu_seqlens_i32 = cu_seqlens.to(torch.int32).contiguous()
@@ -229,7 +273,9 @@ class ChunkKDAFunction(torch.autograd.Function):
             initial_state_cute = _dummy_cache[q.device]["state_cute"]
 
         if output_final_state:
-            final_state_f32 = torch.zeros(num_seqs, HV, D, D, dtype=torch.float32, device=q.device)
+            # The CuTe kernel overwrites every final-state element.  Avoid a
+            # redundant ~3 MiB memset for Qwen3.5-27B (HV=48) on every call.
+            final_state_f32 = torch.empty(num_seqs, HV, D, D, dtype=torch.float32, device=q.device)
             final_state_cute = from_dlpack(final_state_f32.detach())
         else:
             final_state_f32 = None
@@ -247,6 +293,9 @@ class ChunkKDAFunction(torch.autograd.Function):
                 io_dtype=cutlass.BFloat16,
                 scale=scale,
                 safe_gate=safe_gate,
+                scalar_gate=scalar_gate,
+                fuse_scalar_cumsum=fuse_scalar_cumsum,
+                split_value_tiles=split_value_tiles,
                 has_initial_state=has_initial_state,
                 output_final_state=output_final_state,
                 is_varlen=is_varlen,
@@ -317,6 +366,7 @@ def flash_kda_prefill(
     safe_gate: bool = False,
     lower_bound: float | None = None,
     g_is_cumsum: bool = False,
+    scalar_gate: bool = False,
     cu_seqlens: torch.IntTensor | None = None,
     chunk_indices: torch.IntTensor | None = None,
     **kwargs,
@@ -356,12 +406,13 @@ def flash_kda_prefill(
     assert HV % H == 0, (
         f"For GVA, num_v_heads (HV={HV}) must be evenly divisible by num_qk_heads (H={H}), but got HV % H = {HV % H}"
     )
-    assert g.shape == (B, T, HV, K), f"g must have shape [B, T, HV, K]={[B, T, HV, K]}, got {list(g.shape)}"
+    expected_g_shape = (B, T, HV) if scalar_gate else (B, T, HV, K)
+    assert g.shape == expected_g_shape, f"g must have shape {expected_g_shape}, got {list(g.shape)}"
     assert beta.shape == (B, T, HV), f"beta must have shape [B, T, HV]={[B, T, HV]}, got {list(beta.shape)}"
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    o, final_state = ChunkKDAFunction.apply(
+    forward_args = (
         q,
         k,
         v,
@@ -377,7 +428,18 @@ def flash_kda_prefill(
         safe_gate,
         lower_bound,
         g_is_cumsum,
+        scalar_gate,
         cu_seqlens,
         chunk_indices,
     )
+    if torch.is_grad_enabled() and any(
+        tensor is not None and tensor.requires_grad
+        for tensor in (q, k, v, g, beta, initial_state)
+    ):
+        o, final_state = ChunkKDAFunction.apply(*forward_args)
+    else:
+        # The op has no backward implementation.  SGLang always reaches this
+        # inference branch, so avoid the measurable autograd.Function.apply
+        # dispatch cost while retaining AMP/input-guard behavior.
+        o, final_state = ChunkKDAFunction.forward(types.SimpleNamespace(), *forward_args)
     return o, final_state
