@@ -1,0 +1,755 @@
+# Copyright 2025-2026 Ant Group Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Linear Attention Decode Kernel - Single Token Generation
+
+This file implements a fused CUDA kernel using CUTLASS CuTe DSL for executing
+Linear Attention updates during decode phase. Simplified compared to GDN.
+
+Architecture Design:
+- Uses cp.async for efficient Global Memory → Shared Memory transfers
+- Employs N-stage pipeline to overlap loading and computation, hiding memory latency
+- Per-path config (sweep-tuned on GB200): small path uses TILE_V=4 / 4 warps,
+  big path uses TILE_V=32 / 8 warps; both run with NUM_STAGES=3.
+
+Computation Flow:
+1. Warp 0 handles TMA prefetch, loading data from GMEM to SMEM
+2. All warps compute in parallel: state update with exponential decay
+3. Each warp processes one row of data, completing h_new = exp(decay) * h + k ⊗ v
+4. Uses warp-level shuffle for efficient reduction operations
+5. Results are vectorized and written back to Global Memory
+
+Core Formula:
+    state_new = exp(decay) * state_old + k ⊗ v
+    output = q @ state_new
+"""
+
+import functools
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import torch
+from cutlass.cute.nvgpu import cpasync
+from cutlass.cute.runtime import from_dlpack
+
+from cula.utils import USE_FAST_MATH
+
+# ============================================================================
+# Global configuration
+# ============================================================================
+# Per-path tile / pipeline / warp configuration was sweep-tuned on GB200.
+# Small path (B <= 32, grid expanded by NUM_BLOCKS_PER_STATE):
+#   smaller TILE_V keeps the grid wide, deeper NUM_STAGES hides cp.async latency.
+# Big path (B > 32, grid = B*H):
+#   larger TILE_V amortizes per-warp setup, 8 warps fill issue slots, deeper stages help.
+TILE_V_SMALL = 4
+TILE_V_BIG = 32
+TILE_K = 128
+NUM_STAGES_SMALL = 3
+NUM_STAGES_BIG = 3
+NUM_THREADS_BIG = 256  # 8 warps for big-batch path (B > 32)
+NUM_THREADS_SMALL = 128  # 4 warps for small-batch path (B <= 32)
+NUM_BLOCKS_PER_STATE = 8
+
+# Backward-compat aliases (still referenced in some places).
+TILE_V = TILE_V_SMALL
+NUM_STAGES = NUM_STAGES_SMALL
+
+
+@cute.kernel
+def la_decode_kernel_small_batch_pretranspose(
+    tiled_copy_load: cute.TiledCopy,
+    h0_source: cute.Tensor,
+    smem_layout_staged: cute.Layout,
+    vec_size: cutlass.Constexpr[int],
+    num_v_tiles: cutlass.Constexpr[int],
+    decay_scales: cute.Tensor,  # [HV]
+    q: cute.Tensor,  # [B, T, H, K]
+    k: cute.Tensor,  # [B, T, H, K]
+    v: cute.Tensor,  # [B, T, HV, V]
+    o: cute.Tensor,  # [B, T, HV, V] - output
+    h0_indices: cute.Tensor,  # [B] - initial state indices
+    scale: cutlass.Constexpr[float],
+    B: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    HV: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    NUM_WARPS: cutlass.Constexpr[int] = 4,
+    TILE_V: cutlass.Constexpr[int] = 8,
+    NUM_STAGES: cutlass.Constexpr[int] = 2,
+):
+    """Each block uses pipeline to load one batch and vectorized writeback"""
+
+    tidx, _, _ = cute.arch.thread_idx()
+    lane_id = tidx % 32
+    warp_idx = cute.arch.warp_idx()
+    warp_idx = cute.arch.make_warp_uniform(warp_idx)
+    block_idx, _, _ = cute.arch.block_idx()
+    batch_idx = block_idx // NUM_BLOCKS_PER_STATE
+    batch_inner = block_idx % NUM_BLOCKS_PER_STATE
+    num_v_tiles_per_block = num_v_tiles // NUM_BLOCKS_PER_STATE
+    i_n = batch_idx // HV
+    i_hv = batch_idx % HV
+    i_h = i_hv // (HV // H)
+
+    smem = cutlass.utils.SmemAllocator()
+
+    # ===================================================================
+    # Allocate shared memory (using passed-in layout)
+    # ===================================================================
+    sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
+
+    # Allocate shared memory for output (size V) - use BFloat16 to match SGLang
+    sOutput = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((V,)), 16)
+
+    r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_q = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_v = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_h = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_decay_scale = -cutlass.Float32(decay_scales[i_hv])
+    r_decay = cute.exp(r_decay_scale, fastmath=USE_FAST_MATH)
+
+    cute.arch.barrier()
+
+    # Get current batch
+    pool_idx = h0_indices[i_n] * HV + i_hv
+    gSrc_batch = h0_source[(pool_idx, None, None)]  # (V, K)
+    gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (pool_idx, None, 0))
+
+    # split tiles in V-dimension
+    gSrc = cute.local_tile(gSrc_batch, (TILE_V, TILE_K), (None, 0))  # (TILE_V, TILE_K, num_v_tiles)
+
+    # Partition for load
+    thr_copy_load = tiled_copy_load.get_slice(tidx)
+
+    # ===================================================================
+    # Prefetch: All threads participate in cp.async load
+    # ===================================================================
+    start_v_tiles = batch_inner * num_v_tiles_per_block
+    prefetch_count = cutlass.min(NUM_STAGES - 1, num_v_tiles_per_block)
+    for v_tiles in range(start_v_tiles, start_v_tiles + prefetch_count):
+        stage = (v_tiles - start_v_tiles) % NUM_STAGES
+
+        gSrc_tile = gSrc[(None, None, v_tiles)]
+        sData_stage = sData[(None, None, stage)]
+
+        thr_gSrc = thr_copy_load.partition_S(gSrc_tile)
+        thr_sData = thr_copy_load.partition_D(sData_stage)
+
+        cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
+        cute.arch.cp_async_commit_group()
+
+    for i in cutlass.range_constexpr(vec_size):
+        r_q[i] = cutlass.Float32(q[i_n, i_h, i * 32 + lane_id])
+        r_k[i] = cutlass.Float32(k[i_n, i_h, i * 32 + lane_id])
+        r_v[i] = cutlass.Float32(v[i_n, i_hv, i * 32 + lane_id])
+
+    cute.arch.barrier()  # Ensure all threads finish writing to sV
+
+    # Apply scaling in Float32
+    for i in cutlass.range_constexpr(vec_size):
+        r_q[i] = r_q[i] * scale
+
+    # ===================================================================
+    # Mainloop: All threads participate
+    # ===================================================================
+    end_v_tiles = start_v_tiles + num_v_tiles_per_block
+    for v_tiles in range(start_v_tiles, end_v_tiles):
+        stage = (v_tiles - start_v_tiles) % NUM_STAGES
+
+        # Step 1: Wait for current stage to complete
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
+
+        # Step 2: Issue async load for next tile (after compute)
+        next_v_tiles = v_tiles + prefetch_count
+        if next_v_tiles < end_v_tiles:
+            next_stage = (next_v_tiles - start_v_tiles) % NUM_STAGES
+
+            gSrc_next = gSrc[(None, None, next_v_tiles)]
+            sData_next = sData[(None, None, next_stage)]
+
+            thr_gSrc = thr_copy_load.partition_S(gSrc_next)
+            thr_sData = thr_copy_load.partition_D(sData_next)
+
+            cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
+            cute.arch.cp_async_commit_group()
+
+        # Step 3: Compute using data from current stage
+        # v_grp selects which r_v[] entry holds this v_tiles' v values.
+        # r_v has vec_size=4 entries each holding 32 V positions; so each
+        # entry covers (32 / TILE_V) consecutive v_tiles. (e.g. TILE_V=8 -> 4)
+        v_src = cutlass.Float32(0.0)
+        v_grp = v_tiles // (32 // TILE_V)
+        if v_grp == 0:
+            v_src = r_v[0]
+        elif v_grp == 1:
+            v_src = r_v[1]
+        elif v_grp == 2:
+            v_src = r_v[2]
+        else:
+            v_src = r_v[3]
+
+        for row in cutlass.range_constexpr(0, TILE_V, NUM_WARPS):
+            row_offset = tidx // 32
+
+            v_idx = v_tiles * TILE_V + row + row_offset
+            v_row = cute.arch.shuffle_sync(v_src, v_idx % 32, mask=-1, mask_and_clamp=31)
+
+            sum_hq = 0.0
+            # Batch all SMEM loads first to overlap LDS latency (short_scoreboard fix)
+            for i in cutlass.range_constexpr(vec_size):
+                r_h[i] = sData[(row + row_offset, i * 32 + lane_id, stage)]
+            # Then consume them in FMAs / stores
+            for i in cutlass.range_constexpr(vec_size):
+                r_h[i] = r_h[i] * r_decay + r_k[i] * v_row
+                gDst[(0, row + row_offset, i * 32 + lane_id, v_tiles)] = r_h[i]
+                sum_hq += r_h[i] * r_q[i]
+
+            for offset in [16, 8, 4, 2, 1]:
+                sum_hq += cute.arch.shuffle_sync_bfly(sum_hq, offset=offset, mask=-1, mask_and_clamp=31)
+
+            o_idx = v_tiles * TILE_V + row + row_offset
+            if lane_id == 0 and o_idx < V:
+                sOutput[o_idx] = cutlass.BFloat16(sum_hq)
+
+    # ===================================================================
+    # Final writeback: Copy output from shared memory to global memory
+    # All threads write (V=128, NUM_THREADS=128)
+    # ===================================================================
+    cute.arch.barrier()  # Ensure all writes to sOutput are complete
+    if tidx >= start_v_tiles * TILE_V and tidx < end_v_tiles * TILE_V:
+        o[(i_n, i_hv, tidx)] = sOutput[tidx]
+
+
+@cute.kernel
+def la_decode_kernel_big_batch_pretranspose(
+    tiled_copy_load: cute.TiledCopy,
+    h0_source: cute.Tensor,
+    smem_layout_staged: cute.Layout,
+    vec_size: cutlass.Constexpr[int],
+    num_v_tiles: cutlass.Constexpr[int],
+    decay_scales: cute.Tensor,  # [HV]
+    q: cute.Tensor,  # [B, T, H, K]
+    k: cute.Tensor,  # [B, T, H, K]
+    v: cute.Tensor,  # [B, T, HV, V]
+    o: cute.Tensor,  # [B, T, HV, V] - output
+    h0_indices: cute.Tensor,  # [B] - initial state indices
+    scale: cutlass.Constexpr[float],
+    B: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    HV: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    NUM_WARPS: cutlass.Constexpr[int] = 4,
+    TILE_V: cutlass.Constexpr[int] = 8,
+    NUM_STAGES: cutlass.Constexpr[int] = 2,
+):
+    """Each block uses pipeline to load one batch and vectorized writeback"""
+
+    tidx, _, _ = cute.arch.thread_idx()
+    lane_id = tidx % 32
+    warp_idx = cute.arch.warp_idx()
+    warp_idx = cute.arch.make_warp_uniform(warp_idx)
+    batch_idx, _, _ = cute.arch.block_idx()
+    i_n = batch_idx // HV
+    i_hv = batch_idx % HV
+    i_h = i_hv // (HV // H)
+
+    smem = cutlass.utils.SmemAllocator()
+
+    # ===================================================================
+    # Allocate shared memory (using passed-in layout)
+    # ===================================================================
+    sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
+
+    # Allocate shared memory for output (size V) - use BFloat16 to match SGLang
+    sOutput = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((V,)), 16)
+
+    r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_q = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_v = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_h = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+
+    cute.arch.barrier()
+
+    # Get current batch
+    pool_idx = h0_indices[i_n] * HV + i_hv
+    gSrc_batch = h0_source[(pool_idx, None, None)]  # (V, K)
+    gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (pool_idx, None, 0))
+
+    # split tiles in V-dimension
+    gSrc = cute.local_tile(gSrc_batch, (TILE_V, TILE_K), (None, 0))  # (TILE_V, TILE_K, num_v_tiles)
+
+    # Partition for load
+    thr_copy_load = tiled_copy_load.get_slice(tidx)
+
+    # ===================================================================
+    # Prefetch: All threads participate in cp.async load
+    # ===================================================================
+    prefetch_count = cutlass.min(NUM_STAGES - 1, num_v_tiles)
+    for v_tiles in range(prefetch_count):
+        stage = v_tiles % NUM_STAGES
+
+        gSrc_tile = gSrc[(None, None, v_tiles)]
+        sData_stage = sData[(None, None, stage)]
+
+        thr_gSrc = thr_copy_load.partition_S(gSrc_tile)
+        thr_sData = thr_copy_load.partition_D(sData_stage)
+
+        cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
+        cute.arch.cp_async_commit_group()
+
+    for i in cutlass.range_constexpr(vec_size):
+        r_q[i] = cutlass.Float32(q[i_n, i_h, i * 32 + lane_id])
+        r_k[i] = cutlass.Float32(k[i_n, i_h, i * 32 + lane_id])
+        r_v[i] = cutlass.Float32(v[i_n, i_hv, i * 32 + lane_id])
+
+    cute.arch.barrier()  # Ensure all threads finish writing to sV
+
+    # ===================================================================
+    # Compute g and beta (scalar values)
+    # ===================================================================
+    # Apply scaling in Float32
+    for i in cutlass.range_constexpr(vec_size):
+        r_q[i] = r_q[i] * scale
+
+    r_g = cute.exp(-cutlass.Float32(decay_scales[i_hv]), fastmath=USE_FAST_MATH)
+
+    # ===================================================================
+    # Mainloop: All threads participate
+    # ===================================================================
+    for v_tiles in range(num_v_tiles):
+        stage = v_tiles % NUM_STAGES
+
+        # Step 1: Wait for current stage to complete
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
+
+        # Step 2: Issue async load for next tile (after compute)
+        next_v_tiles = v_tiles + prefetch_count
+        if next_v_tiles < num_v_tiles:
+            next_stage = next_v_tiles % NUM_STAGES
+
+            gSrc_next = gSrc[(None, None, next_v_tiles)]
+            sData_next = sData[(None, None, next_stage)]
+
+            thr_gSrc = thr_copy_load.partition_S(gSrc_next)
+            thr_sData = thr_copy_load.partition_D(sData_next)
+
+            cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
+            cute.arch.cp_async_commit_group()
+
+        # Step 3: Compute using data from current stage
+        # v_grp selects which r_v[] entry holds this v_tiles' v values.
+        v_src = cutlass.Float32(0.0)
+        v_grp = v_tiles // (32 // TILE_V)
+        if v_grp == 0:
+            v_src = r_v[0]
+        elif v_grp == 1:
+            v_src = r_v[1]
+        elif v_grp == 2:
+            v_src = r_v[2]
+        else:
+            v_src = r_v[3]
+
+        for row in cutlass.range_constexpr(0, TILE_V, NUM_WARPS):
+            row_offset = tidx // 32
+
+            v_idx = v_tiles * TILE_V + row + row_offset
+            v_row = cute.arch.shuffle_sync(v_src, v_idx % 32, mask=-1, mask_and_clamp=31)
+
+            sum_hq = 0.0
+            # Batch all SMEM loads first to overlap LDS latency (short_scoreboard fix)
+            for i in cutlass.range_constexpr(vec_size):
+                r_h[i] = sData[(row + row_offset, i * 32 + lane_id, stage)]
+            # Then consume them in FMAs / stores
+            for i in cutlass.range_constexpr(vec_size):
+                r_h[i] = r_h[i] * r_g + r_k[i] * v_row
+                gDst[(0, row + row_offset, i * 32 + lane_id, v_tiles)] = r_h[i]
+                sum_hq += r_h[i] * r_q[i]
+
+            for offset in [16, 8, 4, 2, 1]:
+                sum_hq += cute.arch.shuffle_sync_bfly(sum_hq, offset=offset, mask=-1, mask_and_clamp=31)
+
+            o_idx = v_tiles * TILE_V + row + row_offset
+            if lane_id == 0 and o_idx < V:
+                sOutput[o_idx] = cutlass.BFloat16(sum_hq)
+
+    # ===================================================================
+    # Final writeback: Copy output from shared memory to global memory
+    # All threads write (V=128, NUM_THREADS=128)
+    # ===================================================================
+    cute.arch.barrier()  # Ensure all writes to sOutput are complete
+
+    if tidx < V:
+        o[(i_n, i_hv, tidx)] = sOutput[tidx]
+
+
+@cute.jit
+def run_la_decode_kernel_big_batch_pretranspose(
+    h0_source: cute.Tensor,  # [pool_size*HV, V, K]
+    decay_scales: cute.Tensor,  # [HV]
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    o: cute.Tensor,
+    h0_indices: cute.Tensor,
+    softmax_scale: cutlass.Constexpr[float],
+    H: cutlass.Constexpr[int],
+    HV: cutlass.Constexpr[int],
+    B: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    stream: cuda.CUstream,
+):
+    # h0_source: (pool_size*HV, V, K)
+    _pool_dim0, v_dim, _k_dim = (
+        h0_source.layout.shape[0],
+        h0_source.layout.shape[1],
+        h0_source.layout.shape[2],
+    )
+
+    # Create cp.async copy with cache-global mode (bypass L1)
+    copy_atom = cute.make_copy_atom(
+        cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+        cutlass.Float32,
+        num_bits_per_copy=128,  # 4 elements per copy
+    )
+
+    # Thread layout: NUM_WARPS_BIG rows × 32 threads/row
+    NUM_WARPS_BIG = NUM_THREADS_BIG // 32
+    thread_layout = cute.make_layout(
+        (NUM_WARPS_BIG, 32),
+        stride=(32, 1),
+    )
+    val_layout = cute.make_layout((1, 4))  # Each thread handles 4 elements
+
+    tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
+
+    num_v_tiles = cute.ceil_div(v_dim, TILE_V_BIG)
+
+    vec_size = TILE_K // 32  # Each thread in a warp processes this many elements (always 4 for TILE_K=128)
+
+    # Create SMEM layout (row-major: v-row major, k-contiguous)
+    smem_layout_staged = cute.make_layout(
+        (TILE_V_BIG, TILE_K, NUM_STAGES_BIG),
+        stride=(TILE_K, 1, TILE_V_BIG * TILE_K),
+    )
+
+    # sData: TILE_V_BIG * TILE_K * NUM_STAGES_BIG * 4 bytes (Float32)
+    # sOutput: V * 2 bytes (BFloat16)
+    smem_bytes = 4 * TILE_V_BIG * TILE_K * NUM_STAGES_BIG + 2 * v_dim + 32
+
+    la_decode_kernel_big_batch_pretranspose(
+        tiled_copy_load,
+        h0_source,
+        smem_layout_staged,
+        vec_size,
+        num_v_tiles,
+        decay_scales,
+        q,
+        k,
+        v,
+        o,
+        h0_indices,
+        softmax_scale,
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        NUM_WARPS_BIG,
+        TILE_V_BIG,
+        NUM_STAGES_BIG,
+    ).launch(
+        grid=(B * HV, 1, 1),
+        block=[NUM_THREADS_BIG, 1, 1],
+        smem=smem_bytes,
+        stream=stream,
+    )
+
+
+@cute.jit
+def run_la_decode_kernel_small_batch_pretranspose(
+    h0_source: cute.Tensor,  # [pool_size*HV, V, K]
+    decay_scales: cute.Tensor,  # [HV]
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    o: cute.Tensor,
+    h0_indices: cute.Tensor,
+    softmax_scale: cutlass.Constexpr[float],
+    H: cutlass.Constexpr[int],
+    HV: cutlass.Constexpr[int],
+    B: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    stream: cuda.CUstream,
+):
+    # h0_source: (pool_size*HV, V, K)
+    _pool_dim0, v_dim, _k_dim = (
+        h0_source.layout.shape[0],
+        h0_source.layout.shape[1],
+        h0_source.layout.shape[2],
+    )
+
+    # Create cp.async copy with cache-global mode (bypass L1)
+    copy_atom = cute.make_copy_atom(
+        cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+        cutlass.Float32,
+        num_bits_per_copy=128,  # 4 elements per copy
+    )
+
+    # Thread layout: NUM_WARPS_SMALL rows × 32 threads/row
+    NUM_WARPS_SMALL = NUM_THREADS_SMALL // 32
+    thread_layout = cute.make_layout(
+        (NUM_WARPS_SMALL, 32),
+        stride=(32, 1),
+    )
+    val_layout = cute.make_layout((1, 4))  # Each thread handles 4 elements
+
+    tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
+
+    num_v_tiles = cute.ceil_div(v_dim, TILE_V_SMALL)
+
+    vec_size = TILE_K // 32  # Each thread in a warp processes this many elements (always 4 for TILE_K=128)
+
+    # Create SMEM layout (row-major: v-row major, k-contiguous)
+    smem_layout_staged = cute.make_layout(
+        (TILE_V_SMALL, TILE_K, NUM_STAGES_SMALL),
+        stride=(TILE_K, 1, TILE_V_SMALL * TILE_K),
+    )
+
+    # sData: TILE_V_SMALL * TILE_K * NUM_STAGES_SMALL * 4 bytes (Float32)
+    # sOutput: V * 2 bytes (BFloat16)
+    smem_bytes = 4 * TILE_V_SMALL * TILE_K * NUM_STAGES_SMALL + 2 * v_dim + 32
+
+    la_decode_kernel_small_batch_pretranspose(
+        tiled_copy_load,
+        h0_source,
+        smem_layout_staged,
+        vec_size,
+        num_v_tiles,
+        decay_scales,
+        q,
+        k,
+        v,
+        o,
+        h0_indices,
+        softmax_scale,
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        NUM_WARPS_SMALL,
+        TILE_V_SMALL,
+        NUM_STAGES_SMALL,
+    ).launch(
+        grid=(B * HV * NUM_BLOCKS_PER_STATE, 1, 1),
+        block=[NUM_THREADS_SMALL, 1, 1],
+        smem=smem_bytes,
+        stream=stream,
+    )
+
+
+@functools.cache
+def _get_compiled_kernel(
+    B: int, T: int, H: int, HV: int, K: int, V: int, pool_dim0: int, softmax_scale: float, use_fast_math: bool = True
+):
+    """Get or create compiled kernel cache."""
+    return {}
+
+
+def linear_attention_decode(
+    q: torch.Tensor,  # [B, H, HEAD_DIM], same as [B, H, K]
+    k: torch.Tensor,  # [B, H, HEAD_DIM], same as [B, H, K]
+    v: torch.Tensor,  # [B, HV, HEAD_DIM], same as [B, HV, V]
+    s: torch.Tensor,  # [pool_size * HV, V, K]
+    out: torch.Tensor,  # [B, HV, HEAD_DIM]
+    softmax_scale: float,
+    stride_q: int,
+    stride_k: int,
+    stride_v: int,
+    stride_s: int,
+    stride_o: int,
+    s_offsets: torch.Tensor,  # [B] - state pool indices
+    decay_scales: torch.Tensor,  # [HV] or [H]
+    HEAD_DIM: int,
+    K_SPLIT_DIM: int,
+    V_SPLIT_DIM: int,
+) -> None:
+    """
+    Linear Attention Decode using CuTe DSL.
+    Compatible with Triton seg_la_d_kernel interface.
+
+    Args:
+        q: Query tensor [B, H, HEAD_DIM]
+        k: Key tensor [B, H, HEAD_DIM]
+        v: Value tensor [B, HV, HEAD_DIM]
+        s: State pool tensor [pool_size * HV, V, K] in BHVK layout
+        out: Output tensor [B, HV, HEAD_DIM]
+        softmax_scale: Softmax scale factor
+        stride_q: Stride of q tensor
+        stride_k: Stride of k tensor
+        stride_v: Stride of v tensor
+        stride_s: Stride of s tensor
+        stride_o: Stride of out tensor
+        s_offsets: State pool indices [B]
+        decay_scales: Decay scales per value head [HV]. A [H] tensor is accepted and expanded.
+        HEAD_DIM: Head dimension
+        K_SPLIT_DIM: K split dimension (must be HEAD_DIM for no split)
+        V_SPLIT_DIM: V split dimension (must be HEAD_DIM for no split)
+
+    Returns:
+        None (modifies out and s in-place)
+    """
+    if q.ndim != 3 or q.shape[2] != HEAD_DIM:
+        raise ValueError(f"q must have shape (B, H, HEAD_DIM), got {tuple(q.shape)}")
+    if k.shape != q.shape:
+        raise ValueError(f"k must have the same shape as q, got k={tuple(k.shape)}, q={tuple(q.shape)}")
+    B = q.shape[0]
+    H = q.shape[1]
+    if v.ndim != 3 or v.shape[0] != B or v.shape[2] != HEAD_DIM:
+        raise ValueError(f"v must have shape (B, HV, HEAD_DIM), got {tuple(v.shape)}")
+    HV = v.shape[1]
+    if out.shape != (B, HV, HEAD_DIM):
+        raise ValueError(f"out must have shape {(B, HV, HEAD_DIM)}, got {tuple(out.shape)}")
+    if HV < H or HV % H != 0:
+        raise ValueError(f"HV ({HV}) must be >= H ({H}) and divisible by H")
+    if decay_scales.ndim != 1:
+        raise ValueError(f"decay_scales must be 1D, got {tuple(decay_scales.shape)}")
+    if decay_scales.shape[0] == H and HV != H:
+        decay_scales = decay_scales.repeat_interleave(HV // H).contiguous()
+    elif decay_scales.shape[0] == HV:
+        decay_scales = decay_scales.contiguous()
+    else:
+        raise ValueError(f"decay_scales must have shape ({HV},) or ({H},), got {tuple(decay_scales.shape)}")
+
+    k_dim_block = HEAD_DIM // K_SPLIT_DIM
+    if k_dim_block > 1:
+        raise NotImplementedError(f"CuTe kernel doesn't support K splitting (k_dim_block={k_dim_block})")
+
+    # Get compiled kernel (cached)
+    pool_dim0 = s.shape[0]
+    cache_key = (B, 1, H, HV, HEAD_DIM, HEAD_DIM, pool_dim0, softmax_scale, USE_FAST_MATH)
+    cache = _get_compiled_kernel(*cache_key)
+
+    h0_source = s
+
+    # Validate state pool dimensions
+    assert s.shape[0] % HV == 0, f"s.shape[0] must be divisible by HV={HV}, got {s.shape[0]}"
+    # First-time compilation
+    if "compiled" not in cache:
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+        if B <= 32:
+            run_func = run_la_decode_kernel_small_batch_pretranspose
+        else:
+            run_func = run_la_decode_kernel_big_batch_pretranspose
+
+        # Create views for compilation
+        q_view = q
+        k_view = k
+        v_view = v
+        o_view = out
+
+        h0_indices = s_offsets
+
+        # Convert to CuTe format for compilation
+        h0_tensor = from_dlpack(h0_source, assumed_align=16)
+        decay_tensor = from_dlpack(decay_scales, assumed_align=16)
+        q_tensor = from_dlpack(q_view, assumed_align=16)
+        k_tensor = from_dlpack(k_view, assumed_align=16)
+        v_tensor = from_dlpack(v_view, assumed_align=16)
+        o_tensor = from_dlpack(o_view, assumed_align=16)
+        h0_idx_tensor = from_dlpack(h0_indices, assumed_align=16)
+
+        compiled = cute.compile(
+            run_func,
+            h0_tensor,
+            decay_tensor,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            h0_idx_tensor,
+            softmax_scale=softmax_scale,
+            H=H,
+            HV=HV,
+            B=B,
+            T=1,
+            K=HEAD_DIM,
+            V=HEAD_DIM,
+            stream=stream,
+            options="--enable-tvm-ffi",
+        )
+        cache["compiled"] = compiled
+
+    compiled = cache["compiled"]
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    compiled(h0_source, decay_scales, q, k, v, out, s_offsets, stream)
+
+
+def seg_la_d_kernel_cute(
+    q: torch.Tensor,  # [B, H, HEAD_DIM]
+    k: torch.Tensor,  # [B, H, HEAD_DIM]
+    v: torch.Tensor,  # [B, HV, HEAD_DIM]
+    s: torch.Tensor,  # [pool_size * HV, V, K]
+    out: torch.Tensor,  # [B, HV, HEAD_DIM]
+    softmax_scale: float,
+    stride_q: int,
+    stride_k: int,
+    stride_v: int,
+    stride_s: int,
+    stride_o: int,
+    s_offsets: torch.Tensor,  # [B] - state pool indices
+    decay_scales: torch.Tensor,  # [HV] or [H]
+    HEAD_DIM: int,
+    K_SPLIT_DIM: int,
+    V_SPLIT_DIM: int,
+) -> None:
+    """
+    CuTe wrapper function compatible with Triton seg_la_d_kernel interface.
+    """
+    # Call the main implementation
+    linear_attention_decode(
+        q,
+        k,
+        v,
+        s,
+        out,
+        softmax_scale,
+        stride_q,
+        stride_k,
+        stride_v,
+        stride_s,
+        stride_o,
+        s_offsets,
+        decay_scales,
+        HEAD_DIM,
+        K_SPLIT_DIM,
+        V_SPLIT_DIM,
+    )

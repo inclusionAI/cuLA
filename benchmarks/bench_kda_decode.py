@@ -55,7 +55,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from benchmarks.utils import benchmark_cuda_fn, relative_rms_error_rel_max
 from cula.kda import fused_sigmoid_gating_delta_rule_update as cula_fused
-from cula.ops.kda_decode_fla import fused_sigmoid_gating_delta_rule_update as fla_fused
+from cula.ops.kda.decode.reference_fla import fused_sigmoid_gating_delta_rule_update as fla_fused
 
 
 # ──────────────────────────────────────────────────────────────────────

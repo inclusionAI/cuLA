@@ -202,7 +202,7 @@ def cula_kda_prefill(
         final_state (torch.Tensor):
             Final state of shape `[N, HV, K, K]` if `output_final_state=True` else `None`.
     """
-    assert_hopper()
+    assert_hopper(q.device)
     assert safe_gate, "Only support safe_gate=True."
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -259,22 +259,23 @@ def cula_kda_prefill(
     assert q.shape[-1] == k.shape[-1] == v.shape[-1] == 128, "Currently we only support head dim of 128 for KDA"
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    o, final_state = HopperChunkKDAFunction.apply(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        A_log,
-        dt_bias,
-        scale,
-        initial_state,
-        output_final_state,
-        use_qk_l2norm_in_kernel,
-        use_gate_in_kernel,
-        safe_gate,
-        lower_bound,
-        cu_seqlens,
-        chunk_indices,
-    )
+    with torch.cuda.device_of(q):
+        o, final_state = HopperChunkKDAFunction.apply(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            scale,
+            initial_state,
+            output_final_state,
+            use_qk_l2norm_in_kernel,
+            use_gate_in_kernel,
+            safe_gate,
+            lower_bound,
+            cu_seqlens,
+            chunk_indices,
+        )
     return o, final_state

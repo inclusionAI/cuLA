@@ -1,6 +1,6 @@
 # ChunkDeltaRuleFwdH Pipeline
 
-> 文件: `cula/ops/chunk_delta_h.py`  
+> 文件: `cula/ops/kda/sm100/delta_h.py`
 > 类名: `ChunkDeltaRuleFwdH`
 
 ## 计算公式
@@ -24,7 +24,7 @@ $$h_{new} = 2^{gk} \cdot h + \text{update}$$
 | 6 | Store | TMA S2G 写 h_out 和 v_new |
 | 7 | Empty | 占位 |
 
-**总线程**: 256 (8 warps)  
+**总线程**: 256 (8 warps)
 **寄存器分配**: CUDA=232, Others=40, occ=1 (仅支持)
 
 ## MMA 操作

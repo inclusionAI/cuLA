@@ -61,7 +61,14 @@ def set_seed(seed: int):
 
 
 def benchmark_cuda_fn(fn, *, setup_fn=None, warmup=30, rep=200, aggregate="iqr_mean"):
-    """Benchmark a CUDA callable with events and return milliseconds per call."""
+    """Benchmark a CUDA callable with CUDA events; return milliseconds per call.
+
+    Args:
+        aggregate: How to summarize ``rep`` timed iterations.
+            ``"iqr_mean"`` (default) — mean of the middle 50% after sorting
+            (robust to outliers; used by la_decode / MTP benchmarks).
+            ``"mean"`` — arithmetic mean of all iterations.
+    """
     for _ in range(warmup):
         if setup_fn is not None:
             setup_fn()
@@ -108,15 +115,21 @@ def benchmark_cuda_mode_fn(
     ncu_mode=False,
     sanitizer_mode=False,
     setup_fn=None,
+    aggregate="mean",
 ):
-    """Benchmark a CUDA callable using standard repo warmup/repeat mode rules."""
+    """Benchmark a CUDA callable using standard repo warmup/repeat mode rules.
+
+    ``aggregate`` controls how per-iteration times are reduced: ``"mean"`` (default)
+    or ``"iqr_mean"`` (interquartile mean — robust to a stray transient iteration
+    that would otherwise poison the mean).
+    """
     warmup, rep = resolve_benchmark_repeats(
         default_warmup,
         default_rep,
         ncu_mode=ncu_mode,
         sanitizer_mode=sanitizer_mode,
     )
-    return benchmark_cuda_fn(fn, setup_fn=setup_fn, warmup=warmup, rep=rep, aggregate="mean")
+    return benchmark_cuda_fn(fn, setup_fn=setup_fn, warmup=warmup, rep=rep, aggregate=aggregate)
 
 
 def triton_bench_fn(fn, **kwargs):
@@ -433,7 +446,7 @@ def prepare_safe_gate_inputs(
 ):
     """Prepare inputs for safe_gate benchmarks (use_gate_in_kernel=True, safe_gate=True).
 
-    All tensors are flattened to (1, B*T, ...) for cu_seqlens compatibility.
+    Tensors are flattened to (1, B*T, ...) when cu_seqlens is provided.
     """
     HV = H if num_v_heads is None else num_v_heads
     assert HV >= H and HV % H == 0, f"HV ({HV}) must be a positive multiple of H ({H}) with HV >= H."
@@ -456,7 +469,7 @@ def prepare_safe_gate_inputs(
     dt_bias = torch.randn(HV * D, dtype=torch.float, device=device).requires_grad_(False)
 
     # flatten to batch_size=1 for cu_seqlens compatibility
-    if batch_size != 1:
+    if cu_seqlens is not None and batch_size != 1:
         q, k, v, g, beta = map(lambda x: rearrange(x, "b t ... -> 1 (b t) ..."), (q, k, v, g, beta))
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None

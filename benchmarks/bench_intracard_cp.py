@@ -47,7 +47,7 @@ from benchmarks.utils import (
     set_seed,
 )
 from cula.kda.chunk_fwd import chunk_kda_fwd
-from cula.ops.cp.chunk_delta_h import (
+from cula.ops.kda.sm100.cp.chunk_delta_h import (
     compute_subseq_len,
     prepare_subseq_cu_seqlens,
     should_use_intracard_cp,
@@ -59,7 +59,7 @@ from cula.utils import get_device_sm_count
 # ============================================================
 BT, D = 64, 128
 H_VALUES = [4, 8]
-WARMUP = 10
+WARMUP = 25
 N_ITERS = 100
 NCU_MODE = False
 SANITIZER_MODE = False

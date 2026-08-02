@@ -3,10 +3,9 @@
 generate_benchmark_hopper_md.py — Run Hopper (SM90) benchmarks and generate BENCHMARK_hopper.md
 
 Currently supported Hopper benchmarks:
-  - KDA Fused Forward (cula.kda.hopper_fused_fwd)
+  - KDA prefill (cula.kda.flashkda — SM90 K1+K2 two-kernel)
 
-Reuses bench_kda_fused_fwd.py which auto-selects the correct cuLA implementation
-based on GPU architecture (SM90 → hopper_fused_fwd).
+Reuses bench_kda_sm90_prefill.py (calls cula_kda_prefill directly).
 
 Usage:
   python benchmarks/generate_benchmark_hopper_md.py
@@ -33,17 +32,17 @@ sys.path.insert(0, str(ROOT))
 
 os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))  # Enable fast ops in FLA for fair comparison
 
-from benchmarks.bench_kda_fused_fwd import (  # noqa: E402
+from benchmarks.bench_kda_sm90_prefill import (  # noqa: E402
     _SM_TAG,
 )
-from benchmarks.bench_kda_fused_fwd import (  # noqa: E402
-    D as KDA_FUSED_D,
+from benchmarks.bench_kda_sm90_prefill import (  # noqa: E402
+    D as KDA_D,
 )
-from benchmarks.bench_kda_fused_fwd import (  # noqa: E402
-    H as KDA_FUSED_H,
+from benchmarks.bench_kda_sm90_prefill import (  # noqa: E402
+    H as KDA_H,
 )
-from benchmarks.bench_kda_fused_fwd import (  # noqa: E402
-    main as kda_fused_fwd_main,
+from benchmarks.bench_kda_sm90_prefill import (  # noqa: E402
+    main as kda_prefill_main,
 )
 from benchmarks.utils import get_env_info  # noqa: E402
 
@@ -55,20 +54,18 @@ BENCHMARK_MD_DEFAULT = "BENCHMARK_H200.md"
 # ============================================================
 
 
-def run_kda_fused_fwd_benchmarks(has_init_state: bool = False, heads=None, hv=None):
-    """Run bench_kda_fused_fwd.main() with programmatic args and return (fixed, varlen) results."""
-    print("\n>>> Running KDA Fused Forward benchmarks (via bench_kda_fused_fwd.main)...")
+def run_kda_prefill_benchmarks(has_init_state: bool = False, heads=None):
+    """Run bench_kda_sm90_prefill.main() with programmatic args and return (fixed, varlen) results."""
+    print("\n>>> Running SM90 KDA prefill benchmarks (via bench_kda_sm90_prefill.main)...")
     orig_argv = sys.argv
-    argv = ["bench_kda_fused_fwd.py", "--mode", "both"]
+    argv = ["bench_kda_sm90_prefill.py", "--mode", "both"]
     if has_init_state:
         argv.append("--init_state")
     if heads is not None:
         argv += ["--heads", str(heads)]
-    if hv is not None:
-        argv += ["--hv", str(hv)]
     sys.argv = argv
     try:
-        fixed_res, varlen_res = kda_fused_fwd_main()
+        fixed_res, varlen_res = kda_prefill_main()
     finally:
         sys.argv = orig_argv
     return fixed_res, varlen_res
@@ -79,7 +76,7 @@ def run_kda_fused_fwd_benchmarks(has_init_state: bool = False, heads=None, hv=No
 # ============================================================
 
 
-def format_benchmark_md(env, kda_fused_fixed, kda_fused_varlen, has_init_state: bool = False):
+def format_benchmark_md(env, kda_fixed, kda_varlen, has_init_state: bool = False):
     lines = []
     w = lines.append
 
@@ -92,32 +89,32 @@ def format_benchmark_md(env, kda_fused_fixed, kda_fused_varlen, has_init_state: 
     w("")
 
     # -------------------------------------------------------------------
-    # KDA Fused Forward
+    # KDA prefill
     # -------------------------------------------------------------------
-    w("\n## KDA Fused Forward (Kimi Delta Attention)\n")
-    w(f"Fully-fused KDA forward prefill kernel ({_SM_TAG}).\n")
+    w("\n## KDA Prefill (Kimi Delta Attention)\n")
+    w(f"SM90 K1+K2 two-kernel prefill ({_SM_TAG}).\n")
 
     # Fixed-length
-    if kda_fused_fixed:
-        w(f"### Fixed-Length (H={KDA_FUSED_H}, D={KDA_FUSED_D}, bf16)\n")
-        w("| B | T | FLA Triton (ms) | cuLA Fused (ms) | Speedup |")
-        w("|---|---|-----------------|-----------------|---------|")
-        for r in kda_fused_fixed:
+    if kda_fixed:
+        w(f"### Fixed-Length (H={KDA_H}, D={KDA_D}, bf16)\n")
+        w("| B | T | FLA Triton (ms) | cuLA (ms) | Speedup |")
+        w("|---|---|-----------------|-----------|---------|")
+        for r in kda_fixed:
             sp = f"**{r['speedup']:.2f}x**"
             w(f"| {r['B']} | {r['T']} | {r['ms_fla']:.3f} | {r['ms_cula']:.3f} | {sp} |")
 
     # Varlen
-    if kda_fused_varlen:
-        w(f"\n### Variable-Length (H={KDA_FUSED_H}, D={KDA_FUSED_D}, bf16)\n")
-        w("| Config | FLA Triton (ms) | cuLA Fused (ms) | Speedup |")
-        w("|--------|-----------------|-----------------|---------|")
-        for r in kda_fused_varlen:
+    if kda_varlen:
+        w(f"\n### Variable-Length (H={KDA_H}, D={KDA_D}, bf16)\n")
+        w("| Config | FLA Triton (ms) | cuLA (ms) | Speedup |")
+        w("|--------|-----------------|-----------|---------|")
+        for r in kda_varlen:
             tag = r.get("tag", "unknown")
             sp = f"**{r['speedup']:.2f}x**"
             w(f"| {tag} | {r['ms_fla']:.3f} | {r['ms_cula']:.3f} | {sp} |")
 
     # Summary stats
-    all_results = (kda_fused_fixed or []) + (kda_fused_varlen or [])
+    all_results = (kda_fixed or []) + (kda_varlen or [])
     all_sp = [r["speedup"] for r in all_results if r.get("speedup", 0) > 0]
     if all_sp:
         w(
@@ -128,7 +125,7 @@ def format_benchmark_md(env, kda_fused_fixed, kda_fused_varlen, has_init_state: 
     w("To reproduce:\n")
     w("```bash")
     init_state_flag = " --init_state" if has_init_state else ""
-    w(f"python benchmarks/bench_kda_fused_fwd.py --mode both{init_state_flag}")
+    w(f"python benchmarks/bench_kda_sm90_prefill.py --mode both{init_state_flag}")
     w("```\n")
 
     return "\n".join(lines)
@@ -160,13 +157,7 @@ def main():
         "--heads",
         type=int,
         default=None,
-        help="Number of Q/K heads (H) for KDA benchmarks. Default: use bench_kda_fused_fwd default.",
-    )
-    parser.add_argument(
-        "--hv",
-        type=int,
-        default=None,
-        help="Number of V heads (HV) for KDA benchmarks. For GVA, set HV > H with HV %% H == 0.",
+        help="Number of heads (H == HV, MHA) for KDA benchmarks. Default: use bench_kda_sm90_prefill default.",
     )
     args = parser.parse_args()
 
@@ -176,12 +167,10 @@ def main():
         print(f"Loading cached results from {args.cache}")
         with open(args.cache) as f:
             data = json.load(f)
-        kda_fused_fixed = data["kda_fused_fixed"]
-        kda_fused_varlen = data["kda_fused_varlen"]
+        kda_fixed = data["kda_fixed"]
+        kda_varlen = data["kda_varlen"]
     else:
-        kda_fused_fixed, kda_fused_varlen = run_kda_fused_fwd_benchmarks(
-            has_init_state=args.init_state, heads=args.heads, hv=args.hv
-        )
+        kda_fixed, kda_varlen = run_kda_prefill_benchmarks(has_init_state=args.init_state, heads=args.heads)
 
         if args.save_cache:
             cache_path = Path(args.save_cache)
@@ -204,15 +193,15 @@ def main():
             with open(cache_path, "w") as f:
                 json.dump(
                     {
-                        "kda_fused_fixed": sanitize(kda_fused_fixed),
-                        "kda_fused_varlen": sanitize(kda_fused_varlen),
+                        "kda_fixed": sanitize(kda_fixed),
+                        "kda_varlen": sanitize(kda_varlen),
                     },
                     f,
                     indent=2,
                 )
             print(f"Cached results to {cache_path}")
 
-    md = format_benchmark_md(env, kda_fused_fixed, kda_fused_varlen, has_init_state=args.init_state)
+    md = format_benchmark_md(env, kda_fixed, kda_varlen, has_init_state=args.init_state)
 
     output_path = ROOT / (args.output if args.output else BENCHMARK_MD_DEFAULT)
     output_path.write_text(md)
