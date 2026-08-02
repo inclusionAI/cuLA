@@ -20,7 +20,6 @@ import torch
 from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 
 import cula.cudac as cula_cuda
-from cula.ops.qwen35_layout_decode import qwen35_layout_decode_reference
 from cula.qwen35.common import DEFAULT_QWEN35_LINEAR_ATTN_CONFIG as GLOBAL_CONFIG
 from cula.qwen35.common import Qwen35LinearAttentionConfig
 
@@ -104,10 +103,15 @@ def run_case(tokens: int, args, device: torch.device) -> dict[str, float | int]:
         seed=args.seed,
         device=device,
     )
-    q, k, v, a_fla, b_fla = qwen35_layout_decode_reference(mixed, a, b, config=config)
+    qk_width = config.num_k_heads * config.head_k_dim
+    q = mixed[:, :qk_width].view(tokens, config.num_k_heads, config.head_k_dim).contiguous()
+    k = mixed[:, qk_width : 2 * qk_width].view(
+        tokens, config.num_k_heads, config.head_k_dim
+    ).contiguous()
+    v = mixed[:, 2 * qk_width :].view(tokens, config.num_v_heads, config.head_v_dim).contiguous()
     q, k, v = q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1)
-    gate = a_fla.unsqueeze(1)
-    beta = torch.sigmoid(b_fla.float()).unsqueeze(1)
+    gate = a.contiguous().unsqueeze(1)
+    beta = torch.sigmoid(b.float()).unsqueeze(1)
 
     state_cula = torch.empty_like(state)
     out_cula = torch.empty_like(v.squeeze(1))
