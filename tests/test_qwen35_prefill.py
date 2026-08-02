@@ -280,7 +280,8 @@ def test_qwen35_chunk_qk_prefill_sm90_supports_local_tp_shards(local_v_heads: in
     torch.testing.assert_close(out, ref, atol=2e-1, rtol=2e-2)
 
 
-def test_qwen35_fused_kda_prefill_matches_reference():
+@pytest.mark.parametrize("T", [64, 128])
+def test_qwen35_fused_kda_prefill_matches_reference(T: int):
     if not torch.cuda.is_available():
         import pytest
 
@@ -292,10 +293,10 @@ def test_qwen35_fused_kda_prefill_matches_reference():
 
     torch.manual_seed(12)
     device = torch.device("cuda")
-    B, T, HV, K = 1, 64, 48, 128
-    q = torch.randn(B, T, HV, K, device=device, dtype=torch.bfloat16)
+    B, H, HV, K = 1, 16, 48, 128
+    q = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16)
     k = torch.randn_like(q)
-    v = torch.randn_like(q)
+    v = torch.randn(B, T, HV, K, device=device, dtype=torch.bfloat16)
     a = torch.randn(B, T, HV, device=device, dtype=torch.bfloat16)
     b = torch.randn(B, T, HV, device=device, dtype=torch.bfloat16)
     A_log = -torch.rand(HV, device=device, dtype=torch.float32)
@@ -303,8 +304,8 @@ def test_qwen35_fused_kda_prefill_matches_reference():
     initial_state = torch.randn(B, HV, K, K, device=device, dtype=torch.float32) * 0.01
 
     out_ref, state_ref = qwen35_scalar_kda_prefill(
-        q,
-        k,
+        q.repeat_interleave(HV // H, dim=2),
+        k.repeat_interleave(HV // H, dim=2),
         v,
         a,
         b,
