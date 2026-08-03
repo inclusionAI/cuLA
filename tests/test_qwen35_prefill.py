@@ -25,7 +25,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from cula.ops.qwen35_conv1d_prefill import qwen35_conv1d_prefill
 from cula.ops.qwen35_fused_kda_prefill import has_qwen35_fused_kda_prefill, qwen35_fused_kda_prefill
 from cula.ops.qwen35_layout_prefill import qwen35_layout_prefill, qwen35_layout_prefill_reference
-from cula.ops.qwen35_scalar_kda_prefill import qwen35_scalar_kda_prefill
+from cula.ops.qwen35_scalar_kda_prefill import qwen35_scalar_kda_prefill, qwen35_scalar_kda_prefill_core
 from cula.qwen35.common import Qwen35LinearAttentionConfig
 from cula.qwen35.runtime import qwen35_linear_attention_prefill
 
