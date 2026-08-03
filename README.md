@@ -181,8 +181,6 @@ python benchmarks/generate_benchmark_hopper_md.py
 python -m pytest tests/test_kda_sm100_chunk_vs_fla.py -v
 # Tests for modular KDA forward against naive KDA reference
 python -m pytest tests/test_kda_sm100_chunk_vs_naive.py -v
-# Tests for the KDA fused forward (SM90 CUDA C++)
-python -m pytest tests/test_kda_fused_fwd.py -v
 # Tests for the SM90 CuTeDSL two-kernel prefill + intracard CP (vs FLA)
 python -m pytest tests/test_kda_sm90_prefill_vs_fla.py tests/test_kda_sm90_intracard_cp.py -v
 # Tests for Lightning Attention prefill on SM100

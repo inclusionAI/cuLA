@@ -80,10 +80,6 @@ force-sort-within-sections = false
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 "cula/_version.py" = ["UP007"]
-# TODO: fix undefined names (exp_g, chunk_kda_bwd_dqkwg) — WIP code
-"cula/ops/kda/experimental/sm100_fused/kda_fully_fused_wip.py" = ["F821"]
-"cula/ops/kda/experimental/sm100_fused/wrapper.py" = ["F821"]
-
 [tool.setuptools_scm]
 write_to = "cula/_version.py"
 local_scheme = "no-local-version"

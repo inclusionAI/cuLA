@@ -42,7 +42,6 @@ cuLA/
 │       │   │   ├── fwd.py  k1.py  k2.py
 │       │   │   └── cp/                 # driver, planner, pre-scan, merge
 │       │   ├── decode/                 # Single-token, packed, and MTP decode kernels
-│       │   └── experimental/sm100_fused/ # [exp] unwired fully-fused SM100 prototype
 │       ├── lightning/                  # [non-KDA] Lightning prefill/decode kernels
 │       │   ├── prefill.py              # Public SM90/SM100 architecture dispatch
 │       │   ├── prefill_sm90.py         # SM90 validation, compile cache, and TVM-FFI launch
