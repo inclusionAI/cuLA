@@ -48,6 +48,7 @@ template <
     bool UseTF32Inverse_ = true,
     bool RoundingTF32_ = false,
     bool UnifiedGRef_ = false,
+    bool ScalarG_ = false,
     typename ElementBeta_ = float>
 struct KdaChunkFwdIntraMainloopSm100 {
     // ===================== Tile / Buffer Constants =====================
@@ -76,6 +77,7 @@ struct KdaChunkFwdIntraMainloopSm100 {
     // This makes inter and intra A-matrices identical, allowing the intra A-matrix to be skipped entirely.
     // Saves 50% of A-matrix exp2f computation and one TMEM store per k-iteration.
     static constexpr bool UnifiedGRef = UnifiedGRef_;
+    static constexpr bool ScalarG = ScalarG_;
     using ElementBeta = ElementBeta_;
 
     // double buffer in TMEM, overlap prologue A matrix with MMA
@@ -194,12 +196,25 @@ struct KdaChunkFwdIntraMainloopSm100 {
         GmemLayoutAtom{},
         Layout<Shape<_1, Int<kGmemElemsPerStore>>>{}));  // Val layout, 8 or 16 vals per store
 
+    struct VectorGateStorage {
+        array_aligned<float, cosize_v<SmemLayoutInputFP32>> g[StagesLoad];
+    };
+
+    struct ScalarGateStorage {
+        // Four identical floats per row preserve the float4 load contract of
+        // the existing helpers while all logical K columns alias this record.
+        array_aligned<float, TileT * 4> g[StagesAcc];
+    };
+
+    using GateStorage = std::conditional_t<ScalarG, ScalarGateStorage, VectorGateStorage>;
+
     // ===================== Shared Memory Plan =====================
     struct SharedMemoryPlan {
-        // Q, K, G double buffer
+        // Q/K use the TMA pipeline. Generic vector-G keeps a matching staged
+        // matrix; Qwen scalar-G keeps four duplicated floats per token row.
         array_aligned<ku::bf16, cosize_v<SmemLayoutInputBF16>> q[StagesLoad];  // 12KB
         array_aligned<ku::bf16, cosize_v<SmemLayoutInputBF16>> k[StagesLoad];  // 12KB
-        array_aligned<float, cosize_v<SmemLayoutInputFP32>> g[StagesLoad];     // 24KB
+        GateStorage gate;
 
         // Gated MMA K^T, double buffer
         struct {
@@ -331,6 +346,13 @@ struct KdaChunkFwdIntraMainloopSm100 {
             int seq_len = cu_seqlens_ptr[batch_idx + 1] - cu_seqlens_ptr[batch_idx];
             int sub_seq_len = min(TileT, seq_len - tile_idx * TileT);
 
+            // The Qwen specialization publishes compact scalar-g together
+            // with beta. Keep this stage until the tile epilogue so all four
+            // K slices can consume the expanded shared views.
+            if constexpr (ScalarG) {
+                beta_pipeline.consumer_wait(beta_pipe_state_read);
+            }
+
             constexpr int kg_offset = SubTileT * TileK;  // stride between sub_tile buffers
 
             CUTE_NO_UNROLL
@@ -345,7 +367,16 @@ struct KdaChunkFwdIntraMainloopSm100 {
                 // Step 2: Create SMEM tensor views for this buffer slot
                 // ============================================================
                 Tensor sK = make_tensor(make_smem_ptr(shared_plan->k[buf_load_idx].data()), SmemLayoutInputBF16{});
-                Tensor sG = make_tensor(make_smem_ptr(shared_plan->g[buf_load_idx].data()), SmemLayoutInputFP32{});
+                auto sG = [&]() {
+                    if constexpr (ScalarG) {
+                        return ScalarGateView{
+                            shared_plan->gate.g[beta_pipe_state_read.index()].data()};
+                    } else {
+                        return make_tensor(
+                            make_smem_ptr(shared_plan->gate.g[buf_load_idx].data()),
+                            SmemLayoutInputFP32{});
+                    }
+                }();
 
                 qkg_inter_pipeline.producer_acquire(qkg_inter_pipe_state_write);
                 int buf_idx = qkg_inter_pipe_state_write.index();
@@ -484,7 +515,9 @@ struct KdaChunkFwdIntraMainloopSm100 {
             // and beta data before waiting for MMA, overlapping independent waits.
             kk_inv_pipeline.producer_acquire(kk_inv_pipe_state_write);
 
-            beta_pipeline.consumer_wait(beta_pipe_state_read);
+            if constexpr (!ScalarG) {
+                beta_pipeline.consumer_wait(beta_pipe_state_read);
+            }
 
             qk_done_pipeline.consumer_wait(qk_done_pipe_state_read);
             int buf_acc_idx = qk_done_pipe_state_read.index();
@@ -729,8 +762,15 @@ struct KdaChunkFwdIntraMainloopSm100 {
                     make_coord(token_offset, _0{}, _0{}), tma_params.tma_q.get_tma_tensor(tma_params.shape_qk));
                 Tensor mK = domain_offset(
                     make_coord(token_offset, _0{}, _0{}), tma_params.tma_k.get_tma_tensor(tma_params.shape_qk));
-                Tensor mG = domain_offset(
-                    make_coord(token_offset, _0{}, _0{}), tma_params.tma_g.get_tma_tensor(tma_params.shape_vg));
+                auto mG = [&]() {
+                    if constexpr (ScalarG) {
+                        return 0;
+                    } else {
+                        return domain_offset(
+                            make_coord(token_offset, _0{}, _0{}),
+                            tma_params.tma_g.get_tma_tensor(tma_params.shape_vg));
+                    }
+                }();
 
                 // TMA load body (Q, K, G — unified pipeline, single barrier per stage)
                 CUTE_NO_UNROLL
@@ -738,20 +778,28 @@ struct KdaChunkFwdIntraMainloopSm100 {
                     int buf_idx = qkg_load_pipe_state_write.index();
                     Tensor sQ = make_tensor(make_smem_ptr(shared_plan->q[buf_idx].data()), SmemLayoutInputBF16{});
                     Tensor sK = make_tensor(make_smem_ptr(shared_plan->k[buf_idx].data()), SmemLayoutInputBF16{});
-                    Tensor sG = make_tensor(make_smem_ptr(shared_plan->g[buf_idx].data()), SmemLayoutInputFP32{});
 
-                    // GVA: K and Q are sliced by qk_head_idx; G is sliced by head_idx (v-head).
+                    // GVA: K and Q are sliced by qk_head_idx. Generic vector-G
+                    // is sliced by v-head; Qwen scalar-G arrives via the aux
+                    // pipeline and therefore has no TMA transfer here.
                     Tensor gK = local_tile(
                         mK(_, _, qk_head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, k_idx));
-                    Tensor gG = local_tile(
-                        mG(_, _, head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, k_idx));
                     Tensor gQ = local_tile(
                         mQ(_, _, qk_head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, k_idx));
 
                     // Single acquire for all three TMA copies
                     qkg_load_pipeline.producer_acquire(qkg_load_pipe_state_write);
                     auto& barrier = *qkg_load_pipeline.producer_get_barrier(qkg_load_pipe_state_write);
-                    ku::launch_tma_copy(tma_params.tma_g, gG, sG, barrier);
+                    if constexpr (!ScalarG) {
+                        Tensor sG = make_tensor(
+                            make_smem_ptr(shared_plan->gate.g[buf_idx].data()),
+                            SmemLayoutInputFP32{});
+                        Tensor gG = local_tile(
+                            mG(_, _, head_idx),
+                            make_shape(Int<TileT>{}, Int<TileK>{}),
+                            make_coord(tile_idx, k_idx));
+                        ku::launch_tma_copy(tma_params.tma_g, gG, sG, barrier);
+                    }
                     ku::launch_tma_copy(tma_params.tma_k, gK, sK, barrier);
                     ku::launch_tma_copy(tma_params.tma_q, gQ, sQ, barrier);
                     ++qkg_load_pipe_state_write;
@@ -911,11 +959,22 @@ struct KdaChunkFwdIntraMainloopSm100 {
             // Beta loading body
             beta_pipeline.producer_acquire(beta_pipe_state_write);
             if (thread_idx < TileT) {
+                const int token = token_offset + tile_idx * TileT + thread_idx;
                 shared_plan->beta_smem[beta_pipe_state_write.index()][thread_idx] =
                     (thread_idx < sub_seq_len)
-                        ? float(reinterpret_cast<ElementBeta*>(
-                              params.beta_ptr)[(token_offset + tile_idx * TileT + thread_idx) * params.h_v + head_idx])
+                        ? float(reinterpret_cast<ElementBeta*>(params.beta_ptr)[token * params.h_v + head_idx])
                         : float(0);
+                if constexpr (ScalarG) {
+                    const float gate =
+                        (thread_idx < sub_seq_len)
+                            ? reinterpret_cast<const float*>(params.g_ptr)[token * params.h_v + head_idx]
+                            : 0.0f;
+                    float* gate4 = shared_plan->gate.g[beta_pipe_state_write.index()].data() + thread_idx * 4;
+                    gate4[0] = gate;
+                    gate4[1] = gate;
+                    gate4[2] = gate;
+                    gate4[3] = gate;
+                }
             }
             fence_view_async_shared();
             beta_pipeline.producer_commit(beta_pipe_state_write);

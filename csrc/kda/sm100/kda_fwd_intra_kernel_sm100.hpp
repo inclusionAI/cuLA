@@ -129,7 +129,9 @@ struct KdaChunkFwdIntraKernelSm100 {
         if (warp_idx == 0 && lane_predicate) {
             cute::prefetch_tma_descriptor(tma_params.tma_q.get_tma_descriptor());
             cute::prefetch_tma_descriptor(tma_params.tma_k.get_tma_descriptor());
-            cute::prefetch_tma_descriptor(tma_params.tma_g.get_tma_descriptor());
+            if constexpr (!Mainloop::ScalarG) {
+                cute::prefetch_tma_descriptor(tma_params.tma_g.get_tma_descriptor());
+            }
         }
 
         // Allocate TMEM (warp 0 only)
@@ -144,9 +146,10 @@ struct KdaChunkFwdIntraKernelSm100 {
 
         // === Unified TMA load pipeline: Q + K + G ===
         typename PipelineQKG::Params qkg_load_pipe_params;
-        qkg_load_pipe_params.transaction_bytes = sizeof(ku::bf16) * cosize_v<SmemLayoutInputBF16> +  // Q
-                                                 sizeof(ku::bf16) * cosize_v<SmemLayoutInputBF16> +  // K
-                                                 sizeof(float) * cosize_v<SmemLayoutInputFP32>;      // G
+        qkg_load_pipe_params.transaction_bytes =
+            sizeof(ku::bf16) * cosize_v<SmemLayoutInputBF16> +  // Q
+            sizeof(ku::bf16) * cosize_v<SmemLayoutInputBF16> +  // K
+            (Mainloop::ScalarG ? 0 : sizeof(float) * cosize_v<SmemLayoutInputFP32>);
         qkg_load_pipe_params.is_leader = lane_predicate && (role == WarpRole::Load);
         qkg_load_pipe_params.num_consumers = NumCudaCoreThreads;
 
@@ -337,10 +340,16 @@ run_kda_fwd_intra_sm100_impl_dispatch(KDA_fwd_intra_params& params, cudaStream_t
         make_tensor(make_gmem_ptr((ku::bf16*)params.k_ptr), make_layout(shape_QK, stride_QK)),
         typename Kernel::SmemLayoutInputBF16{});
 
-    auto tma_G = cute::make_tma_copy(
-        SM90_TMA_LOAD{},
-        make_tensor(make_gmem_ptr((float*)params.g_ptr), make_layout(shape_VG, stride_VG)),
-        typename Kernel::SmemLayoutInputFP32{});
+    auto tma_G = [&]() {
+        if constexpr (Kernel::Mainloop::ScalarG) {
+            return 0;
+        } else {
+            return cute::make_tma_copy(
+                SM90_TMA_LOAD{},
+                make_tensor(make_gmem_ptr((float*)params.g_ptr), make_layout(shape_VG, stride_VG)),
+                typename Kernel::SmemLayoutInputFP32{});
+        }
+    }();
 
     // --- Pack TMA params ---
     typename Kernel::
@@ -374,11 +383,30 @@ run_kda_fwd_intra_sm100_impl(KDA_fwd_intra_params& params, cudaStream_t stream) 
             BOOL_SWITCH(params.unified_gref, kUnifiedGRef, [&] {
                 // Currently we hardcode RoundingTF32=false to align with FLA implementation, the precision is enough
                 using Kernel = KdaChunkFwdIntraKernelSm100<
-                    KdaChunkFwdIntraMainloopSm100<kUseTF32Inverse, /*RoundingTF32=*/false, kUnifiedGRef, BetaType>>;
+                    KdaChunkFwdIntraMainloopSm100<
+                        kUseTF32Inverse,
+                        /*RoundingTF32=*/false,
+                        kUnifiedGRef,
+                        /*ScalarG=*/false,
+                        BetaType>>;
                 run_kda_fwd_intra_sm100_impl_dispatch<Kernel>(params, stream);
             });
         });
     });
+}
+
+// Qwen GDN uses one scalar gate per token/value-head. Keep this entrypoint
+// separate from the public vector-G dispatcher so the generic ABI and its
+// template combinations remain unchanged.
+inline void
+run_kda_fwd_intra_sm100_qwen_scalar_g_impl(KDA_fwd_intra_params& params, cudaStream_t stream) {
+    using Kernel = KdaChunkFwdIntraKernelSm100<KdaChunkFwdIntraMainloopSm100<
+        /*UseTF32Inverse=*/false,
+        /*RoundingTF32=*/false,
+        /*UnifiedGRef=*/true,
+        /*ScalarG=*/true,
+        float>>;
+    run_kda_fwd_intra_sm100_impl_dispatch<Kernel>(params, stream);
 }
 
 }  // namespace kda::sm100
