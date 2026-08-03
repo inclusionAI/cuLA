@@ -63,4 +63,51 @@ INSTANTIATE_GBAI(true, true, true, true, bf16);
 
 #undef INSTANTIATE_GBAI
 
+// Qwen scalar-G specialization: compact alpha [T, HV] and external state
+// buffers in contiguous [K, V] layout. Keep this separate from the generic
+// vector-alpha instantiations above.
+template void
+launch_kda_fwd_prefill_kernel_gbai<
+    true, true, false, true, cutlass::arch::Sm90, bf16, bf16, float, float, true, true, true>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    float const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t);
+
+template void
+launch_kda_fwd_prefill_kernel_gbai<
+    true, true, true, true, cutlass::arch::Sm90, bf16, bf16, float, float, true, true, true>(
+    cudaStream_t,
+    bf16*,
+    float*,
+    bf16 const*,
+    bf16 const*,
+    bf16 const*,
+    float const*,
+    float const*,
+    float const*,
+    int32_t const*,
+    uint8_t*,
+    int32_t,
+    int32_t,
+    int32_t,
+    int32_t,
+    int64_t,
+    float,
+    int32_t);
+
 }  // namespace kda::sm90

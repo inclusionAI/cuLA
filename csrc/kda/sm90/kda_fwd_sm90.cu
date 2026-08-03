@@ -22,6 +22,7 @@
 namespace kda::sm90 {
 
 using namespace cute;
+using bf16 = cute::bfloat16_t;
 
 // Forward declaration of the per-variant launcher (defined in .cuh, instantiated in separate TUs)
 template <
@@ -33,7 +34,10 @@ template <
     typename TO,
     typename TQKV,
     typename TState,
-    typename TBeta = float>
+    typename TBeta = float,
+    bool ScalarAlpha = false,
+    bool StateKVLayout = false,
+    bool SplitValueDim = false>
 void
 launch_kda_fwd_prefill_kernel_gbai(
     cudaStream_t stream,
@@ -57,6 +61,72 @@ launch_kda_fwd_prefill_kernel_gbai(
     int32_t const* cp_seq_map,
     int32_t const* raw_cu_seqlens,
     int32_t raw_num_seqs);
+
+void
+launch_qwen35_scalar_kda_fwd_prefill_kernel(
+    cudaStream_t stream,
+    void* output,
+    float* output_state,
+    void const* q,
+    void const* k,
+    void const* v,
+    float const* input_state,
+    float const* alpha,
+    float const* beta,
+    int32_t const* cu_seqlens,
+    uint8_t* workspace_buffer,
+    int32_t num_seqs,
+    int32_t num_qk_heads,
+    int32_t num_v_heads,
+    int32_t head_size,
+    int64_t total_seqlen,
+    float scale,
+    bool has_initial_state,
+    int32_t sm_count) {
+    if (has_initial_state) {
+        launch_kda_fwd_prefill_kernel_gbai<
+            true, true, true, true, cutlass::arch::Sm90, bf16, bf16, float, float, true, true, true>(
+            stream,
+            static_cast<bf16*>(output),
+            output_state,
+            static_cast<bf16 const*>(q),
+            static_cast<bf16 const*>(k),
+            static_cast<bf16 const*>(v),
+            input_state,
+            alpha,
+            beta,
+            cu_seqlens,
+            workspace_buffer,
+            num_seqs,
+            num_qk_heads,
+            num_v_heads,
+            head_size,
+            total_seqlen,
+            scale,
+            sm_count);
+    } else {
+        launch_kda_fwd_prefill_kernel_gbai<
+            true, true, false, true, cutlass::arch::Sm90, bf16, bf16, float, float, true, true, true>(
+            stream,
+            static_cast<bf16*>(output),
+            output_state,
+            static_cast<bf16 const*>(q),
+            static_cast<bf16 const*>(k),
+            static_cast<bf16 const*>(v),
+            nullptr,
+            alpha,
+            beta,
+            cu_seqlens,
+            workspace_buffer,
+            num_seqs,
+            num_qk_heads,
+            num_v_heads,
+            head_size,
+            total_seqlen,
+            scale,
+            sm_count);
+    }
+}
 
 template <
     typename ArchTag,  // TODO: hide this
@@ -131,8 +201,6 @@ launch_kda_fwd_prefill_kernel(
 
 #undef LAUNCH
 }
-
-using bf16 = cute::bfloat16_t;
 
 // TBeta=float (default)
 template void
