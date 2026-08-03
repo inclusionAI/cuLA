@@ -191,6 +191,31 @@ qwen35_scalar_kda_prefill(
 }
 
 void
+qwen35_scalar_kda_prefill_core(
+    at::Tensor q,
+    at::Tensor k,
+    at::Tensor v,
+    at::Tensor g,
+    at::Tensor beta,
+    at::Tensor initial_state,
+    at::Tensor cu_seqlens,
+    at::Tensor out,
+    at::Tensor final_state) {
+    cula::qwen35::prefill::ScalarKdaPrefillCoreParams params{
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state,
+        cu_seqlens,
+        out,
+        final_state,
+    };
+    cula::qwen35::prefill::run_qwen35_scalar_kda_prefill_core(params);
+}
+
+void
 qwen35_layout_prefill(
     at::Tensor mixed_qkv_conv,
     at::Tensor a,
@@ -250,5 +275,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("qwen35_layout_scalar_kda_decode", &qwen35_layout_scalar_kda_decode);
     m.def("qwen35_layout_prefill", &qwen35_layout_prefill);
     m.def("qwen35_scalar_kda_prefill", &qwen35_scalar_kda_prefill);
+    m.def("qwen35_scalar_kda_prefill_core", &qwen35_scalar_kda_prefill_core);
     m.def("qwen35_chunk_qk_prefill_sm90", &qwen35_chunk_qk_prefill_sm90);
 }
