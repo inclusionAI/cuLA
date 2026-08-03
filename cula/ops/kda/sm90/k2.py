@@ -348,6 +348,8 @@ def k2_kernel(
                 cute.copy(tma_atom_v, tVg_seq[(None, t, 0, head_idx)], tVs_seq[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             else:
                 cute.copy(tma_atom_v, tVg[(None, tg_l, 0, head_idx)], tVs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
+            # Restore the byte-identical K_INTER images produced by K1. The
+            # raw-workspace transport idea is credited there to Flash-Flash-KDA.
             cute.copy(raw_copy_atom, gKD_raw[(None, wt_l)], sKD_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
             cute.copy(raw_copy_atom, gQD_raw[(None, wt_l)], sQD_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
             cute.copy(raw_copy_atom, gKR_raw[(None, wt_l)], sKR_raw[(None, s_dyn_l)], mbar_ptr=bar_l)

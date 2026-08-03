@@ -107,6 +107,7 @@ def run_cula(q, k, v, g, beta, scale, A_log, dt_bias, init_state, cu_seqlens, lo
         use_gate_in_kernel=True,
         safe_gate=True,
         lower_bound=lower_bound,
+        use_intracard_cp=False,
     )
 
 

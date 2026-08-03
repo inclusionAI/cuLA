@@ -48,16 +48,14 @@ LOAD_WARP_IDX = 4
 def pre_scan_kernel(
     tma_atom_v: cute.CopyAtom,
     tma_tensor_v: cute.Tensor,
-    tma_atom_kd: cute.CopyAtom,
-    tma_tensor_kd: cute.Tensor,
-    tma_atom_kr: cute.CopyAtom,
-    tma_tensor_kr: cute.Tensor,
     tma_atom_inv: cute.CopyAtom,
     tma_tensor_inv: cute.Tensor,
     tma_atom_gt: cute.CopyAtom,
     tma_tensor_gt: cute.Tensor,
     tma_atom_beta: cute.CopyAtom,
     tma_tensor_beta: cute.Tensor,
+    ws_kd: cute.Tensor,
+    ws_kr: cute.Tensor,
     H: cutlass.Constexpr[int],
     total_tiles: cutlass.Int32,
     T_total: cutlass.Int32,
@@ -118,22 +116,6 @@ def pre_scan_kernel(
         cute.group_modes(sV, 0, 2),
         cute.group_modes(gSrc_v, 0, 2),
     )
-    gSrc_kd = cute.local_tile(tma_tensor_kd, (CHUNK, D), (None, None, None))
-    tKDs, tKDg = cpasync.tma_partition(
-        tma_atom_kd,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(sKd, 0, 2),
-        cute.group_modes(gSrc_kd, 0, 2),
-    )
-    gSrc_kr = cute.local_tile(tma_tensor_kr, (CHUNK, D), (None, None, None))
-    tKRs, tKRg = cpasync.tma_partition(
-        tma_atom_kr,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(sKr, 0, 2),
-        cute.group_modes(gSrc_kr, 0, 2),
-    )
     gSrc_inv = cute.local_tile(tma_tensor_inv, (CHUNK, CHUNK), (None, None, None))
     tIs, tIg = cpasync.tma_partition(
         tma_atom_inv,
@@ -158,6 +140,19 @@ def pre_scan_kernel(
         cute.group_modes(sBeta, 0, 2),
         cute.group_modes(gSrc_beta, 0, 2),
     )
+    raw_copy_atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), cutlass.BFloat16)
+    raw_stage_layout = cute.make_layout(
+        (CHUNK * D, STAGES),
+        stride=(1, CHUNK * D),
+    )
+    raw_gmem_layout = cute.make_layout(
+        (CHUNK * D, total_tiles * H),
+        stride=(1, CHUNK * D),
+    )
+    sKD_raw = cute.make_tensor(sKd.iterator, raw_stage_layout)
+    sKR_raw = cute.make_tensor(sKr.iterator, raw_stage_layout)
+    gKD_raw = cute.make_tensor(ws_kd.iterator, raw_gmem_layout)
+    gKR_raw = cute.make_tensor(ws_kr.iterator, raw_gmem_layout)
 
     # sState=0, sM=I
     if tidx < D:
@@ -273,8 +268,8 @@ def pre_scan_kernel(
                 cute.copy(tma_atom_v, tVg_seq[(None, t, 0, head_idx)], tVs_seq[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             else:
                 cute.copy(tma_atom_v, tVg[(None, tg_l, 0, head_idx)], tVs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
-            cute.copy(tma_atom_kd, tKDg[(None, 0, 0, wt_l)], tKDs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
-            cute.copy(tma_atom_kr, tKRg[(None, 0, 0, wt_l)], tKRs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
+            cute.copy(raw_copy_atom, gKD_raw[(None, wt_l)], sKD_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
+            cute.copy(raw_copy_atom, gKR_raw[(None, wt_l)], sKR_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
             cute.copy(tma_atom_inv, tIg[(None, 0, 0, wt_l)], tIs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             cute.copy(tma_atom_gt, tGTg[(None, 0, 0, wt_l)], tGTs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             cute.copy(tma_atom_beta, tBg[(None, 0, 0, wt_l)], tBs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
@@ -487,13 +482,6 @@ def run_pre_scan(
         )
         return cpasync.make_tiled_tma_atom(op, view, kinter_smem, (CHUNK, D))
 
-    def make_ws_qkd_atom(t):
-        view = cute.make_tensor(
-            t.iterator,
-            cute.make_layout((CHUNK, D, total_tiles * H), stride=(D, 1, CHUNK * D)),
-        )
-        return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), view, kinter_smem, (CHUNK, D))
-
     def make_ws_cc_atom(t):
         view = cute.make_tensor(
             t.iterator,
@@ -502,8 +490,6 @@ def run_pre_scan(
         return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), view, cc_smem, (CHUNK, CHUNK))
 
     tma_atom_v, tma_tensor_v = make_thd_atom(v, cpasync.CopyBulkTensorTileG2SOp())
-    tma_atom_kd, tma_tensor_kd = make_ws_qkd_atom(ws_kd)
-    tma_atom_kr, tma_tensor_kr = make_ws_qkd_atom(ws_kr)
     tma_atom_inv, tma_tensor_inv = make_ws_cc_atom(ws_inv)
 
     gt_smem = cute.make_layout((D, 1), stride=(1, D))
@@ -551,16 +537,14 @@ def run_pre_scan(
     pre_scan_kernel(
         tma_atom_v,
         tma_tensor_v,
-        tma_atom_kd,
-        tma_tensor_kd,
-        tma_atom_kr,
-        tma_tensor_kr,
         tma_atom_inv,
         tma_tensor_inv,
         tma_atom_gt,
         tma_tensor_gt,
         tma_atom_beta,
         tma_tensor_beta,
+        ws_kd,
+        ws_kr,
         H,
         total_tiles,
         T_total,

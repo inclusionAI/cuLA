@@ -519,7 +519,8 @@ def k1_kernel(
     cute.arch.barrier()
 
     # Preserve the physical K_INTER byte image for qd/kd/kr; inv/mqk remain
-    # layout-aware tensor TMA stores.
+    # layout-aware tensor TMA stores. This raw-workspace transport idea comes
+    # from Flash-Flash-KDA: https://github.com/Itssshikhar/Flash-Flash-KDA
     if warp_idx == 0:
         # CuTeDSL 4.6 elects the issuing lane inside direct bulk-copy atoms.
         cute.copy(raw_copy_atom, sQDws_raw, gQDws_raw[(None, ws_slot)])
