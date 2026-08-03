@@ -86,6 +86,9 @@ launch_kda_fwd_prefill_kernel_gbai<
     int32_t,
     int64_t,
     float,
+    int32_t,
+    int32_t const*,
+    int32_t const*,
     int32_t);
 
 template void
@@ -108,6 +111,9 @@ launch_kda_fwd_prefill_kernel_gbai<
     int32_t,
     int64_t,
     float,
+    int32_t,
+    int32_t const*,
+    int32_t const*,
     int32_t);
 
 }  // namespace kda::sm90

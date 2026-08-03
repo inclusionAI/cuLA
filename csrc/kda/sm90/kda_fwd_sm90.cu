@@ -103,7 +103,10 @@ launch_qwen35_scalar_kda_fwd_prefill_kernel(
             head_size,
             total_seqlen,
             scale,
-            sm_count);
+            sm_count,
+            nullptr,
+            nullptr,
+            num_seqs);
     } else {
         launch_kda_fwd_prefill_kernel_gbai<
             true, true, false, true, cutlass::arch::Sm90, bf16, bf16, float, float, true, true, true>(
@@ -124,7 +127,10 @@ launch_qwen35_scalar_kda_fwd_prefill_kernel(
             head_size,
             total_seqlen,
             scale,
-            sm_count);
+            sm_count,
+            nullptr,
+            nullptr,
+            num_seqs);
     }
 }
 
