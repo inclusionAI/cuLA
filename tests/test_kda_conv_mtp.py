@@ -365,6 +365,27 @@ def test_conv_mtp_auto_dispatch(N):
 
 
 # --------------------------------------------------------------------------- #
+# Invalid public-API inputs must fail before deriving the launch grid from N.
+# --------------------------------------------------------------------------- #
+def test_conv_mtp_rejects_nonpositive_T():
+    N, input_T, H, HV, K, V = 1, 2, 8, 8, 128, 128
+    inp = _make_inputs(N, input_T, H, HV, K, V, "safe", seed=50)
+
+    with pytest.raises(ValueError, match="T must be positive, got 0"):
+        _run_cula(inp, N, 0, H, HV, K, V, K**-0.5, -5.0, "auto")
+
+
+def test_conv_mtp_rejects_nondivisible_mixed_qkv_rows():
+    N, T, H, HV, K, V = 2, 4, 8, 8, 128, 128
+    inp = _make_inputs(N, T, H, HV, K, V, "safe", seed=51)
+    inp["mixed_qkv"] = torch.cat((inp["mixed_qkv"], inp["mixed_qkv"][:1]), dim=0)
+    assert inp["mixed_qkv"].shape[0] == N * T + 1
+
+    with pytest.raises(ValueError, match="mixed_qkv rows 9 must be divisible by T=4"):
+        _run_cula(inp, N, T, H, HV, K, V, K**-0.5, -5.0, "auto")
+
+
+# --------------------------------------------------------------------------- #
 # determinism: identical inputs must give bit-identical outputs across runs.
 # A residual race (e.g. on the shared conv_state) would surface as non-determinism.
 # --------------------------------------------------------------------------- #

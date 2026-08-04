@@ -1281,6 +1281,10 @@ def kda_conv_decode_mtp_verify(
 ):
     H, HV, K, V = num_q_heads, num_v_heads, head_k_dim, head_v_dim
     seq_len, D = mixed_qkv.shape
+    if T <= 0:
+        raise ValueError(f"T must be positive, got {T}")
+    if seq_len % T != 0:
+        raise ValueError(f"mixed_qkv rows {seq_len} must be divisible by T={T}")
     N = seq_len // T
     assert K == TILE_K, f"requires K={TILE_K}, got {K}"
     assert D == 2 * H * K + HV * V, f"packed dim mismatch: {D} vs {2 * H * K + HV * V}"
