@@ -1,8 +1,10 @@
 import os
+import re
 import subprocess
 import tarfile
 from pathlib import Path
 
+import torch
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import (
     CUDA_HOME,
@@ -265,6 +267,15 @@ def get_nvcc_thread_args():
     return ["--threads", nvcc_threads]
 
 
+def get_torch_version_tag() -> str:
+    match = re.match(r"^(\d+)\.(\d+)", torch.__version__)
+    if match is None:
+        raise RuntimeError(f"Cannot parse PyTorch version: {torch.__version__}")
+
+    major, minor = match.groups()
+    return f"torch{int(major)}{int(minor):02d}"
+
+
 download_cutlass()
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -334,6 +345,7 @@ ext_modules.append(
 )
 
 CUDA_VERSION_TAG = f"cu{NVCC_MAJOR}{NVCC_MINOR}"
+TORCH_VERSION_TAG = get_torch_version_tag()
 
 _long_description = ""
 _readme_path = Path(this_dir) / "README.md"
@@ -341,7 +353,7 @@ if _readme_path.exists():
     _long_description = _readme_path.read_text(encoding="utf-8")
 
 setup(
-    name=f"ant-cula-{CUDA_VERSION_TAG}",
+    name=f"ant-cula-{TORCH_VERSION_TAG}-{CUDA_VERSION_TAG}",
     description="cuLA CUDA extension",
     long_description=_long_description,
     long_description_content_type="text/markdown",
@@ -349,8 +361,8 @@ setup(
     license="Apache-2.0",
     python_requires=">=3.10",
     install_requires=[
-        "nvidia-cutlass-dsl==4.4.2",
-        "apache-tvm-ffi==0.1.9",
+        "nvidia-cutlass-dsl>=4.4.2,<4.7,!=4.5.0",
+        "apache-tvm-ffi>=0.1.9",
     ],
     extras_require={
         "dev": [
@@ -363,6 +375,7 @@ setup(
     cmdclass={"build_ext": BuildExtension},
     use_scm_version={
         "write_to": "cula/_version.py",
+        "version_scheme": "no-guess-dev",
         "local_scheme": "node-and-date",
         "fallback_version": "0.1.0",
     },

@@ -26,3 +26,7 @@ tmp
 
 .claude/settings.json
 cula/_version.py
+/csrc/cutlass/
+/csrc/cutlass.tar.gz
+/csrc/cutlass.zip
+/csrc/cutlass_extract/
