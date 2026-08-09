@@ -74,3 +74,25 @@ benchmark set.
   inputs.  This cuLA result is a complete CP-off prefill A/B on a different
   GPU and workload mix; it is therefore a comparable direction-of-gain
   check, not an exact reproduction of those percentages.
+
+## Nsight Compute spot check
+
+NCU 2025.3.0 (`--set full`, `--launch-count 2`, filtering the generated K1/K2
+names) profiled the first fixed shape, B=1, T=512, H=64.  The six `ctc__*`
+metrics were unavailable on this H200 setup, but the kernel duration and
+L1-TEX/XBAR counters below were collected in both reports.
+
+| Metric | Baseline | Optimized | Change |
+|---|---:|---:|---:|
+| K1 GPU duration | 41.152 us | 27.680 us | **-32.7%** |
+| K2 GPU duration | 76.416 us | 75.072 us | **-1.8%** |
+| K1 + K2 duration | 117.568 us | 102.752 us | **-12.6%** |
+| K1 global-op-TMA-store XBAR bytes | 52.43 MB | 27.26 MB | **-48.0%** |
+| K2 global-op-TMA-load XBAR bytes | 70.32 MB | 45.15 MB | **-35.8%** |
+
+These counters show the same signature as the latency A/B: the main saving is
+in K1's workspace stores, while K2's total duration changes little because
+the recurrence and retained TMA loads remain unchanged.  NCU does not expose
+the internal TensorMap segment count directly, so the evidence is the
+observable duration and transport counters rather than an inferred segment
+number.
