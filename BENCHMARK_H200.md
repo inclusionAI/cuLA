@@ -1,8 +1,8 @@
 # Benchmark Results — Hopper (SM90)
 
-> Measured on 2026-08-09 in `aistudio-62030340-ssctl`.
+> Measured on 2026-08-09.
 
-> **GPU:** NVIDIA H200 141GB, 132 SMs (device alias: `NVIDIA L20X`)  |  **CUDA:** 12.9  |  **PyTorch:** 2.9.1+cu129  |  **Triton:** 3.5.1
+> **GPU:** NVIDIA H200 141GB, 132 SMs  |  **CUDA:** 12.9  |  **PyTorch:** 2.9.1+cu129  |  **Triton:** 3.5.1
 
 > FLA baseline: [flash-linear-attention v0.5.0](https://github.com/fla-org/flash-linear-attention/releases/tag/v0.5.0)
 
