@@ -4,7 +4,8 @@
 """Shared low-level helpers for the SM90 FlashKDA kernels."""
 
 import re
-from importlib.metadata import PackageNotFoundError, version as package_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 
 import cutlass
 import cutlass.cute as cute
