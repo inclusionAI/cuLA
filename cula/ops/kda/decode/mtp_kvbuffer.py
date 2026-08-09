@@ -1097,8 +1097,8 @@ def kda_decode_mtp_shuffle_kvbuffer(
 #   C/D [16,8] f32:     c0=C[gid][2tig] c1=C[gid][2tig+1] c2=C[gid+8][2tig] c3=C[gid+8][2tig+1]
 # ===========================================================================
 
-from cutlass._mlir.dialects import arith as _arith  # noqa: E402
-from cutlass._mlir.dialects import llvm as _llvm  # noqa: E402
+from cula.ops._mlir_compat import arith as _arith  # noqa: E402
+from cula.ops._mlir_compat import llvm as _llvm  # noqa: E402
 from cutlass.cutlass_dsl import T as _T  # noqa: E402
 from cutlass.cutlass_dsl import dsl_user_op  # noqa: E402
 

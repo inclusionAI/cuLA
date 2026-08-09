@@ -6,7 +6,7 @@
 import cutlass
 import torch
 from cutlass import Int32
-from cutlass._mlir.dialects import llvm as _llvm
+from cula.ops._mlir_compat import llvm as _llvm
 from cutlass.cutlass_dsl import T as _T
 
 

@@ -27,7 +27,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 import torch.nn.functional as F
 import triton
-from cutlass._mlir.dialects import llvm as _llvm
+from cula.ops._mlir_compat import llvm as _llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Float32, Int32, Int64

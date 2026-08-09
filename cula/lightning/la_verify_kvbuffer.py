@@ -49,8 +49,8 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass._mlir.dialects import arith as _arith
-from cutlass._mlir.dialects import llvm as _llvm
+from cula.ops._mlir_compat import arith as _arith
+from cula.ops._mlir_compat import llvm as _llvm
 from cutlass.cute.runtime import (
     make_fake_compact_tensor,
     make_fake_stream,

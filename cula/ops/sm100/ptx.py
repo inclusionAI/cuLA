@@ -55,10 +55,10 @@ __all__ = [
 
 import cutlass
 import cutlass.cute as cute
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import arith as _arith
-from cutlass._mlir.dialects import llvm
-from cutlass._mlir.dialects import nvvm as _nvvm
+from cula.ops._mlir_compat import arith as _arith
+from cula.ops._mlir_compat import ir
+from cula.ops._mlir_compat import llvm
+from cula.ops._mlir_compat import nvvm as _nvvm
 from cutlass.cute.arch import elect_one
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.typing import Int32
