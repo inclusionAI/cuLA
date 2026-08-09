@@ -16,10 +16,11 @@
 
 import cutlass
 import cutlass.cute as cute
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import arith as _arith
-from cutlass._mlir.dialects import llvm as _llvm
-from cutlass._mlir.dialects import vector as _vector
+from cula.ops._mlir_compat import arith as _arith
+from cula.ops._mlir_compat import ir
+from cula.ops._mlir_compat import llvm as _llvm
+from cula.ops._mlir_compat import vector as _vector
+from cula.ops._mlir_compat import vector_extract_element
 from cutlass.cutlass_dsl import T as _T
 from cutlass.cutlass_dsl import dsl_user_op
 
@@ -128,9 +129,9 @@ def store_256b(gmem_ptr, vec):
         i32_ty = ir.IntegerType.get_signless(32)
         ir_v = _to_ir(v, loc, ip)
         elems = [
-            _vector.extractelement(
+            vector_extract_element(
                 ir_v,
-                position=_arith.constant(i32_ty, i, loc=loc, ip=ip),
+                _arith.constant(i32_ty, i, loc=loc, ip=ip),
                 loc=loc,
                 ip=ip,
             )
