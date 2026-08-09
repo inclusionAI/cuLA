@@ -44,7 +44,7 @@ def _make_state_smem_layout():
     return cute.tile_to_shape(atom, (D, D), (0, 1))
 
 
-from cula.ops.kda.sm90._common import _stream_key, movm_t_b16  # noqa: E402
+from cula.ops.kda.sm90._common import _stream_key, copy_async_bulk, movm_t_b16  # noqa: E402
 
 
 def _make_out_kinter_one_stage():
@@ -350,9 +350,9 @@ def k2_kernel(
                 cute.copy(tma_atom_v, tVg[(None, tg_l, 0, head_idx)], tVs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             # Restore the byte-identical K_INTER images produced by K1. The
             # raw-workspace transport idea is credited there to Flash-Flash-KDA.
-            cute.copy(raw_copy_atom, gKD_raw[(None, wt_l)], sKD_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
-            cute.copy(raw_copy_atom, gQD_raw[(None, wt_l)], sQD_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
-            cute.copy(raw_copy_atom, gKR_raw[(None, wt_l)], sKR_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
+            copy_async_bulk(raw_copy_atom, gKD_raw[(None, wt_l)], sKD_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
+            copy_async_bulk(raw_copy_atom, gQD_raw[(None, wt_l)], sQD_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
+            copy_async_bulk(raw_copy_atom, gKR_raw[(None, wt_l)], sKR_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
             cute.copy(tma_atom_inv, tIg[(None, 0, 0, wt_l)], tIs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             cute.copy(tma_atom_mqk, tMg[(None, 0, 0, wt_l)], tMs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             cute.copy(tma_atom_gt, tGTg[(None, 0, 0, wt_l)], tGTs[(None, s_dyn_l)], tma_bar_ptr=bar_l)

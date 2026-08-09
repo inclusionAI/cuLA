@@ -30,7 +30,7 @@ from cutlass.cute.nvgpu import warp
 from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
-from cula.ops.kda.sm90._common import movm_t_b16
+from cula.ops.kda.sm90._common import copy_async_bulk, movm_t_b16
 from cula.ops.kda.sm90.k2 import (
     CHUNK,
     D,
@@ -268,8 +268,8 @@ def pre_scan_kernel(
                 cute.copy(tma_atom_v, tVg_seq[(None, t, 0, head_idx)], tVs_seq[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             else:
                 cute.copy(tma_atom_v, tVg[(None, tg_l, 0, head_idx)], tVs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
-            cute.copy(raw_copy_atom, gKD_raw[(None, wt_l)], sKD_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
-            cute.copy(raw_copy_atom, gKR_raw[(None, wt_l)], sKR_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
+            copy_async_bulk(raw_copy_atom, gKD_raw[(None, wt_l)], sKD_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
+            copy_async_bulk(raw_copy_atom, gKR_raw[(None, wt_l)], sKR_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
             cute.copy(tma_atom_inv, tIg[(None, 0, 0, wt_l)], tIs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             cute.copy(tma_atom_gt, tGTg[(None, 0, 0, wt_l)], tGTs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             cute.copy(tma_atom_beta, tBg[(None, 0, 0, wt_l)], tBs[(None, s_dyn_l)], tma_bar_ptr=bar_l)

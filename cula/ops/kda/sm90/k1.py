@@ -30,7 +30,7 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
-from cula.ops.kda.sm90._common import _stream_key, add_f16x2_u32, movm_t_b16
+from cula.ops.kda.sm90._common import _stream_key, add_f16x2_u32, copy_async_bulk, movm_t_b16
 
 CHUNK: int = 16
 D: int = 128
@@ -522,10 +522,11 @@ def k1_kernel(
     # layout-aware tensor TMA stores. This raw-workspace transport idea comes
     # from Flash-Flash-KDA: https://github.com/Itssshikhar/Flash-Flash-KDA
     if warp_idx == 0:
-        # CuTeDSL 4.6 elects the issuing lane inside direct bulk-copy atoms.
-        cute.copy(raw_copy_atom, sQDws_raw, gQDws_raw[(None, ws_slot)])
-        cute.copy(raw_copy_atom, sKDws_raw, gKDws_raw[(None, ws_slot)])
-        cute.copy(raw_copy_atom, sKRws_raw, gKRws_raw[(None, ws_slot)])
+        # copy_async_bulk supplies elect_one only for pre-4.6 CuTeDSL. CuTeDSL
+        # 4.6+ emits it inside cute.copy, where an outer elect_one is invalid.
+        copy_async_bulk(raw_copy_atom, sQDws_raw, gQDws_raw[(None, ws_slot)])
+        copy_async_bulk(raw_copy_atom, sKDws_raw, gKDws_raw[(None, ws_slot)])
+        copy_async_bulk(raw_copy_atom, sKRws_raw, gKRws_raw[(None, ws_slot)])
         with cute.arch.elect_one():
             cute.copy(tma_atom_ws_inv, tINVws_s[(None,)], tINVws_g[(None, 0, 0, ws_slot)])
             cute.copy(tma_atom_ws_mqk, tMQKws_s[(None,)], tMQKws_g[(None, 0, 0, ws_slot)])

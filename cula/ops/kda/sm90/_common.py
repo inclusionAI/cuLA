@@ -3,11 +3,52 @@
 
 """Shared low-level helpers for the SM90 FlashKDA kernels."""
 
+import re
+from importlib.metadata import PackageNotFoundError, version as package_version
+
 import cutlass
+import cutlass.cute as cute
 import torch
 from cutlass import Int32
 from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cutlass_dsl import T as _T
+
+
+def _parse_cutedsl_version(raw_version: str) -> tuple[int, int, int]:
+    """Return the numeric CuTeDSL version from a release or dev version string."""
+    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", raw_version)
+    if match is None:
+        raise RuntimeError(f"Unable to parse the installed CuTeDSL version: {raw_version!r}")
+    return tuple(int(component or 0) for component in match.groups())
+
+
+def _installed_cutedsl_version() -> tuple[int, int, int]:
+    """Read the CuTeDSL version at runtime without relying on a private symbol."""
+    raw_version = getattr(cutlass, "__version__", None)
+    if raw_version is None:
+        try:
+            raw_version = package_version("nvidia-cutlass-dsl")
+        except PackageNotFoundError as exc:
+            raise RuntimeError("nvidia-cutlass-dsl is required by the SM90 FlashKDA backend") from exc
+    return _parse_cutedsl_version(raw_version)
+
+
+# CuTeDSL 4.6.0 added the missing elect_one inside cute.copy for async bulk
+# atoms. Older releases need an explicit elect_one, while nesting one around
+# cute.copy is incorrect in 4.6+. Keep this decision as a compile-time
+# constant after detecting the installed runtime version, so the same source
+# supports both API behaviours.
+_CUTEDSL_VERSION = _installed_cutedsl_version()
+_CUTE_COPY_AUTO_ELECTS_BULK = _CUTEDSL_VERSION >= (4, 6, 0)
+
+
+def copy_async_bulk(atom, src, dst, **kwargs) -> None:
+    """Issue a CuTeDSL async bulk copy across supported elect_one APIs."""
+    if cutlass.const_expr(_CUTE_COPY_AUTO_ELECTS_BULK):
+        cute.copy(atom, src, dst, **kwargs)
+    else:
+        with cute.arch.elect_one():
+            cute.copy(atom, src, dst, **kwargs)
 
 
 def _stream_key(device: torch.device) -> tuple[str, int]:
