@@ -129,11 +129,19 @@ See [BENCHMARK_GB200_CUDA_130.md](BENCHMARK_GB200_CUDA_130.md) tested with CUDA 
 
 See [BENCHMARK_H200.md](BENCHMARK_H200.md) tested with CUDA 12.9 for detailed results.
 
+The raw workspace transport A/B is documented separately in
+[BENCHMARK_SM90_RAW_WORKSPACE.md](BENCHMARK_SM90_RAW_WORKSPACE.md).  On the
+H200 validation container it makes 27/28 serial (non-intracard-CP) configurations
+faster, with a 1.18x geometric-mean speedup and 15.45% latency reduction.
+
 **Highlights:**
 - **KDA Modular Forward (Blackwell):** **avg 1.33x** speedup on fixed-length, **avg 1.35x** on variable-length (18 configs, uniform/skewed/random).
 - **Lightning Attention Prefill (Blackwell):** up to **2.08x** speedup (B=2).
 - **Lightning Attention Varlen (Blackwell):** **avg 1.47x** speedup across 126 configs (uniform/skewed/random).
 - **KDA Fused Forward (Hopper):** **avg 1.58x** speedup across fixed-length and variable-length sequences.
+- **SM90 raw workspace transport:** **1.18x** geometric-mean A/B speedup
+  (15.45% weighted latency reduction, 27/28 configurations) with intracard CP
+  disabled; see [BENCHMARK_SM90_RAW_WORKSPACE.md](BENCHMARK_SM90_RAW_WORKSPACE.md).
 
 To regenerate benchmarks:
 
