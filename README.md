@@ -156,22 +156,26 @@ See [BENCHMARK_GB200_CUDA_130.md](BENCHMARK_GB200_CUDA_130.md) tested with CUDA 
 
 **Hopper (SM90)**
 
-See [BENCHMARK_H200.md](BENCHMARK_H200.md) tested with CUDA 12.9 for detailed results.
+See [BENCHMARK_H200.md](BENCHMARK_H200.md) for CuTe DSL FlashKDA results on an H200 141GB with CUDA 12.9.
 
 **Highlights:**
 - **KDA Modular Forward (Blackwell):** **avg 1.33x** speedup on fixed-length, **avg 1.35x** on variable-length (18 configs, uniform/skewed/random).
 - **Lightning Attention Prefill (Blackwell):** up to **2.08x** speedup (B=2).
 - **Lightning Attention Varlen (Blackwell):** **avg 1.47x** speedup across 126 configs (uniform/skewed/random).
-- **KDA Fused Forward (Hopper):** **avg 1.58x** speedup across fixed-length and variable-length sequences.
+- **FlashKDA Prefill (Hopper):** **avg 2.39x** speedup over FLA across 28 fixed-length and variable-length configs, up to **7.80x**.
+- **FlashKDA Intracard CP (Hopper):** **4.11x geo-mean** speedup over serial FlashKDA on 28 CP-engaged long-sequence configs, up to **7.21x**.
 
-To regenerate benchmarks:
+To reproduce the benchmark suites directly:
 
 ```bash
 # Blackwell (SM10X)
-python benchmarks/generate_benchmark_md.py
+python benchmarks/bench_kda.py --mode both
+python benchmarks/bench_lightning_attn_prefill.py --modes no_state varlen
+python benchmarks/bench_la_decode_vs_fla.py --heads 64 --head-dim 128
 
 # Hopper (SM90)
-python benchmarks/generate_benchmark_hopper_md.py
+python benchmarks/bench_kda_sm90_prefill.py --mode both
+python benchmarks/bench_kda_sm90_cp.py
 ```
 
 ## Tests
