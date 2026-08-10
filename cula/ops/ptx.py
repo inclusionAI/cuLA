@@ -16,13 +16,12 @@
 
 import cutlass
 import cutlass.cute as cute
-from cula.ops._mlir_compat import arith as _arith
-from cula.ops._mlir_compat import ir
-from cula.ops._mlir_compat import llvm as _llvm
-from cula.ops._mlir_compat import vector as _vector
-from cula.ops._mlir_compat import vector_extract_element
 from cutlass.cutlass_dsl import T as _T
 from cutlass.cutlass_dsl import dsl_user_op
+
+from cula.ops._mlir_compat import ir, vector_extract_element
+from cula.ops._mlir_compat import llvm as _llvm
+from cula.ops._mlir_compat import vector as _vector
 
 
 def _to_ir(v, loc=None, ip=None):
@@ -126,17 +125,8 @@ def store_256b(gmem_ptr, vec):
 
     @dsl_user_op
     def _do(addr, v, *, loc=None, ip=None):
-        i32_ty = ir.IntegerType.get_signless(32)
         ir_v = _to_ir(v, loc, ip)
-        elems = [
-            vector_extract_element(
-                ir_v,
-                _arith.constant(i32_ty, i, loc=loc, ip=ip),
-                loc=loc,
-                ip=ip,
-            )
-            for i in range(8)
-        ]
+        elems = [vector_extract_element(ir_v, i, loc=loc, ip=ip) for i in range(8)]
         operands = [_to_ir(addr, loc, ip)] + elems
         _llvm.inline_asm(
             ir.Type.parse("!llvm.void"),

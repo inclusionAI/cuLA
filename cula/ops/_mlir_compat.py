@@ -49,8 +49,7 @@ from __future__ import annotations
 
 import importlib
 import re
-import sys
-from typing import Any, Final, Optional
+from typing import Any, Final
 
 # Version contract for nvidia-cutlass-dsl. Kept in sync with
 # ``pyproject.toml``; when CuTeDSL is bumped, extend ``_SUPPORTED_MIN`` /
@@ -102,24 +101,29 @@ _INCIDENT_NOTE: Final[str] = (
 _CACHE: Final[dict[str, Any]] = {}
 
 
-def _parse_version(version: str) -> tuple[int, ...]:
-    """Parse ``X.Y.Z[.devN...]`` into a comparable tuple, or raise."""
+def _parse_version(version: str) -> tuple[int, int, int]:
+    """Parse ``X.Y.Z[.devN...]`` into a comparable ``(major, minor, patch)`` tuple.
+
+    Missing components normalize to zero so that ``4.5`` and ``4.7`` compare
+    against the contract exactly like ``4.5.0`` and ``4.7.0`` (a two-component
+    ``4.7`` must not slip under the ``< 4.7.0`` upper bound).
+    """
     match = _VERSION_RE.match(version.strip())
     if match is None:
         raise RuntimeError(
             f"cuLA cannot parse the installed CuTeDSL version {version!r}; "
             f"refusing to use its private MLIR bindings. {_INCIDENT_NOTE}"
         )
-    return tuple(int(part) for part in match.groups() if part is not None)
+    major, minor, patch = (int(part) if part is not None else 0 for part in match.groups())
+    return (major, minor, patch)
 
 
-def _installed_version() -> tuple[int, ...]:
+def _installed_version() -> tuple[int, int, int]:
     try:
         import cutlass  # noqa: PLC0415
     except ImportError:
         raise RuntimeError(
-            "cuLA requires the nvidia-cutlass-dsl package; install it with "
-            "`pip install 'nvidia-cutlass-dsl>=4.4.2,<4.7'`."
+            "cuLA requires the nvidia-cutlass-dsl package; install it with `pip install 'nvidia-cutlass-dsl>=4.4.2,<4.7'`."
         ) from None
     version = getattr(cutlass, "__version__", None)
     if not isinstance(version, str):
@@ -164,8 +168,7 @@ def _load(dialect: str) -> Any:
         module = importlib.import_module(package)
     except ImportError as exc:
         raise RuntimeError(
-            f"Unable to import CuTeDSL's private {dialect!r} bindings "
-            f"({package}): {exc}. {_INCIDENT_NOTE}"
+            f"Unable to import CuTeDSL's private {dialect!r} bindings ({package}): {exc}. {_INCIDENT_NOTE}"
         ) from exc
     if attribute:
         for part in attribute.split("."):
@@ -173,10 +176,7 @@ def _load(dialect: str) -> Any:
             if module is None:
                 break
     if module is None:
-        raise RuntimeError(
-            f"CuTeDSL no longer exposes {dialect!r} bindings "
-            f"({package}.{attribute}). {_INCIDENT_NOTE}"
-        )
+        raise RuntimeError(f"CuTeDSL no longer exposes {dialect!r} bindings ({package}.{attribute}). {_INCIDENT_NOTE}")
 
     for canary in _CANARIES[dialect]:
         owner: Any = module
@@ -208,7 +208,7 @@ def __getattr__(name: str) -> Any:
     return _load(name)
 
 
-def cutlass_dsl_version() -> Optional[str]:
+def cutlass_dsl_version() -> str | None:
     """Installed CuTeDSL version string, or None when not installed."""
     try:
         import cutlass  # noqa: PLC0415
@@ -222,11 +222,21 @@ def vector_extract_element(vec, position, *, loc=None, ip=None):
     """Extract one element of ``vec`` at ``position``, across CutDSL versions.
 
     CutDSL renamed ``vector.extractelement`` to ``vector.extract`` in the 4.6
-    line (with the position as the second positional argument). Rather than
-    calling either binding directly from kernel code, kernels go through this
-    helper so a CutDSL patch release can never break the extraction path again.
+    line. ``position`` is the Python element index; each branch builds the
+    operand shape its binding actually expects:
+
+    - ``extractelement`` (4.5 line; also present in early 4.6): takes the
+      index as a single i32 operand, so the constant is constructed here.
+    - ``extract`` (4.6+): takes a sequence of index-typed dynamic operands
+      plus a static-position array, so a constant position is ``extract(vec,
+      [], [position], ...)``.
+
+    Preferring ``extractelement`` when both exist keeps the pre-4.6 code path
+    byte-identical to what cuLA shipped before the gateway.
     """
     vector_dialect = _load("vector")
-    if _has_attribute_path(vector_dialect, ("extract",)):
-        return vector_dialect.extract(vec, position, None, loc=loc, ip=ip)
-    return vector_dialect.extractelement(vec, position=position, loc=loc, ip=ip)
+    if _has_attribute_path(vector_dialect, ("extractelement",)):
+        i32_ty = _load("ir").IntegerType.get_signless(32)
+        index = _load("arith").constant(i32_ty, position, loc=loc, ip=ip)
+        return vector_dialect.extractelement(vec, position=index, loc=loc, ip=ip)
+    return vector_dialect.extract(vec, [], [position], loc=loc, ip=ip)

@@ -17,7 +17,11 @@ FORK = "https://github.com/bikrammajhi/cuLA.git"
 BRANCH = "mlir-compat-gateway"
 CUDA_TAG = "cu129"
 TORCH_VERSION = "2.9.1"
-TESTS = "test_cutedsl_compat.py test_lightning_attn_prefill_sm90.py test_lightning_decode.py"
+TESTS = [
+    "tests/test_cutedsl_compat.py",
+    "tests/test_lightning_attn_prefill_sm90.py",
+    "tests/test_lightning_decode.py",
+]
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.9.0-devel-ubuntu22.04", add_python="3.12")
@@ -76,26 +80,21 @@ def validate() -> str:
     summary["env"] = probe.stdout.strip()
     step("probe")
 
-    tests = tests or "test_cutedsl_compat.py test_lightning_attn_prefill_sm90.py test_lightning_decode.py"
     run = subprocess.run(
-        f"python -m pytest tests/{tests} -v -m 'not sm100_only'",
-        shell=True,
+        ["python", "-m", "pytest", *TESTS, "-v", "-m", "not sm100_only"],
         cwd="/work",
         capture_output=True,
         text=True,
     )
-    summary["pytest_cmd"] = f"pytest tests/{tests} -v -m not_sm100_only (cwd=/work)"
-    ls = subprocess.run(
-        "ls -la tests/test_lightning_attn_prefill_sm90.py tests/test_cutedsl_compat.py tests/test_lightning_decode.py",
-        shell=True,
-        cwd="/work",
-        capture_output=True,
-        text=True,
-    )
-    summary["target_ls"] = ls.stdout + ls.stderr
+    summary["pytest_cmd"] = "pytest " + " ".join(TESTS) + " -v -m 'not sm100_only' (cwd=/work)"
     summary["pytest_rc"] = run.returncode
     summary["pytest_tail"] = (run.stdout + run.stderr)[-5000:]
-    step("pytest" if run.returncode == 0 else "pytest_FAILED")
+    if run.returncode != 0:
+        raise RuntimeError(
+            f"pytest failed with exit code {run.returncode}; summary above captures "
+            "the tail. See the 'pytest_tail' entry for the failing tests."
+        )
+    step("pytest")
 
     summary["elapsed_s"] = int(time.time() - start)
     return json.dumps(summary, indent=1)
