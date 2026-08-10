@@ -2,10 +2,11 @@
 
 Clones the fork branch inside the container (this client ships no Mount),
 builds cuLA, runs the compat + SM90/SM100 kernel JIT tests, returns a JSON
-summary. The GPU and the CuTeDSL version are parameters so a reviewer can
-reproduce a specific environment, e.g.::
+summary. The GPU and the CuTeDSL version are chosen via environment
+variables so a reviewer can reproduce a specific environment, e.g.::
 
-    modal run scripts/modal_validate.py --gpu B200 --cutlass "nvidia-cutlass-dsl==4.5.2"
+    CULA_VALIDATE_GPU=B200 CULA_VALIDATE_CUTLASS='nvidia-cutlass-dsl==4.5.2' \\
+        modal run scripts/modal_validate.py
 
 SM100-only tests (``test_ptx_umma_ws.py``) self-deselect on non-Blackwell
 GPUs via conftest, so the harness is safe to run on either.
@@ -24,8 +25,10 @@ FORK = "https://github.com/bikrammajhi/cuLA.git"
 BRANCH = "mlir-compat-gateway"
 CUDA_TAG = "cu129"
 TORCH_VERSION = "2.9.1"
-DEFAULT_GPU = "H100"
-DEFAULT_CUTLASS = "nvidia-cutlass-dsl>=4.4.2,<4.7,!=4.5.0"
+GPU = os.environ.get("CULA_VALIDATE_GPU", "H100")
+CUTLASS_SPEC = os.environ.get(
+    "CULA_VALIDATE_CUTLASS", "nvidia-cutlass-dsl>=4.4.2,<4.7,!=4.5.0"
+)
 TESTS = [
     "tests/test_cutedsl_compat.py",
     "tests/test_lightning_attn_prefill_sm90.py",
@@ -33,30 +36,27 @@ TESTS = [
     "tests/test_ptx_umma_ws.py",
 ]
 
-
-def _build_image(cutlass_spec: str) -> modal.Image:
-    return (
-        modal.Image.from_registry("nvidia/cuda:12.9.0-devel-ubuntu22.04", add_python="3.12")
-        .apt_install("git")
-        .pip_install("wheel", "setuptools", "setuptools-scm")
-        .pip_install(
-            f"torch=={TORCH_VERSION}",
-            index_url=f"https://download.pytorch.org/whl/{CUDA_TAG}",
-        )
-        .pip_install(cutlass_spec, "flash-linear-attention", "pytest")
+image = (
+    modal.Image.from_registry("nvidia/cuda:12.9.0-devel-ubuntu22.04", add_python="3.12")
+    .apt_install("git")
+    .pip_install("wheel", "setuptools", "setuptools-scm")
+    .pip_install(
+        f"torch=={TORCH_VERSION}",
+        index_url=f"https://download.pytorch.org/whl/{CUDA_TAG}",
     )
-
+    .pip_install(CUTLASS_SPEC, "flash-linear-attention", "pytest")
+)
 
 app = modal.App("cula-validate-v5")
 
 
-@app.function(timeout=60 * 60)
-def validate(gpu: str, cutlass_spec: str) -> str:
+@app.function(image=image, gpu=GPU, timeout=60 * 60)
+def validate() -> str:
     start = time.time()
     summary = {
         "branch": BRANCH,
-        "gpu": gpu,
-        "cutlass_spec": cutlass_spec,
+        "gpu": GPU,
+        "cutlass_spec": CUTLASS_SPEC,
         "steps": {},
     }
 
@@ -119,6 +119,5 @@ def validate(gpu: str, cutlass_spec: str) -> str:
 
 
 @app.local_entrypoint()
-def main(gpu: str = DEFAULT_GPU, cutlass: str = DEFAULT_CUTLASS) -> None:
-    fn = validate.with_options(gpu=gpu, image=_build_image(cutlass))
-    print(fn.remote(gpu=gpu, cutlass_spec=cutlass))
+def main() -> None:
+    print(validate.remote())
