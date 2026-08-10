@@ -51,12 +51,12 @@ app = modal.App("cula-validate-v5")
 
 
 @app.function(image=image, gpu=GPU, timeout=60 * 60)
-def validate() -> str:
+def validate(gpu: str, cutlass_spec: str) -> str:
     start = time.time()
     summary = {
         "branch": BRANCH,
-        "gpu": GPU,
-        "cutlass_spec": CUTLASS_SPEC,
+        "gpu": gpu,
+        "cutlass_spec": cutlass_spec,
         "steps": {},
     }
 
@@ -98,13 +98,15 @@ def validate() -> str:
     summary["env"] = probe.stdout.strip()
     step("probe")
 
+    # conftest gates sm100_only tests (skip on non-Blackwell, run on Blackwell),
+    # so no marker expression is needed here.
     run = subprocess.run(
-        ["python", "-m", "pytest", *TESTS, "-v", "-m", "not sm100_only"],
+        ["python", "-m", "pytest", *TESTS, "-v"],
         cwd="/work",
         capture_output=True,
         text=True,
     )
-    summary["pytest_cmd"] = "pytest " + " ".join(TESTS) + " -v -m 'not sm100_only' (cwd=/work)"
+    summary["pytest_cmd"] = "pytest " + " ".join(TESTS) + " -v (cwd=/work)"
     summary["pytest_rc"] = run.returncode
     summary["pytest_tail"] = (run.stdout + run.stderr)[-5000:]
     if run.returncode != 0:
@@ -120,4 +122,4 @@ def validate() -> str:
 
 @app.local_entrypoint()
 def main() -> None:
-    print(validate.remote())
+    print(validate.remote(gpu=GPU, cutlass_spec=CUTLASS_SPEC))
