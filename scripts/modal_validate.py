@@ -1,7 +1,14 @@
-"""Modal validation harness for cuLA on H100 (modal client v1.4.2 API).
+"""Modal validation harness for cuLA (modal client v1.4.2 API).
 
 Clones the fork branch inside the container (this client ships no Mount),
-builds cuLA, runs the compat + SM90 kernel JIT tests, returns a JSON summary.
+builds cuLA, runs the compat + SM90/SM100 kernel JIT tests, returns a JSON
+summary. The GPU and the CuTeDSL version are parameters so a reviewer can
+reproduce a specific environment, e.g.::
+
+    modal run scripts/modal_validate.py --gpu B200 --cutlass "nvidia-cutlass-dsl==4.5.2"
+
+SM100-only tests (``test_ptx_umma_ws.py``) self-deselect on non-Blackwell
+GPUs via conftest, so the harness is safe to run on either.
 """
 
 from __future__ import annotations
@@ -17,30 +24,41 @@ FORK = "https://github.com/bikrammajhi/cuLA.git"
 BRANCH = "mlir-compat-gateway"
 CUDA_TAG = "cu129"
 TORCH_VERSION = "2.9.1"
+DEFAULT_GPU = "H100"
+DEFAULT_CUTLASS = "nvidia-cutlass-dsl>=4.4.2,<4.7,!=4.5.0"
 TESTS = [
     "tests/test_cutedsl_compat.py",
     "tests/test_lightning_attn_prefill_sm90.py",
     "tests/test_lightning_decode.py",
+    "tests/test_ptx_umma_ws.py",
 ]
 
-image = (
-    modal.Image.from_registry("nvidia/cuda:12.9.0-devel-ubuntu22.04", add_python="3.12")
-    .apt_install("git")
-    .pip_install("wheel", "setuptools", "setuptools-scm")
-    .pip_install(
-        f"torch=={TORCH_VERSION}",
-        index_url=f"https://download.pytorch.org/whl/{CUDA_TAG}",
+
+def _build_image(cutlass_spec: str) -> modal.Image:
+    return (
+        modal.Image.from_registry("nvidia/cuda:12.9.0-devel-ubuntu22.04", add_python="3.12")
+        .apt_install("git")
+        .pip_install("wheel", "setuptools", "setuptools-scm")
+        .pip_install(
+            f"torch=={TORCH_VERSION}",
+            index_url=f"https://download.pytorch.org/whl/{CUDA_TAG}",
+        )
+        .pip_install(cutlass_spec, "flash-linear-attention", "pytest")
     )
-    .pip_install("nvidia-cutlass-dsl>=4.4.2,<4.7,!=4.5.0", "flash-linear-attention", "pytest")
-)
-
-app = modal.App("cula-validate-v4")
 
 
-@app.function(image=image, gpu="h100", timeout=60 * 60)
-def validate() -> str:
+app = modal.App("cula-validate-v5")
+
+
+@app.function(timeout=60 * 60)
+def validate(gpu: str, cutlass_spec: str) -> str:
     start = time.time()
-    summary = {"branch": BRANCH, "steps": {}}
+    summary = {
+        "branch": BRANCH,
+        "gpu": gpu,
+        "cutlass_spec": cutlass_spec,
+        "steps": {},
+    }
 
     def step(name: str) -> None:
         summary["steps"][name] = "ok"
@@ -101,5 +119,6 @@ def validate() -> str:
 
 
 @app.local_entrypoint()
-def main() -> None:
-    print(validate.remote())
+def main(gpu: str = DEFAULT_GPU, cutlass: str = DEFAULT_CUTLASS) -> None:
+    fn = validate.with_options(gpu=gpu, image=_build_image(cutlass))
+    print(fn.remote(gpu=gpu, cutlass_spec=cutlass))
