@@ -30,10 +30,11 @@ import cutlass.cute.nvgpu.warpgroup as warpgroup
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
-from cula.ops._mlir_compat import cute as _cute_ir
-from cula.ops._mlir_compat import llvm
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.utils.tensormap_manager import TensorMapManager, TensorMapUpdateMode
+
+from cula.ops._mlir_compat import cute as _cute_ir
+from cula.ops._mlir_compat import llvm
 
 from .schedule import (
     DYNAMIC_SMEM_ESTIMATE_BYTES,

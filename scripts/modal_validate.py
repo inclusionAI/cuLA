@@ -26,9 +26,7 @@ BRANCH = "mlir-compat-gateway"
 CUDA_TAG = "cu129"
 TORCH_VERSION = "2.9.1"
 GPU = os.environ.get("CULA_VALIDATE_GPU", "H100")
-CUTLASS_SPEC = os.environ.get(
-    "CULA_VALIDATE_CUTLASS", "nvidia-cutlass-dsl>=4.4.2,<4.7,!=4.5.0"
-)
+CUTLASS_SPEC = os.environ.get("CULA_VALIDATE_CUTLASS", "nvidia-cutlass-dsl>=4.4.2,<4.7,!=4.5.0")
 TESTS = [
     "tests/test_cutedsl_compat.py",
     "tests/test_lightning_attn_prefill_sm90.py",

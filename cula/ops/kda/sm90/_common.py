@@ -6,8 +6,9 @@
 import cutlass
 import torch
 from cutlass import Int32
-from cula.ops._mlir_compat import llvm as _llvm
 from cutlass.cutlass_dsl import T as _T
+
+from cula.ops._mlir_compat import llvm as _llvm
 
 
 def _stream_key(device: torch.device) -> tuple[str, int]:

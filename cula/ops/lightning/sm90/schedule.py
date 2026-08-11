@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-from cula.ops._mlir_compat import llvm
 from cutlass.cutlass_dsl import T
+
+from cula.ops._mlir_compat import llvm
 
 TARGET_ARCH = "sm_90a"
 

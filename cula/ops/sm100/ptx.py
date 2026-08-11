@@ -55,16 +55,15 @@ __all__ = [
 
 import cutlass
 import cutlass.cute as cute
-from cula.ops._mlir_compat import arith as _arith
-from cula.ops._mlir_compat import ir
-from cula.ops._mlir_compat import llvm
-from cula.ops._mlir_compat import nvvm as _nvvm
 from cutlass.cute.arch import elect_one
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.typing import Int32
 from cutlass.cutlass_dsl import dsl_user_op
 
 from cula.ops._cutedsl_compat import detect_tcgen05_ldst_api
+from cula.ops._mlir_compat import arith as _arith
+from cula.ops._mlir_compat import ir, llvm
+from cula.ops._mlir_compat import nvvm as _nvvm
 
 CollectorBBuffer = _nvvm.Tcgen05MMACollectorBBuffer
 CollectorOp = _nvvm.Tcgen05MMACollectorOp

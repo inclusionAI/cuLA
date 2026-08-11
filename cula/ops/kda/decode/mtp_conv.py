@@ -33,11 +33,11 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cula.ops._mlir_compat import llvm as _llvm
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32
 from cutlass.cutlass_dsl import T as _T
 
+from cula.ops._mlir_compat import llvm as _llvm
 from cula.ops.kda.decode.cute import (
     TILE_K,
     _get_cached_stream,

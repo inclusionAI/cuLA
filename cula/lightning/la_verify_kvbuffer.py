@@ -49,8 +49,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cula.ops._mlir_compat import arith as _arith
-from cula.ops._mlir_compat import llvm as _llvm
 from cutlass.cute.runtime import (
     make_fake_compact_tensor,
     make_fake_stream,
@@ -63,6 +61,8 @@ from cula.lightning.la_decode_mtp import (
     NUM_THREADS_MTP,
     hq_dot_pair,
 )
+from cula.ops._mlir_compat import arith as _arith
+from cula.ops._mlir_compat import llvm as _llvm
 from cula.utils import USE_FAST_MATH, get_device_sm_version
 
 # Dispatch threshold between the two verify implementations.
