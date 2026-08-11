@@ -19,14 +19,16 @@ from cula.lightning.la_state_update_kvbuffer import (
 )
 from cula.lightning.la_verify_kvbuffer import linear_attention_verify_kvbuffer
 from cula.ops.lightning.decode import linear_attention_decode
-from cula.ops.lightning.prefill_sm100 import (
-    LinearAttentionChunkwiseDecay,
+from cula.ops.lightning.prefill import (
+    get_lightning_attn_prefill_backend_identity,
     lightning_attn_fwd,
     lightning_attn_fwd_varlen,
 )
+from cula.ops.lightning.prefill_sm100 import LinearAttentionChunkwiseDecay
 
 __all__ = [
     "LinearAttentionChunkwiseDecay",
+    "get_lightning_attn_prefill_backend_identity",
     "lightning_attn_fwd",
     "lightning_attn_fwd_varlen",
     "linear_attention_decode",

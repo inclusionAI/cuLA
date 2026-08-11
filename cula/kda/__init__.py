@@ -20,6 +20,10 @@ __all__ = [
     "kda_decode_mtp",
     "kda_decode_mtp_recurrent",
     "kda_decode_mtp_recurrent_ws",
+    "kda_conv_decode_mtp_verify",
+    "kda_conv_decode_mtp_kvbuffer",
+    "kda_flush_kvbuffer",
+    "kda_flush_kvbuffer_all_layers",
     "kda_packed_decode",
     "fused_sigmoid_gating_delta_rule_update",
     "kda_prefill_hopper",
@@ -42,6 +46,22 @@ _LAZY = {
     "kda_decode_mtp_recurrent_ws": (
         "cula.ops.kda.decode.mtp",
         "kda_decode_mtp_recurrent_ws",
+    ),
+    "kda_conv_decode_mtp_verify": (
+        "cula.ops.kda.decode.mtp_conv",
+        "kda_conv_decode_mtp_verify",
+    ),
+    "kda_conv_decode_mtp_kvbuffer": (
+        "cula.ops.kda.decode.mtp_conv_kvbuffer",
+        "kda_conv_decode_mtp_kvbuffer",
+    ),
+    "kda_flush_kvbuffer": (
+        "cula.ops.kda.decode.mtp_kvbuffer",
+        "kda_flush_kvbuffer",
+    ),
+    "kda_flush_kvbuffer_all_layers": (
+        "cula.ops.kda.decode.mtp_kvbuffer",
+        "kda_flush_kvbuffer_all_layers",
     ),
     "kda_packed_decode": ("cula.ops.kda.decode.cute", "kda_packed_decode"),
     "fused_sigmoid_gating_delta_rule_update": (

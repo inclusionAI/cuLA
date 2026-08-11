@@ -91,6 +91,7 @@ def make_varlen_inputs(seq_lens, H, *, use_gk=False, use_h0=False, seed=42):
 
 
 def run_cula_no_cp(k, w, u, gk, h0, cu, **kw):
+    kw["use_intracard_cp"] = False
     return chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -99,7 +100,6 @@ def run_cula_no_cp(k, w, u, gk, h0, cu, **kw):
         initial_state=h0,
         chunk_size=BT,
         cu_seqlens=cu,
-        _no_cp=True,
         **kw,
     )
 
@@ -160,7 +160,7 @@ def run_intracard_direct(k, w, u, gk, h0, cu, *, output_final_state=True, save_n
             chunk_size=BT,
             save_new_value=save_new_value,
             cu_seqlens=cu,
-            _no_cp=True,
+            use_intracard_cp=False,
         )
 
 
