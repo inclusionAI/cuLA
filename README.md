@@ -162,8 +162,8 @@ See [BENCHMARK_H200.md](BENCHMARK_H200.md) for CuTe DSL FlashKDA results on an H
 - **KDA Modular Forward (Blackwell):** **avg 1.33x** speedup on fixed-length, **avg 1.35x** on variable-length (18 configs, uniform/skewed/random).
 - **Lightning Attention Prefill (Blackwell):** up to **2.08x** speedup (B=2).
 - **Lightning Attention Varlen (Blackwell):** **avg 1.47x** speedup across 126 configs (uniform/skewed/random).
-- **FlashKDA Prefill (Hopper):** **avg 2.39x** speedup over FLA across 28 fixed-length and variable-length configs, up to **7.80x**.
-- **FlashKDA Intracard CP (Hopper):** **4.11x geo-mean** speedup over serial FlashKDA on 28 CP-engaged long-sequence configs, up to **7.21x**.
+- **FlashKDA Prefill (Hopper):** **avg 2.72x** speedup over FLA across 28 fixed-length and variable-length configs, up to **7.56x**.
+- **FlashKDA Intracard CP (Hopper):** **4.29x geo-mean** speedup over serial FlashKDA on 28 CP-engaged long-sequence configs, up to **7.83x**.
 
 To reproduce the benchmark suites directly:
 
