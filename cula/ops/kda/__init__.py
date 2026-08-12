@@ -1,14 +1,12 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""KDA backend kernels migrated to the arch-first layout.
+"""KDA backend kernels, organized by arch (sm90 / sm100).
 
-sm100/          SM100 (Blackwell) modular-chunk recurrence/output/bwd kernels
+sm90/   SM90 (Hopper) two-kernel (K1+K2) FlashKDA prefill, fwd-only (+ cp/)
+sm100/  SM100 (Blackwell) modular-chunk recurrence/output/bwd kernels (+ cp/)
 decode/         single-token decode (CuTe DSL + FLA reference)
 experimental/   unwired fully-fused WIP
-policy.py       CP dispatch policy (use_cp / use_intracard_cp)
+cp_mode.py      shared intracard-CP mode vocabulary (CPMode / NotSplittableError)
 
 """
-
-# TODO: The SM90 (Hopper) prefill is still the C++ kernel under csrc/kda/sm90 (CuTeDSL
-# port pending); it is not yet part of this package.

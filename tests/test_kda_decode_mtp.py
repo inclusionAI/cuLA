@@ -734,6 +734,57 @@ def test_lower_bound_kvbuffer(which, N, T, H, HV):
 
 
 @pytest.mark.parametrize(
+    "kernel",
+    ["recurrent_ws", "recurrent_vk", "recurrent_kv", "shuffle_kvbuffer", "tensor_core_kvbuffer"],
+)
+def test_softplus_large_input_is_finite(kernel):
+    N, T, H, HV, K, V = 1, 4, 8, 8, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+    a.fill_(100.0)
+    dt_bias.zero_()
+
+    if kernel == "recurrent_ws":
+        output, final_state = run_recurrent_ws(q, k, v, a, b, A_log, dt_bias, state, scale)
+        tensors = (output, final_state)
+    elif kernel in ("recurrent_vk", "recurrent_kv"):
+        variant = "vk" if kernel == "recurrent_vk" else "kv"
+        output, final_state = run_recurrent(
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            state,
+            scale,
+            variant=variant,
+        )
+        tensors = (output, final_state)
+    else:
+        which = "shuffle" if kernel == "shuffle_kvbuffer" else "tensor_core"
+        ubufs = _alloc_ubufs(N, T, HV, V)
+        output = _kvb_verify(
+            which,
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            state,
+            scale,
+            ubufs=ubufs,
+        )
+        tensors = (output, *ubufs)
+
+    for tensor in tensors:
+        assert torch.isfinite(tensor).all()
+
+
+@pytest.mark.parametrize(
     "N,HV,T,routed",
     [(2, 16, 2, "shuffle"), (8, 16, 4, "tensor_core")],  # S=HV*N: 32 -> shuffle @T2 ; 128 -> tensor_core @T4
 )

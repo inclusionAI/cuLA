@@ -129,7 +129,7 @@ Summary (126 configs across uniform/skewed/random): **avg=1.47x**, min=0.92x, ma
 To reproduce:
 
 ```bash
-python benchmarks/bench_lightning_attn.py --modes no_state varlen
+python benchmarks/bench_lightning_attn_prefill.py --modes no_state varlen
 ```
 
 ### Decode (H=64, D=128, bf16, T=1)

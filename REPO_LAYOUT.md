@@ -4,60 +4,71 @@ Legend: `[exp]` experimental / unwired · `[non-KDA]` other operator.
 
 ```
 cuLA/
-├── cula/                         # Python package (pip install -e .)
+├── cula/                              # Python package (pip install -e .)
 │   ├── __init__.py
-│   ├── utils.py                  # arch asserts, get_pre_scan, cu_seqlens helpers, ...
-│   ├── cudac.py                  # re-export shim over the compiled C++ extension(s)
+│   ├── backends.py                    # Generic backend registry, probing, verification, dispatch
+│   ├── cudac.py                       # Lazy proxy for the per-architecture CUDA extension
+│   ├── utils.py                       # Architecture, stream-buffer, and cu_seqlens helpers
 │   │
-│   ├── kda/                      # KDA PUBLIC API + autograd + dispatch (NO kernels)
-│   │   ├── __init__.py           # lazy PUBLIC API: chunk_kda, kda_prefill_hopper,
-│   │   │                         #                  kda_decode, fused_sigmoid_gating_delta_rule_update
-│   │   ├── chunk.py              # chunk_kda + autograd — SM100 modular path (train + Blackwell prefill)
-│   │   ├── chunk_fwd.py          # chunk_kda_fwd — fwd orchestration (lazy-imports kernels)
-│   │   ├── chunk_intra.py        # fwd intra (C++ ext) + bwd intra (Triton)
-│   │   ├── chunk_bwd.py          # chunk_kda_bwd — Triton + FLA + CuTeDSL + C++ mix
-│   │   └── hopper_fused_fwd.py   # cula_kda_prefill (=kda_prefill_hopper) — SM90 prefill via the C++ kernel (cula.cudac)
+│   ├── kda/                           # KDA public API, wrappers, autograd, routing, and Triton support kernels
+│   │   ├── __init__.py                # Lazy exports for chunk, prefill, and decode APIs
+│   │   ├── backends/                  # kda_prefill runtime dispatch
+│   │   │   ├── flashkda.py            # Preferred SM90 CuTeDSL backend + verifier
+│   │   │   ├── fully_fused.py         # SM90 CUDA C++ backend + verifier
+│   │   │   └── _common.py             # Shared dispatch input checks
+│   │   ├── auto_route.py              # Fully-fused SM90 basic/optimized router
+│   │   ├── flashkda.py                # SM90 CuTeDSL K1+K2 wrapper, autograd shell, and CP selection
+│   │   ├── hopper_fused_fwd.py        # SM90 CUDA C++ basic wrapper
+│   │   ├── hopper_fused_fwd_opt.py    # SM90 CUDA C++ optimized/CP wrapper
+│   │   ├── chunk.py                   # SM100 modular chunk API + autograd
+│   │   ├── chunk_fwd.py               # SM100 forward orchestration
+│   │   ├── chunk_intra.py             # C++ forward intra + Triton backward intra
+│   │   ├── chunk_bwd.py               # Triton + FLA + CuTeDSL + C++ backward orchestration
+│   │   ├── wy_intra.py / wy_recompute.py # Triton WY preparation kernels
+│   │   └── gate_l2norm_fused.py / l2norm_qk_fused.py # SM90 Triton preprocessing kernels
 │   │
-│   ├── lightning/                # [non-KDA] Lightning Attention operator (LinearAttentionChunkwiseDecay, lightning_attn_fwd, linear_attention_decode)
-│   │   └── __init__.py
+│   ├── lightning/                     # [non-KDA] Lightning Attention public wrappers
 │   │
-│   └── ops/                      # backend kernels (CuTe DSL / TVM-FFI) + shared helpers
-│       ├── __init__.py           # exports kda_decode, fused_sigmoid_..., linear_attention_decode
-│       ├── inv.py / ptx.py       # shared low-level helpers
-│       ├── sm100/                # SM100 shared helper only
-│       │   └── ptx.py            #   shared PTX helpers (used by KDA + lightning kernels)
-│       │
-│       ├── kda/                  # ★ KDA Python backends — by arch (sm100 today)
-│       │   ├── policy.py         # SM100 CP dispatch policy: use_intracard_cp:"auto"|bool
-│       │   ├── sm100/            # SM100 (Blackwell) modular-chunk kernels
-│       │   │   ├── delta_h.py    #   recurrence (chunk_gated_delta_rule_fwd_h)
-│       │   │   ├── fwd_o.py      #   output (chunk_gla_fwd_o)
-│       │   │   ├── bwd_wy_dqkg.py#   backward wy/dqkg fused (used by chunk_bwd)
-│       │   │   └── cp/           #   SM100 intracard-CP: chunk_delta_h, pre_scan, merge
-│       │   ├── decode/           #   single-token + MTP decode
-│       │   │   ├── cute.py       #     kda_decode / fused_sigmoid_gating_delta_rule_update (CuTe DSL)
-│       │   │   ├── mtp.py        #     kda_decode_mtp recurrent / recurrent_ws MTP verify (CuTe DSL)
-│       │   │   ├── mtp_kvbuffer.py #   KVBuffer chunkwise MTP verify (shuffle / tensor_core) + flush
-│       │   │   └── reference_fla.py
-│       │   └── experimental/sm100_fused/   # [exp] unwired fully-fused
-│       │       ├── kda_fully_fused_wip.py   #   KDAChunkwise (~6k lines)
-│       │       └── wrapper.py                #   flash_kda_prefill (dead path; raises on SM100 dispatch)
-│       │
-│       ├── lightning/            # [non-KDA] Lightning/linear attention kernels
-│       │   ├── prefill_sm100.py  #   Lightning Attn prefill (LinearAttentionChunkwiseDecay, lightning_attn_fwd[_varlen])
-│       │   └── decode.py         #   linear_attention_decode
-│       └── experimental/
-│           └── linear_attn_prototype.py     # [non-KDA] unwired normalized-linear-attn prototype
+│   └── ops/                           # CuTeDSL kernels and shared low-level helpers
+│       ├── inv.py / ptx.py            # Shared low-level helpers
+│       ├── sm100/ptx.py               # Shared SM100 PTX helpers
+│       ├── kda/
+│       │   ├── cp_mode.py              # Shared intracard-CP mode vocabulary
+│       │   ├── sm100/                  # Blackwell modular forward/backward kernels
+│       │   │   ├── delta_h.py  fwd_o.py  bwd_wy_dqkg.py
+│       │   │   ├── policy.py           # SM100 intracard-CP decision logic
+│       │   │   └── cp/                 # chunk_delta_h, pre_scan, merge
+│       │   ├── sm90/                   # Hopper FlashKDA K1+K2 kernels
+│       │   │   ├── fwd.py  k1.py  k2.py
+│       │   │   └── cp/                 # driver, planner, pre-scan, merge
+│       │   ├── decode/                 # Single-token, packed, and MTP decode kernels
+│       ├── lightning/                  # [non-KDA] Lightning prefill/decode kernels
+│       │   ├── prefill.py              # Public SM90/SM100 architecture dispatch
+│       │   ├── prefill_sm90.py         # SM90 validation, compile cache, and TVM-FFI launch
+│       │   ├── prefill_sm100.py        # SM100 prefill implementation
+│       │   ├── decode.py               # Linear Attention decode
+│       │   └── sm90/                   # SM90 CuTe DSL implementation
+│       │       ├── schedule.py         # Schedule constants and WGMMA fragment helpers
+│       │       └── prefill_kernel.py   # Fixed and packed recurrent prefill kernel
+│       └── experimental/               # [non-KDA] unwired prototypes
 │
-├── csrc/                         # CUDA C++ / CUTLASS
-│   ├── api/{kda_sm90.cu, kda_sm100.cu}        # PyBind11 (cula.cudac): SM90 prefill + SM100 chunk intra/recompute_w_u
-│   ├── kda/sm90/                 # SM90 (Hopper) KDA C++ kernels (CUTLASS 3.x, TMA/wgmma)
-│   ├── kda/sm100/                # Blackwell KDA C++ kernels (CUTLASS 3.x + UMMA)
-│   └── kerutils/include/         # shared C++ headers (generic device helpers sm80/sm90/sm100, host)
+├── csrc/                               # CUDA C++ / CUTLASS kernels for SM90 and SM100/SM103
+│   ├── api/
+│   │   ├── pybind.cu                   # Shared named binding definitions
+│   │   ├── pybind_sm90.cu              # SM90-specific binding translation unit
+│   │   ├── pybind_sm100.cu             # SM100/SM103-specific binding translation unit
+│   │   ├── kda_sm90.cu                 # SM90 host API
+│   │   └── kda_sm100.cu                # SM100/SM103 host API
+│   ├── kda/sm90/                       # Hopper fully-fused prefill kernels
+│   ├── kda/sm100/                      # Blackwell modular chunk kernels
+│   ├── kerutils/include/               # Shared device and host helpers
+│   └── cutlass/                        # CUTLASS submodule
 │
-├── benchmarks/  tests/  docs/
+├── benchmarks/                         # Accuracy and performance runners
+├── tests/                              # CPU registry tests and architecture-marked GPU tests
+├── docs/                               # Pipeline and backend-dispatch design notes
 ├── scripts/build_wheel.sh
-├── third_party/flash-linear-attention/      # FLA submodule (baseline + reused gate/CP ops)
+├── third_party/flash-linear-attention/ # FLA baseline and reused operations
 ├── README.md  USAGE.md  REPO_LAYOUT.md  RECOMMENDED_CODING_STYLE.md
 └── setup.py  pyproject.toml  LICENSE
 ```
@@ -66,8 +77,10 @@ cuLA/
 
 | Directory | Language | Description |
 |-----------|----------|-------------|
-| `cula/kda/` | Python | KDA **public API only** — autograd + dispatch, no kernels. Two prefill entries: modular chunk `chunk_kda` (SM100) and `kda_prefill_hopper` (SM90, driving the C++ kernel). |
-| `cula/ops/kda/` | Python (CuTe DSL) | **KDA Python backends**, by arch: `sm100/` (+cp), `decode/`, `experimental/`, plus `policy.py` (CP dispatch). |
-| `cula/ops/lightning/` · `cula/ops/experimental/` | Python (CuTe DSL) | `[non-KDA]` Lightning/linear attention kernels. |
-| `cula/ops/{inv,ptx}.py`, `cula/ops/sm100/ptx.py` | Python | Shared low-level helpers (kept in place; not KDA-specific). |
-| `csrc/kda/{sm90,sm100}/` · `csrc/api/` | CUDA C++ | Hopper SM90 prefill + Blackwell SM100 (chunk intra + recompute_w_u), exposed as `cula.cudac`. |
+| `cula/kda/` | Python / Triton | Public KDA APIs, wrappers, autograd, routing, and supporting Triton kernels. `kda_prefill` dispatches SM90 calls to FlashKDA first and then the fully-fused CUDA backend; explicit backend exports remain available. See [`cula/kda/README.md`](cula/kda/README.md). |
+| `cula/backends.py` · `cula/kda/backends/` | Python | Generic backend registry plus KDA-specific availability probes, capability verifiers, priorities, and adapters. |
+| `cula/ops/kda/` | Python (CuTeDSL) | CuTeDSL KDA kernels organized into SM100 modular kernels, SM90 FlashKDA K1+K2 and intracard CP, decode, and experimental code. The fully-fused SM90 implementation lives under `csrc/`, not here. |
+| `csrc/kda/{sm90,sm100}/` | CUDA C++ | Hopper fully-fused prefill and Blackwell modular chunk kernels. |
+| `csrc/api/` · `cula/cudac.py` | CUDA C++ / Python | Per-architecture `_cudac_sm90` and `_cudac_sm100` extensions, exposed lazily through the `cula.cudac` compatibility proxy. |
+| `cula/ops/lightning/` · `cula/ops/experimental/` | Python (CuTeDSL) | `[non-KDA]` Lightning/linear-attention kernels and prototypes. Lightning prefill dispatches to the SM90 or SM100 backend from Q's device capability. |
+| `cula/ops/{inv,ptx}.py` · `cula/ops/sm100/ptx.py` | Python | Shared low-level helpers used across operators. |

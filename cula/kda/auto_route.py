@@ -72,6 +72,7 @@ def cula_kda_prefill_auto(
     lower_bound: float | None = -5.0,
     cu_seqlens: torch.IntTensor | None = None,
     chunk_indices: torch.IntTensor | None = None,
+    auto_cp: bool = True,
     **kwargs,
 ):
     if _should_use_opt(q, cu_seqlens):
@@ -90,7 +91,7 @@ def cula_kda_prefill_auto(
             lower_bound=lower_bound,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
-            auto_cp=True,
+            auto_cp=auto_cp,
             **kwargs,
         )
     return _basic(

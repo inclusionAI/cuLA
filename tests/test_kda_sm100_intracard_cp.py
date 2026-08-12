@@ -46,9 +46,9 @@ BT, K, V = 64, 128, 128
 DEVICE = "cuda"
 # Tolerances aligned with existing cuLA tests:
 #   * Same-kernel (CP scheduling only): torch.testing.assert_close(atol=1e-2, rtol=1e-2)
-#                                       — matches tests/test_chunk_delta_h.py CP block
+#                                       — matches tests/test_kda_sm100_recurrence.py CP block
 #   * Cross-impl / vs ref:              fla.utils.assert_close(ratio=...)
-#                                       — matches tests/test_kda_compare_fla.py
+#                                       — matches tests/test_kda_sm100_chunk_vs_fla.py
 ATOL_SAME_KERNEL = 1e-2
 RTOL_SAME_KERNEL = 1e-2
 RATIO_VS_REF = 0.005  # RMSE / RMS(ref) — matches FLA test_gated_delta.py fwd
@@ -91,6 +91,7 @@ def make_varlen_inputs(seq_lens, H, *, use_gk=False, use_h0=False, seed=42):
 
 
 def run_cula_no_cp(k, w, u, gk, h0, cu, **kw):
+    kw["use_intracard_cp"] = False
     return chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -99,7 +100,6 @@ def run_cula_no_cp(k, w, u, gk, h0, cu, **kw):
         initial_state=h0,
         chunk_size=BT,
         cu_seqlens=cu,
-        _no_cp=True,
         **kw,
     )
 
@@ -134,7 +134,7 @@ def run_intracard_direct(k, w, u, gk, h0, cu, *, output_final_state=True, save_n
     post-split occupancy guard rejects; mirror the production caller's graceful
     fallback to the serial path so configs that don't engage CP still return.
     """
-    from cula.ops.kda.policy import NotSplittableError
+    from cula.ops.kda.cp_mode import NotSplittableError
 
     try:
         return intracard_fwd_h(
@@ -160,7 +160,7 @@ def run_intracard_direct(k, w, u, gk, h0, cu, *, output_final_state=True, save_n
             chunk_size=BT,
             save_new_value=save_new_value,
             cu_seqlens=cu,
-            _no_cp=True,
+            use_intracard_cp=False,
         )
 
 
@@ -223,7 +223,7 @@ def pytorch_ref(k, w, u, *, gk=None, initial_state=None, cu_seqlens, save_new_va
 
 
 def _assert_same_kernel(name, actual, ref):
-    """torch.testing.assert_close — matches tests/test_chunk_delta_h.py."""
+    """torch.testing.assert_close — matches tests/test_kda_sm100_recurrence.py."""
     if actual is None or ref is None:
         assert actual is ref, f"{name}: one is None and other isn't"
         return
@@ -257,7 +257,7 @@ def assert_cp_splits(cu, H, total_T):
 
 def test_forced_cp_not_splittable_raises():
     """use_intracard_cp=True on an unsplittable shape must raise NotSplittableError."""
-    from cula.ops.kda.policy import NotSplittableError
+    from cula.ops.kda.cp_mode import NotSplittableError
 
     # A single one-chunk sequence cannot be meaningfully split.
     cu = torch.tensor([0, BT], dtype=torch.int32, device=DEVICE)
@@ -289,7 +289,7 @@ def test_cp_autodispatch_matches_baseline(seq_lens, H, use_gk):
     """CP auto-dispatch output equals no-CP baseline (same kernel).
 
     Tolerance: `torch.testing.assert_close(atol=1e-2, rtol=1e-2)` —
-    matches the CP block in tests/test_chunk_delta_h.py.
+    matches the CP block in tests/test_kda_sm100_recurrence.py.
     """
     k, w, u, gk, _, cu = make_varlen_inputs(seq_lens, H, use_gk=use_gk)
     h_base, v_base, _ = run_cula_no_cp(k, w, u, gk, None, cu)

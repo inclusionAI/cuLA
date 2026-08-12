@@ -1,4 +1,4 @@
-# Copyright (c) 2025 ANTGROUP. All rights reserved.
+# Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -460,7 +460,7 @@ def intracard_fwd_h(
         split_info = False
 
     if not split_info:
-        from cula.ops.kda.policy import NotSplittableError
+        from cula.ops.kda.cp_mode import NotSplittableError
 
         raise NotSplittableError("SM100 intracard CP is not meaningfully splittable for this shape.")
 
@@ -560,7 +560,7 @@ def intracard_fwd_h(
         save_new_value=save_new_value,
         cu_seqlens=cu_seqlens_subseq_gpu,
         chunk_indices=chunk_indices_subseq,
-        _no_cp=True,
+        use_intracard_cp=False,
     )
 
     final_state = _gather_final_states(

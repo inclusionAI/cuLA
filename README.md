@@ -65,6 +65,35 @@ CULA_BUILD_ALL_ARCHS=1 python -m build --wheel --no-isolation
 
 ## Quick Start
 
+### Lightning Attention Prefill — Hopper (SM90)
+
+```python
+import torch
+from cula.lightning import lightning_attn_fwd
+
+B, T, H, D = 2, 4096, 64, 128
+q = torch.randn(B, T, H, D, device="cuda", dtype=torch.bfloat16)
+k = torch.randn_like(q)
+v = torch.randn_like(q)
+decay = torch.linspace(0.0, 0.04, H, device="cuda", dtype=torch.float32)
+
+output, final_state = lightning_attn_fwd(
+    q,
+    k,
+    v,
+    decay,
+    scale=D**-0.5,
+    output_final_state=True,
+)
+```
+
+The SM90 CuTe DSL backend supports fixed and packed variable-length prefill,
+optional recurrent state, GVA head mapping, and persistent packed scheduling.
+It uses BF16 Q/K/V, FP32 decay/state, head dimension 128, and chunk size 64.
+See [the SM90 Lightning prefill pipeline](docs/lightning_attn_sm90.md) for the
+warp-group roles, WGMMA dataflow, pipeline stages, recurrent-state placement,
+and fixed/packed scheduling modes.
+
 ### KDA (Kimi Delta Attention) — Blackwell (SM10X)
 
 Just change the import:
@@ -127,24 +156,26 @@ See [BENCHMARK_GB200_CUDA_130.md](BENCHMARK_GB200_CUDA_130.md) tested with CUDA 
 
 **Hopper (SM90)**
 
-See [BENCHMARK_H200.md](BENCHMARK_H200.md) tested with CUDA 12.9 for detailed results.
+See [BENCHMARK_H200.md](BENCHMARK_H200.md) for CuTe DSL FlashKDA results on an H200 141GB with CUDA 12.9.
 
 **Highlights:**
 - **KDA Modular Forward (Blackwell):** **avg 1.33x** speedup on fixed-length, **avg 1.35x** on variable-length (18 configs, uniform/skewed/random).
 - **Lightning Attention Prefill (Blackwell):** up to **2.08x** speedup (B=2).
 - **Lightning Attention Varlen (Blackwell):** **avg 1.47x** speedup across 126 configs (uniform/skewed/random).
-- **KDA Fused Forward (Hopper):** **avg 1.58x** speedup across fixed-length and variable-length sequences.
+- **FlashKDA Prefill (Hopper):** **avg 2.72x** speedup over FLA across 28 fixed-length and variable-length configs, up to **7.56x**.
+- **FlashKDA Intracard CP (Hopper):** **4.29x geo-mean** speedup over serial FlashKDA on 28 CP-engaged long-sequence configs, up to **7.83x**.
 
-To regenerate benchmarks:
+To reproduce the benchmark suites directly:
 
 ```bash
 # Blackwell (SM10X)
-python benchmarks/generate_benchmark_md.py
+python benchmarks/bench_kda.py --mode both
+python benchmarks/bench_lightning_attn_prefill.py --modes no_state varlen
+python benchmarks/bench_la_decode_vs_fla.py --heads 64 --head-dim 128
 
 # Hopper (SM90)
-python benchmarks/generate_benchmark_hopper_md.py
-
-# Hopper fused WY-DqKG backward vs FLA v0.5.0
+python benchmarks/bench_kda_sm90_prefill.py --mode both
+python benchmarks/bench_kda_sm90_cp.py
 python benchmarks/bench_kda_bwd_wy_dqkg_sm90.py --mode both --heads 32
 ```
 
@@ -152,23 +183,25 @@ python benchmarks/bench_kda_bwd_wy_dqkg_sm90.py --mode both --heads 32
 
 ```bash
 # Tests for modular KDA forward against FLA Triton implementation
-python -m pytest tests/test_kda_compare_fla.py -v
+python -m pytest tests/test_kda_sm100_chunk_vs_fla.py -v
 # Tests for modular KDA forward against naive KDA reference
-python -m pytest tests/test_kda.py -v
-# Tests for KDA fused forward
-python -m pytest tests/test_kda_fused_fwd.py -v
-# Tests for Lightning Attention fused forward
-python tests/test_lightning_attn.py
+python -m pytest tests/test_kda_sm100_chunk_vs_naive.py -v
+# Tests for the SM90 CuTeDSL two-kernel prefill + intracard CP (vs FLA)
+python -m pytest tests/test_kda_sm90_prefill_vs_fla.py tests/test_kda_sm90_intracard_cp.py -v
+# Tests for Lightning Attention prefill on SM100
+python tests/test_lightning_sm100_prefill.py
+# Tests for the SM90 Lightning public dispatch, semantics, and kernel structure
+python -m pytest tests/test_lightning_attn_prefill_dispatch.py tests/test_lightning_attn_prefill_sm90.py -v
 # Tests for Lightning Attention decode
-python -m pytest tests/test_la_decode.py -v
+python -m pytest tests/test_lightning_decode.py -v
 
-# test_kda.py and test_kda_compare_fla.py support a fast/slow split.
+# test_kda_sm100_chunk_vs_naive.py and test_kda_sm100_chunk_vs_fla.py support a fast/slow split.
 # Fast (default) — representative correctness paths for default CI and local iteration
-python -m pytest tests/test_kda.py tests/test_kda_compare_fla.py -v
+python -m pytest tests/test_kda_sm100_chunk_vs_naive.py tests/test_kda_sm100_chunk_vs_fla.py -v
 # Slow — broader stress coverage for nightly or manual runs
-python -m pytest -m kda_slow tests/test_kda.py tests/test_kda_compare_fla.py -v
+python -m pytest -m kda_slow tests/test_kda_sm100_chunk_vs_naive.py tests/test_kda_sm100_chunk_vs_fla.py -v
 # Full sweep (fast + slow) — run before submitting a PR
-python -m pytest -m kda_full tests/test_kda.py tests/test_kda_compare_fla.py -v
+python -m pytest -m kda_full tests/test_kda_sm100_chunk_vs_naive.py tests/test_kda_sm100_chunk_vs_fla.py -v
 ```
 
 <details>
@@ -220,7 +253,7 @@ See [REPO_LAYOUT.md](REPO_LAYOUT.md) for the full directory structure and a summ
 
 **Inference**
 
-* [x] Lightning prefill kernel (SM10X)
+* [x] Lightning prefill kernel (SM90 & SM10X)
 
 * [x] Lightning decode kernel (SM90 & SM10X)
 

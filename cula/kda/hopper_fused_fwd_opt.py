@@ -304,7 +304,7 @@ def cula_kda_prefill_opt(
     cu_seqlens_cpu: torch.IntTensor | None = None,
     **kwargs,
 ):
-    assert_hopper()
+    assert_hopper(q.device)
     assert safe_gate, "Only support safe_gate=True."
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -343,8 +343,31 @@ def cula_kda_prefill_opt(
         scale = k.shape[-1] ** -0.5
 
     needs_grad = torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v, g, beta) if t is not None)
-    if not needs_grad:
-        o, final_state = _inference_forward(
+    with torch.cuda.device_of(q):
+        if not needs_grad:
+            o, final_state = _inference_forward(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                A_log,
+                dt_bias,
+                scale,
+                initial_state,
+                output_final_state,
+                use_qk_l2norm_in_kernel,
+                use_gate_in_kernel,
+                safe_gate,
+                lower_bound,
+                cu_seqlens,
+                chunk_indices,
+                auto_cp,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+            )
+            return o, (final_state if output_final_state else None)
+
+        o, final_state = HopperChunkKDAFunctionOpt.apply(
             q,
             k,
             v,
@@ -362,29 +385,7 @@ def cula_kda_prefill_opt(
             cu_seqlens,
             chunk_indices,
             auto_cp,
-            cu_seqlens_cpu=cu_seqlens_cpu,
+            cu_seqlens_cpu,
         )
-        return o, (final_state if output_final_state else None)
-
-    o, final_state = HopperChunkKDAFunctionOpt.apply(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        A_log,
-        dt_bias,
-        scale,
-        initial_state,
-        output_final_state,
-        use_qk_l2norm_in_kernel,
-        use_gate_in_kernel,
-        safe_gate,
-        lower_bound,
-        cu_seqlens,
-        chunk_indices,
-        auto_cp,
-        cu_seqlens_cpu,
-    )
 
     return o, (final_state if output_final_state else None)
