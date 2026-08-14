@@ -157,6 +157,7 @@ See [BENCHMARK_GB200_CUDA_130.md](BENCHMARK_GB200_CUDA_130.md) tested with CUDA 
 **Hopper (SM90)**
 
 See [BENCHMARK_H200.md](BENCHMARK_H200.md) for CuTe DSL FlashKDA results on an H200 141GB with CUDA 12.9.
+See [BENCHMARK_KDA_BWD_INTRA_SM90.md](BENCHMARK_KDA_BWD_INTRA_SM90.md) for the persistent CUDA C++ KDA intra-chunk backward benchmark.
 
 **Highlights:**
 - **KDA Modular Forward (Blackwell):** **avg 1.33x** speedup on fixed-length, **avg 1.35x** on variable-length (18 configs, uniform/skewed/random).
@@ -164,6 +165,7 @@ See [BENCHMARK_H200.md](BENCHMARK_H200.md) for CuTe DSL FlashKDA results on an H
 - **Lightning Attention Varlen (Blackwell):** **avg 1.47x** speedup across 126 configs (uniform/skewed/random).
 - **FlashKDA Prefill (Hopper):** **avg 2.72x** speedup over FLA across 28 fixed-length and variable-length configs, up to **7.56x**.
 - **FlashKDA Intracard CP (Hopper):** **4.29x geo-mean** speedup over serial FlashKDA on 28 CP-engaged long-sequence configs, up to **7.83x**.
+- **KDA Backward Intra (Hopper):** **1.70x geo-mean** speedup over FLA v0.5.0 across eight fixed-length and variable-length configs.
 
 To reproduce the benchmark suites directly:
 
@@ -176,6 +178,7 @@ python benchmarks/bench_la_decode_vs_fla.py --heads 64 --head-dim 128
 # Hopper (SM90)
 python benchmarks/bench_kda_sm90_prefill.py --mode both
 python benchmarks/bench_kda_sm90_cp.py
+python benchmarks/bench_kda_bwd_intra_sm90.py --heads 32 64
 ```
 
 ## Tests
@@ -187,6 +190,8 @@ python -m pytest tests/test_kda_sm100_chunk_vs_fla.py -v
 python -m pytest tests/test_kda_sm100_chunk_vs_naive.py -v
 # Tests for the SM90 CuTeDSL two-kernel prefill + intracard CP (vs FLA)
 python -m pytest tests/test_kda_sm90_prefill_vs_fla.py tests/test_kda_sm90_intracard_cp.py -v
+# Tests for the persistent SM90 KDA intra-chunk backward kernel (vs FLA)
+python -m pytest tests/test_kda_sm90_bwd_intra.py -v
 # Tests for Lightning Attention prefill on SM100
 python tests/test_lightning_sm100_prefill.py
 # Tests for the SM90 Lightning public dispatch, semantics, and kernel structure

@@ -24,7 +24,39 @@ from fla.ops.utils.op import exp2, gather
 from fla.utils import IS_GATHER_SUPPORTED, autotune_cache_kwargs
 
 import cula.cudac as cula_cuda
-from cula.utils import prepare_uniform_cu_seqlens
+from cula.utils import get_device_sm_version, prepare_uniform_cu_seqlens
+
+
+def _is_mma_bwd_intra_supported(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    dAqk: torch.Tensor,
+    dAkk: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    db: torch.Tensor,
+    dg: torch.Tensor,
+    chunk_size: int,
+    safe_gate: bool,
+) -> bool:
+    tensors = (q, k, g, beta, dAqk, dAkk, dq, dk, db, dg)
+    if not q.is_cuda or any(tensor.device != q.device for tensor in tensors[1:]):
+        return False
+    capability = get_device_sm_version(q.device)
+    return (
+        capability in ((9, 0), (10, 0), (10, 3))
+        and safe_gate
+        and chunk_size == 64
+        and q.ndim == 4
+        and q.shape[-1] == 128
+        and q.shape == k.shape == g.shape == dq.shape == dk.shape == dg.shape
+        and beta.shape == db.shape == q.shape[:-1]
+        and dAqk.shape == dAkk.shape == (*q.shape[:-1], chunk_size)
+        and q.dtype == k.dtype == beta.dtype == torch.bfloat16
+        and g.dtype == dAqk.dtype == dAkk.dtype == dq.dtype == dk.dtype == db.dtype == dg.dtype == torch.float32
+    )
 
 
 @triton.heuristics(
@@ -360,7 +392,7 @@ def chunk_kda_fwd_intra(
     return w, u, qg, kg, Aqk, Akk
 
 
-def chunk_kda_bwd_intra(
+def _chunk_kda_bwd_intra_triton(
     q: torch.Tensor,
     k: torch.Tensor,
     g: torch.Tensor,
@@ -426,3 +458,89 @@ def chunk_kda_bwd_intra(
     dg = dg2
 
     return dq, dk, db, dg
+
+
+def _chunk_kda_bwd_intra_mma(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    dAqk: torch.Tensor,
+    dAkk: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    db: torch.Tensor,
+    dg: torch.Tensor,
+    cu_seqlens: torch.IntTensor | None = None,
+    chunk_indices: torch.IntTensor | None = None,
+    chunk_size: int = 64,
+):
+    from cula.ops.kda.sm90.bwd_intra import kda_bwd_intra_mma
+
+    B, T, _, _ = q.shape
+    if cu_seqlens is None:
+        cu_seqlens = prepare_uniform_cu_seqlens(B, T, q.device, torch.int32)
+    else:
+        cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
+    if chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    else:
+        chunk_indices = chunk_indices.to(device=q.device, dtype=torch.int32).contiguous()
+
+    inputs = (q, k, g, beta, dAqk, dAkk, dq, dk, db, dg)
+    return kda_bwd_intra_mma(
+        *(tensor.contiguous() for tensor in inputs),
+        cu_seqlens,
+        chunk_indices,
+        chunk_size=chunk_size,
+    )
+
+
+def chunk_kda_bwd_intra(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    dAqk: torch.Tensor,
+    dAkk: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    db: torch.Tensor,
+    dg: torch.Tensor,
+    cu_seqlens: torch.IntTensor | None = None,
+    chunk_indices: torch.IntTensor | None = None,
+    chunk_size: int = 64,
+    safe_gate: bool = False,
+):
+    if _is_mma_bwd_intra_supported(q, k, g, beta, dAqk, dAkk, dq, dk, db, dg, chunk_size, safe_gate):
+        return _chunk_kda_bwd_intra_mma(
+            q,
+            k,
+            g,
+            beta,
+            dAqk,
+            dAkk,
+            dq,
+            dk,
+            db,
+            dg,
+            cu_seqlens,
+            chunk_indices,
+            chunk_size,
+        )
+    return _chunk_kda_bwd_intra_triton(
+        q,
+        k,
+        g,
+        beta,
+        dAqk,
+        dAkk,
+        dq,
+        dk,
+        db,
+        dg,
+        cu_seqlens,
+        chunk_indices,
+        chunk_size,
+        safe_gate,
+    )

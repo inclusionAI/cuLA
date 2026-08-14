@@ -172,8 +172,10 @@ if not DISABLE_SM100 or not DISABLE_SM103:
         CUDAExtension(
             name="cula._cudac_sm100",
             sources=[
+                "csrc/api/kda_bwd_intra.cu",
                 "csrc/api/kda_sm100.cu",
                 "csrc/api/pybind_sm100.cu",
+                "csrc/kda/sm90/bwd/kda_bwd_intra_sm90.cu",
                 "csrc/kda/sm100/kda_fwd_sm100.cu",
             ],
             extra_compile_args={
@@ -195,8 +197,10 @@ if not DISABLE_SM90:
         CUDAExtension(
             name="cula._cudac_sm90",
             sources=[
+                "csrc/api/kda_bwd_intra.cu",
                 "csrc/api/kda_sm90.cu",
                 "csrc/api/pybind_sm90.cu",
+                "csrc/kda/sm90/bwd/kda_bwd_intra_sm90.cu",
                 "csrc/kda/sm90/kda_fwd_sm90.cu",
                 "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu",
             ],

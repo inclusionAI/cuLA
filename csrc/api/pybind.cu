@@ -17,6 +17,26 @@
 #include <torch/nn/functional.h>
 #include <torch/python.h>
 
+void
+ChunkKDABwdIntra(
+    at::Tensor q,
+    at::Tensor k,
+    at::Tensor g,
+    at::Tensor beta,
+    at::Tensor dAqk,
+    at::Tensor dAkk,
+    at::Tensor dq,
+    at::Tensor dk,
+    at::Tensor db,
+    at::Tensor dg,
+    at::Tensor cu_seqlens,
+    at::Tensor chunk_indices,
+    at::Tensor dq_out,
+    at::Tensor dk_out,
+    at::Tensor db_out,
+    at::Tensor dg_out,
+    int64_t chunk_size);
+
 #if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
 void
 ChunkKDAFwdIntra(
@@ -72,6 +92,7 @@ kda_fwd_prefill(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "cuLA";
+    m.def("chunk_kda_bwd_intra_cuda", &ChunkKDABwdIntra);
 #if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
     m.def("chunk_kda_fwd_intra_cuda", &ChunkKDAFwdIntra);
     m.def("recompute_w_u_cuda", &ChunkKDAFwdRecompWU);
