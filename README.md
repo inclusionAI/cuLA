@@ -140,6 +140,40 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 - `beta` supports both `float32` and `bfloat16`; `initial_state` must be `float32`.
 - `cu_seqlens` (for variable-length sequences) must be `int32`.
 
+### Gated DeltaNet-2 Prefill — Hopper (SM90)
+
+```python
+import torch
+
+from cula.gdn2 import chunk_gdn2
+
+q = torch.randn(66, 16, 128, device="cuda", dtype=torch.bfloat16)
+k = torch.randn_like(q)
+v = torch.randn(66, 32, 128, device="cuda", dtype=torch.bfloat16)
+g = -torch.rand_like(q, dtype=torch.float32) * 0.05
+b = torch.rand_like(q)
+w = torch.rand_like(v)
+cu_seqlens = torch.tensor([0, 65, 66], device="cuda", dtype=torch.int64)
+
+output, final_state = chunk_gdn2(
+    q,
+    k,
+    v,
+    g,
+    b,
+    w,
+    cu_seqlens=cu_seqlens,
+    output_final_state=True,
+)
+```
+
+The SM90a CuTe DSL backend supports packed MHA, GVA2, and GVA4 with
+`Hq=16`, `Hv={16,32,64}`, `K=V=128`, and up to 32 non-empty sequences.
+Q/K/V/B/W are BF16, G and recurrent state are FP32, and state uses public
+`[N,Hv,V,K]` orientation. Unsupported inputs fail explicitly without a
+fallback. See the [GDN2 SM90 API guide](docs/gdn2_sm90_api.md) and
+[GDN2 SM90 pipeline](docs/gdn2_sm90_pipeline.md).
+
 ## Usage
 
 See [USAGE.md](USAGE.md) for detailed usage examples and notes.
@@ -176,6 +210,11 @@ python benchmarks/bench_la_decode_vs_fla.py --heads 64 --head-dim 128
 # Hopper (SM90)
 python benchmarks/bench_kda_sm90_prefill.py --mode both
 python benchmarks/bench_kda_sm90_cp.py
+
+# GDN2 prefill — canonical five-row SM90 product/FLA matrix
+python benchmarks/bench_gdn2_prefill.py \
+  --implementation both \
+  --output gdn2-sm90-benchmark.json
 ```
 
 ## Tests
@@ -193,6 +232,16 @@ python tests/test_lightning_sm100_prefill.py
 python -m pytest tests/test_lightning_attn_prefill_dispatch.py tests/test_lightning_attn_prefill_sm90.py -v
 # Tests for Lightning Attention decode
 python -m pytest tests/test_lightning_decode.py -v
+# Tests for GDN2 SM90 product dispatch and tokenwise correctness
+python -m pytest tests/gdn2/test_gdn2_prefill_sm90.py -v
+# GDN2 SM90 deterministic stress: one process, 100,000 product launches
+python tests/gdn2/stress_gdn2_sm90.py \
+  --iterations 100000 \
+  --output gdn2-sm90-stress.json
+# GDN2 SM90 memcheck/initcheck/synccheck/racecheck, 120 launches per tool
+tests/gdn2/run_compute_sanitizer_sm90.sh \
+  gdn2-sm90-sanitizers \
+  120
 
 # test_kda_sm100_chunk_vs_naive.py and test_kda_sm100_chunk_vs_fla.py support a fast/slow split.
 # Fast (default) — representative correctness paths for default CI and local iteration

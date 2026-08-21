@@ -10,6 +10,8 @@ cuLA/
 │   ├── cudac.py                       # Lazy proxy for the per-architecture CUDA extension
 │   ├── utils.py                       # Architecture, stream-buffer, and cu_seqlens helpers
 │   │
+│   ├── gdn2/                          # [non-KDA] Gated DeltaNet-2 public API
+│   │
 │   ├── kda/                           # KDA public API, wrappers, autograd, routing, and Triton support kernels
 │   │   ├── __init__.py                # Lazy exports for chunk, prefill, and decode APIs
 │   │   ├── backends/                  # kda_prefill runtime dispatch
@@ -32,6 +34,12 @@ cuLA/
 │   └── ops/                           # CuTeDSL kernels and shared low-level helpers
 │       ├── inv.py / ptx.py            # Shared low-level helpers
 │       ├── sm100/ptx.py               # Shared SM100 PTX helpers
+│       ├── gdn2/                       # [non-KDA] Gated DeltaNet-2 prefill kernels
+│       │   └── sm90/                   # SM90a CuTe DSL implementation
+│       │       ├── config.py           # Host-side product contract and supported ranges
+│       │       ├── prefill.py          # Validation, compile cache, and TVM-FFI launch
+│       │       ├── prefill_kernel.py   # Fused packed recurrent prefill kernel
+│       │       └── collective_inverse_hmma.py / inverse_helpers.py # Triangular inverse
 │       ├── kda/
 │       │   ├── cp_mode.py              # Shared intracard-CP mode vocabulary
 │       │   ├── sm100/                  # Blackwell modular forward/backward kernels
@@ -82,5 +90,6 @@ cuLA/
 | `cula/ops/kda/` | Python (CuTeDSL) | CuTeDSL KDA kernels organized into SM100 modular kernels, SM90 FlashKDA K1+K2 and intracard CP, decode, and experimental code. The fully-fused SM90 implementation lives under `csrc/`, not here. |
 | `csrc/kda/{sm90,sm100}/` | CUDA C++ | Hopper fully-fused prefill and Blackwell modular chunk kernels. |
 | `csrc/api/` · `cula/cudac.py` | CUDA C++ / Python | Per-architecture `_cudac_sm90` and `_cudac_sm100` extensions, exposed lazily through the `cula.cudac` compatibility proxy. |
+| `cula/gdn2/` · `cula/ops/gdn2/` | Python (CuTeDSL) | `[non-KDA]` Gated DeltaNet-2 packed-varlen prefill. `chunk_gdn2` dispatches directly to the SM90a backend with no fallback; unsupported inputs and out-of-range CuTeDSL versions fail closed. See [`docs/gdn2_sm90_api.md`](docs/gdn2_sm90_api.md). |
 | `cula/ops/lightning/` · `cula/ops/experimental/` | Python (CuTeDSL) | `[non-KDA]` Lightning/linear-attention kernels and prototypes. Lightning prefill dispatches to the SM90 or SM100 backend from Q's device capability. |
 | `cula/ops/{inv,ptx}.py` · `cula/ops/sm100/ptx.py` | Python | Shared low-level helpers used across operators. |
