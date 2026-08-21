@@ -80,34 +80,6 @@ def assert_hopper(device: torch.device | str | int | None = None) -> None:
         raise RuntimeError(f"Only Hopper GPUs (SM90) are supported, got compute capability sm_{major}{minor}.")
 
 
-def get_kda_fused_fwd(device: torch.device | str | int | None = None) -> Callable:
-    """Return the appropriate ``kda_prefill`` implementation for *device*.
-
-    - sm100/sm103 (Blackwell) → cula.ops.kda.experimental.sm100_fused (WIP)
-    - sm90  (Hopper)          → cula.kda.hopper_fused_fwd
-
-    Args:
-        device: CUDA device to query.  Defaults to the currently active device.
-
-    Raises:
-        RuntimeError: If the device architecture is not supported.
-    """
-    major, minor = get_device_sm_version(device)
-    if major == 10 and minor in (0, 3):
-        from cula.ops.kda.experimental.sm100_fused.wrapper import flash_kda_prefill
-
-        return flash_kda_prefill
-    elif major == 9 and minor == 0:
-        from cula.kda.hopper_fused_fwd import cula_kda_prefill
-
-        return cula_kda_prefill
-    else:
-        raise RuntimeError(
-            f"Unsupported CUDA compute capability sm_{major}{minor}. "
-            f"Only sm90a (Hopper) and Blackwell (SM100/SM103) are supported."
-        )
-
-
 def get_pre_scan(device: torch.device | str | int | None = None) -> Callable:
     """Return the intracard-CP pre_scan implementation for *device*."""
     major, minor = get_device_sm_version(device)

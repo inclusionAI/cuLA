@@ -30,7 +30,7 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
-from cula.ops.kda.sm90._common import _stream_key, add_f16x2_u32, movm_t_b16
+from cula.ops.kda.sm90._common import _stream_key, add_f16x2_u32, copy_async_bulk, movm_t_b16
 
 CHUNK: int = 16
 D: int = 128
@@ -45,16 +45,13 @@ def k1_kernel(
     tma_tensor_k: cute.Tensor,
     tma_atom_g: cute.CopyAtom,
     tma_tensor_g: cute.Tensor,
-    tma_atom_ws_qd: cute.CopyAtom,
-    tma_tensor_ws_qd: cute.Tensor,
-    tma_atom_ws_kd: cute.CopyAtom,
-    tma_tensor_ws_kd: cute.Tensor,
-    tma_atom_ws_kr: cute.CopyAtom,
-    tma_tensor_ws_kr: cute.Tensor,
     tma_atom_ws_inv: cute.CopyAtom,
     tma_tensor_ws_inv: cute.Tensor,
     tma_atom_ws_mqk: cute.CopyAtom,
     tma_tensor_ws_mqk: cute.Tensor,
+    ws_qd: cute.Tensor,
+    ws_kd: cute.Tensor,
+    ws_kr: cute.Tensor,
     a_log: cute.Tensor,
     dt_bias: cute.Tensor,
     beta: cute.Tensor,
@@ -148,30 +145,6 @@ def k1_kernel(
         cute.group_modes(gSrc_g, 0, 2),
     )
 
-    gDst_qd = cute.local_tile(tma_tensor_ws_qd, (CHUNK, D), (None, None, None))
-    tQDws_s, tQDws_g = cpasync.tma_partition(
-        tma_atom_ws_qd,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(s_q_decayed, 0, 2),
-        cute.group_modes(gDst_qd, 0, 2),
-    )
-    gDst_kd = cute.local_tile(tma_tensor_ws_kd, (CHUNK, D), (None, None, None))
-    tKDws_s, tKDws_g = cpasync.tma_partition(
-        tma_atom_ws_kd,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(s_k_decayed, 0, 2),
-        cute.group_modes(gDst_kd, 0, 2),
-    )
-    gDst_kr = cute.local_tile(tma_tensor_ws_kr, (CHUNK, D), (None, None, None))
-    tKRws_s, tKRws_g = cpasync.tma_partition(
-        tma_atom_ws_kr,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(s_k_restored, 0, 2),
-        cute.group_modes(gDst_kr, 0, 2),
-    )
     gDst_inv = cute.local_tile(tma_tensor_ws_inv, (CHUNK, CHUNK), (None, None, None))
     tINVws_s, tINVws_g = cpasync.tma_partition(
         tma_atom_ws_inv,
@@ -189,6 +162,18 @@ def k1_kernel(
         cute.group_modes(gDst_mqk, 0, 2),
     )
     ws_slot = head_idx * total_tiles + tile_idx
+    raw_copy_atom = cute.make_copy_atom(cpasync.CopyBulkS2GOp(), cutlass.BFloat16)
+    raw_smem_layout = cute.make_layout((CHUNK * D,), stride=(1,))
+    raw_gmem_layout = cute.make_layout(
+        (CHUNK * D, total_tiles * H),
+        stride=(1, CHUNK * D),
+    )
+    sQDws_raw = cute.make_tensor(s_q_decayed.iterator, raw_smem_layout)
+    sKDws_raw = cute.make_tensor(s_k_decayed.iterator, raw_smem_layout)
+    sKRws_raw = cute.make_tensor(s_k_restored.iterator, raw_smem_layout)
+    gQDws_raw = cute.make_tensor(ws_qd.iterator, raw_gmem_layout)
+    gKDws_raw = cute.make_tensor(ws_kd.iterator, raw_gmem_layout)
+    gKRws_raw = cute.make_tensor(ws_kr.iterator, raw_gmem_layout)
 
     if warp_idx == 0:
         with cute.arch.elect_one():
@@ -533,12 +518,16 @@ def k1_kernel(
     cute.arch.fence_view_async_shared()
     cute.arch.barrier()
 
-    # TMA bulk store all 5 workspace tensors (one elect_one, one thread).
+    # Preserve the physical K_INTER byte image for qd/kd/kr; inv/mqk remain
+    # layout-aware tensor TMA stores. This raw-workspace transport idea comes
+    # from Flash-Flash-KDA: https://github.com/Itssshikhar/Flash-Flash-KDA
     if warp_idx == 0:
+        # copy_async_bulk supplies elect_one only for pre-4.6 CuTeDSL. CuTeDSL
+        # 4.6+ emits it inside cute.copy, where an outer elect_one is invalid.
+        copy_async_bulk(raw_copy_atom, sQDws_raw, gQDws_raw[(None, ws_slot)])
+        copy_async_bulk(raw_copy_atom, sKDws_raw, gKDws_raw[(None, ws_slot)])
+        copy_async_bulk(raw_copy_atom, sKRws_raw, gKRws_raw[(None, ws_slot)])
         with cute.arch.elect_one():
-            cute.copy(tma_atom_ws_qd, tQDws_s[(None,)], tQDws_g[(None, 0, 0, ws_slot)])
-            cute.copy(tma_atom_ws_kd, tKDws_s[(None,)], tKDws_g[(None, 0, 0, ws_slot)])
-            cute.copy(tma_atom_ws_kr, tKRws_s[(None,)], tKRws_g[(None, 0, 0, ws_slot)])
             cute.copy(tma_atom_ws_inv, tINVws_s[(None,)], tINVws_g[(None, 0, 0, ws_slot)])
             cute.copy(tma_atom_ws_mqk, tMQKws_s[(None,)], tMQKws_g[(None, 0, 0, ws_slot)])
             cute.arch.cp_async_bulk_commit_group()
@@ -571,9 +560,6 @@ def run_k1(
     stream: cuda_drv.CUstream,
 ):
     smem_layout_qk = cute.make_layout((CHUNK, D), stride=(D, 1))
-    # K_INTER swizzled layout — must match kernel SMEM layout for TMA stores.
-    kinter_atom = make_smem_layout_atom(SmemLayoutAtomKind.K_INTER, cutlass.BFloat16)
-    smem_layout_qk_kinter = cute.tile_to_shape(kinter_atom, (CHUNK, D), order=(0, 1))
 
     def make_atom(t):
         view = cute.make_tensor(
@@ -584,18 +570,6 @@ def run_k1(
             cpasync.CopyBulkTensorTileG2SOp(),
             view,
             smem_layout_qk,
-            (CHUNK, D),
-        )
-
-    def make_ws_store_atom(t):
-        view = cute.make_tensor(
-            t.iterator,
-            cute.make_layout((CHUNK, D, total_tiles * H), stride=(D, 1, CHUNK * D)),
-        )
-        return cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
-            view,
-            smem_layout_qk_kinter,
             (CHUNK, D),
         )
 
@@ -620,9 +594,6 @@ def run_k1(
     tma_atom_q, tma_tensor_q = make_atom(q)
     tma_atom_k, tma_tensor_k = make_atom(k)
     tma_atom_g, tma_tensor_g = make_atom(g)
-    tma_atom_ws_qd, tma_tensor_ws_qd = make_ws_store_atom(ws_qd)
-    tma_atom_ws_kd, tma_tensor_ws_kd = make_ws_store_atom(ws_kd)
-    tma_atom_ws_kr, tma_tensor_ws_kr = make_ws_store_atom(ws_kr)
     tma_atom_ws_inv, tma_tensor_ws_inv = make_ws_cc_store_atom(ws_inv)
     tma_atom_ws_mqk, tma_tensor_ws_mqk = make_ws_cc_store_atom(ws_mqk)
 
@@ -635,16 +606,13 @@ def run_k1(
         tma_tensor_k,
         tma_atom_g,
         tma_tensor_g,
-        tma_atom_ws_qd,
-        tma_tensor_ws_qd,
-        tma_atom_ws_kd,
-        tma_tensor_ws_kd,
-        tma_atom_ws_kr,
-        tma_tensor_ws_kr,
         tma_atom_ws_inv,
         tma_tensor_ws_inv,
         tma_atom_ws_mqk,
         tma_tensor_ws_mqk,
+        ws_qd,
+        ws_kd,
+        ws_kr,
         a_log,
         dt_bias,
         beta,

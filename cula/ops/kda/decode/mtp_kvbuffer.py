@@ -577,12 +577,12 @@ def kda_mtp_shuffle_kvbuffer_kernel(
                         sG[t_tok, k_start + c] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
                     else:
                         beta_x = softplus_beta * x
-                        exp_bx = cute.exp(beta_x, fastmath=fast_math)
-                        sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                            cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
-                        )
-                        use_sp = cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
-                        sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
+                        sp_x = x
+                        if beta_x <= softplus_threshold:
+                            sp_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                                cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=fast_math),
+                                fastmath=fast_math,
+                            )
                         sG[t_tok, k_start + c] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
                     sKdec[t_tok, k_start + c] = r_kf[c]
                     sQdec[t_tok, k_start + c] = r_qf[c]
@@ -1097,10 +1097,11 @@ def kda_decode_mtp_shuffle_kvbuffer(
 #   C/D [16,8] f32:     c0=C[gid][2tig] c1=C[gid][2tig+1] c2=C[gid+8][2tig] c3=C[gid+8][2tig+1]
 # ===========================================================================
 
-from cutlass._mlir.dialects import arith as _arith  # noqa: E402
-from cutlass._mlir.dialects import llvm as _llvm  # noqa: E402
 from cutlass.cutlass_dsl import T as _T  # noqa: E402
 from cutlass.cutlass_dsl import dsl_user_op  # noqa: E402
+
+from cula.ops._mlir_compat import arith as _arith  # noqa: E402
+from cula.ops._mlir_compat import llvm as _llvm  # noqa: E402
 
 
 @dsl_user_op
@@ -1540,12 +1541,12 @@ def kda_mtp_tensor_core_kvbuffer_kernel(
                         sG[t_tok, k_start + c] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
                     else:
                         beta_x = softplus_beta * x
-                        exp_bx = cute.exp(beta_x, fastmath=fast_math)
-                        sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                            cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
-                        )
-                        use_sp = cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
-                        sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
+                        sp_x = x
+                        if beta_x <= softplus_threshold:
+                            sp_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                                cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=fast_math),
+                                fastmath=fast_math,
+                            )
                         sG[t_tok, k_start + c] = cute.exp(
                             -r_exp_A * sp_x, fastmath=fast_math
                         )  # g_t directly (exact prefix product in P2)

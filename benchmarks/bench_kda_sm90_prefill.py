@@ -17,7 +17,7 @@
 bench_kda_sm90_prefill.py — Benchmark: SM90 CuTeDSL KDA prefill vs FLA Triton baseline
 
 Hopper-only. Calls cula.kda.flashkda (cula_kda_prefill, the K1+K2
-two-kernel prefill) directly -- no get_kda_fused_fwd dispatcher.
+two-kernel prefill) directly.
 
 Compares:
   - Accuracy: relative_rms_error, rel_max, mean_diff of the output o vs FLA Triton

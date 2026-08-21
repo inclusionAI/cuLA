@@ -55,17 +55,23 @@ __all__ = [
 
 import cutlass
 import cutlass.cute as cute
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import arith as _arith
-from cutlass._mlir.dialects import llvm
-from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cute.arch import elect_one
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.typing import Int32
 from cutlass.cutlass_dsl import dsl_user_op
 
+from cula.ops._cutedsl_compat import detect_tcgen05_ldst_api
+from cula.ops._mlir_compat import arith as _arith
+from cula.ops._mlir_compat import ir, llvm
+from cula.ops._mlir_compat import nvvm as _nvvm
+
 CollectorBBuffer = _nvvm.Tcgen05MMACollectorBBuffer
 CollectorOp = _nvvm.Tcgen05MMACollectorOp
+
+_tcgen05_ldst_api = detect_tcgen05_ldst_api(_nvvm.tcgen05_ld, _nvvm.tcgen05_st)
+_TCGEN05_LD_HAS_NUM = _tcgen05_ldst_api.ld_has_num
+_TCGEN05_ST_HAS_NUM = _tcgen05_ldst_api.st_has_num
+_TCGEN05_ST_USES_R = _tcgen05_ldst_api.st_value_keyword == "r"
 
 
 def _to_ir(val, loc=None, ip=None):
@@ -168,14 +174,24 @@ def tcgen05_ld_32x32b(num: int, taddr: int):
         ptr6_ty = llvm.PointerType.get(address_space=6)
         tmem_ptr = llvm.inttoptr(ptr6_ty, _to_ir(addr_val, loc, ip), loc=loc, ip=ip)
         vec_i32_ty = ir.VectorType.get([num], i32_ty)
-        return _nvvm.tcgen05_ld(
-            res=vec_i32_ty,
-            shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
-            num=num,
-            tmem_addr=tmem_ptr,
-            loc=loc,
-            ip=ip,
-        )
+        if cutlass.const_expr(_TCGEN05_LD_HAS_NUM):
+            result = _nvvm.tcgen05_ld(
+                res=vec_i32_ty,
+                shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
+                num=num,
+                tmem_addr=tmem_ptr,
+                loc=loc,
+                ip=ip,
+            )
+        else:
+            result = _nvvm.tcgen05_ld(
+                res=vec_i32_ty,
+                shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
+                tmem_addr=tmem_ptr,
+                loc=loc,
+                ip=ip,
+            )
+        return result
 
     return _do(Int32(taddr))
 
@@ -188,14 +204,42 @@ def tcgen05_st_32x32b(num: int, taddr: int, vec):
     def _do(addr_val, vec_val, *, loc=None, ip=None):
         ptr6_ty = llvm.PointerType.get(address_space=6)
         tmem_ptr = llvm.inttoptr(ptr6_ty, _to_ir(addr_val, loc, ip), loc=loc, ip=ip)
-        _nvvm.tcgen05_st(
-            shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
-            num=num,
-            tmem_addr=tmem_ptr,
-            r=_to_ir(vec_val, loc, ip),
-            loc=loc,
-            ip=ip,
-        )
+        if cutlass.const_expr(_TCGEN05_ST_HAS_NUM):
+            if cutlass.const_expr(_TCGEN05_ST_USES_R):
+                _nvvm.tcgen05_st(
+                    shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
+                    num=num,
+                    tmem_addr=tmem_ptr,
+                    r=_to_ir(vec_val, loc, ip),
+                    loc=loc,
+                    ip=ip,
+                )
+            else:
+                _nvvm.tcgen05_st(
+                    shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
+                    num=num,
+                    tmem_addr=tmem_ptr,
+                    val=_to_ir(vec_val, loc, ip),
+                    loc=loc,
+                    ip=ip,
+                )
+        else:
+            if cutlass.const_expr(_TCGEN05_ST_USES_R):
+                _nvvm.tcgen05_st(
+                    shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
+                    tmem_addr=tmem_ptr,
+                    r=_to_ir(vec_val, loc, ip),
+                    loc=loc,
+                    ip=ip,
+                )
+            else:
+                _nvvm.tcgen05_st(
+                    shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
+                    tmem_addr=tmem_ptr,
+                    val=_to_ir(vec_val, loc, ip),
+                    loc=loc,
+                    ip=ip,
+                )
 
     _do(Int32(taddr), vec)
 

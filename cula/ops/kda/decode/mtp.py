@@ -203,12 +203,12 @@ def kda_verify_kernel_mtp_recurrent_ws(
                 sG[(i_t, g_ch)] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
             else:
                 beta_x = softplus_beta * x
-                exp_beta_x = cute.exp(beta_x, fastmath=fast_math)
-                softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + exp_beta_x, fastmath=fast_math
-                )
-                use_softplus = cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
-                softplus_x = use_softplus * softplus_val + (cutlass.Float32(1.0) - use_softplus) * x
+                softplus_x = x
+                if beta_x <= softplus_threshold:
+                    softplus_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                        cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=fast_math),
+                        fastmath=fast_math,
+                    )
                 sG[(i_t, g_ch)] = cute.exp(-r_exp_A * softplus_x, fastmath=fast_math)
 
         # ============ Phase 1b: warp 0 q/k+beta, warps 1-3 state prefetch ============
@@ -1273,12 +1273,12 @@ def kda_mtp_recurrent_kernel(
                     sG[sw] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
                 else:
                     beta_x = softplus_beta * x
-                    exp_bx = cute.exp(beta_x, fastmath=fast_math)
-                    sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                        cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
-                    )
-                    use_sp = cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
-                    sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
+                    sp_x = x
+                    if beta_x <= softplus_threshold:
+                        sp_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                            cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=fast_math),
+                            fastmath=fast_math,
+                        )
                     sG[sw] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
                 sQ[sw] = r_q[i]
                 sK[sw] = r_k[i]
@@ -1753,7 +1753,7 @@ def kda_mtp_recurrent_vk_kernel(
         cute.make_layout((BV,), stride=(1,)), cutlass.Float32
     )  # ILP: BV reduce partials, batched butterfly
     r_gx = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # gate: x=a+dtb
-    r_gexp = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # gate: exp(beta_x)
+    r_gsp = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # gate: softplus(x)
     r_h4 = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )  # float4 temp buffer (state load/store)
@@ -1814,7 +1814,13 @@ def kda_mtp_recurrent_vk_kernel(
                 r_gx[c] = cutlass.Float32(r_abf[cur][c]) + r_dtb[c]  # x = a + dt_bias
             if cutlass.const_expr(not use_lower_bound):
                 for c in cutlass.range_constexpr(vec_size):
-                    r_gexp[c] = cute.exp(softplus_beta * r_gx[c], fastmath=fast_math)  # exp(beta_x)
+                    beta_x = softplus_beta * r_gx[c]
+                    r_gsp[c] = r_gx[c]
+                    if beta_x <= softplus_threshold:
+                        r_gsp[c] = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                            cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=fast_math),
+                            fastmath=fast_math,
+                        )
 
             if cutlass.const_expr(use_qk_l2norm):
                 sum_q = cutlass.Float32(0.0)
@@ -1844,14 +1850,7 @@ def kda_mtp_recurrent_vk_kernel(
                     r_g[c] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
             else:
                 for c in cutlass.range_constexpr(vec_size):
-                    beta_x = softplus_beta * r_gx[c]
-                    sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                        cutlass.Float32(1.0) + r_gexp[c], fastmath=fast_math
-                    )
-                    use_sp = cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
-                    r_g[c] = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * r_gx[c]  # stash sp_x
-                for c in cutlass.range_constexpr(vec_size):
-                    r_g[c] = cute.exp(-r_exp_A * r_g[c], fastmath=fast_math)  # final exp (batched)
+                    r_g[c] = cute.exp(-r_exp_A * r_gsp[c], fastmath=fast_math)
 
             r_beta = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-r_bbf[cur][0], fastmath=fast_math))
 
