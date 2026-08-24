@@ -28,12 +28,15 @@ All timings below use physical GPU 1. The representative shape is BF16
 
 | T | csrc (ms) | CuTeDSL (ms) | csrc / CuTeDSL |
 |---:|---:|---:|---:|
-| 4096 | 0.1700 | 0.1974 | 0.861x |
-| 8192 | 0.3272 | 0.3829 | 0.855x |
-| 16384 | 0.6399 | 0.7556 | 0.847x |
+| 4096 | 0.1702 | 0.1849 | 0.920x |
+| 8192 | 0.3280 | 0.3586 | 0.915x |
+| 16384 | 0.6410 | 0.7070 | 0.907x |
 
-The best measured register split is 216 registers for the four CUDA compute
-warps and 32 for the load/MMA/store warps, while retaining two CTAs per SM.
+The standalone API computes the fp32 gate transform and writes `kg`; it remains
+8-9% slower than csrc. The forward path instead uses the preprocessed
+specialization: fused intra already produced `k_scaled` and `kg`, so W/U skips
+the duplicate fp32 gate load, exponentiation, and `kg` store. This is the path
+used in the parity table below.
 
 ### Raw-gate fused intra plus specialized WU
 
@@ -74,8 +77,11 @@ and the inverse instead of PDL fences.
 
 ## Remaining validation
 
-- Run the SM100 correctness tests for generic and preprocessed W/U.
 - Extend the performance matrix to additional batch/head combinations before
   changing the default public dispatch.
 - Keep the csrc fallback for shapes that do not satisfy the current K=V=128,
   chunk-size=64 specialization constraints.
+
+`tests/test_kda_sm100_recompute_wu_cutedsl.py` passes on the target GB200 for
+float32 and bf16 beta in the generic path and for the preprocessed path against
+a Torch reference.
