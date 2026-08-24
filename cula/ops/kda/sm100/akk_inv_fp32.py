@@ -154,25 +154,29 @@ def akk_inv_fp32_physical_kernel(
         _add_store_C16_smem(sAkk, row_o, 16, r0, r1, r2, r3, r4, r5, r6, r7, lane_id)
     cute.arch.barrier()
 
-    row_start = warp_idx * SB
-    for ri in range(SB):
-        row = row_start + ri
-        col0 = lane_id * 2
-        col1 = col0 + 1
+    # Vectorized inverse epilogue: 512 contiguous 8-element row segments are
+    # distributed evenly across the 128 threads. The input normalization
+    # cleared the upper triangle, so no per-element mask is needed here.
+    rOutFp32 = cute.make_rmem_tensor((8,), cutlass.Float32)
+    rOutBf16 = cute.make_rmem_tensor((8,), cutlass.BFloat16)
+    for store_iter in cutlass.range_constexpr((BS * BS) // (THREADS * 8)):
+        linear_vec = tidx + store_iter * THREADS
+        row = linear_vec // (BS // 8)
+        vec_idx = linear_vec % (BS // 8)
         t_row = chunk_start + row
-        val0 = cutlass.Float32(sAkk[row, col0])
-        val1 = cutlass.Float32(sAkk[row, col1])
-        if row < col0:
-            val0 = cutlass.Float32(0.0)
-        if row < col1:
-            val1 = cutlass.Float32(0.0)
+        sOutRow = sAkk[row, None]
+        sOutVec = cute.local_tile(sOutRow, (8,), (vec_idx,))
+        cute.autovec_copy(sOutVec, rOutFp32)
+        rOutBf16.store(rOutFp32.load().to(cutlass.BFloat16))
         if IS_VARLEN:
             if t_row < eos:
-                mA_out[b_idx, t_row, h_idx, col0] = val0.to(cutlass.BFloat16)
-                mA_out[b_idx, t_row, h_idx, col1] = val1.to(cutlass.BFloat16)
+                gOutRow = mA_out[b_idx, t_row, h_idx, None]
+                gOutVec = cute.local_tile(gOutRow, (8,), (vec_idx,))
+                cute.autovec_copy(rOutBf16, gOutVec)
         else:
-            mA_out[b_idx, t_row, h_idx, col0] = val0.to(cutlass.BFloat16)
-            mA_out[b_idx, t_row, h_idx, col1] = val1.to(cutlass.BFloat16)
+            gOutRow = mA_out[b_idx, t_row, h_idx, None]
+            gOutVec = cute.local_tile(gOutRow, (8,), (vec_idx,))
+            cute.autovec_copy(rOutBf16, gOutVec)
 
 
 @cute.jit
