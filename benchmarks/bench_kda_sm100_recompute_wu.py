@@ -61,6 +61,11 @@ def main():
     parser.add_argument("--heads", type=int, default=64)
     parser.add_argument("--beta-bf16", action="store_true")
     parser.add_argument("--lengths", type=int, nargs="+", default=[512, 1024, 4096, 8192, 16384, 32768])
+    parser.add_argument(
+        "--profile",
+        choices=("cpp", "ws", "occ"),
+        help="Warm up, then launch exactly one selected kernel between CUDA profiler markers",
+    )
     args = parser.parse_args()
 
     import benchmarks.bench_recompute_wu as common
@@ -68,6 +73,34 @@ def main():
     common.H = args.heads
     common.HV = args.heads
     device = torch.device("cuda")
+    if args.profile:
+        if len(args.lengths) != 1:
+            parser.error("--profile requires exactly one value in --lengths")
+        T = args.lengths[0]
+        cu_seqlens = torch.tensor([0, T, 2 * T], dtype=torch.int32, device=device)
+        _q, k, v, cu_gk, beta, A, cu_seqlens, chunk_indices = prepare_recompute_wu_inputs(
+            2,
+            T,
+            device,
+            cu_seqlens=cu_seqlens,
+        )
+        if args.beta_bf16:
+            beta = beta.bfloat16()
+        runners = {
+            "cpp": lambda: _run_cpp(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices),
+            "ws": lambda: recompute_w_u_fwd(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices),
+            "occ": lambda: _run_occ(k, v, beta, A, cu_gk, cu_seqlens),
+        }
+        runner = runners[args.profile]
+        runner()
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStart()
+        runner()
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+        print(f"profiled {args.profile} at T={T}, H={args.heads}")
+        return
+
     print(f"{'T':>8} {'C++ (ms)':>12} {'WS (ms)':>12} {'Occ (ms)':>12} {'WS/C++':>10} {'Occ/C++':>10} {'rel_rmse':>12}")
     for T in args.lengths:
         cu_seqlens = torch.tensor([0, T, 2 * T], dtype=torch.int32, device=device)
