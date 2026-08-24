@@ -109,7 +109,7 @@ class KDARecomputeWU:
         #   Regs: 128*216 + 128*32 = 31,744 registers/CTA; two CTAs fit.
         #   SMEM: ~74KB/CTA × 2 = 148KB < 228KB ✓
         self.min_occupancy = 2
-        self.num_regs_cuda = 224
+        self.num_regs_cuda = 216
         self.num_regs_others = 32
         self.a_stage = 1
         self.kgk_stage = 1
