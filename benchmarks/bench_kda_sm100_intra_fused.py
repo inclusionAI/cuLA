@@ -33,6 +33,7 @@ from fla.ops.utils.constant import RCP_LN2
 
 from benchmarks.utils import exclusive_cumsum, gen_random, gen_skewed, gen_uniform, set_seed
 from cula.kda.chunk_intra import chunk_kda_fwd_intra as cula_chunk_kda_fwd_intra
+from cula.ops.kda.sm100.akk_inv_tf32 import akk_inv_tf32
 from cula.ops.kda.sm100.intra_fused import (
     BT,
     K_DIM,
@@ -205,6 +206,13 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
                 pdl_fp32_akk_inv=True,
             )
 
+    elif args.cutedsl_variant == "flashinfer-k123-copy-tf32-inv":
+
+        def cutedsl_fn(**kwargs):
+            out = chunk_kda_fwd_intra_sm100_equal(**kwargs)
+            akk = akk_inv_tf32(out[5], kwargs["beta"], apply_beta_epilogue=True)
+            return (*out[:5], akk)
+
     else:
         raise NotImplementedError(f"Unsupported CuTeDSL variant: {args.cutedsl_variant}")
 
@@ -281,7 +289,10 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
             ("q_scaled", accuracy_stats(q_scaled_ref, cutedsl[2])),
             ("Aqk_valid", accuracy_stats(aqk_fla, cutedsl[4], valid_mask)),
         ]
-        if args.cutedsl_variant in ("flashinfer-k123-copy-pdl-fp32-inv",):
+        if args.cutedsl_variant in (
+            "flashinfer-k123-copy-pdl-fp32-inv",
+            "flashinfer-k123-copy-tf32-inv",
+        ):
             stats.append(("Akk_valid", accuracy_stats(akk_fla, cutedsl[5], valid_mask)))
         if args.with_recompute_wu:
             stats.extend(
@@ -576,6 +587,7 @@ def main() -> None:
         choices=(
             "flashinfer-k123-copy",
             "flashinfer-k123-copy-pdl-fp32-inv",
+            "flashinfer-k123-copy-tf32-inv",
         ),
         default="flashinfer-k123-copy-pdl-fp32-inv",
         help=("CuTeDSL variant to benchmark. Variants without Akk inverse skip Akk accuracy."),
@@ -585,8 +597,11 @@ def main() -> None:
 
     if args.K != K_DIM:
         raise NotImplementedError(f"SM100 training intra currently supports K={K_DIM}, got {args.K}.")
-    if args.with_recompute_wu and args.cutedsl_variant != "flashinfer-k123-copy-pdl-fp32-inv":
-        raise ValueError("--with-recompute-wu requires the pdl-fp32-inv variant so A_kk is inverted.")
+    if args.with_recompute_wu and args.cutedsl_variant not in (
+        "flashinfer-k123-copy-pdl-fp32-inv",
+        "flashinfer-k123-copy-tf32-inv",
+    ):
+        raise ValueError("--with-recompute-wu requires an inverted A_kk variant.")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required.")
 
