@@ -1102,6 +1102,17 @@ class KDARecomputeWU:
 _recompute_wu_cache = {}
 _dummy_cu_seqlens = None
 _dummy_chunk_indices = None
+_uniform_cu_cache = {}
+
+
+def _uniform_problem(cu_seqlens: torch.Tensor) -> tuple[int, int] | None:
+    """Return ``(batch, sequence_length)`` for a uniform packed batch."""
+    key = (id(cu_seqlens), cu_seqlens._version)
+    if key not in _uniform_cu_cache:
+        offsets = cu_seqlens.detach().cpu().tolist()
+        lengths = [end - start for start, end in zip(offsets, offsets[1:])]
+        _uniform_cu_cache[key] = (len(lengths), lengths[0]) if lengths and len(set(lengths)) == 1 else None
+    return _uniform_cu_cache[key]
 
 
 def _compile_recompute_wu(
@@ -1192,10 +1203,23 @@ def _compile_recompute_wu(
 def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, block_k=None, block_v=None):
     is_varlen = cu_seqlens is not None
     packed_4d = is_varlen and k.dim() == 4
+    restore_packed = False
     if packed_4d:
         if k.shape[0] != 1:
             raise ValueError("varlen inputs must be packed with batch dimension 1")
         k, v, beta, A, gk = (x.squeeze(0) for x in (k, v, beta, A, gk))
+
+        uniform = _uniform_problem(cu_seqlens)
+        if uniform is not None and uniform[1] % A.shape[-1] == 0:
+            batch, seq_len = uniform
+            k = k.view(batch, seq_len, *k.shape[1:])
+            v = v.view(batch, seq_len, *v.shape[1:])
+            beta = beta.view(batch, seq_len, *beta.shape[1:])
+            A = A.view(batch, seq_len, *A.shape[1:])
+            gk = gk.view(batch, seq_len, *gk.shape[1:])
+            is_varlen = False
+            packed_4d = False
+            restore_packed = True
 
     if is_varlen:
         BT = A.shape[-1]
@@ -1261,7 +1285,8 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
 
     compiled_fn(k, v, beta, A, gk, w, u, kg, cu_s, ci_s, ps, Int32(total_nt))
 
-    if packed_4d:
+    if restore_packed:
+        w, u, kg = (x.flatten(0, 1).unsqueeze(0) for x in (w, u, kg))
+    elif packed_4d:
         w, u, kg = (x.unsqueeze(0) for x in (w, u, kg))
     return w, u, None, kg
-
