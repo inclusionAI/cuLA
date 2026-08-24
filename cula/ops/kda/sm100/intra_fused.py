@@ -1103,11 +1103,11 @@ def fused_kernel123(
             col_base = warp_col_group * K1_COLS_PER_WARP + _lane * VEC
             col_vec_idx = warp_col_group * (K1_COLS_PER_WARP // VEC) + _lane
             cumsum_scale = cutlass.Float32(RCP_LN2)
-            thr_copy_k1 = tiled_copy_qk_k1.get_slice(_lane)
-
             rAcc = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float32)
             rPrefix = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float32)
             rGkLast = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float32)
+            rKIn = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
+            rQIn = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
             rKsOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
             rQsOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
             rKgOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
@@ -1249,15 +1249,13 @@ def fused_kernel123(
                     row = k1_row_start + ri
                     t = chunk_start + row
 
-                    sK_tile = cute.local_tile(csK, tiler=(1, K1_COLS_PER_WARP), coord=(row, warp_col_group))
-                    tCsK = thr_copy_k1.partition_S(sK_tile)
-                    tCrK = cute.make_fragment_like(tCsK)
-                    cute.copy(tiled_copy_qk_k1, tCsK, thr_copy_k1.retile(tCrK))
+                    sKRow = csK[row, None]
+                    sKVec = cute.local_tile(sKRow, (VEC,), (col_base // VEC,))
+                    cute.autovec_copy(sKVec, rKIn)
 
-                    sQ_tile = cute.local_tile(csQ, tiler=(1, K1_COLS_PER_WARP), coord=(row, warp_col_group))
-                    tCsQ = thr_copy_k1.partition_S(sQ_tile)
-                    tCrQ = cute.make_fragment_like(tCsQ)
-                    cute.copy(tiled_copy_qk_k1, tCsQ, thr_copy_k1.retile(tCrQ))
+                    sQRow = csQ[row, None]
+                    sQVec = cute.local_tile(sQRow, (VEC,), (col_base // VEC,))
+                    cute.autovec_copy(sQVec, rQIn)
 
                     # Read beta from SMEM (staged once per chunk by warp 0).
                     beta_val = cutlass.Float32(csBeta[row])
@@ -1266,8 +1264,8 @@ def fused_kernel123(
                         rAcc[vi] = rAcc[vi] + rGact[ri, vi]
                         cs = rAcc[vi] * cumsum_scale
 
-                        k_val = tCrK[vi].to(cutlass.Float32)
-                        q_val = tCrQ[vi].to(cutlass.Float32)
+                        k_val = rKIn[vi].to(cutlass.Float32)
+                        q_val = rQIn[vi].to(cutlass.Float32)
 
                         exp2_cs = cute.exp2(cs, fastmath=True)
                         gk_last_cs = rGkLast[vi] * cumsum_scale
