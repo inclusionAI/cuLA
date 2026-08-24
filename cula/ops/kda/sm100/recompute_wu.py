@@ -100,7 +100,7 @@ class KDARecomputeWU:
         self.cluster_shape_mnk = (1, 1, 1)
         self.buffer_align_bytes = 1024
 
-        self.bproc_stage = 2
+        self.bproc_stage = 1
         self.acc_stage = 2
         self.store_stage = 2
 
