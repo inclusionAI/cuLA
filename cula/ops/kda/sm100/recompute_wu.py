@@ -977,7 +977,8 @@ class KDARecomputeWU:
                 lane_idx = local_tidx % self.threads_per_warp
                 direct_row = (warp_id % 2) * self.threads_per_warp + lane_idx
                 direct_col = (warp_id // 2) * (self.BN // 2)
-                direct_num_values = self.BN // 2
+                direct_num_values = self.BN // 4
+                direct_num_parts = 2
                 direct_num_stores = direct_num_values // 16
 
             # ====== Single WU pass ======
@@ -1089,9 +1090,38 @@ class KDARecomputeWU:
                 # Now read K result from acc (MMA V can run on acc[1] concurrently)
                 acc_h = acc_done_C.wait_and_advance()
                 if cutlass.const_expr(self.direct_store):
-                    tcgen05_fence_after()
-                    direct_acc_i32 = tcgen05_ld_32x32b(direct_num_values, acc_h.index * self.BN)
-                    tcgen05_fence_before()
+                    w_addr = (
+                        w_ptr + (i_b * T + i_t * BT + direct_row) * H * K + i_h * K + i_kv * self.BK + direct_col
+                    ).toint()
+                    for direct_part in cutlass.range_constexpr(direct_num_parts):
+                        tcgen05_fence_after()
+                        direct_acc_i32 = tcgen05_ld_32x32b(
+                            direct_num_values,
+                            acc_h.index * (self.BN // 2) + direct_part * direct_num_values,
+                        )
+                        tcgen05_fence_before()
+                        direct_acc_f32 = reinterpret_cast(
+                            direct_acc_i32,
+                            Int32,
+                            direct_num_values,
+                            self.acc_dtype,
+                        )
+                        direct_acc_bf16 = TensorSSA(
+                            direct_acc_f32,
+                            (direct_num_values,),
+                            self.acc_dtype,
+                        ).to(self.io_dtype)
+                        w_i32 = reinterpret_cast(
+                            direct_acc_bf16,
+                            self.io_dtype,
+                            direct_num_values,
+                            Int32,
+                        )
+                        for store_idx in cutlass.range_constexpr(direct_num_stores):
+                            store_256b(
+                                w_addr + direct_part * direct_num_values * 2 + store_idx * 32,
+                                subvec(w_i32, store_idx * 8, 8),
+                            )
                 else:
                     cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, acc_h.index)], tTR_rAcc)
                 cute.arch.fence_view_async_tmem_load()
@@ -1117,19 +1147,7 @@ class KDARecomputeWU:
                                 cute.autovec_copy(r2g_row_frag, tOgW[None, m1, None])
                     cuda_sync.arrive_and_wait()
                 elif cutlass.const_expr(self.direct_store):
-                    direct_acc_f32 = reinterpret_cast(
-                        direct_acc_i32,
-                        Int32,
-                        direct_num_values,
-                        self.acc_dtype,
-                    )
-                    tTR_rBproc.store(TensorSSA(direct_acc_f32, (direct_num_values,), self.acc_dtype).to(self.io_dtype))
-                    w_i32 = reinterpret_cast(tTR_rBproc.load(), self.io_dtype, direct_num_values, Int32)
-                    w_addr = (
-                        w_ptr + (i_b * T + i_t * BT + direct_row) * H * K + i_h * K + i_kv * self.BK + direct_col
-                    ).toint()
-                    for store_idx in cutlass.range_constexpr(direct_num_stores):
-                        store_256b(w_addr + store_idx * 32, subvec(w_i32, store_idx * 8, 8))
+                    pass
                 else:
                     # Write w to sStore → signal store warp
                     sh_w = store_ready_P.acquire_and_advance()
@@ -1142,9 +1160,38 @@ class KDARecomputeWU:
                 # === V MMA done ===
                 acc_h2 = acc_done_C.wait_and_advance()
                 if cutlass.const_expr(self.direct_store):
-                    tcgen05_fence_after()
-                    direct_acc_i32 = tcgen05_ld_32x32b(direct_num_values, acc_h2.index * self.BN)
-                    tcgen05_fence_before()
+                    u_addr = (
+                        u_ptr + (i_b * T + i_t * BT + direct_row) * H * V + i_h * V + i_kv * self.BV + direct_col
+                    ).toint()
+                    for direct_part in cutlass.range_constexpr(direct_num_parts):
+                        tcgen05_fence_after()
+                        direct_acc_i32 = tcgen05_ld_32x32b(
+                            direct_num_values,
+                            acc_h2.index * (self.BN // 2) + direct_part * direct_num_values,
+                        )
+                        tcgen05_fence_before()
+                        direct_acc_f32 = reinterpret_cast(
+                            direct_acc_i32,
+                            Int32,
+                            direct_num_values,
+                            self.acc_dtype,
+                        )
+                        direct_acc_bf16 = TensorSSA(
+                            direct_acc_f32,
+                            (direct_num_values,),
+                            self.acc_dtype,
+                        ).to(self.io_dtype)
+                        u_i32 = reinterpret_cast(
+                            direct_acc_bf16,
+                            self.io_dtype,
+                            direct_num_values,
+                            Int32,
+                        )
+                        for store_idx in cutlass.range_constexpr(direct_num_stores):
+                            store_256b(
+                                u_addr + direct_part * direct_num_values * 2 + store_idx * 32,
+                                subvec(u_i32, store_idx * 8, 8),
+                            )
                 else:
                     cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, acc_h2.index)], tTR_rAcc)
                 cute.arch.fence_view_async_tmem_load()
@@ -1169,19 +1216,7 @@ class KDARecomputeWU:
                                 cute.autovec_copy(tOsU[None, m1, None], r2g_row_frag)
                                 cute.autovec_copy(r2g_row_frag, tOgU[None, m1, None])
                 elif cutlass.const_expr(self.direct_store):
-                    direct_acc_f32 = reinterpret_cast(
-                        direct_acc_i32,
-                        Int32,
-                        direct_num_values,
-                        self.acc_dtype,
-                    )
-                    tTR_rBproc.store(TensorSSA(direct_acc_f32, (direct_num_values,), self.acc_dtype).to(self.io_dtype))
-                    u_i32 = reinterpret_cast(tTR_rBproc.load(), self.io_dtype, direct_num_values, Int32)
-                    u_addr = (
-                        u_ptr + (i_b * T + i_t * BT + direct_row) * H * V + i_h * V + i_kv * self.BV + direct_col
-                    ).toint()
-                    for store_idx in cutlass.range_constexpr(direct_num_stores):
-                        store_256b(u_addr + store_idx * 32, subvec(u_i32, store_idx * 8, 8))
+                    pass
                 else:
                     # Write u to sStore → signal store warp
                     sh_u = store_ready_P.acquire_and_advance()
