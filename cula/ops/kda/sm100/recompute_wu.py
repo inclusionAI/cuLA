@@ -792,11 +792,10 @@ class KDARecomputeWU:
                         cute.arch.cp_async_bulk_commit_group()
 
                         sh_u = store_ready_C.wait_and_advance()
-                        cute.arch.cp_async_bulk_wait_group(0, read=True)
-                        sh_w.release()
                         cute.copy(tma_atom_u_s2g, bSG_sU[None, sh_u.index], bSG_gU[(None, i_t, i_kv)])
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        sh_w.release()
                         sh_u.release()
                     else:
                         sh_kg = store_ready_C.wait_and_advance()
@@ -804,17 +803,16 @@ class KDARecomputeWU:
                         cute.arch.cp_async_bulk_commit_group()
 
                         sh_w = store_ready_C.wait_and_advance()
-                        cute.arch.cp_async_bulk_wait_group(0, read=True)
-                        sh_kg.release()
                         cute.copy(tma_atom_w_s2g, bSG_sW[None, sh_w.index], bSG_gW[(None, i_t, i_kv)])
                         cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(1, read=True)
+                        sh_kg.release()
 
                         sh_u = store_ready_C.wait_and_advance()
-                        cute.arch.cp_async_bulk_wait_group(0, read=True)
-                        sh_w.release()
                         cute.copy(tma_atom_u_s2g, bSG_sU[None, sh_u.index], bSG_gU[(None, i_t, i_kv)])
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        sh_w.release()
                         sh_u.release()
 
         # =====================================================================
