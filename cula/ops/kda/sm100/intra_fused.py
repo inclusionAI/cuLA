@@ -303,22 +303,6 @@ def fast_rcp(x, *, loc=None, ip=None):
 # Akk inverse helpers (fused from Akk_inverse_lower_triangle_bf16.py)
 # ============================================================
 @dsl_user_op
-def store_internal_barrier(*, loc=None, ip=None):
-    """Named barrier for Store warps (4 warps, 128 threads). barrier_id=3."""
-    llvm.inline_asm(
-        T.i32(),
-        [],
-        "membar.cta; bar.sync 3, 128; mov.u32 $0, 0;",
-        "=r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def _ak_pack_bf16x2(lo_f32, hi_f32, *, loc=None, ip=None):
     """cvt.rn.bf16x2.f32 -- pack two fp32 into bf16x2 (as fp32 bitcast view)."""
     result = llvm.inline_asm(
@@ -1909,11 +1893,6 @@ def fused_kernel123(
                                 cute.autovec_copy(rAkkVec, akk_vec)
 
                 cute.arch.mbarrier_arrive(store_done_mbars + s)
-
-            if cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
-                store_internal_barrier()
-                cute.arch.fence_acq_rel_gpu()
-                cute.arch.griddepcontrol_launch_dependents()
 
         yield_out()
 
