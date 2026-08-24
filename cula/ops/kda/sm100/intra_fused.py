@@ -95,13 +95,13 @@ K_STRIDE = K_DIM + K_PAD  # 136, padded row stride to avoid bank conflicts
 CHUNKS_PER_BLOCK = 4
 NUM_SMS = 148  # Persistent kernel: one resident block per SM
 
-NUM_K1_TMA_WARPS = 8  # Warps 0-7: K1 compute (8 row groups, four columns/thread)
-NUM_MMA_WARPS = 11  # Ten K2 MMA warps + one dedicated TMA producer
+NUM_K1_TMA_WARPS = 16  # Warps 0-15:  K1 compute (4 warpgroups, 8×2) -- TMA offloaded
+NUM_MMA_WARPS = 11  # Warps 16-26: MMA (10 active + 1 TMA producer, dropped idle warp 27)
 NUM_MMA_ACTIVE = 10  # mma_warp 0..9: actual MMA work
 TMA_WARP_ID = NUM_K1_TMA_WARPS + NUM_MMA_ACTIVE  # warp 26 = dedicated TMA producer
 NUM_STORE_WARPS = 4  # Warps 28-31: Store (1 warpgroup)
-NUM_WARPS = NUM_K1_TMA_WARPS + NUM_MMA_WARPS + NUM_STORE_WARPS
-THREADS = NUM_WARPS * 32
+NUM_WARPS = NUM_K1_TMA_WARPS + NUM_MMA_WARPS + NUM_STORE_WARPS  # 32
+THREADS = NUM_WARPS * 32  # 1024
 
 NUM_SUB_CHUNKS = BT // BC  # 4
 NUM_TILES = NUM_SUB_CHUNKS * (NUM_SUB_CHUNKS + 1) // 2  # 10 lower-tri tiles
@@ -123,7 +123,7 @@ G_ROW_STRIDE_BF16 = K_DIM  # 128 bf16 per row
 G_STAGE_STRIDE_BF16 = BT * K_DIM  # 8192 bf16 per stage (one stage = BT*K_DIM)
 
 K1_ROW_GROUPS = 8
-K1_COL_GROUPS = 1
+K1_COL_GROUPS = 2
 ROWS_PER_K1_WARP = BT // K1_ROW_GROUPS  # 8
 K1_COLS_PER_WARP = K_DIM // K1_COL_GROUPS  # 64
 ROWS_PER_STORE_WARP = BT // NUM_STORE_WARPS  # 16
@@ -144,11 +144,11 @@ RCP_LN2 = LOG2E
 
 @dsl_user_op
 def k1_internal_barrier(*, loc=None, ip=None):
-    """Named barrier for the eight K1 warps (256 threads). barrier_id=2."""
+    """Named barrier for K1+TMA warps (0-15, 512 threads). barrier_id=2."""
     llvm.inline_asm(
         T.i32(),
         [],
-        "membar.cta; bar.sync 2, 256; mov.u32 $0, 0;",
+        "membar.cta; bar.sync 2, 512; mov.u32 $0, 0;",
         "=r",
         has_side_effects=True,
         is_align_stack=False,
@@ -1044,19 +1044,25 @@ def fused_kernel123(
     # or store warps). Required for downstream row-major store optimizations
     # — positions outside MMA-written sub-tiles stay at 0.
     #
-    # Linear initialization is independent of the compile-time warp split.
-    # Every participating thread clears matching Aqk/Akk coordinates.
+    # Cooperative pattern (32 warps × 32 lanes = 1024 threads):
+    #   - Each warp owns 2 contiguous rows (warp_id*2, warp_id*2+1)
+    #   - For sAqk bf16: each lane owns 2 contiguous bf16 cols
+    #   - For sAkk fp32: each lane owns 1 fp32 col (stride 68)
     # =====================================================================
-    _init_elems = NUM_STAGES * BT * BT
-    for _init_iter in cutlass.range_constexpr((_init_elems + THREADS - 1) // THREADS):
-        _linear = tidx + _init_iter * THREADS
-        if _linear < _init_elems:
-            _s = _linear // (BT * BT)
-            _row_col = _linear % (BT * BT)
-            _row = _row_col // BT
-            _col = _row_col % BT
-            sAqk[_row, _col, _s] = cutlass.BFloat16(0.0)
-            sAkk[_row, _col, _s] = cutlass.Float32(0.0)
+    _warp_id_in_cta = tidx >> 5  # tidx // 32, range 0..31
+    _lane_id_warp = tidx & 31  # tidx % 32, range 0..31
+    _row_base = _warp_id_in_cta * 2  # this warp owns rows [_row_base, _row_base+1]
+    for _s in cutlass.range_constexpr(NUM_STAGES):
+        for _ri in cutlass.range_constexpr(2):
+            _row = _row_base + _ri
+            # sAqk bf16: 2 cols per lane
+            _col_lo_bf16 = _lane_id_warp * 2
+            _col_hi_bf16 = _col_lo_bf16 + 1
+            sAqk[_row, _col_lo_bf16, _s] = cutlass.BFloat16(0.0)
+            sAqk[_row, _col_hi_bf16, _s] = cutlass.BFloat16(0.0)
+            # sAkk fp32: 1 col per lane (stride 68)
+            _col_fp32 = _lane_id_warp
+            sAkk[_row, _col_fp32, _s] = cutlass.Float32(0.0)
     cute.arch.barrier()
 
     # =====================================================================
@@ -2006,15 +2012,9 @@ def make_host_function(
 
         g_cumsum_layout = cute.make_layout((BT, K_DIM, NUM_STAGES), stride=(K_STRIDE, 1, BT * K_STRIDE))
 
-        copy_atom_qk_k1 = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            cutlass.BFloat16,
-            num_bits_per_copy=VEC * cutlass.BFloat16.width,
-        )
+        copy_atom_qk_k1 = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=32)
         tiled_copy_qk_k1 = cute.make_tiled_copy_tv(
-            copy_atom_qk_k1,
-            thr_layout=cute.make_layout((1, 32)),
-            val_layout=cute.make_layout((1, VEC)),
+            copy_atom_qk_k1, thr_layout=cute.make_layout((1, 32)), val_layout=cute.make_layout((1, 2))
         )
 
         out_v2_layout = cute.make_layout(
