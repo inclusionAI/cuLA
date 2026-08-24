@@ -999,7 +999,13 @@ class KDARecomputeWU:
                 bproc_h = bproc_P.acquire_and_advance()
                 for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
                     m_coord, n_coord = tTR_cM[ei]
-                    sB[(n_coord, m_coord, bproc_h.index)] = tTR_rBproc[ei]
+                    b_coord = (
+                        ((n_coord % 64, n_coord // 64), m_coord % 16),
+                        Int32(0),
+                        m_coord // 16,
+                        bproc_h.index,
+                    )
+                    sB[b_coord] = tTR_rBproc[ei]
                 cute.arch.fence_proxy("async.shared", space="cta")
                 bproc_h.commit()
 
@@ -1019,7 +1025,13 @@ class KDARecomputeWU:
                 bproc_h2 = bproc_P.acquire_and_advance()
                 for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
                     m_coord, n_coord = tTR_cM[ei]
-                    sB[(n_coord, m_coord, bproc_h2.index)] = tTR_rBproc[ei]
+                    b_coord = (
+                        ((n_coord % 64, n_coord // 64), m_coord % 16),
+                        Int32(0),
+                        m_coord // 16,
+                        bproc_h2.index,
+                    )
+                    sB[b_coord] = tTR_rBproc[ei]
                 cute.arch.fence_proxy("async.shared", space="cta")
                 bproc_h2.commit()
 
