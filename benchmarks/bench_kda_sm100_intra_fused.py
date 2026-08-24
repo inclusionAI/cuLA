@@ -32,6 +32,7 @@ from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.constant import RCP_LN2
 
 from benchmarks.utils import exclusive_cumsum, gen_random, gen_skewed, gen_uniform, set_seed
+from cula.kda.chunk_intra import chunk_kda_fwd_intra as cula_chunk_kda_fwd_intra
 from cula.ops.kda.sm100.intra_fused import (
     BT,
     K_DIM,
@@ -246,6 +247,27 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
         )
         return (gk, *fla)
 
+    def run_csrc_with_gk():
+        gk = kda_gate_chunk_cumsum(
+            g=g,
+            A_log=a_log,
+            dt_bias=dt_bias,
+            scale=RCP_LN2,
+            chunk_size=BT,
+            lower_bound=args.lower_bound,
+        )
+        csrc = cula_chunk_kda_fwd_intra(
+            q=q,
+            k=k,
+            v=k,
+            gk=gk,
+            beta=beta,
+            scale=scale,
+            chunk_size=BT,
+            safe_gate=True,
+        )
+        return (gk, *csrc)
+
     valid_mask = _valid_lower_mask(args.B, args.T, args.H, q.device)
 
     def compare(cutedsl: tuple[torch.Tensor, ...], fla_with_gk: tuple[torch.Tensor, ...]):
@@ -272,7 +294,8 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
 
     nt = args.B * (args.T // BT)
     detail = f"B={args.B} T={args.T} H={args.H} K={args.K} NT={nt} bias={not args.no_bias} variant={args.cutedsl_variant}"
-    return BenchCase("equal", detail, run, run_fla_with_gk, compare)
+    run_ref = run_csrc_with_gk if args.baseline == "csrc" else run_fla_with_gk
+    return BenchCase("equal", detail, run, run_ref, compare)
 
 
 def make_varlen_case(args: argparse.Namespace) -> BenchCase:
@@ -373,6 +396,31 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
         )
         return (gk, *fla)
 
+    def run_csrc_with_gk():
+        gk = kda_gate_chunk_cumsum(
+            g=g,
+            A_log=a_log,
+            dt_bias=dt_bias,
+            scale=RCP_LN2,
+            chunk_size=BT,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            lower_bound=args.lower_bound,
+        )
+        csrc = cula_chunk_kda_fwd_intra(
+            q=q,
+            k=k,
+            v=k,
+            gk=gk,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_size=BT,
+            safe_gate=True,
+        )
+        return (gk, *csrc)
+
     valid_mask = _valid_lower_mask_varlen(seq_lens, args.H, q.device)
 
     def compare(cutedsl: tuple[torch.Tensor, ...], fla_with_gk: tuple[torch.Tensor, ...]):
@@ -405,7 +453,8 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
         f"seqs={len(seq_lens)} total={total_t} H={args.H} K={args.K} NT={nt} "
         f"T_launch={t_launch} pure={pure} dist={args.dist} bias={not args.no_bias} seq_lens=[{seq_preview}]"
     )
-    return BenchCase("varlen", detail, run, run_fla_with_gk, compare)
+    run_ref = run_csrc_with_gk if args.baseline == "csrc" else run_fla_with_gk
+    return BenchCase("varlen", detail, run, run_ref, compare)
 
 
 def time_case(fn: Callable[[], tuple[torch.Tensor, ...]], warmup: int, iters: int) -> tuple[float, float]:
@@ -427,17 +476,17 @@ def time_case(fn: Callable[[], tuple[torch.Tensor, ...]], warmup: int, iters: in
 
 def run_bench(cases: list[BenchCase], args: argparse.Namespace) -> None:
     print("=" * 100, flush=True)
-    print("  SM100 KDA K123 benchmark vs FLA chunk_intra", flush=True)
+    print(f"  SM100 KDA K123 benchmark vs {args.baseline} chunk_intra", flush=True)
     print(f"  Device: {torch.cuda.get_device_name(0)}", flush=True)
     print(f"  BT={BT} H={args.H} K={args.K} warmup={args.warmup} iters={args.iters}", flush=True)
-    print("  FLA baseline: kda_gate_chunk_cumsum + FLA chunk_kda_fwd_intra", flush=True)
+    print(f"  Baseline: kda_gate_chunk_cumsum + {args.baseline} chunk_kda_fwd_intra", flush=True)
     print("=" * 100, flush=True)
     for case in cases:
         print(f"\n  {'-' * 144}", flush=True)
         print(f"  {case.name}: {case.detail}", flush=True)
         print(f"  {'-' * 144}", flush=True)
         print(
-            f"  {'FLA(us)':>10} {'CuTeDSL(us)':>12} {'wall/ev':>8}  │ {'FLA/CuTe':>9}  │ {'Aqk rel_rmse':>13} {'Akk rel_rmse':>13}",
+            f"  {'Ref(us)':>10} {'CuTeDSL(us)':>12} {'wall/ev':>8}  │ {'Ref/CuTe':>9}  │ {'Aqk rel_rmse':>13} {'Akk rel_rmse':>13}",
             flush=True,
         )
         print(f"  {'-' * 144}", flush=True)
@@ -513,7 +562,10 @@ def main() -> None:
     parser.add_argument("--alog-scale", type=float, default=1.0)
     parser.add_argument("--dt-bias-scale", type=float, default=1.0)
     parser.add_argument("--no-bias", action="store_true")
-    parser.add_argument("--no-fla", action="store_true", help="Only time CuTeDSL; skip FLA timing and accuracy comparison.")
+    parser.add_argument(
+        "--no-fla", action="store_true", help="Only time CuTeDSL; skip baseline timing and accuracy comparison."
+    )
+    parser.add_argument("--baseline", choices=("csrc", "fla"), default="csrc")
     parser.add_argument(
         "--with-recompute-wu",
         action="store_true",
