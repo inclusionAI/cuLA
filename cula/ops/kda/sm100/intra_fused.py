@@ -995,11 +995,6 @@ def fused_kernel123(
     akk_tile_layout = cute.make_layout((BT, AKK_STRIDE, NUM_STAGES), stride=(AKK_STRIDE, 1, BT * AKK_STRIDE))
     sAkk = smem.allocate_tensor(cutlass.Float32, akk_tile_layout, 128)
 
-    # sBeta: chunk's 64 beta values staged in SMEM. K1 reads from here in inner loop
-    # to reduce register pressure / avoid repeated gmem broadcast.
-    beta_smem_layout = cute.make_layout((BT, NUM_STAGES), stride=(1, BT))
-    sBeta = smem.allocate_tensor(cutlass.BFloat16, beta_smem_layout, 128)
-
     # =====================================================================
     # Mbarrier allocation & init
     # =====================================================================
@@ -1154,15 +1149,6 @@ def fused_kernel123(
                 csGcum = sGcum[(None, None, cur_stage)]
                 csQ = sQ[(None, None, cur_stage)]
                 csK = sK[(None, None, cur_stage)]
-                csBeta = sBeta[(None, cur_stage)]
-
-                # Stage chunk's 64 beta values to SMEM (warp 0 of K1 group, 32 threads × 2).
-                # Synced via the existing k1_internal_barrier() before Pass 2b reads it.
-                if k1_warp == 0:
-                    for _bi in cutlass.range_constexpr(BT // 32):
-                        _idx = _bi * 32 + _lane
-                        csBeta[_idx] = mBeta[i_b, chunk_start + _idx, i_h]
-
                 rGact = cute.make_rmem_tensor(cute.make_layout((ROWS_PER_K1_WARP, VEC)), cutlass.Float32)
                 for vi in cutlass.range_constexpr(VEC):
                     rAcc[vi] = cutlass.Float32(0.0)
@@ -1260,9 +1246,6 @@ def fused_kernel123(
                     tCsQ = thr_copy_k1.partition_S(sQ_tile)
                     tCrQ = cute.make_fragment_like(tCsQ)
                     cute.copy(tiled_copy_qk_k1, tCsQ, thr_copy_k1.retile(tCrQ))
-
-                    # Read beta from SMEM (staged once per chunk by warp 0).
-                    beta_val = cutlass.Float32(csBeta[row])
 
                     for vi in cutlass.range_constexpr(VEC):
                         cs = rGact[ri, vi]
@@ -2049,9 +2032,8 @@ def make_host_function(
         # G cumsum: 64 * 136 * 4 * NUM_STAGES = 69,632 B
         # K1 partial prefix: 8 * 132 * 4 = 4,224 B
         # Aqk SMEM: 64 * 72 * 2 * NUM_STAGES = 18,432 B
-        # Beta bf16: 64 * 2 * NUM_STAGES = 256 B
         # Barriers: 5 * 2 * 8 = 80 B
-        # Subtotal: 225,744 B (~220 KB)
+        # Subtotal: 225,488 B (~220 KB)
         # SM100 max: 228 KB (margin ~2 KB)
         smem_size = (
             BT * K_DIM * 2 * 2 * NUM_STAGES  # Q/K bf16: 65,536 B
@@ -2059,7 +2041,6 @@ def make_host_function(
             + BT * K_STRIDE * 4 * NUM_STAGES  # G cumsum fp32: 69,632 B
             + K1_ROW_GROUPS * PARTIAL_COLS * 4  # K1 partial prefix: 4,224 B
             + BT * AQK_TILE_STRIDE * 2 * NUM_STAGES  # sAqk bf16: 18,432 B
-            + BT * NUM_STAGES * 2  # Beta bf16: 256 B
             + 5 * NUM_STAGES * 8  # Barriers: 80 B
             + BT * K_DIM * 2 * NUM_STAGES  # sG bf16 independent allocation
         )
