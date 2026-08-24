@@ -1113,8 +1113,12 @@ def fused_kernel123(
             rKgOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
             rGkOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float32)
 
-            # exp_A depends on i_h (changes per work unit)
-            exp_A = cute.exp(mA_log[i_h], fastmath=True)
+            # exp_A depends only on the head. Compute it once per warp instead
+            # of issuing the same special-function operation in every lane.
+            exp_A = cutlass.Float32(0.0)
+            if _lane == 0:
+                exp_A = cute.exp(mA_log[i_h], fastmath=True)
+            exp_A = cute.arch.shuffle_sync(exp_A, 0)
 
             # Load dt_bias per (head, col) — broadcast across all rows
             rBias = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float32)
@@ -1239,7 +1243,10 @@ def fused_kernel123(
                 # Signal MMA early: csGcum is ready
                 cute.arch.mbarrier_arrive(k1_done_mbars + cur_stage)
 
-                # ---- Pass 2b: recompute + write GMEM (overlaps with MMA, off critical path) ----
+                # ---- Pass 2b: write GMEM (overlaps with MMA, off critical path) ----
+                for vi in cutlass.range_constexpr(VEC):
+                    rGkLast[vi] = rGkLast[vi] * cumsum_scale
+
                 for ri in cutlass.range_constexpr(ROWS_PER_K1_WARP):
                     row = k1_row_start + ri
                     t = chunk_start + row
@@ -1264,8 +1271,7 @@ def fused_kernel123(
                         q_val = tCrQ[vi].to(cutlass.Float32)
 
                         exp2_cs = cute.exp2(cs, fastmath=True)
-                        gk_last_cs = rGkLast[vi] * cumsum_scale
-                        exp2_kg = cute.exp2(gk_last_cs - cs, fastmath=True)
+                        exp2_kg = cute.exp2(rGkLast[vi] - cs, fastmath=True)
 
                         rKsOut[vi] = (k_val * exp2_cs).to(cutlass.BFloat16)
                         rQsOut[vi] = (q_val * exp2_cs).to(cutlass.BFloat16)
@@ -1283,7 +1289,7 @@ def fused_kernel123(
 
                 if warp_row_group == 0:
                     for vi in cutlass.range_constexpr(VEC):
-                        rGkOut[vi] = cute.exp2(rGkLast[vi] * cumsum_scale, fastmath=True)
+                        rGkOut[vi] = cute.exp2(rGkLast[vi], fastmath=True)
                     if IS_VARLEN:
                         if ci_eos > cutlass.Int32(0):
                             cute.autovec_copy(rGkOut, mGkLast[i_b, chunk_idx, i_h, col_vec_idx, None])
