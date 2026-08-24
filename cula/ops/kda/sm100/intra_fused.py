@@ -92,7 +92,7 @@ BC = 16
 K_DIM = 128
 K_PAD = 8
 K_STRIDE = K_DIM + K_PAD  # 136, padded row stride to avoid bank conflicts
-CHUNKS_PER_BLOCK = 4
+CHUNKS_PER_BLOCK = 8
 NUM_SMS = 148  # Persistent kernel: one resident block per SM
 
 NUM_K1_TMA_WARPS = 16  # Warps 0-15:  K1 compute (4 warpgroups, 8×2) -- TMA offloaded
