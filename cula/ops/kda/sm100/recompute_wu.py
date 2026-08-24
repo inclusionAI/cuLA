@@ -895,6 +895,16 @@ class KDARecomputeWU:
             cM_id = cute.make_identity_tensor(out_tile)
             tTR_cM = thr_t2r.partition_D(cM_id)
 
+            r2s_atom_b = sm100_utils.get_smem_store_op(
+                utils.LayoutEnum.ROW_MAJOR,
+                self.io_dtype,
+                self.acc_dtype,
+                tiled_t2r,
+            )
+            tiled_r2s_b = cute.make_tiled_copy_D(r2s_atom_b, tiled_t2r)
+            thr_r2s_b = tiled_r2s_b.get_slice(local_tidx)
+            tRS_sB = thr_r2s_b.partition_D(sBTime)
+
             # Rmem tensors (hoisted outside WU loop to minimise register lifetime)
             tTR_rAcc = cute.make_rmem_tensor(tTR_sOut.shape, self.acc_dtype)
             tTR_rBproc = cute.make_rmem_tensor(tTR_sOut.shape, self.io_dtype)
@@ -1007,9 +1017,8 @@ class KDARecomputeWU:
 
                 # Scatter K bproc into the SS MMA B-operand layout.
                 bproc_h = bproc_P.acquire_and_advance()
-                for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
-                    m_coord, n_coord = tTR_cM[ei]
-                    sBTime[(m_coord, n_coord, bproc_h.index)] = tTR_rBproc[ei]
+                tRS_rBproc = tiled_r2s_b.retile(tTR_rBproc)
+                cute.copy(tiled_r2s_b, tRS_rBproc, tRS_sB[(None, None, None, bproc_h.index)])
                 cute.arch.fence_proxy("async.shared", space="cta")
                 bproc_h.commit()
 
@@ -1027,9 +1036,8 @@ class KDARecomputeWU:
 
                 # Scatter V bproc, then dispatch MMA V.
                 bproc_h2 = bproc_P.acquire_and_advance()
-                for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
-                    m_coord, n_coord = tTR_cM[ei]
-                    sBTime[(m_coord, n_coord, bproc_h2.index)] = tTR_rBproc[ei]
+                tRS_rBproc = tiled_r2s_b.retile(tTR_rBproc)
+                cute.copy(tiled_r2s_b, tRS_rBproc, tRS_sB[(None, None, None, bproc_h2.index)])
                 cute.arch.fence_proxy("async.shared", space="cta")
                 bproc_h2.commit()
 
