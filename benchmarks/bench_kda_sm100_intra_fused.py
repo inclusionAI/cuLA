@@ -33,7 +33,6 @@ from fla.ops.utils.constant import RCP_LN2
 
 from benchmarks.utils import exclusive_cumsum, gen_random, gen_skewed, gen_uniform, set_seed
 from cula.kda.chunk_intra import chunk_kda_fwd_intra as cula_chunk_kda_fwd_intra
-from cula.ops.kda.sm100.akk_inv_tf32 import akk_inv_tf32
 from cula.ops.kda.sm100.intra_fused import (
     BT,
     K_DIM,
@@ -206,18 +205,6 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
                 pdl_fp32_akk_inv=True,
             )
 
-    elif args.cutedsl_variant == "flashinfer-k123-copy-tf32-inv":
-
-        def cutedsl_fn(**kwargs):
-            out = chunk_kda_fwd_intra_sm100_equal(**kwargs)
-            akk = akk_inv_tf32(out[5], kwargs["beta"], apply_beta_epilogue=True)
-            return (*out[:5], akk)
-
-    elif args.cutedsl_variant == "flashinfer-k123-copy-fused-inv":
-
-        def cutedsl_fn(**kwargs):
-            return chunk_kda_fwd_intra_sm100_equal(**kwargs, fused_akk_inv=True)
-
     else:
         raise NotImplementedError(f"Unsupported CuTeDSL variant: {args.cutedsl_variant}")
 
@@ -234,13 +221,7 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
             lower_bound=args.lower_bound,
         )
         if args.with_recompute_wu:
-            w, u = recompute_w_u_from_preprocessed(
-                out[0],
-                k,
-                beta,
-                out[5],
-                wait_on_pdl=args.cutedsl_variant == "flashinfer-k123-copy-pdl-fp32-inv",
-            )
+            w, u = recompute_w_u_from_preprocessed(out[0], k, beta, out[5])
             return (*out, w, u)
         return out
 
@@ -300,11 +281,7 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
             ("q_scaled", accuracy_stats(q_scaled_ref, cutedsl[2])),
             ("Aqk_valid", accuracy_stats(aqk_fla, cutedsl[4], valid_mask)),
         ]
-        if args.cutedsl_variant in (
-            "flashinfer-k123-copy-pdl-fp32-inv",
-            "flashinfer-k123-copy-tf32-inv",
-            "flashinfer-k123-copy-fused-inv",
-        ):
+        if args.cutedsl_variant in ("flashinfer-k123-copy-pdl-fp32-inv",):
             stats.append(("Akk_valid", accuracy_stats(akk_fla, cutedsl[5], valid_mask)))
         if args.with_recompute_wu:
             stats.extend(
@@ -325,7 +302,6 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
     if args.cutedsl_variant not in (
         "flashinfer-k123-copy",
         "flashinfer-k123-copy-pdl-fp32-inv",
-        "flashinfer-k123-copy-fused-inv",
     ):
         raise NotImplementedError(f"{args.cutedsl_variant} CuTeDSL variant currently supports equal mode only.")
     seq_lens = _build_seq_lens(args)
@@ -360,7 +336,6 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
                     out[5],
                     cu_seqlens=cu_seqlens,
                     chunk_indices=chunk_indices,
-                    wait_on_pdl=args.cutedsl_variant == "flashinfer-k123-copy-pdl-fp32-inv",
                 )
                 return (*out, w, u)
             return out
@@ -382,37 +357,6 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
                 lower_bound=args.lower_bound,
                 seq_lens=seq_lens,
                 pdl_fp32_akk_inv=True,
-            )
-            if args.with_recompute_wu:
-                w, u = recompute_w_u_from_preprocessed(
-                    out[0],
-                    k,
-                    beta,
-                    out[5],
-                    cu_seqlens=cu_seqlens,
-                    chunk_indices=chunk_indices,
-                    wait_on_pdl=True,
-                )
-                return (*out, w, u)
-            return out
-
-    elif args.cutedsl_variant == "flashinfer-k123-copy-fused-inv":
-
-        def run():
-            out = chunk_kda_fwd_intra_sm100_varlen(
-                q=q,
-                k=k,
-                g=g,
-                beta=beta,
-                A_log=a_log,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-                scale=scale,
-                dt_bias=dt_bias,
-                safe_gate=True,
-                lower_bound=args.lower_bound,
-                seq_lens=seq_lens,
-                fused_akk_inv=True,
             )
             if args.with_recompute_wu:
                 w, u = recompute_w_u_from_preprocessed(
@@ -490,10 +434,7 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
             ("q_scaled", accuracy_stats(q_scaled_ref, cutedsl[2])),
             ("Aqk_valid", accuracy_stats(aqk_fla, cutedsl[4], valid_mask)),
         ]
-        if args.cutedsl_variant in (
-            "flashinfer-k123-copy-pdl-fp32-inv",
-            "flashinfer-k123-copy-fused-inv",
-        ):
+        if args.cutedsl_variant in ("flashinfer-k123-copy-pdl-fp32-inv",):
             stats.append(("Akk_valid", accuracy_stats(akk_fla, cutedsl[5], valid_mask)))
         if args.with_recompute_wu:
             stats.extend(
@@ -635,8 +576,6 @@ def main() -> None:
         choices=(
             "flashinfer-k123-copy",
             "flashinfer-k123-copy-pdl-fp32-inv",
-            "flashinfer-k123-copy-tf32-inv",
-            "flashinfer-k123-copy-fused-inv",
         ),
         default="flashinfer-k123-copy-pdl-fp32-inv",
         help=("CuTeDSL variant to benchmark. Variants without Akk inverse skip Akk accuracy."),
@@ -646,12 +585,8 @@ def main() -> None:
 
     if args.K != K_DIM:
         raise NotImplementedError(f"SM100 training intra currently supports K={K_DIM}, got {args.K}.")
-    if args.with_recompute_wu and args.cutedsl_variant not in (
-        "flashinfer-k123-copy-pdl-fp32-inv",
-        "flashinfer-k123-copy-tf32-inv",
-        "flashinfer-k123-copy-fused-inv",
-    ):
-        raise ValueError("--with-recompute-wu requires an inverted A_kk variant.")
+    if args.with_recompute_wu and args.cutedsl_variant != "flashinfer-k123-copy-pdl-fp32-inv":
+        raise ValueError("--with-recompute-wu requires the pdl-fp32-inv variant so A_kk is inverted.")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required.")
 

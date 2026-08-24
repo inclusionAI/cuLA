@@ -64,7 +64,6 @@ class KDARecomputeWU:
         beta_dtype: type[cutlass.Numeric] = cutlass.Float32,
         is_varlen: bool = False,
         preprocessed_k: bool = False,
-        wait_on_pdl: bool = False,
         persistent: bool = False,
         use_fast_math: bool = True,
     ):
@@ -83,7 +82,6 @@ class KDARecomputeWU:
         self.beta_dtype = beta_dtype
         self.is_varlen = is_varlen
         self.preprocessed_k = preprocessed_k
-        self.wait_on_pdl = wait_on_pdl
 
         self.threads_per_warp = 32
         self.cuda_warp_ids = (0, 1, 2, 3)
@@ -489,7 +487,6 @@ class KDARecomputeWU:
             cluster=self.cluster_shape_mnk,
             stream=stream,
             min_blocks_per_mp=self.min_occupancy,
-            use_pdl=self.wait_on_pdl,
         )
 
     @cute.kernel
@@ -550,9 +547,6 @@ class KDARecomputeWU:
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
-
-        if cutlass.const_expr(self.wait_on_pdl):
-            cute.arch.griddepcontrol_wait()
 
         if warp_idx == self.load_warp_id:
             cpasync.prefetch_descriptor(tma_atom_A)
@@ -1164,7 +1158,6 @@ def _compile_recompute_wu(
     is_varlen=False,
     beta_dtype=cutlass.Float32,
     preprocessed_k=False,
-    wait_on_pdl=False,
 ):
     key = (
         H,
@@ -1177,7 +1170,6 @@ def _compile_recompute_wu(
         is_varlen,
         beta_dtype,
         preprocessed_k,
-        wait_on_pdl,
         USE_FAST_MATH,
     )
     if key in _recompute_wu_cache:
@@ -1192,7 +1184,6 @@ def _compile_recompute_wu(
         beta_dtype=beta_dtype,
         is_varlen=is_varlen,
         preprocessed_k=preprocessed_k,
-        wait_on_pdl=wait_on_pdl,
         use_fast_math=USE_FAST_MATH,
     )
 
@@ -1366,7 +1357,6 @@ def recompute_w_u_from_preprocessed(
     chunk_indices=None,
     block_k=None,
     block_v=None,
-    wait_on_pdl=False,
 ):
     """Compute only ``w`` and ``u`` when fused intra already produced scaled k.
 
@@ -1428,7 +1418,6 @@ def recompute_w_u_from_preprocessed(
         is_varlen=is_varlen,
         beta_dtype=cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16,
         preprocessed_k=True,
-        wait_on_pdl=wait_on_pdl,
     )
 
     # gk and kg are unused compile-signature placeholders for this
