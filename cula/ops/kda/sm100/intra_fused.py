@@ -80,6 +80,12 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from fla.ops.utils import prepare_chunk_indices
 
 from cula.ops.kda.sm100.akk_inv_fp32 import akk_inv_fp32_physical_host as _akk_inv_fp32_physical_host
+from cula.ops.kda.sm100.akk_inv_tf32 import _add_store_C16_smem as _tf32_add_store_C16_smem
+from cula.ops.kda.sm100.akk_inv_tf32 import _invert_diag_forward16 as _tf32_invert_diag_forward16
+from cula.ops.kda.sm100.akk_inv_tf32 import _matmul16_smem_smem as _tf32_matmul16_smem_smem
+from cula.ops.kda.sm100.akk_inv_tf32 import _matmul16_tmp_smem as _tf32_matmul16_tmp_smem
+from cula.ops.kda.sm100.akk_inv_tf32 import _store_C16_smem as _tf32_store_C16_smem
+from cula.ops.kda.sm100.akk_inv_tf32 import _store_C16_tmp as _tf32_store_C16_tmp
 
 # (Test-only references to upstream act_cumsum / intra_parallel / fla triton
 # kernels were stripped during flashinfer migration — the fused fast path
@@ -121,6 +127,8 @@ AKK_STRIDE = BT + AKK_PAD  # 68 (padded, bank-conflict-free for MMA)
 # sG independent layout constants (bf16 units)
 G_ROW_STRIDE_BF16 = K_DIM  # 128 bf16 per row
 G_STAGE_STRIDE_BF16 = BT * K_DIM  # 8192 bf16 per stage (one stage = BT*K_DIM)
+INV_TMP_SLOTS = 4
+INV_TMP_STRIDE = BC + 4
 
 K1_ROW_GROUPS = 8
 K1_COL_GROUPS = 2
@@ -971,6 +979,8 @@ def fused_kernel123(
     HAS_BIAS: cutlass.Constexpr[int],
     USE_SAFE_GATE: cutlass.Constexpr[int],
     VARLEN_PURE: cutlass.Constexpr[int] = 0,
+    FUSE_AKK_INV: cutlass.Constexpr[int] = 0,
+    SINGLE_G_BUFFER: cutlass.Constexpr[int] = 0,
     FP32_AKK_WORKSPACE: cutlass.Constexpr[int] = 0,
 ):
     block_id, _, _ = cute.arch.block_idx()
@@ -1015,6 +1025,13 @@ def fused_kernel123(
     # to reduce register pressure / avoid repeated gmem broadcast.
     beta_smem_layout = cute.make_layout((BT, NUM_STAGES), stride=(1, BT))
     sBeta = smem.allocate_tensor(cutlass.BFloat16, beta_smem_layout, 128)
+
+    if cutlass.const_expr(FUSE_AKK_INV != 0):
+        inv_tmp_layout = cute.make_layout(
+            (INV_TMP_SLOTS, BC, BC),
+            stride=(BC * INV_TMP_STRIDE, INV_TMP_STRIDE, 1),
+        )
+        sInvTmp = smem.allocate_tensor(cutlass.Float32, inv_tmp_layout, 128)
 
     # =====================================================================
     # Mbarrier allocation & init
@@ -1075,6 +1092,226 @@ def fused_kernel123(
         for s in range(NUM_STAGES):
             cute.arch.mbarrier_arrive(stage_reuse_mbars + s)
             if mma_warp_tmp < NUM_STORE_WARPS:
+                if cutlass.const_expr(FUSE_AKK_INV != 0):
+                    store_tid = store_warp * 32 + lane_id
+
+                    # Convert the block-transposed K123 accumulator into a
+                    # logical unit-lower matrix before the TF32 Schur inverse.
+                    for norm_i in cutlass.range_constexpr((BT * BT) // (NUM_STORE_WARPS * 32)):
+                        linear = store_tid + norm_i * (NUM_STORE_WARPS * 32)
+                        norm_row = linear // BT
+                        norm_col = linear % BT
+                        if norm_row >= norm_col:
+                            norm_val = cutlass.Float32(0.0)
+                            if norm_row == norm_col:
+                                norm_val = cutlass.Float32(1.0)
+                            else:
+                                norm_row_blk = norm_row // BC
+                                norm_col_blk = norm_col // BC
+                                src_row = norm_row
+                                src_col = norm_col
+                                if norm_row_blk != norm_col_blk:
+                                    src_row = norm_col_blk * BC + norm_row % BC
+                                    src_col = norm_row_blk * BC + norm_col % BC
+                                norm_val = cutlass.Float32(csAkk[src_row, src_col])
+                                if IS_VARLEN and not VARLEN_PURE:
+                                    if chunk_start + norm_row >= st_eos:
+                                        norm_val = cutlass.Float32(0.0)
+                            csAkk[norm_row, norm_col] = norm_val
+                    store_internal_barrier()
+
+                    if store_tid < 64:
+                        _tf32_invert_diag_forward16(csAkk, store_tid // 16, store_tid)
+                    store_internal_barrier()
+
+                    if store_tid < 64:
+                        block32 = store_tid // 32
+                        row_base = block32 * 32
+                        c0, c1, c2, c3, c4, c5, c6, c7 = _tf32_matmul16_smem_smem(
+                            csAkk,
+                            row_base + 16,
+                            row_base + 16,
+                            csAkk,
+                            row_base + 16,
+                            row_base,
+                            lane_id,
+                        )
+                        _tf32_store_C16_tmp(
+                            sInvTmp,
+                            block32,
+                            -c0,
+                            -c1,
+                            -c2,
+                            -c3,
+                            -c4,
+                            -c5,
+                            -c6,
+                            -c7,
+                            lane_id,
+                        )
+                    store_internal_barrier()
+
+                    if store_tid < 64:
+                        block32 = store_tid // 32
+                        row_base = block32 * 32
+                        c0, c1, c2, c3, c4, c5, c6, c7 = _tf32_matmul16_tmp_smem(
+                            sInvTmp,
+                            block32,
+                            csAkk,
+                            row_base,
+                            row_base,
+                            lane_id,
+                        )
+                        _tf32_store_C16_smem(
+                            csAkk,
+                            row_base + 16,
+                            row_base,
+                            c0,
+                            c1,
+                            c2,
+                            c3,
+                            c4,
+                            c5,
+                            c6,
+                            c7,
+                            lane_id,
+                        )
+                    store_internal_barrier()
+
+                    inv_x = store_warp // 2
+                    inv_y = store_warp % 2
+                    inv_slot = store_warp
+                    inv_row_o = 32 + inv_y * 16
+                    inv_col_c = inv_x * 16
+
+                    p0, p1, p2, p3, p4, p5, p6, p7 = _tf32_matmul16_smem_smem(
+                        csAkk,
+                        inv_row_o,
+                        32,
+                        csAkk,
+                        32,
+                        inv_col_c,
+                        lane_id,
+                    )
+                    q0, q1, q2, q3, q4, q5, q6, q7 = _tf32_matmul16_smem_smem(
+                        csAkk,
+                        inv_row_o,
+                        48,
+                        csAkk,
+                        48,
+                        inv_col_c,
+                        lane_id,
+                    )
+                    _tf32_store_C16_tmp(
+                        sInvTmp,
+                        inv_slot,
+                        -(p0 + q0),
+                        -(p1 + q1),
+                        -(p2 + q2),
+                        -(p3 + q3),
+                        -(p4 + q4),
+                        -(p5 + q5),
+                        -(p6 + q6),
+                        -(p7 + q7),
+                        lane_id,
+                    )
+                    store_internal_barrier()
+
+                    o0, o1, o2, o3, o4, o5, o6, o7 = _tf32_matmul16_tmp_smem(
+                        sInvTmp,
+                        inv_slot,
+                        csAkk,
+                        inv_x * 16,
+                        0,
+                        lane_id,
+                    )
+                    r0, r1, r2, r3, r4, r5, r6, r7 = _tf32_matmul16_tmp_smem(
+                        sInvTmp,
+                        inv_slot,
+                        csAkk,
+                        inv_x * 16,
+                        16,
+                        lane_id,
+                    )
+                    if inv_x == 0:
+                        _tf32_store_C16_smem(
+                            csAkk,
+                            inv_row_o,
+                            0,
+                            o0,
+                            o1,
+                            o2,
+                            o3,
+                            o4,
+                            o5,
+                            o6,
+                            o7,
+                            lane_id,
+                        )
+                        _tf32_store_C16_smem(
+                            csAkk,
+                            inv_row_o,
+                            16,
+                            r0,
+                            r1,
+                            r2,
+                            r3,
+                            r4,
+                            r5,
+                            r6,
+                            r7,
+                            lane_id,
+                        )
+                    store_internal_barrier()
+                    if inv_x == 1:
+                        _tf32_add_store_C16_smem(
+                            csAkk,
+                            inv_row_o,
+                            0,
+                            o0,
+                            o1,
+                            o2,
+                            o3,
+                            o4,
+                            o5,
+                            o6,
+                            o7,
+                            lane_id,
+                        )
+                        _tf32_add_store_C16_smem(
+                            csAkk,
+                            inv_row_o,
+                            16,
+                            r0,
+                            r1,
+                            r2,
+                            r3,
+                            r4,
+                            r5,
+                            r6,
+                            r7,
+                            lane_id,
+                        )
+                    store_internal_barrier()
+
+                    row_base_warp = store_warp * (BT // NUM_STORE_WARPS)
+                    for ri in cutlass.range_constexpr(BT // NUM_STORE_WARPS):
+                        local_row = row_base_warp + ri
+                        abs_row = chunk_start + local_row
+                        val0 = cutlass.Float32(csAkk[local_row, col_lo])
+                        val1 = cutlass.Float32(csAkk[local_row, col_hi])
+                        if local_row < col_lo:
+                            val0 = cutlass.Float32(0.0)
+                        if local_row < col_hi:
+                            val1 = cutlass.Float32(0.0)
+                        rAkkOut[0] = val0.to(cutlass.BFloat16)
+                        rAkkOut[1] = val1.to(cutlass.BFloat16)
+                        if IS_VARLEN and not VARLEN_PURE:
+                            if abs_row < st_eos:
+                                cute.autovec_copy(rAkkOut, mAkk_v2[i_b, abs_row, i_h, col_vec_idx, None])
+                        else:
+                            cute.autovec_copy(rAkkOut, mAkk_v2[i_b, abs_row, i_h, col_vec_idx, None])
+
                 cute.arch.mbarrier_arrive(store_done_mbars + s)
 
     # =================================================================
@@ -1328,6 +1565,8 @@ def fused_kernel123(
             else:
                 pf_cs = i_b * num_chunks * BT + chunk_base * BT
             cute.arch.mbarrier_wait(stage_reuse_mbars, 0)
+            if cutlass.const_expr(FUSE_AKK_INV != 0):
+                cute.arch.mbarrier_wait(store_done_mbars, 0)
             if lane_id == 0:
                 cute.arch.mbarrier_expect_tx(tma_mbars, bytes_per_stage)
             sQ_pf = sQ[(None, None, 0)]
@@ -1355,6 +1594,11 @@ def fused_kernel123(
             for next_i in cutlass.range_constexpr(1, CHUNKS_PER_BLOCK):
                 next_stage = next_i % NUM_STAGES
                 next_phase = next_i // NUM_STAGES % 2
+                if cutlass.const_expr(SINGLE_G_BUFFER != 0):
+                    prev_i = next_i - 1
+                    prev_stage = prev_i % NUM_STAGES
+                    prev_phase = prev_i // NUM_STAGES % 2
+                    cute.arch.mbarrier_wait(k1_done_mbars + prev_stage, prev_phase)
                 next_cs = cutlass.Int32(0)
                 if IS_VARLEN:
                     next_chunk_idx = chunk_base + next_i
@@ -1364,6 +1608,8 @@ def fused_kernel123(
                 else:
                     next_cs = i_b * num_chunks * BT + (chunk_base + next_i) * BT
                 cute.arch.mbarrier_wait(stage_reuse_mbars + next_stage, next_phase)
+                if cutlass.const_expr(FUSE_AKK_INV != 0):
+                    cute.arch.mbarrier_wait(store_done_mbars + next_stage, next_phase)
                 if lane_id == 0:
                     cute.arch.mbarrier_expect_tx(tma_mbars + next_stage, bytes_per_stage)
                 sQ_ns = sQ[(None, None, next_stage)]
@@ -1386,6 +1632,11 @@ def fused_kernel123(
                 cute.copy(tma_atom_G, tg_ns, ts_ns, tma_bar_ptr=tma_mbars + next_stage)
                 if lane_id == 0:
                     cute.arch.mbarrier_arrive(tma_mbars + next_stage)
+
+            if cutlass.const_expr(SINGLE_G_BUFFER != 0):
+                last_stage = (CHUNKS_PER_BLOCK - 1) % NUM_STAGES
+                last_phase = ((CHUNKS_PER_BLOCK - 1) // NUM_STAGES) % 2
+                cute.arch.mbarrier_wait(k1_done_mbars + last_stage, last_phase)
 
         # =============================================================
         # Warps 16-27 (excluding TMA_WARP_ID=26): K2 MMA Compute
@@ -1658,7 +1909,7 @@ def fused_kernel123(
                                 _v_q07 = _z16
                             csAqk[q_row_base + row1, k_row_base + col3] = _v_q07
 
-                            if cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
+                            if cutlass.const_expr(FP32_AKK_WORKSPACE != 0 or FUSE_AKK_INV != 0):
                                 _v_k00 = acc_akk_n0_0 * beta_row0
                                 if row0 == col0:
                                     _v_k00 = _one32
@@ -1724,7 +1975,7 @@ def fused_kernel123(
                             csAqk[q_row_base + row0, k_row_base + col3] = (acc_aqk_n1_1 * scale).to(cutlass.BFloat16)
                             csAqk[q_row_base + row1, k_row_base + col2] = (acc_aqk_n1_2 * scale).to(cutlass.BFloat16)
                             csAqk[q_row_base + row1, k_row_base + col3] = (acc_aqk_n1_3 * scale).to(cutlass.BFloat16)
-                            if cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
+                            if cutlass.const_expr(FP32_AKK_WORKSPACE != 0 or FUSE_AKK_INV != 0):
                                 csAkk[akk_row_base + row0, akk_col_base + col0] = acc_akk_n0_0 * beta_row0
                                 csAkk[akk_row_base + row0, akk_col_base + col1] = acc_akk_n0_1 * beta_row0
                                 csAkk[akk_row_base + row1, akk_col_base + col0] = acc_akk_n0_2 * beta_row1
@@ -1839,7 +2090,9 @@ def fused_kernel123(
                         rAqkOut[1] = csAqk[local_row, col_hi]
                         if abs_row < st_eos:
                             cute.autovec_copy(rAqkOut, mAqk_v2[i_b, abs_row, i_h, col_vec_idx, None])
-                            if cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
+                            if cutlass.const_expr(FUSE_AKK_INV != 0):
+                                pass
+                            elif cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
                                 rAkkFp32Out[0] = cutlass.Float32(csAkk[local_row, col_lo])
                                 rAkkFp32Out[1] = cutlass.Float32(csAkk[local_row, col_hi])
                                 cute.autovec_copy(rAkkFp32Out, mAkk_v2[i_b, abs_row, i_h, col_vec_idx, None])
@@ -1873,7 +2126,9 @@ def fused_kernel123(
                                 if is_diag and local_row < local_col:
                                     aqk_val = cutlass.BFloat16(0.0)
                                 mAqk[i_b, gmem_aqk_row_base + local_row, i_h, gmem_aqk_col_base + local_col] = aqk_val
-                                if cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
+                                if cutlass.const_expr(FUSE_AKK_INV != 0):
+                                    pass
+                                elif cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
                                     akk_val = cutlass.Float32(
                                         csAkk[smem_akk_row_base + local_row, smem_akk_col_base + local_col]
                                     )
@@ -1914,6 +2169,8 @@ def make_host_function(
     has_bias=False,
     use_safe_gate=False,
     varlen_pure=False,
+    fuse_akk_inv=False,
+    single_g_buffer=False,
     fp32_akk_workspace=False,
 ):
     """
@@ -1928,7 +2185,13 @@ def make_host_function(
     _HAS_BIAS = 1 if has_bias else 0
     _USE_SAFE_GATE = 1 if use_safe_gate else 0
     _VARLEN_PURE = 1 if (is_varlen and varlen_pure) else 0
+    _FUSE_AKK_INV = 1 if fuse_akk_inv else 0
+    _SINGLE_G_BUFFER = 1 if single_g_buffer else 0
     _FP32_AKK_WORKSPACE = 1 if fp32_akk_workspace else 0
+    if fuse_akk_inv and not single_g_buffer:
+        raise ValueError("fuse_akk_inv requires single_g_buffer=True")
+    if fuse_akk_inv and fp32_akk_workspace:
+        raise ValueError("fused inverse and fp32 inverse workspace are mutually exclusive")
     if is_varlen:
         assert _B == 1, "Varlen requires B=1"
         assert T_padded is not None, "T_padded required for varlen"
@@ -1981,7 +2244,8 @@ def make_host_function(
         qk_smem_3d = cute.tile_to_shape(smem_atom_qk, (BT, K_DIM, NUM_STAGES), order=(0, 1, 2))
 
         g_smem_2d = cute.make_layout((BT, K_DIM), stride=(G_ROW_STRIDE_BF16, 1))
-        g_smem_3d = cute.make_layout((BT, K_DIM, NUM_STAGES), stride=(G_ROW_STRIDE_BF16, 1, G_STAGE_STRIDE_BF16))
+        g_stage_stride = 0 if single_g_buffer else G_STAGE_STRIDE_BF16
+        g_smem_3d = cute.make_layout((BT, K_DIM, NUM_STAGES), stride=(G_ROW_STRIDE_BF16, 1, g_stage_stride))
 
         tma_op = cpasync.CopyBulkTensorTileG2SOp(cpasync.CtaGroup.ONE)
         tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
@@ -2054,6 +2318,8 @@ def make_host_function(
         # Barriers: 5 * 2 * 8 = 80 B
         # Subtotal: 225,744 B (~220 KB)
         # SM100 max: 228 KB (margin ~2 KB)
+        g_smem_bytes = BT * K_DIM * 2 * (1 if single_g_buffer else NUM_STAGES)
+        inv_tmp_bytes = INV_TMP_SLOTS * BC * INV_TMP_STRIDE * 4 if fuse_akk_inv else 0
         smem_size = (
             BT * K_DIM * 2 * 2 * NUM_STAGES  # Q/K bf16: 65,536 B
             + BT * AKK_STRIDE * 4 * NUM_STAGES  # sAkk fp32: 34,816 B
@@ -2062,9 +2328,10 @@ def make_host_function(
             + BT * AQK_TILE_STRIDE * 2 * NUM_STAGES  # sAqk bf16: 18,432 B
             + BT * NUM_STAGES * 2  # Beta bf16: 256 B
             + 5 * NUM_STAGES * 8  # Barriers: 80 B
-            + BT * K_DIM * 2 * NUM_STAGES  # sG bf16 independent allocation
+            + g_smem_bytes
+            + inv_tmp_bytes
         )
-        smem_size = max(smem_size, 225 * 1024)
+        smem_size = max(smem_size, (218 if fuse_akk_inv else (212 if single_g_buffer else 225)) * 1024)
 
         _grid_x = min(NUM_SMS, _total_cgs_val)
 
@@ -2106,6 +2373,8 @@ def make_host_function(
             _HAS_BIAS,
             _USE_SAFE_GATE,
             _VARLEN_PURE,
+            _FUSE_AKK_INV,
+            _SINGLE_G_BUFFER,
             _FP32_AKK_WORKSPACE,
         ).launch(
             grid=(_grid_x, 1, 1),
@@ -2308,6 +2577,7 @@ def chunk_kda_fwd_intra_sm100_equal(
     lower_bound: float | None = None,
     chunk_size: int = BT,
     pdl_fp32_akk_inv: bool = False,
+    fused_akk_inv: bool = False,
 ):
     """Launch FlashInfer fused K1+K2+K3 kernel for equal-length sequences."""
     if chunk_size != BT:
@@ -2329,11 +2599,13 @@ def chunk_kda_fwd_intra_sm100_equal(
         scale = K_DIM**-0.5
     if safe_gate and lower_bound is None:
         lower_bound = -5.0
+    if pdl_fp32_akk_inv and fused_akk_inv:
+        raise ValueError("select only one Akk inverse implementation")
 
     NT = T_total // BT
     dev = q.device.index if q.device.index is not None else 0
     has_bias = dt_bias is not None
-    cache_key = (dev, B, NT, H, has_bias, safe_gate, pdl_fp32_akk_inv)
+    cache_key = (dev, B, NT, H, has_bias, safe_gate, pdl_fp32_akk_inv, fused_akk_inv)
 
     k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk = _get_out_buffers_equal(q.device, B, T_total, H)
     A_kk_workspace = _get_akk_fp32_workspace_equal(q.device, B, T_total, H) if pdl_fp32_akk_inv else A_kk
@@ -2388,6 +2660,8 @@ def chunk_kda_fwd_intra_sm100_equal(
             is_varlen=False,
             has_bias=has_bias,
             use_safe_gate=safe_gate,
+            fuse_akk_inv=fused_akk_inv,
+            single_g_buffer=fused_akk_inv,
             fp32_akk_workspace=pdl_fp32_akk_inv,
         )
         kernel = cute.compile(host_fn, *ct_args)
@@ -2424,6 +2698,7 @@ def chunk_kda_fwd_intra_sm100_varlen(
     lower_bound: float | None = None,
     seq_lens: list[int] | None = None,
     pdl_fp32_akk_inv: bool = False,
+    fused_akk_inv: bool = False,
 ):
     """Launch FlashInfer fused K1+K2+K3 kernel for varlen sequences.
 
@@ -2442,6 +2717,8 @@ def chunk_kda_fwd_intra_sm100_varlen(
         scale = K_DIM**-0.5
     if safe_gate and lower_bound is None:
         lower_bound = -5.0
+    if pdl_fp32_akk_inv and fused_akk_inv:
+        raise ValueError("select only one Akk inverse implementation")
     has_bias = dt_bias is not None
 
     cu_seqlens = cu_seqlens.contiguous().to(torch.int32)
@@ -2472,6 +2749,7 @@ def chunk_kda_fwd_intra_sm100_varlen(
         safe_gate,
         varlen_pure,
         pdl_fp32_akk_inv,
+        fused_akk_inv,
     )
 
     k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk = _get_out_buffers_varlen(q.device, T_padded, NT, H)
@@ -2530,6 +2808,8 @@ def chunk_kda_fwd_intra_sm100_varlen(
             has_bias=has_bias,
             use_safe_gate=safe_gate,
             varlen_pure=varlen_pure,
+            fuse_akk_inv=fused_akk_inv,
+            single_g_buffer=fused_akk_inv,
             fp32_akk_workspace=pdl_fp32_akk_inv,
         )
         kernel = cute.compile(host_fn, *ct_args)
