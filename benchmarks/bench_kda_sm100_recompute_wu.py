@@ -4,8 +4,12 @@
 """Compare SM100 C++ and CuTe DSL recompute-WU kernels on the same inputs."""
 
 import argparse
+import pathlib
+import sys
 
 import torch
+
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
 import cula.cudac as cula_cuda
 from benchmarks.bench_recompute_wu import prepare_recompute_wu_inputs
@@ -66,9 +70,7 @@ def main():
     print(f"{'T':>8} {'C++ (ms)':>12} {'WS (ms)':>12} {'Occ (ms)':>12} {'WS/C++':>10} {'Occ/C++':>10} {'rel_rmse':>12}")
     for T in args.lengths:
         cu_seqlens = torch.tensor([0, T, 2 * T], dtype=torch.int32, device=device)
-        _q, k, v, cu_gk, beta, A, cu_seqlens, chunk_indices = prepare_recompute_wu_inputs(
-            2, T, device, cu_seqlens=cu_seqlens
-        )
+        _q, k, v, cu_gk, beta, A, cu_seqlens, chunk_indices = prepare_recompute_wu_inputs(2, T, device, cu_seqlens=cu_seqlens)
         cpp = _run_cpp(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices)
         ws = recompute_w_u_fwd(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices)
         occ = _run_occ(k, v, beta, A, cu_gk, cu_seqlens)
