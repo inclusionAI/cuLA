@@ -54,7 +54,6 @@ def akk_inv_fp32_physical_kernel(
     mCuSeqlens: cute.Tensor,
     mChunkIndices: cute.Tensor,
     IS_VARLEN: cutlass.Constexpr[int],
-    WAIT_ON_PDL: cutlass.Constexpr[int],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -73,11 +72,6 @@ def akk_inv_fp32_physical_kernel(
         bos = cutlass.Int32(mCuSeqlens[seq_id])
         eos = cutlass.Int32(mCuSeqlens[seq_id + 1])
         chunk_start = bos + local * BS
-
-    if cutlass.const_expr(WAIT_ON_PDL != 0):
-        # The setup above is independent. Wait only before reading K123's fp32
-        # workspace.
-        cute.arch.griddepcontrol_wait()
 
     # K123 stores the ten lower 16x16 tiles in block-transposed physical
     # positions, while values inside each tile remain row-contiguous. Two
@@ -243,7 +237,6 @@ def akk_inv_fp32_physical_host(
     mChunkIndices: cute.Tensor,
     IS_VARLEN: cutlass.Constexpr[int],
     T_VAL: cutlass.Constexpr[int],
-    WAIT_ON_PDL: cutlass.Constexpr[int] = 1,
 ):
     in_layout = cute.make_layout((B, T_VAL, H, BS), stride=(T_VAL * H * BS, H * BS, BS, 1))
     out_layout = cute.make_layout((B, T_VAL, H, BS), stride=(T_VAL * H * BS, H * BS, BS, 1))
@@ -264,10 +257,8 @@ def akk_inv_fp32_physical_host(
         mCuSeqlens,
         mChunkIndices,
         IS_VARLEN,
-        WAIT_ON_PDL,
     ).launch(
         grid=(H, NT, B),
         block=(THREADS, 1, 1),
         smem=smem_bytes,
-        use_pdl=WAIT_ON_PDL != 0,
     )

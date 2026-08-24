@@ -108,10 +108,11 @@ def _check_accuracy(
             )
         stats[name] = values
 
-    upper_max = outputs[5][~lower_mask].abs().max().item()
-    if upper_max != 0.0:
-        raise AssertionError(f"Akk upper triangle is not exactly zero: max_abs={upper_max}")
-    stats["Akk_upper"] = {"rel_rmse": 0.0, "max_abs": upper_max, "mean_abs": 0.0}
+    for name, output in (("Aqk_upper", outputs[4]), ("Akk_upper", outputs[5])):
+        upper_max = output[~lower_mask].abs().max().item()
+        if upper_max != 0.0:
+            raise AssertionError(f"{name} is not exactly zero: max_abs={upper_max}")
+        stats[name] = {"rel_rmse": 0.0, "max_abs": upper_max, "mean_abs": 0.0}
     return stats
 
 
@@ -159,7 +160,7 @@ def main() -> None:
             safe_gate=True,
             lower_bound=lower_bound,
             seq_lens=seq_lens,
-            pdl_fp32_akk_inv=True,
+            fp32_akk_inv=True,
         )
         w, u = recompute_w_u_from_preprocessed(
             intra[0],

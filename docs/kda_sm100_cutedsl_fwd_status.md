@@ -64,6 +64,43 @@ inverse loads/stores, clear only the six inverse upper tiles, reuse prefix
 results, hoist gate invariants, and use ordinary stream ordering between K123
 and the inverse instead of PDL fences.
 
+## Varlen determinism stress
+
+The complete CuTeDSL varlen forward chain was replayed 10,000,000 times on
+physical GPU 1. The case uses four deliberately unaligned sequence lengths
+`[65, 127, 193, 255]`, `H=8`, and therefore exercises partial chunks and the
+non-pure varlen path.
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python benchmarks/stress_kda_sm100_varlen_determinism.py \
+  --iterations 10000000 --checkpoint 1000000 \
+  --report-json /tmp/kda_sm100_varlen_10m.json
+```
+
+The complete forward plus exact-output comparison is captured in one CUDA
+Graph. Every replay compares every element of `k_scaled`, `kg`, `q_scaled`,
+`gk_last_exp`, `Aqk`, `Akk`, `w`, and `u` against the first-run golden output;
+the device-side mismatch counter is checked every 1,000,000 iterations.
+
+- Iterations: 10,000,000
+- Exact element mismatches: 0
+- Elapsed time: 471.308 seconds
+- Throughput: 21,217.6 iterations/second
+- Aqk/Akk upper-triangle max absolute value: 0
+
+Accuracy against the csrc path for the same inputs:
+
+| Output | Relative RMSE | Max absolute error |
+|---|---:|---:|
+| k_scaled | 3.894e-8 | 2.384e-7 |
+| kg | 4.572e-5 | 4.883e-4 |
+| q_scaled | 6.323e-7 | 3.815e-6 |
+| gk_last_exp | 4.398e-9 | 4.470e-8 |
+| Aqk | 4.397e-4 | 1.221e-4 |
+| Akk | 1.466e-5 | 4.883e-4 |
+| w | 2.163e-3 | 9.766e-4 |
+| u | 9.090e-5 | 9.766e-4 |
+
 ## Rejected experiments
 
 - High-occupancy small-tile WU: slower than the warp-specialized baseline.

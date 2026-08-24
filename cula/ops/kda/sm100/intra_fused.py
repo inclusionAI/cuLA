@@ -24,31 +24,31 @@ and inter sub-chunk solve + merged inverse (K3) into a single persistent kernel.
 Grid: (NUM_SMS, 1, 1) — 148 persistent blocks, each loops over work units
   Total work units = (NT/4) * H * B, distributed round-robin across SMs
   Block i processes work units i, i+NUM_SMS, i+2*NUM_SMS, ...
-Block: 1024 threads (32 warps), warp-specialized with setmaxnreg (all groups 4-aligned):
-  Warps 0-15:  TMA+K1 fused (8×2, vec2, prefetch pipeline) – 4 WGs, 56 regs
-  Warps 16-27: K2 MMA compute (10 active + 2 idle for WG alignment) – 3 WGs, 72 regs
-  Warps 28-31: Store warps – 1 WG, 24 regs
+Block: 992 threads (31 warps), warp-specialized by role:
+  Warps 0-15: K1 gate activation/cumsum/scaling (8×2, vec2)
+  Warps 16-25: K2/K3 MMA compute (one lower-triangular tile per warp)
+  Warp 26: dedicated TMA producer for Q/K/G
+  Warps 27-30: vectorized Aqk/Akk stores
 
 Pipeline (single for_generate, warp groups separated by if-blocks):
   per work unit:
-    Warps 0-15:  prefetch chunk 0→stage 0 (warp 0), then loop:
-                    TMA next chunk (warp 0), wait cur chunk, K1 compute, arrive(k1_done)
-    Warps 16-27: wait(k1_done)+wait(store_done), MMA, arrive(mma_done+stage_reuse)
-    Warps 28-31: wait(mma_done), store sAqk/sAkk→GMEM, arrive(store_done)
+    Warp 26: prefetch Q/K/G and reuse the two stages as MMA releases them
+    Warps 0-15: wait for TMA, run K1, arrive(k1_done)
+    Warps 16-25: wait(k1_done)+wait(store_done), MMA, arrive(mma_done+stage_reuse)
+    Warps 27-30: wait(mma_done), store sAqk/sAkk→GMEM, arrive(store_done)
   All warp-group invariants are computed inside each group's if-block (not hoisted)
   to eliminate cross-group register pressure — same budget as the _all version.
   Mbarrier phases self-reset after 4 iterations (2 stages × 2 phases).
 
 Mbarriers:
   tma_mbars[2]:          count=1, warp 0 lane 0 → K1+MMA wait for TMA data
-  stage_reuse_mbars[2]:  count=384, MMA(12 warps) → warp 0 waits before TMA reuse
+  stage_reuse_mbars[2]:  count=320, MMA(10 warps) → TMA waits before stage reuse
   k1_done_mbars[2]:      count=512, K1(16 warps) → MMA waits for g_cumsum ready
-  mma_done_mbars[2]:     count=384, MMA(12 warps) → Store waits for sAqk/sAkk ready
+  mma_done_mbars[2]:     count=320, MMA(10 warps) → Store waits for sAqk/sAkk ready
   store_done_mbars[2]:   count=128, Store(4 warps) → MMA waits for sAqk/sAkk stage free
 
-SMEM: ~215KB (q+k+g × [64,128] bf16 × 2 stages + g_cumsum [64,136] fp32 × 2 stages
-      + sPartialLast [8,132] fp32 + sAqk [16,168,2] bf16
-      + sAkk [64,72,2] fp32 block-transposed upper-tri layout)
+SMEM: ~220KB (Q/K/G double buffers, fp32 gate cumsum, prefix scratch,
+      Aqk/Akk double buffers, staged beta, and pipeline barriers).
 
 Inputs:
   g       [B,T,H,K]   bf16  raw gate
@@ -65,7 +65,7 @@ Outputs (g_cumsum stays in SMEM, not written to GMEM):
   gk_last_exp[B,NT,H,K]  fp32
   A_qk       [B,T,H,BT]  bf16  full merged (diagonal + off-diagonal)
   A_kk       [B,T,H,BT]  bf16  pre-inverse output by default; bf16 inverse
-                              output when pdl_fp32_akk_inv uses fp32 workspace
+                              output when fp32_akk_inv uses an fp32 workspace
 """
 
 
@@ -85,8 +85,6 @@ from cula.ops.kda.sm100.akk_inv_fp32 import akk_inv_fp32_physical_host as _akk_i
 # kernels were stripped during flashinfer migration — the fused fast path
 # does not depend on them.)
 
-B200_PEAK_BW_GBS = 7672  # GB/s
-
 BT = 64
 BC = 16
 K_DIM = 128
@@ -99,9 +97,9 @@ NUM_K1_TMA_WARPS = 16  # Warps 0-15:  K1 compute (4 warpgroups, 8×2) -- TMA off
 NUM_MMA_WARPS = 11  # Warps 16-26: MMA (10 active + 1 TMA producer, dropped idle warp 27)
 NUM_MMA_ACTIVE = 10  # mma_warp 0..9: actual MMA work
 TMA_WARP_ID = NUM_K1_TMA_WARPS + NUM_MMA_ACTIVE  # warp 26 = dedicated TMA producer
-NUM_STORE_WARPS = 4  # Warps 28-31: Store (1 warpgroup)
-NUM_WARPS = NUM_K1_TMA_WARPS + NUM_MMA_WARPS + NUM_STORE_WARPS  # 32
-THREADS = NUM_WARPS * 32  # 1024
+NUM_STORE_WARPS = 4  # Warps 27-30: vectorized stores
+NUM_WARPS = NUM_K1_TMA_WARPS + NUM_MMA_WARPS + NUM_STORE_WARPS  # 31
+THREADS = NUM_WARPS * 32  # 992
 
 NUM_SUB_CHUNKS = BT // BC  # 4
 NUM_TILES = NUM_SUB_CHUNKS * (NUM_SUB_CHUNKS + 1) // 2  # 10 lower-tri tiles
@@ -126,8 +124,6 @@ K1_ROW_GROUPS = 8
 K1_COL_GROUPS = 2
 ROWS_PER_K1_WARP = BT // K1_ROW_GROUPS  # 8
 K1_COLS_PER_WARP = K_DIM // K1_COL_GROUPS  # 64
-ROWS_PER_STORE_WARP = BT // NUM_STORE_WARPS  # 16
-
 VEC = K1_COLS_PER_WARP // 32  # 2
 K_VEC = K_DIM // VEC  # 64
 NUM_STAGES = 2
@@ -1027,8 +1023,9 @@ def fused_kernel123(
     # or store warps). Required for downstream row-major store optimizations
     # — positions outside MMA-written sub-tiles stay at 0.
     #
-    # Cooperative pattern (32 warps × 32 lanes = 1024 threads):
+    # Cooperative pattern (31 warps × 32 lanes = 992 threads):
     #   - Each warp owns 2 contiguous rows (warp_id*2, warp_id*2+1)
+    #   - Warp 0 additionally owns the final two rows (62, 63)
     #   - For sAqk bf16: each lane owns 2 contiguous bf16 cols
     #   - For sAkk fp32: each lane owns 1 fp32 col (stride 68)
     # =====================================================================
@@ -1046,11 +1043,19 @@ def fused_kernel123(
             # sAkk fp32: 1 col per lane (stride 68)
             _col_fp32 = _lane_id_warp
             sAkk[_row, _col_fp32, _s] = cutlass.Float32(0.0)
+        if _warp_id_in_cta == 0:
+            for _ri in cutlass.range_constexpr(2):
+                _row = 62 + _ri
+                _col_lo_bf16 = _lane_id_warp * 2
+                _col_hi_bf16 = _col_lo_bf16 + 1
+                sAqk[_row, _col_lo_bf16, _s] = cutlass.BFloat16(0.0)
+                sAqk[_row, _col_hi_bf16, _s] = cutlass.BFloat16(0.0)
+                sAkk[_row, _lane_id_warp, _s] = cutlass.Float32(0.0)
     cute.arch.barrier()
 
     # =====================================================================
     # Pre-arrive (MMA warps only)
-    # stage_reuse_mbars: warp 0 waits before MMA arrives → pre-arrive all 12 MMA warps
+    # stage_reuse_mbars: TMA waits before MMA arrives → pre-arrive all 10 MMA warps
     # store_done_mbars:  MMA waits before Store arrives → pre-arrive first 4 MMA warps
     # =====================================================================
     if warp_idx >= NUM_K1_TMA_WARPS and warp_idx < NUM_K1_TMA_WARPS + NUM_MMA_WARPS and warp_idx != TMA_WARP_ID:
@@ -1370,7 +1375,7 @@ def fused_kernel123(
                     cute.arch.mbarrier_arrive(tma_mbars + next_stage)
 
         # =============================================================
-        # Warps 16-27 (excluding TMA_WARP_ID=26): K2 MMA Compute
+        # Warps 16-25: K2/K3 MMA compute
         # =============================================================
         if warp_idx >= NUM_K1_TMA_WARPS and warp_idx < NUM_K1_TMA_WARPS + NUM_MMA_WARPS and warp_idx != TMA_WARP_ID:
             # Warp-layout invariants (scope-local → no cross-group register spill)
@@ -1767,7 +1772,7 @@ def fused_kernel123(
                 cute.arch.mbarrier_arrive(mma_done_mbars + s)
 
         # =============================================================
-        # Warps 28-31: Store warps
+        # Warps 27-30: Store warps
         # =============================================================
         if warp_idx >= NUM_K1_TMA_WARPS + NUM_MMA_WARPS:
             store_warp = warp_idx - (NUM_K1_TMA_WARPS + NUM_MMA_WARPS)
@@ -2045,7 +2050,7 @@ def make_host_function(
         # K1 partial prefix: 8 * 132 * 4 = 4,224 B
         # Aqk SMEM: 64 * 72 * 2 * NUM_STAGES = 18,432 B
         # Barriers: 5 * 2 * 8 = 80 B
-        # Subtotal: 225,488 B (~220 KB)
+        # Subtotal: 225,744 B (~220 KB)
         # SM100 max: 228 KB (margin ~2 KB)
         smem_size = (
             BT * K_DIM * 2 * 2 * NUM_STAGES  # Q/K bf16: 65,536 B
@@ -2268,7 +2273,7 @@ def _run_akk_inv_fp32_physical(
     dev = A_phys.device.index if A_phys.device.index is not None else 0
     phys_ct = _ct_cached(A_phys, cutlass.Float32)
     out_ct = _ct_cached(A_out, cutlass.BFloat16)
-    cache_key = ("akk_inv_fp32_physical", dev, B, NT, H, bool(is_varlen), T_val, False)
+    cache_key = ("akk_inv_fp32_physical", dev, B, NT, H, bool(is_varlen), T_val)
     kernel = _K123_CACHE.get(cache_key)
     if kernel is None:
         kernel = cute.compile(
@@ -2282,7 +2287,6 @@ def _run_akk_inv_fp32_physical(
             ci_ct,
             1 if is_varlen else 0,
             T_val,
-            0,
         )
         _K123_CACHE[cache_key] = kernel
     kernel(phys_ct, out_ct, cu_ct, ci_ct)
@@ -2300,7 +2304,7 @@ def chunk_kda_fwd_intra_sm100_equal(
     safe_gate: bool = True,
     lower_bound: float | None = None,
     chunk_size: int = BT,
-    pdl_fp32_akk_inv: bool = False,
+    fp32_akk_inv: bool = False,
 ):
     """Launch FlashInfer fused K1+K2+K3 kernel for equal-length sequences."""
     if chunk_size != BT:
@@ -2326,10 +2330,10 @@ def chunk_kda_fwd_intra_sm100_equal(
     NT = T_total // BT
     dev = q.device.index if q.device.index is not None else 0
     has_bias = dt_bias is not None
-    cache_key = (dev, B, NT, H, has_bias, safe_gate, pdl_fp32_akk_inv)
+    cache_key = (dev, B, NT, H, has_bias, safe_gate, fp32_akk_inv)
 
     k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk = _get_out_buffers_equal(q.device, B, T_total, H)
-    A_kk_workspace = _get_akk_fp32_workspace_equal(q.device, B, T_total, H) if pdl_fp32_akk_inv else A_kk
+    A_kk_workspace = _get_akk_fp32_workspace_equal(q.device, B, T_total, H) if fp32_akk_inv else A_kk
 
     q_ct = _ct_cached(q, cutlass.BFloat16)
     k_ct = _ct_cached(k, cutlass.BFloat16)
@@ -2341,7 +2345,7 @@ def chunk_kda_fwd_intra_sm100_equal(
     qs_ct = _ct_cached(q_scaled, cutlass.BFloat16)
     gk_ct = _ct_cached(gk_last_exp, cutlass.Float32)
     aqk_ct = _ct_cached(A_qk, cutlass.BFloat16)
-    akk_ct = _ct_cached(A_kk_workspace, cutlass.Float32 if pdl_fp32_akk_inv else cutlass.BFloat16)
+    akk_ct = _ct_cached(A_kk_workspace, cutlass.Float32 if fp32_akk_inv else cutlass.BFloat16)
     cu_ct, ci_ct = _get_eqlen_dummies(q.device)
 
     if has_bias:
@@ -2381,13 +2385,13 @@ def chunk_kda_fwd_intra_sm100_equal(
             is_varlen=False,
             has_bias=has_bias,
             use_safe_gate=safe_gate,
-            fp32_akk_workspace=pdl_fp32_akk_inv,
+            fp32_akk_workspace=fp32_akk_inv,
         )
         kernel = cute.compile(host_fn, *ct_args)
         _K123_CACHE[("kernel", cache_key)] = kernel
 
     kernel(*ct_args)
-    if pdl_fp32_akk_inv:
+    if fp32_akk_inv:
         _run_akk_inv_fp32_physical(
             A_kk_workspace,
             A_kk,
@@ -2416,7 +2420,7 @@ def chunk_kda_fwd_intra_sm100_varlen(
     safe_gate: bool = True,
     lower_bound: float | None = None,
     seq_lens: list[int] | None = None,
-    pdl_fp32_akk_inv: bool = False,
+    fp32_akk_inv: bool = False,
 ):
     """Launch FlashInfer fused K1+K2+K3 kernel for varlen sequences.
 
@@ -2464,11 +2468,11 @@ def chunk_kda_fwd_intra_sm100_varlen(
         has_bias,
         safe_gate,
         varlen_pure,
-        pdl_fp32_akk_inv,
+        fp32_akk_inv,
     )
 
     k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk = _get_out_buffers_varlen(q.device, T_padded, NT, H)
-    A_kk_workspace = _get_akk_fp32_workspace_varlen(q.device, T_padded, NT, H) if pdl_fp32_akk_inv else A_kk
+    A_kk_workspace = _get_akk_fp32_workspace_varlen(q.device, T_padded, NT, H) if fp32_akk_inv else A_kk
 
     q_ct = _ct_cached(q_pad, cutlass.BFloat16)
     k_ct = _ct_cached(k_pad, cutlass.BFloat16)
@@ -2480,7 +2484,7 @@ def chunk_kda_fwd_intra_sm100_varlen(
     qs_ct = _ct_cached(q_scaled, cutlass.BFloat16)
     gk_ct = _ct_cached(gk_last_exp, cutlass.Float32)
     aqk_ct = _ct_cached(A_qk, cutlass.BFloat16)
-    akk_ct = _ct_cached(A_kk_workspace, cutlass.Float32 if pdl_fp32_akk_inv else cutlass.BFloat16)
+    akk_ct = _ct_cached(A_kk_workspace, cutlass.Float32 if fp32_akk_inv else cutlass.BFloat16)
     cu_ct = _ct_cached(cu_seqlens, cutlass.Int32)
     ci_ct = _ct_cached(chunk_indices, cutlass.Int32)
 
@@ -2523,13 +2527,13 @@ def chunk_kda_fwd_intra_sm100_varlen(
             has_bias=has_bias,
             use_safe_gate=safe_gate,
             varlen_pure=varlen_pure,
-            fp32_akk_workspace=pdl_fp32_akk_inv,
+            fp32_akk_workspace=fp32_akk_inv,
         )
         kernel = cute.compile(host_fn, *ct_args)
         _K123_CACHE[("kernel_varlen", cache_key)] = kernel
 
     kernel(*ct_args)
-    if pdl_fp32_akk_inv:
+    if fp32_akk_inv:
         _run_akk_inv_fp32_physical(
             A_kk_workspace,
             A_kk,

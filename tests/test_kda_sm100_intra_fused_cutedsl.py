@@ -66,7 +66,7 @@ def test_fused_intra_and_preprocessed_wu_match_csrc():
         dt_bias=dt_bias,
         safe_gate=True,
         lower_bound=lower_bound,
-        pdl_fp32_akk_inv=True,
+        fp32_akk_inv=True,
     )
     w, u = recompute_w_u_from_preprocessed(k_scaled, k, beta, Akk)
 
@@ -80,6 +80,7 @@ def test_fused_intra_and_preprocessed_wu_match_csrc():
     lower = (col[None, :] <= row[:, None]).view(1, seqlen, 1, chunk_size).expand_as(Akk)
     torch.testing.assert_close(Aqk[lower], Aqk_ref[lower], rtol=1e-2, atol=2e-3)
     torch.testing.assert_close(Akk[lower], Akk_ref[lower], rtol=1e-2, atol=2e-3)
+    torch.testing.assert_close(Aqk[~lower], torch.zeros_like(Aqk[~lower]), rtol=0, atol=0)
     torch.testing.assert_close(Akk[~lower], torch.zeros_like(Akk[~lower]), rtol=0, atol=0)
     torch.testing.assert_close(w, w_ref, rtol=1e-2, atol=2e-3)
     torch.testing.assert_close(u, u_ref, rtol=1e-2, atol=2e-3)
