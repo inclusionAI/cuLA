@@ -981,16 +981,17 @@ class KDARecomputeWU:
                 beta_gmem_p,
                 cute.make_layout((self.BT,), stride=(beta_stride,)),
             )
-            beta_load_idx = local_tidx % self.BT
-            if cutlass.const_expr(self.is_varlen):
-                safe_idx = cutlass.select_(beta_load_idx < remaining, beta_load_idx, Int32(0))
-                sBeta[beta_load_idx] = cutlass.select_(
-                    beta_load_idx < remaining,
-                    beta_gmem[safe_idx],
-                    self.beta_dtype(0.0),
-                )
-            else:
-                sBeta[beta_load_idx] = beta_gmem[beta_load_idx]
+            beta_load_idx = local_tidx
+            if beta_load_idx < self.BT:
+                if cutlass.const_expr(self.is_varlen):
+                    safe_idx = cutlass.select_(beta_load_idx < remaining, beta_load_idx, Int32(0))
+                    sBeta[beta_load_idx] = cutlass.select_(
+                        beta_load_idx < remaining,
+                        beta_gmem[safe_idx],
+                        self.beta_dtype(0.0),
+                    )
+                else:
+                    sBeta[beta_load_idx] = beta_gmem[beta_load_idx]
             cuda_sync.arrive_and_wait()
 
             for i_kv in cutlass.range(0, self.NK):
