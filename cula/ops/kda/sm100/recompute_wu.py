@@ -392,6 +392,12 @@ class KDARecomputeWU:
         )
 
         # ---------- SharedStorage ----------
+        gk_elems = cute.cosize(gk_epi_staged)
+        store_elems_as_fp32 = (cute.cosize(store_epi_staged) * (self.io_dtype.width // 8) + self.acc_dtype.width // 8 - 1) // (
+            self.acc_dtype.width // 8
+        )
+        alias_elems = max(gk_elems, store_elems_as_fp32)
+
         @cute.struct
         class SharedStorage:
             load_A_mbar: cute.struct.MemRange[Int64, self.a_stage * 2]
@@ -412,12 +418,8 @@ class KDARecomputeWU:
                 cute.struct.MemRange[self.io_dtype, cute.cosize(v_epi_staged)],
                 self.buffer_align_bytes,
             ]
-            sGK: cute.struct.Align[
-                cute.struct.MemRange[self.acc_dtype, cute.cosize(gk_epi_staged)],
-                self.buffer_align_bytes,
-            ]
-            sStore: cute.struct.Align[
-                cute.struct.MemRange[self.io_dtype, cute.cosize(store_epi_staged)],
+            sGKStore: cute.struct.Align[
+                cute.struct.MemRange[self.acc_dtype, alias_elems],
                 self.buffer_align_bytes,
             ]
             sBeta: cute.struct.Align[
@@ -566,8 +568,11 @@ class KDARecomputeWU:
         sA = storage.sA.get_tensor(a_smem_staged.outer, swizzle=a_smem_staged.inner)
         sK = storage.sK.get_tensor(k_epi_staged.outer, swizzle=k_epi_staged.inner)
         sV = storage.sV.get_tensor(v_epi_staged.outer, swizzle=v_epi_staged.inner)
-        sGK = storage.sGK.get_tensor(gk_epi_staged.outer, swizzle=gk_epi_staged.inner)
-        sStore = storage.sStore.get_tensor(store_epi_staged.outer, swizzle=store_epi_staged.inner)
+        sGK = storage.sGKStore.get_tensor(gk_epi_staged.outer, swizzle=gk_epi_staged.inner)
+        sStore = cute.make_tensor(
+            cute.recast_ptr(storage.sGKStore.data_ptr(), store_epi_staged.inner, dtype=self.io_dtype),
+            store_epi_staged.outer,
+        )
         sBeta = cute.make_tensor(
             cute.make_ptr(self.beta_dtype, storage.sBeta.data_ptr().toint(), cute.AddressSpace.smem),
             cute.make_layout((self.BT,), stride=(1,)),
@@ -610,6 +615,7 @@ class KDARecomputeWU:
             consumer_group=_make_coop_group(self.threads_per_warp),
             barrier_storage=storage.store_ready_mbar.data_ptr(),
         ).make_participants()
+        store_load_sync = pipeline.NamedBarrier(barrier_id=3, num_threads=2 * self.threads_per_warp)
 
         # ---------- TMEM ----------
         tmem_alloc_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=self.threads_per_cta)
@@ -640,6 +646,8 @@ class KDARecomputeWU:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
             for wu_iter in cutlass.range(num_iters, unroll=1):
+                if wu_iter > 0:
+                    store_load_sync.arrive_and_wait()
                 work_idx = block_idx_x + wu_iter * grid_dim_x
                 i_t, i_h, i_b, tok_offset, data_bidx, remaining = self._decode_work(
                     work_idx, total_nt, problem_size, cu_seqlens, chunk_indices
@@ -794,6 +802,8 @@ class KDARecomputeWU:
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
                         sh_u.release()
+                    if wu_iter + 1 < num_iters:
+                        store_load_sync.arrive_and_wait()
 
         # =====================================================================
         # EMPTY WARP -- idle
