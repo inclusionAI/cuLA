@@ -41,10 +41,12 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import Int32, Int64
 from fla.ops.utils import prepare_chunk_indices
 
 from cula.ops.ptx import reinterpret_cast, store_256b, subvec
+from cula.ops.sm100.ptx import tcgen05_fence_after, tcgen05_fence_before, tcgen05_ld_32x32b
 from cula.utils import USE_FAST_MATH, assert_blackwell
 
 
@@ -70,6 +72,7 @@ class KDARecomputeWU:
         use_fast_math: bool = True,
     ):
         assert K == 128 and V == 128, f"K and V must both be 128, got K={K}, V={V}"
+        assert not direct_store or preprocessed_k, "direct stores require the preprocessed-k specialization"
         assert_blackwell()
         self.use_fast_math = use_fast_math
         self.K = K
@@ -1075,13 +1078,6 @@ class KDARecomputeWU:
                                 cute.autovec_copy(tOsKg[None, m1, None], r2g_row_frag)
                                 cute.autovec_copy(r2g_row_frag, tOgKg[None, m1, None])
                     cuda_sync.arrive_and_wait()
-                elif cutlass.const_expr(self.direct_store):
-                    kg_i32 = reinterpret_cast(tTR_rKg.load(), self.io_dtype, direct_num_values, Int32)
-                    kg_addr = (
-                        kg_ptr + (i_b * T + i_t * BT + direct_row) * H * K + i_h * K + i_kv * self.BK + direct_col
-                    ).toint()
-                    for store_idx in cutlass.range_constexpr(direct_num_stores):
-                        store_256b(kg_addr + store_idx * 32, subvec(kg_i32, store_idx * 8, 8))
                 else:
                     # === Non-varlen: scatter to sStore → signal store warp ===
                     sh_kg = store_ready_P.acquire_and_advance()
@@ -1092,7 +1088,12 @@ class KDARecomputeWU:
 
                 # Now read K result from acc (MMA V can run on acc[1] concurrently)
                 acc_h = acc_done_C.wait_and_advance()
-                cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, acc_h.index)], tTR_rAcc)
+                if cutlass.const_expr(self.direct_store):
+                    tcgen05_fence_after()
+                    direct_acc_i32 = tcgen05_ld_32x32b(direct_num_values, acc_h.index * self.BN)
+                    tcgen05_fence_before()
+                else:
+                    cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, acc_h.index)], tTR_rAcc)
                 cute.arch.fence_view_async_tmem_load()
                 acc_h.release()
 
@@ -1116,7 +1117,13 @@ class KDARecomputeWU:
                                 cute.autovec_copy(r2g_row_frag, tOgW[None, m1, None])
                     cuda_sync.arrive_and_wait()
                 elif cutlass.const_expr(self.direct_store):
-                    tTR_rBproc.store(tTR_rAcc.load().to(self.io_dtype))
+                    direct_acc_f32 = reinterpret_cast(
+                        direct_acc_i32,
+                        Int32,
+                        direct_num_values,
+                        self.acc_dtype,
+                    )
+                    tTR_rBproc.store(TensorSSA(direct_acc_f32, (direct_num_values,), self.acc_dtype).to(self.io_dtype))
                     w_i32 = reinterpret_cast(tTR_rBproc.load(), self.io_dtype, direct_num_values, Int32)
                     w_addr = (
                         w_ptr + (i_b * T + i_t * BT + direct_row) * H * K + i_h * K + i_kv * self.BK + direct_col
@@ -1134,7 +1141,12 @@ class KDARecomputeWU:
 
                 # === V MMA done ===
                 acc_h2 = acc_done_C.wait_and_advance()
-                cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, acc_h2.index)], tTR_rAcc)
+                if cutlass.const_expr(self.direct_store):
+                    tcgen05_fence_after()
+                    direct_acc_i32 = tcgen05_ld_32x32b(direct_num_values, acc_h2.index * self.BN)
+                    tcgen05_fence_before()
+                else:
+                    cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, acc_h2.index)], tTR_rAcc)
                 cute.arch.fence_view_async_tmem_load()
                 acc_h2.release()
 
@@ -1157,7 +1169,13 @@ class KDARecomputeWU:
                                 cute.autovec_copy(tOsU[None, m1, None], r2g_row_frag)
                                 cute.autovec_copy(r2g_row_frag, tOgU[None, m1, None])
                 elif cutlass.const_expr(self.direct_store):
-                    tTR_rBproc.store(tTR_rAcc.load().to(self.io_dtype))
+                    direct_acc_f32 = reinterpret_cast(
+                        direct_acc_i32,
+                        Int32,
+                        direct_num_values,
+                        self.acc_dtype,
+                    )
+                    tTR_rBproc.store(TensorSSA(direct_acc_f32, (direct_num_values,), self.acc_dtype).to(self.io_dtype))
                     u_i32 = reinterpret_cast(tTR_rBproc.load(), self.io_dtype, direct_num_values, Int32)
                     u_addr = (
                         u_ptr + (i_b * T + i_t * BT + direct_row) * H * V + i_h * V + i_kv * self.BV + direct_col
@@ -1321,7 +1339,6 @@ def recompute_w_u_fwd(
     chunk_indices=None,
     block_k=None,
     block_v=None,
-    direct_store=False,
 ):
     is_varlen = cu_seqlens is not None
     packed_4d = is_varlen and k.dim() == 4
@@ -1364,7 +1381,6 @@ def recompute_w_u_fwd(
                 gk_4d,
                 block_k=block_k,
                 block_v=block_v,
-                direct_store=direct_store,
             )
             return w_4d.squeeze(0), u_4d.squeeze(0), None, kg_4d.squeeze(0)
 
@@ -1404,7 +1420,6 @@ def recompute_w_u_fwd(
         block_v=block_v,
         is_varlen=is_varlen,
         beta_dtype=cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16,
-        direct_store=direct_store,
     )
 
     compiled_fn(k, v, beta, A, gk, w, u, kg, cu_s, ci_s, ps, Int32(total_nt))
