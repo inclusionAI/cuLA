@@ -253,6 +253,13 @@ class KDARecomputeWU:
             self.io_dtype,
             self.bproc_stage,
         )
+        b_epi_staged = sm100_utils.make_smem_layout_epi(
+            self.io_dtype,
+            utils.LayoutEnum.ROW_MAJOR,
+            (self.BT, self.BN),
+            self.bproc_stage,
+        )
+        assert cute.cosize(b_smem_staged) == cute.cosize(b_epi_staged)
 
         # ---------- TMA load op ----------
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
@@ -474,6 +481,7 @@ class KDARecomputeWU:
             tma_tensor_kg,
             a_smem_staged,
             b_smem_staged,
+            b_epi_staged,
             k_epi_staged,
             v_epi_staged,
             gk_epi_staged,
@@ -514,6 +522,7 @@ class KDARecomputeWU:
         tma_tensor_kg: cute.Tensor,
         a_smem_staged: cute.ComposedLayout,
         b_smem_staged: cute.ComposedLayout,
+        b_epi_staged: cute.ComposedLayout,
         k_epi_staged: cute.ComposedLayout,
         v_epi_staged: cute.ComposedLayout,
         gk_epi_staged: cute.ComposedLayout,
@@ -570,6 +579,7 @@ class KDARecomputeWU:
         storage = smem.allocate(self.shared_storage)
         sA = storage.sA.get_tensor(a_smem_staged.outer, swizzle=a_smem_staged.inner)
         sB = storage.sB.get_tensor(b_smem_staged.outer, swizzle=b_smem_staged.inner)
+        sBTime = storage.sB.get_tensor(b_epi_staged.outer, swizzle=b_epi_staged.inner)
         sK = storage.sK.get_tensor(k_epi_staged.outer, swizzle=k_epi_staged.inner)
         sV = storage.sV.get_tensor(v_epi_staged.outer, swizzle=v_epi_staged.inner)
         # sGK and sStore alias the same memory (non-overlapping lifetimes)
@@ -999,13 +1009,7 @@ class KDARecomputeWU:
                 bproc_h = bproc_P.acquire_and_advance()
                 for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
                     m_coord, n_coord = tTR_cM[ei]
-                    b_coord = (
-                        ((n_coord % 64, n_coord // 64), m_coord % 16),
-                        Int32(0),
-                        m_coord // 16,
-                        bproc_h.index,
-                    )
-                    sB[b_coord] = tTR_rBproc[ei]
+                    sBTime[(m_coord, n_coord, bproc_h.index)] = tTR_rBproc[ei]
                 cute.arch.fence_proxy("async.shared", space="cta")
                 bproc_h.commit()
 
@@ -1025,13 +1029,7 @@ class KDARecomputeWU:
                 bproc_h2 = bproc_P.acquire_and_advance()
                 for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
                     m_coord, n_coord = tTR_cM[ei]
-                    b_coord = (
-                        ((n_coord % 64, n_coord // 64), m_coord % 16),
-                        Int32(0),
-                        m_coord // 16,
-                        bproc_h2.index,
-                    )
-                    sB[b_coord] = tTR_rBproc[ei]
+                    sBTime[(m_coord, n_coord, bproc_h2.index)] = tTR_rBproc[ei]
                 cute.arch.fence_proxy("async.shared", space="cta")
                 bproc_h2.commit()
 
