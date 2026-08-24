@@ -217,6 +217,9 @@ def akk_inv_fp32_physical_kernel(
         sOutRow = sAkk[row, None]
         sOutVec = cute.local_tile(sOutRow, (8,), (vec_idx,))
         cute.autovec_copy(sOutVec, rOutFp32)
+        for elem in cutlass.range_constexpr(8):
+            if row < vec_idx * 8 + elem:
+                rOutFp32[elem] = cutlass.Float32(0.0)
         rOutBf16.store(rOutFp32.load().to(cutlass.BFloat16))
         if IS_VARLEN:
             if t_row < eos:
