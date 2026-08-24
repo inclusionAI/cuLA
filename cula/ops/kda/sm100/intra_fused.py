@@ -2308,7 +2308,6 @@ def chunk_kda_fwd_intra_sm100_equal(
     lower_bound: float | None = None,
     chunk_size: int = BT,
     pdl_fp32_akk_inv: bool = False,
-    fp32_akk_workspace_only: bool = False,
 ):
     """Launch FlashInfer fused K1+K2+K3 kernel for equal-length sequences."""
     if chunk_size != BT:
@@ -2330,17 +2329,14 @@ def chunk_kda_fwd_intra_sm100_equal(
         scale = K_DIM**-0.5
     if safe_gate and lower_bound is None:
         lower_bound = -5.0
-    if pdl_fp32_akk_inv and fp32_akk_workspace_only:
-        raise ValueError("select either standalone inverse or deferred fused inverse")
 
     NT = T_total // BT
     dev = q.device.index if q.device.index is not None else 0
     has_bias = dt_bias is not None
-    use_fp32_workspace = pdl_fp32_akk_inv or fp32_akk_workspace_only
-    cache_key = (dev, B, NT, H, has_bias, safe_gate, use_fp32_workspace)
+    cache_key = (dev, B, NT, H, has_bias, safe_gate, pdl_fp32_akk_inv)
 
     k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk = _get_out_buffers_equal(q.device, B, T_total, H)
-    A_kk_workspace = _get_akk_fp32_workspace_equal(q.device, B, T_total, H) if use_fp32_workspace else A_kk
+    A_kk_workspace = _get_akk_fp32_workspace_equal(q.device, B, T_total, H) if pdl_fp32_akk_inv else A_kk
 
     q_ct = _ct_cached(q, cutlass.BFloat16)
     k_ct = _ct_cached(k, cutlass.BFloat16)
@@ -2352,7 +2348,7 @@ def chunk_kda_fwd_intra_sm100_equal(
     qs_ct = _ct_cached(q_scaled, cutlass.BFloat16)
     gk_ct = _ct_cached(gk_last_exp, cutlass.Float32)
     aqk_ct = _ct_cached(A_qk, cutlass.BFloat16)
-    akk_ct = _ct_cached(A_kk_workspace, cutlass.Float32 if use_fp32_workspace else cutlass.BFloat16)
+    akk_ct = _ct_cached(A_kk_workspace, cutlass.Float32 if pdl_fp32_akk_inv else cutlass.BFloat16)
     cu_ct, ci_ct = _get_eqlen_dummies(q.device)
 
     if has_bias:
@@ -2392,7 +2388,7 @@ def chunk_kda_fwd_intra_sm100_equal(
             is_varlen=False,
             has_bias=has_bias,
             use_safe_gate=safe_gate,
-            fp32_akk_workspace=use_fp32_workspace,
+            fp32_akk_workspace=pdl_fp32_akk_inv,
         )
         kernel = cute.compile(host_fn, *ct_args)
         _K123_CACHE[("kernel", cache_key)] = kernel
@@ -2410,8 +2406,6 @@ def chunk_kda_fwd_intra_sm100_equal(
             is_varlen=False,
             T_val=T_total,
         )
-    if fp32_akk_workspace_only:
-        A_kk = A_kk_workspace
     return k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk
 
 
