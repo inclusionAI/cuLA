@@ -122,10 +122,10 @@ AKK_STRIDE = BT + AKK_PAD  # 68 (padded, bank-conflict-free for MMA)
 G_ROW_STRIDE_BF16 = K_DIM  # 128 bf16 per row
 G_STAGE_STRIDE_BF16 = BT * K_DIM  # 8192 bf16 per stage (one stage = BT*K_DIM)
 
-K1_ROW_GROUPS = 16
-K1_COL_GROUPS = 1
-ROWS_PER_K1_WARP = BT // K1_ROW_GROUPS  # 4
-K1_COLS_PER_WARP = K_DIM // K1_COL_GROUPS  # 128
+K1_ROW_GROUPS = 8
+K1_COL_GROUPS = 2
+ROWS_PER_K1_WARP = BT // K1_ROW_GROUPS  # 8
+K1_COLS_PER_WARP = K_DIM // K1_COL_GROUPS  # 64
 ROWS_PER_STORE_WARP = BT // NUM_STORE_WARPS  # 16
 
 VEC = K1_COLS_PER_WARP // 32  # 2
@@ -279,7 +279,7 @@ def mma_tf32_m16n8k8(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=Non
     return d0, d1, d2, d3
 
 
-SHFL_ROW_GROUP_CLAMP = 0x1000
+SHFL_W8_CLAMP = 0x1800
 
 
 @dsl_user_op
@@ -1103,11 +1103,11 @@ def fused_kernel123(
             col_base = warp_col_group * K1_COLS_PER_WARP + _lane * VEC
             col_vec_idx = warp_col_group * (K1_COLS_PER_WARP // VEC) + _lane
             cumsum_scale = cutlass.Float32(RCP_LN2)
+            thr_copy_k1 = tiled_copy_qk_k1.get_slice(_lane)
+
             rAcc = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float32)
             rPrefix = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float32)
             rGkLast = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float32)
-            rKIn = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
-            rQIn = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
             rKsOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
             rQsOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
             rKgOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
@@ -1197,23 +1197,19 @@ def fused_kernel123(
 
                 prefix_col_start = k1_warp * PARTIAL_COLS_PER_WARP
                 row_in_prefix = lane_id % K1_ROW_GROUPS
-                prefix_cols_per_lane_group = 32 // K1_ROW_GROUPS
                 col_in_group = lane_id // K1_ROW_GROUPS
 
-                for j in cutlass.range_constexpr(PARTIAL_COLS_PER_WARP // prefix_cols_per_lane_group):
-                    col = prefix_col_start + j * prefix_cols_per_lane_group + col_in_group
+                for j in cutlass.range_constexpr(PARTIAL_COLS_PER_WARP // 4):
+                    col = prefix_col_start + j * 4 + col_in_group
                     val = cutlass.Float32(sPartialLast[row_in_prefix, col])
-                    tmp = cute.arch.shuffle_sync_up(val, 1, mask=-1, mask_and_clamp=SHFL_ROW_GROUP_CLAMP)
+                    tmp = cute.arch.shuffle_sync_up(val, 1, mask=-1, mask_and_clamp=SHFL_W8_CLAMP)
                     if row_in_prefix >= 1:
                         val = val + tmp
-                    tmp = cute.arch.shuffle_sync_up(val, 2, mask=-1, mask_and_clamp=SHFL_ROW_GROUP_CLAMP)
+                    tmp = cute.arch.shuffle_sync_up(val, 2, mask=-1, mask_and_clamp=SHFL_W8_CLAMP)
                     if row_in_prefix >= 2:
                         val = val + tmp
-                    tmp = cute.arch.shuffle_sync_up(val, 4, mask=-1, mask_and_clamp=SHFL_ROW_GROUP_CLAMP)
+                    tmp = cute.arch.shuffle_sync_up(val, 4, mask=-1, mask_and_clamp=SHFL_W8_CLAMP)
                     if row_in_prefix >= 4:
-                        val = val + tmp
-                    tmp = cute.arch.shuffle_sync_up(val, 8, mask=-1, mask_and_clamp=SHFL_ROW_GROUP_CLAMP)
-                    if row_in_prefix >= 8:
                         val = val + tmp
                     sPartialLast[row_in_prefix, col] = val
 
@@ -1249,13 +1245,15 @@ def fused_kernel123(
                     row = k1_row_start + ri
                     t = chunk_start + row
 
-                    sKRow = csK[row, None]
-                    sKVec = cute.local_tile(sKRow, (VEC,), (col_base // VEC,))
-                    cute.autovec_copy(sKVec, rKIn)
+                    sK_tile = cute.local_tile(csK, tiler=(1, K1_COLS_PER_WARP), coord=(row, warp_col_group))
+                    tCsK = thr_copy_k1.partition_S(sK_tile)
+                    tCrK = cute.make_fragment_like(tCsK)
+                    cute.copy(tiled_copy_qk_k1, tCsK, thr_copy_k1.retile(tCrK))
 
-                    sQRow = csQ[row, None]
-                    sQVec = cute.local_tile(sQRow, (VEC,), (col_base // VEC,))
-                    cute.autovec_copy(sQVec, rQIn)
+                    sQ_tile = cute.local_tile(csQ, tiler=(1, K1_COLS_PER_WARP), coord=(row, warp_col_group))
+                    tCsQ = thr_copy_k1.partition_S(sQ_tile)
+                    tCrQ = cute.make_fragment_like(tCsQ)
+                    cute.copy(tiled_copy_qk_k1, tCsQ, thr_copy_k1.retile(tCrQ))
 
                     # Read beta from SMEM (staged once per chunk by warp 0).
                     beta_val = cutlass.Float32(csBeta[row])
@@ -1264,8 +1262,8 @@ def fused_kernel123(
                         rAcc[vi] = rAcc[vi] + rGact[ri, vi]
                         cs = rAcc[vi] * cumsum_scale
 
-                        k_val = rKIn[vi].to(cutlass.Float32)
-                        q_val = rQIn[vi].to(cutlass.Float32)
+                        k_val = tCrK[vi].to(cutlass.Float32)
+                        q_val = tCrQ[vi].to(cutlass.Float32)
 
                         exp2_cs = cute.exp2(cs, fastmath=True)
                         gk_last_cs = rGkLast[vi] * cumsum_scale
