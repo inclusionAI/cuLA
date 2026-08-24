@@ -1848,11 +1848,15 @@ def fused_kernel123(
                                 rAkkOut[1] = csAkk[local_row, col_hi].to(cutlass.BFloat16)
                                 cute.autovec_copy(rAkkOut, mAkk_v2[i_b, abs_row, i_h, col_vec_idx, None])
                 else:
-                    # PURE: per-tile loop over 10 lower-tri sub-tiles, reading
-                    # row-major sAqk/sAkk. MMA writes 16x16 unconditional so we
-                    # must apply causal+diag mask in store. Each warp handles
-                    # BC/4=4 rows per sub-tile, lanes 0..15 write 1 bf16 each.
-                    # Original baseline behavior — no MMA-write overhead.
+                    # PURE: keep the reduced lower-tile bandwidth, but store
+                    # each 16-column row as two vec8 segments. Eight lanes per
+                    # warp cover four rows, reducing the scalar epilogue's
+                    # instruction count without writing the upper six tiles.
+                    rAqkVec = cute.make_rmem_tensor((8,), cutlass.BFloat16)
+                    if cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
+                        rAkkFp32Vec = cute.make_rmem_tensor((8,), cutlass.Float32)
+                    else:
+                        rAkkVec = cute.make_rmem_tensor((8,), cutlass.BFloat16)
                     for tile_idx in cutlass.range_constexpr(NUM_TILES):
                         i_q = _TILE_IQ[tile_idx]
                         i_k = _TILE_IK[tile_idx]
@@ -1865,32 +1869,44 @@ def fused_kernel123(
                         smem_aqk_col_base = i_k * BC
                         smem_akk_row_base = i_k * BC
                         smem_akk_col_base = i_q * BC
-                        for ri in cutlass.range_constexpr(BC // NUM_STORE_WARPS):
-                            local_row = store_warp * (BC // NUM_STORE_WARPS) + ri
-                            if lane_id < BC:
-                                local_col = lane_id
-                                aqk_val = csAqk[smem_aqk_row_base + local_row, smem_aqk_col_base + local_col]
+                        if lane_id < 2 * (BC // NUM_STORE_WARPS):
+                            local_row = store_warp * (BC // NUM_STORE_WARPS) + lane_id // 2
+                            vec_idx = lane_id % 2
+                            for elem in cutlass.range_constexpr(8):
+                                local_col = vec_idx * 8 + elem
+                                aqk_val = csAqk[
+                                    smem_aqk_row_base + local_row,
+                                    smem_aqk_col_base + local_col,
+                                ]
                                 if is_diag and local_row < local_col:
                                     aqk_val = cutlass.BFloat16(0.0)
-                                mAqk[i_b, gmem_aqk_row_base + local_row, i_h, gmem_aqk_col_base + local_col] = aqk_val
+                                rAqkVec[elem] = aqk_val
+
+                                akk_val = cutlass.Float32(
+                                    csAkk[
+                                        smem_akk_row_base + local_row,
+                                        smem_akk_col_base + local_col,
+                                    ]
+                                )
+                                if is_diag and local_row < local_col:
+                                    akk_val = cutlass.Float32(0.0)
+                                if is_diag and local_row == local_col:
+                                    akk_val = cutlass.Float32(1.0)
                                 if cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
-                                    akk_val = cutlass.Float32(
-                                        csAkk[smem_akk_row_base + local_row, smem_akk_col_base + local_col]
-                                    )
-                                    if is_diag and local_row < local_col:
-                                        akk_val = cutlass.Float32(0.0)
-                                    if is_diag and local_row == local_col:
-                                        akk_val = cutlass.Float32(1.0)
-                                    mAkk[i_b, gmem_akk_row_base + local_row, i_h, gmem_akk_col_base + local_col] = akk_val
+                                    rAkkFp32Vec[elem] = akk_val
                                 else:
-                                    akk_val = csAkk[smem_akk_row_base + local_row, smem_akk_col_base + local_col].to(
-                                        cutlass.BFloat16
-                                    )  # FP32 -> BF16
-                                    if is_diag and local_row < local_col:
-                                        akk_val = cutlass.BFloat16(0.0)
-                                    if is_diag and local_row == local_col:
-                                        akk_val = cutlass.BFloat16(1.0)
-                                    mAkk[i_b, gmem_akk_row_base + local_row, i_h, gmem_akk_col_base + local_col] = akk_val
+                                    rAkkVec[elem] = akk_val.to(cutlass.BFloat16)
+
+                            aqk_row = mAqk[i_b, gmem_aqk_row_base + local_row, i_h, None]
+                            aqk_vec = cute.local_tile(aqk_row, (8,), (2 * i_k + vec_idx,))
+                            cute.autovec_copy(rAqkVec, aqk_vec)
+
+                            akk_row = mAkk[i_b, gmem_akk_row_base + local_row, i_h, None]
+                            akk_vec = cute.local_tile(akk_row, (8,), (2 * i_q + vec_idx,))
+                            if cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
+                                cute.autovec_copy(rAkkFp32Vec, akk_vec)
+                            else:
+                                cute.autovec_copy(rAkkVec, akk_vec)
 
                 cute.arch.mbarrier_arrive(store_done_mbars + s)
 
