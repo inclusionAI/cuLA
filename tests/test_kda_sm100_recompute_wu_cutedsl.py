@@ -1,9 +1,14 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
+import pathlib
+import sys
+
 import pytest
 import torch
 from fla.ops.utils import prepare_chunk_indices
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import cula.cudac as cula_cuda
 from cula.ops.kda.sm100.recompute_wu import recompute_w_u_fwd
