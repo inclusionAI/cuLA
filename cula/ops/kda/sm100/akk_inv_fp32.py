@@ -81,6 +81,16 @@ def akk_inv_fp32_physical_kernel(
     # positions, while values inside each tile remain row-contiguous. Two
     # groups of 64 threads load two tiles per iteration as float4 vectors.
     rNorm = cute.make_rmem_tensor((4,), cutlass.Float32)
+    rNorm.fill(cutlass.Float32(0.0))
+    for zero_iter in cutlass.range_constexpr((BS * BS) // (THREADS * 4)):
+        zero_linear_vec = tidx + zero_iter * THREADS
+        zero_row = zero_linear_vec // (BS // 4)
+        zero_vec = zero_linear_vec % (BS // 4)
+        sZeroRow = sAkk[zero_row, None]
+        sZeroVec = cute.local_tile(sZeroRow, (4,), (zero_vec,))
+        cute.autovec_copy(rNorm, sZeroVec)
+    cute.arch.barrier()
+
     tile_slot = tidx // 64
     tile_thread = tidx % 64
     tile_row = tile_thread // 4
