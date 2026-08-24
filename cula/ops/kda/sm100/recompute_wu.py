@@ -101,7 +101,7 @@ class KDARecomputeWU:
         self.buffer_align_bytes = 1024
 
         self.bproc_stage = 1
-        self.acc_stage = 1
+        self.acc_stage = 2
         self.store_stage = 2
 
         # occ=2 resource budget. SS MMA keeps only the accumulator in TMEM;
