@@ -995,6 +995,10 @@ def fused_kernel123(
     akk_tile_layout = cute.make_layout((BT, AKK_STRIDE, NUM_STAGES), stride=(AKK_STRIDE, 1, BT * AKK_STRIDE))
     sAkk = smem.allocate_tensor(cutlass.Float32, akk_tile_layout, 128)
 
+    # K1 loads each beta value once; all ten MMA tile warps reuse it.
+    beta_smem_layout = cute.make_layout((BT, NUM_STAGES), stride=(1, BT))
+    sBeta = smem.allocate_tensor(cutlass.BFloat16, beta_smem_layout, 128)
+
     # =====================================================================
     # Mbarrier allocation & init
     # =====================================================================
@@ -1149,6 +1153,13 @@ def fused_kernel123(
                 csGcum = sGcum[(None, None, cur_stage)]
                 csQ = sQ[(None, None, cur_stage)]
                 csK = sK[(None, None, cur_stage)]
+                csBeta = sBeta[(None, cur_stage)]
+
+                if k1_warp == 0:
+                    for beta_iter in cutlass.range_constexpr(BT // 32):
+                        beta_row = beta_iter * 32 + _lane
+                        csBeta[beta_row] = mBeta[i_b, chunk_start + beta_row, i_h]
+
                 rGact = cute.make_rmem_tensor(cute.make_layout((ROWS_PER_K1_WARP, VEC)), cutlass.Float32)
                 for vi in cutlass.range_constexpr(VEC):
                     rAcc[vi] = cutlass.Float32(0.0)
@@ -1420,11 +1431,12 @@ def fused_kernel123(
                     csGcum = sGcum[(None, None, s)]
                     csAqk = sAqk[(None, None, s)]
                     csAkk = sAkk[(None, None, s)]
+                    csBeta = sBeta[(None, s)]
 
                     _z = cutlass.Float32(0.0)
 
-                    beta_row0 = mBeta[i_b, chunk_start + q_row_base + row0, i_h].to(cutlass.Float32)
-                    beta_row1 = mBeta[i_b, chunk_start + q_row_base + row1, i_h].to(cutlass.Float32)
+                    beta_row0 = csBeta[q_row_base + row0].to(cutlass.Float32)
+                    beta_row1 = csBeta[q_row_base + row1].to(cutlass.Float32)
 
                     acc_aqk_n0_0, acc_aqk_n0_1, acc_aqk_n0_2, acc_aqk_n0_3 = _z, _z, _z, _z
                     acc_aqk_n1_0, acc_aqk_n1_1, acc_aqk_n1_2, acc_aqk_n1_3 = _z, _z, _z, _z
@@ -2041,6 +2053,7 @@ def make_host_function(
             + BT * K_STRIDE * 4 * NUM_STAGES  # G cumsum fp32: 69,632 B
             + K1_ROW_GROUPS * PARTIAL_COLS * 4  # K1 partial prefix: 4,224 B
             + BT * AQK_TILE_STRIDE * 2 * NUM_STAGES  # sAqk bf16: 18,432 B
+            + BT * NUM_STAGES * 2  # Beta bf16: 256 B
             + 5 * NUM_STAGES * 8  # Barriers: 80 B
             + BT * K_DIM * 2 * NUM_STAGES  # sG bf16 independent allocation
         )
