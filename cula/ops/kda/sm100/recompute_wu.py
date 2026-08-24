@@ -905,17 +905,11 @@ class KDARecomputeWU:
             thr_r2s_b = tiled_r2s_b.get_slice(local_tidx)
             tRS_sB = thr_r2s_b.partition_D(sBTime)
             tRS_sStore = thr_r2s_b.partition_D(sStore)
-            tTR_sK = thr_t2r.partition_D(sK)
-            tTR_sV = thr_t2r.partition_D(sV)
-            tTR_sGK = thr_t2r.partition_D(sGK)
 
             # Rmem tensors (hoisted outside WU loop to minimise register lifetime)
             tTR_rAcc = cute.make_rmem_tensor(tTR_sOut.shape, self.acc_dtype)
             tTR_rBproc = cute.make_rmem_tensor(tTR_sOut.shape, self.io_dtype)
             tTR_rKg = cute.make_rmem_tensor(tTR_sOut.shape, self.io_dtype)
-            tTR_rK = cute.make_rmem_tensor(tTR_sOut.shape, self.io_dtype)
-            tTR_rV = cute.make_rmem_tensor(tTR_sOut.shape, self.io_dtype)
-            tTR_rGK = cute.make_rmem_tensor(tTR_sOut.shape, self.acc_dtype)
 
             cuda_sync = pipeline.NamedBarrier(barrier_id=2, num_threads=self.num_cuda_threads)
 
@@ -1002,26 +996,22 @@ class KDARecomputeWU:
             for i_kv in cutlass.range(0, self.NK):
                 # ==== K pass: compute k*beta*exp2(gk) + kg ====
                 kgk_h = load_kgk_C.wait_and_advance()
-                cute.autovec_copy(tTR_sK[(None, None, None, kgk_h.index)], tTR_rK)
-                cute.autovec_copy(tTR_sV[(None, None, None, kgk_h.index)], tTR_rV)
-                if cutlass.const_expr(not self.preprocessed_k):
-                    cute.autovec_copy(tTR_sGK[(None, None, None, kgk_h.index)], tTR_rGK)
 
                 for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                     m_coord, n_coord = tTR_cM[ei]
-                    k_val = tTR_rK[ei].to(self.acc_dtype)
+                    k_val = sK[(m_coord, n_coord, kgk_h.index)].to(self.acc_dtype)
                     beta_val = sBeta[m_coord].to(self.acc_dtype)
                     if cutlass.const_expr(self.preprocessed_k):
                         tTR_rBproc[ei] = (k_val * beta_val).to(self.io_dtype)
                     elif cutlass.const_expr(self.is_varlen):
-                        gk_val = tTR_rGK[ei]
+                        gk_val = sGK[(m_coord, n_coord, kgk_h.index)]
                         gn_val = sGK[(remaining - 1, n_coord, kgk_h.index)]
                         bproc_val = (k_val * beta_val * cute.exp2(gk_val)).to(self.io_dtype)
                         kg_val = (k_val * cute.exp2(gn_val - gk_val, fastmath=True)).to(self.io_dtype)
                         tTR_rBproc[ei] = cutlass.select_(m_coord < remaining, bproc_val, self.io_dtype(0.0))
                         tTR_rKg[ei] = cutlass.select_(m_coord < remaining, kg_val, self.io_dtype(0.0))
                     else:
-                        gk_val = tTR_rGK[ei]
+                        gk_val = sGK[(m_coord, n_coord, kgk_h.index)]
                         gn_val = sGK[(self.BT - 1, n_coord, kgk_h.index)]
                         tTR_rBproc[ei] = (k_val * beta_val * cute.exp2(gk_val, fastmath=self.use_fast_math)).to(self.io_dtype)
                         tTR_rKg[ei] = (k_val * cute.exp2(gn_val - gk_val, fastmath=self.use_fast_math)).to(self.io_dtype)
@@ -1036,7 +1026,7 @@ class KDARecomputeWU:
                 # === Overlap with MMA K: precompute V bproc ===
                 for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
                     m_coord, n_coord = tTR_cM[ei]
-                    v_val = tTR_rV[ei].to(self.acc_dtype)
+                    v_val = sV[(m_coord, n_coord, kgk_h.index)].to(self.acc_dtype)
                     beta_val = sBeta[m_coord].to(self.acc_dtype)
                     if cutlass.const_expr(self.is_varlen):
                         bproc_v = (v_val * beta_val).to(self.io_dtype)
