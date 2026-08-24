@@ -753,13 +753,57 @@ class KDARecomputeWU:
                 )
 
         # =====================================================================
-        # STORE WARP — varlen stores are handled by the CUDA warpgroup, while
-        # full chunks are written directly from the T2R fragments.
+        # STORE WARP — TMA S2G for w, u, kg outputs
         # =====================================================================
         elif warp_idx == self.store_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
-            pass
+            if cutlass.const_expr(self.is_varlen):
+                # --- Varlen: CUDA warps handle R2G, store warps idle ---
+                pass
+
+            else:  # non-varlen: always full chunks, TMA S2G only
+                bSG_sW, bSG_gW = self._data_tma_partition(
+                    tma_atom_w_s2g, tma_tensor_w, (self.BT, self.BK), sStore, i_h, data_bidx
+                )
+                bSG_sU, bSG_gU = self._data_tma_partition(
+                    tma_atom_u_s2g, tma_tensor_u, (self.BT, self.BV), sStore, i_h, data_bidx
+                )
+                bSG_sKg, bSG_gKg = self._data_tma_partition(
+                    tma_atom_kg_s2g, tma_tensor_kg, (self.BT, self.BK), sStore, i_h, data_bidx
+                )
+
+                for i_kv in cutlass.range(0, self.NK):
+                    if cutlass.const_expr(self.preprocessed_k):
+                        sh_w = store_ready_C.wait_and_advance()
+                        cute.copy(tma_atom_w_s2g, bSG_sW[None, sh_w.index], bSG_gW[(None, i_t, i_kv)])
+                        cute.arch.cp_async_bulk_commit_group()
+
+                        sh_u = store_ready_C.wait_and_advance()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        sh_w.release()
+                        cute.copy(tma_atom_u_s2g, bSG_sU[None, sh_u.index], bSG_gU[(None, i_t, i_kv)])
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        sh_u.release()
+                    else:
+                        sh_kg = store_ready_C.wait_and_advance()
+                        cute.copy(tma_atom_kg_s2g, bSG_sKg[None, sh_kg.index], bSG_gKg[(None, i_t, i_kv)])
+                        cute.arch.cp_async_bulk_commit_group()
+
+                        sh_w = store_ready_C.wait_and_advance()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        sh_kg.release()
+                        cute.copy(tma_atom_w_s2g, bSG_sW[None, sh_w.index], bSG_gW[(None, i_t, i_kv)])
+                        cute.arch.cp_async_bulk_commit_group()
+
+                        sh_u = store_ready_C.wait_and_advance()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        sh_w.release()
+                        cute.copy(tma_atom_u_s2g, bSG_sU[None, sh_u.index], bSG_gU[(None, i_t, i_kv)])
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        sh_u.release()
 
         # =====================================================================
         # EMPTY WARP -- idle
@@ -906,43 +950,6 @@ class KDARecomputeWU:
                 is_full_chunk = remaining >= Int32(BT)
                 r2g_row_frag = cute.make_fragment_like(r2g_dummy_part[None, 0, None], self.io_dtype)
                 r2g_stage = Int32(0)  # single fixed stage
-            else:
-                # The T2R thread-value layout already assigns contiguous
-                # head-dimension runs to each lane. Preserve that layout in a
-                # transposed GMEM view so the compiler can emit vector stores
-                # without staging through sStore and a TMA store warp.
-                direct_base = ((i_b * T + i_t * BT) * H + i_h) * K
-                direct_stride_t = H * K
-                gW_direct = cute.make_tensor(
-                    cute.make_ptr(
-                        self.io_dtype,
-                        (w_ptr + direct_base).toint(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    ),
-                    cute.make_layout((self.BN, self.BT), stride=(1, direct_stride_t)),
-                )
-                gU_direct = cute.make_tensor(
-                    cute.make_ptr(
-                        self.io_dtype,
-                        (u_ptr + direct_base).toint(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    ),
-                    cute.make_layout((self.BN, self.BT), stride=(1, direct_stride_t)),
-                )
-                gKg_direct = cute.make_tensor(
-                    cute.make_ptr(
-                        self.io_dtype,
-                        (kg_ptr + direct_base).toint(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    ),
-                    cute.make_layout((self.BN, self.BT), stride=(1, direct_stride_t)),
-                )
-                tTR_gW = thr_t2r.partition_D(gW_direct)
-                tTR_gU = thr_t2r.partition_D(gU_direct)
-                tTR_gKg = thr_t2r.partition_D(gKg_direct)
 
             # ====== Single WU pass ======
             # beta is original [B,T,H] → stride=H (saves API transpose cost)
@@ -1044,7 +1051,12 @@ class KDARecomputeWU:
                                 cute.autovec_copy(r2g_row_frag, tOgKg[None, m1, None])
                     cuda_sync.arrive_and_wait()
                 else:
-                    cute.autovec_copy(tTR_rKg, tTR_gKg)
+                    # === Non-varlen: scatter to sStore → signal store warp ===
+                    sh_kg = store_ready_P.acquire_and_advance()
+                    for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
+                        m_coord, k_coord = tTR_cM[ei]
+                        sStore[(k_coord, m_coord, sh_kg.index)] = tTR_rKg[ei]
+                    sh_kg.commit()
 
                 # Now read K result from acc (MMA V can run on acc[1] concurrently)
                 acc_h = acc_done_C.wait_and_advance()
@@ -1071,8 +1083,12 @@ class KDARecomputeWU:
                                 cute.autovec_copy(r2g_row_frag, tOgW[None, m1, None])
                     cuda_sync.arrive_and_wait()
                 else:
-                    tTR_rBproc.store(tTR_rAcc.load().to(self.io_dtype))
-                    cute.autovec_copy(tTR_rBproc, tTR_gW)
+                    # Write w to sStore → signal store warp
+                    sh_w = store_ready_P.acquire_and_advance()
+                    for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
+                        m_coord, n_coord = tTR_cM[ei]
+                        sStore[(n_coord, m_coord, sh_w.index)] = tTR_rAcc[ei].to(self.io_dtype)
+                    sh_w.commit()
 
                 # === V MMA done ===
                 acc_h2 = acc_done_C.wait_and_advance()
@@ -1098,8 +1114,12 @@ class KDARecomputeWU:
                                 cute.autovec_copy(tOsU[None, m1, None], r2g_row_frag)
                                 cute.autovec_copy(r2g_row_frag, tOgU[None, m1, None])
                 else:
-                    tTR_rBproc.store(tTR_rAcc.load().to(self.io_dtype))
-                    cute.autovec_copy(tTR_rBproc, tTR_gU)
+                    # Write u to sStore → signal store warp
+                    sh_u = store_ready_P.acquire_and_advance()
+                    for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
+                        m_coord, n_coord = tTR_cM[ei]
+                        sStore[(n_coord, m_coord, sh_u.index)] = tTR_rAcc[ei].to(self.io_dtype)
+                    sh_u.commit()
 
         # ---------- TMEM cleanup ----------
         tmem.relinquish_alloc_permit()
