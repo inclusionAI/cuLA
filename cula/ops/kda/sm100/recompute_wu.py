@@ -110,8 +110,8 @@ class KDARecomputeWU:
         #   Regs: 65536/(2×256) = 128/thread → CUDA=200, others=56 per warp group
         #   SMEM: ~74KB/CTA × 2 = 148KB < 228KB ✓
         self.min_occupancy = 2
-        self.num_regs_cuda = 224
-        self.num_regs_others = 24
+        self.num_regs_cuda = 216
+        self.num_regs_others = 32
         self.a_stage = 1
         self.kgk_stage = 1
         self.v_tma_stage = 1
@@ -437,6 +437,10 @@ class KDARecomputeWU:
                 cute.struct.MemRange[self.beta_dtype, self.BT + 2],
                 128,
             ]
+            sGnExp: cute.struct.Align[
+                cute.struct.MemRange[self.acc_dtype, self.BK],
+                128,
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -575,6 +579,10 @@ class KDARecomputeWU:
         sBeta = cute.make_tensor(
             cute.make_ptr(self.beta_dtype, storage.sBeta.data_ptr().toint(), cute.AddressSpace.smem),
             cute.make_layout((self.BT,), stride=(1,)),
+        )
+        sGnExp = cute.make_tensor(
+            cute.make_ptr(self.acc_dtype, storage.sGnExp.data_ptr().toint(), cute.AddressSpace.smem),
+            cute.make_layout((self.BK,), stride=(1,)),
         )
 
         # ---------- Pipelines ----------
@@ -984,6 +992,17 @@ class KDARecomputeWU:
                 # ==== K pass: compute k*beta*exp2(gk) + kg ====
                 kgk_h = load_kgk_C.wait_and_advance()
 
+                if cutlass.const_expr(not self.preprocessed_k):
+                    gn_row = self.BT - 1
+                    if cutlass.const_expr(self.is_varlen):
+                        gn_row = remaining - 1
+                    if local_tidx < self.BK:
+                        sGnExp[local_tidx] = cute.exp2(
+                            sGK[(gn_row, local_tidx, kgk_h.index)],
+                            fastmath=self.use_fast_math,
+                        )
+                    cuda_sync.arrive_and_wait()
+
                 for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                     m_coord, k_coord = tTR_cM[ei]
                     k_val = sK[(k_coord, m_coord, kgk_h.index)].to(self.acc_dtype)
@@ -992,17 +1011,17 @@ class KDARecomputeWU:
                         tTR_rBproc[ei] = (k_val * beta_val).to(self.io_dtype)
                     elif cutlass.const_expr(self.is_varlen):
                         gk_val = sGK[(k_coord, m_coord, kgk_h.index)]
-                        gn_val = sGK[(remaining - 1, m_coord, kgk_h.index)]
-                        bproc_val = (k_val * beta_val * cute.exp2(gk_val)).to(self.io_dtype)
-                        kg_val = (k_val * cute.exp2(gn_val - gk_val, fastmath=True)).to(self.io_dtype)
+                        gk_exp = cute.exp2(gk_val, fastmath=True)
+                        bproc_val = (k_val * beta_val * gk_exp).to(self.io_dtype)
+                        kg_val = (k_val * sGnExp[m_coord] / gk_exp).to(self.io_dtype)
                         tTR_rBproc[ei] = cutlass.select_(k_coord < remaining, bproc_val, self.io_dtype(0.0))
                         tTR_rKg[ei] = cutlass.select_(k_coord < remaining, kg_val, self.io_dtype(0.0))
                     else:
                         gk_val = sGK[(k_coord, m_coord, kgk_h.index)]
-                        gn_val = sGK[(self.BT - 1, m_coord, kgk_h.index)]
                         beta_val = sBeta[k_coord].to(self.acc_dtype)
-                        tTR_rBproc[ei] = (k_val * beta_val * cute.exp2(gk_val, fastmath=self.use_fast_math)).to(self.io_dtype)
-                        tTR_rKg[ei] = (k_val * cute.exp2(gn_val - gk_val, fastmath=self.use_fast_math)).to(self.io_dtype)
+                        gk_exp = cute.exp2(gk_val, fastmath=self.use_fast_math)
+                        tTR_rBproc[ei] = (k_val * beta_val * gk_exp).to(self.io_dtype)
+                        tTR_rKg[ei] = (k_val * sGnExp[m_coord] / gk_exp).to(self.io_dtype)
 
                 # R2T K bproc -> TMEM -> signal MMA K start
                 tRT_rBproc.store(tTR_rBproc.load())
