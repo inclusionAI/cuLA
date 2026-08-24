@@ -122,10 +122,10 @@ AKK_STRIDE = BT + AKK_PAD  # 68 (padded, bank-conflict-free for MMA)
 G_ROW_STRIDE_BF16 = K_DIM  # 128 bf16 per row
 G_STAGE_STRIDE_BF16 = BT * K_DIM  # 8192 bf16 per stage (one stage = BT*K_DIM)
 
-K1_ROW_GROUPS = 8
-K1_COL_GROUPS = 2
-ROWS_PER_K1_WARP = BT // K1_ROW_GROUPS  # 8
-K1_COLS_PER_WARP = K_DIM // K1_COL_GROUPS  # 64
+K1_ROW_GROUPS = 16
+K1_COL_GROUPS = 1
+ROWS_PER_K1_WARP = BT // K1_ROW_GROUPS  # 4
+K1_COLS_PER_WARP = K_DIM // K1_COL_GROUPS  # 128
 ROWS_PER_STORE_WARP = BT // NUM_STORE_WARPS  # 16
 
 VEC = K1_COLS_PER_WARP // 32  # 2
@@ -279,7 +279,7 @@ def mma_tf32_m16n8k8(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=Non
     return d0, d1, d2, d3
 
 
-SHFL_W8_CLAMP = 0x1800
+SHFL_ROW_GROUP_CLAMP = 0x1000
 
 
 @dsl_user_op
@@ -1197,19 +1197,23 @@ def fused_kernel123(
 
                 prefix_col_start = k1_warp * PARTIAL_COLS_PER_WARP
                 row_in_prefix = lane_id % K1_ROW_GROUPS
+                prefix_cols_per_lane_group = 32 // K1_ROW_GROUPS
                 col_in_group = lane_id // K1_ROW_GROUPS
 
-                for j in cutlass.range_constexpr(PARTIAL_COLS_PER_WARP // 4):
-                    col = prefix_col_start + j * 4 + col_in_group
+                for j in cutlass.range_constexpr(PARTIAL_COLS_PER_WARP // prefix_cols_per_lane_group):
+                    col = prefix_col_start + j * prefix_cols_per_lane_group + col_in_group
                     val = cutlass.Float32(sPartialLast[row_in_prefix, col])
-                    tmp = cute.arch.shuffle_sync_up(val, 1, mask=-1, mask_and_clamp=SHFL_W8_CLAMP)
+                    tmp = cute.arch.shuffle_sync_up(val, 1, mask=-1, mask_and_clamp=SHFL_ROW_GROUP_CLAMP)
                     if row_in_prefix >= 1:
                         val = val + tmp
-                    tmp = cute.arch.shuffle_sync_up(val, 2, mask=-1, mask_and_clamp=SHFL_W8_CLAMP)
+                    tmp = cute.arch.shuffle_sync_up(val, 2, mask=-1, mask_and_clamp=SHFL_ROW_GROUP_CLAMP)
                     if row_in_prefix >= 2:
                         val = val + tmp
-                    tmp = cute.arch.shuffle_sync_up(val, 4, mask=-1, mask_and_clamp=SHFL_W8_CLAMP)
+                    tmp = cute.arch.shuffle_sync_up(val, 4, mask=-1, mask_and_clamp=SHFL_ROW_GROUP_CLAMP)
                     if row_in_prefix >= 4:
+                        val = val + tmp
+                    tmp = cute.arch.shuffle_sync_up(val, 8, mask=-1, mask_and_clamp=SHFL_ROW_GROUP_CLAMP)
+                    if row_in_prefix >= 8:
                         val = val + tmp
                     sPartialLast[row_in_prefix, col] = val
 
