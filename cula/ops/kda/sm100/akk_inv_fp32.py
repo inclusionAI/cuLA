@@ -37,6 +37,8 @@ THREADS = 128
 AKK_STRIDE = BS + 4
 TMP_STRIDE = SB + 4
 TMP_SLOTS = 4
+LOWER_TILE_ROWS = (0, 1, 1, 2, 2, 2, 3, 3, 3, 3)
+LOWER_TILE_COLS = (0, 0, 1, 0, 1, 2, 0, 1, 2, 3)
 
 
 @cute.kernel
@@ -75,29 +77,54 @@ def akk_inv_fp32_physical_kernel(
         # workspace.
         cute.arch.griddepcontrol_wait()
 
-    for i in range((BS * BS) // THREADS):
-        linear = tidx + i * THREADS
-        row = linear // BS
-        col = linear % BS
+    # K123 stores the ten lower 16x16 tiles in block-transposed physical
+    # positions, while values inside each tile remain row-contiguous. Two
+    # groups of 64 threads load two tiles per iteration as float4 vectors.
+    rNorm = cute.make_rmem_tensor((4,), cutlass.Float32)
+    tile_slot = tidx // 64
+    tile_thread = tidx % 64
+    tile_row = tile_thread // 4
+    tile_vec = tile_thread % 4
+    for tile_pair in cutlass.range_constexpr(5):
+        row_blk = cutlass.select_(
+            tile_slot == 0,
+            cutlass.Int32(LOWER_TILE_ROWS[tile_pair * 2]),
+            cutlass.Int32(LOWER_TILE_ROWS[tile_pair * 2 + 1]),
+        )
+        col_blk = cutlass.select_(
+            tile_slot == 0,
+            cutlass.Int32(LOWER_TILE_COLS[tile_pair * 2]),
+            cutlass.Int32(LOWER_TILE_COLS[tile_pair * 2 + 1]),
+        )
+        row = row_blk * SB + tile_row
+        col = col_blk * SB + tile_vec * 4
+        src_row = col_blk * SB + tile_row
+        src_col = row_blk * SB + tile_vec * 4
         t_row = chunk_start + row
-        value = cutlass.Float32(0.0)
-        if row >= col:
-            if row == col:
-                value = cutlass.Float32(1.0)
+
+        if IS_VARLEN:
+            if t_row < eos:
+                gNormRow = mA_phys[b_idx, chunk_start + src_row, h_idx, None]
+                gNormVec = cute.local_tile(gNormRow, (4,), (src_col // 4,))
+                cute.autovec_copy(gNormVec, rNorm)
             else:
-                row_blk = row // SB
-                col_blk = col // SB
-                src_row = row
-                src_col = col
-                if row_blk != col_blk:
-                    src_row = col_blk * SB + row % SB
-                    src_col = row_blk * SB + col % SB
-                if IS_VARLEN:
-                    if t_row < eos:
-                        value = cutlass.Float32(mA_phys[b_idx, chunk_start + src_row, h_idx, src_col])
-                else:
-                    value = cutlass.Float32(mA_phys[b_idx, chunk_start + src_row, h_idx, src_col])
-        sAkk[row, col] = value
+                rNorm.fill(cutlass.Float32(0.0))
+        else:
+            gNormRow = mA_phys[b_idx, chunk_start + src_row, h_idx, None]
+            gNormVec = cute.local_tile(gNormRow, (4,), (src_col // 4,))
+            cute.autovec_copy(gNormVec, rNorm)
+
+        if row_blk == col_blk:
+            for elem in cutlass.range_constexpr(4):
+                logical_col = col + elem
+                if row == logical_col:
+                    rNorm[elem] = cutlass.Float32(1.0)
+                if row < logical_col:
+                    rNorm[elem] = cutlass.Float32(0.0)
+
+        sNormRow = sAkk[row, None]
+        sNormVec = cute.local_tile(sNormRow, (4,), (col // 4,))
+        cute.autovec_copy(rNorm, sNormVec)
     cute.arch.barrier()
 
     if tidx < 64:
@@ -167,6 +194,9 @@ def akk_inv_fp32_physical_kernel(
         sOutRow = sAkk[row, None]
         sOutVec = cute.local_tile(sOutRow, (8,), (vec_idx,))
         cute.autovec_copy(sOutVec, rOutFp32)
+        for elem in cutlass.range_constexpr(8):
+            if row < vec_idx * 8 + elem:
+                rOutFp32[elem] = cutlass.Float32(0.0)
         rOutBf16.store(rOutFp32.load().to(cutlass.BFloat16))
         if IS_VARLEN:
             if t_row < eos:
