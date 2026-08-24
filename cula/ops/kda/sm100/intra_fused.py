@@ -1232,15 +1232,14 @@ def fused_kernel123(
                     row = k1_row_start + ri
                     for vi in cutlass.range_constexpr(VEC):
                         rAcc[vi] = rAcc[vi] + rGact[ri, vi]
-                        csGcum[row, col_base + vi] = rAcc[vi] * cumsum_scale
+                        cs = rAcc[vi] * cumsum_scale
+                        rGact[ri, vi] = cs
+                        csGcum[row, col_base + vi] = cs
 
                 # Signal MMA early: csGcum is ready
                 cute.arch.mbarrier_arrive(k1_done_mbars + cur_stage)
 
                 # ---- Pass 2b: recompute + write GMEM (overlaps with MMA, off critical path) ----
-                for vi in cutlass.range_constexpr(VEC):
-                    rAcc[vi] = rPrefix[vi]
-
                 for ri in cutlass.range_constexpr(ROWS_PER_K1_WARP):
                     row = k1_row_start + ri
                     t = chunk_start + row
@@ -1259,8 +1258,7 @@ def fused_kernel123(
                     beta_val = cutlass.Float32(csBeta[row])
 
                     for vi in cutlass.range_constexpr(VEC):
-                        rAcc[vi] = rAcc[vi] + rGact[ri, vi]
-                        cs = rAcc[vi] * cumsum_scale
+                        cs = rGact[ri, vi]
 
                         k_val = tCrK[vi].to(cutlass.Float32)
                         q_val = tCrQ[vi].to(cutlass.Float32)
