@@ -107,11 +107,11 @@ class KDARecomputeWU:
         # occ=2 resource budget:
         #   TMEM: acc_stage=1 → 128 cols/CTA; 128×2=256 < 512 ✓
         #         (acc_stage=2 → 256 cols → 256×2=512 exact fit → sporadic corruption)
-        #   Regs: 65536/(2×256) = 128/thread → CUDA=200, others=56 per warp group
+        #   Regs: 128*216 + 128*32 = 31,744 registers/CTA; two CTAs fit.
         #   SMEM: ~74KB/CTA × 2 = 148KB < 228KB ✓
         self.min_occupancy = 2
-        self.num_regs_cuda = 224
-        self.num_regs_others = 24
+        self.num_regs_cuda = 216
+        self.num_regs_others = 32
         self.a_stage = 1
         self.kgk_stage = 1
         self.v_tma_stage = 1
