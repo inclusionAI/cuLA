@@ -904,6 +904,7 @@ class KDARecomputeWU:
             tiled_r2s_b = cute.make_tiled_copy_D(r2s_atom_b, tiled_t2r)
             thr_r2s_b = tiled_r2s_b.get_slice(local_tidx)
             tRS_sB = thr_r2s_b.partition_D(sBTime)
+            tRS_sStore = thr_r2s_b.partition_D(sStore)
 
             # Rmem tensors (hoisted outside WU loop to minimise register lifetime)
             tTR_rAcc = cute.make_rmem_tensor(tTR_sOut.shape, self.acc_dtype)
@@ -1045,9 +1046,9 @@ class KDARecomputeWU:
                     pass
                 elif cutlass.const_expr(self.is_varlen):
                     # === Varlen: scatter kg to sStore → sync → 128-thread R2G ===
-                    for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
-                        m_coord, n_coord = tTR_cM[ei]
-                        sStore[(m_coord, n_coord, r2g_stage)] = tTR_rKg[ei]
+                    tRS_rOut = tiled_r2s_b.retile(tTR_rKg)
+                    cute.copy(tiled_r2s_b, tRS_rOut, tRS_sStore[(None, None, None, r2g_stage)])
+                    cute.arch.fence_proxy("async.shared", space="cta")
                     cuda_sync.arrive_and_wait()
                     tOsKg = r2g_thr_copy.partition_S(sStore[(None, None, r2g_stage)])
                     if is_full_chunk:
@@ -1064,9 +1065,9 @@ class KDARecomputeWU:
                 else:
                     # === Non-varlen: scatter to sStore → signal store warp ===
                     sh_kg = store_ready_P.acquire_and_advance()
-                    for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
-                        m_coord, n_coord = tTR_cM[ei]
-                        sStore[(m_coord, n_coord, sh_kg.index)] = tTR_rKg[ei]
+                    tRS_rOut = tiled_r2s_b.retile(tTR_rKg)
+                    cute.copy(tiled_r2s_b, tRS_rOut, tRS_sStore[(None, None, None, sh_kg.index)])
+                    cute.arch.fence_proxy("async.shared", space="cta")
                     sh_kg.commit()
 
                 # Now read K result from acc (MMA V can run on acc[1] concurrently)
@@ -1077,9 +1078,10 @@ class KDARecomputeWU:
 
                 if cutlass.const_expr(self.is_varlen):
                     # === Varlen: scatter w → sync → 128-thread R2G ===
-                    for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
-                        m_coord, n_coord = tTR_cM[ei]
-                        sStore[(m_coord, n_coord, r2g_stage)] = tTR_rAcc[ei].to(self.io_dtype)
+                    tTR_rBproc.store(tTR_rAcc.load().to(self.io_dtype))
+                    tRS_rOut = tiled_r2s_b.retile(tTR_rBproc)
+                    cute.copy(tiled_r2s_b, tRS_rOut, tRS_sStore[(None, None, None, r2g_stage)])
+                    cute.arch.fence_proxy("async.shared", space="cta")
                     cuda_sync.arrive_and_wait()
                     tOsW = r2g_thr_copy.partition_S(sStore[(None, None, r2g_stage)])
                     if is_full_chunk:
@@ -1096,9 +1098,10 @@ class KDARecomputeWU:
                 else:
                     # Write w to sStore → signal store warp
                     sh_w = store_ready_P.acquire_and_advance()
-                    for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
-                        m_coord, n_coord = tTR_cM[ei]
-                        sStore[(m_coord, n_coord, sh_w.index)] = tTR_rAcc[ei].to(self.io_dtype)
+                    tTR_rBproc.store(tTR_rAcc.load().to(self.io_dtype))
+                    tRS_rOut = tiled_r2s_b.retile(tTR_rBproc)
+                    cute.copy(tiled_r2s_b, tRS_rOut, tRS_sStore[(None, None, None, sh_w.index)])
+                    cute.arch.fence_proxy("async.shared", space="cta")
                     sh_w.commit()
 
                 # === V MMA done ===
@@ -1109,9 +1112,10 @@ class KDARecomputeWU:
 
                 if cutlass.const_expr(self.is_varlen):
                     # === Varlen: scatter u → sync → 128-thread R2G (last output, no post-sync) ===
-                    for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
-                        m_coord, n_coord = tTR_cM[ei]
-                        sStore[(m_coord, n_coord, r2g_stage)] = tTR_rAcc[ei].to(self.io_dtype)
+                    tTR_rBproc.store(tTR_rAcc.load().to(self.io_dtype))
+                    tRS_rOut = tiled_r2s_b.retile(tTR_rBproc)
+                    cute.copy(tiled_r2s_b, tRS_rOut, tRS_sStore[(None, None, None, r2g_stage)])
+                    cute.arch.fence_proxy("async.shared", space="cta")
                     cuda_sync.arrive_and_wait()
                     tOsU = r2g_thr_copy.partition_S(sStore[(None, None, r2g_stage)])
                     if is_full_chunk:
@@ -1127,9 +1131,10 @@ class KDARecomputeWU:
                 else:
                     # Write u to sStore → signal store warp
                     sh_u = store_ready_P.acquire_and_advance()
-                    for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
-                        m_coord, n_coord = tTR_cM[ei]
-                        sStore[(m_coord, n_coord, sh_u.index)] = tTR_rAcc[ei].to(self.io_dtype)
+                    tTR_rBproc.store(tTR_rAcc.load().to(self.io_dtype))
+                    tRS_rOut = tiled_r2s_b.retile(tTR_rBproc)
+                    cute.copy(tiled_r2s_b, tRS_rOut, tRS_sStore[(None, None, None, sh_u.index)])
+                    cute.arch.fence_proxy("async.shared", space="cta")
                     sh_u.commit()
 
         # ---------- TMEM cleanup ----------
