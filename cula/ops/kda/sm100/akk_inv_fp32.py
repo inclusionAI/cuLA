@@ -39,6 +39,8 @@ TMP_STRIDE = SB + 4
 TMP_SLOTS = 4
 LOWER_TILE_ROWS = (0, 1, 1, 2, 2, 2, 3, 3, 3, 3)
 LOWER_TILE_COLS = (0, 0, 1, 0, 1, 2, 0, 1, 2, 3)
+UPPER_TILE_ROWS = (0, 0, 0, 1, 1, 2)
+UPPER_TILE_COLS = (1, 2, 3, 2, 3, 3)
 
 
 @cute.kernel
@@ -82,19 +84,30 @@ def akk_inv_fp32_physical_kernel(
     # groups of 64 threads load two tiles per iteration as float4 vectors.
     rNorm = cute.make_rmem_tensor((4,), cutlass.Float32)
     rNorm.fill(cutlass.Float32(0.0))
-    for zero_iter in cutlass.range_constexpr((BS * BS) // (THREADS * 4)):
-        zero_linear_vec = tidx + zero_iter * THREADS
-        zero_row = zero_linear_vec // (BS // 4)
-        zero_vec = zero_linear_vec % (BS // 4)
+    tile_slot = tidx // 64
+    tile_thread = tidx % 64
+    tile_row = tile_thread // 4
+    tile_vec = tile_thread % 4
+    # The ten lower tiles are overwritten by the physical workspace below.
+    # Clear only the six upper tiles that the block inverse may read.
+    for tile_pair in cutlass.range_constexpr(3):
+        zero_row_blk = cutlass.select_(
+            tile_slot == 0,
+            cutlass.Int32(UPPER_TILE_ROWS[tile_pair * 2]),
+            cutlass.Int32(UPPER_TILE_ROWS[tile_pair * 2 + 1]),
+        )
+        zero_col_blk = cutlass.select_(
+            tile_slot == 0,
+            cutlass.Int32(UPPER_TILE_COLS[tile_pair * 2]),
+            cutlass.Int32(UPPER_TILE_COLS[tile_pair * 2 + 1]),
+        )
+        zero_row = zero_row_blk * SB + tile_row
+        zero_vec = zero_col_blk * (SB // 4) + tile_vec
         sZeroRow = sAkk[zero_row, None]
         sZeroVec = cute.local_tile(sZeroRow, (4,), (zero_vec,))
         cute.autovec_copy(rNorm, sZeroVec)
     cute.arch.barrier()
 
-    tile_slot = tidx // 64
-    tile_thread = tidx % 64
-    tile_row = tile_thread // 4
-    tile_vec = tile_thread % 4
     for tile_pair in cutlass.range_constexpr(5):
         row_blk = cutlass.select_(
             tile_slot == 0,
