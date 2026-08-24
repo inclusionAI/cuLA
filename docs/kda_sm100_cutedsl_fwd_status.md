@@ -84,8 +84,8 @@ the device-side mismatch counter is checked every 1,000,000 iterations.
 
 - Iterations: 10,000,000
 - Exact element mismatches: 0
-- Elapsed time: 471.308 seconds
-- Throughput: 21,217.6 iterations/second
+- Elapsed time: 471.316 seconds
+- Throughput: 21,217.2 iterations/second
 - Aqk/Akk upper-triangle max absolute value: 0
 
 Accuracy against the csrc path for the same inputs:
