@@ -278,6 +278,16 @@ class KDARecomputeWU:
             self.bproc_stage,
         )
         assert cute.cosize(b_smem_staged) == cute.cosize(b_epi_staged)
+        inv_a_copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.io_dtype,
+            num_bits_per_copy=self.io_dtype.width,
+        )
+        inv_a_tiled_copy = cute.make_tiled_copy_tv(
+            inv_a_copy_atom,
+            thr_layout=cute.make_ordered_layout((8, 16), order=(1, 0)),
+            val_layout=cute.make_layout((1, 1)),
+        )
 
         # ---------- TMA load op ----------
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
@@ -340,15 +350,13 @@ class KDARecomputeWU:
         a_smem_one = cute.select(a_smem_staged, mode=[0, 1, 2])
         if cutlass.const_expr(self.fused_inverse):
             aphys_smem_layout = cute.make_layout((self.BT, self.BT), stride=(INV_STRIDE, 1))
-            tma_atom_A, tma_tensor_A = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_atom_A, tma_tensor_A = cpasync.make_tiled_tma_atom(
                 tma_load_op,
-                A_out_gmem,
-                a_smem_one,
-                self.mma_tiler,
-                tiled_mma,
-                cluster_layout.shape,
+                A_gmem,
+                aphys_smem_layout,
+                (self.BT, self.BT),
             )
-            self.tma_A_bytes = cute.size_in_bytes(self.io_dtype, a_smem_one)
+            self.tma_A_bytes = self.BT * self.BT * (self.acc_dtype.width // 8)
         else:
             aphys_smem_layout = cute.make_layout((1, 1))
             tma_atom_A, tma_tensor_A = cute.nvgpu.make_tiled_tma_atom_A(
@@ -513,6 +521,7 @@ class KDARecomputeWU:
             tma_tensor_kg,
             a_smem_staged,
             aphys_smem_layout,
+            inv_a_tiled_copy,
             A_gmem,
             b_smem_staged,
             b_epi_staged,
@@ -557,6 +566,7 @@ class KDARecomputeWU:
         tma_tensor_kg: cute.Tensor,
         a_smem_staged: cute.ComposedLayout,
         aphys_smem_layout: cute.Layout,
+        inv_a_tiled_copy: cute.TiledCopy,
         A_gmem: cute.Tensor,
         b_smem_staged: cute.ComposedLayout,
         b_epi_staged: cute.ComposedLayout,
@@ -601,7 +611,8 @@ class KDARecomputeWU:
         tidx, _, _ = cute.arch.thread_idx()
 
         if warp_idx == self.load_warp_id:
-            cpasync.prefetch_descriptor(tma_atom_A)
+            if cutlass.const_expr(not self.fused_inverse):
+                cpasync.prefetch_descriptor(tma_atom_A)
             cpasync.prefetch_descriptor(tma_atom_k)
             cpasync.prefetch_descriptor(tma_atom_v)
             if cutlass.const_expr(not self.preprocessed_k):
@@ -648,13 +659,22 @@ class KDARecomputeWU:
         )
 
         # ---------- Pipelines ----------
-        load_A_P, load_A_C = pipeline.PipelineTmaUmma.create(
-            num_stages=self.a_stage,
-            producer_group=_make_coop_group(1),
-            consumer_group=_make_coop_group(1),
-            tx_count=self.tma_A_bytes,
-            barrier_storage=storage.load_A_mbar.data_ptr(),
-        ).make_participants()
+        if cutlass.const_expr(self.fused_inverse):
+            load_A_P, load_A_C = pipeline.PipelineTmaAsync.create(
+                num_stages=self.a_stage,
+                producer_group=_make_coop_group(1),
+                consumer_group=_make_coop_group(self.num_cuda_threads),
+                tx_count=self.tma_A_bytes,
+                barrier_storage=storage.load_A_mbar.data_ptr(),
+            ).make_participants()
+        else:
+            load_A_P, load_A_C = pipeline.PipelineTmaUmma.create(
+                num_stages=self.a_stage,
+                producer_group=_make_coop_group(1),
+                consumer_group=_make_coop_group(1),
+                tx_count=self.tma_A_bytes,
+                barrier_storage=storage.load_A_mbar.data_ptr(),
+            ).make_participants()
 
         load_kgk_P, load_kgk_C = pipeline.PipelineTmaAsync.create(
             num_stages=self.kgk_stage,
@@ -800,6 +820,15 @@ class KDARecomputeWU:
                     _add_store_C16_smem(sAphys, inv_row_o, 16, r0, r1, r2, r3, r4, r5, r6, r7, inv_lane)
                 inv_sync.arrive_and_wait()
 
+                inv_a_thr = inv_a_tiled_copy.get_slice(inv_tid)
+                inv_a_identity = cute.make_identity_tensor((self.BT, self.BT))
+                tInv_cA = inv_a_thr.partition_D(inv_a_identity)
+                tInv_sA = inv_a_thr.partition_D(sA[(None, None, None, 0)])
+                for ai in cutlass.range(cute.size(tInv_cA), unroll_full=True):
+                    a_row, a_col = tInv_cA[ai]
+                    a_val = self.acc_dtype(sAphys[a_row, a_col]).to(self.io_dtype)
+                    tInv_sA[ai] = a_val
+
                 row_base = inv_warp * 16
                 for ri in cutlass.range_constexpr(16):
                     row = row_base + ri
@@ -820,7 +849,7 @@ class KDARecomputeWU:
                     else:
                         A_out_gmem[chunk_row + row, col0, (i_h, data_bidx)] = out0
                         A_out_gmem[chunk_row + row, col1, (i_h, data_bidx)] = out1
-                cute.arch.fence_acq_rel_gpu()
+            cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.barrier()
 
         # =====================================================================
@@ -862,15 +891,16 @@ class KDARecomputeWU:
                         (self.BT, self.BK),
                         sGK,
                     )
-                tAsA, tAgA = self._tma_partition_A(
-                    tma_atom_A,
-                    tma_A_v,
-                    sA,
-                    self.mma_tiler,
-                    tiled_mma,
-                    data_bidx,
-                    i_h,
-                )
+                if cutlass.const_expr(not self.fused_inverse):
+                    tAsA, tAgA = self._tma_partition_A(
+                        tma_atom_A,
+                        tma_A_v,
+                        sA,
+                        self.mma_tiler,
+                        tiled_mma,
+                        data_bidx,
+                        i_h,
+                    )
             else:
                 bSG_sK, bSG_gK = self._data_tma_partition(
                     tma_atom_k,
@@ -897,24 +927,26 @@ class KDARecomputeWU:
                         i_h,
                         data_bidx,
                     )
-                tAsA, tAgA = self._tma_partition_A(
-                    tma_atom_A,
-                    tma_A_v,
-                    sA,
-                    self.mma_tiler,
-                    tiled_mma,
-                    data_bidx,
-                    i_h,
-                )
+                if cutlass.const_expr(not self.fused_inverse):
+                    tAsA, tAgA = self._tma_partition_A(
+                        tma_atom_A,
+                        tma_A_v,
+                        sA,
+                        self.mma_tiler,
+                        tiled_mma,
+                        data_bidx,
+                        i_h,
+                    )
 
             # --- Issue TMA loads ---
-            h_a = load_A_P.acquire_and_advance()
-            cute.copy(
-                tma_atom_A,
-                tAgA[(None, i_t, 0)],
-                tAsA[(None, h_a.index)],
-                tma_bar_ptr=h_a.barrier,
-            )
+            if cutlass.const_expr(not self.fused_inverse):
+                h_a = load_A_P.acquire_and_advance()
+                cute.copy(
+                    tma_atom_A,
+                    tAgA[(None, i_t, 0)],
+                    tAsA[(None, h_a.index)],
+                    tma_bar_ptr=h_a.barrier,
+                )
 
             for i_kv in cutlass.range(0, self.NK):
                 kgk_h = load_kgk_P.acquire_and_advance()
@@ -1003,7 +1035,10 @@ class KDARecomputeWU:
 
             num_kblks = cute.size(tCrB, mode=[2])
 
-            a_h = load_A_C.wait_and_advance()
+            # The regular path waits on the TMA->UMMA pipeline.  The fused
+            # inverse path published sA through the CTA barrier above.
+            if cutlass.const_expr(not self.fused_inverse):
+                a_h = load_A_C.wait_and_advance()
 
             for i_kv in cutlass.range(0, self.NK):
                 # K pass: w = A_mat @ B_proc(k)
@@ -1014,7 +1049,7 @@ class KDARecomputeWU:
                     cute.gemm(
                         tiled_mma,
                         tCtAcc[(None, None, None, acc_h.index)],
-                        tCrA[(None, None, kblk, a_h.index)],
+                        tCrA[(None, None, kblk, 0 if self.fused_inverse else a_h.index)],
                         tCrB[(None, None, kblk, bp_h.index)],
                         tCtAcc[(None, None, None, acc_h.index)],
                     )
@@ -1029,14 +1064,16 @@ class KDARecomputeWU:
                     cute.gemm(
                         tiled_mma,
                         tCtAcc[(None, None, None, acc_h2.index)],
-                        tCrA[(None, None, kblk, a_h.index)],
+                        tCrA[(None, None, kblk, 0 if self.fused_inverse else a_h.index)],
                         tCrB[(None, None, kblk, bp_h2.index)],
                         tCtAcc[(None, None, None, acc_h2.index)],
                     )
                 acc_h2.commit()
                 bp_h2.release()
 
-            a_h.release()
+            # Release A after all GEMMs that read sA are dispatched.
+            if cutlass.const_expr(not self.fused_inverse):
+                a_h.release()
 
         # =====================================================================
         # CUDA CORE WARPS
