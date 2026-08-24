@@ -14,8 +14,10 @@ Target machine: `aistudio-58650011-ssctl`, NVIDIA GB200, physical GPU 1
 - Fused raw-gate K1/K2/K3 intra candidate plus standalone fp32 Akk inverse.
 - Same-input benchmarks against the repository SM100 csrc kernels.
 
-The public csrc dispatch remains unchanged because the measured CuTeDSL paths
-do not yet meet the no-regression performance requirement.
+The public csrc dispatch remains unchanged while the CuTeDSL candidate is
+validated on a broader shape matrix. The fused forward chain now matches the
+csrc implementation within 0.1% at the representative T=8192 shape and within
+2.0% across the measured equal-length matrix.
 
 ## GB200 results
 
@@ -35,14 +37,29 @@ warps and 32 for the load/MMA/store warps, while retaining two CTAs per SM.
 
 ### Raw-gate fused intra plus specialized WU
 
-For `B=2, T=8192, H=64`, the csrc gate + intra + recompute chain takes
-1.0692 ms. The CuTeDSL fused K1/K2/K3 + fp32 inverse + specialized WU takes
-1.3162 ms (0.81x). Representative relative RMSE against csrc is:
+The table below measures the complete csrc gate + intra + recompute chain
+against CuTeDSL fused K1/K2/K3 + fp32 inverse + preprocessed W/U. Each point
+uses 10 warmup iterations and 100 measured iterations.
+
+| Shape | csrc (us) | CuTeDSL (us) | csrc / CuTeDSL |
+|---|---:|---:|---:|
+| equal, T=4096 | 553.4 | 554.1 | 0.999x |
+| equal, T=8192 | 1068.0 | 1068.6 | 0.999x |
+| equal, T=16384 | 2099.0 | 2141.1 | 0.980x |
+| varlen, lengths=4096,4096 | 559.3 | 565.5 | 0.989x |
+
+Representative relative RMSE against csrc at T=8192 is:
 
 - `Aqk`: 4.112e-4
 - `Akk`: 7.065e-6
 - `w`: 2.836e-3
 - `u`: 4.838e-5
+
+The final parity improvement came from sharing each chunk's 64 beta values in
+SMEM across the ten MMA tile warps. Other retained changes vectorize K123 and
+inverse loads/stores, clear only the six inverse upper tiles, reuse prefix
+results, hoist gate invariants, and use ordinary stream ordering between K123
+and the inverse instead of PDL fences.
 
 ## Rejected experiments
 
@@ -55,11 +72,10 @@ For `B=2, T=8192, H=64`, the csrc gate + intra + recompute chain takes
 - In-CTA fused inverse with a single G buffer: serialized G staging and
   regressed the full chain to about 2.04 ms.
 
-## Required next step
+## Remaining validation
 
-Closing the remaining gap needs a dataflow change rather than another launch
-or register tweak. The promising direction is a direct CuTeDSL port of the
-csrc persistent intra schedule, with inverse and WU sharing the same per-chunk
-SMEM/TMEM residency so the inverted Akk matrix is not written and reread from
-global memory. Default API dispatch must remain on csrc until that path is at
-least 1.0x across the benchmark matrix.
+- Run the SM100 correctness tests for generic and preprocessed W/U.
+- Extend the performance matrix to additional batch/head combinations before
+  changing the default public dispatch.
+- Keep the csrc fallback for shapes that do not satisfy the current K=V=128,
+  chunk-size=64 specialization constraints.

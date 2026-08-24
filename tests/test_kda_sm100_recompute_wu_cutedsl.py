@@ -11,7 +11,7 @@ from fla.ops.utils import prepare_chunk_indices
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import cula.cudac as cula_cuda
-from cula.ops.kda.sm100.recompute_wu import recompute_w_u_fwd
+from cula.ops.kda.sm100.recompute_wu import recompute_w_u_from_preprocessed, recompute_w_u_fwd
 
 
 def _requires_sm100():
@@ -57,3 +57,32 @@ def test_recompute_wu_matches_csrc(beta_dtype):
     torch.testing.assert_close(w, w_ref, rtol=1e-2, atol=2e-3)
     torch.testing.assert_close(u, u_ref, rtol=1e-2, atol=2e-3)
     torch.testing.assert_close(kg, kg_ref, rtol=1e-2, atol=2e-3)
+
+
+def test_preprocessed_recompute_wu_matches_torch():
+    _requires_sm100()
+    torch.manual_seed(1)
+    device = torch.device("cuda")
+    batch, seqlen, heads, dim, chunk_size = 1, 256, 4, 128, 64
+
+    k_scaled = torch.randn(batch, seqlen, heads, dim, device=device, dtype=torch.bfloat16) * 0.1
+    v = torch.randn_like(k_scaled) * 0.1
+    beta = torch.rand(batch, seqlen, heads, device=device, dtype=torch.bfloat16)
+    A = torch.randn(batch, seqlen, heads, chunk_size, device=device, dtype=torch.bfloat16) * 0.02
+    row = torch.arange(seqlen, device=device) % chunk_size
+    col = torch.arange(chunk_size, device=device)
+    A.masked_fill_((col[None, :] > row[:, None]).view(1, seqlen, 1, chunk_size), 0)
+
+    w, u = recompute_w_u_from_preprocessed(k_scaled, v, beta, A)
+    w_ref = torch.empty_like(w)
+    u_ref = torch.empty_like(u)
+    k_beta = (k_scaled.float() * beta.float().unsqueeze(-1)).bfloat16()
+    v_beta = (v.float() * beta.float().unsqueeze(-1)).bfloat16()
+    for start in range(0, seqlen, chunk_size):
+        end = start + chunk_size
+        A_tile = A[:, start:end].float()
+        w_ref[:, start:end] = torch.einsum("bmhk,bkhd->bmhd", A_tile, k_beta[:, start:end].float())
+        u_ref[:, start:end] = torch.einsum("bmhk,bkhd->bmhd", A_tile, v_beta[:, start:end].float())
+
+    torch.testing.assert_close(w, w_ref, rtol=1e-2, atol=2e-3)
+    torch.testing.assert_close(u, u_ref, rtol=1e-2, atol=2e-3)
