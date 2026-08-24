@@ -44,6 +44,7 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Int32, Int64
 from fla.ops.utils import prepare_chunk_indices
 
+from cula.ops.ptx import reinterpret_cast, store_256b, subvec
 from cula.utils import USE_FAST_MATH, assert_blackwell
 
 
@@ -64,6 +65,7 @@ class KDARecomputeWU:
         beta_dtype: type[cutlass.Numeric] = cutlass.Float32,
         is_varlen: bool = False,
         preprocessed_k: bool = False,
+        direct_store: bool = False,
         persistent: bool = False,
         use_fast_math: bool = True,
     ):
@@ -82,6 +84,7 @@ class KDARecomputeWU:
         self.beta_dtype = beta_dtype
         self.is_varlen = is_varlen
         self.preprocessed_k = preprocessed_k
+        self.direct_store = direct_store
 
         self.threads_per_warp = 32
         self.cuda_warp_ids = (0, 1, 2, 3)
@@ -770,7 +773,9 @@ class KDARecomputeWU:
         elif warp_idx == self.store_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
 
-            if cutlass.const_expr(self.is_varlen):
+            if cutlass.const_expr(self.direct_store and not self.is_varlen):
+                pass
+            elif cutlass.const_expr(self.is_varlen):
                 # --- Varlen: CUDA warps handle R2G, store warps idle ---
                 pass
 
@@ -961,6 +966,16 @@ class KDARecomputeWU:
                 is_full_chunk = remaining >= Int32(BT)
                 r2g_row_frag = cute.make_fragment_like(r2g_dummy_part[None, 0, None], self.io_dtype)
                 r2g_stage = Int32(0)  # single fixed stage
+            elif cutlass.const_expr(self.direct_store):
+                # tcgen05 data-path layout E: each pair of warps owns the
+                # same 32-row half and each warp in the pair owns one 64-col
+                # half. Every thread therefore has one contiguous output row.
+                warp_id = local_tidx // self.threads_per_warp
+                lane_idx = local_tidx % self.threads_per_warp
+                direct_row = (warp_id % 2) * self.threads_per_warp + lane_idx
+                direct_col = (warp_id // 2) * (self.BN // 2)
+                direct_num_values = self.BN // 2
+                direct_num_stores = direct_num_values // 16
 
             # ====== Single WU pass ======
             # beta is original [B,T,H] → stride=H (saves API transpose cost)
@@ -1060,6 +1075,13 @@ class KDARecomputeWU:
                                 cute.autovec_copy(tOsKg[None, m1, None], r2g_row_frag)
                                 cute.autovec_copy(r2g_row_frag, tOgKg[None, m1, None])
                     cuda_sync.arrive_and_wait()
+                elif cutlass.const_expr(self.direct_store):
+                    kg_i32 = reinterpret_cast(tTR_rKg.load(), self.io_dtype, direct_num_values, Int32)
+                    kg_addr = (
+                        kg_ptr + (i_b * T + i_t * BT + direct_row) * H * K + i_h * K + i_kv * self.BK + direct_col
+                    ).toint()
+                    for store_idx in cutlass.range_constexpr(direct_num_stores):
+                        store_256b(kg_addr + store_idx * 32, subvec(kg_i32, store_idx * 8, 8))
                 else:
                     # === Non-varlen: scatter to sStore → signal store warp ===
                     sh_kg = store_ready_P.acquire_and_advance()
@@ -1093,6 +1115,14 @@ class KDARecomputeWU:
                                 cute.autovec_copy(tOsW[None, m1, None], r2g_row_frag)
                                 cute.autovec_copy(r2g_row_frag, tOgW[None, m1, None])
                     cuda_sync.arrive_and_wait()
+                elif cutlass.const_expr(self.direct_store):
+                    tTR_rBproc.store(tTR_rAcc.load().to(self.io_dtype))
+                    w_i32 = reinterpret_cast(tTR_rBproc.load(), self.io_dtype, direct_num_values, Int32)
+                    w_addr = (
+                        w_ptr + (i_b * T + i_t * BT + direct_row) * H * K + i_h * K + i_kv * self.BK + direct_col
+                    ).toint()
+                    for store_idx in cutlass.range_constexpr(direct_num_stores):
+                        store_256b(w_addr + store_idx * 32, subvec(w_i32, store_idx * 8, 8))
                 else:
                     # Write w to sStore → signal store warp
                     sh_w = store_ready_P.acquire_and_advance()
@@ -1126,6 +1156,14 @@ class KDARecomputeWU:
                             if bt_coord < remaining:
                                 cute.autovec_copy(tOsU[None, m1, None], r2g_row_frag)
                                 cute.autovec_copy(r2g_row_frag, tOgU[None, m1, None])
+                elif cutlass.const_expr(self.direct_store):
+                    tTR_rBproc.store(tTR_rAcc.load().to(self.io_dtype))
+                    u_i32 = reinterpret_cast(tTR_rBproc.load(), self.io_dtype, direct_num_values, Int32)
+                    u_addr = (
+                        u_ptr + (i_b * T + i_t * BT + direct_row) * H * V + i_h * V + i_kv * self.BV + direct_col
+                    ).toint()
+                    for store_idx in cutlass.range_constexpr(direct_num_stores):
+                        store_256b(u_addr + store_idx * 32, subvec(u_i32, store_idx * 8, 8))
                 else:
                     # Write u to sStore → signal store warp
                     sh_u = store_ready_P.acquire_and_advance()
@@ -1172,6 +1210,7 @@ def _compile_recompute_wu(
     is_varlen=False,
     beta_dtype=cutlass.Float32,
     preprocessed_k=False,
+    direct_store=False,
 ):
     key = (
         H,
@@ -1184,6 +1223,7 @@ def _compile_recompute_wu(
         is_varlen,
         beta_dtype,
         preprocessed_k,
+        direct_store,
         USE_FAST_MATH,
     )
     if key in _recompute_wu_cache:
@@ -1198,6 +1238,7 @@ def _compile_recompute_wu(
         beta_dtype=beta_dtype,
         is_varlen=is_varlen,
         preprocessed_k=preprocessed_k,
+        direct_store=direct_store,
         use_fast_math=USE_FAST_MATH,
     )
 
@@ -1270,7 +1311,18 @@ def _compile_recompute_wu(
 # ============================================================================
 
 
-def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, block_k=None, block_v=None):
+def recompute_w_u_fwd(
+    k,
+    v,
+    beta,
+    A,
+    gk,
+    cu_seqlens=None,
+    chunk_indices=None,
+    block_k=None,
+    block_v=None,
+    direct_store=False,
+):
     is_varlen = cu_seqlens is not None
     packed_4d = is_varlen and k.dim() == 4
     restore_packed = False
@@ -1312,6 +1364,7 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
                 gk_4d,
                 block_k=block_k,
                 block_v=block_v,
+                direct_store=direct_store,
             )
             return w_4d.squeeze(0), u_4d.squeeze(0), None, kg_4d.squeeze(0)
 
@@ -1351,6 +1404,7 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
         block_v=block_v,
         is_varlen=is_varlen,
         beta_dtype=cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16,
+        direct_store=direct_store,
     )
 
     compiled_fn(k, v, beta, A, gk, w, u, kg, cu_s, ci_s, ps, Int32(total_nt))
@@ -1371,6 +1425,7 @@ def recompute_w_u_from_preprocessed(
     chunk_indices=None,
     block_k=None,
     block_v=None,
+    direct_store=False,
 ):
     """Compute only ``w`` and ``u`` when fused intra already produced scaled k.
 
@@ -1432,6 +1487,7 @@ def recompute_w_u_from_preprocessed(
         is_varlen=is_varlen,
         beta_dtype=cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16,
         preprocessed_k=True,
+        direct_store=direct_store,
     )
 
     # gk and kg are unused compile-signature placeholders for this

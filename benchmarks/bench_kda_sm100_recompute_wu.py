@@ -62,6 +62,11 @@ def main():
     parser.add_argument("--heads", type=int, default=64)
     parser.add_argument("--beta-bf16", action="store_true")
     parser.add_argument(
+        "--direct-store",
+        action="store_true",
+        help="Use CUDA-warp 256-bit global stores instead of the shared-memory/TMA epilogue.",
+    )
+    parser.add_argument(
         "--force-varlen",
         action="store_true",
         help="Keep packed uniform inputs on the varlen kernel path (diagnostic only)",
@@ -97,7 +102,7 @@ def main():
             beta = beta.bfloat16()
         runners = {
             "cpp": lambda: _run_cpp(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices),
-            "ws": lambda: recompute_w_u_fwd(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices),
+            "ws": lambda: recompute_w_u_fwd(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices, direct_store=args.direct_store),
             "occ": lambda: _run_occ(k, v, beta, A, cu_gk, cu_seqlens),
         }
         runner = runners[args.profile]
@@ -117,7 +122,7 @@ def main():
         if args.beta_bf16:
             beta = beta.bfloat16()
         cpp = _run_cpp(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices)
-        ws = recompute_w_u_fwd(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices)
+        ws = recompute_w_u_fwd(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices, direct_store=args.direct_store)
         occ = _run_occ(k, v, beta, A, cu_gk, cu_seqlens)
         ws_err = _max_error(cpp, ws)[0]
         occ_err = _max_error(cpp, occ)[0]
@@ -125,7 +130,9 @@ def main():
             raise AssertionError(f"non-finite error at T={T}: ws={ws_err}, occ={occ_err}")
 
         cpp_ms = triton_bench_fn(lambda: _run_cpp(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices))
-        ws_ms = triton_bench_fn(lambda: recompute_w_u_fwd(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices))
+        ws_ms = triton_bench_fn(
+            lambda: recompute_w_u_fwd(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices, direct_store=args.direct_store)
+        )
         occ_ms = triton_bench_fn(lambda: _run_occ(k, v, beta, A, cu_gk, cu_seqlens))
         print(
             f"{T:8d} {cpp_ms:12.4f} {ws_ms:12.4f} {occ_ms:12.4f} "
