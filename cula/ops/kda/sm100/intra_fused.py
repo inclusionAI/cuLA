@@ -2291,7 +2291,7 @@ def _run_akk_inv_fp32_physical(
     dev = A_phys.device.index if A_phys.device.index is not None else 0
     phys_ct = _ct_cached(A_phys, cutlass.Float32)
     out_ct = _ct_cached(A_out, cutlass.BFloat16)
-    cache_key = ("akk_inv_fp32_physical", dev, B, NT, H, bool(is_varlen), T_val, True)
+    cache_key = ("akk_inv_fp32_physical", dev, B, NT, H, bool(is_varlen), T_val, False)
     kernel = _K123_CACHE.get(cache_key)
     if kernel is None:
         kernel = cute.compile(
@@ -2305,7 +2305,7 @@ def _run_akk_inv_fp32_physical(
             ci_ct,
             1 if is_varlen else 0,
             T_val,
-            1,
+            0,
         )
         _K123_CACHE[cache_key] = kernel
     kernel(phys_ct, out_ct, cu_ct, ci_ct)
