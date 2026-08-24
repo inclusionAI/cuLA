@@ -14,6 +14,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 import cula.cudac as cula_cuda
 from benchmarks.bench_recompute_wu import prepare_recompute_wu_inputs
 from benchmarks.utils import relative_rms_error_rel_max_mean_abs_rhs, triton_bench_fn
+from cula.ops.kda.sm100 import recompute_wu as recompute_wu_module
 from cula.ops.kda.sm100.recompute_wu import recompute_w_u_fwd
 from cula.ops.kda.sm100.recompute_wu_occ import recompute_w_u_fwd_occ
 
@@ -60,6 +61,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--heads", type=int, default=64)
     parser.add_argument("--beta-bf16", action="store_true")
+    parser.add_argument(
+        "--force-varlen",
+        action="store_true",
+        help="Keep packed uniform inputs on the varlen kernel path (diagnostic only)",
+    )
     parser.add_argument("--lengths", type=int, nargs="+", default=[512, 1024, 4096, 8192, 16384, 32768])
     parser.add_argument(
         "--profile",
@@ -67,6 +73,9 @@ def main():
         help="Warm up, then launch exactly one selected kernel between CUDA profiler markers",
     )
     args = parser.parse_args()
+
+    if args.force_varlen:
+        recompute_wu_module._uniform_problem = lambda _cu_seqlens: None
 
     import benchmarks.bench_recompute_wu as common
 
