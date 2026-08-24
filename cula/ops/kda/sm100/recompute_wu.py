@@ -63,6 +63,7 @@ class KDARecomputeWU:
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         beta_dtype: type[cutlass.Numeric] = cutlass.Float32,
         is_varlen: bool = False,
+        preprocessed_k: bool = False,
         persistent: bool = False,
         use_fast_math: bool = True,
     ):
@@ -80,6 +81,7 @@ class KDARecomputeWU:
         self.acc_dtype = acc_dtype
         self.beta_dtype = beta_dtype
         self.is_varlen = is_varlen
+        self.preprocessed_k = preprocessed_k
 
         self.threads_per_warp = 32
         self.cuda_warp_ids = (0, 1, 2, 3)
@@ -336,18 +338,26 @@ class KDARecomputeWU:
         )
 
         gk_epi_smem = cute.select(gk_epi_staged, mode=[0, 1])
-        tma_atom_gk, tma_tensor_gk = cpasync.make_tiled_tma_atom(
-            tma_load_op,
-            gk_gmem,
-            gk_epi_smem,
-            (self.BT, self.BK),
-        )
+        if cutlass.const_expr(self.preprocessed_k):
+            # The preprocessed path does not consume gk. Reusing the k
+            # descriptor also lets the public wrapper pass k as the unused
+            # placeholder without constructing an fp32 tensor.
+            tma_atom_gk, tma_tensor_gk = tma_atom_k, tma_tensor_k
+        else:
+            tma_atom_gk, tma_tensor_gk = cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                gk_gmem,
+                gk_epi_smem,
+                (self.BT, self.BK),
+            )
 
         # ---------- TMA byte counts ----------
         self.tma_bytes_k = cute.size_in_bytes(self.io_dtype, k_epi_smem)
         self.tma_bytes_v = cute.size_in_bytes(self.io_dtype, v_epi_smem)
         self.tma_bytes_gk = cute.size_in_bytes(self.acc_dtype, gk_epi_smem)
-        self.tma_bytes_kgkv = self.tma_bytes_k + self.tma_bytes_gk + self.tma_bytes_v
+        self.tma_bytes_kgkv = self.tma_bytes_k + self.tma_bytes_v
+        if cutlass.const_expr(not self.preprocessed_k):
+            self.tma_bytes_kgkv += self.tma_bytes_gk
 
         # ---------- Store epi layout for TMA S2G ----------
         store_epi_staged = sm100_utils.make_smem_layout_epi(
@@ -542,7 +552,8 @@ class KDARecomputeWU:
             cpasync.prefetch_descriptor(tma_atom_A)
             cpasync.prefetch_descriptor(tma_atom_k)
             cpasync.prefetch_descriptor(tma_atom_v)
-            cpasync.prefetch_descriptor(tma_atom_gk)
+            if cutlass.const_expr(not self.preprocessed_k):
+                cpasync.prefetch_descriptor(tma_atom_gk)
         if warp_idx == self.store_warp_id:
             if cutlass.const_expr(not self.is_varlen):
                 cpasync.prefetch_descriptor(tma_atom_w_s2g)
@@ -658,12 +669,13 @@ class KDARecomputeWU:
                     (self.BT, self.BV),
                     sV,
                 )
-                bSG_sGK, bSG_gGK = self._epilog_partition_varlen(
-                    tma_atom_gk,
-                    tma_gk_v[None, None, (i_h, data_bidx)],
-                    (self.BT, self.BK),
-                    sGK,
-                )
+                if cutlass.const_expr(not self.preprocessed_k):
+                    bSG_sGK, bSG_gGK = self._epilog_partition_varlen(
+                        tma_atom_gk,
+                        tma_gk_v[None, None, (i_h, data_bidx)],
+                        (self.BT, self.BK),
+                        sGK,
+                    )
                 tAsA, tAgA = self._tma_partition_B(
                     tma_atom_A,
                     tma_A_v,
@@ -690,14 +702,15 @@ class KDARecomputeWU:
                     i_h,
                     data_bidx,
                 )
-                bSG_sGK, bSG_gGK = self._data_tma_partition(
-                    tma_atom_gk,
-                    tma_gk_v,
-                    (self.BT, self.BK),
-                    sGK,
-                    i_h,
-                    data_bidx,
-                )
+                if cutlass.const_expr(not self.preprocessed_k):
+                    bSG_sGK, bSG_gGK = self._data_tma_partition(
+                        tma_atom_gk,
+                        tma_gk_v,
+                        (self.BT, self.BK),
+                        sGK,
+                        i_h,
+                        data_bidx,
+                    )
                 tAsA, tAgA = self._tma_partition_B(
                     tma_atom_A,
                     tma_A_v,
@@ -725,12 +738,13 @@ class KDARecomputeWU:
                     bSG_sK[None, kgk_h.index],
                     tma_bar_ptr=kgk_h.barrier,
                 )
-                cute.copy(
-                    tma_atom_gk,
-                    bSG_gGK[(None, i_t, i_kv)],
-                    bSG_sGK[None, kgk_h.index],
-                    tma_bar_ptr=kgk_h.barrier,
-                )
+                if cutlass.const_expr(not self.preprocessed_k):
+                    cute.copy(
+                        tma_atom_gk,
+                        bSG_gGK[(None, i_t, i_kv)],
+                        bSG_sGK[None, kgk_h.index],
+                        tma_bar_ptr=kgk_h.barrier,
+                    )
                 cute.copy(
                     tma_atom_v,
                     bSG_gV[(None, i_t, i_kv)],
@@ -760,23 +774,36 @@ class KDARecomputeWU:
                 )
 
                 for i_kv in cutlass.range(0, self.NK):
-                    sh_kg = store_ready_C.wait_and_advance()
-                    cute.copy(tma_atom_kg_s2g, bSG_sKg[None, sh_kg.index], bSG_gKg[(None, i_t, i_kv)])
-                    cute.arch.cp_async_bulk_commit_group()
+                    if cutlass.const_expr(self.preprocessed_k):
+                        sh_w = store_ready_C.wait_and_advance()
+                        cute.copy(tma_atom_w_s2g, bSG_sW[None, sh_w.index], bSG_gW[(None, i_t, i_kv)])
+                        cute.arch.cp_async_bulk_commit_group()
 
-                    sh_w = store_ready_C.wait_and_advance()
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    sh_kg.release()
-                    cute.copy(tma_atom_w_s2g, bSG_sW[None, sh_w.index], bSG_gW[(None, i_t, i_kv)])
-                    cute.arch.cp_async_bulk_commit_group()
+                        sh_u = store_ready_C.wait_and_advance()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        sh_w.release()
+                        cute.copy(tma_atom_u_s2g, bSG_sU[None, sh_u.index], bSG_gU[(None, i_t, i_kv)])
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        sh_u.release()
+                    else:
+                        sh_kg = store_ready_C.wait_and_advance()
+                        cute.copy(tma_atom_kg_s2g, bSG_sKg[None, sh_kg.index], bSG_gKg[(None, i_t, i_kv)])
+                        cute.arch.cp_async_bulk_commit_group()
 
-                    sh_u = store_ready_C.wait_and_advance()
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    sh_w.release()
-                    cute.copy(tma_atom_u_s2g, bSG_sU[None, sh_u.index], bSG_gU[(None, i_t, i_kv)])
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    sh_u.release()
+                        sh_w = store_ready_C.wait_and_advance()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        sh_kg.release()
+                        cute.copy(tma_atom_w_s2g, bSG_sW[None, sh_w.index], bSG_gW[(None, i_t, i_kv)])
+                        cute.arch.cp_async_bulk_commit_group()
+
+                        sh_u = store_ready_C.wait_and_advance()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        sh_w.release()
+                        cute.copy(tma_atom_u_s2g, bSG_sU[None, sh_u.index], bSG_gU[(None, i_t, i_kv)])
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        sh_u.release()
 
         # =====================================================================
         # EMPTY WARP -- idle
@@ -960,15 +987,18 @@ class KDARecomputeWU:
                 for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                     m_coord, k_coord = tTR_cM[ei]
                     k_val = sK[(k_coord, m_coord, kgk_h.index)].to(self.acc_dtype)
-                    gk_val = sGK[(k_coord, m_coord, kgk_h.index)]
                     beta_val = sBeta[k_coord].to(self.acc_dtype)
-                    if cutlass.const_expr(self.is_varlen):
+                    if cutlass.const_expr(self.preprocessed_k):
+                        tTR_rBproc[ei] = (k_val * beta_val).to(self.io_dtype)
+                    elif cutlass.const_expr(self.is_varlen):
+                        gk_val = sGK[(k_coord, m_coord, kgk_h.index)]
                         gn_val = sGK[(remaining - 1, m_coord, kgk_h.index)]
                         bproc_val = (k_val * beta_val * cute.exp2(gk_val)).to(self.io_dtype)
                         kg_val = (k_val * cute.exp2(gn_val - gk_val, fastmath=True)).to(self.io_dtype)
                         tTR_rBproc[ei] = cutlass.select_(k_coord < remaining, bproc_val, self.io_dtype(0.0))
                         tTR_rKg[ei] = cutlass.select_(k_coord < remaining, kg_val, self.io_dtype(0.0))
                     else:
+                        gk_val = sGK[(k_coord, m_coord, kgk_h.index)]
                         gn_val = sGK[(self.BT - 1, m_coord, kgk_h.index)]
                         beta_val = sBeta[k_coord].to(self.acc_dtype)
                         tTR_rBproc[ei] = (k_val * beta_val * cute.exp2(gk_val, fastmath=self.use_fast_math)).to(self.io_dtype)
@@ -1000,7 +1030,9 @@ class KDARecomputeWU:
                 cute.arch.fence_view_async_tmem_store()
                 bproc_h2.commit()
 
-                if cutlass.const_expr(self.is_varlen):
+                if cutlass.const_expr(self.preprocessed_k):
+                    pass
+                elif cutlass.const_expr(self.is_varlen):
                     # === Varlen: scatter kg to sStore → sync → 128-thread R2G ===
                     for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
                         m_coord, k_coord = tTR_cM[ei]
@@ -1125,8 +1157,21 @@ def _compile_recompute_wu(
     persistent=True,
     is_varlen=False,
     beta_dtype=cutlass.Float32,
+    preprocessed_k=False,
 ):
-    key = (H, K, V, chunk_size, block_k, block_v, persistent, is_varlen, beta_dtype, USE_FAST_MATH)
+    key = (
+        H,
+        K,
+        V,
+        chunk_size,
+        block_k,
+        block_v,
+        persistent,
+        is_varlen,
+        beta_dtype,
+        preprocessed_k,
+        USE_FAST_MATH,
+    )
     if key in _recompute_wu_cache:
         return _recompute_wu_cache[key]
 
@@ -1138,6 +1183,7 @@ def _compile_recompute_wu(
         block_v=block_v,
         beta_dtype=beta_dtype,
         is_varlen=is_varlen,
+        preprocessed_k=preprocessed_k,
         use_fast_math=USE_FAST_MATH,
     )
 
@@ -1152,7 +1198,12 @@ def _compile_recompute_wu(
         v_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, V), stride_order=(2, 1, 0), assumed_align=128)
         beta_fake = make_fake_compact_tensor(beta_dtype, (sym_a, H), stride_order=(1, 0), assumed_align=128)
         A_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, BT), stride_order=(2, 1, 0), assumed_align=128)
-        gk_fake = make_fake_compact_tensor(cutlass.Float32, (sym_a, H, K), stride_order=(2, 1, 0), assumed_align=128)
+        gk_fake = make_fake_compact_tensor(
+            cutlass.BFloat16 if preprocessed_k else cutlass.Float32,
+            (sym_a, H, K),
+            stride_order=(2, 1, 0),
+            assumed_align=128,
+        )
         w_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, K), stride_order=(2, 1, 0), assumed_align=128)
         u_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, V), stride_order=(2, 1, 0), assumed_align=128)
         kg_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, K), stride_order=(2, 1, 0), assumed_align=128)
@@ -1163,7 +1214,12 @@ def _compile_recompute_wu(
         A_fake = make_fake_compact_tensor(
             cutlass.BFloat16, (sym_a, sym_b, H, BT), stride_order=(3, 2, 1, 0), assumed_align=128
         )
-        gk_fake = make_fake_compact_tensor(cutlass.Float32, (sym_a, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
+        gk_fake = make_fake_compact_tensor(
+            cutlass.BFloat16 if preprocessed_k else cutlass.Float32,
+            (sym_a, sym_b, H, K),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
+        )
         w_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
         u_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, V), stride_order=(3, 2, 1, 0), assumed_align=128)
         kg_fake = make_fake_compact_tensor(
@@ -1290,3 +1346,86 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
     elif packed_4d:
         w, u, kg = (x.unsqueeze(0) for x in (w, u, kg))
     return w, u, None, kg
+
+
+def recompute_w_u_from_preprocessed(
+    k_scaled,
+    v,
+    beta,
+    A,
+    cu_seqlens=None,
+    chunk_indices=None,
+    block_k=None,
+    block_v=None,
+):
+    """Compute only ``w`` and ``u`` when fused intra already produced scaled k.
+
+    ``k_scaled`` is ``k * exp2(gk)`` and ``A`` is the inverted intra-chunk
+    matrix. The companion fused intra kernel already produced ``kg``, so this
+    path avoids loading the fp32 cumulative gate and writing ``kg`` again.
+    """
+    is_varlen = cu_seqlens is not None
+    packed_4d = is_varlen and k_scaled.dim() == 4
+    restore_packed = False
+    if packed_4d:
+        if k_scaled.shape[0] != 1:
+            raise ValueError("varlen inputs must be packed with batch dimension 1")
+        k_scaled, v, beta, A = (x.squeeze(0) for x in (k_scaled, v, beta, A))
+
+        uniform = _uniform_problem(cu_seqlens)
+        if uniform is not None and uniform[1] % A.shape[-1] == 0:
+            batch, seq_len = uniform
+            k_scaled = k_scaled.view(batch, seq_len, *k_scaled.shape[1:])
+            v = v.view(batch, seq_len, *v.shape[1:])
+            beta = beta.view(batch, seq_len, *beta.shape[1:])
+            A = A.view(batch, seq_len, *A.shape[1:])
+            is_varlen = False
+            packed_4d = False
+            restore_packed = True
+
+    if is_varlen:
+        BT = A.shape[-1]
+        T_total, H, K = k_scaled.shape
+        V = v.shape[2]
+        num_seqs = cu_seqlens.shape[0] - 1
+        ci_s = chunk_indices.reshape(-1) if chunk_indices is not None else prepare_chunk_indices(cu_seqlens, BT).reshape(-1)
+        total_nt = ci_s.shape[0] // 2
+        ps = (Int32(num_seqs), Int32(T_total), Int32(H), Int32(K), Int32(V))
+        cu_s = cu_seqlens
+    else:
+        B, T, H, K = k_scaled.shape
+        V = v.shape[-1]
+        BT = A.shape[-1]
+        total_nt = B * ((T + BT - 1) // BT)
+        ps = (Int32(B), Int32(T), Int32(H), Int32(K), Int32(V))
+        global _dummy_cu_seqlens, _dummy_chunk_indices
+        if _dummy_cu_seqlens is None or _dummy_cu_seqlens.device != k_scaled.device:
+            _dummy_cu_seqlens = torch.zeros(2, dtype=torch.int32, device=k_scaled.device)
+        if _dummy_chunk_indices is None or _dummy_chunk_indices.device != k_scaled.device:
+            _dummy_chunk_indices = torch.zeros(2, dtype=torch.int32, device=k_scaled.device)
+        cu_s = _dummy_cu_seqlens
+        ci_s = _dummy_chunk_indices
+
+    w = torch.empty_like(k_scaled)
+    u = torch.empty_like(v)
+    compiled_fn = _compile_recompute_wu(
+        H,
+        K,
+        V,
+        chunk_size=BT,
+        block_k=block_k,
+        block_v=block_v,
+        is_varlen=is_varlen,
+        beta_dtype=cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16,
+        preprocessed_k=True,
+    )
+
+    # gk and kg are unused compile-signature placeholders for this
+    # specialization. Reusing existing bf16 buffers avoids extra allocations.
+    compiled_fn(k_scaled, v, beta, A, k_scaled, w, u, w, cu_s, ci_s, ps, Int32(total_nt))
+
+    if restore_packed:
+        w, u = (x.flatten(0, 1).unsqueeze(0) for x in (w, u))
+    elif packed_4d:
+        w, u = (x.unsqueeze(0) for x in (w, u))
+    return w, u

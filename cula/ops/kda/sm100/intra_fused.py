@@ -2569,4 +2569,3 @@ def _get_dt_bias_ct(dt_bias, H, K):
 
 def _get_empty_bias_ct(device):
     return _get_bias_ct(None, 1, 1, device)
-

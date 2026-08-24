@@ -38,6 +38,7 @@ from cula.ops.kda.sm100.intra_fused import (
     chunk_kda_fwd_intra_sm100_equal,
     chunk_kda_fwd_intra_sm100_varlen,
 )
+from cula.ops.kda.sm100.recompute_wu import recompute_w_u_from_preprocessed
 
 
 @dataclass
@@ -207,7 +208,7 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
         raise NotImplementedError(f"Unsupported CuTeDSL variant: {args.cutedsl_variant}")
 
     def run():
-        return cutedsl_fn(
+        out = cutedsl_fn(
             q=q,
             k=k,
             g=g,
@@ -218,6 +219,10 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
             safe_gate=True,
             lower_bound=args.lower_bound,
         )
+        if args.with_recompute_wu:
+            w, u = recompute_w_u_from_preprocessed(out[0], k, beta, out[5])
+            return (*out, w, u)
+        return out
 
     def run_fla_with_gk():
         gk = _reference_gk_equal(g, a_log, dt_bias, args.lower_bound)
@@ -256,6 +261,13 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
         ]
         if args.cutedsl_variant in ("flashinfer-k123-copy-pdl-fp32-inv",):
             stats.append(("Akk_valid", accuracy_stats(akk_fla, cutedsl[5], valid_mask)))
+        if args.with_recompute_wu:
+            stats.extend(
+                [
+                    ("w", accuracy_stats(fla_with_gk[1], cutedsl[6])),
+                    ("u", accuracy_stats(fla_with_gk[2], cutedsl[7])),
+                ]
+            )
         return stats
 
     nt = args.B * (args.T // BT)
@@ -279,7 +291,7 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
     if args.cutedsl_variant == "flashinfer-k123-copy":
 
         def run():
-            return chunk_kda_fwd_intra_sm100_varlen(
+            out = chunk_kda_fwd_intra_sm100_varlen(
                 q=q,
                 k=k,
                 g=g,
@@ -293,11 +305,22 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
                 lower_bound=args.lower_bound,
                 seq_lens=seq_lens,
             )
+            if args.with_recompute_wu:
+                w, u = recompute_w_u_from_preprocessed(
+                    out[0],
+                    k,
+                    beta,
+                    out[5],
+                    cu_seqlens=cu_seqlens,
+                    chunk_indices=chunk_indices,
+                )
+                return (*out, w, u)
+            return out
 
     elif args.cutedsl_variant == "flashinfer-k123-copy-pdl-fp32-inv":
 
         def run():
-            return chunk_kda_fwd_intra_sm100_varlen(
+            out = chunk_kda_fwd_intra_sm100_varlen(
                 q=q,
                 k=k,
                 g=g,
@@ -312,6 +335,17 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
                 seq_lens=seq_lens,
                 pdl_fp32_akk_inv=True,
             )
+            if args.with_recompute_wu:
+                w, u = recompute_w_u_from_preprocessed(
+                    out[0],
+                    k,
+                    beta,
+                    out[5],
+                    cu_seqlens=cu_seqlens,
+                    chunk_indices=chunk_indices,
+                )
+                return (*out, w, u)
+            return out
 
     def run_fla_with_gk():
         gk = kda_gate_chunk_cumsum(
@@ -354,6 +388,13 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
         ]
         if args.cutedsl_variant in ("flashinfer-k123-copy-pdl-fp32-inv",):
             stats.append(("Akk_valid", accuracy_stats(akk_fla, cutedsl[5], valid_mask)))
+        if args.with_recompute_wu:
+            stats.extend(
+                [
+                    ("w", accuracy_stats(fla_with_gk[1], cutedsl[6])),
+                    ("u", accuracy_stats(fla_with_gk[2], cutedsl[7])),
+                ]
+            )
         return stats
 
     nt, t_launch, pure = _varlen_launch_summary(seq_lens)
@@ -474,6 +515,11 @@ def main() -> None:
     parser.add_argument("--no-bias", action="store_true")
     parser.add_argument("--no-fla", action="store_true", help="Only time CuTeDSL; skip FLA timing and accuracy comparison.")
     parser.add_argument(
+        "--with-recompute-wu",
+        action="store_true",
+        help="Include the specialized w/u recompute after fused intra in CuTeDSL timing.",
+    )
+    parser.add_argument(
         "--cutedsl-variant",
         choices=(
             "flashinfer-k123-copy",
@@ -487,6 +533,8 @@ def main() -> None:
 
     if args.K != K_DIM:
         raise NotImplementedError(f"SM100 training intra currently supports K={K_DIM}, got {args.K}.")
+    if args.with_recompute_wu and args.cutedsl_variant != "flashinfer-k123-copy-pdl-fp32-inv":
+        raise ValueError("--with-recompute-wu requires the pdl-fp32-inv variant so A_kk is inverted.")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required.")
 
@@ -506,4 +554,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
