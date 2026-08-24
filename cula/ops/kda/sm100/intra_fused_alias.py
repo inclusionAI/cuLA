@@ -115,7 +115,6 @@ _input_wrap_cache = {}
 _eqlen_dummy_cache = {}
 _dt_bias_cache = {}
 _empty_bias_cache = {}
-_out_buffer_cache = {}
 
 BT = 64
 BC = 16
@@ -1443,7 +1442,7 @@ def kda_fwd_intra_sm100_training_triton_reduce_kernel(
                         exp2_kg = cute.exp2(gk_last_cs - cs, fastmath=True)
 
                         rKsOut[vi] = (k_val * exp2_cs).to(cutlass.BFloat16)
-                        rQsOut[vi] = (q_val * exp2_cs).to(cutlass.BFloat16)
+                        rQsOut[vi] = (q_val * exp2_cs * scale).to(cutlass.BFloat16)
                         rKgOut[vi] = (k_val * exp2_kg).to(cutlass.BFloat16)
 
                     if IS_VARLEN and not VARLEN_PURE:
@@ -2347,21 +2346,6 @@ def _get_dt_bias_ct(dt_bias, H, K):
     return entry[1]
 
 
-def _get_out_buffers_equal(device, B, T_total, H):
-    key = (device.index if device.index is not None else 0, B, T_total, H)
-    entry = _out_buffer_cache.get(key)
-    if entry is None:
-        k_scaled = torch.empty(B, T_total, H, K_DIM, device=device, dtype=torch.bfloat16)
-        kg = torch.empty_like(k_scaled)
-        q_scaled = torch.empty_like(k_scaled)
-        gk_last_exp = torch.empty(B, T_total // BT, H, K_DIM, device=device, dtype=torch.float32)
-        A_qk = torch.zeros(B, T_total, H, BT, device=device, dtype=torch.bfloat16)
-        A_kk = torch.zeros_like(A_qk)
-        entry = (k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk)
-        _out_buffer_cache[key] = entry
-    return entry
-
-
 def chunk_kda_fwd_intra_sm100_training_triton_reduce(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2429,7 +2413,12 @@ def chunk_kda_fwd_intra_sm100_training_triton_reduce(
     has_bias = dt_bias is not None
     cache_key = (dev, B, NT, H, has_bias, safe_gate)
 
-    k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk = _get_out_buffers_equal(q.device, B, T_total, H)
+    k_scaled = torch.empty_like(k)
+    kg = torch.empty_like(k)
+    q_scaled = torch.empty_like(q)
+    gk_last_exp = torch.empty(B, NT, H, K_DIM, device=q.device, dtype=torch.float32)
+    A_qk = torch.zeros(B, T_total, H, BT, device=q.device, dtype=torch.bfloat16)
+    A_kk = torch.zeros(B, T_total, H, BT, device=q.device, dtype=torch.bfloat16)
 
     q_ct = _ct_cached(q, cutlass.BFloat16)
     k_ct = _ct_cached(k, cutlass.BFloat16)
