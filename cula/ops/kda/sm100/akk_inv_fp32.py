@@ -174,6 +174,11 @@ def akk_inv_fp32_physical_kernel(
             mA_out[b_idx, t_row, h_idx, col0] = val0.to(cutlass.BFloat16)
             mA_out[b_idx, t_row, h_idx, col1] = val1.to(cutlass.BFloat16)
 
+    if cutlass.const_expr(WAIT_ON_PDL != 0):
+        cute.arch.barrier()
+        cute.arch.fence_acq_rel_gpu()
+        cute.arch.griddepcontrol_launch_dependents()
+
 
 @cute.jit
 def akk_inv_fp32_physical_host(

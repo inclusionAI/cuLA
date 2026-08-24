@@ -229,7 +229,13 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
             lower_bound=args.lower_bound,
         )
         if args.with_recompute_wu:
-            w, u = recompute_w_u_from_preprocessed(out[0], k, beta, out[5])
+            w, u = recompute_w_u_from_preprocessed(
+                out[0],
+                k,
+                beta,
+                out[5],
+                wait_on_pdl=args.cutedsl_variant == "flashinfer-k123-copy-pdl-fp32-inv",
+            )
             return (*out, w, u)
         return out
 
@@ -347,6 +353,7 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
                     out[5],
                     cu_seqlens=cu_seqlens,
                     chunk_indices=chunk_indices,
+                    wait_on_pdl=args.cutedsl_variant == "flashinfer-k123-copy-pdl-fp32-inv",
                 )
                 return (*out, w, u)
             return out
@@ -377,6 +384,7 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
                     out[5],
                     cu_seqlens=cu_seqlens,
                     chunk_indices=chunk_indices,
+                    wait_on_pdl=True,
                 )
                 return (*out, w, u)
             return out
