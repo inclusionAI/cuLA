@@ -221,7 +221,7 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
             lower_bound=args.lower_bound,
         )
         if args.with_recompute_wu:
-            w, u = recompute_w_u_from_preprocessed(out[0], k, beta, out[5], direct_store=args.wu_direct_store)
+            w, u = recompute_w_u_from_preprocessed(out[0], k, beta, out[5])
             return (*out, w, u)
         return out
 
@@ -336,7 +336,6 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
                     out[5],
                     cu_seqlens=cu_seqlens,
                     chunk_indices=chunk_indices,
-                    direct_store=args.wu_direct_store,
                 )
                 return (*out, w, u)
             return out
@@ -367,7 +366,6 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
                     out[5],
                     cu_seqlens=cu_seqlens,
                     chunk_indices=chunk_indices,
-                    direct_store=args.wu_direct_store,
                 )
                 return (*out, w, u)
             return out
@@ -572,11 +570,6 @@ def main() -> None:
         "--with-recompute-wu",
         action="store_true",
         help="Include the specialized w/u recompute after fused intra in CuTeDSL timing.",
-    )
-    parser.add_argument(
-        "--wu-direct-store",
-        action="store_true",
-        help="Use direct 256-bit output stores in the specialized recompute-WU kernel.",
     )
     parser.add_argument(
         "--cutedsl-variant",
