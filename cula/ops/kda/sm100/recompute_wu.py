@@ -110,8 +110,8 @@ class KDARecomputeWU:
         #   Regs: 65536/(2×256) = 128/thread → CUDA=200, others=56 per warp group
         #   SMEM: ~74KB/CTA × 2 = 148KB < 228KB ✓
         self.min_occupancy = 2
-        self.num_regs_cuda = 200
-        self.num_regs_others = 56
+        self.num_regs_cuda = 208
+        self.num_regs_others = 40
         self.a_stage = 1
         self.kgk_stage = 1
         self.v_tma_stage = 1
