@@ -1092,226 +1092,6 @@ def fused_kernel123(
         for s in range(NUM_STAGES):
             cute.arch.mbarrier_arrive(stage_reuse_mbars + s)
             if mma_warp_tmp < NUM_STORE_WARPS:
-                if cutlass.const_expr(FUSE_AKK_INV != 0):
-                    store_tid = store_warp * 32 + lane_id
-
-                    # Convert the block-transposed K123 accumulator into a
-                    # logical unit-lower matrix before the TF32 Schur inverse.
-                    for norm_i in cutlass.range_constexpr((BT * BT) // (NUM_STORE_WARPS * 32)):
-                        linear = store_tid + norm_i * (NUM_STORE_WARPS * 32)
-                        norm_row = linear // BT
-                        norm_col = linear % BT
-                        if norm_row >= norm_col:
-                            norm_val = cutlass.Float32(0.0)
-                            if norm_row == norm_col:
-                                norm_val = cutlass.Float32(1.0)
-                            else:
-                                norm_row_blk = norm_row // BC
-                                norm_col_blk = norm_col // BC
-                                src_row = norm_row
-                                src_col = norm_col
-                                if norm_row_blk != norm_col_blk:
-                                    src_row = norm_col_blk * BC + norm_row % BC
-                                    src_col = norm_row_blk * BC + norm_col % BC
-                                norm_val = cutlass.Float32(csAkk[src_row, src_col])
-                                if IS_VARLEN and not VARLEN_PURE:
-                                    if chunk_start + norm_row >= st_eos:
-                                        norm_val = cutlass.Float32(0.0)
-                            csAkk[norm_row, norm_col] = norm_val
-                    store_internal_barrier()
-
-                    if store_tid < 64:
-                        _tf32_invert_diag_forward16(csAkk, store_tid // 16, store_tid)
-                    store_internal_barrier()
-
-                    if store_tid < 64:
-                        block32 = store_tid // 32
-                        row_base = block32 * 32
-                        c0, c1, c2, c3, c4, c5, c6, c7 = _tf32_matmul16_smem_smem(
-                            csAkk,
-                            row_base + 16,
-                            row_base + 16,
-                            csAkk,
-                            row_base + 16,
-                            row_base,
-                            lane_id,
-                        )
-                        _tf32_store_C16_tmp(
-                            sInvTmp,
-                            block32,
-                            -c0,
-                            -c1,
-                            -c2,
-                            -c3,
-                            -c4,
-                            -c5,
-                            -c6,
-                            -c7,
-                            lane_id,
-                        )
-                    store_internal_barrier()
-
-                    if store_tid < 64:
-                        block32 = store_tid // 32
-                        row_base = block32 * 32
-                        c0, c1, c2, c3, c4, c5, c6, c7 = _tf32_matmul16_tmp_smem(
-                            sInvTmp,
-                            block32,
-                            csAkk,
-                            row_base,
-                            row_base,
-                            lane_id,
-                        )
-                        _tf32_store_C16_smem(
-                            csAkk,
-                            row_base + 16,
-                            row_base,
-                            c0,
-                            c1,
-                            c2,
-                            c3,
-                            c4,
-                            c5,
-                            c6,
-                            c7,
-                            lane_id,
-                        )
-                    store_internal_barrier()
-
-                    inv_x = store_warp // 2
-                    inv_y = store_warp % 2
-                    inv_slot = store_warp
-                    inv_row_o = 32 + inv_y * 16
-                    inv_col_c = inv_x * 16
-
-                    p0, p1, p2, p3, p4, p5, p6, p7 = _tf32_matmul16_smem_smem(
-                        csAkk,
-                        inv_row_o,
-                        32,
-                        csAkk,
-                        32,
-                        inv_col_c,
-                        lane_id,
-                    )
-                    q0, q1, q2, q3, q4, q5, q6, q7 = _tf32_matmul16_smem_smem(
-                        csAkk,
-                        inv_row_o,
-                        48,
-                        csAkk,
-                        48,
-                        inv_col_c,
-                        lane_id,
-                    )
-                    _tf32_store_C16_tmp(
-                        sInvTmp,
-                        inv_slot,
-                        -(p0 + q0),
-                        -(p1 + q1),
-                        -(p2 + q2),
-                        -(p3 + q3),
-                        -(p4 + q4),
-                        -(p5 + q5),
-                        -(p6 + q6),
-                        -(p7 + q7),
-                        lane_id,
-                    )
-                    store_internal_barrier()
-
-                    o0, o1, o2, o3, o4, o5, o6, o7 = _tf32_matmul16_tmp_smem(
-                        sInvTmp,
-                        inv_slot,
-                        csAkk,
-                        inv_x * 16,
-                        0,
-                        lane_id,
-                    )
-                    r0, r1, r2, r3, r4, r5, r6, r7 = _tf32_matmul16_tmp_smem(
-                        sInvTmp,
-                        inv_slot,
-                        csAkk,
-                        inv_x * 16,
-                        16,
-                        lane_id,
-                    )
-                    if inv_x == 0:
-                        _tf32_store_C16_smem(
-                            csAkk,
-                            inv_row_o,
-                            0,
-                            o0,
-                            o1,
-                            o2,
-                            o3,
-                            o4,
-                            o5,
-                            o6,
-                            o7,
-                            lane_id,
-                        )
-                        _tf32_store_C16_smem(
-                            csAkk,
-                            inv_row_o,
-                            16,
-                            r0,
-                            r1,
-                            r2,
-                            r3,
-                            r4,
-                            r5,
-                            r6,
-                            r7,
-                            lane_id,
-                        )
-                    store_internal_barrier()
-                    if inv_x == 1:
-                        _tf32_add_store_C16_smem(
-                            csAkk,
-                            inv_row_o,
-                            0,
-                            o0,
-                            o1,
-                            o2,
-                            o3,
-                            o4,
-                            o5,
-                            o6,
-                            o7,
-                            lane_id,
-                        )
-                        _tf32_add_store_C16_smem(
-                            csAkk,
-                            inv_row_o,
-                            16,
-                            r0,
-                            r1,
-                            r2,
-                            r3,
-                            r4,
-                            r5,
-                            r6,
-                            r7,
-                            lane_id,
-                        )
-                    store_internal_barrier()
-
-                    row_base_warp = store_warp * (BT // NUM_STORE_WARPS)
-                    for ri in cutlass.range_constexpr(BT // NUM_STORE_WARPS):
-                        local_row = row_base_warp + ri
-                        abs_row = chunk_start + local_row
-                        val0 = cutlass.Float32(csAkk[local_row, col_lo])
-                        val1 = cutlass.Float32(csAkk[local_row, col_hi])
-                        if local_row < col_lo:
-                            val0 = cutlass.Float32(0.0)
-                        if local_row < col_hi:
-                            val1 = cutlass.Float32(0.0)
-                        rAkkOut[0] = val0.to(cutlass.BFloat16)
-                        rAkkOut[1] = val1.to(cutlass.BFloat16)
-                        if IS_VARLEN and not VARLEN_PURE:
-                            if abs_row < st_eos:
-                                cute.autovec_copy(rAkkOut, mAkk_v2[i_b, abs_row, i_h, col_vec_idx, None])
-                        else:
-                            cute.autovec_copy(rAkkOut, mAkk_v2[i_b, abs_row, i_h, col_vec_idx, None])
-
                 cute.arch.mbarrier_arrive(store_done_mbars + s)
 
     # =================================================================
@@ -2146,6 +1926,226 @@ def fused_kernel123(
                                     if is_diag and local_row == local_col:
                                         akk_val = cutlass.BFloat16(1.0)
                                     mAkk[i_b, gmem_akk_row_base + local_row, i_h, gmem_akk_col_base + local_col] = akk_val
+
+                if cutlass.const_expr(FUSE_AKK_INV != 0):
+                    store_tid = store_warp * 32 + lane_id
+
+                    # Convert the block-transposed K123 accumulator into a
+                    # logical unit-lower matrix before the TF32 Schur inverse.
+                    for norm_i in cutlass.range_constexpr((BT * BT) // (NUM_STORE_WARPS * 32)):
+                        linear = store_tid + norm_i * (NUM_STORE_WARPS * 32)
+                        norm_row = linear // BT
+                        norm_col = linear % BT
+                        if norm_row >= norm_col:
+                            norm_val = cutlass.Float32(0.0)
+                            if norm_row == norm_col:
+                                norm_val = cutlass.Float32(1.0)
+                            else:
+                                norm_row_blk = norm_row // BC
+                                norm_col_blk = norm_col // BC
+                                src_row = norm_row
+                                src_col = norm_col
+                                if norm_row_blk != norm_col_blk:
+                                    src_row = norm_col_blk * BC + norm_row % BC
+                                    src_col = norm_row_blk * BC + norm_col % BC
+                                norm_val = cutlass.Float32(csAkk[src_row, src_col])
+                                if IS_VARLEN and not VARLEN_PURE:
+                                    if chunk_start + norm_row >= st_eos:
+                                        norm_val = cutlass.Float32(0.0)
+                            csAkk[norm_row, norm_col] = norm_val
+                    store_internal_barrier()
+
+                    if store_tid < 64:
+                        _tf32_invert_diag_forward16(csAkk, store_tid // 16, store_tid)
+                    store_internal_barrier()
+
+                    if store_tid < 64:
+                        block32 = store_tid // 32
+                        row_base = block32 * 32
+                        c0, c1, c2, c3, c4, c5, c6, c7 = _tf32_matmul16_smem_smem(
+                            csAkk,
+                            row_base + 16,
+                            row_base + 16,
+                            csAkk,
+                            row_base + 16,
+                            row_base,
+                            lane_id,
+                        )
+                        _tf32_store_C16_tmp(
+                            sInvTmp,
+                            block32,
+                            -c0,
+                            -c1,
+                            -c2,
+                            -c3,
+                            -c4,
+                            -c5,
+                            -c6,
+                            -c7,
+                            lane_id,
+                        )
+                    store_internal_barrier()
+
+                    if store_tid < 64:
+                        block32 = store_tid // 32
+                        row_base = block32 * 32
+                        c0, c1, c2, c3, c4, c5, c6, c7 = _tf32_matmul16_tmp_smem(
+                            sInvTmp,
+                            block32,
+                            csAkk,
+                            row_base,
+                            row_base,
+                            lane_id,
+                        )
+                        _tf32_store_C16_smem(
+                            csAkk,
+                            row_base + 16,
+                            row_base,
+                            c0,
+                            c1,
+                            c2,
+                            c3,
+                            c4,
+                            c5,
+                            c6,
+                            c7,
+                            lane_id,
+                        )
+                    store_internal_barrier()
+
+                    inv_x = store_warp // 2
+                    inv_y = store_warp % 2
+                    inv_slot = store_warp
+                    inv_row_o = 32 + inv_y * 16
+                    inv_col_c = inv_x * 16
+
+                    p0, p1, p2, p3, p4, p5, p6, p7 = _tf32_matmul16_smem_smem(
+                        csAkk,
+                        inv_row_o,
+                        32,
+                        csAkk,
+                        32,
+                        inv_col_c,
+                        lane_id,
+                    )
+                    q0, q1, q2, q3, q4, q5, q6, q7 = _tf32_matmul16_smem_smem(
+                        csAkk,
+                        inv_row_o,
+                        48,
+                        csAkk,
+                        48,
+                        inv_col_c,
+                        lane_id,
+                    )
+                    _tf32_store_C16_tmp(
+                        sInvTmp,
+                        inv_slot,
+                        -(p0 + q0),
+                        -(p1 + q1),
+                        -(p2 + q2),
+                        -(p3 + q3),
+                        -(p4 + q4),
+                        -(p5 + q5),
+                        -(p6 + q6),
+                        -(p7 + q7),
+                        lane_id,
+                    )
+                    store_internal_barrier()
+
+                    o0, o1, o2, o3, o4, o5, o6, o7 = _tf32_matmul16_tmp_smem(
+                        sInvTmp,
+                        inv_slot,
+                        csAkk,
+                        inv_x * 16,
+                        0,
+                        lane_id,
+                    )
+                    r0, r1, r2, r3, r4, r5, r6, r7 = _tf32_matmul16_tmp_smem(
+                        sInvTmp,
+                        inv_slot,
+                        csAkk,
+                        inv_x * 16,
+                        16,
+                        lane_id,
+                    )
+                    if inv_x == 0:
+                        _tf32_store_C16_smem(
+                            csAkk,
+                            inv_row_o,
+                            0,
+                            o0,
+                            o1,
+                            o2,
+                            o3,
+                            o4,
+                            o5,
+                            o6,
+                            o7,
+                            lane_id,
+                        )
+                        _tf32_store_C16_smem(
+                            csAkk,
+                            inv_row_o,
+                            16,
+                            r0,
+                            r1,
+                            r2,
+                            r3,
+                            r4,
+                            r5,
+                            r6,
+                            r7,
+                            lane_id,
+                        )
+                    store_internal_barrier()
+                    if inv_x == 1:
+                        _tf32_add_store_C16_smem(
+                            csAkk,
+                            inv_row_o,
+                            0,
+                            o0,
+                            o1,
+                            o2,
+                            o3,
+                            o4,
+                            o5,
+                            o6,
+                            o7,
+                            lane_id,
+                        )
+                        _tf32_add_store_C16_smem(
+                            csAkk,
+                            inv_row_o,
+                            16,
+                            r0,
+                            r1,
+                            r2,
+                            r3,
+                            r4,
+                            r5,
+                            r6,
+                            r7,
+                            lane_id,
+                        )
+                    store_internal_barrier()
+
+                    row_base_warp = store_warp * (BT // NUM_STORE_WARPS)
+                    for ri in cutlass.range_constexpr(BT // NUM_STORE_WARPS):
+                        local_row = row_base_warp + ri
+                        abs_row = chunk_start + local_row
+                        val0 = cutlass.Float32(csAkk[local_row, col_lo])
+                        val1 = cutlass.Float32(csAkk[local_row, col_hi])
+                        if local_row < col_lo:
+                            val0 = cutlass.Float32(0.0)
+                        if local_row < col_hi:
+                            val1 = cutlass.Float32(0.0)
+                        rAkkOut[0] = val0.to(cutlass.BFloat16)
+                        rAkkOut[1] = val1.to(cutlass.BFloat16)
+                        if IS_VARLEN and not VARLEN_PURE:
+                            if abs_row < st_eos:
+                                cute.autovec_copy(rAkkOut, mAkk_v2[i_b, abs_row, i_h, col_vec_idx, None])
+                        else:
+                            cute.autovec_copy(rAkkOut, mAkk_v2[i_b, abs_row, i_h, col_vec_idx, None])
 
                 cute.arch.mbarrier_arrive(store_done_mbars + s)
 
