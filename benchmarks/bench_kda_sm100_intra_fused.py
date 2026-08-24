@@ -39,7 +39,7 @@ from cula.ops.kda.sm100.intra_fused import (
     chunk_kda_fwd_intra_sm100_equal,
     chunk_kda_fwd_intra_sm100_varlen,
 )
-from cula.ops.kda.sm100.recompute_wu import recompute_w_u_from_preprocessed
+from cula.ops.kda.sm100.recompute_wu import recompute_w_u_from_preinverse, recompute_w_u_from_preprocessed
 
 
 @dataclass
@@ -205,6 +205,14 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
                 pdl_fp32_akk_inv=True,
             )
 
+    elif args.cutedsl_variant == "flashinfer-k123-copy-fused-inv-wu":
+
+        def cutedsl_fn(**kwargs):
+            return chunk_kda_fwd_intra_sm100_equal(
+                **kwargs,
+                fp32_akk_workspace_only=True,
+            )
+
     else:
         raise NotImplementedError(f"Unsupported CuTeDSL variant: {args.cutedsl_variant}")
 
@@ -220,6 +228,9 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
             safe_gate=True,
             lower_bound=args.lower_bound,
         )
+        if args.cutedsl_variant == "flashinfer-k123-copy-fused-inv-wu":
+            w, u, akk = recompute_w_u_from_preinverse(out[0], k, beta, out[5])
+            return (*out[:5], akk, w, u)
         if args.with_recompute_wu:
             w, u = recompute_w_u_from_preprocessed(out[0], k, beta, out[5])
             return (*out, w, u)
@@ -281,7 +292,10 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
             ("q_scaled", accuracy_stats(q_scaled_ref, cutedsl[2])),
             ("Aqk_valid", accuracy_stats(aqk_fla, cutedsl[4], valid_mask)),
         ]
-        if args.cutedsl_variant in ("flashinfer-k123-copy-pdl-fp32-inv",):
+        if args.cutedsl_variant in (
+            "flashinfer-k123-copy-pdl-fp32-inv",
+            "flashinfer-k123-copy-fused-inv-wu",
+        ):
             stats.append(("Akk_valid", accuracy_stats(akk_fla, cutedsl[5], valid_mask)))
         if args.with_recompute_wu:
             stats.extend(
@@ -576,6 +590,7 @@ def main() -> None:
         choices=(
             "flashinfer-k123-copy",
             "flashinfer-k123-copy-pdl-fp32-inv",
+            "flashinfer-k123-copy-fused-inv-wu",
         ),
         default="flashinfer-k123-copy-pdl-fp32-inv",
         help=("CuTeDSL variant to benchmark. Variants without Akk inverse skip Akk accuracy."),
@@ -585,8 +600,13 @@ def main() -> None:
 
     if args.K != K_DIM:
         raise NotImplementedError(f"SM100 training intra currently supports K={K_DIM}, got {args.K}.")
-    if args.with_recompute_wu and args.cutedsl_variant != "flashinfer-k123-copy-pdl-fp32-inv":
-        raise ValueError("--with-recompute-wu requires the pdl-fp32-inv variant so A_kk is inverted.")
+    if args.with_recompute_wu and args.cutedsl_variant not in (
+        "flashinfer-k123-copy-pdl-fp32-inv",
+        "flashinfer-k123-copy-fused-inv-wu",
+    ):
+        raise ValueError("--with-recompute-wu requires an inverted A_kk variant.")
+    if args.cutedsl_variant == "flashinfer-k123-copy-fused-inv-wu" and not args.with_recompute_wu:
+        raise ValueError("the fused inverse/WU variant requires --with-recompute-wu")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required.")
 

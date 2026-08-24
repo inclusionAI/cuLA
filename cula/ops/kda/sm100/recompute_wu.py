@@ -44,7 +44,20 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Int32, Int64
 from fla.ops.utils import prepare_chunk_indices
 
+from cula.ops.kda.sm100.akk_inv_tf32 import (
+    _add_store_C16_smem,
+    _invert_diag_forward16,
+    _matmul16_smem_smem,
+    _matmul16_tmp_smem,
+    _store_C16_smem,
+    _store_C16_tmp,
+)
 from cula.utils import USE_FAST_MATH, assert_blackwell
+
+INV_STRIDE = 68
+INV_TMP_STRIDE = 20
+INV_TMP_SLOTS = 4
+INV_A_ELEMS = 64 * INV_STRIDE
 
 
 def _make_coop_group(size: int):
@@ -64,6 +77,7 @@ class KDARecomputeWU:
         beta_dtype: type[cutlass.Numeric] = cutlass.Float32,
         is_varlen: bool = False,
         preprocessed_k: bool = False,
+        fused_inverse: bool = False,
         persistent: bool = False,
         use_fast_math: bool = True,
     ):
@@ -82,6 +96,8 @@ class KDARecomputeWU:
         self.beta_dtype = beta_dtype
         self.is_varlen = is_varlen
         self.preprocessed_k = preprocessed_k
+        self.fused_inverse = fused_inverse
+        assert not fused_inverse or preprocessed_k, "fused inverse is only valid for the preprocessed WU path"
 
         self.threads_per_warp = 32
         self.cuda_warp_ids = (0, 1, 2, 3)
@@ -197,6 +213,7 @@ class KDARecomputeWU:
         v_in: cute.Tensor,
         beta_in: cute.Tensor,
         A_in: cute.Tensor,
+        A_out_in: cute.Tensor,
         gk_in: cute.Tensor,
         w_in: cute.Tensor,
         u_in: cute.Tensor,
@@ -211,6 +228,7 @@ class KDARecomputeWU:
         v_ptr = v_in.iterator
         beta_ptr = beta_in.iterator
         A_ptr = A_in.iterator
+        A_out_ptr = A_out_in.iterator
         gk_ptr = gk_in.iterator
         w_ptr = w_in.iterator
         u_ptr = u_in.iterator
@@ -260,6 +278,16 @@ class KDARecomputeWU:
             self.bproc_stage,
         )
         assert cute.cosize(b_smem_staged) == cute.cosize(b_epi_staged)
+        inv_a_copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.io_dtype,
+            num_bits_per_copy=self.io_dtype.width,
+        )
+        inv_a_tiled_copy = cute.make_tiled_copy_tv(
+            inv_a_copy_atom,
+            thr_layout=cute.make_ordered_layout((8, 16), order=(1, 0)),
+            val_layout=cute.make_layout((1, 1)),
+        )
 
         # ---------- TMA load op ----------
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
@@ -298,6 +326,7 @@ class KDARecomputeWU:
             stride=(H * BT, 1, (BT, T * H * BT)),
         )
         A_gmem = cute.make_tensor(A_ptr, A_layout)
+        A_out_gmem = cute.make_tensor(A_out_ptr, A_layout)
 
         k_layout = cute.make_layout(
             (T, K, (H, data_B)),
@@ -319,15 +348,26 @@ class KDARecomputeWU:
 
         # ---------- TMA descriptors ----------
         a_smem_one = cute.select(a_smem_staged, mode=[0, 1, 2])
-        tma_atom_A, tma_tensor_A = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            A_gmem,
-            a_smem_one,
-            self.mma_tiler,
-            tiled_mma,
-            cluster_layout.shape,
-        )
-        self.tma_A_bytes = cute.size_in_bytes(self.io_dtype, a_smem_one)
+        if cutlass.const_expr(self.fused_inverse):
+            aphys_smem_layout = cute.make_layout((self.BT, self.BT), stride=(INV_STRIDE, 1))
+            tma_atom_A, tma_tensor_A = cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                A_gmem,
+                aphys_smem_layout,
+                (self.BT, self.BT),
+            )
+            self.tma_A_bytes = self.BT * self.BT * (self.acc_dtype.width // 8)
+        else:
+            aphys_smem_layout = cute.make_layout((1, 1))
+            tma_atom_A, tma_tensor_A = cute.nvgpu.make_tiled_tma_atom_A(
+                tma_load_op,
+                A_gmem,
+                a_smem_one,
+                self.mma_tiler,
+                tiled_mma,
+                cluster_layout.shape,
+            )
+            self.tma_A_bytes = cute.size_in_bytes(self.io_dtype, a_smem_one)
 
         k_epi_smem = cute.select(k_epi_staged, mode=[0, 1])
         tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
@@ -480,6 +520,8 @@ class KDARecomputeWU:
             tma_atom_kg_s2g,
             tma_tensor_kg,
             a_smem_staged,
+            aphys_smem_layout,
+            inv_a_tiled_copy,
             b_smem_staged,
             b_epi_staged,
             k_epi_staged,
@@ -487,6 +529,7 @@ class KDARecomputeWU:
             gk_epi_staged,
             store_epi_staged,
             beta_ptr,
+            A_out_gmem,
             w_ptr,
             u_ptr,
             kg_ptr,
@@ -521,6 +564,8 @@ class KDARecomputeWU:
         tma_atom_kg_s2g: cute.CopyAtom,
         tma_tensor_kg: cute.Tensor,
         a_smem_staged: cute.ComposedLayout,
+        aphys_smem_layout: cute.Layout,
+        inv_a_tiled_copy: cute.TiledCopy,
         b_smem_staged: cute.ComposedLayout,
         b_epi_staged: cute.ComposedLayout,
         k_epi_staged: cute.ComposedLayout,
@@ -528,6 +573,7 @@ class KDARecomputeWU:
         gk_epi_staged: cute.ComposedLayout,
         store_epi_staged: cute.ComposedLayout,
         beta_ptr: cute.Pointer,
+        A_out_gmem: cute.Tensor,
         w_ptr: cute.Pointer,
         u_ptr: cute.Pointer,
         kg_ptr: cute.Pointer,
@@ -588,19 +634,44 @@ class KDARecomputeWU:
             cute.recast_ptr(storage.sGKStore.data_ptr(), store_epi_staged.inner, dtype=self.io_dtype),
             store_epi_staged.outer,
         )
+        sAphys = cute.make_tensor(
+            cute.make_ptr(self.acc_dtype, storage.sGKStore.data_ptr().toint(), cute.AddressSpace.smem),
+            aphys_smem_layout,
+        )
+        inv_tmp_layout = cute.make_layout(
+            (INV_TMP_SLOTS, 16, 16),
+            stride=(16 * INV_TMP_STRIDE, INV_TMP_STRIDE, 1),
+        )
+        sInvTmp = cute.make_tensor(
+            cute.make_ptr(
+                self.acc_dtype,
+                storage.sGKStore.data_ptr().toint() + INV_A_ELEMS * (self.acc_dtype.width // 8),
+                cute.AddressSpace.smem,
+            ),
+            inv_tmp_layout,
+        )
         sBeta = cute.make_tensor(
             cute.make_ptr(self.beta_dtype, storage.sBeta.data_ptr().toint(), cute.AddressSpace.smem),
             cute.make_layout((self.BT,), stride=(1,)),
         )
 
         # ---------- Pipelines ----------
-        load_A_P, load_A_C = pipeline.PipelineTmaUmma.create(
-            num_stages=self.a_stage,
-            producer_group=_make_coop_group(1),
-            consumer_group=_make_coop_group(1),
-            tx_count=self.tma_A_bytes,
-            barrier_storage=storage.load_A_mbar.data_ptr(),
-        ).make_participants()
+        if cutlass.const_expr(self.fused_inverse):
+            load_A_P, load_A_C = pipeline.PipelineTmaAsync.create(
+                num_stages=self.a_stage,
+                producer_group=_make_coop_group(1),
+                consumer_group=_make_coop_group(self.num_cuda_threads),
+                tx_count=self.tma_A_bytes,
+                barrier_storage=storage.load_A_mbar.data_ptr(),
+            ).make_participants()
+        else:
+            load_A_P, load_A_C = pipeline.PipelineTmaUmma.create(
+                num_stages=self.a_stage,
+                producer_group=_make_coop_group(1),
+                consumer_group=_make_coop_group(1),
+                tx_count=self.tma_A_bytes,
+                barrier_storage=storage.load_A_mbar.data_ptr(),
+            ).make_participants()
 
         load_kgk_P, load_kgk_C = pipeline.PipelineTmaAsync.create(
             num_stages=self.kgk_stage,
@@ -650,6 +721,167 @@ class KDARecomputeWU:
         tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
         # =====================================================================
+        # FUSED PHYSICAL-AKK INVERSE
+        # =====================================================================
+        # K123 writes fp32 Akk in a block-transposed physical layout.  For the
+        # fused specialization, load that workspace into the sGK/sStore alias,
+        # normalize and invert it with the four CUDA warps, write the final
+        # bf16 Akk output, and publish the same values directly into the SS-MMA
+        # A operand.  The alias is free until output staging starts.
+        if cutlass.const_expr(self.fused_inverse):
+            if cutlass.const_expr(self.is_varlen):
+                tma_A_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_A)
+            else:
+                tma_A_v = tma_tensor_A
+
+            if warp_idx == self.load_warp_id:
+                if cutlass.const_expr(self.is_varlen):
+                    bSG_sAphys, bSG_gAphys = self._epilog_partition_varlen(
+                        tma_atom_A,
+                        tma_A_v[None, None, (i_h, data_bidx)],
+                        (self.BT, self.BT),
+                        sAphys,
+                    )
+                else:
+                    bSG_sAphys, bSG_gAphys = self._data_tma_partition(
+                        tma_atom_A,
+                        tma_A_v,
+                        (self.BT, self.BT),
+                        sAphys,
+                        i_h,
+                        data_bidx,
+                    )
+                a_load_h = load_A_P.acquire_and_advance()
+                cute.copy(
+                    tma_atom_A,
+                    bSG_gAphys[(None, i_t, 0)],
+                    bSG_sAphys,
+                    tma_bar_ptr=a_load_h.barrier,
+                )
+
+            if warp_idx in self.cuda_warp_ids:
+                a_load_h = load_A_C.wait_and_advance()
+                inv_tid = tidx % self.num_cuda_threads
+                inv_warp = inv_tid // self.threads_per_warp
+                inv_lane = inv_tid % self.threads_per_warp
+                inv_sync = pipeline.NamedBarrier(barrier_id=3, num_threads=self.num_cuda_threads)
+
+                # Physical off-diagonal blocks live in the unused upper half,
+                # so this physical->logical transform is safe in-place.
+                for inv_i in cutlass.range_constexpr((self.BT * self.BT) // self.num_cuda_threads):
+                    linear = inv_tid + inv_i * self.num_cuda_threads
+                    row = linear // self.BT
+                    col = linear % self.BT
+                    value = self.acc_dtype(0.0)
+                    if row >= col:
+                        if row == col:
+                            value = self.acc_dtype(1.0)
+                        else:
+                            row_blk = row // 16
+                            col_blk = col // 16
+                            src_row = row
+                            src_col = col
+                            if row_blk != col_blk:
+                                src_row = col_blk * 16 + row % 16
+                                src_col = row_blk * 16 + col % 16
+                            if cutlass.const_expr(self.is_varlen):
+                                if row < remaining:
+                                    value = self.acc_dtype(sAphys[src_row, src_col])
+                            else:
+                                value = self.acc_dtype(sAphys[src_row, src_col])
+                    sAphys[row, col] = value
+                inv_sync.arrive_and_wait()
+
+                if inv_tid < 64:
+                    _invert_diag_forward16(sAphys, inv_tid // 16, inv_tid)
+                inv_sync.arrive_and_wait()
+
+                if inv_tid < 64:
+                    block32 = inv_tid // 32
+                    row_base = block32 * 32
+                    c0, c1, c2, c3, c4, c5, c6, c7 = _matmul16_smem_smem(
+                        sAphys, row_base + 16, row_base + 16, sAphys, row_base + 16, row_base, inv_lane
+                    )
+                    _store_C16_tmp(sInvTmp, block32, -c0, -c1, -c2, -c3, -c4, -c5, -c6, -c7, inv_lane)
+                inv_sync.arrive_and_wait()
+
+                if inv_tid < 64:
+                    block32 = inv_tid // 32
+                    row_base = block32 * 32
+                    c0, c1, c2, c3, c4, c5, c6, c7 = _matmul16_tmp_smem(sInvTmp, block32, sAphys, row_base, row_base, inv_lane)
+                    _store_C16_smem(sAphys, row_base + 16, row_base, c0, c1, c2, c3, c4, c5, c6, c7, inv_lane)
+                inv_sync.arrive_and_wait()
+
+                inv_x = inv_warp // 2
+                inv_y = inv_warp % 2
+                inv_row_o = 32 + inv_y * 16
+                inv_col_c = inv_x * 16
+                p0, p1, p2, p3, p4, p5, p6, p7 = _matmul16_smem_smem(sAphys, inv_row_o, 32, sAphys, 32, inv_col_c, inv_lane)
+                q0, q1, q2, q3, q4, q5, q6, q7 = _matmul16_smem_smem(sAphys, inv_row_o, 48, sAphys, 48, inv_col_c, inv_lane)
+                _store_C16_tmp(
+                    sInvTmp,
+                    inv_warp,
+                    -(p0 + q0),
+                    -(p1 + q1),
+                    -(p2 + q2),
+                    -(p3 + q3),
+                    -(p4 + q4),
+                    -(p5 + q5),
+                    -(p6 + q6),
+                    -(p7 + q7),
+                    inv_lane,
+                )
+                inv_sync.arrive_and_wait()
+
+                o0, o1, o2, o3, o4, o5, o6, o7 = _matmul16_tmp_smem(sInvTmp, inv_warp, sAphys, inv_x * 16, 0, inv_lane)
+                r0, r1, r2, r3, r4, r5, r6, r7 = _matmul16_tmp_smem(sInvTmp, inv_warp, sAphys, inv_x * 16, 16, inv_lane)
+                if inv_x == 0:
+                    _store_C16_smem(sAphys, inv_row_o, 0, o0, o1, o2, o3, o4, o5, o6, o7, inv_lane)
+                    _store_C16_smem(sAphys, inv_row_o, 16, r0, r1, r2, r3, r4, r5, r6, r7, inv_lane)
+                inv_sync.arrive_and_wait()
+                if inv_x == 1:
+                    _add_store_C16_smem(sAphys, inv_row_o, 0, o0, o1, o2, o3, o4, o5, o6, o7, inv_lane)
+                    _add_store_C16_smem(sAphys, inv_row_o, 16, r0, r1, r2, r3, r4, r5, r6, r7, inv_lane)
+                inv_sync.arrive_and_wait()
+
+                inv_a_thr = inv_a_tiled_copy.get_slice(inv_tid)
+                inv_a_identity = cute.make_identity_tensor((self.BT, self.BT))
+                tInv_cA = inv_a_thr.partition_D(inv_a_identity)
+                tInv_sA = inv_a_thr.partition_D(sA[(None, None, None, 0)])
+                for ai in cutlass.range(cute.size(tInv_cA), unroll_full=True):
+                    a_row, a_col = tInv_cA[ai]
+                    a_val = self.acc_dtype(sAphys[a_row, a_col]).to(self.io_dtype)
+                    tInv_sA[ai] = a_val
+
+                row_base = inv_warp * 16
+                chunk_row = i_t * self.BT
+                if cutlass.const_expr(self.is_varlen):
+                    chunk_row = tok_offset + chunk_row
+                for ri in cutlass.range_constexpr(16):
+                    row = row_base + ri
+                    col0 = inv_lane * 2
+                    col1 = col0 + 1
+                    val0 = self.acc_dtype(sAphys[row, col0])
+                    val1 = self.acc_dtype(sAphys[row, col1])
+                    if row < col0:
+                        val0 = self.acc_dtype(0.0)
+                    if row < col1:
+                        val1 = self.acc_dtype(0.0)
+                    out0 = val0.to(self.io_dtype)
+                    out1 = val1.to(self.io_dtype)
+                    if cutlass.const_expr(self.is_varlen):
+                        if row < remaining:
+                            A_out_gmem[chunk_row + row, col0, (i_h, data_bidx)] = out0
+                            A_out_gmem[chunk_row + row, col1, (i_h, data_bidx)] = out1
+                    else:
+                        A_out_gmem[chunk_row + row, col0, (i_h, data_bidx)] = out0
+                        A_out_gmem[chunk_row + row, col1, (i_h, data_bidx)] = out1
+                a_load_h.release()
+
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.barrier()
+
+        # =====================================================================
         # LOAD WARP
         # =====================================================================
         if warp_idx == self.load_warp_id:
@@ -688,15 +920,16 @@ class KDARecomputeWU:
                         (self.BT, self.BK),
                         sGK,
                     )
-                tAsA, tAgA = self._tma_partition_A(
-                    tma_atom_A,
-                    tma_A_v,
-                    sA,
-                    self.mma_tiler,
-                    tiled_mma,
-                    data_bidx,
-                    i_h,
-                )
+                if cutlass.const_expr(not self.fused_inverse):
+                    tAsA, tAgA = self._tma_partition_A(
+                        tma_atom_A,
+                        tma_A_v,
+                        sA,
+                        self.mma_tiler,
+                        tiled_mma,
+                        data_bidx,
+                        i_h,
+                    )
             else:
                 bSG_sK, bSG_gK = self._data_tma_partition(
                     tma_atom_k,
@@ -723,24 +956,26 @@ class KDARecomputeWU:
                         i_h,
                         data_bidx,
                     )
-                tAsA, tAgA = self._tma_partition_A(
-                    tma_atom_A,
-                    tma_A_v,
-                    sA,
-                    self.mma_tiler,
-                    tiled_mma,
-                    data_bidx,
-                    i_h,
-                )
+                if cutlass.const_expr(not self.fused_inverse):
+                    tAsA, tAgA = self._tma_partition_A(
+                        tma_atom_A,
+                        tma_A_v,
+                        sA,
+                        self.mma_tiler,
+                        tiled_mma,
+                        data_bidx,
+                        i_h,
+                    )
 
             # --- Issue TMA loads ---
-            h_a = load_A_P.acquire_and_advance()
-            cute.copy(
-                tma_atom_A,
-                tAgA[(None, i_t, 0)],
-                tAsA[(None, h_a.index)],
-                tma_bar_ptr=h_a.barrier,
-            )
+            if cutlass.const_expr(not self.fused_inverse):
+                h_a = load_A_P.acquire_and_advance()
+                cute.copy(
+                    tma_atom_A,
+                    tAgA[(None, i_t, 0)],
+                    tAsA[(None, h_a.index)],
+                    tma_bar_ptr=h_a.barrier,
+                )
 
             for i_kv in cutlass.range(0, self.NK):
                 kgk_h = load_kgk_P.acquire_and_advance()
@@ -829,8 +1064,10 @@ class KDARecomputeWU:
 
             num_kblks = cute.size(tCrB, mode=[2])
 
-            # Wait for A_mat — hold handle until all GEMMs finish reading sA
-            a_h = load_A_C.wait_and_advance()
+            # The regular path waits on the TMA->UMMA pipeline.  The fused
+            # inverse path published sA through the CTA barrier above.
+            if cutlass.const_expr(not self.fused_inverse):
+                a_h = load_A_C.wait_and_advance()
 
             for i_kv in cutlass.range(0, self.NK):
                 # K pass: w = A_mat @ B_proc(k)
@@ -841,7 +1078,7 @@ class KDARecomputeWU:
                     cute.gemm(
                         tiled_mma,
                         tCtAcc[(None, None, None, acc_h.index)],
-                        tCrA[(None, None, kblk, a_h.index)],
+                        tCrA[(None, None, kblk, 0 if self.fused_inverse else a_h.index)],
                         tCrB[(None, None, kblk, bp_h.index)],
                         tCtAcc[(None, None, None, acc_h.index)],
                     )
@@ -856,15 +1093,16 @@ class KDARecomputeWU:
                     cute.gemm(
                         tiled_mma,
                         tCtAcc[(None, None, None, acc_h2.index)],
-                        tCrA[(None, None, kblk, a_h.index)],
+                        tCrA[(None, None, kblk, 0 if self.fused_inverse else a_h.index)],
                         tCrB[(None, None, kblk, bp_h2.index)],
                         tCtAcc[(None, None, None, acc_h2.index)],
                     )
                 acc_h2.commit()
                 bp_h2.release()
 
-            # Release A after all GEMMs that read sA are dispatched
-            a_h.release()
+            # Release A after all GEMMs that read sA are dispatched.
+            if cutlass.const_expr(not self.fused_inverse):
+                a_h.release()
 
         # =====================================================================
         # CUDA CORE WARPS
@@ -1172,6 +1410,7 @@ def _compile_recompute_wu(
     is_varlen=False,
     beta_dtype=cutlass.Float32,
     preprocessed_k=False,
+    fused_inverse=False,
 ):
     key = (
         H,
@@ -1184,6 +1423,7 @@ def _compile_recompute_wu(
         is_varlen,
         beta_dtype,
         preprocessed_k,
+        fused_inverse,
         USE_FAST_MATH,
     )
     if key in _recompute_wu_cache:
@@ -1198,6 +1438,7 @@ def _compile_recompute_wu(
         beta_dtype=beta_dtype,
         is_varlen=is_varlen,
         preprocessed_k=preprocessed_k,
+        fused_inverse=fused_inverse,
         use_fast_math=USE_FAST_MATH,
     )
 
@@ -1211,7 +1452,13 @@ def _compile_recompute_wu(
         k_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, K), stride_order=(2, 1, 0), assumed_align=128)
         v_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, V), stride_order=(2, 1, 0), assumed_align=128)
         beta_fake = make_fake_compact_tensor(beta_dtype, (sym_a, H), stride_order=(1, 0), assumed_align=128)
-        A_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, BT), stride_order=(2, 1, 0), assumed_align=128)
+        A_fake = make_fake_compact_tensor(
+            cutlass.Float32 if fused_inverse else cutlass.BFloat16,
+            (sym_a, H, BT),
+            stride_order=(2, 1, 0),
+            assumed_align=128,
+        )
+        A_out_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, BT), stride_order=(2, 1, 0), assumed_align=128)
         gk_fake = make_fake_compact_tensor(
             cutlass.BFloat16 if preprocessed_k else cutlass.Float32,
             (sym_a, H, K),
@@ -1226,6 +1473,12 @@ def _compile_recompute_wu(
         v_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, V), stride_order=(3, 2, 1, 0), assumed_align=128)
         beta_fake = make_fake_compact_tensor(beta_dtype, (sym_a, sym_b, H), stride_order=(2, 1, 0), assumed_align=128)
         A_fake = make_fake_compact_tensor(
+            cutlass.Float32 if fused_inverse else cutlass.BFloat16,
+            (sym_a, sym_b, H, BT),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=128,
+        )
+        A_out_fake = make_fake_compact_tensor(
             cutlass.BFloat16, (sym_a, sym_b, H, BT), stride_order=(3, 2, 1, 0), assumed_align=128
         )
         gk_fake = make_fake_compact_tensor(
@@ -1250,6 +1503,7 @@ def _compile_recompute_wu(
         v_fake,
         beta_fake,
         A_fake,
+        A_out_fake,
         gk_fake,
         w_fake,
         u_fake,
@@ -1353,7 +1607,7 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
         beta_dtype=cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16,
     )
 
-    compiled_fn(k, v, beta, A, gk, w, u, kg, cu_s, ci_s, ps, Int32(total_nt))
+    compiled_fn(k, v, beta, A, A, gk, w, u, kg, cu_s, ci_s, ps, Int32(total_nt))
 
     if restore_packed:
         w, u, kg = (x.flatten(0, 1).unsqueeze(0) for x in (w, u, kg))
@@ -1436,10 +1690,81 @@ def recompute_w_u_from_preprocessed(
 
     # gk and kg are unused compile-signature placeholders for this
     # specialization. Reusing existing bf16 buffers avoids extra allocations.
-    compiled_fn(k_scaled, v, beta, A, k_scaled, w, u, w, cu_s, ci_s, ps, Int32(total_nt))
+    compiled_fn(k_scaled, v, beta, A, A, k_scaled, w, u, w, cu_s, ci_s, ps, Int32(total_nt))
 
     if restore_packed:
         w, u = (x.flatten(0, 1).unsqueeze(0) for x in (w, u))
     elif packed_4d:
         w, u = (x.unsqueeze(0) for x in (w, u))
     return w, u
+
+
+def recompute_w_u_from_preinverse(
+    k_scaled,
+    v,
+    beta,
+    A_phys,
+    A_out=None,
+    *,
+    block_k=None,
+    block_v=None,
+):
+    """Invert physical fp32 Akk and compute W/U in one CuTeDSL kernel.
+
+    This equal-length candidate consumes the fp32 physical workspace emitted
+    by fused K123, writes the final logical bf16 Akk, and immediately reuses it
+    as the SS-MMA A operand.  Keeping this separate from the established
+    preprocessed entry makes the optimization easy to benchmark and revert.
+    """
+    if k_scaled.dim() != 4 or v.dim() != 4 or beta.dim() != 3 or A_phys.dim() != 4:
+        raise ValueError("expected k/v/A_phys [B,T,H,D] and beta [B,T,H]")
+    if A_phys.dtype != torch.float32:
+        raise TypeError(f"A_phys must be fp32, got {A_phys.dtype}")
+    B, T, H, K = k_scaled.shape
+    V = v.shape[-1]
+    BT = A_phys.shape[-1]
+    if A_phys.shape[:3] != (B, T, H):
+        raise ValueError(f"A_phys prefix must be {(B, T, H)}, got {tuple(A_phys.shape[:3])}")
+    if T % BT != 0:
+        raise ValueError(f"equal-length T={T} must be divisible by BT={BT}")
+    if A_out is None:
+        A_out = torch.empty(A_phys.shape, dtype=torch.bfloat16, device=A_phys.device)
+
+    global _dummy_cu_seqlens, _dummy_chunk_indices
+    if _dummy_cu_seqlens is None or _dummy_cu_seqlens.device != k_scaled.device:
+        _dummy_cu_seqlens = torch.zeros(2, dtype=torch.int32, device=k_scaled.device)
+    if _dummy_chunk_indices is None or _dummy_chunk_indices.device != k_scaled.device:
+        _dummy_chunk_indices = torch.zeros(2, dtype=torch.int32, device=k_scaled.device)
+
+    w = torch.empty_like(k_scaled)
+    u = torch.empty_like(v)
+    total_nt = B * (T // BT)
+    ps = (Int32(B), Int32(T), Int32(H), Int32(K), Int32(V))
+    compiled_fn = _compile_recompute_wu(
+        H,
+        K,
+        V,
+        chunk_size=BT,
+        block_k=block_k,
+        block_v=block_v,
+        is_varlen=False,
+        beta_dtype=cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16,
+        preprocessed_k=True,
+        fused_inverse=True,
+    )
+    compiled_fn(
+        k_scaled,
+        v,
+        beta,
+        A_phys,
+        A_out,
+        k_scaled,
+        w,
+        u,
+        w,
+        _dummy_cu_seqlens,
+        _dummy_chunk_indices,
+        ps,
+        Int32(total_nt),
+    )
+    return w, u, A_out
