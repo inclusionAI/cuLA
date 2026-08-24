@@ -39,12 +39,30 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Int32, Int64
+from cutlass.cutlass_dsl import T, dsl_user_op
 from fla.ops.utils import prepare_chunk_indices
 
 from cula.utils import USE_FAST_MATH, assert_blackwell
+
+
+@dsl_user_op
+def _fast_rcp(x, *, loc=None, ip=None):
+    result = llvm.inline_asm(
+        T.f32(),
+        [x.ir_value(loc=loc, ip=ip)],
+        "rcp.approx.ftz.f32 $0, $1;",
+        "=f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Float32(result)
 
 
 def _make_coop_group(size: int):
@@ -1013,7 +1031,7 @@ class KDARecomputeWU:
                         gk_val = sGK[(k_coord, m_coord, kgk_h.index)]
                         gk_exp = cute.exp2(gk_val, fastmath=True)
                         bproc_val = (k_val * beta_val * gk_exp).to(self.io_dtype)
-                        kg_val = (k_val * sGnExp[m_coord] / gk_exp).to(self.io_dtype)
+                        kg_val = (k_val * sGnExp[m_coord] * _fast_rcp(gk_exp)).to(self.io_dtype)
                         tTR_rBproc[ei] = cutlass.select_(k_coord < remaining, bproc_val, self.io_dtype(0.0))
                         tTR_rKg[ei] = cutlass.select_(k_coord < remaining, kg_val, self.io_dtype(0.0))
                     else:
@@ -1021,7 +1039,7 @@ class KDARecomputeWU:
                         beta_val = sBeta[k_coord].to(self.acc_dtype)
                         gk_exp = cute.exp2(gk_val, fastmath=self.use_fast_math)
                         tTR_rBproc[ei] = (k_val * beta_val * gk_exp).to(self.io_dtype)
-                        tTR_rKg[ei] = (k_val * sGnExp[m_coord] / gk_exp).to(self.io_dtype)
+                        tTR_rKg[ei] = (k_val * sGnExp[m_coord] * _fast_rcp(gk_exp)).to(self.io_dtype)
 
                 # R2T K bproc -> TMEM -> signal MMA K start
                 tRT_rBproc.store(tTR_rBproc.load())
