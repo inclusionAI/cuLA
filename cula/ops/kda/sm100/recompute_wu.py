@@ -522,7 +522,6 @@ class KDARecomputeWU:
             a_smem_staged,
             aphys_smem_layout,
             inv_a_tiled_copy,
-            A_gmem,
             b_smem_staged,
             b_epi_staged,
             k_epi_staged,
@@ -567,7 +566,6 @@ class KDARecomputeWU:
         a_smem_staged: cute.ComposedLayout,
         aphys_smem_layout: cute.Layout,
         inv_a_tiled_copy: cute.TiledCopy,
-        A_gmem: cute.Tensor,
         b_smem_staged: cute.ComposedLayout,
         b_epi_staged: cute.ComposedLayout,
         k_epi_staged: cute.ComposedLayout,
@@ -611,8 +609,7 @@ class KDARecomputeWU:
         tidx, _, _ = cute.arch.thread_idx()
 
         if warp_idx == self.load_warp_id:
-            if cutlass.const_expr(not self.fused_inverse):
-                cpasync.prefetch_descriptor(tma_atom_A)
+            cpasync.prefetch_descriptor(tma_atom_A)
             cpasync.prefetch_descriptor(tma_atom_k)
             cpasync.prefetch_descriptor(tma_atom_v)
             if cutlass.const_expr(not self.preprocessed_k):
@@ -732,18 +729,45 @@ class KDARecomputeWU:
         # bf16 Akk output, and publish the same values directly into the SS-MMA
         # A operand.  The alias is free until output staging starts.
         if cutlass.const_expr(self.fused_inverse):
+            if cutlass.const_expr(self.is_varlen):
+                tma_A_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_A)
+            else:
+                tma_A_v = tma_tensor_A
+
+            if warp_idx == self.load_warp_id:
+                if cutlass.const_expr(self.is_varlen):
+                    bSG_sAphys, bSG_gAphys = self._epilog_partition_varlen(
+                        tma_atom_A,
+                        tma_A_v[None, None, (i_h, data_bidx)],
+                        (self.BT, self.BT),
+                        sAphys,
+                    )
+                else:
+                    bSG_sAphys, bSG_gAphys = self._data_tma_partition(
+                        tma_atom_A,
+                        tma_A_v,
+                        (self.BT, self.BT),
+                        sAphys,
+                        i_h,
+                        data_bidx,
+                    )
+                a_load_h = load_A_P.acquire_and_advance()
+                cute.copy(
+                    tma_atom_A,
+                    bSG_gAphys[(None, i_t, 0)],
+                    bSG_sAphys,
+                    tma_bar_ptr=a_load_h.barrier,
+                )
+
             if warp_idx in self.cuda_warp_ids:
+                a_load_h = load_A_C.wait_and_advance()
                 inv_tid = tidx % self.num_cuda_threads
                 inv_warp = inv_tid // self.threads_per_warp
                 inv_lane = inv_tid % self.threads_per_warp
                 inv_sync = pipeline.NamedBarrier(barrier_id=3, num_threads=self.num_cuda_threads)
-                chunk_row = i_t * self.BT
-                if cutlass.const_expr(self.is_varlen):
-                    chunk_row = tok_offset + chunk_row
 
-                # Load only the logical lower half from K123's physical fp32
-                # workspace.  Direct CUDA-core loads avoid the stricter TMA
-                # shared-stride requirements and skip the unused upper half.
+                # Physical off-diagonal blocks live in the unused upper half,
+                # so this physical->logical transform is safe in-place.
                 for inv_i in cutlass.range_constexpr((self.BT * self.BT) // self.num_cuda_threads):
                     linear = inv_tid + inv_i * self.num_cuda_threads
                     row = linear // self.BT
@@ -762,9 +786,9 @@ class KDARecomputeWU:
                                 src_col = row_blk * 16 + col % 16
                             if cutlass.const_expr(self.is_varlen):
                                 if row < remaining:
-                                    value = self.acc_dtype(A_gmem[chunk_row + src_row, src_col, (i_h, data_bidx)])
+                                    value = self.acc_dtype(sAphys[src_row, src_col])
                             else:
-                                value = self.acc_dtype(A_gmem[chunk_row + src_row, src_col, (i_h, data_bidx)])
+                                value = self.acc_dtype(sAphys[src_row, src_col])
                     sAphys[row, col] = value
                 inv_sync.arrive_and_wait()
 
@@ -830,6 +854,9 @@ class KDARecomputeWU:
                     tInv_sA[ai] = a_val
 
                 row_base = inv_warp * 16
+                chunk_row = i_t * self.BT
+                if cutlass.const_expr(self.is_varlen):
+                    chunk_row = tok_offset + chunk_row
                 for ri in cutlass.range_constexpr(16):
                     row = row_base + ri
                     col0 = inv_lane * 2
@@ -849,6 +876,8 @@ class KDARecomputeWU:
                     else:
                         A_out_gmem[chunk_row + row, col0, (i_h, data_bidx)] = out0
                         A_out_gmem[chunk_row + row, col1, (i_h, data_bidx)] = out1
+                a_load_h.release()
+
             cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.barrier()
 
