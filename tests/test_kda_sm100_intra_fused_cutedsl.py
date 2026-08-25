@@ -13,7 +13,7 @@ from fla.ops.utils.constant import RCP_LN2
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from cula.kda.chunk_intra import chunk_kda_fwd_intra as csrc_chunk_kda_fwd_intra
-from cula.ops.kda.sm100.intra_fused import chunk_kda_fwd_intra_sm100_equal
+from cula.ops.kda.sm100.intra_fused import chunk_kda_fwd_intra_sm100_equal, chunk_kda_fwd_intra_sm100_varlen
 from cula.ops.kda.sm100.recompute_wu import recompute_w_u_from_preprocessed
 
 
@@ -22,7 +22,42 @@ def _requires_sm100():
         pytest.skip("SM100 CUDA device required")
 
 
-def test_fused_intra_and_preprocessed_wu_match_csrc():
+def _chunk_fp64_oracle(q, k, v, gk, beta, scale, chunk_size):
+    """Small-shape oracle for ranking csrc and CuTeDSL rounding error."""
+    batch, seqlen, heads, dim = q.shape
+    chunks = seqlen // chunk_size
+
+    def chunked(x):
+        return x.double().view(batch, chunks, chunk_size, heads, -1).permute(0, 1, 3, 2, 4)
+
+    q_c = chunked(q)
+    k_c = chunked(k)
+    v_c = chunked(v)
+    g_c = chunked(gk)
+    beta_c = beta.double().view(batch, chunks, chunk_size, heads).permute(0, 1, 3, 2)
+    exp_g = torch.exp2(g_c)
+    q_g = q_c * exp_g
+    k_g = k_c * exp_g
+    k_inv_g = k_c / exp_g
+    aqk = torch.tril(torch.matmul(q_g, k_inv_g.transpose(-1, -2)) * scale)
+    eye = torch.eye(chunk_size, dtype=torch.float64, device=q.device)
+    mat = eye + torch.tril(torch.matmul(k_g, k_inv_g.transpose(-1, -2)), diagonal=-1) * beta_c.unsqueeze(-1)
+    akk = torch.linalg.inv(mat)
+    w = torch.matmul(akk, (k_c * beta_c.unsqueeze(-1)) * exp_g)
+    u = torch.matmul(akk, v_c * beta_c.unsqueeze(-1))
+
+    def unchunk(x):
+        return x.permute(0, 1, 3, 2, 4).reshape(batch, seqlen, heads, x.shape[-1])
+
+    return unchunk(aqk), unchunk(akk), unchunk(w), unchunk(u)
+
+
+def _rel_rmse_fp64(actual, oracle):
+    diff = actual.double() - oracle
+    return torch.sqrt(torch.mean(diff.square()) / torch.mean(oracle.square())).item()
+
+
+def test_fp16_preprocessed_intra_wu_matches_csrc_and_fp64_oracle():
     _requires_sm100()
     torch.manual_seed(2)
     device = torch.device("cuda")
@@ -67,11 +102,12 @@ def test_fused_intra_and_preprocessed_wu_match_csrc():
         safe_gate=True,
         lower_bound=lower_bound,
         fp32_akk_inv=True,
+        kscaled_fp16=True,
     )
     w, u = recompute_w_u_from_preprocessed(k_scaled, k, beta, Akk)
 
     exp_gk = torch.exp2(gk)
-    torch.testing.assert_close(k_scaled, (k.float() * exp_gk).bfloat16(), rtol=1e-2, atol=1e-3)
+    torch.testing.assert_close(k_scaled, (k.float() * exp_gk).half(), rtol=1e-2, atol=1e-3)
     torch.testing.assert_close(q_scaled, (q.float() * exp_gk).bfloat16(), rtol=1e-2, atol=1e-3)
     torch.testing.assert_close(kg, kg_ref, rtol=1e-2, atol=2e-3)
 
@@ -84,3 +120,50 @@ def test_fused_intra_and_preprocessed_wu_match_csrc():
     torch.testing.assert_close(Akk[~lower], torch.zeros_like(Akk[~lower]), rtol=0, atol=0)
     torch.testing.assert_close(w, w_ref, rtol=1e-2, atol=2e-3)
     torch.testing.assert_close(u, u_ref, rtol=1e-2, atol=2e-3)
+
+    aqk_oracle, akk_oracle, w_oracle, u_oracle = _chunk_fp64_oracle(q, k, k, gk, beta, scale, chunk_size)
+    for name, candidate, baseline, oracle in (
+        ("Aqk", Aqk, Aqk_ref, aqk_oracle),
+        ("Akk", Akk, Akk_ref, akk_oracle),
+        ("w", w, w_ref, w_oracle),
+        ("u", u, u_ref, u_oracle),
+    ):
+        candidate_error = _rel_rmse_fp64(candidate, oracle)
+        baseline_error = _rel_rmse_fp64(baseline, oracle)
+        assert candidate_error <= baseline_error * 1.05, (
+            f"{name} precision regressed: CuTeDSL={candidate_error:.6e}, csrc={baseline_error:.6e}"
+        )
+
+
+def test_uniform_varlen_uses_equal_fp16_path_bitwise():
+    _requires_sm100()
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    batch, seqlen, heads, dim = 2, 256, 4, 128
+    q = F.normalize(torch.randn(batch, seqlen, heads, dim, device=device).float(), dim=-1).bfloat16()
+    k = F.normalize(torch.randn(batch, seqlen, heads, dim, device=device).float(), dim=-1).bfloat16()
+    g = torch.randn(batch, seqlen, heads, dim, device=device, dtype=torch.bfloat16)
+    beta = torch.randn(batch, seqlen, heads, device=device).sigmoid().bfloat16()
+    a_log = torch.full((heads,), -4.0, device=device)
+    dt_bias = torch.zeros(heads * dim, device=device)
+    kwargs = dict(
+        A_log=a_log,
+        dt_bias=dt_bias,
+        safe_gate=True,
+        lower_bound=-5.0,
+        fp32_akk_inv=True,
+        kscaled_fp16=True,
+    )
+    equal = chunk_kda_fwd_intra_sm100_equal(q=q, k=k, g=g, beta=beta, **kwargs)
+    packed = chunk_kda_fwd_intra_sm100_varlen(
+        q=q.flatten(0, 1).unsqueeze(0),
+        k=k.flatten(0, 1).unsqueeze(0),
+        g=g.flatten(0, 1).unsqueeze(0),
+        beta=beta.flatten(0, 1).unsqueeze(0),
+        cu_seqlens=torch.tensor([0, seqlen, 2 * seqlen], dtype=torch.int32, device=device),
+        seq_lens=[seqlen, seqlen],
+        **kwargs,
+    )
+    for equal_tensor, packed_tensor in zip(equal, packed, strict=True):
+        expected = equal_tensor.flatten(0, 1).unsqueeze(0)
+        torch.testing.assert_close(packed_tensor, expected, rtol=0, atol=0, equal_nan=True)

@@ -62,8 +62,10 @@ class KDARecomputeWU:
         io_dtype: type[cutlass.Numeric] = cutlass.BFloat16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         beta_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        k_dtype: type[cutlass.Numeric] = cutlass.BFloat16,
         is_varlen: bool = False,
         preprocessed_k: bool = False,
+        preprocessed_k_has_beta: bool = False,
         persistent: bool = False,
         use_fast_math: bool = True,
     ):
@@ -80,8 +82,10 @@ class KDARecomputeWU:
         self.io_dtype = io_dtype
         self.acc_dtype = acc_dtype
         self.beta_dtype = beta_dtype
+        self.k_dtype = k_dtype
         self.is_varlen = is_varlen
         self.preprocessed_k = preprocessed_k
+        self.preprocessed_k_has_beta = preprocessed_k_has_beta
 
         self.threads_per_warp = 32
         self.cuda_warp_ids = (0, 1, 2, 3)
@@ -272,7 +276,7 @@ class KDARecomputeWU:
 
         # ---------- SMEM layouts: k (bf16), v (bf16), gk (fp32) ----------
         k_epi_staged = sm100_utils.make_smem_layout_epi(
-            self.io_dtype,
+            self.k_dtype,
             utils.LayoutEnum.ROW_MAJOR,
             (self.BT, self.BK),
             self.kgk_stage,
@@ -360,7 +364,7 @@ class KDARecomputeWU:
             )
 
         # ---------- TMA byte counts ----------
-        self.tma_bytes_k = cute.size_in_bytes(self.io_dtype, k_epi_smem)
+        self.tma_bytes_k = cute.size_in_bytes(self.k_dtype, k_epi_smem)
         self.tma_bytes_v = cute.size_in_bytes(self.io_dtype, v_epi_smem)
         self.tma_bytes_gk = cute.size_in_bytes(self.acc_dtype, gk_epi_smem)
         self.tma_bytes_kgkv = self.tma_bytes_k + self.tma_bytes_v
@@ -433,7 +437,7 @@ class KDARecomputeWU:
                 self.buffer_align_bytes,
             ]
             sK: cute.struct.Align[
-                cute.struct.MemRange[self.io_dtype, cute.cosize(k_epi_staged)],
+                cute.struct.MemRange[self.k_dtype, cute.cosize(k_epi_staged)],
                 self.buffer_align_bytes,
             ]
             sV: cute.struct.Align[
@@ -816,7 +820,7 @@ class KDARecomputeWU:
                         sh_u.release()
 
         # =====================================================================
-        # EMPTY WARP -- idle
+        # EMPTY WARP -- participates in CTA-wide allocator synchronization.
         # =====================================================================
         elif warp_idx == self.empty_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_others)
@@ -997,22 +1001,32 @@ class KDARecomputeWU:
 
                 for ei in cutlass.range_constexpr(cute.size(tTR_cM)):
                     m_coord, n_coord = tTR_cM[ei]
-                    k_val = sK[(m_coord, n_coord, kgk_h.index)].to(self.acc_dtype)
-                    beta_val = sBeta[m_coord].to(self.acc_dtype)
-                    if cutlass.const_expr(self.preprocessed_k):
-                        tTR_rBproc[ei] = (k_val * beta_val).to(self.io_dtype)
-                    elif cutlass.const_expr(self.is_varlen):
-                        gk_val = sGK[(m_coord, n_coord, kgk_h.index)]
-                        gn_val = sGK[(remaining - 1, n_coord, kgk_h.index)]
-                        bproc_val = (k_val * beta_val * cute.exp2(gk_val)).to(self.io_dtype)
-                        kg_val = (k_val * cute.exp2(gn_val - gk_val, fastmath=True)).to(self.io_dtype)
-                        tTR_rBproc[ei] = cutlass.select_(m_coord < remaining, bproc_val, self.io_dtype(0.0))
-                        tTR_rKg[ei] = cutlass.select_(m_coord < remaining, kg_val, self.io_dtype(0.0))
+                    if cutlass.const_expr(self.preprocessed_k and self.preprocessed_k_has_beta):
+                        # K123 already emitted the final BF16 MMA operand.
+                        # Preserve its bits; a BF16->FP32->BF16 round trip is
+                        # redundant and lengthens the CUDA-core producer path.
+                        tTR_rBproc[ei] = sK[(m_coord, n_coord, kgk_h.index)]
                     else:
-                        gk_val = sGK[(m_coord, n_coord, kgk_h.index)]
-                        gn_val = sGK[(self.BT - 1, n_coord, kgk_h.index)]
-                        tTR_rBproc[ei] = (k_val * beta_val * cute.exp2(gk_val, fastmath=self.use_fast_math)).to(self.io_dtype)
-                        tTR_rKg[ei] = (k_val * cute.exp2(gn_val - gk_val, fastmath=self.use_fast_math)).to(self.io_dtype)
+                        k_val = sK[(m_coord, n_coord, kgk_h.index)].to(self.acc_dtype)
+                        if cutlass.const_expr(self.preprocessed_k):
+                            beta_k_val = sBeta[m_coord].to(self.acc_dtype)
+                            tTR_rBproc[ei] = (k_val * beta_k_val).to(self.io_dtype)
+                        elif cutlass.const_expr(self.is_varlen):
+                            beta_k_val = sBeta[m_coord].to(self.acc_dtype)
+                            gk_val = sGK[(m_coord, n_coord, kgk_h.index)]
+                            gn_val = sGK[(remaining - 1, n_coord, kgk_h.index)]
+                            bproc_val = (k_val * beta_k_val * cute.exp2(gk_val)).to(self.io_dtype)
+                            kg_val = (k_val * cute.exp2(gn_val - gk_val, fastmath=True)).to(self.io_dtype)
+                            tTR_rBproc[ei] = cutlass.select_(m_coord < remaining, bproc_val, self.io_dtype(0.0))
+                            tTR_rKg[ei] = cutlass.select_(m_coord < remaining, kg_val, self.io_dtype(0.0))
+                        else:
+                            beta_k_val = sBeta[m_coord].to(self.acc_dtype)
+                            gk_val = sGK[(m_coord, n_coord, kgk_h.index)]
+                            gn_val = sGK[(self.BT - 1, n_coord, kgk_h.index)]
+                            tTR_rBproc[ei] = (k_val * beta_k_val * cute.exp2(gk_val, fastmath=self.use_fast_math)).to(
+                                self.io_dtype
+                            )
+                            tTR_rKg[ei] = (k_val * cute.exp2(gn_val - gk_val, fastmath=self.use_fast_math)).to(self.io_dtype)
 
                 # Scatter K bproc into the SS MMA B-operand layout.
                 bproc_h = bproc_P.acquire_and_advance()
@@ -1025,12 +1039,12 @@ class KDARecomputeWU:
                 for ei in cutlass.range(cute.size(tTR_cM), unroll_full=True):
                     m_coord, n_coord = tTR_cM[ei]
                     v_val = sV[(m_coord, n_coord, kgk_h.index)].to(self.acc_dtype)
-                    beta_val = sBeta[m_coord].to(self.acc_dtype)
+                    beta_v_val = sBeta[m_coord].to(self.acc_dtype)
                     if cutlass.const_expr(self.is_varlen):
-                        bproc_v = (v_val * beta_val).to(self.io_dtype)
+                        bproc_v = (v_val * beta_v_val).to(self.io_dtype)
                         tTR_rBproc[ei] = cutlass.select_(m_coord < remaining, bproc_v, self.io_dtype(0.0))
                     else:
-                        tTR_rBproc[ei] = (v_val * beta_val).to(self.io_dtype)
+                        tTR_rBproc[ei] = (v_val * beta_v_val).to(self.io_dtype)
                 kgk_h.release()
 
                 # Scatter V bproc, then dispatch MMA V.
@@ -1172,6 +1186,8 @@ def _compile_recompute_wu(
     is_varlen=False,
     beta_dtype=cutlass.Float32,
     preprocessed_k=False,
+    preprocessed_k_has_beta=False,
+    k_dtype=cutlass.BFloat16,
 ):
     key = (
         H,
@@ -1184,6 +1200,8 @@ def _compile_recompute_wu(
         is_varlen,
         beta_dtype,
         preprocessed_k,
+        preprocessed_k_has_beta,
+        k_dtype,
         USE_FAST_MATH,
     )
     if key in _recompute_wu_cache:
@@ -1196,8 +1214,10 @@ def _compile_recompute_wu(
         block_k=block_k,
         block_v=block_v,
         beta_dtype=beta_dtype,
+        k_dtype=k_dtype,
         is_varlen=is_varlen,
         preprocessed_k=preprocessed_k,
+        preprocessed_k_has_beta=preprocessed_k_has_beta,
         use_fast_math=USE_FAST_MATH,
     )
 
@@ -1208,7 +1228,7 @@ def _compile_recompute_wu(
     BT = chunk_size
 
     if is_varlen:
-        k_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, K), stride_order=(2, 1, 0), assumed_align=128)
+        k_fake = make_fake_compact_tensor(k_dtype, (sym_a, H, K), stride_order=(2, 1, 0), assumed_align=128)
         v_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, V), stride_order=(2, 1, 0), assumed_align=128)
         beta_fake = make_fake_compact_tensor(beta_dtype, (sym_a, H), stride_order=(1, 0), assumed_align=128)
         A_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, BT), stride_order=(2, 1, 0), assumed_align=128)
@@ -1222,7 +1242,7 @@ def _compile_recompute_wu(
         u_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, V), stride_order=(2, 1, 0), assumed_align=128)
         kg_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, K), stride_order=(2, 1, 0), assumed_align=128)
     else:
-        k_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
+        k_fake = make_fake_compact_tensor(k_dtype, (sym_a, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
         v_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, V), stride_order=(3, 2, 1, 0), assumed_align=128)
         beta_fake = make_fake_compact_tensor(beta_dtype, (sym_a, sym_b, H), stride_order=(2, 1, 0), assumed_align=128)
         A_fake = make_fake_compact_tensor(
@@ -1371,12 +1391,15 @@ def recompute_w_u_from_preprocessed(
     chunk_indices=None,
     block_k=None,
     block_v=None,
+    k_includes_beta=False,
 ):
     """Compute only ``w`` and ``u`` when fused intra already produced scaled k.
 
-    ``k_scaled`` is ``k * exp2(gk)`` and ``A`` is the inverted intra-chunk
-    matrix. The companion fused intra kernel already produced ``kg``, so this
-    path avoids loading the fp32 cumulative gate and writing ``kg`` again.
+    ``k_scaled`` is normally ``k * exp2(gk)``. With ``k_includes_beta=True``
+    it is the csrc-associated W operand ``(k * beta) * exp2(gk)`` and beta is
+    not applied a second time. ``A`` is the inverted intra-chunk matrix. The
+    companion fused intra kernel already produced ``kg``, so this path avoids
+    loading the fp32 cumulative gate and writing ``kg`` again.
     """
     is_varlen = cu_seqlens is not None
     packed_4d = is_varlen and k_scaled.dim() == 4
@@ -1420,7 +1443,7 @@ def recompute_w_u_from_preprocessed(
         cu_s = _dummy_cu_seqlens
         ci_s = _dummy_chunk_indices
 
-    w = torch.empty_like(k_scaled)
+    w = torch.empty(k_scaled.shape, dtype=v.dtype, device=k_scaled.device)
     u = torch.empty_like(v)
     compiled_fn = _compile_recompute_wu(
         H,
@@ -1432,11 +1455,16 @@ def recompute_w_u_from_preprocessed(
         is_varlen=is_varlen,
         beta_dtype=cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16,
         preprocessed_k=True,
+        preprocessed_k_has_beta=k_includes_beta,
+        k_dtype=cutlass.Float16 if k_scaled.dtype == torch.float16 else cutlass.BFloat16,
     )
 
     # gk and kg are unused compile-signature placeholders for this
     # specialization. Reusing existing bf16 buffers avoids extra allocations.
-    compiled_fn(k_scaled, v, beta, A, k_scaled, w, u, w, cu_s, ci_s, ps, Int32(total_nt))
+    # gk is an unused BF16 signature placeholder in this specialization.
+    # Reuse v when the preprocessed K workspace is FP16.
+    gk_placeholder = v if k_scaled.dtype == torch.float16 else k_scaled
+    compiled_fn(k_scaled, v, beta, A, gk_placeholder, w, u, w, cu_s, ci_s, ps, Int32(total_nt))
 
     if restore_packed:
         w, u = (x.flatten(0, 1).unsqueeze(0) for x in (w, u))

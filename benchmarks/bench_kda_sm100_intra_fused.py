@@ -205,6 +205,32 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
                 fp32_akk_inv=True,
             )
 
+    elif args.cutedsl_variant == "flashinfer-k123-incta-inv":
+
+        def cutedsl_fn(**kwargs):
+            return chunk_kda_fwd_intra_sm100_equal(
+                **kwargs,
+                fused_akk_inv=True,
+            )
+
+    elif args.cutedsl_variant == "flashinfer-k123-copy-fp32-inv-wbeta":
+
+        def cutedsl_fn(**kwargs):
+            return chunk_kda_fwd_intra_sm100_equal(
+                **kwargs,
+                fp32_akk_inv=True,
+                preprocess_w_beta=True,
+            )
+
+    elif args.cutedsl_variant == "flashinfer-k123-copy-fp32-inv-fp16-k":
+
+        def cutedsl_fn(**kwargs):
+            return chunk_kda_fwd_intra_sm100_equal(
+                **kwargs,
+                fp32_akk_inv=True,
+                kscaled_fp16=True,
+            )
+
     else:
         raise NotImplementedError(f"Unsupported CuTeDSL variant: {args.cutedsl_variant}")
 
@@ -221,7 +247,13 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
             lower_bound=args.lower_bound,
         )
         if args.with_recompute_wu:
-            w, u = recompute_w_u_from_preprocessed(out[0], k, beta, out[5])
+            w, u = recompute_w_u_from_preprocessed(
+                out[0],
+                k,
+                beta,
+                out[5],
+                k_includes_beta=args.cutedsl_variant == "flashinfer-k123-copy-fp32-inv-wbeta",
+            )
             return (*out, w, u)
         return out
 
@@ -273,7 +305,12 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
     def compare(cutedsl: tuple[torch.Tensor, ...], fla_with_gk: tuple[torch.Tensor, ...]):
         gk, _, _, _, kg_fla, aqk_fla, akk_fla = fla_with_gk
         exp_gk = torch.exp2(gk)
-        k_scaled_ref = (k.float() * exp_gk).to(torch.bfloat16)
+        if args.cutedsl_variant == "flashinfer-k123-copy-fp32-inv-wbeta":
+            k_scaled_ref = ((k.float() * beta.unsqueeze(-1).float()) * exp_gk).to(torch.bfloat16)
+        elif args.cutedsl_variant == "flashinfer-k123-copy-fp32-inv-fp16-k":
+            k_scaled_ref = (k.float() * exp_gk).to(torch.float16)
+        else:
+            k_scaled_ref = (k.float() * exp_gk).to(torch.bfloat16)
         q_scaled_ref = (q.float() * exp_gk).to(torch.bfloat16)
         stats = [
             ("k_scaled", accuracy_stats(k_scaled_ref, cutedsl[0])),
@@ -281,7 +318,12 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
             ("q_scaled", accuracy_stats(q_scaled_ref, cutedsl[2])),
             ("Aqk_valid", accuracy_stats(aqk_fla, cutedsl[4], valid_mask)),
         ]
-        if args.cutedsl_variant in ("flashinfer-k123-copy-fp32-inv",):
+        if args.cutedsl_variant in (
+            "flashinfer-k123-copy-fp32-inv",
+            "flashinfer-k123-copy-fp32-inv-fp16-k",
+            "flashinfer-k123-copy-fp32-inv-wbeta",
+            "flashinfer-k123-incta-inv",
+        ):
             stats.append(("Akk_valid", accuracy_stats(akk_fla, cutedsl[5], valid_mask)))
         if args.with_recompute_wu:
             stats.extend(
@@ -302,6 +344,9 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
     if args.cutedsl_variant not in (
         "flashinfer-k123-copy",
         "flashinfer-k123-copy-fp32-inv",
+        "flashinfer-k123-copy-fp32-inv-fp16-k",
+        "flashinfer-k123-copy-fp32-inv-wbeta",
+        "flashinfer-k123-incta-inv",
     ):
         raise NotImplementedError(f"{args.cutedsl_variant} CuTeDSL variant currently supports equal mode only.")
     seq_lens = _build_seq_lens(args)
@@ -357,6 +402,99 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
                 lower_bound=args.lower_bound,
                 seq_lens=seq_lens,
                 fp32_akk_inv=True,
+            )
+            if args.with_recompute_wu:
+                w, u = recompute_w_u_from_preprocessed(
+                    out[0],
+                    k,
+                    beta,
+                    out[5],
+                    cu_seqlens=cu_seqlens,
+                    chunk_indices=chunk_indices,
+                )
+                return (*out, w, u)
+            return out
+
+    elif args.cutedsl_variant == "flashinfer-k123-incta-inv":
+
+        def run():
+            out = chunk_kda_fwd_intra_sm100_varlen(
+                q=q,
+                k=k,
+                g=g,
+                beta=beta,
+                A_log=a_log,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                scale=scale,
+                dt_bias=dt_bias,
+                safe_gate=True,
+                lower_bound=args.lower_bound,
+                seq_lens=seq_lens,
+                fused_akk_inv=True,
+            )
+            if args.with_recompute_wu:
+                w, u = recompute_w_u_from_preprocessed(
+                    out[0],
+                    k,
+                    beta,
+                    out[5],
+                    cu_seqlens=cu_seqlens,
+                    chunk_indices=chunk_indices,
+                )
+                return (*out, w, u)
+            return out
+
+    elif args.cutedsl_variant == "flashinfer-k123-copy-fp32-inv-wbeta":
+
+        def run():
+            out = chunk_kda_fwd_intra_sm100_varlen(
+                q=q,
+                k=k,
+                g=g,
+                beta=beta,
+                A_log=a_log,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                scale=scale,
+                dt_bias=dt_bias,
+                safe_gate=True,
+                lower_bound=args.lower_bound,
+                seq_lens=seq_lens,
+                fp32_akk_inv=True,
+                preprocess_w_beta=True,
+            )
+            if args.with_recompute_wu:
+                w, u = recompute_w_u_from_preprocessed(
+                    out[0],
+                    k,
+                    beta,
+                    out[5],
+                    cu_seqlens=cu_seqlens,
+                    chunk_indices=chunk_indices,
+                    k_includes_beta=True,
+                )
+                return (*out, w, u)
+            return out
+
+    elif args.cutedsl_variant == "flashinfer-k123-copy-fp32-inv-fp16-k":
+
+        def run():
+            out = chunk_kda_fwd_intra_sm100_varlen(
+                q=q,
+                k=k,
+                g=g,
+                beta=beta,
+                A_log=a_log,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                scale=scale,
+                dt_bias=dt_bias,
+                safe_gate=True,
+                lower_bound=args.lower_bound,
+                seq_lens=seq_lens,
+                fp32_akk_inv=True,
+                kscaled_fp16=True,
             )
             if args.with_recompute_wu:
                 w, u = recompute_w_u_from_preprocessed(
@@ -426,7 +564,12 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
     def compare(cutedsl: tuple[torch.Tensor, ...], fla_with_gk: tuple[torch.Tensor, ...]):
         gk, _, _, _, kg_fla, aqk_fla, akk_fla = fla_with_gk
         exp_gk = torch.exp2(gk)
-        k_scaled_ref = (k.float() * exp_gk).to(torch.bfloat16)
+        if args.cutedsl_variant == "flashinfer-k123-copy-fp32-inv-wbeta":
+            k_scaled_ref = ((k.float() * beta.unsqueeze(-1).float()) * exp_gk).to(torch.bfloat16)
+        elif args.cutedsl_variant == "flashinfer-k123-copy-fp32-inv-fp16-k":
+            k_scaled_ref = (k.float() * exp_gk).to(torch.float16)
+        else:
+            k_scaled_ref = (k.float() * exp_gk).to(torch.bfloat16)
         q_scaled_ref = (q.float() * exp_gk).to(torch.bfloat16)
         stats = [
             ("k_scaled", accuracy_stats(k_scaled_ref, cutedsl[0])),
@@ -434,7 +577,12 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
             ("q_scaled", accuracy_stats(q_scaled_ref, cutedsl[2])),
             ("Aqk_valid", accuracy_stats(aqk_fla, cutedsl[4], valid_mask)),
         ]
-        if args.cutedsl_variant in ("flashinfer-k123-copy-fp32-inv",):
+        if args.cutedsl_variant in (
+            "flashinfer-k123-copy-fp32-inv",
+            "flashinfer-k123-copy-fp32-inv-fp16-k",
+            "flashinfer-k123-copy-fp32-inv-wbeta",
+            "flashinfer-k123-incta-inv",
+        ):
             stats.append(("Akk_valid", accuracy_stats(akk_fla, cutedsl[5], valid_mask)))
         if args.with_recompute_wu:
             stats.extend(
@@ -576,8 +724,11 @@ def main() -> None:
         choices=(
             "flashinfer-k123-copy",
             "flashinfer-k123-copy-fp32-inv",
+            "flashinfer-k123-copy-fp32-inv-fp16-k",
+            "flashinfer-k123-copy-fp32-inv-wbeta",
+            "flashinfer-k123-incta-inv",
         ),
-        default="flashinfer-k123-copy-fp32-inv",
+        default="flashinfer-k123-copy-fp32-inv-fp16-k",
         help=("CuTeDSL variant to benchmark. Variants without Akk inverse skip Akk accuracy."),
     )
     parser.add_argument("--ncu", action="store_true", help="Run one case under cudaProfilerStart/Stop for Nsight Compute.")
@@ -585,8 +736,13 @@ def main() -> None:
 
     if args.K != K_DIM:
         raise NotImplementedError(f"SM100 training intra currently supports K={K_DIM}, got {args.K}.")
-    if args.with_recompute_wu and args.cutedsl_variant != "flashinfer-k123-copy-fp32-inv":
-        raise ValueError("--with-recompute-wu requires the fp32-inv variant so A_kk is inverted.")
+    if args.with_recompute_wu and args.cutedsl_variant not in (
+        "flashinfer-k123-copy-fp32-inv",
+        "flashinfer-k123-copy-fp32-inv-fp16-k",
+        "flashinfer-k123-copy-fp32-inv-wbeta",
+        "flashinfer-k123-incta-inv",
+    ):
+        raise ValueError("--with-recompute-wu requires an Akk-inverse variant.")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required.")
 

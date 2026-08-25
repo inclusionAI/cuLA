@@ -80,6 +80,12 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from fla.ops.utils import prepare_chunk_indices
 
 from cula.ops.kda.sm100.akk_inv_fp32 import akk_inv_fp32_physical_host as _akk_inv_fp32_physical_host
+from cula.ops.kda.sm100.akk_inv_tf32 import _add_store_C16_smem as _tf32_add_store_C16_smem
+from cula.ops.kda.sm100.akk_inv_tf32 import _invert_diag_forward16 as _tf32_invert_diag_forward16
+from cula.ops.kda.sm100.akk_inv_tf32 import _matmul16_smem_smem as _tf32_matmul16_smem_smem
+from cula.ops.kda.sm100.akk_inv_tf32 import _matmul16_tmp_smem as _tf32_matmul16_tmp_smem
+from cula.ops.kda.sm100.akk_inv_tf32 import _store_C16_smem as _tf32_store_C16_smem
+from cula.ops.kda.sm100.akk_inv_tf32 import _store_C16_tmp as _tf32_store_C16_tmp
 
 # (Test-only references to upstream act_cumsum / intra_parallel / fla triton
 # kernels were stripped during flashinfer migration — the fused fast path
@@ -97,8 +103,9 @@ NUM_K1_TMA_WARPS = 16  # Warps 0-15:  K1 compute (4 warpgroups, 8×2) -- TMA off
 NUM_MMA_WARPS = 11  # Warps 16-26: MMA (10 active + 1 TMA producer, dropped idle warp 27)
 NUM_MMA_ACTIVE = 10  # mma_warp 0..9: actual MMA work
 TMA_WARP_ID = NUM_K1_TMA_WARPS + NUM_MMA_ACTIVE  # warp 26 = dedicated TMA producer
-NUM_STORE_WARPS = 4  # Warps 27-30: vectorized stores
-NUM_WARPS = NUM_K1_TMA_WARPS + NUM_MMA_WARPS + NUM_STORE_WARPS  # 31
+NUM_STORE_WARPS = 4  # Warps 27-30: vectorized stores / optional in-CTA inverse
+STORE_WARP_BASE = NUM_K1_TMA_WARPS + NUM_MMA_WARPS
+NUM_WARPS = STORE_WARP_BASE + NUM_STORE_WARPS  # 31
 THREADS = NUM_WARPS * 32  # 992
 
 NUM_SUB_CHUNKS = BT // BC  # 4
@@ -129,6 +136,7 @@ K_VEC = K_DIM // VEC  # 64
 NUM_STAGES = 2
 PARTIAL_COLS = K_DIM + 4  # 132
 PARTIAL_COLS_PER_WARP = K_DIM // NUM_K1_TMA_WARPS  # 8
+INV_TMP_STRIDE = BC + 4
 
 _TILE_IQ = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3]
 _TILE_IK = [0, 0, 1, 0, 1, 2, 0, 1, 2, 3]
@@ -145,6 +153,22 @@ def k1_internal_barrier(*, loc=None, ip=None):
         T.i32(),
         [],
         "membar.cta; bar.sync 2, 512; mov.u32 $0, 0;",
+        "=r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def store_internal_barrier(*, loc=None, ip=None):
+    """Named barrier for the four store/inverse warps. barrier_id=3."""
+    llvm.inline_asm(
+        T.i32(),
+        [],
+        "membar.cta; bar.sync 3, 128; mov.u32 $0, 0;",
         "=r",
         has_side_effects=True,
         is_align_stack=False,
@@ -951,6 +975,9 @@ def fused_kernel123(
     HAS_BIAS: cutlass.Constexpr[int],
     USE_SAFE_GATE: cutlass.Constexpr[int],
     VARLEN_PURE: cutlass.Constexpr[int] = 0,
+    KSCALED_FP16: cutlass.Constexpr[int] = 0,
+    PREPROCESS_W_BETA: cutlass.Constexpr[int] = 0,
+    FUSE_AKK_INV: cutlass.Constexpr[int] = 0,
     FP32_AKK_WORKSPACE: cutlass.Constexpr[int] = 0,
 ):
     block_id, _, _ = cute.arch.block_idx()
@@ -1112,7 +1139,10 @@ def fused_kernel123(
             rAcc = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float32)
             rPrefix = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float32)
             rGkLast = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float32)
-            rKsOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
+            if cutlass.const_expr(KSCALED_FP16 != 0):
+                rKsOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float16)
+            else:
+                rKsOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
             rQsOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
             rKgOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
             rGkOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.Float32)
@@ -1252,6 +1282,8 @@ def fused_kernel123(
                 for ri in cutlass.range_constexpr(ROWS_PER_K1_WARP):
                     row = k1_row_start + ri
                     t = chunk_start + row
+                    if cutlass.const_expr(PREPROCESS_W_BETA != 0):
+                        beta_for_w = csBeta[row].to(cutlass.Float32)
 
                     sK_tile = cute.local_tile(csK, tiler=(1, K1_COLS_PER_WARP), coord=(row, warp_col_group))
                     tCsK = thr_copy_k1.partition_S(sK_tile)
@@ -1272,7 +1304,15 @@ def fused_kernel123(
                         exp2_cs = cute.exp2(cs, fastmath=True)
                         exp2_kg = cute.exp2(rGkLast[vi] - cs, fastmath=True)
 
-                        rKsOut[vi] = (k_val * exp2_cs).to(cutlass.BFloat16)
+                        if cutlass.const_expr(PREPROCESS_W_BETA != 0):
+                            # Match the csrc W operand association exactly:
+                            # bf16((k * beta) * exp2(gk)). WU consumes this
+                            # value directly and must not multiply beta again.
+                            rKsOut[vi] = ((k_val * beta_for_w) * exp2_cs).to(cutlass.BFloat16)
+                        elif cutlass.const_expr(KSCALED_FP16 != 0):
+                            rKsOut[vi] = (k_val * exp2_cs).to(cutlass.Float16)
+                        else:
+                            rKsOut[vi] = (k_val * exp2_cs).to(cutlass.BFloat16)
                         rQsOut[vi] = (q_val * exp2_cs).to(cutlass.BFloat16)
                         rKgOut[vi] = (k_val * exp2_kg).to(cutlass.BFloat16)
 
@@ -1507,9 +1547,6 @@ def fused_kernel123(
                         # qa fp32 = Q*gate (8 per thread). tCrQ indexing assumption:
                         # [0..3] first k-chunk (k=0..7), [4..7] second k-chunk (k=8..15).
                         qa0 = tCrQ[0].to(cutlass.Float32) * gate_q_0
-                        # qa fp32 = Q*gate (8 per thread). tCrQ indexing assumption:
-                        # [0..3] first k-chunk (k=0..7), [4..7] second k-chunk (k=8..15).
-                        qa0 = tCrQ[0].to(cutlass.Float32) * gate_q_0
                         qa1 = tCrQ[1].to(cutlass.Float32) * gate_q_1
                         qa2 = tCrQ[2].to(cutlass.Float32) * gate_q_2
                         qa3 = tCrQ[3].to(cutlass.Float32) * gate_q_3
@@ -1646,7 +1683,7 @@ def fused_kernel123(
                                 _v_q07 = _z16
                             csAqk[q_row_base + row1, k_row_base + col3] = _v_q07
 
-                            if cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
+                            if cutlass.const_expr(FP32_AKK_WORKSPACE != 0 or FUSE_AKK_INV != 0):
                                 _v_k00 = acc_akk_n0_0 * beta_row0
                                 if row0 == col0:
                                     _v_k00 = _one32
@@ -1712,7 +1749,7 @@ def fused_kernel123(
                             csAqk[q_row_base + row0, k_row_base + col3] = (acc_aqk_n1_1 * scale).to(cutlass.BFloat16)
                             csAqk[q_row_base + row1, k_row_base + col2] = (acc_aqk_n1_2 * scale).to(cutlass.BFloat16)
                             csAqk[q_row_base + row1, k_row_base + col3] = (acc_aqk_n1_3 * scale).to(cutlass.BFloat16)
-                            if cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
+                            if cutlass.const_expr(FP32_AKK_WORKSPACE != 0 or FUSE_AKK_INV != 0):
                                 csAkk[akk_row_base + row0, akk_col_base + col0] = acc_akk_n0_0 * beta_row0
                                 csAkk[akk_row_base + row0, akk_col_base + col1] = acc_akk_n0_1 * beta_row0
                                 csAkk[akk_row_base + row1, akk_col_base + col0] = acc_akk_n0_2 * beta_row1
@@ -1772,10 +1809,10 @@ def fused_kernel123(
                 cute.arch.mbarrier_arrive(mma_done_mbars + s)
 
         # =============================================================
-        # Warps 27-30: Store warps
+        # Warps 27-30: Store warps / optional in-CTA inverse workers
         # =============================================================
-        if warp_idx >= NUM_K1_TMA_WARPS + NUM_MMA_WARPS:
-            store_warp = warp_idx - (NUM_K1_TMA_WARPS + NUM_MMA_WARPS)
+        if warp_idx >= STORE_WARP_BASE:
+            store_warp = warp_idx - STORE_WARP_BASE
             for chunk_iter in cutlass.range_constexpr(CHUNKS_PER_BLOCK):
                 s = chunk_iter % NUM_STAGES
                 phase = chunk_iter // NUM_STAGES % 2
@@ -1827,7 +1864,9 @@ def fused_kernel123(
                         rAqkOut[1] = csAqk[local_row, col_hi]
                         if abs_row < st_eos:
                             cute.autovec_copy(rAqkOut, mAqk_v2[i_b, abs_row, i_h, col_vec_idx, None])
-                            if cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
+                            if cutlass.const_expr(FUSE_AKK_INV != 0):
+                                pass
+                            elif cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
                                 rAkkFp32Out[0] = cutlass.Float32(csAkk[local_row, col_lo])
                                 rAkkFp32Out[1] = cutlass.Float32(csAkk[local_row, col_hi])
                                 cute.autovec_copy(rAkkFp32Out, mAkk_v2[i_b, abs_row, i_h, col_vec_idx, None])
@@ -1870,31 +1909,270 @@ def fused_kernel123(
                                     aqk_val = cutlass.BFloat16(0.0)
                                 rAqkVec[elem] = aqk_val
 
-                                akk_val = cutlass.Float32(
-                                    csAkk[
-                                        smem_akk_row_base + local_row,
-                                        smem_akk_col_base + local_col,
-                                    ]
-                                )
-                                if is_diag and local_row < local_col:
-                                    akk_val = cutlass.Float32(0.0)
-                                if is_diag and local_row == local_col:
-                                    akk_val = cutlass.Float32(1.0)
-                                if cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
-                                    rAkkFp32Vec[elem] = akk_val
-                                else:
-                                    rAkkVec[elem] = akk_val.to(cutlass.BFloat16)
+                                if cutlass.const_expr(FUSE_AKK_INV == 0):
+                                    akk_val = cutlass.Float32(
+                                        csAkk[
+                                            smem_akk_row_base + local_row,
+                                            smem_akk_col_base + local_col,
+                                        ]
+                                    )
+                                    if is_diag and local_row < local_col:
+                                        akk_val = cutlass.Float32(0.0)
+                                    if is_diag and local_row == local_col:
+                                        akk_val = cutlass.Float32(1.0)
+                                    if cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
+                                        rAkkFp32Vec[elem] = akk_val
+                                    else:
+                                        rAkkVec[elem] = akk_val.to(cutlass.BFloat16)
 
                             aqk_row = mAqk[i_b, gmem_aqk_row_base + local_row, i_h, None]
                             aqk_vec = cute.local_tile(aqk_row, (8,), (2 * i_k + vec_idx,))
                             cute.autovec_copy(rAqkVec, aqk_vec)
 
-                            akk_row = mAkk[i_b, gmem_akk_row_base + local_row, i_h, None]
-                            akk_vec = cute.local_tile(akk_row, (8,), (2 * i_q + vec_idx,))
-                            if cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
-                                cute.autovec_copy(rAkkFp32Vec, akk_vec)
+                            if cutlass.const_expr(FUSE_AKK_INV == 0):
+                                akk_row = mAkk[i_b, gmem_akk_row_base + local_row, i_h, None]
+                                akk_vec = cute.local_tile(akk_row, (8,), (2 * i_q + vec_idx,))
+                                if cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
+                                    cute.autovec_copy(rAkkFp32Vec, akk_vec)
+                                else:
+                                    cute.autovec_copy(rAkkVec, akk_vec)
+
+                if cutlass.const_expr(FUSE_AKK_INV != 0):
+                    # Aqk has reached GMEM, so its current-stage storage can
+                    # safely become the 4x16x16 FP32 Schur workspace. The
+                    # stage remains owned by these four warps until
+                    # store_done, hence the next MMA stage cannot race this
+                    # alias. 64x72 bf16 = 9216 B; the workspace needs 5120 B.
+                    store_internal_barrier()
+                    inv_tmp_layout = cute.make_layout(
+                        (NUM_STORE_WARPS, BC, BC),
+                        stride=(BC * INV_TMP_STRIDE, INV_TMP_STRIDE, 1),
+                    )
+                    sInvTmp = cute.make_tensor(
+                        cute.recast_ptr(csAqk.iterator, dtype=cutlass.Float32),
+                        inv_tmp_layout,
+                    )
+                    store_tid = store_warp * 32 + lane_id
+
+                    # Convert the block-transposed K123 accumulator into a
+                    # logical unit-lower matrix before the TF32 Schur inverse.
+                    for norm_i in cutlass.range_constexpr((BT * BT) // (NUM_STORE_WARPS * 32)):
+                        linear = store_tid + norm_i * (NUM_STORE_WARPS * 32)
+                        norm_row = linear // BT
+                        norm_col = linear % BT
+                        if norm_row >= norm_col:
+                            norm_val = cutlass.Float32(0.0)
+                            if norm_row == norm_col:
+                                norm_val = cutlass.Float32(1.0)
                             else:
-                                cute.autovec_copy(rAkkVec, akk_vec)
+                                norm_row_blk = norm_row // BC
+                                norm_col_blk = norm_col // BC
+                                src_row = norm_row
+                                src_col = norm_col
+                                if norm_row_blk != norm_col_blk:
+                                    src_row = norm_col_blk * BC + norm_row % BC
+                                    src_col = norm_row_blk * BC + norm_col % BC
+                                norm_val = cutlass.Float32(csAkk[src_row, src_col])
+                                if IS_VARLEN and not VARLEN_PURE:
+                                    if chunk_start + norm_row >= st_eos:
+                                        norm_val = cutlass.Float32(0.0)
+                            csAkk[norm_row, norm_col] = norm_val
+                    store_internal_barrier()
+
+                    if store_tid < 64:
+                        _tf32_invert_diag_forward16(csAkk, store_tid // 16, store_tid)
+                    store_internal_barrier()
+
+                    # Invert each diagonal 32x32 block.
+                    if store_tid < 64:
+                        block32 = store_tid // 32
+                        row_base = block32 * 32
+                        c0, c1, c2, c3, c4, c5, c6, c7 = _tf32_matmul16_smem_smem(
+                            csAkk,
+                            row_base + 16,
+                            row_base + 16,
+                            csAkk,
+                            row_base + 16,
+                            row_base,
+                            lane_id,
+                        )
+                        _tf32_store_C16_tmp(
+                            sInvTmp,
+                            block32,
+                            -c0,
+                            -c1,
+                            -c2,
+                            -c3,
+                            -c4,
+                            -c5,
+                            -c6,
+                            -c7,
+                            lane_id,
+                        )
+                    store_internal_barrier()
+
+                    if store_tid < 64:
+                        block32 = store_tid // 32
+                        row_base = block32 * 32
+                        c0, c1, c2, c3, c4, c5, c6, c7 = _tf32_matmul16_tmp_smem(
+                            sInvTmp,
+                            block32,
+                            csAkk,
+                            row_base,
+                            row_base,
+                            lane_id,
+                        )
+                        _tf32_store_C16_smem(
+                            csAkk,
+                            row_base + 16,
+                            row_base,
+                            c0,
+                            c1,
+                            c2,
+                            c3,
+                            c4,
+                            c5,
+                            c6,
+                            c7,
+                            lane_id,
+                        )
+                    store_internal_barrier()
+
+                    # Schur solve for the lower-left 32x32 block. Each warp
+                    # computes one 16x16 quadrant.
+                    inv_x = store_warp // 2
+                    inv_y = store_warp % 2
+                    inv_slot = store_warp
+                    inv_row_o = 32 + inv_y * 16
+                    inv_col_c = inv_x * 16
+
+                    p0, p1, p2, p3, p4, p5, p6, p7 = _tf32_matmul16_smem_smem(
+                        csAkk,
+                        inv_row_o,
+                        32,
+                        csAkk,
+                        32,
+                        inv_col_c,
+                        lane_id,
+                    )
+                    q0, q1, q2, q3, q4, q5, q6, q7 = _tf32_matmul16_smem_smem(
+                        csAkk,
+                        inv_row_o,
+                        48,
+                        csAkk,
+                        48,
+                        inv_col_c,
+                        lane_id,
+                    )
+                    _tf32_store_C16_tmp(
+                        sInvTmp,
+                        inv_slot,
+                        -(p0 + q0),
+                        -(p1 + q1),
+                        -(p2 + q2),
+                        -(p3 + q3),
+                        -(p4 + q4),
+                        -(p5 + q5),
+                        -(p6 + q6),
+                        -(p7 + q7),
+                        lane_id,
+                    )
+                    store_internal_barrier()
+
+                    o0, o1, o2, o3, o4, o5, o6, o7 = _tf32_matmul16_tmp_smem(
+                        sInvTmp,
+                        inv_slot,
+                        csAkk,
+                        inv_x * 16,
+                        0,
+                        lane_id,
+                    )
+                    r0, r1, r2, r3, r4, r5, r6, r7 = _tf32_matmul16_tmp_smem(
+                        sInvTmp,
+                        inv_slot,
+                        csAkk,
+                        inv_x * 16,
+                        16,
+                        lane_id,
+                    )
+                    if inv_x == 0:
+                        _tf32_store_C16_smem(
+                            csAkk,
+                            inv_row_o,
+                            0,
+                            o0,
+                            o1,
+                            o2,
+                            o3,
+                            o4,
+                            o5,
+                            o6,
+                            o7,
+                            lane_id,
+                        )
+                        _tf32_store_C16_smem(
+                            csAkk,
+                            inv_row_o,
+                            16,
+                            r0,
+                            r1,
+                            r2,
+                            r3,
+                            r4,
+                            r5,
+                            r6,
+                            r7,
+                            lane_id,
+                        )
+                    store_internal_barrier()
+                    if inv_x == 1:
+                        _tf32_add_store_C16_smem(
+                            csAkk,
+                            inv_row_o,
+                            0,
+                            o0,
+                            o1,
+                            o2,
+                            o3,
+                            o4,
+                            o5,
+                            o6,
+                            o7,
+                            lane_id,
+                        )
+                        _tf32_add_store_C16_smem(
+                            csAkk,
+                            inv_row_o,
+                            16,
+                            r0,
+                            r1,
+                            r2,
+                            r3,
+                            r4,
+                            r5,
+                            r6,
+                            r7,
+                            lane_id,
+                        )
+                    store_internal_barrier()
+
+                    row_base_warp = store_warp * (BT // NUM_STORE_WARPS)
+                    for ri in cutlass.range_constexpr(BT // NUM_STORE_WARPS):
+                        local_row = row_base_warp + ri
+                        abs_row = chunk_start + local_row
+                        val0 = cutlass.Float32(csAkk[local_row, col_lo])
+                        val1 = cutlass.Float32(csAkk[local_row, col_hi])
+                        if local_row < col_lo:
+                            val0 = cutlass.Float32(0.0)
+                        if local_row < col_hi:
+                            val1 = cutlass.Float32(0.0)
+                        rAkkOut[0] = val0.to(cutlass.BFloat16)
+                        rAkkOut[1] = val1.to(cutlass.BFloat16)
+                        if IS_VARLEN and not VARLEN_PURE:
+                            if abs_row < st_eos:
+                                cute.autovec_copy(rAkkOut, mAkk_v2[i_b, abs_row, i_h, col_vec_idx, None])
+                        else:
+                            cute.autovec_copy(rAkkOut, mAkk_v2[i_b, abs_row, i_h, col_vec_idx, None])
 
                 cute.arch.mbarrier_arrive(store_done_mbars + s)
 
@@ -1913,6 +2191,9 @@ def make_host_function(
     has_bias=False,
     use_safe_gate=False,
     varlen_pure=False,
+    kscaled_fp16=False,
+    preprocess_w_beta=False,
+    fuse_akk_inv=False,
     fp32_akk_workspace=False,
 ):
     """
@@ -1927,7 +2208,14 @@ def make_host_function(
     _HAS_BIAS = 1 if has_bias else 0
     _USE_SAFE_GATE = 1 if use_safe_gate else 0
     _VARLEN_PURE = 1 if (is_varlen and varlen_pure) else 0
+    _KSCALED_FP16 = 1 if kscaled_fp16 else 0
+    _PREPROCESS_W_BETA = 1 if preprocess_w_beta else 0
+    if _KSCALED_FP16 and _PREPROCESS_W_BETA:
+        raise ValueError("kscaled_fp16 and preprocess_w_beta are mutually exclusive")
+    _FUSE_AKK_INV = 1 if fuse_akk_inv else 0
     _FP32_AKK_WORKSPACE = 1 if fp32_akk_workspace else 0
+    if _FUSE_AKK_INV and _FP32_AKK_WORKSPACE:
+        raise ValueError("fuse_akk_inv and fp32_akk_workspace are mutually exclusive")
     if is_varlen:
         assert _B == 1, "Varlen requires B=1"
         assert T_padded is not None, "T_padded required for varlen"
@@ -2104,6 +2392,9 @@ def make_host_function(
             _HAS_BIAS,
             _USE_SAFE_GATE,
             _VARLEN_PURE,
+            _KSCALED_FP16,
+            _PREPROCESS_W_BETA,
+            _FUSE_AKK_INV,
             _FP32_AKK_WORKSPACE,
         ).launch(
             grid=(_grid_x, 1, 1),
@@ -2165,13 +2456,13 @@ def _get_bias_ct(dt_bias, H, K, device):
         return entry
 
 
-def _get_out_buffers_equal(device, B, T_total, H):
+def _get_out_buffers_equal(device, B, T_total, H, kscaled_dtype=torch.bfloat16):
     """Cache and reuse the six K123 output buffers by shape."""
-    key = (device.index if device.index is not None else 0, B, T_total, H)
+    key = (device.index if device.index is not None else 0, B, T_total, H, kscaled_dtype)
     entry = _K123_CACHE.get(("buffers", key))
     if entry is None:
         nt = T_total // BT
-        k_scaled = torch.empty(B, T_total, H, K_DIM, device=device, dtype=torch.bfloat16)
+        k_scaled = torch.empty(B, T_total, H, K_DIM, device=device, dtype=kscaled_dtype)
         kg = torch.empty(B, T_total, H, K_DIM, device=device, dtype=torch.bfloat16)
         q_scaled = torch.empty(B, T_total, H, K_DIM, device=device, dtype=torch.bfloat16)
         gk_last_exp = torch.empty(B, nt, H, K_DIM, device=device, dtype=torch.float32)
@@ -2182,12 +2473,12 @@ def _get_out_buffers_equal(device, B, T_total, H):
     return entry
 
 
-def _get_out_buffers_varlen(device, T_padded, NT, H):
+def _get_out_buffers_varlen(device, T_padded, NT, H, kscaled_dtype=torch.bfloat16):
     """Varlen counterpart keyed on launch shape."""
-    key = (device.index if device.index is not None else 0, T_padded, NT, H)
+    key = (device.index if device.index is not None else 0, T_padded, NT, H, kscaled_dtype)
     entry = _K123_CACHE.get(("buffers_varlen", key))
     if entry is None:
-        k_scaled = torch.empty(1, T_padded, H, K_DIM, device=device, dtype=torch.bfloat16)
+        k_scaled = torch.empty(1, T_padded, H, K_DIM, device=device, dtype=kscaled_dtype)
         kg = torch.empty(1, T_padded, H, K_DIM, device=device, dtype=torch.bfloat16)
         q_scaled = torch.empty(1, T_padded, H, K_DIM, device=device, dtype=torch.bfloat16)
         gk_last_exp = torch.empty(1, NT, H, K_DIM, device=device, dtype=torch.float32)
@@ -2305,6 +2596,9 @@ def chunk_kda_fwd_intra_sm100_equal(
     lower_bound: float | None = None,
     chunk_size: int = BT,
     fp32_akk_inv: bool = False,
+    fused_akk_inv: bool = False,
+    preprocess_w_beta: bool = False,
+    kscaled_fp16: bool = False,
 ):
     """Launch FlashInfer fused K1+K2+K3 kernel for equal-length sequences."""
     if chunk_size != BT:
@@ -2326,13 +2620,29 @@ def chunk_kda_fwd_intra_sm100_equal(
         scale = K_DIM**-0.5
     if safe_gate and lower_bound is None:
         lower_bound = -5.0
+    if fp32_akk_inv and fused_akk_inv:
+        raise ValueError("fp32_akk_inv and fused_akk_inv are mutually exclusive")
+    if preprocess_w_beta and kscaled_fp16:
+        raise ValueError("preprocess_w_beta and kscaled_fp16 are mutually exclusive")
 
     NT = T_total // BT
     dev = q.device.index if q.device.index is not None else 0
     has_bias = dt_bias is not None
-    cache_key = (dev, B, NT, H, has_bias, safe_gate, fp32_akk_inv)
+    cache_key = (
+        dev,
+        B,
+        NT,
+        H,
+        has_bias,
+        safe_gate,
+        fp32_akk_inv,
+        fused_akk_inv,
+        preprocess_w_beta,
+        kscaled_fp16,
+    )
 
-    k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk = _get_out_buffers_equal(q.device, B, T_total, H)
+    kscaled_dtype = torch.float16 if kscaled_fp16 else torch.bfloat16
+    k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk = _get_out_buffers_equal(q.device, B, T_total, H, kscaled_dtype)
     A_kk_workspace = _get_akk_fp32_workspace_equal(q.device, B, T_total, H) if fp32_akk_inv else A_kk
 
     q_ct = _ct_cached(q, cutlass.BFloat16)
@@ -2340,7 +2650,7 @@ def chunk_kda_fwd_intra_sm100_equal(
     g_ct = _ct_cached(g, cutlass.BFloat16)
     alog_ct = _ct_cached(A_log, cutlass.Float32)
     beta_ct = _ct_cached(beta, cutlass.BFloat16)
-    ks_ct = _ct_cached(k_scaled, cutlass.BFloat16)
+    ks_ct = _ct_cached(k_scaled, cutlass.Float16 if kscaled_fp16 else cutlass.BFloat16)
     kg_ct = _ct_cached(kg, cutlass.BFloat16)
     qs_ct = _ct_cached(q_scaled, cutlass.BFloat16)
     gk_ct = _ct_cached(gk_last_exp, cutlass.Float32)
@@ -2385,6 +2695,9 @@ def chunk_kda_fwd_intra_sm100_equal(
             is_varlen=False,
             has_bias=has_bias,
             use_safe_gate=safe_gate,
+            kscaled_fp16=kscaled_fp16,
+            preprocess_w_beta=preprocess_w_beta,
+            fuse_akk_inv=fused_akk_inv,
             fp32_akk_workspace=fp32_akk_inv,
         )
         kernel = cute.compile(host_fn, *ct_args)
@@ -2421,6 +2734,9 @@ def chunk_kda_fwd_intra_sm100_varlen(
     lower_bound: float | None = None,
     seq_lens: list[int] | None = None,
     fp32_akk_inv: bool = False,
+    fused_akk_inv: bool = False,
+    preprocess_w_beta: bool = False,
+    kscaled_fp16: bool = False,
 ):
     """Launch FlashInfer fused K1+K2+K3 kernel for varlen sequences.
 
@@ -2439,7 +2755,44 @@ def chunk_kda_fwd_intra_sm100_varlen(
         scale = K_DIM**-0.5
     if safe_gate and lower_bound is None:
         lower_bound = -5.0
+    if fp32_akk_inv and fused_akk_inv:
+        raise ValueError("fp32_akk_inv and fused_akk_inv are mutually exclusive")
+    if preprocess_w_beta and kscaled_fp16:
+        raise ValueError("preprocess_w_beta and kscaled_fp16 are mutually exclusive")
     has_bias = dt_bias is not None
+
+    # A packed uniform batch with full 4-chunk groups has exactly the same
+    # storage as the equal-length path. Route it there to remove per-work-unit
+    # chunk-index decoding and varlen predicates; flatten the outputs back to
+    # the packed ABI. The WU wrapper applies the same uniform fast path.
+    if seq_lens and len(set(seq_lens)) == 1 and seq_lens[0] % (4 * BT) == 0:
+        uniform_batch = len(seq_lens)
+        uniform_t = seq_lens[0]
+        if uniform_batch * uniform_t != T_total:
+            raise ValueError(f"seq_lens sum must equal packed T={T_total}, got {sum(seq_lens)}")
+        equal_out = chunk_kda_fwd_intra_sm100_equal(
+            q.view(uniform_batch, uniform_t, H, K),
+            k.view(uniform_batch, uniform_t, H, K),
+            g.view(uniform_batch, uniform_t, H, K),
+            beta.view(uniform_batch, uniform_t, H),
+            A_log,
+            scale,
+            dt_bias=dt_bias,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            fp32_akk_inv=fp32_akk_inv,
+            fused_akk_inv=fused_akk_inv,
+            preprocess_w_beta=preprocess_w_beta,
+            kscaled_fp16=kscaled_fp16,
+        )
+        return (
+            equal_out[0].flatten(0, 1).unsqueeze(0),
+            equal_out[1].flatten(0, 1).unsqueeze(0),
+            equal_out[2].flatten(0, 1).unsqueeze(0),
+            equal_out[3].flatten(0, 1).unsqueeze(0),
+            equal_out[4].flatten(0, 1).unsqueeze(0),
+            equal_out[5].flatten(0, 1).unsqueeze(0),
+        )
 
     cu_seqlens = cu_seqlens.contiguous().to(torch.int32)
     if chunk_indices is None:
@@ -2469,9 +2822,13 @@ def chunk_kda_fwd_intra_sm100_varlen(
         safe_gate,
         varlen_pure,
         fp32_akk_inv,
+        fused_akk_inv,
+        preprocess_w_beta,
+        kscaled_fp16,
     )
 
-    k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk = _get_out_buffers_varlen(q.device, T_padded, NT, H)
+    kscaled_dtype = torch.float16 if kscaled_fp16 else torch.bfloat16
+    k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk = _get_out_buffers_varlen(q.device, T_padded, NT, H, kscaled_dtype)
     A_kk_workspace = _get_akk_fp32_workspace_varlen(q.device, T_padded, NT, H) if fp32_akk_inv else A_kk
 
     q_ct = _ct_cached(q_pad, cutlass.BFloat16)
@@ -2479,7 +2836,7 @@ def chunk_kda_fwd_intra_sm100_varlen(
     g_ct = _ct_cached(g_pad, cutlass.BFloat16)
     alog_ct = _ct_cached(A_log, cutlass.Float32)
     beta_ct = _ct_cached(beta_pad, cutlass.BFloat16)
-    ks_ct = _ct_cached(k_scaled, cutlass.BFloat16)
+    ks_ct = _ct_cached(k_scaled, cutlass.Float16 if kscaled_fp16 else cutlass.BFloat16)
     kg_ct = _ct_cached(kg, cutlass.BFloat16)
     qs_ct = _ct_cached(q_scaled, cutlass.BFloat16)
     gk_ct = _ct_cached(gk_last_exp, cutlass.Float32)
@@ -2527,6 +2884,9 @@ def chunk_kda_fwd_intra_sm100_varlen(
             has_bias=has_bias,
             use_safe_gate=safe_gate,
             varlen_pure=varlen_pure,
+            kscaled_fp16=kscaled_fp16,
+            preprocess_w_beta=preprocess_w_beta,
+            fuse_akk_inv=fused_akk_inv,
             fp32_akk_workspace=fp32_akk_inv,
         )
         kernel = cute.compile(host_fn, *ct_args)
