@@ -105,7 +105,10 @@ class KDARecomputeWU:
         self.bproc_stage = 1
         self.acc_storage_stage = 2
         self.acc_pipe_stage = 1
-        self.store_stage = 2
+        # Temporary staged epilogue uses one slot; csrc direct stores replace
+        # this buffer below. Keeping it separate from G is required for the
+        # persistent cross-WU lifetime.
+        self.store_stage = 1
 
         # Match the csrc 384-thread, one-CTA-per-SM register split.
         self.min_occupancy = 1
@@ -434,13 +437,6 @@ class KDARecomputeWU:
         )
 
         # ---------- SharedStorage ----------
-        # sGK and sStore alias the same memory (non-overlapping lifetimes)
-        gk_elems = cute.cosize(gk_epi_staged)
-        store_elems_as_fp32 = (cute.cosize(store_epi_staged) * (self.io_dtype.width // 8) + self.acc_dtype.width // 8 - 1) // (
-            self.acc_dtype.width // 8
-        )
-        alias_elems = max(gk_elems, store_elems_as_fp32)
-
         @cute.struct
         class SharedStorage:
             load_A_mbar: cute.struct.MemRange[Int64, self.a_stage * 2]
@@ -472,9 +468,12 @@ class KDARecomputeWU:
                 cute.struct.MemRange[self.io_dtype, cute.cosize(v_epi_staged)],
                 self.buffer_align_bytes,
             ]
-            # sGK and sStore alias the same memory — use max of both sizes
-            sGKStore: cute.struct.Align[
-                cute.struct.MemRange[self.acc_dtype, alias_elems],
+            sGK: cute.struct.Align[
+                cute.struct.MemRange[self.acc_dtype, cute.cosize(gk_epi_staged)],
+                self.buffer_align_bytes,
+            ]
+            sStore: cute.struct.Align[
+                cute.struct.MemRange[self.io_dtype, cute.cosize(store_epi_staged)],
                 self.buffer_align_bytes,
             ]
             sStoreKg: cute.struct.Align[
@@ -604,12 +603,8 @@ class KDARecomputeWU:
         sBVTime = storage.sBV.get_tensor(b_epi_staged.outer, swizzle=b_epi_staged.inner)
         sK = storage.sK.get_tensor(k_epi_staged.outer, swizzle=k_epi_staged.inner)
         sV = storage.sV.get_tensor(v_epi_staged.outer, swizzle=v_epi_staged.inner)
-        # sGK and sStore alias the same memory (non-overlapping lifetimes)
-        sGK = storage.sGKStore.get_tensor(gk_epi_staged.outer, swizzle=gk_epi_staged.inner)
-        sStore = cute.make_tensor(
-            cute.recast_ptr(storage.sGKStore.data_ptr(), store_epi_staged.inner, dtype=self.io_dtype),
-            store_epi_staged.outer,
-        )
+        sGK = storage.sGK.get_tensor(gk_epi_staged.outer, swizzle=gk_epi_staged.inner)
+        sStore = storage.sStore.get_tensor(store_epi_staged.outer, swizzle=store_epi_staged.inner)
         sStoreKg = storage.sStoreKg.get_tensor(store_epi_staged.outer, swizzle=store_epi_staged.inner)
         sBeta = cute.make_tensor(
             cute.make_ptr(self.beta_dtype, storage.sBeta.data_ptr().toint(), cute.AddressSpace.smem),
