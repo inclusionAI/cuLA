@@ -83,6 +83,7 @@ from cula.ops.kda.sm100.akk_inv_fp32 import akk_inv_fp32_physical_host as _akk_i
 from cula.ops.kda.sm100.akk_inv_tf32 import _add_store_C16_smem as _tf32_add_store_C16_smem
 from cula.ops.kda.sm100.akk_inv_tf32 import _invert_diag_forward16 as _tf32_invert_diag_forward16
 from cula.ops.kda.sm100.akk_inv_tf32 import _matmul16_smem_smem as _tf32_matmul16_smem_smem
+from cula.ops.kda.sm100.akk_inv_tf32 import _matmul32_smem_smem as _tf32_matmul32_smem_smem
 from cula.ops.kda.sm100.akk_inv_tf32 import _matmul16_tmp_smem as _tf32_matmul16_tmp_smem
 from cula.ops.kda.sm100.akk_inv_tf32 import _store_C16_smem as _tf32_store_C16_smem
 from cula.ops.kda.sm100.akk_inv_tf32 import _store_C16_tmp as _tf32_store_C16_tmp
@@ -979,6 +980,8 @@ def fused_kernel123(
     PREPROCESS_W_BETA: cutlass.Constexpr[int] = 0,
     FUSE_AKK_INV: cutlass.Constexpr[int] = 0,
     FP32_AKK_WORKSPACE: cutlass.Constexpr[int] = 0,
+    INPUT_GK_FP32: cutlass.Constexpr[int] = 0,
+    BETA_FP32: cutlass.Constexpr[int] = 0,
 ):
     block_id, _, _ = cute.arch.block_idx()
     tidx = cute.arch.thread_idx()[0]
@@ -1003,7 +1006,10 @@ def fused_kernel123(
     sQ = smem.allocate_tensor(cutlass.BFloat16, qk_smem_layout.outer, 128, swizzle=qk_smem_layout.inner)
     sK = smem.allocate_tensor(cutlass.BFloat16, qk_smem_layout.outer, 128, swizzle=qk_smem_layout.inner)
     sG = smem.allocate_tensor(cutlass.BFloat16, g_smem_layout, 128)
-    sGcum = smem.allocate_tensor(cutlass.Float32, g_cumsum_layout, 128)
+    if cutlass.const_expr(INPUT_GK_FP32 != 0):
+        sGcum = smem.allocate_tensor(cutlass.Float32, g_cumsum_layout.outer, 128, swizzle=g_cumsum_layout.inner)
+    else:
+        sGcum = smem.allocate_tensor(cutlass.Float32, g_cumsum_layout, 128)
     partial_last_layout = cute.make_layout((K1_ROW_GROUPS, PARTIAL_COLS), stride=(PARTIAL_COLS, 1))
     sPartialLast = smem.allocate_tensor(cutlass.Float32, partial_last_layout, 128)
 
@@ -1020,7 +1026,10 @@ def fused_kernel123(
 
     # K1 loads each beta value once; all ten MMA tile warps reuse it.
     beta_smem_layout = cute.make_layout((BT, NUM_STAGES), stride=(1, BT))
-    sBeta = smem.allocate_tensor(cutlass.BFloat16, beta_smem_layout, 128)
+    if cutlass.const_expr(BETA_FP32 != 0):
+        sBeta = smem.allocate_tensor(cutlass.Float32, beta_smem_layout, 128)
+    else:
+        sBeta = smem.allocate_tensor(cutlass.BFloat16, beta_smem_layout, 128)
 
     # =====================================================================
     # Mbarrier allocation & init
@@ -1031,7 +1040,10 @@ def fused_kernel123(
     mma_done_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
     store_done_mbars = smem.allocate_array(cutlass.Int64, NUM_STAGES)
 
-    bytes_per_stage = BT * K_DIM * 2 * 3
+    if cutlass.const_expr(INPUT_GK_FP32 != 0):
+        bytes_per_stage = BT * K_DIM * (2 + 2 + 4)
+    else:
+        bytes_per_stage = BT * K_DIM * 2 * 3
 
     if tidx == 0:
         for s in range(NUM_STAGES):
@@ -1199,141 +1211,158 @@ def fused_kernel123(
                 for vi in cutlass.range_constexpr(VEC):
                     rAcc[vi] = cutlass.Float32(0.0)
 
-                for ri in cutlass.range_constexpr(ROWS_PER_K1_WARP):
-                    row = k1_row_start + ri
+                if cutlass.const_expr(INPUT_GK_FP32 != 0):
+                    # One-to-one csrc port: consume the same FP32 cumulative
+                    # gate tensor that csrc receives. Do not recompute the
+                    # activation or cumsum inside this kernel.
+                    for ri in cutlass.range_constexpr(ROWS_PER_K1_WARP):
+                        row = k1_row_start + ri
+                        for vi in cutlass.range_constexpr(VEC):
+                            rGact[ri, vi] = csGcum[row, col_base + vi]
                     for vi in cutlass.range_constexpr(VEC):
-                        c = col_base + vi
-                        g_val = csG[row, c].to(cutlass.Float32)
-                        if HAS_BIAS:
-                            g_val = g_val + rBias[vi]
-                        g_activated = cutlass.Float32(0.0)
-                        if USE_SAFE_GATE:
-                            sigmoid_g = fast_rcp(cutlass.Float32(1.0) + cute.exp2(-exp_A * g_val * LOG2E, fastmath=True))
-                            g_activated = lower_bound * sigmoid_g
-                        else:
-                            softplus_g = (
-                                cute.log2(cutlass.Float32(1.0) + cute.exp2(g_val * LOG2E, fastmath=True), fastmath=True) * LN2
-                            )
-                            g_activated = -exp_A * softplus_g
-                        # Varlen: zero gate for out-of-bounds rows so cumsum
-                        # stays flat beyond the last valid position.
-                        # VARLEN_PURE=1 elides this at compile time — caller
-                        # guarantees all seq lengths are multiples of BT so no
-                        # chunk has OOB rows.
-                        if IS_VARLEN and not VARLEN_PURE:
-                            if chunk_start + row >= ci_eos:
-                                g_activated = cutlass.Float32(0.0)
-                        rGact[ri, vi] = g_activated
-                        rAcc[vi] = rAcc[vi] + g_activated
-
-                for vi in cutlass.range_constexpr(VEC):
-                    sPartialLast[warp_row_group, col_base + vi] = rAcc[vi]
-
-                k1_internal_barrier()
-
-                prefix_col_start = k1_warp * PARTIAL_COLS_PER_WARP
-                row_in_prefix = lane_id % K1_ROW_GROUPS
-                col_in_group = lane_id // K1_ROW_GROUPS
-
-                for j in cutlass.range_constexpr(PARTIAL_COLS_PER_WARP // 4):
-                    col = prefix_col_start + j * 4 + col_in_group
-                    val = cutlass.Float32(sPartialLast[row_in_prefix, col])
-                    tmp = cute.arch.shuffle_sync_up(val, 1, mask=-1, mask_and_clamp=SHFL_W8_CLAMP)
-                    if row_in_prefix >= 1:
-                        val = val + tmp
-                    tmp = cute.arch.shuffle_sync_up(val, 2, mask=-1, mask_and_clamp=SHFL_W8_CLAMP)
-                    if row_in_prefix >= 2:
-                        val = val + tmp
-                    tmp = cute.arch.shuffle_sync_up(val, 4, mask=-1, mask_and_clamp=SHFL_W8_CLAMP)
-                    if row_in_prefix >= 4:
-                        val = val + tmp
-                    sPartialLast[row_in_prefix, col] = val
-
-                k1_internal_barrier()
-
-                for vi in cutlass.range_constexpr(VEC):
-                    rGkLast[vi] = sPartialLast[K1_ROW_GROUPS - 1, col_base + vi]
-
-                for vi in cutlass.range_constexpr(VEC):
-                    rPrefix[vi] = cutlass.Float32(0.0)
-                if warp_row_group > 0:
-                    for vi in cutlass.range_constexpr(VEC):
-                        rPrefix[vi] = sPartialLast[warp_row_group - 1, col_base + vi]
-
-                # ---- Pass 2a: ONLY cumsum + write csGcum (critical path, minimal work) ----
-                for vi in cutlass.range_constexpr(VEC):
-                    rAcc[vi] = rPrefix[vi]
-
-                for ri in cutlass.range_constexpr(ROWS_PER_K1_WARP):
-                    row = k1_row_start + ri
-                    for vi in cutlass.range_constexpr(VEC):
-                        rAcc[vi] = rAcc[vi] + rGact[ri, vi]
-                        cs = rAcc[vi] * cumsum_scale
-                        rGact[ri, vi] = cs
-                        csGcum[row, col_base + vi] = cs
-
-                # Signal MMA early: csGcum is ready
-                cute.arch.mbarrier_arrive(k1_done_mbars + cur_stage)
-
-                # ---- Pass 2b: write GMEM (overlaps with MMA, off critical path) ----
-                for vi in cutlass.range_constexpr(VEC):
-                    rGkLast[vi] = rGkLast[vi] * cumsum_scale
-
-                for ri in cutlass.range_constexpr(ROWS_PER_K1_WARP):
-                    row = k1_row_start + ri
-                    t = chunk_start + row
-                    if cutlass.const_expr(PREPROCESS_W_BETA != 0):
-                        beta_for_w = csBeta[row].to(cutlass.Float32)
-
-                    sK_tile = cute.local_tile(csK, tiler=(1, K1_COLS_PER_WARP), coord=(row, warp_col_group))
-                    tCsK = thr_copy_k1.partition_S(sK_tile)
-                    tCrK = cute.make_fragment_like(tCsK)
-                    cute.copy(tiled_copy_qk_k1, tCsK, thr_copy_k1.retile(tCrK))
-
-                    sQ_tile = cute.local_tile(csQ, tiler=(1, K1_COLS_PER_WARP), coord=(row, warp_col_group))
-                    tCsQ = thr_copy_k1.partition_S(sQ_tile)
-                    tCrQ = cute.make_fragment_like(tCsQ)
-                    cute.copy(tiled_copy_qk_k1, tCsQ, thr_copy_k1.retile(tCrQ))
+                        rGkLast[vi] = csGcum[BT - 1, col_base + vi]
+                    cute.arch.mbarrier_arrive(k1_done_mbars + cur_stage)
+                else:
+                    for ri in cutlass.range_constexpr(ROWS_PER_K1_WARP):
+                        row = k1_row_start + ri
+                        for vi in cutlass.range_constexpr(VEC):
+                            c = col_base + vi
+                            g_val = csG[row, c].to(cutlass.Float32)
+                            if HAS_BIAS:
+                                g_val = g_val + rBias[vi]
+                            g_activated = cutlass.Float32(0.0)
+                            if USE_SAFE_GATE:
+                                sigmoid_g = fast_rcp(cutlass.Float32(1.0) + cute.exp2(-exp_A * g_val * LOG2E, fastmath=True))
+                                g_activated = lower_bound * sigmoid_g
+                            else:
+                                softplus_g = (
+                                    cute.log2(
+                                        cutlass.Float32(1.0) + cute.exp2(g_val * LOG2E, fastmath=True),
+                                        fastmath=True,
+                                    )
+                                    * LN2
+                                )
+                                g_activated = -exp_A * softplus_g
+                            # Varlen: zero gate for out-of-bounds rows so cumsum
+                            # stays flat beyond the last valid position.
+                            # VARLEN_PURE=1 elides this at compile time — caller
+                            # guarantees all seq lengths are multiples of BT so no
+                            # chunk has OOB rows.
+                            if IS_VARLEN and not VARLEN_PURE:
+                                if chunk_start + row >= ci_eos:
+                                    g_activated = cutlass.Float32(0.0)
+                            rGact[ri, vi] = g_activated
+                            rAcc[vi] = rAcc[vi] + g_activated
 
                     for vi in cutlass.range_constexpr(VEC):
-                        cs = rGact[ri, vi]
+                        sPartialLast[warp_row_group, col_base + vi] = rAcc[vi]
 
-                        k_val = tCrK[vi].to(cutlass.Float32)
-                        q_val = tCrQ[vi].to(cutlass.Float32)
+                    k1_internal_barrier()
 
-                        exp2_cs = cute.exp2(cs, fastmath=True)
-                        exp2_kg = cute.exp2(rGkLast[vi] - cs, fastmath=True)
+                    prefix_col_start = k1_warp * PARTIAL_COLS_PER_WARP
+                    row_in_prefix = lane_id % K1_ROW_GROUPS
+                    col_in_group = lane_id // K1_ROW_GROUPS
 
+                    for j in cutlass.range_constexpr(PARTIAL_COLS_PER_WARP // 4):
+                        col = prefix_col_start + j * 4 + col_in_group
+                        val = cutlass.Float32(sPartialLast[row_in_prefix, col])
+                        tmp = cute.arch.shuffle_sync_up(val, 1, mask=-1, mask_and_clamp=SHFL_W8_CLAMP)
+                        if row_in_prefix >= 1:
+                            val = val + tmp
+                        tmp = cute.arch.shuffle_sync_up(val, 2, mask=-1, mask_and_clamp=SHFL_W8_CLAMP)
+                        if row_in_prefix >= 2:
+                            val = val + tmp
+                        tmp = cute.arch.shuffle_sync_up(val, 4, mask=-1, mask_and_clamp=SHFL_W8_CLAMP)
+                        if row_in_prefix >= 4:
+                            val = val + tmp
+                        sPartialLast[row_in_prefix, col] = val
+
+                    k1_internal_barrier()
+
+                    for vi in cutlass.range_constexpr(VEC):
+                        rGkLast[vi] = sPartialLast[K1_ROW_GROUPS - 1, col_base + vi]
+
+                    for vi in cutlass.range_constexpr(VEC):
+                        rPrefix[vi] = cutlass.Float32(0.0)
+                    if warp_row_group > 0:
+                        for vi in cutlass.range_constexpr(VEC):
+                            rPrefix[vi] = sPartialLast[warp_row_group - 1, col_base + vi]
+
+                    # ---- Pass 2a: ONLY cumsum + write csGcum (critical path, minimal work) ----
+                    for vi in cutlass.range_constexpr(VEC):
+                        rAcc[vi] = rPrefix[vi]
+
+                    for ri in cutlass.range_constexpr(ROWS_PER_K1_WARP):
+                        row = k1_row_start + ri
+                        for vi in cutlass.range_constexpr(VEC):
+                            rAcc[vi] = rAcc[vi] + rGact[ri, vi]
+                            cs = rAcc[vi] * cumsum_scale
+                            rGact[ri, vi] = cs
+                            csGcum[row, col_base + vi] = cs
+
+                    # Signal MMA early: csGcum is ready
+                    cute.arch.mbarrier_arrive(k1_done_mbars + cur_stage)
+
+                    for vi in cutlass.range_constexpr(VEC):
+                        rGkLast[vi] = rGkLast[vi] * cumsum_scale
+
+                if cutlass.const_expr(INPUT_GK_FP32 == 0):
+                    # ---- Pass 2b: write GMEM (overlaps with MMA, off critical path) ----
+                    for ri in cutlass.range_constexpr(ROWS_PER_K1_WARP):
+                        row = k1_row_start + ri
+                        t = chunk_start + row
                         if cutlass.const_expr(PREPROCESS_W_BETA != 0):
-                            # Match the csrc W operand association exactly:
-                            # bf16((k * beta) * exp2(gk)). WU consumes this
-                            # value directly and must not multiply beta again.
-                            rKsOut[vi] = ((k_val * beta_for_w) * exp2_cs).to(cutlass.BFloat16)
-                        elif cutlass.const_expr(KSCALED_FP16 != 0):
-                            rKsOut[vi] = (k_val * exp2_cs).to(cutlass.Float16)
-                        else:
-                            rKsOut[vi] = (k_val * exp2_cs).to(cutlass.BFloat16)
-                        rQsOut[vi] = (q_val * exp2_cs).to(cutlass.BFloat16)
-                        rKgOut[vi] = (k_val * exp2_kg).to(cutlass.BFloat16)
+                            beta_for_w = csBeta[row].to(cutlass.Float32)
 
-                    if IS_VARLEN and not VARLEN_PURE:
-                        if t < ci_eos:
+                        sK_tile = cute.local_tile(csK, tiler=(1, K1_COLS_PER_WARP), coord=(row, warp_col_group))
+                        tCsK = thr_copy_k1.partition_S(sK_tile)
+                        tCrK = cute.make_fragment_like(tCsK)
+                        cute.copy(tiled_copy_qk_k1, tCsK, thr_copy_k1.retile(tCrK))
+
+                        sQ_tile = cute.local_tile(csQ, tiler=(1, K1_COLS_PER_WARP), coord=(row, warp_col_group))
+                        tCsQ = thr_copy_k1.partition_S(sQ_tile)
+                        tCrQ = cute.make_fragment_like(tCsQ)
+                        cute.copy(tiled_copy_qk_k1, tCsQ, thr_copy_k1.retile(tCrQ))
+
+                        for vi in cutlass.range_constexpr(VEC):
+                            cs = rGact[ri, vi]
+
+                            k_val = tCrK[vi].to(cutlass.Float32)
+                            q_val = tCrQ[vi].to(cutlass.Float32)
+
+                            exp2_cs = cute.exp2(cs, fastmath=True)
+                            exp2_kg = cute.exp2(rGkLast[vi] - cs, fastmath=True)
+
+                            if cutlass.const_expr(PREPROCESS_W_BETA != 0):
+                                # Match the csrc W operand association exactly:
+                                # bf16((k * beta) * exp2(gk)). WU consumes this
+                                # value directly and must not multiply beta again.
+                                rKsOut[vi] = ((k_val * beta_for_w) * exp2_cs).to(cutlass.BFloat16)
+                            elif cutlass.const_expr(KSCALED_FP16 != 0):
+                                rKsOut[vi] = (k_val * exp2_cs).to(cutlass.Float16)
+                            else:
+                                rKsOut[vi] = (k_val * exp2_cs).to(cutlass.BFloat16)
+                            rQsOut[vi] = (q_val * exp2_cs).to(cutlass.BFloat16)
+                            rKgOut[vi] = (k_val * exp2_kg).to(cutlass.BFloat16)
+
+                        if IS_VARLEN and not VARLEN_PURE:
+                            if t < ci_eos:
+                                cute.autovec_copy(rKsOut, mKscaled[i_b, t, i_h, col_vec_idx, None])
+                                cute.autovec_copy(rQsOut, mQscaled[i_b, t, i_h, col_vec_idx, None])
+                                cute.autovec_copy(rKgOut, mKg[i_b, t, i_h, col_vec_idx, None])
+                        else:
                             cute.autovec_copy(rKsOut, mKscaled[i_b, t, i_h, col_vec_idx, None])
                             cute.autovec_copy(rQsOut, mQscaled[i_b, t, i_h, col_vec_idx, None])
                             cute.autovec_copy(rKgOut, mKg[i_b, t, i_h, col_vec_idx, None])
-                    else:
-                        cute.autovec_copy(rKsOut, mKscaled[i_b, t, i_h, col_vec_idx, None])
-                        cute.autovec_copy(rQsOut, mQscaled[i_b, t, i_h, col_vec_idx, None])
-                        cute.autovec_copy(rKgOut, mKg[i_b, t, i_h, col_vec_idx, None])
 
-                if warp_row_group == 0:
-                    for vi in cutlass.range_constexpr(VEC):
-                        rGkOut[vi] = cute.exp2(rGkLast[vi], fastmath=True)
-                    if IS_VARLEN:
-                        if ci_eos > cutlass.Int32(0):
+                    if warp_row_group == 0:
+                        for vi in cutlass.range_constexpr(VEC):
+                            rGkOut[vi] = cute.exp2(rGkLast[vi], fastmath=True)
+                        if IS_VARLEN:
+                            if ci_eos > cutlass.Int32(0):
+                                cute.autovec_copy(rGkOut, mGkLast[i_b, chunk_idx, i_h, col_vec_idx, None])
+                        else:
                             cute.autovec_copy(rGkOut, mGkLast[i_b, chunk_idx, i_h, col_vec_idx, None])
-                    else:
-                        cute.autovec_copy(rGkOut, mGkLast[i_b, chunk_idx, i_h, col_vec_idx, None])
 
         # =============================================================
         # Warp 26 (TMA_WARP_ID): dedicated TMA producer.
@@ -1369,7 +1398,10 @@ def fused_kernel123(
                 tma_atom_K, 0, cute.make_layout(1), cute.group_modes(sK_pf, 0, 2), cute.group_modes(gK_pf, 0, 2)
             )
             cute.copy(tma_atom_K, tg_pf, ts_pf, tma_bar_ptr=tma_mbars)
-            sG_pf = sG[(None, None, 0)]
+            if cutlass.const_expr(INPUT_GK_FP32 != 0):
+                sG_pf = sGcum[(None, None, 0)]
+            else:
+                sG_pf = sG[(None, None, 0)]
             gG_pf = cute.local_tile(cute.domain_offset((pf_cs, 0), gG_head), (BT, K_DIM), (0, 0))
             ts_pf, tg_pf = cpasync.tma_partition(
                 tma_atom_G, 0, cute.make_layout(1), cute.group_modes(sG_pf, 0, 2), cute.group_modes(gG_pf, 0, 2)
@@ -1405,7 +1437,10 @@ def fused_kernel123(
                     tma_atom_K, 0, cute.make_layout(1), cute.group_modes(sK_ns, 0, 2), cute.group_modes(gK_ns, 0, 2)
                 )
                 cute.copy(tma_atom_K, tg_ns, ts_ns, tma_bar_ptr=tma_mbars + next_stage)
-                sG_ns = sG[(None, None, next_stage)]
+                if cutlass.const_expr(INPUT_GK_FP32 != 0):
+                    sG_ns = sGcum[(None, None, next_stage)]
+                else:
+                    sG_ns = sG[(None, None, next_stage)]
                 gG_ns = cute.local_tile(cute.domain_offset((next_cs, 0), gG_head), (BT, K_DIM), (0, 0))
                 ts_ns, tg_ns = cpasync.tma_partition(
                     tma_atom_G, 0, cute.make_layout(1), cute.group_modes(sG_ns, 0, 2), cute.group_modes(gG_ns, 0, 2)
@@ -2046,35 +2081,20 @@ def fused_kernel123(
                     inv_row_o = 32 + inv_y * 16
                     inv_col_c = inv_x * 16
 
-                    p0, p1, p2, p3, p4, p5, p6, p7 = _tf32_matmul16_smem_smem(
-                        csAkk,
-                        inv_row_o,
-                        32,
-                        csAkk,
-                        32,
-                        inv_col_c,
-                        lane_id,
-                    )
-                    q0, q1, q2, q3, q4, q5, q6, q7 = _tf32_matmul16_smem_smem(
-                        csAkk,
-                        inv_row_o,
-                        48,
-                        csAkk,
-                        48,
-                        inv_col_c,
-                        lane_id,
+                    p0, p1, p2, p3, p4, p5, p6, p7 = _tf32_matmul32_smem_smem(
+                        csAkk, inv_row_o, 32, csAkk, 32, inv_col_c, lane_id
                     )
                     _tf32_store_C16_tmp(
                         sInvTmp,
                         inv_slot,
-                        -(p0 + q0),
-                        -(p1 + q1),
-                        -(p2 + q2),
-                        -(p3 + q3),
-                        -(p4 + q4),
-                        -(p5 + q5),
-                        -(p6 + q6),
-                        -(p7 + q7),
+                        -p0,
+                        -p1,
+                        -p2,
+                        -p3,
+                        -p4,
+                        -p5,
+                        -p6,
+                        -p7,
                         lane_id,
                     )
                     store_internal_barrier()
@@ -2195,6 +2215,8 @@ def make_host_function(
     preprocess_w_beta=False,
     fuse_akk_inv=False,
     fp32_akk_workspace=False,
+    input_gk_fp32=False,
+    beta_fp32=False,
 ):
     """
     `varlen_pure=True` asserts that all seq lengths in the batch are multiples
@@ -2214,6 +2236,10 @@ def make_host_function(
         raise ValueError("kscaled_fp16 and preprocess_w_beta are mutually exclusive")
     _FUSE_AKK_INV = 1 if fuse_akk_inv else 0
     _FP32_AKK_WORKSPACE = 1 if fp32_akk_workspace else 0
+    _INPUT_GK_FP32 = 1 if input_gk_fp32 else 0
+    _BETA_FP32 = 1 if beta_fp32 else 0
+    if _INPUT_GK_FP32 and (_HAS_BIAS or _PREPROCESS_W_BETA):
+        raise ValueError("input_gk_fp32 does not accept gate bias or beta preprocessing")
     if _FUSE_AKK_INV and _FP32_AKK_WORKSPACE:
         raise ValueError("fuse_akk_inv and fp32_akk_workspace are mutually exclusive")
     if is_varlen:
@@ -2269,7 +2295,8 @@ def make_host_function(
 
         g_smem_2d = cute.make_layout((BT, K_DIM), stride=(G_ROW_STRIDE_BF16, 1))
         g_smem_3d = cute.make_layout((BT, K_DIM, NUM_STAGES), stride=(G_ROW_STRIDE_BF16, 1, G_STAGE_STRIDE_BF16))
-
+        smem_atom_gk = tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.Float32)
+        gk_smem_2d = cute.tile_to_shape(smem_atom_gk, (BT, K_DIM), order=(0, 1))
         tma_op = cpasync.CopyBulkTensorTileG2SOp(cpasync.CtaGroup.ONE)
         tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
             tma_op, mQ_view, qk_smem_2d, cute.product_each(qk_smem_2d.shape), num_multicast=1
@@ -2277,11 +2304,19 @@ def make_host_function(
         tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
             tma_op, mK_view, qk_smem_2d, cute.product_each(qk_smem_2d.shape), num_multicast=1
         )
-        tma_atom_G, tma_tensor_G = cpasync.make_tiled_tma_atom(
-            tma_op, mG_view, g_smem_2d, cute.product_each(g_smem_2d.shape), num_multicast=1
-        )
+        if cutlass.const_expr(_INPUT_GK_FP32 != 0):
+            tma_atom_G, tma_tensor_G = cpasync.make_tiled_tma_atom(
+                tma_op, mG_view, gk_smem_2d, cute.product_each(gk_smem_2d.shape), num_multicast=1
+            )
+        else:
+            tma_atom_G, tma_tensor_G = cpasync.make_tiled_tma_atom(
+                tma_op, mG_view, g_smem_2d, cute.product_each(g_smem_2d.shape), num_multicast=1
+            )
 
-        g_cumsum_layout = cute.make_layout((BT, K_DIM, NUM_STAGES), stride=(K_STRIDE, 1, BT * K_STRIDE))
+        if cutlass.const_expr(_INPUT_GK_FP32 != 0):
+            g_cumsum_layout = cute.tile_to_shape(smem_atom_gk, (BT, K_DIM, NUM_STAGES), order=(0, 1, 2))
+        else:
+            g_cumsum_layout = cute.make_layout((BT, K_DIM, NUM_STAGES), stride=(K_STRIDE, 1, BT * K_STRIDE))
 
         copy_atom_qk_k1 = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=32)
         tiled_copy_qk_k1 = cute.make_tiled_copy_tv(
@@ -2346,7 +2381,7 @@ def make_host_function(
             + BT * K_STRIDE * 4 * NUM_STAGES  # G cumsum fp32: 69,632 B
             + K1_ROW_GROUPS * PARTIAL_COLS * 4  # K1 partial prefix: 4,224 B
             + BT * AQK_TILE_STRIDE * 2 * NUM_STAGES  # sAqk bf16: 18,432 B
-            + BT * NUM_STAGES * 2  # Beta bf16: 256 B
+            + BT * NUM_STAGES * (4 if _BETA_FP32 else 2)
             + 5 * NUM_STAGES * 8  # Barriers: 80 B
             + BT * K_DIM * 2 * NUM_STAGES  # sG bf16 independent allocation
         )
@@ -2396,6 +2431,8 @@ def make_host_function(
             _PREPROCESS_W_BETA,
             _FUSE_AKK_INV,
             _FP32_AKK_WORKSPACE,
+            _INPUT_GK_FP32,
+            _BETA_FP32,
         ).launch(
             grid=(_grid_x, 1, 1),
             block=(THREADS, 1, 1),
@@ -2547,6 +2584,26 @@ def _get_eqlen_dummies(device):
         entry = (cu_seqlens, chunk_indices, cu_ct, ci_ct)
         _K123_CACHE[key] = entry
     return entry[2], entry[3]
+
+
+def _get_csrc_port_dummy_alog(device, heads):
+    """Return an unused A_log argument for the FP32-gk specialization."""
+    key = ("csrc_port_dummy_alog", device.index if device.index is not None else 0, heads)
+    entry = _K123_CACHE.get(key)
+    if entry is None:
+        entry = torch.zeros(heads, dtype=torch.float32, device=device)
+        _K123_CACHE[key] = entry
+    return entry
+
+
+def _get_csrc_port_dummy_bias(device, heads):
+    """Return an unused dt-bias argument for the FP32-gk specialization."""
+    key = ("csrc_port_dummy_bias", device.index if device.index is not None else 0, heads)
+    entry = _K123_CACHE.get(key)
+    if entry is None:
+        entry = torch.zeros((heads, K_DIM), dtype=torch.float32, device=device)
+        _K123_CACHE[key] = entry
+    return entry
 
 
 def _run_akk_inv_fp32_physical(
@@ -2717,6 +2774,122 @@ def chunk_kda_fwd_intra_sm100_equal(
             T_val=T_total,
         )
     return k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk
+
+
+def chunk_kda_fwd_intra_sm100_from_gk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    gk: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float | None = None,
+    *,
+    chunk_size: int = BT,
+    use_tf32_inverse: bool = True,
+    fp32_akk_inv: bool = True,
+):
+    """CuTeDSL port of the equal-length csrc intra API.
+
+    Unlike :func:`chunk_kda_fwd_intra_sm100_equal`, this entry point consumes
+    the already activated and chunk-cumsummed FP32 ``gk`` tensor, exactly like
+    ``chunk_kda_fwd_intra_cuda``. It deliberately preserves the csrc kernel
+    boundary; gate fusion is not part of this correctness baseline.
+
+    ``fp32_akk_inv=True`` keeps the pre-inverse Akk workspace in FP32 so the
+    strict oracle error is no worse than csrc while the exact TF32 Schur
+    accumulation order is being ported.
+    """
+    if chunk_size != BT:
+        raise NotImplementedError(f"chunk_size must be {BT}, got {chunk_size}.")
+    if q.dim() != 4 or k.dim() != 4 or gk.dim() != 4 or beta.dim() != 3:
+        raise ValueError("Expected q/k/gk [B,T,H,K] and beta [B,T,H].")
+    if q.shape != k.shape or q.shape != gk.shape:
+        raise ValueError(f"q/k/gk shapes must match, got q={q.shape}, k={k.shape}, gk={gk.shape}.")
+    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16:
+        raise TypeError("q and k must be bfloat16, matching the csrc specialization.")
+    if gk.dtype != torch.float32:
+        raise TypeError(f"gk must be float32, got {gk.dtype}.")
+    if beta.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"beta must be bfloat16 or float32, got {beta.dtype}.")
+    B, T_total, H, K = q.shape
+    if K != K_DIM:
+        raise NotImplementedError(f"K must be {K_DIM}, got {K}.")
+    if T_total % (CHUNKS_PER_BLOCK * BT) != 0:
+        raise NotImplementedError(f"T must be a multiple of {CHUNKS_PER_BLOCK * BT}, got {T_total}.")
+    if beta.shape != (B, T_total, H):
+        raise ValueError(f"beta shape must be {(B, T_total, H)}, got {tuple(beta.shape)}.")
+    if not use_tf32_inverse:
+        raise NotImplementedError("The one-to-one baseline currently ports the default csrc TF32 inverse only.")
+    if scale is None:
+        scale = K_DIM**-0.5
+
+    NT = T_total // BT
+    dev = q.device.index if q.device.index is not None else 0
+    cache_key = ("csrc_port", dev, B, NT, H, beta.dtype, fp32_akk_inv)
+    k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk = _get_out_buffers_equal(q.device, B, T_total, H, torch.bfloat16)
+    A_kk_workspace = _get_akk_fp32_workspace_equal(q.device, B, T_total, H) if fp32_akk_inv else A_kk
+
+    q_ct = _ct_cached(q, cutlass.BFloat16)
+    k_ct = _ct_cached(k, cutlass.BFloat16)
+    gk_in_ct = _ct_cached(gk, cutlass.Float32)
+    alog_ct = _ct_cached(_get_csrc_port_dummy_alog(q.device, H), cutlass.Float32)
+    beta_type = cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16
+    beta_ct = _ct_cached(beta, beta_type)
+    ks_ct = _ct_cached(k_scaled, cutlass.BFloat16)
+    kg_ct = _ct_cached(kg, cutlass.BFloat16)
+    qs_ct = _ct_cached(q_scaled, cutlass.BFloat16)
+    gk_last_ct = _ct_cached(gk_last_exp, cutlass.Float32)
+    aqk_ct = _ct_cached(A_qk, cutlass.BFloat16)
+    akk_ct = _ct_cached(A_kk_workspace, cutlass.Float32 if fp32_akk_inv else cutlass.BFloat16)
+    cu_ct, ci_ct = _get_eqlen_dummies(q.device)
+    bias_ct = _ct_cached(_get_csrc_port_dummy_bias(q.device, H), cutlass.Float32)
+
+    ct_args = (
+        q_ct,
+        k_ct,
+        gk_in_ct,
+        alog_ct,
+        beta_ct,
+        float(scale),
+        ks_ct,
+        kg_ct,
+        qs_ct,
+        gk_last_ct,
+        aqk_ct,
+        akk_ct,
+        cu_ct,
+        ci_ct,
+        bias_ct,
+        0.0,
+    )
+    kernel = _K123_CACHE.get(("kernel", cache_key))
+    if kernel is None:
+        host_fn = make_host_function(
+            B,
+            NT,
+            H,
+            is_varlen=False,
+            fuse_akk_inv=not fp32_akk_inv,
+            fp32_akk_workspace=fp32_akk_inv,
+            input_gk_fp32=True,
+            beta_fp32=beta.dtype == torch.float32,
+        )
+        kernel = cute.compile(host_fn, *ct_args)
+        _K123_CACHE[("kernel", cache_key)] = kernel
+
+    kernel(*ct_args)
+    if fp32_akk_inv:
+        _run_akk_inv_fp32_physical(
+            A_kk_workspace,
+            A_kk,
+            B,
+            NT,
+            H,
+            cu_ct,
+            ci_ct,
+            is_varlen=False,
+            T_val=T_total,
+        )
+    return A_qk, A_kk
 
 
 def chunk_kda_fwd_intra_sm100_varlen(

@@ -174,6 +174,45 @@ def _matmul16_smem_smem(
 
 
 @dsl_user_op
+def _matmul32_smem_smem(
+    sA: cute.Tensor,
+    a_row,
+    a_col,
+    sB: cute.Tensor,
+    b_row,
+    b_col,
+    lane_id,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Return a 16x16 tile over K=32 with csrc's four-MMA order."""
+    gid = lane_id // 4
+    tid = lane_id % 4
+    c0 = cutlass.Float32(0.0)
+    c1 = cutlass.Float32(0.0)
+    c2 = cutlass.Float32(0.0)
+    c3 = cutlass.Float32(0.0)
+    c4 = cutlass.Float32(0.0)
+    c5 = cutlass.Float32(0.0)
+    c6 = cutlass.Float32(0.0)
+    c7 = cutlass.Float32(0.0)
+
+    for k_base in (0, 8, 16, 24):
+        a0 = cutlass.Float32(sA[a_row + gid, a_col + k_base + 2 * tid])
+        a1 = cutlass.Float32(sA[a_row + gid + 8, a_col + k_base + 2 * tid])
+        a2 = cutlass.Float32(sA[a_row + gid, a_col + k_base + 2 * tid + 1])
+        a3 = cutlass.Float32(sA[a_row + gid + 8, a_col + k_base + 2 * tid + 1])
+        b0n0 = cutlass.Float32(sB[b_row + k_base + 2 * tid, b_col + gid])
+        b1n0 = cutlass.Float32(sB[b_row + k_base + 2 * tid + 1, b_col + gid])
+        b0n1 = cutlass.Float32(sB[b_row + k_base + 2 * tid, b_col + 8 + gid])
+        b1n1 = cutlass.Float32(sB[b_row + k_base + 2 * tid + 1, b_col + 8 + gid])
+        c0, c1, c2, c3 = mma_tf32_m16n8k8(a0, a1, a2, a3, b0n0, b1n0, c0, c1, c2, c3)
+        c4, c5, c6, c7 = mma_tf32_m16n8k8(a0, a1, a2, a3, b0n1, b1n1, c4, c5, c6, c7)
+    return c0, c1, c2, c3, c4, c5, c6, c7
+
+
+@dsl_user_op
 def _matmul16_tmp_smem(
     sTmp: cute.Tensor,
     slot,
@@ -391,19 +430,18 @@ def akk_inv_tf32_kernel(
     row_o = 32 + y * 16
     col_c = x * 16
 
-    p0, p1, p2, p3, p4, p5, p6, p7 = _matmul16_smem_smem(sAkk, row_o, 32, sAkk, 32, col_c, lane_id)
-    q0, q1, q2, q3, q4, q5, q6, q7 = _matmul16_smem_smem(sAkk, row_o, 48, sAkk, 48, col_c, lane_id)
+    p0, p1, p2, p3, p4, p5, p6, p7 = _matmul32_smem_smem(sAkk, row_o, 32, sAkk, 32, col_c, lane_id)
     _store_C16_tmp(
         sTmp,
         slot,
-        -(p0 + q0),
-        -(p1 + q1),
-        -(p2 + q2),
-        -(p3 + q3),
-        -(p4 + q4),
-        -(p5 + q5),
-        -(p6 + q6),
-        -(p7 + q7),
+        -p0,
+        -p1,
+        -p2,
+        -p3,
+        -p4,
+        -p5,
+        -p6,
+        -p7,
         lane_id,
     )
     cute.arch.barrier()

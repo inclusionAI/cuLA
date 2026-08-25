@@ -13,8 +13,12 @@ from fla.ops.utils.constant import RCP_LN2
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from cula.kda.chunk_intra import chunk_kda_fwd_intra as csrc_chunk_kda_fwd_intra
-from cula.ops.kda.sm100.intra_fused import chunk_kda_fwd_intra_sm100_equal, chunk_kda_fwd_intra_sm100_varlen
-from cula.ops.kda.sm100.recompute_wu import recompute_w_u_from_preprocessed
+from cula.ops.kda.sm100.intra_fused import (
+    chunk_kda_fwd_intra_sm100_equal,
+    chunk_kda_fwd_intra_sm100_from_gk,
+    chunk_kda_fwd_intra_sm100_varlen,
+)
+from cula.ops.kda.sm100.recompute_wu import recompute_w_u_fwd
 
 
 def _requires_sm100():
@@ -57,7 +61,7 @@ def _rel_rmse_fp64(actual, oracle):
     return torch.sqrt(torch.mean(diff.square()) / torch.mean(oracle.square())).item()
 
 
-def test_fp16_preprocessed_intra_wu_strict_fp64_precision():
+def test_csrc_boundary_port_intra_wu_strict_fp64_precision():
     _requires_sm100()
     torch.manual_seed(2)
     device = torch.device("cuda")
@@ -91,24 +95,14 @@ def test_fp16_preprocessed_intra_wu_strict_fp64_precision():
         safe_gate=True,
     )
 
-    k_scaled, kg, q_scaled, _, Aqk, Akk = chunk_kda_fwd_intra_sm100_equal(
+    Aqk, Akk = chunk_kda_fwd_intra_sm100_from_gk(
         q=q,
         k=k,
-        g=g,
+        gk=gk,
         beta=beta,
-        A_log=A_log,
         scale=scale,
-        dt_bias=dt_bias,
-        safe_gate=True,
-        lower_bound=lower_bound,
-        fp32_akk_inv=True,
-        kscaled_fp16=True,
     )
-    w, u = recompute_w_u_from_preprocessed(k_scaled, k, beta, Akk)
-
-    exp_gk = torch.exp2(gk)
-    torch.testing.assert_close(k_scaled, (k.float() * exp_gk).half(), rtol=1e-2, atol=1e-3)
-    torch.testing.assert_close(q_scaled, (q.float() * exp_gk).bfloat16(), rtol=1e-2, atol=1e-3)
+    w, u, _, kg = recompute_w_u_fwd(k, k, beta, Akk, gk)
     torch.testing.assert_close(kg, kg_ref, rtol=1e-2, atol=2e-3)
 
     row = torch.arange(seqlen, device=device) % chunk_size
@@ -120,6 +114,7 @@ def test_fp16_preprocessed_intra_wu_strict_fp64_precision():
     torch.testing.assert_close(Akk[~lower], torch.zeros_like(Akk[~lower]), rtol=0, atol=0)
     torch.testing.assert_close(w, w_ref, rtol=1e-2, atol=2e-3)
     torch.testing.assert_close(u, u_ref, rtol=1e-2, atol=2e-3)
+    assert torch.equal(Aqk, Aqk_ref)
 
     aqk_oracle, akk_oracle, w_oracle, u_oracle = _chunk_fp64_oracle(q, k, k, gk, beta, scale, chunk_size)
     precision_rows = []
@@ -133,14 +128,10 @@ def test_fp16_preprocessed_intra_wu_strict_fp64_precision():
         baseline_error = _rel_rmse_fp64(baseline, oracle)
         precision_rows.append((name, candidate_error, baseline_error))
     regressions = [row for row in precision_rows if row[1] > row[2] * (1.0 + 1e-6)]
-    if regressions:
-        pytest.xfail(
-            "strict FP64 precision target not met; "
-            + "; ".join(
-                f"{name}: CuTeDSL={candidate_error:.6e}, csrc={baseline_error:.6e}"
-                for name, candidate_error, baseline_error in precision_rows
-            )
-        )
+    assert not regressions, "; ".join(
+        f"{name}: CuTeDSL={candidate_error:.6e}, csrc={baseline_error:.6e}"
+        for name, candidate_error, baseline_error in precision_rows
+    )
 
 
 def test_uniform_varlen_uses_equal_fp16_path_bitwise():
