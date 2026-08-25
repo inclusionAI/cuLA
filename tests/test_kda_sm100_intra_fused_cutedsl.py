@@ -61,7 +61,8 @@ def _rel_rmse_fp64(actual, oracle):
     return torch.sqrt(torch.mean(diff.square()) / torch.mean(oracle.square())).item()
 
 
-def test_csrc_boundary_port_intra_wu_strict_fp64_precision():
+@pytest.mark.parametrize("beta_dtype", [torch.bfloat16, torch.float32])
+def test_csrc_boundary_port_intra_wu_strict_fp64_precision(beta_dtype):
     _requires_sm100()
     torch.manual_seed(2)
     device = torch.device("cuda")
@@ -72,7 +73,7 @@ def test_csrc_boundary_port_intra_wu_strict_fp64_precision():
     q = F.normalize(torch.randn(batch, seqlen, heads, dim, device=device).float(), dim=-1).bfloat16()
     k = F.normalize(torch.randn(batch, seqlen, heads, dim, device=device).float(), dim=-1).bfloat16()
     g = torch.randn(batch, seqlen, heads, dim, device=device, dtype=torch.bfloat16)
-    beta = torch.randn(batch, seqlen, heads, device=device).sigmoid().bfloat16()
+    beta = torch.randn(batch, seqlen, heads, device=device).sigmoid().to(beta_dtype)
     A_log = torch.randn(heads, device=device)
     dt_bias = torch.randn(heads * dim, device=device)
 
@@ -101,20 +102,20 @@ def test_csrc_boundary_port_intra_wu_strict_fp64_precision():
         gk=gk,
         beta=beta,
         scale=scale,
+        fp32_akk_inv=True,
     )
     w, u, _, kg = recompute_w_u_fwd(k, k, beta, Akk, gk)
-    torch.testing.assert_close(kg, kg_ref, rtol=1e-2, atol=2e-3)
+    assert torch.equal(kg, kg_ref), f"kg differs bitwise: max_abs={(kg.float() - kg_ref.float()).abs().max().item()}"
 
     row = torch.arange(seqlen, device=device) % chunk_size
     col = torch.arange(chunk_size, device=device)
     lower = (col[None, :] <= row[:, None]).view(1, seqlen, 1, chunk_size).expand_as(Akk)
-    torch.testing.assert_close(Aqk[lower], Aqk_ref[lower], rtol=1e-2, atol=2e-3)
-    torch.testing.assert_close(Akk[lower], Akk_ref[lower], rtol=1e-2, atol=2e-3)
+    assert torch.equal(Aqk, Aqk_ref), f"Aqk differs bitwise: max_abs={(Aqk.float() - Aqk_ref.float()).abs().max().item()}"
+    assert torch.equal(Akk, Akk_ref), f"Akk differs bitwise: max_abs={(Akk.float() - Akk_ref.float()).abs().max().item()}"
     torch.testing.assert_close(Aqk[~lower], torch.zeros_like(Aqk[~lower]), rtol=0, atol=0)
     torch.testing.assert_close(Akk[~lower], torch.zeros_like(Akk[~lower]), rtol=0, atol=0)
-    torch.testing.assert_close(w, w_ref, rtol=1e-2, atol=2e-3)
-    torch.testing.assert_close(u, u_ref, rtol=1e-2, atol=2e-3)
-    assert torch.equal(Aqk, Aqk_ref)
+    assert torch.equal(w, w_ref), f"w differs bitwise: max_abs={(w.float() - w_ref.float()).abs().max().item()}"
+    assert torch.equal(u, u_ref), f"u differs bitwise: max_abs={(u.float() - u_ref.float()).abs().max().item()}"
 
     aqk_oracle, akk_oracle, w_oracle, u_oracle = _chunk_fp64_oracle(q, k, k, gk, beta, scale, chunk_size)
     precision_rows = []
@@ -132,6 +133,67 @@ def test_csrc_boundary_port_intra_wu_strict_fp64_precision():
         f"{name}: CuTeDSL={candidate_error:.6e}, csrc={baseline_error:.6e}"
         for name, candidate_error, baseline_error in precision_rows
     )
+
+
+@pytest.mark.parametrize("beta_dtype", [torch.bfloat16, torch.float32])
+def test_csrc_boundary_port_intra_wu_larger_shape_bitwise(beta_dtype):
+    _requires_sm100()
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    batch, seqlen, heads, dim, chunk_size = 2, 512, 8, 128, 64
+    scale = dim**-0.5
+
+    q = F.normalize(torch.randn(batch, seqlen, heads, dim, device=device).float(), dim=-1).bfloat16()
+    k = F.normalize(torch.randn(batch, seqlen, heads, dim, device=device).float(), dim=-1).bfloat16()
+    gk = torch.randn(batch, seqlen, heads, dim, device=device, dtype=torch.float32) * 0.02
+    beta = torch.randn(batch, seqlen, heads, device=device).sigmoid().to(beta_dtype)
+
+    w_ref, u_ref, _, kg_ref, Aqk_ref, Akk_ref = csrc_chunk_kda_fwd_intra(
+        q=q,
+        k=k,
+        v=k,
+        gk=gk,
+        beta=beta,
+        scale=scale,
+        chunk_size=chunk_size,
+        safe_gate=True,
+    )
+    Aqk, Akk = chunk_kda_fwd_intra_sm100_from_gk(
+        q=q,
+        k=k,
+        gk=gk,
+        beta=beta,
+        scale=scale,
+        fp32_akk_inv=True,
+    )
+    w, u, _, kg = recompute_w_u_fwd(k, k, beta, Akk, gk)
+
+    for name, actual, expected in (
+        ("Aqk", Aqk, Aqk_ref),
+        ("Akk", Akk, Akk_ref),
+        ("kg", kg, kg_ref),
+        ("w", w, w_ref),
+        ("u", u, u_ref),
+    ):
+        assert torch.equal(actual, expected), (
+            f"{name} differs bitwise: max_abs={(actual.float() - expected.float()).abs().max().item()}"
+        )
+
+    # The csrc-boundary kernel must overwrite the complete Aqk/Akk output,
+    # including the causal upper triangle; correctness cannot depend on the
+    # initial contents of the cached output buffers.
+    Aqk.fill_(float("nan"))
+    Akk.fill_(float("nan"))
+    Aqk_repeat, Akk_repeat = chunk_kda_fwd_intra_sm100_from_gk(
+        q=q,
+        k=k,
+        gk=gk,
+        beta=beta,
+        scale=scale,
+        fp32_akk_inv=True,
+    )
+    assert torch.equal(Aqk_repeat, Aqk_ref)
+    assert torch.equal(Akk_repeat, Akk_ref)
 
 
 def test_uniform_varlen_uses_equal_fp16_path_bitwise():

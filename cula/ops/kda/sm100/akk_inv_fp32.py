@@ -27,6 +27,7 @@ from cula.ops.kda.sm100.akk_inv_tf32 import (
     _invert_diag_forward16,
     _matmul16_smem_smem,
     _matmul16_tmp_smem,
+    _matmul32_smem_smem,
     _store_C16_smem,
     _store_C16_tmp,
 )
@@ -170,19 +171,22 @@ def akk_inv_fp32_physical_kernel(
     row_o = 32 + y * 16
     col_c = x * 16
 
-    p0, p1, p2, p3, p4, p5, p6, p7 = _matmul16_smem_smem(sAkk, row_o, 32, sAkk, 32, col_c, lane_id)
-    q0, q1, q2, q3, q4, q5, q6, q7 = _matmul16_smem_smem(sAkk, row_o, 48, sAkk, 48, col_c, lane_id)
+    # Match CollectiveInverseTF32::blockwise_diagonal_inversed_32x32_to_64x64:
+    # accumulate the complete K=32 product in one FP32 accumulator. Splitting
+    # this into two K=16 accumulators followed by p + q changes the FP32
+    # reduction tree and therefore cannot be bitwise equal to csrc.
+    p0, p1, p2, p3, p4, p5, p6, p7 = _matmul32_smem_smem(sAkk, row_o, 32, sAkk, 32, col_c, lane_id)
     _store_C16_tmp(
         sTmp,
         slot,
-        -(p0 + q0),
-        -(p1 + q1),
-        -(p2 + q2),
-        -(p3 + q3),
-        -(p4 + q4),
-        -(p5 + q5),
-        -(p6 + q6),
-        -(p7 + q7),
+        -p0,
+        -p1,
+        -p2,
+        -p3,
+        -p4,
+        -p5,
+        -p6,
+        -p7,
         lane_id,
     )
     cute.arch.barrier()

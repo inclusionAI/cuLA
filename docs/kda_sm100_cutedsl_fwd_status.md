@@ -19,13 +19,18 @@ Target machine: `aistudio-58650011-ssctl`, NVIDIA GB200, physical GPU 1
 - Fused raw-gate K1/K2/K3 intra candidate plus standalone fp32 Akk inverse.
 - A csrc-boundary CuTeDSL intra entry point that consumes the same precomputed
   FP32 `gk` tensor as `chunk_kda_fwd_intra_cuda`; no gate activation or cumsum
-  is fused into this correctness baseline.
+  is fused into this correctness baseline. Its FP32-workspace inverse uses the
+  csrc single-accumulator K=32 TF32 Schur order.
 - A zero-copy packed-uniform route through the equal-length kernel.
 - Same-input benchmarks against the repository SM100 csrc kernels.
 
 The public csrc dispatch remains unchanged. The standalone recompute-WU port is
 bitwise equal to csrc for W, U, and KG in the FP32- and BF16-beta tests. At the
 representative T=8192 shape it is about 4% faster than csrc.
+
+The csrc-boundary intra plus recompute-WU path is also bitwise equal for Aqk,
+Akk, KG, W, and U. At `B=2,T=8192,H=64,K=V=128` it runs in 0.8645 ms versus
+0.9157 ms for csrc, or 1.059x csrc throughput.
 
 ## GB200 results
 
@@ -48,6 +53,20 @@ the csrc baseline. The CuTeDSL runtime has a visible fixed launch/descriptor
 cost at T=512 and T=1024; from T=4096 through T=32768 the aligned persistent
 kernel meets or exceeds csrc throughput. The former staged-output/store-warp
 CuTeDSL implementation has been removed.
+
+### Csrc-boundary intra plus recompute WU
+
+This comparison consumes the same precomputed FP32 `gk` tensor on both sides
+and includes intra, the Akk inverse, and recompute WU. It uses three warmup
+iterations and 20 CUDA-Event-timed iterations.
+
+| Shape | csrc (ms) | CuTeDSL (ms) | csrc / CuTeDSL |
+|---|---:|---:|---:|
+| B=2, T=8192, H=64 | 0.9157 | 0.8645 | 1.059x |
+
+For the measured input, `torch.equal` passes for every complete Aqk, Akk, KG,
+W, and U tensor; each tensor has zero mismatched elements and zero maximum
+absolute difference.
 
 ### Raw-gate fused intra plus specialized WU
 
@@ -82,13 +101,12 @@ inverse, W, and U from the same BF16 inputs in FP64. It compares both csrc and
 CuTeDSL against that shared oracle and requires every CuTeDSL relative RMSE to
 be no greater than the csrc error (apart from a 1e-6 comparison epsilon).
 
-The strict check now uses the same precomputed FP32 `gk` for both implementations
-and passes for Aqk, Akk, W, and U. Aqk is bitwise equal to csrc for the checked
-shape. The standalone recompute-WU test additionally requires bitwise equality
-to csrc for W, U, and KG with both FP32 and BF16 beta. Akk uses an FP32
-pre-inverse workspace while the exact csrc TF32 Schur
-order is being ported, so this is a precision baseline rather than the final
-one-to-one performance implementation.
+The strict check uses the same precomputed FP32 `gk` for both implementations
+and now requires bitwise equality to csrc for Aqk, Akk, KG, W, and U. It passes
+with both FP32 and BF16 beta at `B=1,T=256,H=4` and
+`B=2,T=512,H=8`, and the representative BF16-beta benchmark passes at
+`B=2,T=8192,H=64`. The standalone recompute-WU test independently requires
+bitwise equality for W, U, and KG.
 
 The source audit found why the earlier fused version missed the precision
 target: it recomputed gate activation and the chunk scan with a different
@@ -96,13 +114,20 @@ reduction tree before intra. That changed the FP32 cumulative gate before any
 TF32 MMA. Fusion and FP16 workspace rounding are therefore excluded from the
 new baseline.
 
-The direct TF32 inverse port is bitwise equal to csrc in all diagonal 16x16
-blocks and the two off-diagonal 16x16 blocks inside each 32x32 diagonal block.
-The final lower-left 32x32 Schur block still has 3,828 differing BF16 elements
-in the test shape (maximum absolute difference 1.5258789e-4). Consequently the
-remaining one-to-one work is specifically the csrc 32x32-to-64x64 TF32
-accumulator/reduction schedule; it is not hidden behind the passing FP32
-precision gate.
+The former mismatch was isolated to the final lower-left 32x32 Schur block.
+The CuTeDSL baseline split the K=32 product into two independently initialized
+K=16 accumulators and then added their FP32 results. csrc instead issues the
+four K=8 TF32 MMA steps into one accumulator. Replacing the split reduction
+with the csrc order removes the different FP32 rounding point and makes the
+complete csrc-boundary chain bitwise equal. The experimental in-CTA inverse is
+still excluded from this claim and the boundary API rejects selecting it.
+
+The csrc-boundary specialization also writes the complete 64x64 Aqk tile and
+explicitly zeros the causal upper triangle. The earlier lower-tile-only store
+left those global elements dependent on `torch.empty` allocator contents.
+CuTe tensor-wrapper and varlen-padding caches now validate weak-reference
+identity as well as tensor version, preventing Python object-ID reuse from
+selecting a stale device pointer during long sequential workloads.
 
 ### Profile decomposition
 
@@ -171,14 +196,15 @@ Accuracy against the csrc path for the same inputs:
   the csrc gate boundary and runs at 1143.7 us. It is no longer the correctness
   baseline.
 - Precomputed-FP32-gk diagnostic with the old fused shell: passes the strict
-  FP64 gate but previously took 1675.2 us at T=8192. The new port skips fused
-  K1 output work; it must be rebenchmarked after TF32 one-to-one completion.
+  FP64 gate but took 1675.2 us at T=8192. The completed csrc-boundary port
+  skips fused K1 output work and now measures 864.5 us at the same target
+  shape.
 
 ## Remaining validation
 
-- Finish the csrc 32x32-to-64x64 TF32 Schur accumulation/reduction order, then
-  replace the K2 warp-MMA/shared-memory schedule with csrc-style TMEM/UMMA
-  residency.
+- Replace the experimental fused K2 warp-MMA/shared-memory path with the csrc
+  TMEM/UMMA residency before claiming that fused raw-gate candidate is also a
+  one-to-one implementation.
 - Extend the performance matrix to additional batch/head combinations before
   changing the default public dispatch.
 - Keep the csrc fallback for shapes that do not satisfy the current K=V=128,

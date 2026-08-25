@@ -69,6 +69,8 @@ Outputs (g_cumsum stays in SMEM, not written to GMEM):
 """
 
 
+import weakref
+
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -1861,6 +1863,7 @@ def fused_kernel123(
                         st_eos = cutlass.Int32(mCuSeqlens[_sid + 1])
                 else:
                     chunk_start = chunk_idx * BT
+                    st_eos = chunk_start + BT
 
                 cute.arch.mbarrier_wait(mma_done_mbars + s, phase)
 
@@ -1887,28 +1890,33 @@ def fused_kernel123(
                 else:
                     rAkkOut = cute.make_rmem_tensor(cute.make_layout((VEC,)), cutlass.BFloat16)
 
-                if IS_VARLEN and not VARLEN_PURE:
+                if cutlass.const_expr(INPUT_GK_FP32 != 0 or (IS_VARLEN and not VARLEN_PURE)):
                     # NON-PURE: row-major full-row vec autovec + row mask. SMEM
                     # upper-tri is zero (MMA-masked at write), so writing all 64
                     # cols is correct. STG.E.32 (32 lanes × 4 bytes per row).
                     row_base_warp = store_warp * (BT // NUM_STORE_WARPS)
                     for ri in cutlass.range_constexpr(BT // NUM_STORE_WARPS):
-                        local_row = row_base_warp + ri
-                        abs_row = chunk_start + local_row
-                        rAqkOut[0] = csAqk[local_row, col_lo]
-                        rAqkOut[1] = csAqk[local_row, col_hi]
-                        if abs_row < st_eos:
-                            cute.autovec_copy(rAqkOut, mAqk_v2[i_b, abs_row, i_h, col_vec_idx, None])
+                        full_row = row_base_warp + ri
+                        full_abs_row = chunk_start + full_row
+                        rAqkOut[0] = csAqk[full_row, col_lo]
+                        rAqkOut[1] = csAqk[full_row, col_hi]
+                        if cutlass.const_expr(INPUT_GK_FP32 != 0):
+                            if full_row < col_lo:
+                                rAqkOut[0] = cutlass.BFloat16(0.0)
+                            if full_row < col_hi:
+                                rAqkOut[1] = cutlass.BFloat16(0.0)
+                        if full_abs_row < st_eos:
+                            cute.autovec_copy(rAqkOut, mAqk_v2[i_b, full_abs_row, i_h, col_vec_idx, None])
                             if cutlass.const_expr(FUSE_AKK_INV != 0):
                                 pass
                             elif cutlass.const_expr(FP32_AKK_WORKSPACE != 0):
-                                rAkkFp32Out[0] = cutlass.Float32(csAkk[local_row, col_lo])
-                                rAkkFp32Out[1] = cutlass.Float32(csAkk[local_row, col_hi])
-                                cute.autovec_copy(rAkkFp32Out, mAkk_v2[i_b, abs_row, i_h, col_vec_idx, None])
+                                rAkkFp32Out[0] = cutlass.Float32(csAkk[full_row, col_lo])
+                                rAkkFp32Out[1] = cutlass.Float32(csAkk[full_row, col_hi])
+                                cute.autovec_copy(rAkkFp32Out, mAkk_v2[i_b, full_abs_row, i_h, col_vec_idx, None])
                             else:
-                                rAkkOut[0] = csAkk[local_row, col_lo].to(cutlass.BFloat16)  # FP32 -> BF16
-                                rAkkOut[1] = csAkk[local_row, col_hi].to(cutlass.BFloat16)
-                                cute.autovec_copy(rAkkOut, mAkk_v2[i_b, abs_row, i_h, col_vec_idx, None])
+                                rAkkOut[0] = csAkk[full_row, col_lo].to(cutlass.BFloat16)  # FP32 -> BF16
+                                rAkkOut[1] = csAkk[full_row, col_hi].to(cutlass.BFloat16)
+                                cute.autovec_copy(rAkkOut, mAkk_v2[i_b, full_abs_row, i_h, col_vec_idx, None])
                 else:
                     # PURE: keep the reduced lower-tile bandwidth, but store
                     # each 16-column row as two vec8 segments. Eight lanes per
@@ -2461,16 +2469,18 @@ def _tensor_version(t: torch.Tensor) -> int:
 
 def _ct_cached(t: torch.Tensor, dtype) -> torch.Tensor:
     """Cache CuTe tensor wrappers to avoid repeated wrapping overhead."""
-    key = (id(t), _tensor_version(t), dtype)
+    version = _tensor_version(t)
+    key = ("ct", id(t), dtype)
     entry = _K123_CACHE.get(key)
-    if entry is None:
+    if entry is None or entry[0]() is not t or entry[1] != version:
         from cutlass.cute.runtime import from_dlpack
 
         # Use assumed_align and mark_layout_dynamic for optimal performance
-        entry = from_dlpack(t, assumed_align=16).mark_layout_dynamic()
-        entry.element_type = dtype
+        wrapper = from_dlpack(t, assumed_align=16).mark_layout_dynamic()
+        wrapper.element_type = dtype
+        entry = (weakref.ref(t), version, wrapper)
         _K123_CACHE[key] = entry
-    return entry
+    return entry[2]
 
 
 def _get_bias_ct(dt_bias, H, K, device):
@@ -2487,10 +2497,11 @@ def _get_bias_ct(dt_bias, H, K, device):
             from cutlass.cute.runtime import from_dlpack
 
             bias = torch.empty(1, 1, dtype=torch.float32, device=device)
-            entry = from_dlpack(bias, assumed_align=16).mark_layout_dynamic()
-            entry.element_type = cutlass.Float32
+            wrapper = from_dlpack(bias, assumed_align=16).mark_layout_dynamic()
+            wrapper.element_type = cutlass.Float32
+            entry = (bias, wrapper)
             _K123_CACHE[key] = entry
-        return entry
+        return entry[1]
 
 
 def _get_out_buffers_equal(device, B, T_total, H, kscaled_dtype=torch.bfloat16):
@@ -2546,19 +2557,14 @@ def _get_akk_fp32_workspace_varlen(device, T_padded, NT, H):
 
 def _pad_varlen_inputs(q, k, g, beta, T_padded):
     """Zero-pad packed varlen inputs to 4*BT boundary."""
-    key = (
-        id(q),
-        _tensor_version(q),
-        id(k),
-        _tensor_version(k),
-        id(g),
-        _tensor_version(g),
-        id(beta),
-        _tensor_version(beta),
-        T_padded,
-    )
+    inputs = (q, k, g, beta)
+    if all(t.shape[1] == T_padded for t in inputs):
+        return inputs
+
+    versions = tuple(_tensor_version(t) for t in inputs)
+    key = (*map(id, inputs), T_padded)
     entry = _VARLEN_PAD_CACHE.get(key)
-    if entry is None:
+    if entry is None or any(ref() is not tensor for ref, tensor in zip(entry[0], inputs, strict=True)) or entry[1] != versions:
 
         def _pad(t):
             if t.shape[1] == T_padded:
@@ -2567,9 +2573,9 @@ def _pad_varlen_inputs(q, k, g, beta, T_padded):
             pad[:, : t.shape[1]].copy_(t)
             return pad
 
-        entry = (_pad(q), _pad(k), _pad(g), _pad(beta))
+        entry = (tuple(weakref.ref(t) for t in inputs), versions, tuple(_pad(t) for t in inputs))
         _VARLEN_PAD_CACHE[key] = entry
-    return entry
+    return entry[2]
 
 
 def _get_eqlen_dummies(device):
@@ -2794,9 +2800,10 @@ def chunk_kda_fwd_intra_sm100_from_gk(
     ``chunk_kda_fwd_intra_cuda``. It deliberately preserves the csrc kernel
     boundary; gate fusion is not part of this correctness baseline.
 
-    ``fp32_akk_inv=True`` keeps the pre-inverse Akk workspace in FP32 so the
-    strict oracle error is no worse than csrc while the exact TF32 Schur
-    accumulation order is being ported.
+    ``fp32_akk_inv=True`` keeps the pre-inverse Akk workspace in FP32 and uses
+    the same single-accumulator K=32 TF32 Schur reduction order as csrc.  The
+    experimental in-CTA inverse is intentionally excluded from this bitwise
+    correctness boundary.
     """
     if chunk_size != BT:
         raise NotImplementedError(f"chunk_size must be {BT}, got {chunk_size}.")
@@ -2819,6 +2826,10 @@ def chunk_kda_fwd_intra_sm100_from_gk(
         raise ValueError(f"beta shape must be {(B, T_total, H)}, got {tuple(beta.shape)}.")
     if not use_tf32_inverse:
         raise NotImplementedError("The one-to-one baseline currently ports the default csrc TF32 inverse only.")
+    if not fp32_akk_inv:
+        raise NotImplementedError(
+            "The csrc-boundary port requires fp32_akk_inv=True; the experimental in-CTA inverse is not bitwise aligned."
+        )
     if scale is None:
         scale = K_DIM**-0.5
 
