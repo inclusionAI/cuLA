@@ -7,8 +7,10 @@ Target machine: `aistudio-58650011-ssctl`, NVIDIA GB200, physical GPU 1
 
 ## Implemented candidates
 
-- Warp-specialized CuTeDSL `recompute_w_u`, including equal-length, packed
-  uniform, and varlen dispatch.
+- A csrc-aligned persistent CuTeDSL `recompute_w_u`: 384 threads, separate
+  A/K/G/V and beta pipelines, co-produced K/V MMA-ready barrier, dp-lane
+  aliased W/U TMEM accumulators, direct CUDA-core W/U stores, and vectorized
+  KG stores. Equal-length, packed-uniform, and varlen dispatch are supported.
 - A preprocessed specialization that consumes `k_scaled` and skips the fp32
   cumulative-gate load and duplicate `kg` store.
 - An FP16 `k * exp2(gk)` workspace specialization. It keeps the same two-byte
@@ -21,10 +23,9 @@ Target machine: `aistudio-58650011-ssctl`, NVIDIA GB200, physical GPU 1
 - A zero-copy packed-uniform route through the equal-length kernel.
 - Same-input benchmarks against the repository SM100 csrc kernels.
 
-The public csrc dispatch remains unchanged. The FP16-workspace candidate is
-faster at the representative T=8192 shape and for packed-uniform T=4096+4096,
-but the T=16384 point is still 1.8% slower and therefore blocks a global
-dispatch change.
+The public csrc dispatch remains unchanged. The standalone recompute-WU port is
+bitwise equal to csrc for W, U, and KG in the FP32- and BF16-beta tests. At the
+representative T=8192 shape it is about 4% faster than csrc.
 
 ## GB200 results
 
@@ -35,15 +36,18 @@ All timings below use physical GPU 1. The representative shape is BF16
 
 | T | csrc (ms) | CuTeDSL (ms) | csrc / CuTeDSL |
 |---:|---:|---:|---:|
-| 4096 | 0.1702 | 0.1849 | 0.920x |
-| 8192 | 0.3280 | 0.3586 | 0.915x |
-| 16384 | 0.6410 | 0.7070 | 0.907x |
+| 512 | 0.0328 | 0.0704 | 0.466x |
+| 1024 | 0.0517 | 0.0782 | 0.662x |
+| 4096 | 0.1702 | 0.1613 | 1.055x |
+| 8192 | 0.3261 | 0.3129 | 1.042x |
+| 16384 | 0.6376 | 0.6222 | 1.025x |
+| 32768 | 1.2618 | 1.2534 | 1.007x |
 
-The standalone API computes the fp32 gate transform and writes `kg`; it remains
-8-9% slower than csrc. The forward path instead uses the preprocessed
-specialization: fused intra already produced `k_scaled` and `kg`, so W/U skips
-the duplicate fp32 gate load, exponentiation, and `kg` store. This is the path
-used in the parity table below.
+The standalone API computes the fp32 gate transform and writes `kg`, exactly as
+the csrc baseline. The CuTeDSL runtime has a visible fixed launch/descriptor
+cost at T=512 and T=1024; from T=4096 through T=32768 the aligned persistent
+kernel meets or exceeds csrc throughput. The former staged-output/store-warp
+CuTeDSL implementation has been removed.
 
 ### Raw-gate fused intra plus specialized WU
 
@@ -80,7 +84,9 @@ be no greater than the csrc error (apart from a 1e-6 comparison epsilon).
 
 The strict check now uses the same precomputed FP32 `gk` for both implementations
 and passes for Aqk, Akk, W, and U. Aqk is bitwise equal to csrc for the checked
-shape. Akk uses an FP32 pre-inverse workspace while the exact csrc TF32 Schur
+shape. The standalone recompute-WU test additionally requires bitwise equality
+to csrc for W, U, and KG with both FP32 and BF16 beta. Akk uses an FP32
+pre-inverse workspace while the exact csrc TF32 Schur
 order is being ported, so this is a precision baseline rather than the final
 one-to-one performance implementation.
 
@@ -100,12 +106,12 @@ precision gate.
 
 ### Profile decomposition
 
-At T=16384, Nsight Systems reports K123 / inverse / WU averages of
-1386.0 / 216.1 / 519.4 us. Nsight Compute reports K123 at about 79% memory
-throughput (L1/TEX is the dominant path), 48% achieved occupancy, and one CTA
-per SM due to both registers and roughly 220 KB shared memory. WU reaches only
-25% theoretical occupancy with two CTAs per SM and is latency limited. This is
-why launch fusion and extra rounding do not close the long-sequence slope.
+The aligned recompute-WU kernel uses one 384-thread CTA per SM, 168 registers
+per thread at launch, and about 199 KB dynamic shared memory. Nsight Compute
+confirmed that the csrc launch is not a CUDA cluster; removing the accidental
+single-CTA cluster launch from CuTeDSL removed about 4% at T=8192. Pipeline
+barrier initialization is deferred so all seven pipelines share one CTA sync,
+matching the single post-construction `__syncthreads()` in csrc.
 
 ## Varlen determinism stress
 

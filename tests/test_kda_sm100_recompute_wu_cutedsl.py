@@ -54,9 +54,9 @@ def test_recompute_wu_matches_csrc(beta_dtype):
     )
     w, u, _, kg = recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens, chunk_indices)
 
-    torch.testing.assert_close(w, w_ref, rtol=1e-2, atol=2e-3)
-    torch.testing.assert_close(u, u_ref, rtol=1e-2, atol=2e-3)
-    torch.testing.assert_close(kg, kg_ref, rtol=1e-2, atol=2e-3)
+    assert torch.equal(w, w_ref), f"w differs bitwise: max_abs={(w.float() - w_ref.float()).abs().max().item()}"
+    assert torch.equal(u, u_ref), f"u differs bitwise: max_abs={(u.float() - u_ref.float()).abs().max().item()}"
+    assert torch.equal(kg, kg_ref), f"kg differs bitwise: max_abs={(kg.float() - kg_ref.float()).abs().max().item()}"
 
 
 def test_preprocessed_recompute_wu_matches_torch():
