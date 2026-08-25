@@ -2,8 +2,7 @@
 
 Branch: `icavan/cutedsl-sm100-fwd`
 
-Target machine: `aistudio-58650011-ssctl`, NVIDIA GB200, physical GPU 1
-(`CUDA_VISIBLE_DEVICES=1`).
+Validation hardware: NVIDIA GB200 (SM100).
 
 ## Implemented candidates
 
@@ -34,8 +33,7 @@ Akk, KG, W, and U. At `B=2,T=8192,H=64,K=V=128` it runs in 0.8645 ms versus
 
 ## GB200 results
 
-All timings below use physical GPU 1. The representative shape is BF16
-`B=2, H=64, K=V=128, chunk_size=64`.
+The representative shape is BF16 `B=2, H=64, K=V=128, chunk_size=64`.
 
 ### Modular recompute WU
 
@@ -140,16 +138,15 @@ matching the single post-construction `__syncthreads()` in csrc.
 
 ## Appendix A: csrc-boundary bitwise and determinism stress
 
-The bitwise-aligned csrc-boundary path was replayed 10,000,000 times on
-physical GPU 1. The case uses BF16 beta at `B=1,T=256,H=4,K=V=128`. Before
-stress replay, the harness compares every complete Aqk, Akk, KG, W, and U
-tensor against csrc with `torch.equal`. It then captures CuTeDSL intra, the
-Akk inverse, recompute WU, and the complete output comparison against csrc in
-one CUDA Graph. Every replay therefore checks every output element.
+The bitwise-aligned csrc-boundary path was replayed 10,000,000 times on an
+NVIDIA GB200. The case uses BF16 beta at `B=1,T=256,H=4,K=V=128`. Before stress
+replay, the harness compares every complete Aqk, Akk, KG, W, and U tensor
+against csrc with `torch.equal`. It then captures CuTeDSL intra, the Akk
+inverse, recompute WU, and the complete output comparison against csrc in one
+CUDA Graph. Every replay therefore checks every output element.
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python \
-  benchmarks/stress_kda_sm100_csrc_boundary_determinism.py \
+python benchmarks/stress_kda_sm100_csrc_boundary_determinism.py \
   --iterations 10000000 --checkpoint 1000000 \
   --report-json /tmp/kda_sm100_csrc_boundary_10m.json
 ```
@@ -178,13 +175,13 @@ beta specialization.
 
 ## Appendix B: experimental raw-gate varlen determinism stress
 
-The complete CuTeDSL varlen forward chain was replayed 10,000,000 times on
-physical GPU 1. The case uses four deliberately unaligned sequence lengths
+The complete CuTeDSL varlen forward chain was replayed 10,000,000 times on an
+NVIDIA GB200. The case uses four deliberately unaligned sequence lengths
 `[65, 127, 193, 255]`, `H=8`, and therefore exercises partial chunks and the
 non-pure varlen path.
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python benchmarks/stress_kda_sm100_varlen_determinism.py \
+python benchmarks/stress_kda_sm100_varlen_determinism.py \
   --iterations 10000000 --checkpoint 1000000 \
   --report-json /tmp/kda_sm100_varlen_10m.json
 ```
