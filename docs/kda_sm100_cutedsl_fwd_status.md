@@ -138,7 +138,45 @@ single-CTA cluster launch from CuTeDSL removed about 4% at T=8192. Pipeline
 barrier initialization is deferred so all seven pipelines share one CTA sync,
 matching the single post-construction `__syncthreads()` in csrc.
 
-## Varlen determinism stress
+## Appendix A: csrc-boundary bitwise and determinism stress
+
+The bitwise-aligned csrc-boundary path was replayed 10,000,000 times on
+physical GPU 1. The case uses BF16 beta at `B=1,T=256,H=4,K=V=128`. Before
+stress replay, the harness compares every complete Aqk, Akk, KG, W, and U
+tensor against csrc with `torch.equal`. It then captures CuTeDSL intra, the
+Akk inverse, recompute WU, and the complete output comparison against csrc in
+one CUDA Graph. Every replay therefore checks every output element.
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python \
+  benchmarks/stress_kda_sm100_csrc_boundary_determinism.py \
+  --iterations 10000000 --checkpoint 1000000 \
+  --report-json /tmp/kda_sm100_csrc_boundary_10m.json
+```
+
+Bitwise alignment before graph replay:
+
+| Output | `torch.equal` | Mismatched elements | Max absolute difference |
+|---|---:|---:|---:|
+| Aqk | true | 0 | 0 |
+| Akk | true | 0 | 0 |
+| KG | true | 0 | 0 |
+| W | true | 0 | 0 |
+| U | true | 0 | 0 |
+
+Determinism result:
+
+- Iterations: 10,000,000
+- Exact element mismatches accumulated across all replays: 0
+- Elapsed time: 271.881 seconds
+- Throughput: 36,780.9 iterations/second
+- Status: passed
+
+The FP32-beta specialization is covered separately by the strict bitwise
+pytest cases. The 10,000,000-replay stress above uses the representative BF16
+beta specialization.
+
+## Appendix B: experimental raw-gate varlen determinism stress
 
 The complete CuTeDSL varlen forward chain was replayed 10,000,000 times on
 physical GPU 1. The case uses four deliberately unaligned sequence lengths
