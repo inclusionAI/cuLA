@@ -73,9 +73,19 @@ or bytes to K123.
 `tests/test_kda_sm100_intra_fused_cutedsl.py` builds Aqk, the unit-lower
 inverse, W, and U from the same BF16 inputs in FP64. It compares both csrc and
 CuTeDSL against that shared oracle and requires every CuTeDSL relative RMSE to
-be at most 1.05 times the csrc error. The FP16-workspace candidate passes all
-four checks; this replaces csrc-output parity as the precision acceptance
-criterion.
+be no greater than the csrc error (apart from a 1e-6 comparison epsilon).
+
+The strict check is currently an expected failure:
+
+| Output | CuTeDSL FP64 rel. RMSE | csrc FP64 rel. RMSE | Status |
+|---|---:|---:|---|
+| Aqk | 1.806507e-3 | 1.803550e-3 | 0.164% worse |
+| Akk | 3.913761e-5 | 3.914064e-5 | better |
+| W | 2.066073e-3 | 2.018450e-3 | 2.36% worse |
+| U | 2.334001e-3 | 2.334055e-3 | better |
+
+Therefore csrc-output parity is no longer accepted as a precision proof, and
+the candidate does not yet satisfy the requested all-output precision gate.
 
 ### Profile decomposition
 
