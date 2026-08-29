@@ -24,8 +24,18 @@ run_kda_fwd_intra_sm100(KDA_fwd_intra_params& params, cudaStream_t stream) {
 }
 
 void
+run_kda_fwd_intra_sm100_qwen_scalar_g(KDA_fwd_intra_params& params, cudaStream_t stream) {
+    kda::sm100::run_kda_fwd_intra_sm100_qwen_scalar_g_impl(params, stream);
+}
+
+void
 run_kda_fwd_recomp_w_u_sm100(KDA_fwd_recomp_w_u_params& params, cudaStream_t stream) {
     kda::sm100::run_kda_fwd_recomp_w_u_sm100_impl(params, stream);
+}
+
+void
+run_kda_fwd_recomp_w_u_sm100_qwen_scalar_g(KDA_fwd_recomp_w_u_params& params, cudaStream_t stream) {
+    kda::sm100::run_kda_fwd_recomp_w_u_sm100_qwen_scalar_g_impl(params, stream);
 }
 
 }  // namespace kda::sm100

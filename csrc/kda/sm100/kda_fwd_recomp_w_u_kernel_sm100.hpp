@@ -152,7 +152,9 @@ struct KdaChunkFwdRecompWUKernelSm100 {
             cute::prefetch_tma_descriptor(tma_params.tma_akk.get_tma_descriptor());
             cute::prefetch_tma_descriptor(tma_params.tma_k.get_tma_descriptor());
             cute::prefetch_tma_descriptor(tma_params.tma_v.get_tma_descriptor());
-            cute::prefetch_tma_descriptor(tma_params.tma_g.get_tma_descriptor());
+            if constexpr (!Mainloop::ScalarG) {
+                cute::prefetch_tma_descriptor(tma_params.tma_g.get_tma_descriptor());
+            }
             if constexpr (StoreQG) {
                 cute::prefetch_tma_descriptor(tma_params.tma_q.get_tma_descriptor());
             }
@@ -453,10 +455,16 @@ run_kda_fwd_recomp_w_u_sm100_impl_dispatch(KDA_fwd_recomp_w_u_params& params, cu
         make_tensor(make_gmem_ptr((bf16*)params.k_ptr), make_layout(shape_QK, stride_QK)),
         typename Kernel::SmemLayoutInputBF16{});
 
-    auto tma_G = cute::make_tma_copy(
-        SM90_TMA_LOAD{},
-        make_tensor(make_gmem_ptr((float*)params.g_ptr), make_layout(shape_VG, stride_VG)),
-        typename Kernel::SmemLayoutInputFP32{});
+    auto tma_G = [&]() {
+        if constexpr (Kernel::Mainloop::ScalarG) {
+            return 0;
+        } else {
+            return cute::make_tma_copy(
+                SM90_TMA_LOAD{},
+                make_tensor(make_gmem_ptr((float*)params.g_ptr), make_layout(shape_VG, stride_VG)),
+                typename Kernel::SmemLayoutInputFP32{});
+        }
+    }();
 
     auto tma_Akk = cute::make_tma_copy(
         SM90_TMA_LOAD{},
@@ -502,10 +510,18 @@ inline void
 run_kda_fwd_recomp_w_u_sm100_impl(KDA_fwd_recomp_w_u_params& params, cudaStream_t stream) {
     BETA_TYPE_SWITCH(params.is_beta_bf16, BetaType, [&] {
         BOOL_SWITCH(params.store_qg, kStoreQG, [&] {
-            using Kernel = KdaChunkFwdRecompWUKernelSm100<KdaChunkFwdRecompWUMainloopSm100<kStoreQG, BetaType>>;
+            using Kernel = KdaChunkFwdRecompWUKernelSm100<
+                KdaChunkFwdRecompWUMainloopSm100<kStoreQG, /*ScalarG=*/false, BetaType>>;
             run_kda_fwd_recomp_w_u_sm100_impl_dispatch<Kernel>(params, stream);
         });
     });
+}
+
+inline void
+run_kda_fwd_recomp_w_u_sm100_qwen_scalar_g_impl(KDA_fwd_recomp_w_u_params& params, cudaStream_t stream) {
+    using Kernel = KdaChunkFwdRecompWUKernelSm100<
+        KdaChunkFwdRecompWUMainloopSm100</*StoreQG=*/false, /*ScalarG=*/true, float>>;
+    run_kda_fwd_recomp_w_u_sm100_impl_dispatch<Kernel>(params, stream);
 }
 
 }  // namespace kda::sm100

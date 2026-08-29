@@ -35,7 +35,7 @@ struct KdaChunkFwdRecompWUSm100NamedBarriers {
 // constants, and the persistent loop bodies for each warp role.
 // The Kernel struct is templated on this Mainloop.
 // ===================================================================
-template <bool StoreQG_ = false, typename ElementBeta_ = float>
+template <bool StoreQG_ = false, bool ScalarG_ = false, typename ElementBeta_ = float>
 struct KdaChunkFwdRecompWUMainloopSm100 {
     // ===================== Tile / Buffer Constants =====================
     static constexpr int TileT = 64;
@@ -49,6 +49,7 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     static constexpr int StagesQ = 1;
 
     static constexpr bool StoreQG = StoreQG_;
+    static constexpr bool ScalarG = ScalarG_;
     using ElementBeta = ElementBeta_;
 
     // TODO: try optimization with tcgen05.mma.ws
@@ -160,13 +161,22 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
     struct QSmemBufferDisabled {};  // empty, zero-cost
     using QSmemBuffer = cute::conditional_t<StoreQG, QSmemBufferEnabled, QSmemBufferDisabled>;
 
+    struct VectorGateStorage {
+        array_aligned<float, cosize_v<SmemLayoutInputFP32>> g[StagesLoadStore];
+    };
+    struct ScalarGateStorage {
+        array_aligned<float, TileT * 4> g[StagesA];
+    };
+    using GateStorage = cute::conditional_t<ScalarG, ScalarGateStorage, VectorGateStorage>;
+
     struct SharedMemoryPlan {
         // Akk, single buffer
         array_aligned<bf16, cosize_v<SmemLayoutInputAkkBF16>> akk[StagesA];  // 16KB
-        // K, V, G double buffer
+        // K/V are double buffered. Generic vector-G keeps the full staged
+        // matrix; Qwen scalar-G keeps four duplicated floats per token row.
         array_aligned<bf16, cosize_v<SmemLayoutInputBF16>> k[StagesLoadStore];   // 32KB
         array_aligned<bf16, cosize_v<SmemLayoutInputBF16>> v[StagesLoadStore];   // 32KB
-        array_aligned<float, cosize_v<SmemLayoutInputFP32>> g[StagesLoadStore];  // 64KB
+        GateStorage gate;
         // Q double buffer (only present when StoreQG=true)
         QSmemBuffer q_buf;
         // MMA B-operand staging: K_proc/V_proc after prologue, [N=TileK, K=TileT] MN-major, double buffer
@@ -326,9 +336,19 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                     }
                 }
 
-                g_pipeline.consumer_wait(g_pipe_state_read);
-                Tensor sG =
-                    make_tensor(make_smem_ptr(shared_plan->g[g_pipe_state_read.index()].data()), SmemLayoutInputFP32{});
+                if constexpr (!ScalarG) {
+                    g_pipeline.consumer_wait(g_pipe_state_read);
+                }
+                auto sG = [&]() {
+                    if constexpr (ScalarG) {
+                        return ScalarGateView{
+                            shared_plan->gate.g[beta_pipe_state_read.index()].data()};
+                    } else {
+                        return make_tensor(
+                            make_smem_ptr(shared_plan->gate.g[g_pipe_state_read.index()].data()),
+                            SmemLayoutInputFP32{});
+                    }
+                }();
                 // Load G with same 16x64 column mapping as K (two float4 per iteration)
 #pragma unroll
                 for (int ti = 0; ti < TileT / 16; ++ti) {
@@ -368,15 +388,27 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                                 // lo half (cols y..y+3): k_reg a01, a23 + g_reg lo
                                 float2 kf_01 = __bfloat1622float2(k_reg[ti][k_yi].a01);
                                 float2 kf_23 = __bfloat1622float2(k_reg[ti][k_yi].a23);
-                                float2 g_01 = {exp2f(g_reg[ti][k_yi][0].x), exp2f(g_reg[ti][k_yi][0].y)};
-                                float2 g_23 = {exp2f(g_reg[ti][k_yi][0].z), exp2f(g_reg[ti][k_yi][0].w)};
+                                float2 g_01;
+                                float2 g_23;
+                                float2 g_45;
+                                float2 g_67;
+                                if constexpr (ScalarG) {
+                                    const float scale = exp2f(g_reg[ti][k_yi][0].x);
+                                    g_01 = make_float2(scale, scale);
+                                    g_23 = make_float2(scale, scale);
+                                    g_45 = make_float2(scale, scale);
+                                    g_67 = make_float2(scale, scale);
+                                } else {
+                                    g_01 = {exp2f(g_reg[ti][k_yi][0].x), exp2f(g_reg[ti][k_yi][0].y)};
+                                    g_23 = {exp2f(g_reg[ti][k_yi][0].z), exp2f(g_reg[ti][k_yi][0].w)};
+                                    g_45 = {exp2f(g_reg[ti][k_yi][1].x), exp2f(g_reg[ti][k_yi][1].y)};
+                                    g_67 = {exp2f(g_reg[ti][k_yi][1].z), exp2f(g_reg[ti][k_yi][1].w)};
+                                }
                                 float2 res_01 = float2_mul(float2_mul(kf_01, beta2), g_01);
                                 float2 res_23 = float2_mul(float2_mul(kf_23, beta2), g_23);
                                 // hi half (cols y+4..y+7): k_reg a45, a67 + g_reg hi
                                 float2 kf_45 = __bfloat1622float2(k_reg[ti][k_yi].a45);
                                 float2 kf_67 = __bfloat1622float2(k_reg[ti][k_yi].a67);
-                                float2 g_45 = {exp2f(g_reg[ti][k_yi][1].x), exp2f(g_reg[ti][k_yi][1].y)};
-                                float2 g_67 = {exp2f(g_reg[ti][k_yi][1].z), exp2f(g_reg[ti][k_yi][1].w)};
                                 float2 res_45 = float2_mul(float2_mul(kf_45, beta2), g_45);
                                 float2 res_67 = float2_mul(float2_mul(kf_67, beta2), g_67);
                                 // Single 128-bit store
@@ -431,23 +463,36 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                             // lo half (cols y..y+3): k_reg a01, a23
                             float2 kf_01 = __bfloat1622float2(k_reg[ti][k_yi].a01);
                             float2 kf_23 = __bfloat1622float2(k_reg[ti][k_yi].a23);
-                            float2 gd_01 = {
-                                exp2f(g_last_reg[k_yi][0].x - g_reg[ti][k_yi][0].x),
-                                exp2f(g_last_reg[k_yi][0].y - g_reg[ti][k_yi][0].y)};
-                            float2 gd_23 = {
-                                exp2f(g_last_reg[k_yi][0].z - g_reg[ti][k_yi][0].z),
-                                exp2f(g_last_reg[k_yi][0].w - g_reg[ti][k_yi][0].w)};
+                            float2 gd_01;
+                            float2 gd_23;
+                            float2 gd_45;
+                            float2 gd_67;
+                            if constexpr (ScalarG) {
+                                const float scale = exp2f(
+                                    g_last_reg[k_yi][0].x - g_reg[ti][k_yi][0].x);
+                                gd_01 = make_float2(scale, scale);
+                                gd_23 = make_float2(scale, scale);
+                                gd_45 = make_float2(scale, scale);
+                                gd_67 = make_float2(scale, scale);
+                            } else {
+                                gd_01 = {
+                                    exp2f(g_last_reg[k_yi][0].x - g_reg[ti][k_yi][0].x),
+                                    exp2f(g_last_reg[k_yi][0].y - g_reg[ti][k_yi][0].y)};
+                                gd_23 = {
+                                    exp2f(g_last_reg[k_yi][0].z - g_reg[ti][k_yi][0].z),
+                                    exp2f(g_last_reg[k_yi][0].w - g_reg[ti][k_yi][0].w)};
+                                gd_45 = {
+                                    exp2f(g_last_reg[k_yi][1].x - g_reg[ti][k_yi][1].x),
+                                    exp2f(g_last_reg[k_yi][1].y - g_reg[ti][k_yi][1].y)};
+                                gd_67 = {
+                                    exp2f(g_last_reg[k_yi][1].z - g_reg[ti][k_yi][1].z),
+                                    exp2f(g_last_reg[k_yi][1].w - g_reg[ti][k_yi][1].w)};
+                            }
                             float2 res_01 = float2_mul(kf_01, gd_01);
                             float2 res_23 = float2_mul(kf_23, gd_23);
                             // hi half (cols y+4..y+7): k_reg a45, a67
                             float2 kf_45 = __bfloat1622float2(k_reg[ti][k_yi].a45);
                             float2 kf_67 = __bfloat1622float2(k_reg[ti][k_yi].a67);
-                            float2 gd_45 = {
-                                exp2f(g_last_reg[k_yi][1].x - g_reg[ti][k_yi][1].x),
-                                exp2f(g_last_reg[k_yi][1].y - g_reg[ti][k_yi][1].y)};
-                            float2 gd_67 = {
-                                exp2f(g_last_reg[k_yi][1].z - g_reg[ti][k_yi][1].z),
-                                exp2f(g_last_reg[k_yi][1].w - g_reg[ti][k_yi][1].w)};
                             float2 res_45 = float2_mul(kf_45, gd_45);
                             float2 res_67 = float2_mul(kf_67, gd_67);
                             // Single 128-bit store
@@ -468,8 +513,10 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                     }
                 }
 
-                g_pipeline.consumer_release(g_pipe_state_read);
-                ++g_pipe_state_read;
+                if constexpr (!ScalarG) {
+                    g_pipeline.consumer_release(g_pipe_state_read);
+                    ++g_pipe_state_read;
+                }
 
                 // Ensure all 128 prologue threads have finished writing sKG_out
                 cutlass::arch::NamedBarrier::arrive_and_wait(
@@ -534,15 +581,27 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                                 // lo half (cols y..y+3)
                                 float2 qf_01 = __bfloat1622float2(q_reg[ti][k_yi].a01);
                                 float2 qf_23 = __bfloat1622float2(q_reg[ti][k_yi].a23);
-                                float2 g_01 = {exp2f(g_reg[ti][k_yi][0].x), exp2f(g_reg[ti][k_yi][0].y)};
-                                float2 g_23 = {exp2f(g_reg[ti][k_yi][0].z), exp2f(g_reg[ti][k_yi][0].w)};
+                                float2 g_01;
+                                float2 g_23;
+                                float2 g_45;
+                                float2 g_67;
+                                if constexpr (ScalarG) {
+                                    const float scale = exp2f(g_reg[ti][k_yi][0].x);
+                                    g_01 = make_float2(scale, scale);
+                                    g_23 = make_float2(scale, scale);
+                                    g_45 = make_float2(scale, scale);
+                                    g_67 = make_float2(scale, scale);
+                                } else {
+                                    g_01 = {exp2f(g_reg[ti][k_yi][0].x), exp2f(g_reg[ti][k_yi][0].y)};
+                                    g_23 = {exp2f(g_reg[ti][k_yi][0].z), exp2f(g_reg[ti][k_yi][0].w)};
+                                    g_45 = {exp2f(g_reg[ti][k_yi][1].x), exp2f(g_reg[ti][k_yi][1].y)};
+                                    g_67 = {exp2f(g_reg[ti][k_yi][1].z), exp2f(g_reg[ti][k_yi][1].w)};
+                                }
                                 float2 res_01 = float2_mul(qf_01, g_01);
                                 float2 res_23 = float2_mul(qf_23, g_23);
                                 // hi half (cols y+4..y+7)
                                 float2 qf_45 = __bfloat1622float2(q_reg[ti][k_yi].a45);
                                 float2 qf_67 = __bfloat1622float2(q_reg[ti][k_yi].a67);
-                                float2 g_45 = {exp2f(g_reg[ti][k_yi][1].x), exp2f(g_reg[ti][k_yi][1].y)};
-                                float2 g_67 = {exp2f(g_reg[ti][k_yi][1].z), exp2f(g_reg[ti][k_yi][1].w)};
                                 float2 res_45 = float2_mul(qf_45, g_45);
                                 float2 res_67 = float2_mul(qf_67, g_67);
                                 // Single 128-bit store
@@ -919,8 +978,15 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                     make_coord(token_offset, _0{}, _0{}), tma_params.tma_k.get_tma_tensor(tma_params.shape_qk));
                 Tensor mV = domain_offset(
                     make_coord(token_offset, _0{}, _0{}), tma_params.tma_v.get_tma_tensor(tma_params.shape_vg));
-                Tensor mG = domain_offset(
-                    make_coord(token_offset, _0{}, _0{}), tma_params.tma_g.get_tma_tensor(tma_params.shape_vg));
+                auto mG = [&]() {
+                    if constexpr (ScalarG) {
+                        return 0;
+                    } else {
+                        return domain_offset(
+                            make_coord(token_offset, _0{}, _0{}),
+                            tma_params.tma_g.get_tma_tensor(tma_params.shape_vg));
+                    }
+                }();
                 Tensor mA = domain_offset(
                     make_coord(token_offset, _0{}, _0{}), tma_params.tma_akk.get_tma_tensor(tma_params.shape_Akk));
 
@@ -958,26 +1024,37 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
                         make_smem_ptr(shared_plan->k[k_pipe_state_write.index()].data()), SmemLayoutInputBF16{});
                     Tensor sV = make_tensor(
                         make_smem_ptr(shared_plan->v[v_pipe_state_write.index()].data()), SmemLayoutInputBF16{});
-                    Tensor sG = make_tensor(
-                        make_smem_ptr(shared_plan->g[g_pipe_state_write.index()].data()), SmemLayoutInputFP32{});
 
-                    // GVA slicing: K uses qk_head_idx; V and G use the v-head index.
+                    // GVA slicing: K uses qk_head_idx and V uses v-head.
+                    // Generic vector-G is loaded by TMA; Qwen scalar-G is
+                    // published by the aux pipeline instead.
                     Tensor gK = local_tile(
                         mK(_, _, qk_head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, i_k));
                     Tensor gV = local_tile(
                         mV(_, _, head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, i_k));
-                    Tensor gG = local_tile(
-                        mG(_, _, head_idx), make_shape(Int<TileT>{}, Int<TileK>{}), make_coord(tile_idx, i_k));
 
                     // K: Load → Compute
                     k_pipeline.producer_acquire(k_pipe_state_write);
                     ku::launch_tma_copy(tma_params.tma_k, gK, sK, *k_pipeline.producer_get_barrier(k_pipe_state_write));
                     ++k_pipe_state_write;
 
-                    // G: Load → Compute
-                    g_pipeline.producer_acquire(g_pipe_state_write);
-                    ku::launch_tma_copy(tma_params.tma_g, gG, sG, *g_pipeline.producer_get_barrier(g_pipe_state_write));
-                    ++g_pipe_state_write;
+                    // G: Load → Compute (generic vector-G only)
+                    if constexpr (!ScalarG) {
+                        Tensor sG = make_tensor(
+                            make_smem_ptr(shared_plan->gate.g[g_pipe_state_write.index()].data()),
+                            SmemLayoutInputFP32{});
+                        Tensor gG = local_tile(
+                            mG(_, _, head_idx),
+                            make_shape(Int<TileT>{}, Int<TileK>{}),
+                            make_coord(tile_idx, i_k));
+                        g_pipeline.producer_acquire(g_pipe_state_write);
+                        ku::launch_tma_copy(
+                            tma_params.tma_g,
+                            gG,
+                            sG,
+                            *g_pipeline.producer_get_barrier(g_pipe_state_write));
+                        ++g_pipe_state_write;
+                    }
 
                     // V: Load → Compute
                     v_pipeline.producer_acquire(v_pipe_state_write);
@@ -1039,12 +1116,24 @@ struct KdaChunkFwdRecompWUMainloopSm100 {
             // ============================================================
             beta_pipeline.producer_acquire(beta_pipe_state_write);
             if (thread_idx < TileT) {
+                const int token = token_offset + tile_idx * TileT + thread_idx;
                 float beta_val =
                     (thread_idx < sub_seq_len)
-                        ? float(reinterpret_cast<ElementBeta*>(
-                              params.beta_ptr)[(token_offset + tile_idx * TileT + thread_idx) * params.h_v + head_idx])
+                        ? float(reinterpret_cast<ElementBeta*>(params.beta_ptr)[token * params.h_v + head_idx])
                         : float(0);
                 shared_plan->beta_smem[beta_pipe_state_write.index()][thread_idx] = beta_val;
+                if constexpr (ScalarG) {
+                    const float gate =
+                        (thread_idx < sub_seq_len)
+                            ? reinterpret_cast<const float*>(params.g_ptr)[token * params.h_v + head_idx]
+                            : 0.0f;
+                    float* gate4 =
+                        shared_plan->gate.g[beta_pipe_state_write.index()].data() + thread_idx * 4;
+                    gate4[0] = gate;
+                    gate4[1] = gate;
+                    gate4[2] = gate;
+                    gate4[3] = gate;
+                }
             }
             fence_view_async_shared();
             beta_pipeline.producer_commit(beta_pipe_state_write);
