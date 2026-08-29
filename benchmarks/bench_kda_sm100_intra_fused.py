@@ -7,10 +7,10 @@
 """Benchmark/profiling entry for SM100 KDA K123 inverse variants.
 
 Examples:
-  python benchmarks/bench_kda_fwd_intra_sm100_fused_inv.py --mode both
-  python benchmarks/bench_kda_fwd_intra_sm100_fused_inv.py --mode varlen --seq-lens 288
+  python benchmarks/bench_kda_sm100_intra_fused.py --mode both
+  python benchmarks/bench_kda_sm100_intra_fused.py --mode varlen --seq-lens 288
   /usr/local/cuda-13/bin/ncu --profile-from-start off --set full -o ncu_reports/kda_fwd_intra_sm100_varlen \
-    .venv/bin/python benchmarks/bench_kda_fwd_intra_sm100_fused_inv.py --ncu --mode varlen
+    .venv/bin/python benchmarks/bench_kda_sm100_intra_fused.py --ncu --mode varlen
 """
 
 from __future__ import annotations
