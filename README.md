@@ -140,6 +140,38 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 - `beta` supports both `float32` and `bfloat16`; `initial_state` must be `float32`.
 - `cu_seqlens` (for variable-length sequences) must be `int32`.
 
+### NVSHMEM CP overlap
+
+cuLA provides an opt-in NVSHMEM CP-overlap backend for KDA preprocessing. In the
+validated CP=2 path, it writes the producer state directly into symmetric
+memory, publishes readiness with an NVSHMEM signal, and transfers only the
+V-state consumed by the successor.
+
+```bash
+export CULA_CP_OVERLAP=1
+export CULA_CP_COMM_BACKEND=nvshmem
+export CULA_CP_NVSHMEM_READY_WAIT=1
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NVSHMEM_DISABLE_CUDA_VMM=1
+export NVSHMEM_SYMMETRIC_SIZE=256M
+```
+
+The default remains the FLA path because `CULA_CP_OVERLAP` defaults to `0`. The
+validated NVSHMEM-overlap path uses eager execution, a global CP group of size
+two, one global sequence, and the rank-0-to-rank-1 predecessor relationship. The
+GB200 validation used `NVSHMEM_DISABLE_CUDA_VMM=1`; cuLA does not override this
+installation-specific setting.
+
+Run the integrated correctness check with:
+
+```bash
+torchrun --standalone --nproc-per-node=2 \
+  benchmarks/check_cp_predecessor_nvshmem.py
+```
+
+See [the focused benchmark note](docs/cp_overlap/nvshmem_predecessor_handoff.md)
+for the before/after result and reproduction command.
+
 ## Usage
 
 See [USAGE.md](USAGE.md) for detailed usage examples and notes.

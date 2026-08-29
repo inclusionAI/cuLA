@@ -1,0 +1,49 @@
+{
+  "date": "2026-07-22",
+  "base_commit": "7bbf9cd94eb5b7d174a0852802ba909437846c29",
+  "hardware": "4x NVIDIA GB200, one host",
+  "software": {
+    "torch": "2.10.0+cu130",
+    "cuda": "13.0",
+    "nvshmem": "3.4.5",
+    "cutlass_dsl": "4.4.2"
+  },
+  "environment": {
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "NVSHMEM_DISABLE_CUDA_VMM": "1",
+    "NVSHMEM_SYMMETRIC_SIZE": "256M",
+    "NVSHMEM_IB_ENABLE": "0"
+  },
+  "root_cause": {
+    "category": "cross_stream_and_collective_bootstrap_ordering",
+    "first_divergence": "consumer ranks waited for peer 0 epoch 1 before peer 0 completed symmetric cache construction",
+    "heap_exhaustion": false
+  },
+  "fix": [
+    "synchronize NVSHMEM initialization barrier before symmetric allocation",
+    "synchronize ready-flag initialization and complete a collective bootstrap barrier",
+    "make the communication stream wait for the producer stream before publication",
+    "reject first-time symmetric cache allocation during CUDA graph capture"
+  ],
+  "correctness": [
+    {"world_size": 2, "sequence_length": 1024, "heads": 4, "process_launches": 1, "passes": 1, "max_abs_diff": 0.0},
+    {"world_size": 4, "sequence_length": 1024, "heads": 4, "process_launches": 5, "passes": 5, "max_abs_diff": 0.0},
+    {"world_size": 4, "sequence_length": 4096, "heads": 8, "process_launches": 1, "passes": 1, "max_abs_diff": 0.0}
+  ],
+  "pytest": {
+    "passed": 3,
+    "failed": 0
+  },
+  "timing_protocol": {
+    "dtype": "bfloat16",
+    "warmup": 20,
+    "iterations": 60,
+    "repeats": 5,
+    "metric": "median of repeat rank-max iteration medians"
+  },
+  "timing_ms": [
+    {"sequence_length": 4096, "heads": 8, "fla_cp": 0.6088, "nvshmem_multi_peer": 0.6921, "nvshmem_change_percent": 13.68},
+    {"sequence_length": 8192, "heads": 16, "fla_cp": 0.6011, "nvshmem_multi_peer": 0.6764, "nvshmem_change_percent": 12.53}
+  ],
+  "status": "stable_and_correct_but_not_faster"
+}

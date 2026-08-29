@@ -1,0 +1,85 @@
+{
+  "date": "2026-07-22",
+  "status": {
+    "correct_forward_backward": true,
+    "faster_than_fla_cp": true,
+    "met_20_percent_target": false,
+    "integrated_megatron_result": false
+  },
+  "environment": {
+    "gpus": "4x NVIDIA GB200, one host",
+    "pytorch": "2.10.0+cu130",
+    "cuda": "13.0",
+    "nvshmem": "3.4.5",
+    "cutlass_dsl": "4.4.2",
+    "NVSHMEM_DISABLE_CUDA_VMM": "1",
+    "NVSHMEM_SYMMETRIC_SIZE": "256M",
+    "CUDA_DEVICE_MAX_CONNECTIONS": "2"
+  },
+  "candidate": {
+    "world_size": 4,
+    "ready_protocol": "barrier",
+    "direct_symmetric_store": true,
+    "fused_remote_merge": true,
+    "current_stream": true,
+    "execution": "eager"
+  },
+  "correctness": [
+    {
+      "sequence_length": 1024,
+      "heads": 4,
+      "launches_passed": 3,
+      "launches_total": 3,
+      "max_abs_diff": 0.0
+    },
+    {
+      "sequence_length": 4096,
+      "heads": 8,
+      "launches_passed": 1,
+      "launches_total": 1,
+      "max_abs_diff": 0.0
+    },
+    {
+      "sequence_length": 8192,
+      "heads": 16,
+      "launches_passed": 1,
+      "launches_total": 1,
+      "max_abs_diff": 0.0
+    }
+  ],
+  "timing_protocol": {
+    "dtype": "bf16",
+    "warmups": 20,
+    "iterations": 60,
+    "repeats": 5,
+    "score": "median repeat of rank-max iteration median"
+  },
+  "timings": [
+    {
+      "sequence_length": 4096,
+      "heads": 8,
+      "fla_rank_max_median_ms": 0.6317,
+      "nvshmem_rank_max_median_ms": 0.5680,
+      "improvement_percent": 10.08,
+      "fla_repeat_rank_max_median_ms": [0.6438, 0.6368, 0.6317, 0.6230, 0.6230],
+      "nvshmem_repeat_rank_max_median_ms": [0.5792, 0.5680, 0.5738, 0.5620, 0.5619]
+    },
+    {
+      "sequence_length": 8192,
+      "heads": 16,
+      "fla_rank_max_median_ms": 0.6112,
+      "nvshmem_rank_max_median_ms": 0.5662,
+      "improvement_percent": 7.36,
+      "fla_repeat_rank_max_median_ms": [0.6289, 0.6237, 0.6079, 0.6112, 0.6077],
+      "nvshmem_repeat_rank_max_median_ms": [0.5826, 0.5641, 0.5677, 0.5662, 0.5565]
+    }
+  ],
+  "rejected": [
+    "serialized chained predecessor schedule",
+    "per-peer ready signals",
+    "CUDA_DEVICE_MAX_CONNECTIONS=3",
+    "CUDA_DEVICE_MAX_CONNECTIONS=4",
+    "eight-warp fused merge configurations",
+    "CUDA Graph comparison without a valid FLA baseline"
+  ]
+}
