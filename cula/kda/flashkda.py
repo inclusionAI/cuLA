@@ -1,17 +1,17 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SM90 KDA prefill wrapper for the two-kernel K1+K2 CuTeDSL path"""
+"""SM90/SM100 KDA prefill wrapper for the two-kernel K1+K2 CuTeDSL path."""
 
 from typing import Literal
 
 import torch
 from torch.amp import custom_bwd, custom_fwd
 
+from cula.kda._flashkda_arch import assert_flashkda_supported
 from cula.ops.kda.cp_mode import CPMode
 from cula.ops.kda.sm90.cp.plan import plan_prefill
 from cula.ops.kda.sm90.fwd import _seq_tiles_from_problem, _validate_inputs, _validate_launch_options, flash_kda_fwd
-from cula.utils import assert_hopper
 
 
 def _beta_logits_bf16(beta: torch.Tensor) -> torch.Tensor:
@@ -196,10 +196,11 @@ def cula_kda_prefill(
     **kwargs,
 ):
     r"""
-    Hopper (SM90) KDA forward prefill using CuTeDSL two-kernel pipeline.
+    SM90/SM100 KDA forward prefill using the SM90-derived CuTeDSL two-kernel
+    pipeline.
 
     Gate preprocessing (A_log, dt_bias, lower_bound) and L2-norm are handled
-    internally by the K1 kernel. This SM90 CuTeDSL path supports only the safe
+    internally by the K1 kernel. This CuTeDSL path supports only the safe
     in-kernel gate mode: ``use_gate_in_kernel=True`` and ``safe_gate=True``.
     ``use_qk_l2norm_in_kernel`` is accepted for API compatibility; CuTeDSL
     always applies L2-norm internally.
@@ -251,7 +252,7 @@ def cula_kda_prefill(
         chunk_indices (torch.IntTensor):
             Accepted for API compatibility; unused by CuTeDSL.
         use_intracard_cp (Literal["auto"] | bool):
-            Whether to use the SM90 intracard-CP path when profitable. ``True``
+            Whether to use the FlashKDA intracard-CP path when profitable. ``True``
             requires CP support and raises on rejection, ``"auto"`` falls back
             to the serial K1+K2 path, and ``False`` disables CP.
         out (Optional[torch.Tensor]):
@@ -269,14 +270,14 @@ def cula_kda_prefill(
         final_state (torch.Tensor):
             Final state of shape `[N, H, V, K]` if `output_final_state=True` else `None`.
     """
-    assert_hopper(q.device)
+    assert_flashkda_supported(q.device)
     if not use_gate_in_kernel:
         raise NotImplementedError(
-            "SM90 CuTeDSL KDA prefill only supports use_gate_in_kernel=True. "
+            "FlashKDA CuTeDSL prefill only supports use_gate_in_kernel=True. "
             "Passing preprocessed gates would otherwise fall back to the slow reference path."
         )
     if not safe_gate:
-        raise NotImplementedError("SM90 CuTeDSL KDA prefill only supports safe_gate=True.")
+        raise NotImplementedError("FlashKDA CuTeDSL prefill only supports safe_gate=True.")
     num_qk_heads, head_dim = q.shape[2], q.shape[3]
     num_kv_heads = v.shape[2]
     A_log = kwargs.pop("A_log", None)
@@ -292,7 +293,7 @@ def cula_kda_prefill(
         raise TypeError("beta must be in bfloat16 or float32.")
     if num_kv_heads != num_qk_heads:
         raise NotImplementedError(
-            "SM90 CuTeDSL KDA prefill does not support grouped-value attention yet "
+            "FlashKDA CuTeDSL prefill does not support grouped-value attention yet "
             f"(num_kv_heads={num_kv_heads} != num_qk_heads={num_qk_heads}); native GVA is a follow-up change."
         )
 

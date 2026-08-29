@@ -8,10 +8,7 @@ import importlib.util
 import torch
 
 from cula.backends import BaseBackend
-
-
-def _is_sm90(device: torch.device) -> bool:
-    return device.type == "cuda" and torch.cuda.get_device_capability(device) == (9, 0)
+from cula.kda._flashkda_arch import is_flashkda_supported
 
 
 class FlashKDABackend(BaseBackend):
@@ -42,8 +39,8 @@ class FlashKDABackend(BaseBackend):
         chunk_indices=None,
         **kwargs,
     ):
-        if not _is_sm90(q.device):
-            return False, "requires an SM90 (Hopper) device"
+        if not is_flashkda_supported(q.device):
+            return False, "requires an SM90 (Hopper) or SM100 (Blackwell) device"
         if v.shape[2] != q.shape[2]:
             return False, f"no GVA support (HV={v.shape[2]} != H={q.shape[2]})"
         if any(not t.is_contiguous() for t in (q, k, v, g)):
