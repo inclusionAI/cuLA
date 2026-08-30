@@ -176,6 +176,7 @@ python benchmarks/bench_la_decode_vs_fla.py --heads 64 --head-dim 128
 # Hopper (SM90)
 python benchmarks/bench_kda_sm90_prefill.py --mode both
 python benchmarks/bench_kda_sm90_cp.py
+python benchmarks/bench_kda_bwd_wy_dqkg_sm90.py --mode both --heads 32
 ```
 
 ## Tests
