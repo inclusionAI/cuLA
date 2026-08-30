@@ -103,6 +103,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print medians and compact error metrics instead of full samples and tensor statistics",
     )
+    parser.add_argument(
+        "--nsys-backend",
+        choices=("cake", "cula", "fla"),
+        help="Capture repeated backward calls for one backend with cudaProfilerApi",
+    )
+    parser.add_argument("--nsys-iters", type=int, default=20)
     return parser.parse_args()
 
 
@@ -415,6 +421,35 @@ def run_case(
     cula_backward = make_backward(cula_backend)
     fla_backward = make_backward(fla_backend)
 
+    if args.nsys_backend:
+        profile_functions = {
+            "cake": cake_backward,
+            "cula": cula_backward,
+            "fla": fla_backward,
+        }
+        profile_fn = profile_functions[args.nsys_backend]
+        for _ in range(3):
+            profile_fn()
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStart()
+        torch.cuda.nvtx.range_push(f"{args.nsys_backend}_bwd_x{args.nsys_iters}")
+        for _ in range(args.nsys_iters):
+            profile_fn()
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+        return {
+            "case": case.name,
+            "profile_backend": args.nsys_backend,
+            "profile_iters": args.nsys_iters,
+            "cula_bwd": {
+                "intra_requested": cula_chunk_intra._normalize_bwd_intra_backend(),
+                "intra_cutedsl_supported": cula_chunk_intra._is_bwd_intra_sm100_supported(
+                    cula_backend["leaves"][0], cula_backend["leaves"][3], 64, True
+                ),
+            },
+        }
+
     def cake_pair():
         cake_forward()
         return cake_backward()
@@ -537,7 +572,7 @@ def main() -> None:
                 cula_chunk_bwd,
                 args,
             )
-            emitted_result = compact_result(result) if args.compact else result
+            emitted_result = compact_result(result) if args.compact and not args.nsys_backend else result
             print("RESULT " + json.dumps(emitted_result, sort_keys=True), flush=True)
         except Exception as exc:
             print(
