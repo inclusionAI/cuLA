@@ -97,6 +97,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Save cuLA/FLA forward intermediates instead of recomputing them in backward",
     )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Print medians and compact error metrics instead of full samples and tensor statistics",
+    )
     return parser.parse_args()
 
 
@@ -135,6 +140,36 @@ def tensor_diff(actual: torch.Tensor, reference: torch.Tensor) -> dict[str, floa
         .mean()
         .mul(100)
         .item(),
+    }
+
+
+def compact_result(result: dict[str, object]) -> dict[str, object]:
+    compact_diffs = {
+        pair: {
+            tensor: {
+                "max_abs": stats["max_abs"],
+                "rel_rms": stats["rel_rms"],
+                "close_pct_at_1e-2": stats["close_pct_at_1e-2"],
+            }
+            for tensor, stats in tensors.items()
+        }
+        for pair, tensors in result["diff"].items()
+    }
+    compact_timing = {
+        phase: {
+            "median_ms": stats["median_ms"],
+            "speedup_vs_fla": stats["speedup_vs_fla"],
+            "cake_speedup_vs_cula": stats["cake_speedup_vs_cula"],
+        }
+        for phase, stats in result["timing"].items()
+    }
+    return {
+        "case": result["case"],
+        "shape": result["shape"],
+        "cake_route": result["cake_route"],
+        "cula_bwd": result["cula_bwd"],
+        "diff": compact_diffs,
+        "timing": compact_timing,
     }
 
 
@@ -501,7 +536,8 @@ def main() -> None:
                 cula_chunk_bwd,
                 args,
             )
-            print("RESULT " + json.dumps(result, sort_keys=True), flush=True)
+            emitted_result = compact_result(result) if args.compact else result
+            print("RESULT " + json.dumps(emitted_result, sort_keys=True), flush=True)
         except Exception as exc:
             print(
                 "RESULT "
