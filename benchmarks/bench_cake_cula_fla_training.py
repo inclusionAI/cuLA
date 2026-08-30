@@ -438,10 +438,18 @@ def run_case(
             "intra_cutedsl_supported": cula_chunk_intra._is_bwd_intra_sm100_supported(
                 cula_backend["leaves"][0], cula_backend["leaves"][3], 64, True
             ),
-            "wy_dqkg_impl": cula_chunk_bwd._select_chunk_kda_bwd_wy_dqkg_fused(
-                cula_backend["leaves"][0], cula_backend["leaves"][2]
-            ).__module__,
-            "recompute_impl": cula_chunk_bwd._select_recompute_w_u_backend(cula_backend["leaves"][0].device),
+            "wy_dqkg_impl": (
+                cula_chunk_bwd._select_chunk_kda_bwd_wy_dqkg_fused(
+                    cula_backend["leaves"][0], cula_backend["leaves"][2]
+                ).__module__
+                if hasattr(cula_chunk_bwd, "_select_chunk_kda_bwd_wy_dqkg_fused")
+                else cula_chunk_bwd.chunk_kda_bwd_wy_dqkg_fused_cutedsl.__module__
+            ),
+            "recompute_impl": (
+                cula_chunk_bwd._select_recompute_w_u_backend(cula_backend["leaves"][0].device)
+                if hasattr(cula_chunk_bwd, "_select_recompute_w_u_backend")
+                else "cula.cudac.recompute_w_u_cuda"
+            ),
             "disable_recompute": args.disable_recompute,
         },
         "diff": diffs,
