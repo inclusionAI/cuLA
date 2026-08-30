@@ -44,3 +44,33 @@ CAKE is close for the BF16 token/state gradients, but its FP32 `dA_log` and
 1e-2 tolerance. The relatively large output relative-RMS value is amplified by
 near-zero FLA reference values; the maximum absolute error and close percentage
 are more informative for that tensor.
+
+## Nsight Systems backward breakdown
+
+Each backend was captured independently for 30 backward calls after JIT and
+warmup. The summed GPU kernel times per backward are 1.393 ms for CAKE, 2.368 ms
+for cuLA, and 3.440 ms for FLA, closely matching the CUDA-event medians.
+
+| Backend / stage | Time per backward | GPU time |
+|---|---:|---:|
+| CAKE persistent fused backward | 1.260 ms | 90.5% |
+| CAKE parameter reduction | 0.132 ms | 9.5% |
+| cuLA CuTeDSL intra | 0.693 ms | 29.3% |
+| cuLA CuTeDSL WY/dKQG | 0.509 ms | 21.5% |
+| cuLA recurrent-state `dhu` | 0.353 ms | 14.9% |
+| cuLA remaining kernels | 0.813 ms | 34.3% |
+| FLA Triton intra | 1.283 ms | 37.3% |
+| FLA Triton WY/dKQG | 1.178 ms | 34.3% |
+| FLA recurrent-state `dhu` | 0.353 ms | 10.3% |
+| FLA remaining kernels | 0.626 ms | 18.1% |
+
+The 15-sequence distribution primarily improves CAKE: its persistent kernel
+drops from 1.913 ms in the earlier four-sequence skewed distribution to 1.260
+ms here, while cuLA and FLA change only slightly. This indicates that CAKE's
+persistent scheduler benefits much more from the additional sequence-level
+parallelism. cuLA's two CuTeDSL kernels remain the source of its advantage over
+FLA; they are approximately 1.85x and 2.32x faster than the corresponding
+Triton kernels in this distribution.
+
+The raw reports are stored on the GB200 host as
+`/ossfs/workspace/cuLA-fast-cutedsl-bwd/benchmarks/nsys_kda_h64_8k_15seq_{cake,cula,fla}.nsys-rep`.
