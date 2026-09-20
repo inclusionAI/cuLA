@@ -281,14 +281,3 @@ If you find cuLA useful, please cite it using the metadata in our [`CITATION.cff
   url     = {https://github.com/InclusionAI/cuLA}
 }
 ```
-
-## Contact
-
-If you're interested in an internship or job opportunity, feel free to reach out:  **chaofanyu@gmail.com**
-
-No CUDA experience is required as long as you're a quick learner.
-
-For Q&A and discussion, you can join us through:
-
-- **Slack:** [cuLA Slack Community](https://join.slack.com/t/cula-hq/shared_invite/zt-3uaacvm9y-xJwZyGueeKxZRYQlj7~hxw)
-- **WeChat:** The WeChat group has exceeded 200 members and can no longer be joined via QR code. To join, please send your WeChat ID to any of the following emails and we'll invite you: **chaofanyu@gmail.com** / **kevinzz08@foxmail.com** / **yzpag@gmail.com** / **haoc80996@gmail.com**. You can also ask someone already in the group to invite you directly.
