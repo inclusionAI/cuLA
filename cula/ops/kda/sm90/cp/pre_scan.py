@@ -91,6 +91,9 @@ def pre_scan_kernel(
     sINV = smem.allocate_tensor(cutlass.BFloat16, cc_stage_layout, 128)
     sState = smem.allocate_tensor(cutlass.BFloat16, state_layout, 128)
     sM = smem.allocate_tensor(cutlass.BFloat16, state_layout, 128)
+    # sState intentionally matches the serial FlashKDA BF16 recurrence.  sM
+    # is only its Tensor Core operand mirror; the CP-only affine transform is
+    # kept canonically in a distributed FP32 register fragment below.
     sGt = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D, 1, STAGES), stride=(1, D, D)), 128)
     sBeta = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((CHUNK, 1, STAGES), stride=(1, 64, 64)), 128)
     sMbar = smem.allocate_tensor(cutlass.Int64, cute.make_layout((STAGES,)), 16)
@@ -154,12 +157,10 @@ def pre_scan_kernel(
     gKD_raw = cute.make_tensor(ws_kd.iterator, raw_gmem_layout)
     gKR_raw = cute.make_tensor(ws_kr.iterator, raw_gmem_layout)
 
-    # sState=0, sM=I
+    # sState=0.  The distributed FP32 M accumulator initializes sM below.
     if tidx < D:
         for e in cutlass.range_constexpr(D):
             sState[tidx, e] = cutlass.BFloat16(0.0)
-            sM[tidx, e] = cutlass.BFloat16(0.0)
-        sM[tidx, tidx] = cutlass.BFloat16(1.0)
     cute.arch.barrier()
 
     mma_atom = warp.MmaF16BF16Op(cutlass.BFloat16, cutlass.Float32, (16, 8, 16))
@@ -223,9 +224,25 @@ def pre_scan_kernel(
     tCrKrA_state_blk_cv = smem_thr_copy_A_state.retile(tCrKrA_state_blk)
     tCrUpd_blk = thr_mma_state.make_fragment_C(tiled_mma_state.partition_shape_C((CHUNK, D)))
     sState_blk_tile = cute.flat_divide(sState, (CHUNK, D))
-    sM_blk_tile = cute.flat_divide(sM, (CHUNK, D))
     coord_state_blk = cute.make_identity_tensor((CHUNK, D))
     tCcState_blk = thr_mma_state.partition_C(coord_state_blk)
+
+    # Four compute warps jointly own the complete transition matrix.  Keeping
+    # this fragment in registers preserves the original shared-memory
+    # footprint and avoids round-tripping the canonical value through SMEM.
+    tCrKrA_m = thr_mma_state.make_fragment_A(thr_mma_state.partition_A(sKr_T_view_s0))
+    tCrKrA_m_cv = smem_thr_copy_A_state.retile(tCrKrA_m)
+    tCrMAcc = thr_mma_state.make_fragment_C(tiled_mma_state.partition_shape_C((D, D)))
+    tCcM = thr_mma_state.partition_C(cute.make_identity_tensor((D, D)))
+    tCsM = thr_mma_state.partition_C(sM)
+    if warp_idx < LOAD_WARP_IDX:
+        for i in cutlass.range_constexpr(cute.size(tCrMAcc)):
+            ii: cutlass.Constexpr[int] = i
+            row, col = tCcM[ii]
+            value = cutlass.Float32(1.0) if row == col else cutlass.Float32(0.0)
+            tCrMAcc[ii] = value
+            tCsM[ii] = cutlass.BFloat16(value)
+    cute.arch.barrier()
 
     tCrU_T = thr_mma.make_fragment_B(thr_mma.partition_B(sKr_T_ref))
 
@@ -406,30 +423,21 @@ def pre_scan_kernel(
                 ii: cutlass.Constexpr[int] = i
                 tCrU_T_post_u32[ii] = movm_t_b16(cutlass.Int32(tCrU_post_u32[ii]))
 
-            # State update': M = M*gt + kr^T @ U
-            for mi in cutlass.range_constexpr(M_BLOCKS):
-                sKr_T_blk_s = sKr_T_blk_tile_s[None, None, mi, 0]
-                cute.copy(
-                    smem_tiled_copy_A_state,
-                    smem_thr_copy_A_state.partition_S(sKr_T_blk_s),
-                    tCrKrA_state_blk_cv,
-                )
-                tCrUpd_blk.fill(0.0)
-                cute.gemm(tiled_mma_state, tCrUpd_blk, tCrKrA_state_blk, tCrU_T_post, tCrUpd_blk)
-
-                sM_blk = sM_blk_tile[None, None, mi, 0]
-                tCsM_blk = thr_mma_state.partition_C(sM_blk)
-                m_frag_blk = cute.make_fragment_like(tCsM_blk, cutlass.BFloat16)
-                gt_frag_blk_m = cute.make_fragment_like(tCsM_blk, cutlass.Float32)
-                m_off2: cutlass.Constexpr[int] = mi * CHUNK
-                for i in cutlass.range_constexpr(cute.size(m_frag_blk)):
-                    ii: cutlass.Constexpr[int] = i
-                    m_frag_blk[ii] = tCsM_blk[ii]
-                    gt_frag_blk_m[ii] = sGt_s[m_off2 + tCcState_blk[ii][0]]
-                for i in cutlass.range_constexpr(cute.size(tCrUpd_blk)):
-                    ii: cutlass.Constexpr[int] = i
-                    old = cutlass.Float32(m_frag_blk[ii]) * gt_frag_blk_m[ii]
-                    tCsM_blk[ii] = cutlass.BFloat16(old + tCrUpd_blk[ii])
+            # State update': M = M*gt + kr^T @ U.  Accumulate into the
+            # persistent FP32 register fragment and publish only a BF16 image
+            # for the next chunk's kd@M Tensor Core operand.
+            cute.copy(
+                smem_tiled_copy_A_state,
+                smem_thr_copy_A_state.partition_S(sKr_T_s),
+                tCrKrA_m_cv,
+            )
+            for i in cutlass.range_constexpr(cute.size(tCrMAcc)):
+                ii: cutlass.Constexpr[int] = i
+                tCrMAcc[ii] = tCrMAcc[ii] * sGt_s[tCcM[ii][0]]
+            cute.gemm(tiled_mma_state, tCrMAcc, tCrKrA_m, tCrU_T_post, tCrMAcc)
+            for i in cutlass.range_constexpr(cute.size(tCrMAcc)):
+                ii: cutlass.Constexpr[int] = i
+                tCsM[ii] = cutlass.BFloat16(tCrMAcc[ii])
 
             cute.arch.barrier(barrier_id=1, number_of_threads=128)
             cute.arch.fence_view_async_shared()
@@ -448,7 +456,11 @@ def pre_scan_kernel(
     if tidx < D:
         for d_out in cutlass.range_constexpr(D):
             b_state_g[state_base_f + cutlass.Int32(d_out * D) + cutlass.Int32(tidx)] = cutlass.Float32(sState[tidx, d_out])
-            m_state_g[state_base_f + cutlass.Int32(d_out * D) + cutlass.Int32(tidx)] = cutlass.Float32(sM[tidx, d_out])
+    if warp_idx < LOAD_WARP_IDX:
+        for i in cutlass.range_constexpr(cute.size(tCrMAcc)):
+            ii: cutlass.Constexpr[int] = i
+            row, col = tCcM[ii]
+            m_state_g[state_base_f + cutlass.Int32(col * D + row)] = tCrMAcc[ii]
 
 
 @cute.jit
