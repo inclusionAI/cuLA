@@ -29,7 +29,7 @@ import warnings
 import pytest
 import torch
 
-pytestmark = pytest.mark.sm100_only
+pytestmark = [pytest.mark.sm100_only, pytest.mark.cula_slow]
 
 # Suppress third-party deprecation warnings (e.g. torch.jit)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -292,6 +292,7 @@ def test_different_decay_values():
         return False
 
 
+@pytest.mark.cula_fast
 def test_against_reference(B=1, S=128, H=4, HV=None, D=128, C=64, decay_val=0.1, atol=5e-3, rtol=5e-2, verbose=True):
     """Compare against PyTorch reference (exact match)."""
     HV = H if HV is None else HV

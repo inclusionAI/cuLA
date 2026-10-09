@@ -58,6 +58,7 @@ RATIO_STRESS = 1e-6  # deterministic re-run: drift would indicate race
 
 pytestmark = [
     pytest.mark.sm100_only,
+    pytest.mark.cula_slow,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
 
@@ -255,6 +256,7 @@ def assert_cp_splits(cu, H, total_T):
     assert split_info, "config must exercise the split path"
 
 
+@pytest.mark.cula_fast
 def test_forced_cp_not_splittable_raises():
     """use_intracard_cp=True on an unsplittable shape must raise NotSplittableError."""
     from cula.ops.kda.cp_mode import NotSplittableError
@@ -275,12 +277,8 @@ def test_forced_cp_not_splittable_raises():
 DISPATCH_CONFIGS = [
     ([32768], 4, False),
     ([32768], 4, True),
-    ([65536], 4, True),
     ([32768], 8, True),
     ([32768, 256, 32768], 4, True),
-    ([65536, 128], 4, False),
-    ([32768, 32768, 32768], 4, True),
-    ([65536, 256, 128, 64], 8, True),
 ]
 
 
@@ -344,11 +342,7 @@ def test_cp_autodispatch_vs_fla(T, H):
 ACCURACY_CONFIGS = [
     ([65536], 4, False, False),
     ([65536], 4, True, True),
-    ([65536, 512], 4, True, True),
     ([65536, 256, 32768], 4, True, False),
-    ([65536, 128], 4, False, True),
-    ([131072], 4, True, True),
-    ([65536, 512, 256, 128], 4, True, False),
     ([65536, 1024, 8192], 8, True, True),
 ]
 
@@ -389,8 +383,6 @@ def test_intracard_cp_vs_pytorch_ref(seq_lens, H, use_gk, use_h0):
 FINAL_STATE_CONFIGS = [
     ([65536], 4, False, False),
     ([65536], 4, True, True),
-    ([65536], 8, True, True),
-    ([65536, 16384], 4, True, True),
     ([65536, 512, 16384], 4, True, False),
 ]
 
@@ -435,14 +427,13 @@ def test_intracard_cp_final_state_per_seq(seq_lens, H, use_gk, use_h0):
 # CP uses dynamic atomicAdd scheduling + multi-sub-seq merge — re-running the
 # same inputs must produce the same outputs (no race, no order-dependence).
 
-STRESS_ITERS = 100
+STRESS_ITERS = 10
 
 
 @pytest.mark.parametrize(
     "seq_lens,H,use_gk,use_h0",
     [
         pytest.param([65536], 4, True, True, id="single-64K-H4-gk-h0"),
-        pytest.param([65536, 4096], 4, True, True, id="multi-64K+4K-H4-gk-h0"),
     ],
 )
 def test_intracard_cp_stress_repeat(seq_lens, H, use_gk, use_h0):

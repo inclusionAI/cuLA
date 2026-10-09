@@ -30,6 +30,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from cula.ops.lightning.decode import linear_attention_decode
 
+pytestmark = pytest.mark.cula_slow
+
 
 def torch_la_decode_ref(q, k, v, state, decay_scales, scale):
     """Pure PyTorch reference; state is [B, HV, K, V] (BHKV)."""
@@ -119,6 +121,7 @@ def test_identity_offsets():
 # ---------------------------------------------------------------------------
 # Test 2: Non-identity offsets (exposes the bug)
 # ---------------------------------------------------------------------------
+@pytest.mark.cula_fast
 def test_non_identity_offsets():
     """
     pool_size=6, batch=4, offsets=[2, 0, 5, 1].
