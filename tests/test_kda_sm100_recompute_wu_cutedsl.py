@@ -13,6 +13,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import cula.cudac as cula_cuda
 from cula.ops.kda.sm100.recompute_wu import recompute_w_u_from_preprocessed, recompute_w_u_fwd
 
+pytestmark = pytest.mark.cula_slow
+
 
 def _requires_sm100():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
@@ -59,6 +61,7 @@ def test_recompute_wu_matches_csrc(beta_dtype):
     assert torch.equal(kg, kg_ref), f"kg differs bitwise: max_abs={(kg.float() - kg_ref.float()).abs().max().item()}"
 
 
+@pytest.mark.cula_fast
 def test_preprocessed_recompute_wu_matches_torch():
     _requires_sm100()
     torch.manual_seed(1)

@@ -49,7 +49,7 @@ build_chunk_offsets = _mod.build_chunk_offsets
 
 from fla.ops.gla.chunk import chunk_gla_fwd_o_gk as triton_chunk_gla_fwd_o_gk  # noqa: E402
 
-pytestmark = pytest.mark.sm100_only
+pytestmark = [pytest.mark.sm100_only, pytest.mark.cula_slow]
 
 # ── Constants ──
 K, V, BT = 128, 128, 64
@@ -564,6 +564,7 @@ def test_head_counts(H):
 # ═══════════════════════════════════════════════════════════════════════
 
 
+@pytest.mark.cula_fast
 def test_determinism():
     """Multiple calls with same input must produce identical output."""
     seq_lens = [256, 128, 100]

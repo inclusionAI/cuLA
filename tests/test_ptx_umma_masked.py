@@ -56,7 +56,7 @@ from cula.ops.sm100.ptx import (
     tcgen05mma_ss_no_mask,
 )
 
-pytestmark = pytest.mark.sm100_only
+pytestmark = [pytest.mark.sm100_only, pytest.mark.cula_slow]
 
 M_DIM, N_DIM, K_DIM = 64, 64, 8
 TMEM_COLS = 64
@@ -276,6 +276,7 @@ def _run_masked(mask_mode, A_real, B):
     return _Kernel(mask_mode).run(A_combined, B)
 
 
+@pytest.mark.cula_fast
 def test_ss_mask0():
     print("\n=== Test 2: tcgen05mma_ss_mask0 ===")
     torch.manual_seed(0)

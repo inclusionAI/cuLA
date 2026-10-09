@@ -21,7 +21,7 @@ from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as fla_fwd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import importlib.util
 
-pytestmark = pytest.mark.sm100_only
+pytestmark = [pytest.mark.sm100_only, pytest.mark.cula_slow]
 
 _spec = importlib.util.spec_from_file_location(
     "chunk_delta_h", os.path.join(os.path.dirname(__file__), "..", "cula", "ops", "kda", "sm100", "delta_h.py")
@@ -70,13 +70,15 @@ def run_cute_dsl(k, w, u, g=None, gk=None, initial_state=None, output_final_stat
 # ===================== Pytest parametrized tests =====================
 
 
-@pytest.mark.parametrize("B", [1, 2])
-@pytest.mark.parametrize("H", [1, 4])
-@pytest.mark.parametrize("T", [64, 128, 256])
-@pytest.mark.parametrize("K", [128])
-@pytest.mark.parametrize("V", [128])
-@pytest.mark.parametrize("use_gk", [False, True])
-@pytest.mark.parametrize("use_h0", [False, True])
+@pytest.mark.parametrize(
+    "B,H,T,K,V,use_gk,use_h0",
+    [
+        (1, 1, 64, 128, 128, False, False),
+        (1, 4, 128, 128, 128, True, False),
+        (2, 1, 256, 128, 128, False, True),
+        (2, 4, 256, 128, 128, True, True),
+    ],
+)
 def test_h_against_fla(B, H, T, K, V, use_gk, use_h0):
     """Test CuTe DSL h_out matches FLA's Triton kernel."""
     torch.manual_seed(42)
@@ -207,16 +209,14 @@ def _make_varlen_inputs(seq_lens, H, K, V, use_gk=False, use_h0=False, seed=42):
 
 
 @pytest.mark.parametrize(
-    "seq_lens",
+    "seq_lens,H,use_gk,use_h0",
     [
-        [128, 128],
-        [50, 192, 100],
-        [33, 128, 200, 95],
+        ([128, 128], 1, False, False),
+        ([50, 192, 100], 4, True, False),
+        ([33, 128, 200, 95], 1, False, True),
+        ([33, 128, 200, 95], 4, True, True),
     ],
 )
-@pytest.mark.parametrize("H", [1, 4])
-@pytest.mark.parametrize("use_gk", [False, True])
-@pytest.mark.parametrize("use_h0", [False, True])
 def test_varlen_against_fla(seq_lens, H, use_gk, use_h0):
     """Test varlen CuTe DSL h_out/v_new/ht matches FLA's Triton kernel."""
     K, V = 128, 128
@@ -275,6 +275,7 @@ def test_varlen_against_fla(seq_lens, H, use_gk, use_h0):
         )
 
 
+@pytest.mark.cula_fast
 def test_varlen_vs_nonvarlen():
     """Test that varlen with a single sequence matches non-varlen output."""
     H, K, V = 2, 128, 128

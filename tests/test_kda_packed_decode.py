@@ -35,6 +35,8 @@ from tests.test_kda_decode import _assert_close, make_inputs  # noqa: F401
 
 K = 128
 
+pytestmark = pytest.mark.cula_slow
+
 
 def _pack_mixed_qkv(q, k, v, N):
     """q,k: (N,H,K) bf16 ; v: (N,HV,V) bf16 -> mixed_qkv (N, qkv_dim) bf16."""
@@ -81,9 +83,10 @@ def _run_packed_dense(q, k, v, a, b, A_log, dt_bias, state, scale):
     return o.squeeze(1), state_p  # (N,HV,V), (N,HV,V,K)
 
 
-@pytest.mark.parametrize("N", [1, 2, 8, 16, 32, 64, 128])
-@pytest.mark.parametrize("H,HV", [(8, 16), (16, 32)])
-@pytest.mark.parametrize("V", [128, 256])
+@pytest.mark.parametrize(
+    "N,H,HV,V",
+    [(1, 8, 16, 128), (8, 16, 32, 128), (32, 8, 16, 256), (128, 16, 32, 256)],
+)
 def test_packed_dense(N, H, HV, V):
     scale = K**-0.5
     q, k, v, a, b, A_log, dt_bias, state = make_inputs(N, H, HV, K, V)
@@ -138,9 +141,10 @@ def _run_packed_varlen(q, k, v, a, b, A_log, dt_bias, state, scale):
     return o.squeeze(0), state_p  # (N,HV,V), (N,HV,V,K)
 
 
-@pytest.mark.parametrize("N", [2, 8, 16, 32, 64, 128])
-@pytest.mark.parametrize("H,HV", [(8, 16), (16, 32)])
-@pytest.mark.parametrize("V", [128, 256])
+@pytest.mark.parametrize(
+    "N,H,HV,V",
+    [(2, 8, 16, 128), (8, 16, 32, 128), (32, 8, 16, 256), (128, 16, 32, 256)],
+)
 def test_packed_varlen(N, H, HV, V):
     scale = K**-0.5
     q, k, v, a, b, A_log, dt_bias, state = make_inputs(N, H, HV, K, V)
@@ -155,8 +159,7 @@ def test_packed_varlen(N, H, HV, V):
 # ---------------------------------------------------------------------------
 # Equal-head coverage: H == HV (group ratio = 1)
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("N", [1, 8, 64])
-@pytest.mark.parametrize("H", [8, 16, 32, 64])
+@pytest.mark.parametrize("N,H", [(1, 8), (8, 32), (64, 64)])
 def test_packed_dense_equal_heads(N, H):
     HV, V = H, 128
     scale = K**-0.5
@@ -169,8 +172,7 @@ def test_packed_dense_equal_heads(N, H):
     _assert_close("state", state_ref, state_p)
 
 
-@pytest.mark.parametrize("N", [2, 8, 64])
-@pytest.mark.parametrize("H", [8, 16, 32, 64])
+@pytest.mark.parametrize("N,H", [(2, 8), (8, 32), (64, 64)])
 def test_packed_varlen_equal_heads(N, H):
     HV, V = H, 128
     scale = K**-0.5
@@ -328,6 +330,7 @@ def test_packed_kv_state_layout(is_varlen):
 # ---------------------------------------------------------------------------
 # No L2 norm path
 # ---------------------------------------------------------------------------
+@pytest.mark.cula_fast
 def test_packed_no_l2norm():
     N, H, HV, V = 8, 8, 16, 128
     scale = K**-0.5

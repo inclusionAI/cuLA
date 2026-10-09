@@ -34,6 +34,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from cula.ops.kda.decode.mtp_conv import NWARP, kda_conv_decode_mtp_verify
 
+pytestmark = pytest.mark.cula_slow
+
 W = 4  # KDA conv width (short_conv_kernel_size)
 
 
@@ -233,6 +235,7 @@ def test_conv_mtp_hv_eq_h_softplus(N, T, H, HV, variant):
 
 
 @pytest.mark.parametrize("variant", ["small_batch", "large_batch"])
+@pytest.mark.cula_fast
 def test_conv_mtp_softplus_large_input_is_finite(variant):
     N, T, H, HV, K, V = 1, 4, 8, 8, 128, 128
     scale = K**-0.5

@@ -57,7 +57,7 @@ from cula.ops.sm100.ptx import (
     tcgen05mma_ws_ss_tf32,
 )
 
-pytestmark = pytest.mark.sm100_only
+pytestmark = [pytest.mark.sm100_only, pytest.mark.cula_slow]
 
 M_DIM, N_DIM = 64, 64
 # TODO: support arbitrary K
@@ -526,6 +526,7 @@ class _WsSsTf32CollectorKernel:
 # =====================================================================
 
 
+@pytest.mark.cula_fast
 def test_ws_ss_tf32():
     print("\n=== Test 1: tcgen05mma_ws_ss_tf32 (weight-stationary, SMEM A × SMEM B, tf32) ===")
     torch.manual_seed(42)

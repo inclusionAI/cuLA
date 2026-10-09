@@ -40,6 +40,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from cula.lightning.la_decode_mtp import linear_attention_decode_mtp
 
+pytestmark = pytest.mark.cula_slow
+
 
 # ---------------------------------------------------------------------------
 # Pure PyTorch reference for multi-token Lightning Attention decode
@@ -402,6 +404,7 @@ def test_zero_decay():
     assert rmse / (max_ref + 1e-8) < 0.01, "zero decay: output mismatch"
 
 
+@pytest.mark.cula_fast
 def test_zero_state():
     """With zero initial state."""
     _skip_if_no_sm90_or_later()

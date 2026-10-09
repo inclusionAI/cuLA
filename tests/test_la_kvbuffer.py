@@ -31,6 +31,8 @@ from cula.lightning.la_state_update_kvbuffer import (
 )
 from cula.lightning.la_verify_kvbuffer import linear_attention_verify_kvbuffer
 
+pytestmark = pytest.mark.cula_slow
+
 
 # ---------------------------------------------------------------------------
 # Pure PyTorch reference for multi-token Lightning Attention decode
@@ -400,6 +402,7 @@ def test_verify_zero_state():
     assert rel < 1e-2, f"zero state: {rel:.6f}"
 
 
+@pytest.mark.cula_fast
 def test_end_to_end_equivalence_with_baseline():
     """KVBuffer (verify + state_update L=T) == baseline (cache_inter=T, disable=T)."""
     _skip_if_no_sm90_or_later()

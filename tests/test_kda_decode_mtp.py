@@ -43,6 +43,8 @@ from cula.ops.kda.decode.mtp_kvbuffer import (
     kda_flush_kvbuffer,
 )
 
+pytestmark = pytest.mark.cula_slow
+
 
 def torch_kda_mtp_ref(
     q, k, v, a, b, A_log, dt_bias, state, scale, use_l2norm=True, softplus_beta=1.0, softplus_threshold=20.0, lower_bound=None
@@ -379,6 +381,7 @@ def test_determinism(kernel):
         assert torch.equal(st_i, st_ref), f"{kernel} state non-deterministic at iter {i}"
 
 
+@pytest.mark.cula_fast
 def test_intermediate_disable_state_update():
     """disable_state_update leaves the pool untouched; snapshots still fire and match the oracle."""
     N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128

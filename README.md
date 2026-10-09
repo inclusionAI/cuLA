@@ -182,6 +182,15 @@ python benchmarks/bench_kda_bwd_wy_dqkg_sm90.py --mode both --heads 32
 ## Tests
 
 ```bash
+# Time-bounded default suite (representative CUDA shapes, about five minutes on GB200)
+python -m pytest -q
+
+# Extended CUDA parameter sweeps only
+python -m pytest -m cula_slow -q
+
+# Default tests plus every extended CUDA case
+python -m pytest -m cula_full -q
+
 # Tests for modular KDA forward against FLA Triton implementation
 python -m pytest tests/test_kda_sm100_chunk_vs_fla.py -v
 # Tests for modular KDA forward against naive KDA reference
@@ -195,7 +204,7 @@ python -m pytest tests/test_lightning_attn_prefill_dispatch.py tests/test_lightn
 # Tests for Lightning Attention decode
 python -m pytest tests/test_lightning_decode.py -v
 
-# test_kda_sm100_chunk_vs_naive.py and test_kda_sm100_chunk_vs_fla.py support a fast/slow split.
+# The two chunk-vs-reference files also retain their narrower KDA fast/slow split.
 # Fast (default) — representative correctness paths for default CI and local iteration
 python -m pytest tests/test_kda_sm100_chunk_vs_naive.py tests/test_kda_sm100_chunk_vs_fla.py -v
 # Slow — broader stress coverage for nightly or manual runs

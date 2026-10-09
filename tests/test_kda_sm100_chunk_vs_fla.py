@@ -35,6 +35,7 @@ _FAST_NR = [pytest.mark.kda_fast, pytest.mark.kda_fast_norecomp]
 _SLOW = [pytest.mark.kda_slow]
 
 # (B, T, H, HV, D, gln, mask_p, l2norm, gate, safe_gate, dtype), marks
+# FLA chunk KDA requires H == HV; dedicated decode/conv tests cover GVA.
 _FIXED_CONFIGS = [
     ((1, 63, 1, 1, 128, 1, 0, False, False, True, torch.bfloat16), _FAST_NR),  # small fixed (+ no_recomp)
     ((2, 500, 3, 3, 128, 1, 0, False, False, True, torch.bfloat16), _SLOW),
@@ -44,18 +45,14 @@ _FIXED_CONFIGS = [
     ((4, 1024, 4, 4, 128, 1, 0, True, False, True, torch.bfloat16), _FAST),  # l2norm medium
     ((2, 1500, 4, 4, 128, 10, 0, False, True, True, torch.bfloat16), _FAST_NR),  # gated (+ no_recomp)
     ((4, 2048, 8, 8, 128, 1, 0, False, True, True, torch.bfloat16), _SLOW),
-    # GVA cases: HV > H
-    ((2, 1024, 4, 8, 128, 1, 0, True, False, True, torch.bfloat16), _FAST),  # GVA medium
-    ((2, 1500, 2, 4, 128, 10, 0, False, True, True, torch.bfloat16), _SLOW),
-    ((2, 2048, 4, 8, 128, 1, 0, False, True, True, torch.bfloat16), _SLOW),
 ]
 
 # (H, HV, D, mask_p, cu_seqlens, dtype, safe_gate), marks
 _VARLEN_CONFIGS = [
-    ((4, 4, 128, 0.1, [0, 15], torch.bfloat16, True), _FAST),  # short varlen smoke
+    ((4, 4, 128, 0.1, [0, 15], torch.bfloat16, True), _SLOW),
     ((4, 4, 128, 0.9, [0, 256, 500, 1000], torch.bfloat16, True), _SLOW),
     ((4, 4, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True), _SLOW),
-    ((4, 4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16, True), _FAST),  # multi-batch varlen
+    ((4, 4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16, True), _SLOW),
     ((4, 4, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True), _SLOW),
     # ======Varlen test with simulated trace=======
     (
@@ -97,22 +94,6 @@ _VARLEN_CONFIGS = [
     (
         (
             32,
-            32,
-            128,
-            0,
-            [0, 494, 1004, 1561, 1908, 2240, 2849, 3116, 4096, 4986, 5626, 6090, 6718, 7244, 7870, 8192],
-            torch.bfloat16,
-            True,
-        ),
-        _SLOW,
-    ),
-    # ======GVA varlen cases: HV > H=======
-    ((2, 4, 128, 0.1, [0, 15], torch.bfloat16, True), _FAST),  # GVA varlen smoke
-    ((4, 8, 128, 0.5, [0, 256, 500, 1000], torch.bfloat16, True), _SLOW),
-    ((4, 8, 128, 0, [0, 100, 300, 1200, 3000, 4096], torch.bfloat16, True), _SLOW),
-    (
-        (
-            8,
             32,
             128,
             0,

@@ -12,6 +12,8 @@ from cula.ops.kda.decode.mtp_kvbuffer import (
     kda_flush_kvbuffer,
 )
 
+pytestmark = pytest.mark.cula_slow
+
 W = 4
 K = 128
 V = 128
@@ -209,6 +211,7 @@ def test_fused_without_conv_bias(gate):
         torch.testing.assert_close(actual, expected, atol=4e-3, rtol=6e-3)
 
 
+@pytest.mark.cula_fast
 def test_fused_tensor_core_single_qk_cta():
     result = _run_pair(2, 4, 8, 8, num_v_tiles=1, seed=64)
     _, out_base, out_fused, base_bufs, fused_bufs, conv_state, windows, rolled, windows_ref = result

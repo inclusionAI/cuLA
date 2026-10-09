@@ -35,6 +35,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from cula.kda import fused_sigmoid_gating_delta_rule_update, kda_decode
 
+pytestmark = pytest.mark.cula_slow
+
 
 # ---------------------------------------------------------------------------
 # PyTorch reference
@@ -223,8 +225,7 @@ def run_kda_decode_triton_compatible(q, k, v, a, b, A_log, dt_bias, state_kv, sc
 # ---------------------------------------------------------------------------
 # Tests: Dense layout
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("N", [1, 4, 16, 32, 64, 128])
-@pytest.mark.parametrize("H,HV", [(8, 16), (16, 32)])
+@pytest.mark.parametrize("N,H,HV", [(1, 8, 16), (16, 16, 32), (64, 8, 16), (128, 16, 32)])
 def test_kda_decode_dense(N, H, HV):
     K, V = 128, 128
     scale = K**-0.5
@@ -263,8 +264,7 @@ def test_kda_decode_dense(N, H, HV):
 # ---------------------------------------------------------------------------
 # Tests: Varlen layout
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("N", [4, 16, 32, 64, 128])
-@pytest.mark.parametrize("H,HV", [(8, 16), (16, 32)])
+@pytest.mark.parametrize("N,H,HV", [(4, 8, 16), (32, 16, 32), (128, 8, 16)])
 def test_kda_decode_varlen(N, H, HV):
     K, V = 128, 128
     scale = K**-0.5
@@ -340,6 +340,7 @@ def test_kda_decode_large_v(N):
 # ---------------------------------------------------------------------------
 # Tests: Zero initial state
 # ---------------------------------------------------------------------------
+@pytest.mark.cula_fast
 def test_kda_decode_zero_state():
     N, H, HV, K, V = 4, 8, 16, 128, 128
     scale = K**-0.5

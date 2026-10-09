@@ -20,6 +20,8 @@ from cula.ops.kda.sm100.intra_fused import (
 )
 from cula.ops.kda.sm100.recompute_wu import recompute_w_u_fwd
 
+pytestmark = pytest.mark.cula_slow
+
 
 def _requires_sm100():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
