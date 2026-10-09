@@ -213,6 +213,11 @@ Pass `use_intracard_cp` to the Hopper prefill:
 
 Works with **any sequence length** (non-CHUNK-aligned is handled internally) and **dense or varlen** input. The auto decision uses the device SM count plus two tunables in `cula/ops/kda/sm90/cp/plan.py` (`CULA_KDA_CP_RERUN_RATIO`, `CULA_KDA_CP_AUTO_MIN_SEG_TILES`).
 
+The SM90 CP pre-scan keeps its segment transition matrix canonically in FP32
+registers and maintains a BF16 mirror only for Tensor Core products. This
+prevents transition error from compounding when many slow-decay segments are
+composed.
+
 ```python
 o, final_state = flashkda_prefill(
     q=q, k=k, v=v, g=g, beta=beta, A_log=A_log, dt_bias=dt_bias,

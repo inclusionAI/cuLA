@@ -67,6 +67,11 @@ def _rel_rmse(a, b):
     return (a - b).pow(2).mean().sqrt().item() / max(b.pow(2).mean().sqrt().item(), 1e-6)
 
 
+def _rel_l2(a, b):
+    a, b = a.float(), b.float()
+    return ((a - b).norm() / b.norm().clamp_min(1e-30)).item()
+
+
 def _assert_cp_matches(actual, ref, name):
     rrmse = _rel_rmse(actual, ref)
     assert rrmse < TOL_RMSE, f"{name}: rel_rmse {rrmse:.2e} >= {TOL_RMSE}"
@@ -166,6 +171,121 @@ def test_trivial_manual_plan_falls_back_to_serial():
     out_fb, fin_fb = _run_cp(q, k, v, g, beta, A_log, dt_bias, None, True, s_split=1)
     assert torch.equal(out_fb, out_ref)
     assert torch.equal(fin_fb, fin_ref)
+
+
+@needs_cuda
+@pytest.mark.kda_slow
+def test_slow_decay_64k_cp_relative_l2_matches_fla_scale():
+    """Regression for #126 using the issue's public synthetic reproducer."""
+    torch.manual_seed(0)
+    h = 1
+    shape = (1, 65536, h, D)
+    q = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    g = torch.full(shape, -10.0, dtype=torch.bfloat16, device="cuda")
+    beta = torch.zeros(shape[:-1], dtype=torch.bfloat16, device="cuda")
+    A_log = torch.zeros(h, dtype=torch.float32, device="cuda")
+    dt_bias = torch.zeros(h, D, dtype=torch.float32, device="cuda")
+
+    def run(*, split):
+        out = torch.empty_like(v)
+        state = torch.empty(1, h, D, D, dtype=torch.float32, device="cuda")
+        if split == 1:
+            flash_kda_fwd(q, k, v, g, beta, SCALE, out, A_log, dt_bias, LB, final_state=state)
+        else:
+            intracard_prefill(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                SCALE,
+                out,
+                A_log,
+                dt_bias,
+                LB,
+                final_state=state,
+                s_split=split,
+                allow_fallback=False,
+            )
+        return out, state
+
+    out_serial, state_serial = run(split=1)
+    for split in (2, 4, 8, 16):
+        out_cp, state_cp = run(split=split)
+
+        if split == 2:
+            # There is only one carry handoff, so the CP path is exactly the
+            # same BF16 recurrence as serial FlashKDA.
+            assert torch.equal(out_cp, out_serial)
+            assert torch.equal(state_cp, state_serial)
+        else:
+            # This public reproducer has an almost-zero segment transition;
+            # it mostly measures the different BF16 state-rounding points.
+            # Keep the divergence bounded while the transition-sensitive
+            # regression below directly covers the #126 amplification.
+            assert _rel_l2(out_cp, out_serial) < 8e-3, f"output split={split}"
+            assert _rel_l2(state_cp, state_serial) < 8e-3, f"state split={split}"
+
+
+@needs_cuda
+@pytest.mark.kda_slow
+def test_slow_decay_16k_cp_transition_matches_fp64():
+    """The CP-only affine transition must not accumulate in BF16 (#126)."""
+    from fla.ops.kda import fused_recurrent_kda
+
+    torch.manual_seed(123)
+    h = 1
+    shape = (1, 16384, h, D)
+    q = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    g = torch.full(shape, -10.0, dtype=torch.bfloat16, device="cuda")
+    beta = torch.full(shape[:-1], -10.0, dtype=torch.bfloat16, device="cuda")
+    A_log = torch.zeros(h, dtype=torch.float32, device="cuda")
+    dt_bias = torch.zeros(h, D, dtype=torch.float32, device="cuda")
+    h0 = torch.randn(1, h, D, D, dtype=torch.float32, device="cuda") * 0.1
+
+    out = torch.empty_like(v)
+    state = torch.empty_like(h0)
+    intracard_prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        SCALE,
+        out,
+        A_log,
+        dt_bias,
+        LB,
+        initial_state=h0,
+        final_state=state,
+        s_split=16,
+        allow_fallback=False,
+    )
+
+    g64 = LB * torch.sigmoid(torch.exp(A_log.double()).view(1, 1, h, 1) * (g.double() + dt_bias.double().view(1, 1, h, D)))
+    beta64 = torch.sigmoid(beta.double())
+    ref_out, ref_state = fused_recurrent_kda(
+        q.double(),
+        k.double(),
+        v.double(),
+        g64,
+        beta64,
+        scale=SCALE,
+        initial_state=h0.double(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=False,
+        transpose_state_layout=True,
+    )
+
+    # BF16 sM gives about 1.45e-1 / 5.60e-1 on this case.  Keeping the
+    # canonical transition in FP32 reduces that to about 5.5e-2 / 1.4e-2.
+    assert _rel_l2(out, ref_out) < 8e-2
+    assert _rel_l2(state, ref_state) < 3e-2
 
 
 @needs_cuda
