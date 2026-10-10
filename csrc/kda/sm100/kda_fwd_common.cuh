@@ -18,14 +18,32 @@
 
 namespace kda::sm100 {
 
+// Presents a compact per-row scalar gate as the float4-addressable 2-D view
+// used by the existing gated Q/K helpers. Each row stores four identical
+// values; all logical K columns intentionally alias that four-float record.
+struct ScalarGateView {
+    float* ptr;
+
+    __device__ __forceinline__ float&
+    operator()(int row, int) const {
+        return ptr[row * 4];
+    }
+};
+
 // KDA forward kernels
 
 // KDA forward intra-chunk kernel
 void
 run_kda_fwd_intra_sm100(KDA_fwd_intra_params& params, cudaStream_t stream);
 
+void
+run_kda_fwd_intra_sm100_qwen_scalar_g(KDA_fwd_intra_params& params, cudaStream_t stream);
+
 // KDA forward recompute W & U kernel
 void
 run_kda_fwd_recomp_w_u_sm100(KDA_fwd_recomp_w_u_params& params, cudaStream_t stream);
+
+void
+run_kda_fwd_recomp_w_u_sm100_qwen_scalar_g(KDA_fwd_recomp_w_u_params& params, cudaStream_t stream);
 
 }  // namespace kda::sm100

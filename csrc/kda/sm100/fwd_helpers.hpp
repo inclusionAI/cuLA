@@ -16,7 +16,10 @@
 
 #include <cute/tensor.hpp>
 
+#include <type_traits>
+
 #include "kerutils/kerutils.cuh"
+#include "kda/sm100/kda_fwd_common.cuh"
 
 namespace kda::sm100 {
 
@@ -25,6 +28,21 @@ using ku::float2_sub;
 using ku::nvbf16x4;
 using ku::store_128b;
 using namespace cute;
+
+template <typename GTensor>
+CUTE_DEVICE void
+gate_exp2_float4(float2& s1, float2& s2) {
+    if constexpr (std::is_same_v<std::remove_cvref_t<GTensor>, ScalarGateView>) {
+        const float scale = exp2f(s1.x);
+        s1 = make_float2(scale, scale);
+        s2 = make_float2(scale, scale);
+    } else {
+        s1.x = exp2f(s1.x);
+        s1.y = exp2f(s1.y);
+        s2.x = exp2f(s2.x);
+        s2.y = exp2f(s2.y);
+    }
+}
 
 // ============================================================
 // Forward Prologue: B-matrix (SMEM) helper functions
@@ -104,10 +122,7 @@ fwd_setup_kg_col0_4out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_0_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_0_local)[1], g_b);
-                s1.x = exp2f(s1.x);
-                s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x);
-                s2.y = exp2f(s2.y);
+                gate_exp2_float4<G_TENSOR>(s1, s2);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -117,10 +132,7 @@ fwd_setup_kg_col0_4out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_1_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_1_local)[1], g_b);
-                s1.x = exp2f(s1.x);
-                s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x);
-                s2.y = exp2f(s2.y);
+                gate_exp2_float4<G_TENSOR>(s1, s2);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -130,10 +142,7 @@ fwd_setup_kg_col0_4out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[1], g_b);
-                s1.x = exp2f(s1.x);
-                s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x);
-                s2.y = exp2f(s2.y);
+                gate_exp2_float4<G_TENSOR>(s1, s2);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -143,10 +152,7 @@ fwd_setup_kg_col0_4out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[1], g_b);
-                s1.x = exp2f(s1.x);
-                s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x);
-                s2.y = exp2f(s2.y);
+                gate_exp2_float4<G_TENSOR>(s1, s2);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -193,10 +199,7 @@ fwd_setup_kg_col1_3out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_1_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_1_local)[1], g_b);
-                s1.x = exp2f(s1.x);
-                s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x);
-                s2.y = exp2f(s2.y);
+                gate_exp2_float4<G_TENSOR>(s1, s2);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -206,10 +209,7 @@ fwd_setup_kg_col1_3out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[1], g_b);
-                s1.x = exp2f(s1.x);
-                s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x);
-                s2.y = exp2f(s2.y);
+                gate_exp2_float4<G_TENSOR>(s1, s2);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -219,10 +219,7 @@ fwd_setup_kg_col1_3out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[1], g_b);
-                s1.x = exp2f(s1.x);
-                s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x);
-                s2.y = exp2f(s2.y);
+                gate_exp2_float4<G_TENSOR>(s1, s2);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -266,10 +263,7 @@ fwd_setup_kg_col2_2out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_2_local)[1], g_b);
-                s1.x = exp2f(s1.x);
-                s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x);
-                s2.y = exp2f(s2.y);
+                gate_exp2_float4<G_TENSOR>(s1, s2);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -279,10 +273,7 @@ fwd_setup_kg_col2_2out(
             {
                 float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[0], g_a);
                 float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[1], g_b);
-                s1.x = exp2f(s1.x);
-                s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x);
-                s2.y = exp2f(s2.y);
+                gate_exp2_float4<G_TENSOR>(s1, s2);
                 float4 res;
                 reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, kf_a);
                 reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, kf_b);
@@ -317,10 +308,7 @@ fwd_setup_kg_col3_1out(G_TENSOR& sG, K_TENSOR& sK, KG_TENSOR& sKG_intra, int idx
             // intra(3,3): exp2(g_first_3 - g[x]) * K[x]
             float2 s1 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[0], reinterpret_cast<float2*>(&g)[0]);
             float2 s2 = float2_sub(reinterpret_cast<float2*>(&g_first_3_local)[1], reinterpret_cast<float2*>(&g)[1]);
-            s1.x = exp2f(s1.x);
-            s1.y = exp2f(s1.y);
-            s2.x = exp2f(s2.x);
-            s2.y = exp2f(s2.y);
+            gate_exp2_float4<G_TENSOR>(s1, s2);
             float4 res;
             reinterpret_cast<float2*>(&res)[0] = float2_mul(s1, __bfloat1622float2(k.a));
             reinterpret_cast<float2*>(&res)[1] = float2_mul(s2, __bfloat1622float2(k.b));
@@ -365,10 +353,7 @@ fwd_setup_A_inter_intra_all(
                 float4 g_ref = *reinterpret_cast<float4*>(&sG(g_first_row, y));
                 float2 s1 = float2_sub(g_a, reinterpret_cast<float2*>(&g_ref)[0]);
                 float2 s2 = float2_sub(g_b, reinterpret_cast<float2*>(&g_ref)[1]);
-                s1.x = exp2f(s1.x);
-                s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x);
-                s2.y = exp2f(s2.y);
+                gate_exp2_float4<G_TENSOR>(s1, s2);
                 reinterpret_cast<float2*>(&res_inter[i * 4])[0] = float2_mul(s1, va);
                 reinterpret_cast<float2*>(&res_inter[i * 4])[1] = float2_mul(s2, vb);
             }
@@ -377,10 +362,7 @@ fwd_setup_A_inter_intra_all(
                 float4 g_ref = *reinterpret_cast<float4*>(&sG(g_half_row, y));
                 float2 s1 = float2_sub(g_a, reinterpret_cast<float2*>(&g_ref)[0]);
                 float2 s2 = float2_sub(g_b, reinterpret_cast<float2*>(&g_ref)[1]);
-                s1.x = exp2f(s1.x);
-                s1.y = exp2f(s1.y);
-                s2.x = exp2f(s2.x);
-                s2.y = exp2f(s2.y);
+                gate_exp2_float4<G_TENSOR>(s1, s2);
                 reinterpret_cast<float2*>(&res_intra[i * 4])[0] = float2_mul(s1, va);
                 reinterpret_cast<float2*>(&res_intra[i * 4])[1] = float2_mul(s2, vb);
             }
@@ -417,10 +399,7 @@ fwd_setup_A_inter_all(
             float4 g_ref = *reinterpret_cast<float4*>(&sG(g_first_row, y));
             float2 s1 = float2_sub(reinterpret_cast<float2*>(&g)[0], reinterpret_cast<float2*>(&g_ref)[0]);
             float2 s2 = float2_sub(reinterpret_cast<float2*>(&g)[1], reinterpret_cast<float2*>(&g_ref)[1]);
-            s1.x = exp2f(s1.x);
-            s1.y = exp2f(s1.y);
-            s2.x = exp2f(s2.x);
-            s2.y = exp2f(s2.y);
+            gate_exp2_float4<G_TENSOR>(s1, s2);
             reinterpret_cast<float2*>(&res_inter[i * 4])[0] = float2_mul(s1, va);
             reinterpret_cast<float2*>(&res_inter[i * 4])[1] = float2_mul(s2, vb);
         }

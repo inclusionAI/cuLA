@@ -184,7 +184,6 @@ struct CollectiveStoreTma {
     CUTE_DEVICE auto
     partition_SD(ProblemSize const& problem_size, TileShape const& tile_shape, WorkDesc const& work_desc) {
         constexpr auto BlkSeqQ = decltype(get<0>(tile_shape))::value;
-        constexpr auto HeadSize = decltype(get<2>(tile_shape))::value;
 
         Tensor g = [&] {
             DPRINTF0_W(
@@ -198,10 +197,10 @@ struct CollectiveStoreTma {
                 problem_size.num_v_heads));                                 // O lives in the V/O head space under GVA
             Tensor m_varlen = m_varlen_head(_, _, work_desc.o_head_idx());  // slice into current head_idx
             Tensor m_offset = domain_offset(
-                make_coord(_0{}, work_desc.tok_offset),
+                make_coord(work_desc.value_tile_idx * int(SizeM{}), work_desc.tok_offset),
                 m_varlen);  // offset to start of the current sequence
             Tensor g_full =
-                local_tile(m_offset, make_tile(HeadSize, BlkSeqQ), make_coord(_0{}, _));  // (d, blk, iter_blk)
+                local_tile(m_offset, make_tile(SizeM{}, BlkSeqQ), make_coord(_0{}, _));  // (d, blk, iter_blk)
             return g_full;
         }();
         Tensor s = make_tensor(make_smem_ptr(storage_.data()), SmemLayoutO{});

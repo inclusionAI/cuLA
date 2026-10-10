@@ -151,8 +151,8 @@ nvcc_common_args = [
 include_dirs = [
     Path(this_dir) / "csrc",
     Path(this_dir) / "csrc" / "kerutils" / "include",
-    Path(this_dir) / "csrc" / "cutlass" / "include",
-    Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
+            Path(this_dir) / "csrc" / "cutlass" / "include",
+            Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
 ]
 
 major, minor = get_nvcc_version()
@@ -160,6 +160,14 @@ print(f"Compiling using NVCC {major}.{minor}")
 assert_blackwell_build_env()
 
 ext_modules = []
+qwen35_sources = [
+    "csrc/qwen35/decode/qwen35_conv1d_decode.cu",
+    "csrc/qwen35/decode/qwen35_layout_decode.cu",
+    "csrc/qwen35/decode/qwen35_scalar_kda_decode.cu",
+    "csrc/qwen35/prefill/qwen35_layout_prefill.cu",
+    "csrc/qwen35/prefill/qwen35_scalar_kda_prefill.cu",
+    "csrc/qwen35/prefill/sm90/qwen35_chunk_prefill_sm90.cu",
+]
 
 if not DISABLE_SM100 or not DISABLE_SM103:
     sm100_arch_flags = []
@@ -175,7 +183,8 @@ if not DISABLE_SM100 or not DISABLE_SM103:
                 "csrc/api/kda_sm100.cu",
                 "csrc/api/pybind_sm100.cu",
                 "csrc/kda/sm100/kda_fwd_sm100.cu",
-            ],
+            ]
+            + qwen35_sources,
             extra_compile_args={
                 "cxx": cxx_args + get_features_args(),
                 "nvcc": nvcc_common_args
@@ -199,7 +208,8 @@ if not DISABLE_SM90:
                 "csrc/api/pybind_sm90.cu",
                 "csrc/kda/sm90/kda_fwd_sm90.cu",
                 "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu",
-            ],
+            ]
+            + qwen35_sources,
             extra_compile_args={
                 "cxx": cxx_args + get_features_args(),
                 "nvcc": nvcc_common_args
