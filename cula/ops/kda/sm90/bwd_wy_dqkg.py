@@ -2864,15 +2864,17 @@ class ChunkKdaBwdWyDqkgFusedSM90:
                             )
                         warpgroup.commit_group()
 
-                        if v_iter > 0:
-                            warpgroup.wait_group(1)
+                        # This release returns the current stage to DMA. Wait for
+                        # its WGMMA reads, not only the preceding group, before
+                        # allowing the producer to overwrite the shared buffer.
+                        warpgroup.wait_group(0)
 
                         pipeline_load_tv.consumer_release(load_tv_cs)
                         # h NOT released here — reused by dw loop below
                         load_tv_cs.advance()
                         load_h_wait_cs.advance()
 
-                    # Wait for g/k TMA before WGMMA completes — ldmatrix overlaps with WGMMA.
+                    # Wait for g/k TMA before loading the gating operands.
                     # q is only needed for dg_part1 and is loaded in a separate pass
                     # after dq is gated.
                     pipeline_load_g.consumer_wait(load_g_cs)
@@ -3017,8 +3019,10 @@ class ChunkKdaBwdWyDqkgFusedSM90:
                             )
                         warpgroup.commit_group()
 
-                        if v_iter > 0:
-                            warpgroup.wait_group(1)
+                        # This release returns the current stage to DMA. Wait for
+                        # its WGMMA reads, not only the preceding group, before
+                        # allowing the producer to overwrite the shared buffer.
+                        warpgroup.wait_group(0)
 
                         pipeline_load_dv.consumer_release(load_dv_cs)
                         pipeline_load_h.consumer_release(load_h_release_cs)
@@ -3089,8 +3093,10 @@ class ChunkKdaBwdWyDqkgFusedSM90:
                             )
                         warpgroup.commit_group()
 
-                        if v_iter > 0:
-                            warpgroup.wait_group(1)
+                        # This release returns the current stage to DMA. Wait for
+                        # its WGMMA reads, not only the preceding group, before
+                        # allowing the producer to overwrite the shared buffer.
+                        warpgroup.wait_group(0)
 
                         pipeline_load_tv.consumer_release(load_tv_cs)
                         pipeline_load_dh.consumer_release(load_dh_cs)
