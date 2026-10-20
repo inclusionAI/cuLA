@@ -90,10 +90,12 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     static constexpr bool kIsPersistent = find_option_t<Tag::kIsPersistent, false_type, Options>::value;
 
     static constexpr bool kInitStateFromInput = find_option_t<Tag::kInitStateFromInput, false_type, Options>::value;
+    static constexpr bool SplitValueDim = find_option_t<Tag::kSplitValueDim, cute::false_type, Options>::value;
 
     static constexpr int NumLoadWarpGroups = 1;
-    static constexpr int NumStateMmaWarpGroups = 2;
+    static constexpr int NumStateMmaWarpGroups = SplitValueDim ? 1 : 2;
     static constexpr int NumAuxMmaWarpGroups = 1;
+    static constexpr int NumValueTiles = SplitValueDim ? 2 : 1;
 
     static constexpr int StageCountQ = find_option_t<Tag::kStagesQ, Int<2>, Options>::value;
     static constexpr int StageCountK = find_option_t<Tag::kStagesK, Int<2>, Options>::value;
@@ -101,6 +103,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
     static constexpr int NeedsAlpha = find_option_t<Tag::kNeedsAlpha, cute::true_type, Options>::value;
     static constexpr int NeedsBeta = find_option_t<Tag::kNeedsBeta, cute::true_type, Options>::value;
+    static constexpr bool ScalarAlpha = find_option_t<Tag::kScalarAlpha, cute::false_type, Options>::value;
+    static constexpr bool StateKVLayout = find_option_t<Tag::kStateKVLayout, cute::false_type, Options>::value;
     static_assert(NeedsAlpha && NeedsBeta, "Alpha and Beta are both used in KDA.");
 
     static constexpr int SafeGate = true;  // only support safe_gate=true
@@ -136,7 +140,11 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     static constexpr auto BlkSeqKV = get<1>(TileShape{});  // Blk_K/V
     static constexpr auto HeadSize = get<2>(TileShape{});  // D (Dq, Dk, Dv all equal)
     static constexpr auto HeadSizeQK = HeadSize;
-    static constexpr auto HeadSizeV = HeadSize;
+    using HeadSizeVType = std::conditional_t<
+        SplitValueDim,
+        _64,
+        std::remove_cv_t<decltype(HeadSize)>>;
+    static constexpr auto HeadSizeV = HeadSizeVType{};
     using HeadSizeHalf = _64;
     using HeadSizeQuar = _32;
 
@@ -150,6 +158,11 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
     using TileShapeO2 = decltype(make_shape(HeadSizeV, BlkSeqQ, BlkSeqKV));
     using TileShapeO1 = decltype(make_shape(HeadSizeV, BlkSeqQ, HeadSizeQK));
+
+    using StateMmaSchedule = std::conditional_t<
+        NumStateMmaWarpGroups == 1,
+        cutlass::gemm::KernelTmaWarpSpecialized,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperative>;
 
     static_assert(BlkSeqQ % 64 == 0);
     static_assert(BlkSeqQ == 64 || BlkSeqQ == 128);
@@ -200,24 +213,37 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         TileShapeKV,
         ClusterShape,
         DummyStages,
-        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+        StateMmaSchedule>::CollectiveOp;
 
     using SmemLayoutAlphaAtom = GMMA::Layout_K_SW128_Atom<ElementAlpha>;
-    using SmemLayoutAlpha_SD = decltype(tile_to_shape(
+    using SmemLayoutAlphaVector_SD = decltype(tile_to_shape(
         SmemLayoutAlphaAtom{},
         make_shape(
             shape<1>(TileShapeQK{}),
             shape<2>(TileShapeQK{}),
             Int<StagesAlpha::value>{})));                     // (blk_kv, head_size), (64, 128)
-    using GmemShapeAlpha = Shape<int64_t, int32_t, int32_t>;  // (seqlen_k, d, h)
+    // TMA requires its first global mode to be contiguous. A single scalar
+    // head is strided by HV across tokens, so scalar mode loads four adjacent
+    // heads as one 16-byte unit and each CTA selects its hv % 4 lane.
+    using AlphaWidth = std::conditional_t<ScalarAlpha, _4, decltype(shape<2>(TileShapeQK{}))>;
+    using SmemLayoutAlphaScalar_SD = decltype(make_layout(
+        make_shape(shape<1>(TileShapeQK{}), _4{}, Int<StagesAlpha::value>{}),
+        make_stride(_4{}, _1{}, Int<4 * size<1>(TileShapeQK{})>{})));
+    using SmemLayoutAlphaLoad_SD =
+        std::conditional_t<ScalarAlpha, SmemLayoutAlphaScalar_SD, SmemLayoutAlphaVector_SD>;
+    // Vector-alpha compute layouts stay intact for the generic path. Scalar
+    // specializations bypass them and fill MMA fragments from the compact
+    // [token, stage] tensor using token coordinates.
+    using SmemLayoutAlpha_SD = SmemLayoutAlphaVector_SD;
+    using GmemShapeAlpha = Shape<int64_t, AlphaWidth, int32_t>;  // (seqlen_k, d-or-1, h)
     using GmemStrideAlpha = Stride<int64_t, _1, int32_t>;
     using GmemLayoutAlpha = Layout<GmemShapeAlpha, GmemStrideAlpha>;
     using GmemTiledCopyAlpha = cute::SM90_TMA_LOAD;
     using TMA_Alpha = decltype(make_tma_copy(
         GmemTiledCopyAlpha{},
         make_tensor(make_gmem_ptr(static_cast<float const*>(nullptr)), GmemLayoutAlpha{}),
-        take<0, 2>(SmemLayoutAlpha_SD{}),
-        select<1, 2>(TileShapeQK{}),
+        take<0, 2>(SmemLayoutAlphaLoad_SD{}),
+        make_shape(shape<1>(TileShapeQK{}), AlphaWidth{}),
         size<0>(ClusterShape{})));
 
     // raw layout for copy
@@ -247,7 +273,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         TileShapeKV,
         ClusterShape,
         DummyStages,
-        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+        StateMmaSchedule>::CollectiveOp;
 
     using RefLayoutKV = decltype(make_layout(select<0, 1>(TileShapeKV{}), LayoutRight{}));  // (dv, dk)
     using CollectiveMmaO1 = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -263,7 +289,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         TileShapeO1,
         ClusterShape,
         DummyStages,
-        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+        StateMmaSchedule>::CollectiveOp;
 
     // (blk_q,blk_k) to align with O2 mma, LayoutRight to align with QK mma output
     using DesiredLayoutQK = decltype(make_layout(select<0, 1>(TileShapeQK{}), LayoutRight{}));
@@ -280,7 +306,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         TileShapeO2,
         ClusterShape,
         DummyStages,
-        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+        StateMmaSchedule>::CollectiveOp;
 
     using TiledMmaQK = typename CollectiveMmaQK::TiledMma;  // Q@K^t
     using TiledMmaKV = decltype(convert_to_gmma_rs(typename CollectiveMmaKV::TiledMma{}));
@@ -346,7 +372,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         TileShapeSK,
         ClusterShape,
         DummyStages,
-        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+        StateMmaSchedule>::CollectiveOp;
 
     using ElementAccumulatorNewV = float;
     using TileShapeNewV = decltype(make_shape(HeadSizeV, BlkSeqKV, BlkSeqKV));
@@ -365,7 +391,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         TileShapeNewV,
         ClusterShape,
         DummyStages,
-        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+        StateMmaSchedule>::CollectiveOp;
 
     // FIXME: K@K^t are not exactly the same as Q@K^t, but similar enough (what does this mean??)
     using TiledMmaKK = typename CollectiveMmaQK::TiledMma;  // T = inv(I + strict_lower_triangular(K@K^t))
@@ -379,6 +405,9 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
     // only store the last row in Alpha
     using SmemLayoutAlphaLast = decltype(make_layout(make_shape(HeadSize, Int<StagesAlpha::value>{})));
+    using SmemLayoutAlphaLastScalar = decltype(make_layout(make_shape(_1{}, Int<StagesAlpha::value>{})));
+    using SmemLayoutAlphaLastStorage =
+        std::conditional_t<ScalarAlpha, SmemLayoutAlphaLastScalar, SmemLayoutAlphaLast>;
     using SmemLayoutBeta = decltype(make_layout(make_shape(BlkSeqQ, Int<StagesBeta::value>{})));
 
     using MainloopQPipeline = cutlass::PipelineTmaAsync<StagesQ::value>;
@@ -416,7 +445,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     static constexpr int LoadQBytes = size(QKSmemLayoutQ{}(_, _, _0{})) * sizeof(Element);
     static constexpr int LoadKBytes = size(KVSmemLayoutK{}(_, _, _0{})) * sizeof(Element);
     static constexpr int LoadVBytes = size(KVSmemLayoutV{}(_, _, _0{})) * sizeof(Element);
-    static constexpr int LoadAlphaBytes = size(QKQSmemLayoutAlpha{}(_, _, _0{})) * sizeof(ElementAlpha);
+    static constexpr int LoadAlphaBytes = size(SmemLayoutAlphaLoad_SD{}(_, _, _0{})) * sizeof(ElementAlpha);
     static constexpr int StoreOBytes = CollectiveStoreO::TmaTransactionBytes;
 
     using SharedStorageO = typename CollectiveStoreO::SharedStorage;
@@ -429,7 +458,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         alignas(
             alignment_for_swizzle(KVSmemLayoutV{})) cute::array_aligned<Element, cute::cosize_v<KVSmemLayoutV>> smem_v;
         alignas(alignment_for_swizzle(
-            QKQSmemLayoutAlpha{})) cute::array_aligned<ElementAlpha, cute::cosize_v<QKQSmemLayoutAlpha>> smem_alpha;
+            SmemLayoutAlphaLoad_SD{})) cute::array_aligned<ElementAlpha, cute::cosize_v<SmemLayoutAlphaLoad_SD>> smem_alpha;
         alignas(
             alignment_for_swizzle(SmemLayoutQK{})) cute::array_aligned<Element, cute::cosize_v<SmemLayoutQK>> smem_qk;
         alignas(alignment_for_swizzle(
@@ -442,7 +471,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
         cute::array_aligned<ElementBeta, cute::cosize_v<SmemLayoutBeta>> smem_beta;
         // store last row in Alpha separately, used for S'=K^T NewV's epilogue and S+=decay(S') (one fused epilogue)
-        cute::array_aligned<ElementAlpha, cute::cosize_v<SmemLayoutAlphaLast>> smem_alpha_last;
+        cute::array_aligned<ElementAlpha, cute::cosize_v<SmemLayoutAlphaLastStorage>> smem_alpha_last;
     };
 
     using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;
@@ -454,7 +483,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
     using LoadK = CollectiveLoadTma<LoadKind::kK, MainloopKPipeline, Element, KVSmemLayoutK, TMA_K>;
     using LoadV = CollectiveLoadTma<LoadKind::kV, MainloopVPipeline, Element, KVSmemLayoutV, TMA_V>;
     using LoadAlpha =
-        CollectiveLoadTma<LoadKind::kAlpha, MainloopAlphaPipeline, ElementAlpha, QKQSmemLayoutAlpha, TMA_Alpha>;
+        CollectiveLoadTma<LoadKind::kAlpha, MainloopAlphaPipeline, ElementAlpha, SmemLayoutAlphaLoad_SD, TMA_Alpha>;
 
     using LoadBeta = CollectiveLoadVector<
         LoadKindVector::kBeta,
@@ -493,6 +522,34 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         GmemLayoutBeta beta_layout;
     };
 
+    template <class Ptr, class ProblemShape, class NumSeqs>
+    CUTE_DEVICE static auto
+    make_state_tensor(Ptr ptr, ProblemShape const& problem_size, NumSeqs num_seqs) {
+        // The global state always remains a full [K=128,V=128] matrix. Split
+        // V64 CTAs select disjoint column tiles after constructing this view.
+        auto state_shape = make_shape(
+            Int<HeadSizeQK>{}, problem_size.head_size, problem_size.num_v_heads, num_seqs);
+        if constexpr (StateKVLayout) {
+            // Qwen exposes state as contiguous [N, HV, K, V].  Express that
+            // physical layout in the kernel's logical (K,V,HV,N) coordinates
+            // instead of paying for pre/post transpose kernels.
+            auto state_stride = make_stride(
+                int64_t(problem_size.head_size),
+                _1{},
+                int64_t(HeadSizeQK) * problem_size.head_size,
+                int64_t(problem_size.num_v_heads) * int(HeadSizeQK) * problem_size.head_size);
+            return make_tensor(make_gmem_ptr(ptr), make_layout(state_shape, state_stride));
+        } else {
+            return make_tensor(make_gmem_ptr(ptr), make_layout(state_shape, LayoutLeft{}));
+        }
+    }
+
+    template <class Ptr, class ProblemShape>
+    CUTE_DEVICE static auto
+    make_state_tensor(Ptr ptr, ProblemShape const& problem_size) {
+        return make_state_tensor(ptr, problem_size, problem_size.num_seqs);
+    }
+
     template <class ProblemShape>
     static bool
     can_implement(ProblemShape const& problem_size, Arguments const& args) {
@@ -525,7 +582,9 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             },
             /*workspace=*/nullptr);
 
-        auto alpha_shape = make_shape(s, d, problem_size.num_v_heads);
+        const int32_t alpha_head_groups =
+            ScalarAlpha ? problem_size.num_v_heads / int(AlphaWidth{}) : problem_size.num_v_heads;
+        auto alpha_shape = make_shape(s, AlphaWidth{}, alpha_head_groups);
         auto alpha_stride = make_stride(
             get<0>(args.dAlpha),  // seqlen stride
             get<1>(args.dAlpha),  // head_dim stride
@@ -535,8 +594,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         TMA_Alpha tma_load_alpha = make_tma_copy(
             GmemTiledCopyAlpha{},
             mAlpha,
-            take<0, 2>(SmemLayoutAlpha_SD{}),
-            select<1, 2>(TileShapeQK{}),
+            take<0, 2>(SmemLayoutAlphaLoad_SD{}),
+            make_shape(shape<1>(TileShapeQK{}), AlphaWidth{}),
             size<0>(ClusterShape{}));
 
         auto params_kv_v = CollectiveMmaKV_G2S::to_underlying_arguments(
@@ -617,10 +676,11 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         auto k_collective_load = LoadK(params.tma_load_k, k_pipeline, storage.smem_k);
         auto v_collective_load = LoadV(params.tma_load_v, v_pipeline, storage.smem_v);
         auto alpha_collective_load = LoadAlpha{params.tma_load_alpha, alpha_pipeline, storage.smem_alpha};
+        auto v_load_tile_shape = make_shape(BlkSeqQ, BlkSeqKV, HeadSizeV);
 
         auto q_src_dst = q_collective_load.partition_SD(problem_size, load_tile_shape, work_desc);
         auto k_src_dst = k_collective_load.partition_SD(problem_size, load_tile_shape, work_desc);
-        auto v_src_dst = v_collective_load.partition_SD(problem_size, load_tile_shape, work_desc);
+        auto v_src_dst = v_collective_load.partition_SD(problem_size, v_load_tile_shape, work_desc);
         auto alpha_src_dst = alpha_collective_load.partition_SD(problem_size, load_tile_shape, work_desc);
 
         CUTE_NO_UNROLL
@@ -673,7 +733,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         int thread_idx = threadIdx.x % cutlass::NumThreadsPerWarp;
 
         Tensor sAqkq = make_tensor(make_smem_ptr(storage.smem_alpha.data()), QKQSmemLayoutAlpha{});
-        Tensor sAlast = make_tensor(make_smem_ptr(storage.smem_alpha_last.data()), SmemLayoutAlphaLast{});
+        Tensor sAlphaLoad = make_tensor(make_smem_ptr(storage.smem_alpha.data()), SmemLayoutAlphaLoad_SD{});
+        Tensor sAlast = make_tensor(make_smem_ptr(storage.smem_alpha_last.data()), SmemLayoutAlphaLastStorage{});
 
         auto extract_loop_body = [&](int blk, auto is_final_block_) INLINE_LAMBDA {
             constexpr bool is_final_block = decltype(is_final_block_)::value;
@@ -681,15 +742,22 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             int B = is_final_block ? valid_seq_len(work_desc, blk) : BlkSeqKV;
 
             auto sAqkq_curr = sAqkq(_, _, alpha_smem_pipe_read.index());
+            auto sAlphaLoadCurr = sAlphaLoad(_, _, alpha_smem_pipe_read.index());
             Tensor sAlast_out = sAlast(_, alpha_last_smem_pipe_write.index());
 
             alpha_pipeline.consumer_wait(alpha_smem_pipe_read);
             alpha_last_pipeline.producer_acquire(alpha_last_smem_pipe_write);
 
             // each thread copy 4 elements, total 128 elements with one warp
-            CUTE_UNROLL
-            for (int t = thread_idx; t < HeadSize; t += 32) {
-                sAlast_out(t) = sAqkq_curr(B - 1, t);
+            if constexpr (ScalarAlpha) {
+                if (thread_idx == 0) {
+                    sAlast_out(_0{}) = sAlphaLoadCurr(B - 1, work_desc.o_head_idx() & 3);
+                }
+            } else {
+                CUTE_UNROLL
+                for (int t = thread_idx; t < HeadSize; t += 32) {
+                    sAlast_out(t) = sAqkq_curr(B - 1, t);
+                }
             }
 
             cutlass::arch::fence_view_async_shared();
@@ -775,10 +843,13 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
         Tensor Beta = make_tensor(make_smem_ptr(storage.smem_beta.data()), SmemLayoutBeta{});
         Tensor AlphaLast = make_tensor(make_smem_ptr(storage.smem_alpha_last.data()), SmemLayoutAlphaLast{});
+        Tensor AlphaLastStorage =
+            make_tensor(make_smem_ptr(storage.smem_alpha_last.data()), SmemLayoutAlphaLastStorage{});
 
         Tensor sQqk = make_tensor(make_smem_ptr(storage.smem_q.data()), QKSmemLayoutQ{});
         Tensor sKqk = make_tensor(make_smem_ptr(storage.smem_k.data()), QKSmemLayoutK{});
         Tensor sAqkq = make_tensor(make_smem_ptr(storage.smem_alpha.data()), QKQSmemLayoutAlpha{});
+        Tensor sAlphaLoad = make_tensor(make_smem_ptr(storage.smem_alpha.data()), SmemLayoutAlphaLoad_SD{});
         Tensor sVkv = make_tensor(make_smem_ptr(storage.smem_v.data()), KVSmemLayoutV{});
         Tensor sQK = make_tensor(make_smem_ptr(storage.smem_qk.data()), SmemLayoutQK{});
         Tensor sO = make_tensor(make_smem_ptr(storage.smem_o.data()), SmemLayoutO{});
@@ -883,7 +954,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         auto thr_copy_o = tiled_copy_o.get_thread_slice(thread_idx);
         auto tOsO = thr_copy_o.partition_D(sO);
 
-        auto const cO = make_identity_tensor(Shape<Int<HeadSizeQK>, Int<BlkSeqQ>>{});
+        auto const cO = make_identity_tensor(Shape<Int<HeadSizeV>, Int<BlkSeqQ>>{});
         Tensor tOcO = o1_thr_mma.partition_C(cO);
 
         auto const seq_idx = work_desc.seq_idx;
@@ -902,12 +973,13 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         auto kv_load = [&](auto& tKVrKV) INLINE_LAMBDA {
             DPRINTF0_WG("[%d,%d,%d,%d]>> load tKVgKV -> tKVrKV\n", seq_idx, q_head_idx, k_head_idx, v_head_idx);
             // GVA: state is stored per V/O head.
-            int num_state_heads = problem_size.num_v_heads;
             int state_head_idx = work_desc.o_head_idx();
-            auto gKV = make_tensor(
-                make_gmem_ptr(params.ptr_input_state),
-                make_layout(make_shape(Int<HeadSizeQK>{}, Int<HeadSizeV>{}, num_state_heads, problem_size.num_seqs)))(
-                _, _, state_head_idx, seq_idx);  // (KDim, VDim), K-contiguous
+            auto gKV_full = make_state_tensor(params.ptr_input_state, problem_size)(
+                _, _, state_head_idx, seq_idx);  // full (KDim, VDim)
+            auto gKV = local_tile(
+                gKV_full,
+                make_tile(Int<HeadSizeQK>{}, HeadSizeVType{}),
+                make_coord(_0{}, work_desc.value_tile_idx));
 
             auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, ElementAlpha>{}, kv_tiled_mma);
             auto thr_copy_kv = tiled_copy_kv.get_thread_slice(thread_idx);
@@ -944,12 +1016,13 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             }
             DPRINTF0_WG("[%d,%d,%d,%d]>> save tKVrKV -> tKVgKV\n", seq_idx, q_head_idx, k_head_idx, v_head_idx);
             // GVA: state is stored per V/O head.
-            int num_state_heads = problem_size.num_v_heads;
             int state_head_idx = work_desc.o_head_idx();
-            auto gKV = make_tensor(
-                make_gmem_ptr(params.ptr_output_state),
-                make_layout(make_shape(Int<HeadSizeQK>{}, Int<HeadSizeV>{}, num_state_heads, out_num_seqs)))(
-                _, _, state_head_idx, out_seq_idx);  // (KDim, VDim), K-contiguous
+            auto gKV_full = make_state_tensor(params.ptr_output_state, problem_size, out_num_seqs)(
+                _, _, state_head_idx, out_seq_idx);  // full (KDim, VDim)
+            auto gKV = local_tile(
+                gKV_full,
+                make_tile(Int<HeadSizeQK>{}, HeadSizeVType{}),
+                make_coord(_0{}, work_desc.value_tile_idx));
 
             auto tiled_copy_kv = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopy, ElementAlpha>{}, kv_tiled_mma);
             auto thr_copy_kv = tiled_copy_kv.get_thread_slice(thread_idx);
@@ -959,12 +1032,17 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
         };
 
         auto s_decay = [&](auto& tKVrKV, auto const& alpha_last_smem_pipe_read) INLINE_LAMBDA {
-            Tensor alpha_last_curr = AlphaLast(_, alpha_last_smem_pipe_read.index());
-            for_each(make_int_sequence<size(tKVcS)>{}, [&](auto i) {
-                auto coord = tKVcS(i);
-                auto [s, t] = coord;  // (head_size_v, head_size_k)
-                tKVrKV(i) *= exp2f(alpha_last_curr(t));
-            });
+            if constexpr (ScalarAlpha) {
+                const float decay = exp2f(AlphaLastStorage(_0{}, alpha_last_smem_pipe_read.index()));
+                for_each(make_int_sequence<size(tKVcS)>{}, [&](auto i) { tKVrKV(i) *= decay; });
+            } else {
+                Tensor alpha_last_curr = AlphaLast(_, alpha_last_smem_pipe_read.index());
+                for_each(make_int_sequence<size(tKVcS)>{}, [&](auto i) {
+                    auto coord = tKVcS(i);
+                    auto [s, t] = coord;  // (head_size_v, head_size_k)
+                    tKVrKV(i) *= exp2f(alpha_last_curr(t));
+                });
+            }
         };
 
         auto o1_epi = [&](auto& tOrO1) INLINE_LAMBDA {
@@ -1034,6 +1112,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             auto sK_scaled_curr = sQ_K_scaled(_, _, _1{});
             auto sAlast_curr = AlphaLast(_, alpha_last_smem_pipe_read.index());
             auto sAqkq_curr = sAqkq(_, _, alpha_smem_pipe_read.index());
+            auto sAlphaLoadCurr = sAlphaLoad(_, _, alpha_smem_pipe_read.index());
             auto sQqk_slice = flat_divide(sQqk_curr, tiler_qk);
             auto sKqk_slice = flat_divide(sKqk_curr, tiler_qk);
             auto sQ_scaled_slice = flat_divide(sQ_scaled_curr, tiler_qk);
@@ -1054,12 +1133,12 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             if constexpr (!is_first_block) {
                 // make sure sQ_K_scaled is already consumed for previous K^@V
                 cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::StateMath);
-                // Each WG iterates over 2 slices of 32 elements each.
-                // WG0 (thread_idx < 128): wg_idx=0, processes alpha indices {0,1}, Q/K dim1=0
-                // WG1 (thread_idx >= 128): wg_idx=1, processes alpha indices {2,3}, Q/K dim1=1
+                // Divide the four 32-d Q/K quarters over the active state WGs.
+                // V128 uses two quarters per WG; split V64 uses one WG for all four.
                 {
-                    int wg_idx = thread_idx / 128;  // 0 or 1
-                    int alpha_base = wg_idx * 2;    // 0 or 2
+                    constexpr int kQuarterCount = int(HeadSizeQK) / int(HeadSizeQuar{});
+                    constexpr int kQuartersPerWG = kQuarterCount / NumStateMmaWarpGroups;
+                    int wg_idx = thread_idx / 128;
 
                     // Allocate Q/K register fragments once (reused across slices)
                     // Only shape/layout matters for partition_fragment_A, use compile-time indices
@@ -1069,17 +1148,26 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         qk_thr_mma_rs_quar.partition_fragment_A(sKqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
                     auto tArA = make_fragment_like<ElementAlpha>(tQKrQ_wg);
 
-                    for (int s = 0; s < 2; ++s) {
-                        // S2R Alpha: alpha_col = wg_idx * 2 + s
-                        int alpha_col = alpha_base + s;
-                        auto sA_cur = sAqkq_slice(_, _, _0{}, make_coord(0, alpha_col));
-                        auto tAsA_cur = qk_thr_mma_rs_quar.partition_A(sA_cur);
-                        copy(CopyAlphaAtom{}, tAsA_cur, tArA);
+                    for (int local_quarter = 0; local_quarter < kQuartersPerWG; ++local_quarter) {
+                        int quarter = wg_idx * kQuartersPerWG + local_quarter;
+                        int quarter_col = quarter & 1;
+                        int quarter_group = quarter >> 1;
+                        int alpha_col = quarter;
+                        if constexpr (ScalarAlpha) {
+                            for_each(make_int_sequence<size(tArA)>{}, [&](auto i) {
+                                auto [seq, _] = tQcMq_quar(i);
+                                tArA(i) = sAlphaLoadCurr(seq, work_desc.o_head_idx() & 3);
+                            });
+                        } else {
+                            auto sA_cur = sAqkq_slice(_, _, _0{}, make_coord(0, alpha_col));
+                            auto tAsA_cur = qk_thr_mma_rs_quar.partition_A(sA_cur);
+                            copy(CopyAlphaAtom{}, tAsA_cur, tArA);
+                        }
 
                         cute::transform(tArA, [](auto g) { return exp2f(g); });
 
                         // S2R Q
-                        auto sQqk_cur = sQqk_slice(_, _, _0{}, make_coord(s, wg_idx));
+                        auto sQqk_cur = sQqk_slice(_, _, _0{}, make_coord(quarter_col, quarter_group));
                         auto tQKsQ_cur = thr_load_qk_quar.partition_S(sQqk_cur);
                         auto tQKrQ_cv = thr_load_qk_quar.retile_D(tQKrQ_wg);
                         copy(tiled_load_qk_quar, tQKsQ_cur, tQKrQ_cv);
@@ -1091,13 +1179,14 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         });
 
                         // R2S Q -> stage 0
-                        auto sQ_scaled_cur = sQ_scaled_slice(_, _, _0{}, make_coord(s, wg_idx));
+                        auto sQ_scaled_cur =
+                            sQ_scaled_slice(_, _, _0{}, make_coord(quarter_col, quarter_group));
                         auto tQKsQ_out = thr_store_qk_quar.partition_D(sQ_scaled_cur);
                         auto tQKrQ_out_cv = thr_store_qk_quar.retile_S(tQKrQ_wg);
                         copy(tiled_store_qk_quar, tQKrQ_out_cv, tQKsQ_out);
 
                         // S2R K
-                        auto sKqk_cur = sKqk_slice(_, _, _0{}, make_coord(s, wg_idx));
+                        auto sKqk_cur = sKqk_slice(_, _, _0{}, make_coord(quarter_col, quarter_group));
                         auto tQKsK_cur = thr_load_qk_quar.partition_S(sKqk_cur);
                         auto tQKrK_cv = thr_load_qk_quar.retile_D(tQKrK_wg);
                         copy(tiled_load_qk_quar, tQKsK_cur, tQKrK_cv);
@@ -1109,7 +1198,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                         });
 
                         // R2S K -> stage 1
-                        auto sK_scaled_cur = sK_scaled_slice(_, _, _0{}, make_coord(s, wg_idx));
+                        auto sK_scaled_cur =
+                            sK_scaled_slice(_, _, _0{}, make_coord(quarter_col, quarter_group));
                         auto tQKsK_out = thr_store_qk_quar.partition_D(sK_scaled_cur);
                         auto tQKrK_out_cv = thr_store_qk_quar.retile_S(tQKrK_wg);
                         copy(tiled_store_qk_quar, tQKrK_out_cv, tQKsK_out);
@@ -1286,40 +1376,58 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
             // synchronize 2 WGs before rewriting sQ_K_scaled
             cutlass::arch::NamedBarrier::arrive_and_wait(NumStateMmaThreads, KdaNamedBarriers::StateMath);
-            // exp(alpha_last - alpha) * K
-            // Each WG iterates over 2 slices of 32 elements each.
-            // WG0 (thread_idx < 128): wg_idx=0, alpha_last indices {0,1}, K/output dim1=0
-            // WG1 (thread_idx >= 128): wg_idx=1, alpha_last indices {2,3}, K/output dim1=1
+            // exp(alpha_last - alpha) * K over all four 32-d quarters.
             {
-                int wg_idx = thread_idx / 128;  // 0 or 1
-                int alpha_base = wg_idx * 2;    // 0 or 2
+                constexpr int kQuarterCount = int(HeadSizeQK) / int(HeadSizeQuar{});
+                constexpr int kQuartersPerWG = kQuarterCount / NumStateMmaWarpGroups;
+                int wg_idx = thread_idx / 128;
 
                 // Allocate K/Alpha register fragments once (reused across slices)
                 auto tQKrK_wg = qk_thr_mma_rs_quar.partition_fragment_A(sKqk_slice(_, _, _0{}, make_coord(_0{}, _0{})));
                 auto tArA_wg = make_fragment_like<ElementAlpha>(tQKrK_wg);
+                float scalar_alpha_last = 0.0f;
+                if constexpr (ScalarAlpha) {
+                    scalar_alpha_last = AlphaLastStorage(_0{}, alpha_last_smem_pipe_read.index());
+                }
 
-                for (int s = 0; s < 2; ++s) {
+                for (int local_quarter = 0; local_quarter < kQuartersPerWG; ++local_quarter) {
+                    int quarter = wg_idx * kQuartersPerWG + local_quarter;
+                    int quarter_col = quarter & 1;
+                    int quarter_group = quarter >> 1;
                     // S2R Alpha
-                    int alpha_col = alpha_base + s;
-                    auto sA_cur = sAqkq_slice(_, _, _0{}, make_coord(0, alpha_col));
-                    auto tAsA_cur = qk_thr_mma_rs_quar.partition_A(sA_cur);
-                    copy(CopyAlphaAtom{}, tAsA_cur, tArA_wg);
+                    int alpha_col = quarter;
+                    if constexpr (ScalarAlpha) {
+                        for_each(make_int_sequence<size(tArA_wg)>{}, [&](auto i) {
+                            auto [seq, _] = tQcMq_quar(i);
+                            tArA_wg(i) = sAlphaLoadCurr(seq, work_desc.o_head_idx() & 3);
+                        });
+                    } else {
+                        auto sA_cur = sAqkq_slice(_, _, _0{}, make_coord(0, alpha_col));
+                        auto tAsA_cur = qk_thr_mma_rs_quar.partition_A(sA_cur);
+                        copy(CopyAlphaAtom{}, tAsA_cur, tArA_wg);
+                    }
 
                     // S2R K
-                    auto sKqk_cur = sKqk_slice(_, _, _0{}, make_coord(s, wg_idx));
+                    auto sKqk_cur = sKqk_slice(_, _, _0{}, make_coord(quarter_col, quarter_group));
                     auto tQKsK_cur = thr_load_qk_quar.partition_S(sKqk_cur);
                     auto tQKrK_cv = thr_load_qk_quar.retile_D(tQKrK_wg);
                     copy(tiled_load_qk_quar, tQKsK_cur, tQKrK_cv);
 
                     // element-wise: exp(alpha_last - alpha) * K
-                    int alast_idx = alpha_base + s;
+                    int alast_idx = quarter;
                     auto alpha_last_cur = sAlast_slice(_, alast_idx);
                     for_each(make_int_sequence<size(tQcMq_quar)>{}, [&](auto i) {
                         auto coord = tQcMq_quar(i);
                         auto [seq, t] = coord;
                         auto alpha = tArA_wg(i);
                         auto k = tQKrK_wg(i);
-                        auto alpha_last = alpha_last_cur(t);
+                        auto alpha_last = [&]() {
+                            if constexpr (ScalarAlpha) {
+                                return scalar_alpha_last;
+                            } else {
+                                return alpha_last_cur(t);
+                            }
+                        }();
                         auto k_scaled = Element(exp2f(alpha_last - alpha) * float(k));
                         tQKrK_wg(i) = k_scaled;
                         if constexpr (is_final_block) {
@@ -1330,7 +1438,8 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                     });
 
                     // R2S K -> stage 0 (reuse for KV update)
-                    auto sQ_scaled_cur = sQ_scaled_slice(_, _, _0{}, make_coord(s, wg_idx));
+                    auto sQ_scaled_cur =
+                        sQ_scaled_slice(_, _, _0{}, make_coord(quarter_col, quarter_group));
                     auto tQKsK_out = thr_store_qk_quar.partition_D(sQ_scaled_cur);
                     auto tQKrK_out_cv = thr_store_qk_quar.retile_S(tQKrK_wg);
                     copy(tiled_store_qk_quar, tQKrK_out_cv, tQKsK_out);
@@ -1444,6 +1553,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
 
         Tensor sAqkq = make_tensor(make_smem_ptr(storage.smem_alpha.data()), QKQSmemLayoutAlpha{});
         Tensor sAqkk = make_tensor(make_smem_ptr(storage.smem_alpha.data()), QKKSmemLayoutAlpha{});
+        Tensor sAlphaLoad = make_tensor(make_smem_ptr(storage.smem_alpha.data()), SmemLayoutAlphaLoad_SD{});
         Tensor sAlast = make_tensor(make_smem_ptr(storage.smem_alpha_last.data()), SmemLayoutAlphaLast{});
 
         Tensor sKkv = make_tensor(make_smem_ptr(storage.smem_k.data()), KVSmemLayoutK{});
@@ -1517,6 +1627,10 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             // index tensor
             auto cMqk_subchunk = make_identity_tensor(select<0, 1>(TileShape_SubChunk{}));
             auto tQKcMqk_subchunk = thr_mma_subchunk.partition_C(cMqk_subchunk);
+            auto cMq_subchunk = make_identity_tensor(select<0, 2>(TileShape_SubChunk{}));
+            auto tQcMq_bf16_subchunk = thr_mma_bf16_subchunk.partition_A(cMq_subchunk);
+            auto cNk_subchunk = make_identity_tensor(select<1, 2>(TileShape_SubChunk{}));
+            auto tKcNk_bf16_subchunk = thr_mma_bf16_subchunk.partition_B(cNk_subchunk);
 
             // do MMA at the granularity of 16x16x64 with two warps
             constexpr auto tiler_subchunk_alpha = Shape<_16, Shape<_32, _1>>{};
@@ -1525,6 +1639,7 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             auto sQqk_curr = sQqk(_, _, q_smem_pipe_read.index());
             auto sKqk_curr = sKqk(_, _, k_smem_pipe_read.index());
             auto sAqkq_curr = sAqkq(_, _, alpha_smem_pipe_read.index());
+            auto sAlphaLoadCurr = sAlphaLoad(_, _, alpha_smem_pipe_read.index());
             Tensor sBeta_curr = Beta(_, beta_smem_pipe_read.index());
 
             // (_16,(_32,_1),_4,(_2,_2)):(_64,(_1,_0),_1024,(_32,_4096))
@@ -1565,11 +1680,20 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             // layout)
             auto s2r_compute_subchunk_operandA = [&](auto r_, int j, int j0, int j1) INLINE_LAMBDA {
                 // S2R g_r_j in BF16 MMA operand A layout (single load)
-                Tensor sAqkq_r_j = sAqkq_slice(_, _, r_, make_coord(_0{}, j));
-                Tensor tAsA_r_j = alpha_Q_bf16_thr_copy.partition_S(sAqkq_r_j);
                 Tensor tArA_r_j = make_fragment_like<ElementAlpha>(tv_layout_bf16_mma_A);
-                Tensor tArA_r_j_cv = alpha_Q_bf16_thr_copy.retile_D(tArA_r_j);
-                copy(alpha_Q_bf16_tiled_copy, tAsA_r_j, tArA_r_j_cv);
+                if constexpr (ScalarAlpha) {
+                    constexpr int kSubchunkRows = size<0>(TileShape_SubChunk{});
+                    for_each(make_int_sequence<size(tArA_r_j)>{}, [&](auto i) {
+                        auto [row, _] = tQcMq_bf16_subchunk(i);
+                        tArA_r_j(i) =
+                            sAlphaLoadCurr(int(r_) * kSubchunkRows + int(row), work_desc.o_head_idx() & 3);
+                    });
+                } else {
+                    Tensor sAqkq_r_j = sAqkq_slice(_, _, r_, make_coord(_0{}, j));
+                    Tensor tAsA_r_j = alpha_Q_bf16_thr_copy.partition_S(sAqkq_r_j);
+                    Tensor tArA_r_j_cv = alpha_Q_bf16_thr_copy.retile_D(tArA_r_j);
+                    copy(alpha_Q_bf16_tiled_copy, tAsA_r_j, tArA_r_j_cv);
+                }
 
                 // Derive g_first (alpha[row=0, :]) from tArA_r_j via warp shuffle,
                 // directly into operand B layout (8 values instead of 16).
@@ -1577,7 +1701,14 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
                 // v1=0 subset of operand A. We shuffle v1=0 values from t1=0 thread and
                 // output directly as operand B fragment, saving 8 float registers.
                 Tensor tArAfirst_r_j_kt = make_fragment_like<ElementAlpha>(tv_layout_bf16_mma_B);
-                broadcast_row0_operandA_to_operandB_bf16_layout(tArA_r_j, tArAfirst_r_j_kt, local_thread_idx);
+                if constexpr (ScalarAlpha) {
+                    const float g_first = sAlphaLoadCurr(
+                        int(r_) * size<0>(TileShape_SubChunk{}), work_desc.o_head_idx() & 3);
+                    fill(tArAfirst_r_j_kt, g_first);
+                } else {
+                    broadcast_row0_operandA_to_operandB_bf16_layout(
+                        tArA_r_j, tArAfirst_r_j_kt, local_thread_idx);
+                }
 
                 // gqn_r_j = exp2(g_r_j - g_r_j_first[None, :]) in BF16 MMA A layout.
                 // g_first per k-iter is in tArAfirst_r_j_kt: frag_B(2j)=K_lo, frag_B(2j+1)=K_hi.
@@ -1635,11 +1766,20 @@ struct FlatMainloopTmaWarpSpecializedKdaFwd {
             auto s2r_compute_subchunk_operandB =
                 [&](auto c_, int j, int j0, int j1, auto const& tArAfirst_kt) INLINE_LAMBDA {
                     // S2R g_c_j in BF16 MMA operand B layout
-                    Tensor sAqkq_c_j = sAqkq_slice(_, _, c_, make_coord(_0{}, j));
-                    Tensor tAsA_c_j = alpha_Kt_bf16_thr_copy.partition_S(sAqkq_c_j);
                     Tensor tArA_c_j = make_fragment_like<ElementAlpha>(tv_layout_bf16_mma_B);
-                    Tensor tArA_c_j_cv = alpha_Kt_bf16_thr_copy.retile_D(tArA_c_j);
-                    copy(alpha_Kt_bf16_tiled_copy, tAsA_c_j, tArA_c_j_cv);
+                    if constexpr (ScalarAlpha) {
+                        constexpr int kSubchunkCols = size<1>(TileShape_SubChunk{});
+                        for_each(make_int_sequence<size(tArA_c_j)>{}, [&](auto i) {
+                            auto [col, _] = tKcNk_bf16_subchunk(i);
+                            tArA_c_j(i) =
+                                sAlphaLoadCurr(int(c_) * kSubchunkCols + int(col), work_desc.o_head_idx() & 3);
+                        });
+                    } else {
+                        Tensor sAqkq_c_j = sAqkq_slice(_, _, c_, make_coord(_0{}, j));
+                        Tensor tAsA_c_j = alpha_Kt_bf16_thr_copy.partition_S(sAqkq_c_j);
+                        Tensor tArA_c_j_cv = alpha_Kt_bf16_thr_copy.retile_D(tArA_c_j);
+                        copy(alpha_Kt_bf16_tiled_copy, tAsA_c_j, tArA_c_j_cv);
+                    }
 
                     // compute gktn_c_j = exp2(g_first - g_c_j) in BF16 MMA B layout
                     cute::transform(

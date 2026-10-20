@@ -38,7 +38,10 @@ template <
     typename TO,
     typename TQKV,
     typename TState,
-    typename TBeta = float>
+    typename TBeta = float,
+    bool ScalarAlpha = false,
+    bool StateKVLayout = false,
+    bool SplitValueDim = false>
 void
 launch_kda_fwd_prefill_kernel_gbai(
     cudaStream_t stream,
@@ -81,17 +84,21 @@ launch_kda_fwd_prefill_kernel_gbai(
         using NeedsBetaType = std::conditional_t<NeedsBeta, cute::true_type, cute::false_type>;
         using NeedsAlphaType = std::conditional_t<NeedsAlpha, cute::true_type, cute::false_type>;
         using InitStateType = std::conditional_t<InitStateFromInput, cute::true_type, cute::false_type>;
+        using Options0 = decltype(add_option(Option<Tag::kIsDeltaRule, cute::true_type>{}, DefaultOptions{}));
+        using Options1 = decltype(add_option(Option<Tag::kNeedsBeta, NeedsBetaType>{}, Options0{}));
+        using Options2 = decltype(add_option(Option<Tag::kNeedsAlpha, NeedsAlphaType>{}, Options1{}));
+        using Options3 = decltype(add_option(Option<Tag::kInitStateFromInput, InitStateType>{}, Options2{}));
+        using Options4 = decltype(add_option(Option<Tag::kSafeGate, SafeGateType>{}, Options3{}));
+        using Options5 = decltype(add_option(Option<Tag::kElementBetaGmem, TBeta>{}, Options4{}));
+        using Options6 = decltype(add_option(
+            Option<Tag::kScalarAlpha, std::conditional_t<ScalarAlpha, cute::true_type, cute::false_type>>{},
+            Options5{}));
+        using Options7 = decltype(add_option(
+            Option<Tag::kStateKVLayout, std::conditional_t<StateKVLayout, cute::true_type, cute::false_type>>{},
+            Options6{}));
         using Options = decltype(add_option(
-            Option<Tag::kElementBetaGmem, TBeta>{},
-            add_option(
-                Option<Tag::kSafeGate, SafeGateType>{},
-                add_option(
-                    Option<Tag::kInitStateFromInput, InitStateType>{},
-                    add_option(
-                        Option<Tag::kNeedsAlpha, NeedsAlphaType>{},
-                        add_option(
-                            Option<Tag::kNeedsBeta, NeedsBetaType>{},
-                            add_option(Option<Tag::kIsDeltaRule, cute::true_type>{}, DefaultOptions{})))))));
+            Option<Tag::kSplitValueDim, std::conditional_t<SplitValueDim, cute::true_type, cute::false_type>>{},
+            Options7{}));
 
         using TileShape = Shape<_64, _64, _128>;
         using Scheduler = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
@@ -137,7 +144,11 @@ launch_kda_fwd_prefill_kernel_gbai(
                 .ptr_K = (T*)k,      .dK = {qk_tok_stride, _1{}, head_stride},
                 .ptr_V = (T*)v,      .dV = {v_tok_stride,  _1{}, head_stride},
                 .ptr_O = (T*)output, .dO = {v_tok_stride,  _1{}, head_stride},
-                .ptr_Alpha = alpha,  .dAlpha = {v_tok_stride, _1{}, head_stride},
+                .ptr_Alpha = alpha,
+                .dAlpha = {
+                    ScalarAlpha ? int64_t(num_v_heads) : int64_t(v_tok_stride),
+                    _1{},
+                    ScalarAlpha ? int32_t(4) : head_stride},
                 .ptr_output_state = (float*)output_state,
                 .ptr_input_state  = (float*)input_state,
                 .scale = scale,

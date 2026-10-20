@@ -27,6 +27,7 @@ struct WorkDesc {
     int32_t seq_idx;      // which sequence to process
     int32_t qk_head_idx;  // head idx for Q/K (the representative of the GVA group)
     int32_t head_idx;     // head idx for V/O/g/beta
+    int32_t value_tile_idx;  // V-feature tile within one value head
     int64_t tok_offset;   // start offset of this sequence in the packed tensor
 
     // shape
@@ -65,10 +66,12 @@ struct WorkDesc {
     }
 };
 
-// Each block handles a single (seq, v_head) work item; CTAs do not cooperate.
+// Each block handles one (seq, v_head, value_tile) work item; CTAs do not cooperate.
 // GVA optimization: heads_per_group is precomputed on the host and stored in
 // Params, so the device side does not redo the integer division per CTA.
+template <int NumValueTiles = 1>
 struct IndividualTileScheduler {
+    static_assert(NumValueTiles >= 1);
     struct Params {
         dim3 grid;
         int32_t num_seqs;
@@ -93,7 +96,7 @@ struct IndividualTileScheduler {
         // the integer division.
         int32_t const heads_per_group = problem_size.num_v_heads / problem_size.num_qk_heads;
         dim3 grid(0, 1, 1);
-        grid.x = problem_size.num_seqs * problem_size.num_v_heads;
+        grid.x = problem_size.num_seqs * problem_size.num_v_heads * NumValueTiles;
         DPRINTF(
             "to_underlying_arguments: grid:{.x:%d, .y:%d, .z:%d}, num_seqs:%d, num_qk_heads:%d, num_v_heads:%d, "
             "heads_per_group:%d\n",
@@ -120,8 +123,10 @@ struct IndividualTileScheduler {
     template <typename ProblemSize>
     CUTE_DEVICE WorkDesc
     get_next_work(Params params, ProblemSize const& problem_size) {
-        int32_t seq_idx = blockIdx.x / params.num_v_heads;
-        int32_t head_idx = blockIdx.x % params.num_v_heads;
+        int32_t value_tile_idx = blockIdx.x % NumValueTiles;
+        int32_t work_idx = blockIdx.x / NumValueTiles;
+        int32_t seq_idx = work_idx / params.num_v_heads;
+        int32_t head_idx = work_idx % params.num_v_heads;
         // GVA: use the host-precomputed heads_per_group to avoid device-side division.
         int32_t qk_head_idx = head_idx / params.heads_per_group;
 
@@ -134,10 +139,12 @@ struct IndividualTileScheduler {
         } else {
             scheduled = true;
             DPRINTF0_W(
-                "get_next_work: this_work={seq_idx:%d qk_head_idx:%d head_idx:%d tok_offset:%lld seq_len:%lld}\n",
+                "get_next_work: this_work={seq_idx:%d qk_head_idx:%d head_idx:%d value_tile_idx:%d "
+                "tok_offset:%lld seq_len:%lld}\n",
                 seq_idx,
                 qk_head_idx,
                 head_idx,
+                value_tile_idx,
                 s,
                 seq_len);
         }
@@ -146,6 +153,7 @@ struct IndividualTileScheduler {
             .seq_idx = seq_idx,
             .qk_head_idx = qk_head_idx,
             .head_idx = head_idx,
+            .value_tile_idx = value_tile_idx,
             .tok_offset = s,
             .seq_len = seq_len,
         };

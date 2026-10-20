@@ -198,7 +198,11 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
         get_register_requirements(MaxThreadsPerBlock, MinBlocksPerMultiprocessor, NumStateMmaWarpGroups);
     static constexpr uint32_t LdStRegisterRequirement = get<0>(RegisterRequirements);
     static constexpr uint32_t StateMmaRegisterRequirement = get<1>(RegisterRequirements);
-    static constexpr uint32_t AuxMmaRegisterRequirement = get<2>(RegisterRequirements);
+    // The V64 specialization statically uses 168 registers/thread. setmaxnreg
+    // `.inc 152` is illegal when the requested aux ceiling is below that
+    // initial allocation, so keep the aux WG slightly above the static value.
+    static constexpr uint32_t AuxMmaRegisterRequirement =
+        NumStateMmaWarpGroups == 1 ? 176 : get<2>(RegisterRequirements);
 
     static size_t
     get_workspace_size(Arguments const& args) {
@@ -236,13 +240,6 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
 
     CUTE_DEVICE void
     operator()(const Params& params, char* smem) {
-        enum class WarpGroupRole {
-            LdSt = 0,
-            Math0 = 1,
-            Math1 = 2,
-            MathA = 3,  // auxiliary math WG
-        };
-
         // NOTE: CollectiveInverse will have more utilization on warp 0&1
         //       so we put beta and alpha preprocessing on warp 2&3
         enum class LdStWarpRole {
@@ -261,7 +258,10 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
         int warp_idx = cutlass::canonical_warp_idx_sync();
         int warp_idx_in_wg = warp_idx % cutlass::NumWarpsPerWarpGroup;
         int warp_group_idx = cutlass::canonical_warp_group_idx();
-        auto warp_group_role = WarpGroupRole(warp_group_idx);
+        bool is_load_wg = warp_group_idx == 0;
+        bool is_state_wg =
+            warp_group_idx >= 1 && warp_group_idx < 1 + NumStateMmaWarpGroups;
+        bool is_aux_wg = warp_group_idx == 1 + NumStateMmaWarpGroups;
         auto ldst_warp_role = LdStWarpRole(warp_idx_in_wg);
 
         int lane_predicate = cute::elect_one_sync();
@@ -323,7 +323,7 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
 
         OrderedMathBarriers math_barriers;
 
-        if (warp_group_role == WarpGroupRole::LdSt && ldst_warp_role == LdStWarpRole::LoadQKV) {
+        if (is_load_wg && ldst_warp_role == LdStWarpRole::LoadQKV) {
             DPRINTF0_W("ldst_warp_role: LoadQKV Alpha\n");
             q_pipeline_params.role = MainloopQPipeline::ThreadCategory::Producer;
             k_pipeline_params.role = MainloopKPipeline::ThreadCategory::Producer;
@@ -332,23 +332,23 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
                 alpha_pipeline_params.role = MainloopAlphaPipeline::ThreadCategory::Producer;
             }
         }
-        if (warp_group_role == WarpGroupRole::LdSt && ldst_warp_role == LdStWarpRole::StoreO) {
+        if (is_load_wg && ldst_warp_role == LdStWarpRole::StoreO) {
             DPRINTF0_W("ldst_warp_role: StoreO\n");
             o_pipeline_params.role = MainloopOPipeline::ThreadCategory::Consumer;
         }
-        if (warp_group_role == WarpGroupRole::LdSt && ldst_warp_role == LdStWarpRole::LoadBeta) {
+        if (is_load_wg && ldst_warp_role == LdStWarpRole::LoadBeta) {
             if constexpr (NeedsBeta) {
                 beta_pipeline_params.role = MainloopBetaPipeline::ThreadCategory::Producer;
             }
         }
-        if (warp_group_role == WarpGroupRole::LdSt && ldst_warp_role == LdStWarpRole::LoadAlpha) {
+        if (is_load_wg && ldst_warp_role == LdStWarpRole::LoadAlpha) {
             // LoadAlpha warp consumes alpha_pipeline (reads last row) and produces alpha_last_pipeline
             if constexpr (NeedsAlpha) {
                 alpha_pipeline_params.role = MainloopAlphaPipeline::ThreadCategory::Consumer;
             }
             alpha_last_pipeline_params.role = MainloopAlphaLastPipeline::ThreadCategory::Producer;
         }
-        if (warp_group_role == WarpGroupRole::Math0 || warp_group_role == WarpGroupRole::Math1) {
+        if (is_state_wg) {
             DPRINTF0_WG("warp_group_role: MathX\n");
             q_pipeline_params.role = MainloopQPipeline::ThreadCategory::Consumer;
             k_pipeline_params.role = MainloopKPipeline::ThreadCategory::Consumer;
@@ -368,7 +368,7 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
 
             math_barriers.init(warp_group_idx - 1);
         }
-        if (warp_group_role == WarpGroupRole::MathA) {
+        if (is_aux_wg) {
             DPRINTF0_WG("warp_group_role: MathA\n");
             q_pipeline_params.role = MainloopQPipeline::ThreadCategory::Consumer;
             k_pipeline_params.role = MainloopKPipeline::ThreadCategory::Consumer;
@@ -453,7 +453,7 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
 
         CollectiveMainloop collective_mainloop;
 
-        if (warp_group_role == WarpGroupRole::LdSt) {
+        if (is_load_wg) {
             DPRINTF0_WG("LsSt warp_group_idx:%d, RegisterRequirement:%d\n", warp_group_idx, LdStRegisterRequirement);
             cutlass::arch::warpgroup_reg_dealloc<LdStRegisterRequirement>();
             if (ldst_warp_role == LdStWarpRole::LoadQKV) {
@@ -549,7 +549,7 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
                     o_smem_pipe_read,
                     storage.tensors.mainloop.smem_o);
             }
-        } else if (warp_group_role == WarpGroupRole::Math0 || warp_group_role == WarpGroupRole::Math1) {
+        } else if (is_state_wg) {
             DPRINTF0_WG(
                 "Compute[state]: warp_group_idx:%d, RegisterRequirement:%d\n",
                 warp_group_idx,
@@ -592,7 +592,7 @@ struct FlatKernelTmaWarpSpecializedKdaFwd {
                     math_barriers,
                     storage.tensors.mainloop);
             }
-        } else if (warp_group_role == WarpGroupRole::MathA) {
+        } else if (is_aux_wg) {
             DPRINTF0_WG(
                 "Compute[aux]: warp_group_idx:%d, RegisterRequirement:%d\n", warp_group_idx, AuxMmaRegisterRequirement);
             cutlass::arch::warpgroup_reg_alloc<AuxMmaRegisterRequirement>();

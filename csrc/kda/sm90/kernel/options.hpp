@@ -82,6 +82,9 @@ enum class Tag {
     kInitStateFromInput,  // if true, initialize state by reading global memory instead of zero initialization.
     kSafeGate,            // KDA
     kElementBetaGmem,     // GMEM element type for beta (default float, can be bf16)
+    kScalarAlpha,         // Qwen GDN: one gate value per token/V head, broadcast over D
+    kStateKVLayout,       // Qwen adapter: external state is contiguous [K, V]
+    kSplitValueDim,       // Qwen SM90: split the V=128 feature dimension into two V64 CTAs
 };
 
 }  // namespace kda::sm90::kernel

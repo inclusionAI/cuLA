@@ -51,4 +51,29 @@ launch_kda_fwd_prefill_kernel(
     int32_t const* raw_cu_seqlens = nullptr,
     int32_t raw_num_seqs = 0);
 
+// Qwen GDN-only specialization. Alpha is compact chunk-prefix log2 gate
+// [packed_tokens, num_v_heads], and state buffers use contiguous [K, V].
+// The generic vector-alpha public API above remains unchanged.
+void
+launch_qwen35_scalar_kda_fwd_prefill_kernel(
+    cudaStream_t stream,
+    void* output,
+    float* output_state,
+    void const* q,
+    void const* k,
+    void const* v,
+    float const* input_state,
+    float const* alpha,
+    float const* beta,
+    int32_t const* cu_seqlens,
+    uint8_t* workspace_buffer,
+    int32_t num_seqs,
+    int32_t num_qk_heads,
+    int32_t num_v_heads,
+    int32_t head_size,
+    int64_t total_seqlen,
+    float scale,
+    bool has_initial_state,
+    int32_t sm_count);
+
 }  // namespace kda::sm90
