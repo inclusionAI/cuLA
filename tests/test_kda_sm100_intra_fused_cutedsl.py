@@ -198,6 +198,54 @@ def test_csrc_boundary_port_intra_wu_larger_shape_bitwise(beta_dtype):
     assert torch.equal(Akk_repeat, Akk_ref)
 
 
+@pytest.mark.parametrize("beta_dtype", [torch.bfloat16, torch.float32])
+def test_csrc_boundary_port_intra_wu_gva_bitwise(beta_dtype):
+    _requires_sm100()
+    torch.manual_seed(17)
+    device = torch.device("cuda")
+    batch, seqlen, h_qk, h_v, dim, chunk_size = 1, 256, 2, 4, 128, 64
+    scale = dim**-0.5
+
+    q = F.normalize(torch.randn(batch, seqlen, h_qk, dim, device=device).float(), dim=-1).bfloat16()
+    k = F.normalize(torch.randn(batch, seqlen, h_qk, dim, device=device).float(), dim=-1).bfloat16()
+    v = torch.randn(batch, seqlen, h_v, dim, device=device, dtype=torch.bfloat16)
+    gk = torch.randn(batch, seqlen, h_v, dim, device=device, dtype=torch.float32) * 0.02
+    beta = torch.randn(batch, seqlen, h_v, device=device).sigmoid().to(beta_dtype)
+
+    w_ref, u_ref, qg_ref, kg_ref, Aqk_ref, Akk_ref = csrc_chunk_kda_fwd_intra(
+        q=q,
+        k=k,
+        v=v,
+        gk=gk,
+        beta=beta,
+        scale=scale,
+        chunk_size=chunk_size,
+        safe_gate=True,
+        disable_recompute=True,
+    )
+    Aqk, Akk = chunk_kda_fwd_intra_sm100_from_gk(
+        q=q,
+        k=k,
+        gk=gk,
+        beta=beta,
+        scale=scale,
+        fp32_akk_inv=True,
+    )
+    w, u, qg, kg = recompute_w_u_fwd(k, v, beta, Akk, gk, q=q)
+
+    for name, actual, expected in (
+        ("Aqk", Aqk, Aqk_ref),
+        ("Akk", Akk, Akk_ref),
+        ("kg", kg, kg_ref),
+        ("qg", qg, qg_ref),
+        ("w", w, w_ref),
+        ("u", u, u_ref),
+    ):
+        assert torch.equal(actual, expected), (
+            f"{name} differs bitwise: max_abs={(actual.float() - expected.float()).abs().max().item()}"
+        )
+
+
 def test_uniform_varlen_uses_equal_fp16_path_bitwise():
     _requires_sm100()
     torch.manual_seed(7)

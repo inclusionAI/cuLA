@@ -969,6 +969,7 @@ def fused_kernel123(
     g_cumsum_layout,
     num_chunks: int,
     num_heads: int,
+    num_qk_heads: int,
     batch_size: int,
     mCuSeqlens: cute.Tensor,
     mChunkIndices: cute.Tensor,
@@ -1127,6 +1128,9 @@ def fused_kernel123(
             i_h = (work_id // cgs_per_head) % num_heads
             i_b = work_id // (cgs_per_head * num_heads)
             chunk_base = i_cg * CHUNKS_PER_BLOCK
+        # Tiles are scheduled in V-head space. Under GVA, a consecutive
+        # group of V heads shares one Q/K head, matching the csrc scheduler.
+        i_h_qk = i_h // (num_heads // num_qk_heads)
 
         # Anti-LICM barrier: _oz is always 0 but appears to depend on work_id.
         # Because this asm has side_effects=True, it stays inside the loop.
@@ -1178,8 +1182,8 @@ def fused_kernel123(
                     rBias[vi] = cutlass.Float32(0.0)
 
             # 3D TMA head slices (fixed for this work unit's head)
-            gQ_head = tma_tensor_Q[(None, None, i_h)]
-            gK_head = tma_tensor_K[(None, None, i_h)]
+            gQ_head = tma_tensor_Q[(None, None, i_h_qk)]
+            gK_head = tma_tensor_K[(None, None, i_h_qk)]
             gG_head = tma_tensor_G[(None, None, i_h)]
 
             for chunk_iter in cutlass.range_constexpr(CHUNKS_PER_BLOCK):
@@ -1372,8 +1376,8 @@ def fused_kernel123(
         # signals tma_mbar. Decouples MMA -> TMA dependency from K1 compute.
         # =============================================================
         if warp_idx == TMA_WARP_ID:
-            gQ_head = tma_tensor_Q[(None, None, i_h)]
-            gK_head = tma_tensor_K[(None, None, i_h)]
+            gQ_head = tma_tensor_Q[(None, None, i_h_qk)]
+            gK_head = tma_tensor_K[(None, None, i_h_qk)]
             gG_head = tma_tensor_G[(None, None, i_h)]
 
             # Prefetch chunk 0 -> stage 0 (stage_reuse[0] pre-arrived)
@@ -2213,7 +2217,8 @@ def fused_kernel123(
 def make_host_function(
     B,
     NT,
-    H,
+    H_qk,
+    H_v=None,
     is_varlen=False,
     T_padded=None,
     has_bias=False,
@@ -2233,7 +2238,11 @@ def make_host_function(
     Store row mask) are guaranteed to never fire and are dead-code eliminated
     at compile time. Caller's data layout is unchanged — this is a hint only.
     """
-    _B, _NT, _H = B, NT, H
+    if H_v is None:
+        H_v = H_qk
+    if H_qk <= 0 or H_v <= 0 or H_v % H_qk != 0:
+        raise ValueError(f"H_v ({H_v}) must be a positive multiple of H_qk ({H_qk})")
+    _B, _NT, _H_QK, _H_V = B, NT, H_qk, H_v
     _IS_VARLEN = 1 if is_varlen else 0
     _HAS_BIAS = 1 if has_bias else 0
     _USE_SAFE_GATE = 1 if use_safe_gate else 0
@@ -2258,13 +2267,12 @@ def make_host_function(
         _T = _NT * BT
 
     if is_varlen:
-        _total_cgs_val = ((_NT + CHUNKS_PER_BLOCK - 1) // CHUNKS_PER_BLOCK) * _H
+        _total_cgs_val = ((_NT + CHUNKS_PER_BLOCK - 1) // CHUNKS_PER_BLOCK) * _H_V
     else:
-        _total_cgs_val = (_NT // CHUNKS_PER_BLOCK) * _H * _B
+        _total_cgs_val = (_NT // CHUNKS_PER_BLOCK) * _H_V * _B
 
-    # 3D TMA view: (B*T, K_DIM, H) — domain_offset handles non-aligned addressing
+    # Q/K live in QK-head space; G and every output live in V-head space.
     _T_total = _B * _T
-    s_row = _H * K_DIM
     s_col = 1
     s_h = K_DIM
 
@@ -2289,13 +2297,17 @@ def make_host_function(
     ):
         # 3D TMA view: (B*T, K_DIM, H). domain_offset in kernel shifts to
         # arbitrary chunk_start — no BT alignment required for varlen.
-        view_layout_3d = cute.make_layout(
-            (_T_total, K_DIM, _H),
-            stride=(s_row, s_col, s_h),
+        qk_view_layout_3d = cute.make_layout(
+            (_T_total, K_DIM, _H_QK),
+            stride=(_H_QK * K_DIM, s_col, s_h),
         )
-        mQ_view = cute.make_tensor(mQ.iterator, view_layout_3d)
-        mK_view = cute.make_tensor(mK.iterator, view_layout_3d)
-        mG_view = cute.make_tensor(mG.iterator, view_layout_3d)
+        g_view_layout_3d = cute.make_layout(
+            (_T_total, K_DIM, _H_V),
+            stride=(_H_V * K_DIM, s_col, s_h),
+        )
+        mQ_view = cute.make_tensor(mQ.iterator, qk_view_layout_3d)
+        mK_view = cute.make_tensor(mK.iterator, qk_view_layout_3d)
+        mG_view = cute.make_tensor(mG.iterator, g_view_layout_3d)
 
         smem_atom_qk = tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.BFloat16)
         qk_smem_2d = cute.tile_to_shape(smem_atom_qk, (BT, K_DIM), order=(0, 1))
@@ -2332,8 +2344,8 @@ def make_host_function(
         )
 
         out_v2_layout = cute.make_layout(
-            (_B, _T, _H, K_VEC, VEC),
-            stride=(_T * _H * K_DIM, _H * K_DIM, K_DIM, VEC, 1),
+            (_B, _T, _H_V, K_VEC, VEC),
+            stride=(_T * _H_V * K_DIM, _H_V * K_DIM, K_DIM, VEC, 1),
         )
         mKscaled_v2 = cute.make_tensor(mKscaled.iterator, out_v2_layout)
         mQscaled_v2 = cute.make_tensor(mQscaled.iterator, out_v2_layout)
@@ -2345,15 +2357,15 @@ def make_host_function(
         # STG.E.32 with 32 lanes coalesced to 1 cache line per row.
         BT_VEC = BT // VEC  # 32
         akk_v2_layout = cute.make_layout(
-            (_B, _T, _H, BT_VEC, VEC),
-            stride=(_T * _H * BT, _H * BT, BT, VEC, 1),
+            (_B, _T, _H_V, BT_VEC, VEC),
+            stride=(_T * _H_V * BT, _H_V * BT, BT, VEC, 1),
         )
         mAqk_v2 = cute.make_tensor(mAqk.iterator, akk_v2_layout)
         mAkk_v2 = cute.make_tensor(mAkk.iterator, akk_v2_layout)
 
         gklast_v2_layout = cute.make_layout(
-            (_B, _NT, _H, K_VEC, VEC),
-            stride=(_NT * _H * K_DIM, _H * K_DIM, K_DIM, VEC, 1),
+            (_B, _NT, _H_V, K_VEC, VEC),
+            stride=(_NT * _H_V * K_DIM, _H_V * K_DIM, K_DIM, VEC, 1),
         )
         mGkLast_v2 = cute.make_tensor(mGkLast.iterator, gklast_v2_layout)
 
@@ -2425,7 +2437,8 @@ def make_host_function(
             g_smem_3d,
             g_cumsum_layout,
             _NT,
-            _H,
+            _H_V,
+            _H_QK,
             _B,
             mCuSeqlens,
             mChunkIndices,
@@ -2809,21 +2822,26 @@ def chunk_kda_fwd_intra_sm100_from_gk(
         raise NotImplementedError(f"chunk_size must be {BT}, got {chunk_size}.")
     if q.dim() != 4 or k.dim() != 4 or gk.dim() != 4 or beta.dim() != 3:
         raise ValueError("Expected q/k/gk [B,T,H,K] and beta [B,T,H].")
-    if q.shape != k.shape or q.shape != gk.shape:
-        raise ValueError(f"q/k/gk shapes must match, got q={q.shape}, k={k.shape}, gk={gk.shape}.")
+    if q.shape != k.shape:
+        raise ValueError(f"q/k shapes must match, got q={q.shape}, k={k.shape}.")
     if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16:
         raise TypeError("q and k must be bfloat16, matching the csrc specialization.")
     if gk.dtype != torch.float32:
         raise TypeError(f"gk must be float32, got {gk.dtype}.")
     if beta.dtype not in (torch.bfloat16, torch.float32):
         raise TypeError(f"beta must be bfloat16 or float32, got {beta.dtype}.")
-    B, T_total, H, K = q.shape
+    B, T_total, H_qk, K = q.shape
+    if gk.shape[:2] != (B, T_total) or gk.shape[3] != K:
+        raise ValueError(f"gk must have shape [B, T, H_v, K], got {tuple(gk.shape)}.")
+    H_v = gk.shape[2]
+    if H_qk <= 0 or H_v <= 0 or H_v % H_qk != 0:
+        raise ValueError(f"H_v ({H_v}) must be a positive multiple of H_qk ({H_qk}).")
     if K != K_DIM:
         raise NotImplementedError(f"K must be {K_DIM}, got {K}.")
     if T_total % (CHUNKS_PER_BLOCK * BT) != 0:
         raise NotImplementedError(f"T must be a multiple of {CHUNKS_PER_BLOCK * BT}, got {T_total}.")
-    if beta.shape != (B, T_total, H):
-        raise ValueError(f"beta shape must be {(B, T_total, H)}, got {tuple(beta.shape)}.")
+    if beta.shape != (B, T_total, H_v):
+        raise ValueError(f"beta shape must be {(B, T_total, H_v)}, got {tuple(beta.shape)}.")
     if not use_tf32_inverse:
         raise NotImplementedError("The one-to-one baseline currently ports the default csrc TF32 inverse only.")
     if not fp32_akk_inv:
@@ -2835,14 +2853,14 @@ def chunk_kda_fwd_intra_sm100_from_gk(
 
     NT = T_total // BT
     dev = q.device.index if q.device.index is not None else 0
-    cache_key = ("csrc_port", dev, B, NT, H, beta.dtype, fp32_akk_inv)
-    k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk = _get_out_buffers_equal(q.device, B, T_total, H, torch.bfloat16)
-    A_kk_workspace = _get_akk_fp32_workspace_equal(q.device, B, T_total, H) if fp32_akk_inv else A_kk
+    cache_key = ("csrc_port", dev, B, NT, H_qk, H_v, beta.dtype, fp32_akk_inv)
+    k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk = _get_out_buffers_equal(q.device, B, T_total, H_v, torch.bfloat16)
+    A_kk_workspace = _get_akk_fp32_workspace_equal(q.device, B, T_total, H_v) if fp32_akk_inv else A_kk
 
     q_ct = _ct_cached(q, cutlass.BFloat16)
     k_ct = _ct_cached(k, cutlass.BFloat16)
     gk_in_ct = _ct_cached(gk, cutlass.Float32)
-    alog_ct = _ct_cached(_get_csrc_port_dummy_alog(q.device, H), cutlass.Float32)
+    alog_ct = _ct_cached(_get_csrc_port_dummy_alog(q.device, H_v), cutlass.Float32)
     beta_type = cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16
     beta_ct = _ct_cached(beta, beta_type)
     ks_ct = _ct_cached(k_scaled, cutlass.BFloat16)
@@ -2852,7 +2870,7 @@ def chunk_kda_fwd_intra_sm100_from_gk(
     aqk_ct = _ct_cached(A_qk, cutlass.BFloat16)
     akk_ct = _ct_cached(A_kk_workspace, cutlass.Float32 if fp32_akk_inv else cutlass.BFloat16)
     cu_ct, ci_ct = _get_eqlen_dummies(q.device)
-    bias_ct = _ct_cached(_get_csrc_port_dummy_bias(q.device, H), cutlass.Float32)
+    bias_ct = _ct_cached(_get_csrc_port_dummy_bias(q.device, H_v), cutlass.Float32)
 
     ct_args = (
         q_ct,
@@ -2877,7 +2895,8 @@ def chunk_kda_fwd_intra_sm100_from_gk(
         host_fn = make_host_function(
             B,
             NT,
-            H,
+            H_qk,
+            H_v,
             is_varlen=False,
             fuse_akk_inv=not fp32_akk_inv,
             fp32_akk_workspace=fp32_akk_inv,
@@ -2894,7 +2913,7 @@ def chunk_kda_fwd_intra_sm100_from_gk(
             A_kk,
             B,
             NT,
-            H,
+            H_v,
             cu_ct,
             ci_ct,
             is_varlen=False,
