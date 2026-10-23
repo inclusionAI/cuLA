@@ -16,6 +16,7 @@ from fla.ops.utils import prepare_chunk_indices
 import cula.cudac as cula_cuda
 from benchmarks.utils import triton_bench_fn
 from cula.kda.chunk_intra import chunk_kda_fwd_intra
+from cula.ops.kda.sm100.intra_fused import chunk_kda_fwd_intra_sm100_from_gk
 
 
 def _make_inputs(batch, length, h_qk, h_v, dim, beta_bf16):
@@ -33,26 +34,9 @@ def _make_inputs(batch, length, h_qk, h_v, dim, beta_bf16):
 
 
 def _run_csrc(q, k, v, gk, beta, cu_seqlens, chunk_indices, scale):
+    Aqk, Akk = _run_csrc_intra(q, k, v, gk, beta, cu_seqlens, chunk_indices, scale)
     batch, length, _, dim = q.shape
     h_v = v.shape[2]
-    Aqk = torch.empty(batch, length, h_v, 64, dtype=torch.bfloat16, device=q.device)
-    Akk = torch.empty_like(Aqk)
-    tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
-    cula_cuda.chunk_kda_fwd_intra_cuda(
-        q,
-        k,
-        gk,
-        beta,
-        cu_seqlens,
-        chunk_indices,
-        Aqk,
-        Akk,
-        tile_counter,
-        scale,
-        64,
-        True,
-        False,
-    )
     w = torch.empty(batch, length, h_v, dim, dtype=torch.bfloat16, device=q.device)
     u = torch.empty_like(v)
     kg = torch.empty_like(w)
@@ -72,6 +56,34 @@ def _run_csrc(q, k, v, gk, beta, cu_seqlens, chunk_indices, scale):
         None,
     )
     return w, u, None, kg, Aqk, Akk
+
+
+def _run_csrc_intra(q, k, v, gk, beta, cu_seqlens, chunk_indices, scale):
+    batch, length = q.shape[:2]
+    h_v = v.shape[2]
+    Aqk = torch.empty(batch, length, h_v, 64, dtype=torch.bfloat16, device=q.device)
+    Akk = torch.empty_like(Aqk)
+    tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
+    cula_cuda.chunk_kda_fwd_intra_cuda(
+        q,
+        k,
+        gk,
+        beta,
+        cu_seqlens,
+        chunk_indices,
+        Aqk,
+        Akk,
+        tile_counter,
+        scale,
+        64,
+        True,
+        False,
+    )
+    return Aqk, Akk
+
+
+def _run_cutedsl_intra(q, k, _v, gk, beta, _cu_seqlens, _chunk_indices, scale):
+    return chunk_kda_fwd_intra_sm100_from_gk(q, k, gk, beta, scale)
 
 
 def _run_cutedsl(q, k, v, gk, beta, cu_seqlens, chunk_indices, scale):
@@ -112,7 +124,10 @@ def main():
         parser.error("--heads-v must be a multiple of --heads-qk")
 
     scale = args.dim**-0.5
-    print(f"{'T':>8} {'csrc ms':>10} {'CuTeDSL ms':>12} {'csrc/DSL':>10} {'bitwise':>10}")
+    print(
+        f"{'T':>8} {'csrc intra':>11} {'DSL intra':>11} {'intra x':>9} "
+        f"{'csrc full':>11} {'DSL full':>11} {'full x':>9} {'bitwise':>10}"
+    )
     for length in args.lengths:
         inputs = _make_inputs(
             args.batch,
@@ -126,9 +141,15 @@ def main():
         cutedsl = _run_cutedsl(*inputs, scale)
         _assert_bitwise(csrc, cutedsl)
 
+        csrc_intra_ms = triton_bench_fn(lambda: _run_csrc_intra(*inputs, scale))
+        cutedsl_intra_ms = triton_bench_fn(lambda: _run_cutedsl_intra(*inputs, scale))
         csrc_ms = triton_bench_fn(lambda: _run_csrc(*inputs, scale))
         cutedsl_ms = triton_bench_fn(lambda: _run_cutedsl(*inputs, scale))
-        print(f"{length:8d} {csrc_ms:10.4f} {cutedsl_ms:12.4f} {csrc_ms / cutedsl_ms:10.3f} {'yes':>10}")
+        print(
+            f"{length:8d} {csrc_intra_ms:11.4f} {cutedsl_intra_ms:11.4f} "
+            f"{csrc_intra_ms / cutedsl_intra_ms:9.3f} {csrc_ms:11.4f} {cutedsl_ms:11.4f} "
+            f"{csrc_ms / cutedsl_ms:9.3f} {'yes':>10}"
+        )
 
 
 if __name__ == "__main__":
