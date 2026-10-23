@@ -35,7 +35,8 @@ from cula.utils import get_device_sm_version
 def _get_sm100_cutedsl_fwd():
     intra = importlib.import_module("cula.ops.kda.sm100.intra_fused")
     recompute = importlib.import_module("cula.ops.kda.sm100.recompute_wu")
-    return intra.chunk_kda_fwd_intra_sm100_from_gk, recompute.recompute_w_u_fwd
+    full = importlib.import_module("cula.ops.kda.sm100.full_port")
+    return intra.chunk_kda_fwd_intra_sm100_from_gk, recompute.recompute_w_u_fwd, full.chunk_kda_fwd_full_sm100_from_gk
 
 
 @triton.heuristics(
@@ -368,7 +369,10 @@ def chunk_kda_fwd_intra(
     if cu_seqlens is not None and (cu_seqlens.dtype != torch.int32 or chunk_indices.dtype != torch.int32):
         raise TypeError("cu_seqlens and chunk_indices must be int32")
 
-    cutedsl_intra, cutedsl_recompute_wu = _get_sm100_cutedsl_fwd()
+    cutedsl_intra, cutedsl_recompute_wu, cutedsl_full = _get_sm100_cutedsl_fwd()
+    if cu_seqlens is None and not disable_recompute and T % (4 * BT) == 0 and K == 128 and v.shape[-1] == 128:
+        return cutedsl_full(q, k, v, gk, beta, K**-0.5 if scale is None else scale)
+
     Aqk, Akk = cutedsl_intra(
         q=q,
         k=k,
