@@ -2512,7 +2512,7 @@ def make_host_function(
         # therefore pass Python None.  A composed host passes a real DSL
         # stream value.  Omitting the keyword in the former case is required:
         # MLIR launch operands cannot contain None.
-        if stream is None:
+        if cutlass.const_expr(stream is None):
             kernel.launch(
                 grid=(_grid_x, 1, 1),
                 block=(_THREADS, 1, 1),

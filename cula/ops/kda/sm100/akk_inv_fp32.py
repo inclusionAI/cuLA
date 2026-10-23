@@ -263,7 +263,7 @@ def akk_inv_fp32_physical_host(
         mChunkIndices,
         IS_VARLEN,
     )
-    if stream is None:
+    if cutlass.const_expr(stream is None):
         kernel.launch(
             grid=(H, NT, B),
             block=(THREADS, 1, 1),
