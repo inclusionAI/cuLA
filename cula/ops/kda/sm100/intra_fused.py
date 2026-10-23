@@ -3002,6 +3002,12 @@ def chunk_kda_fwd_intra_sm100_from_gk(
         raise NotImplementedError("The one-to-one baseline currently ports the default csrc TF32 inverse only.")
     if not fp32_akk_inv and (cu_seqlens is not None or T_total % (CHUNKS_PER_BLOCK * BT) != 0):
         raise NotImplementedError("The in-CTA inverse currently requires the aligned equal-length scheduler.")
+    # The compiled kernel constructs fixed compact views from each base
+    # pointer, so normalize strided slices before either scheduler path.
+    q = q.contiguous()
+    k = k.contiguous()
+    gk = gk.contiguous()
+    beta = beta.contiguous()
     if scale is None:
         scale = K_DIM**-0.5
 

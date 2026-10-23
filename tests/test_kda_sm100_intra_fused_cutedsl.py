@@ -135,6 +135,24 @@ def test_exact_port_clamps_beta_for_boundary_aligned_packed_tail():
         assert torch.equal(observed, reference)
 
 
+def test_exact_port_normalizes_strided_inputs():
+    """Fixed-stride kernel views must not reinterpret non-contiguous inputs."""
+    _requires_sm100()
+    torch.manual_seed(43)
+    batch, seqlen, heads, dim = 1, 256, 4, 128
+    q = torch.randn(batch, seqlen, heads, dim * 2, device="cuda", dtype=torch.bfloat16)[..., ::2]
+    k = torch.randn(batch, seqlen, heads, dim * 2, device="cuda", dtype=torch.bfloat16)[..., ::2]
+    gk_storage = torch.randn(batch, seqlen, heads, dim * 2, device="cuda", dtype=torch.float32) * 0.02
+    gk = gk_storage[..., ::2]
+    beta = torch.rand(batch, seqlen, heads * 2, device="cuda", dtype=torch.float32)[..., ::2]
+    assert not q.is_contiguous() and not k.is_contiguous() and not gk.is_contiguous() and not beta.is_contiguous()
+
+    expected = chunk_kda_fwd_intra_sm100_from_gk(q.contiguous(), k.contiguous(), gk.contiguous(), beta.contiguous())
+    actual = chunk_kda_fwd_intra_sm100_from_gk(q, k, gk, beta)
+    for observed, reference in zip(actual, expected, strict=True):
+        assert torch.equal(observed, reference)
+
+
 def test_uniform_varlen_uses_equal_fp16_path_bitwise():
     _requires_sm100()
     torch.manual_seed(7)
