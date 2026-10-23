@@ -985,6 +985,11 @@ def fused_kernel123(
     FP32_AKK_WORKSPACE: cutlass.Constexpr[int] = 0,
     INPUT_GK_FP32: cutlass.Constexpr[int] = 0,
     BETA_FP32: cutlass.Constexpr[int] = 0,
+    K1_WARP_COUNT: cutlass.Constexpr[int] = NUM_K1_TMA_WARPS,
+    MMA_WARP_BASE: cutlass.Constexpr[int] = NUM_K1_TMA_WARPS,
+    TMA_WARP: cutlass.Constexpr[int] = TMA_WARP_ID,
+    STORE_WARP_START: cutlass.Constexpr[int] = STORE_WARP_BASE,
+    TOTAL_WARPS: cutlass.Constexpr[int] = NUM_WARPS,
 ):
     block_id, _, _ = cute.arch.block_idx()
     tidx = cute.arch.thread_idx()[0]
@@ -1053,7 +1058,7 @@ def fused_kernel123(
             cute.arch.mbarrier_init(tma_mbars + s, 1)
             # TMA warp is waiter (not arriver) on stage_reuse; and it skips mma_done arrive
             cute.arch.mbarrier_init(stage_reuse_mbars + s, (NUM_MMA_WARPS - 1) * 32)
-            cute.arch.mbarrier_init(k1_done_mbars + s, NUM_K1_TMA_WARPS * 32)
+            cute.arch.mbarrier_init(k1_done_mbars + s, (K1_WARP_COUNT if K1_WARP_COUNT > 0 else 1) * 32)
             cute.arch.mbarrier_init(mma_done_mbars + s, (NUM_MMA_WARPS - 1) * 32)
             cute.arch.mbarrier_init(store_done_mbars + s, NUM_STORE_WARPS * 32)
     cute.arch.mbarrier_init_fence()
@@ -1065,29 +1070,18 @@ def fused_kernel123(
     # or store warps). Required for downstream row-major store optimizations
     # — positions outside MMA-written sub-tiles stay at 0.
     #
-    # Cooperative pattern (31 warps × 32 lanes = 992 threads):
-    #   - Each warp owns 2 contiguous rows (warp_id*2, warp_id*2+1)
-    #   - Warp 0 additionally owns the final two rows (62, 63)
+    # Cooperative pattern: each active warp owns a contiguous row group.
     #   - For sAqk bf16: each lane owns 2 contiguous bf16 cols
     #   - For sAkk fp32: each lane owns 1 fp32 col (stride 68)
     # =====================================================================
     _warp_id_in_cta = tidx >> 5  # tidx // 32, range 0..31
     _lane_id_warp = tidx & 31  # tidx % 32, range 0..31
-    _row_base = _warp_id_in_cta * 2  # this warp owns rows [_row_base, _row_base+1]
+    _rows_per_init_warp = (BT + TOTAL_WARPS - 1) // TOTAL_WARPS
+    _row_base = _warp_id_in_cta * _rows_per_init_warp
     for _s in cutlass.range_constexpr(NUM_STAGES):
-        for _ri in cutlass.range_constexpr(2):
+        for _ri in cutlass.range_constexpr(_rows_per_init_warp):
             _row = _row_base + _ri
-            # sAqk bf16: 2 cols per lane
-            _col_lo_bf16 = _lane_id_warp * 2
-            _col_hi_bf16 = _col_lo_bf16 + 1
-            sAqk[_row, _col_lo_bf16, _s] = cutlass.BFloat16(0.0)
-            sAqk[_row, _col_hi_bf16, _s] = cutlass.BFloat16(0.0)
-            # sAkk fp32: 1 col per lane (stride 68)
-            _col_fp32 = _lane_id_warp
-            sAkk[_row, _col_fp32, _s] = cutlass.Float32(0.0)
-        if _warp_id_in_cta == 0:
-            for _ri in cutlass.range_constexpr(2):
-                _row = 62 + _ri
+            if _row < BT:
                 _col_lo_bf16 = _lane_id_warp * 2
                 _col_hi_bf16 = _col_lo_bf16 + 1
                 sAqk[_row, _col_lo_bf16, _s] = cutlass.BFloat16(0.0)
@@ -1100,8 +1094,8 @@ def fused_kernel123(
     # stage_reuse_mbars: TMA waits before MMA arrives → pre-arrive all 10 MMA warps
     # store_done_mbars:  MMA waits before Store arrives → pre-arrive first 4 MMA warps
     # =====================================================================
-    if warp_idx >= NUM_K1_TMA_WARPS and warp_idx < NUM_K1_TMA_WARPS + NUM_MMA_WARPS and warp_idx != TMA_WARP_ID:
-        mma_warp_tmp = warp_idx - NUM_K1_TMA_WARPS
+    if warp_idx >= MMA_WARP_BASE and warp_idx < MMA_WARP_BASE + NUM_MMA_WARPS and warp_idx != TMA_WARP:
+        mma_warp_tmp = warp_idx - MMA_WARP_BASE
         for s in range(NUM_STAGES):
             cute.arch.mbarrier_arrive(stage_reuse_mbars + s)
             if mma_warp_tmp < NUM_STORE_WARPS:
@@ -1143,7 +1137,7 @@ def fused_kernel123(
         # =============================================================
         # Warps 0-15: Fused TMA + K1
         # =============================================================
-        if warp_idx < NUM_K1_TMA_WARPS:
+        if warp_idx < K1_WARP_COUNT:
             # Warp-layout invariants (scope-local → no cross-group register spill)
             k1_warp = _warp
             warp_row_group = k1_warp % K1_ROW_GROUPS
@@ -1375,7 +1369,7 @@ def fused_kernel123(
         # Waits stage_reuse (gated by MMA arrives), issues TMA for Q/K/G,
         # signals tma_mbar. Decouples MMA -> TMA dependency from K1 compute.
         # =============================================================
-        if warp_idx == TMA_WARP_ID:
+        if warp_idx == TMA_WARP:
             gQ_head = tma_tensor_Q[(None, None, i_h_qk)]
             gK_head = tma_tensor_K[(None, None, i_h_qk)]
             gG_head = tma_tensor_G[(None, None, i_h)]
@@ -1415,6 +1409,12 @@ def fused_kernel123(
             cute.copy(tma_atom_G, tg_pf, ts_pf, tma_bar_ptr=tma_mbars)
             if lane_id == 0:
                 cute.arch.mbarrier_arrive(tma_mbars)
+            if cutlass.const_expr(INPUT_GK_FP32 != 0):
+                sBeta_pf = sBeta[(None, 0)]
+                for beta_iter in cutlass.range_constexpr(BT // 32):
+                    beta_row = beta_iter * 32 + lane_id
+                    sBeta_pf[beta_row] = mBeta[i_b, pf_cs + beta_row, i_h]
+                cute.arch.mbarrier_arrive(k1_done_mbars)
 
             # Issue TMAs for chunks 1..CHUNKS_PER_BLOCK-1
             for next_i in cutlass.range_constexpr(1, CHUNKS_PER_BLOCK):
@@ -1454,15 +1454,21 @@ def fused_kernel123(
                 cute.copy(tma_atom_G, tg_ns, ts_ns, tma_bar_ptr=tma_mbars + next_stage)
                 if lane_id == 0:
                     cute.arch.mbarrier_arrive(tma_mbars + next_stage)
+                if cutlass.const_expr(INPUT_GK_FP32 != 0):
+                    sBeta_ns = sBeta[(None, next_stage)]
+                    for beta_iter in cutlass.range_constexpr(BT // 32):
+                        beta_row = beta_iter * 32 + lane_id
+                        sBeta_ns[beta_row] = mBeta[i_b, next_cs + beta_row, i_h]
+                    cute.arch.mbarrier_arrive(k1_done_mbars + next_stage)
 
         # =============================================================
         # Warps 16-25: K2/K3 MMA compute
         # =============================================================
-        if warp_idx >= NUM_K1_TMA_WARPS and warp_idx < NUM_K1_TMA_WARPS + NUM_MMA_WARPS and warp_idx != TMA_WARP_ID:
+        if warp_idx >= MMA_WARP_BASE and warp_idx < MMA_WARP_BASE + NUM_MMA_WARPS and warp_idx != TMA_WARP:
             # Warp-layout invariants (scope-local → no cross-group register spill)
             _tid_in_group = _lane % 4
             _group_id = _lane // 4
-            mma_warp = _warp - NUM_K1_TMA_WARPS
+            mma_warp = _warp - MMA_WARP_BASE
             my_i_q = cutlass.Int32(0)
             my_i_k = cutlass.Int32(0)
             if mma_warp < 1:
@@ -1523,6 +1529,8 @@ def fused_kernel123(
                     if norm_row_cur >= valid_rows:
                         norm_row_cur = valid_rows - 1
 
+                if cutlass.const_expr(INPUT_GK_FP32 != 0):
+                    cute.arch.mbarrier_wait(tma_mbars + s, phase)
                 cute.arch.mbarrier_wait(k1_done_mbars + s, phase)
                 cute.arch.mbarrier_wait(store_done_mbars + s, phase)
 
@@ -1867,8 +1875,8 @@ def fused_kernel123(
         # =============================================================
         # Warps 27-30: Store warps / optional in-CTA inverse workers
         # =============================================================
-        if warp_idx >= STORE_WARP_BASE:
-            store_warp = warp_idx - STORE_WARP_BASE
+        if warp_idx >= STORE_WARP_START and warp_idx < STORE_WARP_START + NUM_STORE_WARPS:
+            store_warp = warp_idx - STORE_WARP_START
             for chunk_iter in cutlass.range_constexpr(CHUNKS_PER_BLOCK):
                 s = chunk_iter % NUM_STAGES
                 phase = chunk_iter // NUM_STAGES % 2
@@ -2282,6 +2290,12 @@ def make_host_function(
     _FP32_AKK_WORKSPACE = 1 if fp32_akk_workspace else 0
     _INPUT_GK_FP32 = 1 if input_gk_fp32 else 0
     _BETA_FP32 = 1 if beta_fp32 else 0
+    _K1_WARP_COUNT = 0 if _INPUT_GK_FP32 else NUM_K1_TMA_WARPS
+    _MMA_WARP_BASE = _K1_WARP_COUNT
+    _TMA_WARP = _MMA_WARP_BASE + NUM_MMA_ACTIVE
+    _STORE_WARP_START = _MMA_WARP_BASE + NUM_MMA_WARPS
+    _TOTAL_WARPS = _STORE_WARP_START + NUM_STORE_WARPS
+    _THREADS = _TOTAL_WARPS * 32
     if _INPUT_GK_FP32 and (_HAS_BIAS or _PREPROCESS_W_BETA):
         raise ValueError("input_gk_fp32 does not accept gate bias or beta preprocessing")
     if _FUSE_AKK_INV and _FP32_AKK_WORKSPACE:
@@ -2481,9 +2495,14 @@ def make_host_function(
             _FP32_AKK_WORKSPACE,
             _INPUT_GK_FP32,
             _BETA_FP32,
+            _K1_WARP_COUNT,
+            _MMA_WARP_BASE,
+            _TMA_WARP,
+            _STORE_WARP_START,
+            _TOTAL_WARPS,
         ).launch(
             grid=(_grid_x, 1, 1),
-            block=(THREADS, 1, 1),
+            block=(_THREADS, 1, 1),
             smem=smem_size,
         )
 
