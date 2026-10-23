@@ -22,6 +22,13 @@ partial, and packed-varlen inputs use the same exact CuTeDSL kernels through
 the modular host path. Batch one deliberately avoids a composed-host compiler
 failure observed in CUTLASS DSL 4.6.2 and 4.6.3; it does not fall back to C++.
 
+The package currently declares `nvidia-cutlass-dsl>=4.4.2,<4.7,!=4.5.0`
+and this migration was validated with 4.6.2. An isolated 4.6.3 check reproduced
+the batch-one composed-host compiler failure, so a patch-version upgrade does
+not remove the modular fallback. Version 4.8.1 is outside the supported range
+and did not provide a clean drop-in validation in the current environment;
+the production path therefore does not depend on an unverified upgrade.
+
 `unified_gref=True` and `use_tf32_inverse=False` are rejected explicitly
 because neither option belongs to the bitwise-compatible production path.
 
@@ -38,6 +45,13 @@ SM100. Complete tensors were compared with `torch.equal`, including causal
 upper triangles, for FP32/BF16 beta, MHA, GVA, packed partial-varlen, unaligned
 fixed tails, QG, KG, W, U, Aqk, and Akk. All mismatched-element counts and
 maximum absolute differences were zero.
+
+For inputs containing exact BF16 zero beta values, the two implementations can
+choose different IEEE `+0`/`-0` signs at a few inverse elements because of
+equivalent predication and reduction ordering. The values compare equal and
+have identical precision; no extra rounding, truncation, or reduced-precision
+intermediate is used. The frozen byte-level vectors generate beta in FP32 and
+then cast, avoiding this zero-sign ambiguity while retaining both beta dtypes.
 
 Six representative former-csrc outputs are retained as SHA-256 regression
 vectors in `tests/test_kda_sm100_csrc_golden.py`. They cover both beta dtypes
@@ -90,6 +104,13 @@ python benchmarks/stress_kda_sm100_varlen_determinism.py \
 
 Both harnesses retain a first-run golden output, reject NaN/Inf, compare every
 output bit on every replay, and report checkpoint progress plus a JSON result.
+
+Final pure-path results:
+
+| Path | Shape | Outputs checked | Replays | Mismatches | Time | Replays/s |
+|---|---|---|---:|---:|---:|---:|
+| Public fixed-length | B=1, T=256, H=4 | W, U, KG, Aqk, Akk | 10,000,000 | 0 | 266.210 s | 37,564.4 |
+| Packed partial-varlen | lengths 65/127/193/255, H=8 | K-scaled, KG, Q-scaled, gate tail, Aqk, Akk, W, U | 10,000,000 | 0 | 610.337 s | 16,384.4 |
 
 ## Validation gates
 
