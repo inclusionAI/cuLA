@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from fla.ops.kda.gate import kda_gate_chunk_cumsum
+from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.constant import RCP_LN2
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -232,6 +233,70 @@ def test_csrc_boundary_port_intra_wu_gva_bitwise(beta_dtype):
         fp32_akk_inv=True,
     )
     w, u, qg, kg = recompute_w_u_fwd(k, v, beta, Akk, gk, q=q)
+
+    for name, actual, expected in (
+        ("Aqk", Aqk, Aqk_ref),
+        ("Akk", Akk, Akk_ref),
+        ("kg", kg, kg_ref),
+        ("qg", qg, qg_ref),
+        ("w", w, w_ref),
+        ("u", u, u_ref),
+    ):
+        assert torch.equal(actual, expected), (
+            f"{name} differs bitwise: max_abs={(actual.float() - expected.float()).abs().max().item()}"
+        )
+
+
+@pytest.mark.parametrize("beta_dtype", [torch.bfloat16, torch.float32])
+def test_csrc_boundary_port_intra_wu_gva_partial_varlen_bitwise(beta_dtype):
+    _requires_sm100()
+    torch.manual_seed(23)
+    device = torch.device("cuda")
+    cu_offsets = [0, 63, 193]
+    total_tokens, h_qk, h_v, dim, chunk_size = cu_offsets[-1], 2, 4, 128, 64
+    scale = dim**-0.5
+
+    q = F.normalize(torch.randn(1, total_tokens, h_qk, dim, device=device).float(), dim=-1).bfloat16()
+    k = F.normalize(torch.randn(1, total_tokens, h_qk, dim, device=device).float(), dim=-1).bfloat16()
+    v = torch.randn(1, total_tokens, h_v, dim, device=device, dtype=torch.bfloat16)
+    gk = torch.randn(1, total_tokens, h_v, dim, device=device, dtype=torch.float32) * 0.02
+    beta = torch.randn(1, total_tokens, h_v, device=device).sigmoid().to(beta_dtype)
+    cu_seqlens = torch.tensor(cu_offsets, dtype=torch.int32, device=device)
+    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+
+    w_ref, u_ref, qg_ref, kg_ref, Aqk_ref, Akk_ref = csrc_chunk_kda_fwd_intra(
+        q=q,
+        k=k,
+        v=v,
+        gk=gk,
+        beta=beta,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+        safe_gate=True,
+        disable_recompute=True,
+    )
+    Aqk, Akk = chunk_kda_fwd_intra_sm100_from_gk(
+        q=q,
+        k=k,
+        gk=gk,
+        beta=beta,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        fp32_akk_inv=True,
+    )
+    w, u, qg, kg = recompute_w_u_fwd(
+        k,
+        v,
+        beta,
+        Akk,
+        gk,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        q=q,
+    )
 
     for name, actual, expected in (
         ("Aqk", Aqk, Aqk_ref),

@@ -2802,11 +2802,13 @@ def chunk_kda_fwd_intra_sm100_from_gk(
     beta: torch.Tensor,
     scale: float | None = None,
     *,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
     chunk_size: int = BT,
     use_tf32_inverse: bool = True,
     fp32_akk_inv: bool = True,
 ):
-    """CuTeDSL port of the equal-length csrc intra API.
+    """CuTeDSL port of the csrc intra API.
 
     Unlike :func:`chunk_kda_fwd_intra_sm100_equal`, this entry point consumes
     the already activated and chunk-cumsummed FP32 ``gk`` tensor, exactly like
@@ -2838,8 +2840,6 @@ def chunk_kda_fwd_intra_sm100_from_gk(
         raise ValueError(f"H_v ({H_v}) must be a positive multiple of H_qk ({H_qk}).")
     if K != K_DIM:
         raise NotImplementedError(f"K must be {K_DIM}, got {K}.")
-    if T_total % (CHUNKS_PER_BLOCK * BT) != 0:
-        raise NotImplementedError(f"T must be a multiple of {CHUNKS_PER_BLOCK * BT}, got {T_total}.")
     if beta.shape != (B, T_total, H_v):
         raise ValueError(f"beta shape must be {(B, T_total, H_v)}, got {tuple(beta.shape)}.")
     if not use_tf32_inverse:
@@ -2850,6 +2850,106 @@ def chunk_kda_fwd_intra_sm100_from_gk(
         )
     if scale is None:
         scale = K_DIM**-0.5
+
+    # The equal-length specialization groups four chunks per CTA and avoids
+    # scheduler decoding. Any explicit packed layout, or an equal-length tail
+    # smaller than four chunks, uses the same arithmetic kernel through its
+    # varlen scheduler. This is also how the csrc API represents tails.
+    if cu_seqlens is not None or T_total % (CHUNKS_PER_BLOCK * BT) != 0:
+        if cu_seqlens is None:
+            cu_seqlens = torch.arange(B + 1, dtype=torch.int32, device=q.device) * T_total
+        if cu_seqlens.dtype != torch.int32:
+            raise TypeError(f"cu_seqlens must be int32, got {cu_seqlens.dtype}.")
+        cu_seqlens = cu_seqlens.contiguous()
+        if chunk_indices is None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        if chunk_indices.dtype != torch.int32:
+            raise TypeError(f"chunk_indices must be int32, got {chunk_indices.dtype}.")
+        chunk_indices = chunk_indices.contiguous()
+
+        T_flat = B * T_total
+        T_padded = ((T_flat + CHUNKS_PER_BLOCK * BT - 1) // (CHUNKS_PER_BLOCK * BT)) * (CHUNKS_PER_BLOCK * BT)
+        q_pack = q.reshape(1, T_flat, H_qk, K)
+        k_pack = k.reshape(1, T_flat, H_qk, K)
+        gk_pack = gk.reshape(1, T_flat, H_v, K)
+        beta_pack = beta.reshape(1, T_flat, H_v)
+        q_pad, k_pad, gk_pad, beta_pad = _pad_varlen_inputs(q_pack, k_pack, gk_pack, beta_pack, T_padded)
+
+        NT = chunk_indices.shape[0]
+        dev = q.device.index if q.device.index is not None else 0
+        cache_key = ("csrc_port_varlen", dev, T_padded, NT, H_qk, H_v, beta.dtype, fp32_akk_inv)
+        _, _, _, _, A_qk, A_kk = _get_out_buffers_varlen(q.device, T_padded, NT, H_v, torch.bfloat16)
+        A_kk_workspace = _get_akk_fp32_workspace_varlen(q.device, T_padded, NT, H_v) if fp32_akk_inv else A_kk
+
+        q_ct = _ct_cached(q_pad, cutlass.BFloat16)
+        k_ct = _ct_cached(k_pad, cutlass.BFloat16)
+        gk_in_ct = _ct_cached(gk_pad, cutlass.Float32)
+        alog_ct = _ct_cached(_get_csrc_port_dummy_alog(q.device, H_v), cutlass.Float32)
+        beta_type = cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16
+        beta_ct = _ct_cached(beta_pad, beta_type)
+        # The FP32-gk specialization does not materialize these K1 outputs,
+        # but the shared kernel ABI still carries their tensors.
+        k_scaled, kg, q_scaled, gk_last_exp, _, _ = _get_out_buffers_varlen(q.device, T_padded, NT, H_v, torch.bfloat16)
+        ks_ct = _ct_cached(k_scaled, cutlass.BFloat16)
+        kg_ct = _ct_cached(kg, cutlass.BFloat16)
+        qs_ct = _ct_cached(q_scaled, cutlass.BFloat16)
+        gk_last_ct = _ct_cached(gk_last_exp, cutlass.Float32)
+        aqk_ct = _ct_cached(A_qk, cutlass.BFloat16)
+        akk_ct = _ct_cached(A_kk_workspace, cutlass.Float32)
+        cu_ct = _ct_cached(cu_seqlens, cutlass.Int32)
+        ci_ct = _ct_cached(chunk_indices, cutlass.Int32)
+        bias_ct = _ct_cached(_get_csrc_port_dummy_bias(q.device, H_v), cutlass.Float32)
+        ct_args = (
+            q_ct,
+            k_ct,
+            gk_in_ct,
+            alog_ct,
+            beta_ct,
+            float(scale),
+            ks_ct,
+            kg_ct,
+            qs_ct,
+            gk_last_ct,
+            aqk_ct,
+            akk_ct,
+            cu_ct,
+            ci_ct,
+            bias_ct,
+            0.0,
+        )
+        kernel = _K123_CACHE.get(("kernel", cache_key))
+        if kernel is None:
+            host_fn = make_host_function(
+                1,
+                NT,
+                H_qk,
+                H_v,
+                is_varlen=True,
+                T_padded=T_padded,
+                varlen_pure=False,
+                fp32_akk_workspace=True,
+                input_gk_fp32=True,
+                beta_fp32=beta.dtype == torch.float32,
+            )
+            kernel = cute.compile(host_fn, *ct_args)
+            _K123_CACHE[("kernel", cache_key)] = kernel
+
+        kernel(*ct_args)
+        _run_akk_inv_fp32_physical(
+            A_kk_workspace,
+            A_kk,
+            1,
+            NT,
+            H_v,
+            cu_ct,
+            ci_ct,
+            is_varlen=True,
+            T_val=T_padded,
+        )
+        return (
+            A_qk[:, :T_flat].view(B, T_total, H_v, BT),
+            A_kk[:, :T_flat].view(B, T_total, H_v, BT),
+        )
 
     NT = T_total // BT
     dev = q.device.index if q.device.index is not None else 0
