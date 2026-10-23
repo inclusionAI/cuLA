@@ -41,9 +41,10 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.runtime import _Pointer as RuntimePointer
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.tensor import TensorSSA
-from cutlass.cute.typing import Int32, Int64
+from cutlass.cute.typing import Int32, Int64, Pointer
 from fla.ops.utils import prepare_chunk_indices
 
 from cula.ops.ptx import reinterpret_cast, store_256b, subvec
@@ -218,16 +219,16 @@ class KDARecomputeWU:
     @cute.jit
     def run_from_ptrs(
         self,
-        k_addr: Int64,
-        v_addr: Int64,
-        beta_addr: Int64,
-        A_addr: Int64,
-        gk_addr: Int64,
-        w_addr: Int64,
-        u_addr: Int64,
-        kg_addr: Int64,
-        cu_seqlens_addr: Int64,
-        chunk_indices_addr: Int64,
+        k_ptr: Pointer,
+        v_ptr: Pointer,
+        beta_ptr: Pointer,
+        A_ptr: Pointer,
+        gk_ptr: Pointer,
+        w_ptr: Pointer,
+        u_ptr: Pointer,
+        kg_ptr: Pointer,
+        cu_seqlens_ptr: Pointer,
+        chunk_indices_ptr: Pointer,
         problem_size: tuple[Int32, Int32, Int32, Int32, Int32, Int32],
         total_nt: Int32,
         stream,
@@ -241,45 +242,16 @@ class KDARecomputeWU:
         """
 
         self(
-            cute.make_tensor(
-                cute.make_ptr(self.io_dtype, k_addr, cute.AddressSpace.gmem, assumed_align=16), cute.make_layout(1)
-            ),
-            cute.make_tensor(
-                cute.make_ptr(self.io_dtype, v_addr, cute.AddressSpace.gmem, assumed_align=16), cute.make_layout(1)
-            ),
-            cute.make_tensor(
-                cute.make_ptr(self.beta_dtype, beta_addr, cute.AddressSpace.gmem, assumed_align=16),
-                cute.make_layout(1),
-            ),
-            cute.make_tensor(
-                cute.make_ptr(self.io_dtype, A_addr, cute.AddressSpace.gmem, assumed_align=16), cute.make_layout(1)
-            ),
-            cute.make_tensor(
-                cute.make_ptr(
-                    self.io_dtype if self.preprocessed_k else self.acc_dtype,
-                    gk_addr,
-                    cute.AddressSpace.gmem,
-                    assumed_align=16,
-                ),
-                cute.make_layout(1),
-            ),
-            cute.make_tensor(
-                cute.make_ptr(self.io_dtype, w_addr, cute.AddressSpace.gmem, assumed_align=16), cute.make_layout(1)
-            ),
-            cute.make_tensor(
-                cute.make_ptr(self.io_dtype, u_addr, cute.AddressSpace.gmem, assumed_align=16), cute.make_layout(1)
-            ),
-            cute.make_tensor(
-                cute.make_ptr(self.io_dtype, kg_addr, cute.AddressSpace.gmem, assumed_align=16), cute.make_layout(1)
-            ),
-            cute.make_tensor(
-                cute.make_ptr(cutlass.Int32, cu_seqlens_addr, cute.AddressSpace.gmem, assumed_align=16),
-                cute.make_layout(1),
-            ),
-            cute.make_tensor(
-                cute.make_ptr(cutlass.Int32, chunk_indices_addr, cute.AddressSpace.gmem, assumed_align=16),
-                cute.make_layout(1),
-            ),
+            cute.make_tensor(k_ptr, cute.make_layout(1)),
+            cute.make_tensor(v_ptr, cute.make_layout(1)),
+            cute.make_tensor(beta_ptr, cute.make_layout(1)),
+            cute.make_tensor(A_ptr, cute.make_layout(1)),
+            cute.make_tensor(gk_ptr, cute.make_layout(1)),
+            cute.make_tensor(w_ptr, cute.make_layout(1)),
+            cute.make_tensor(u_ptr, cute.make_layout(1)),
+            cute.make_tensor(kg_ptr, cute.make_layout(1)),
+            cute.make_tensor(cu_seqlens_ptr, cute.make_layout(1)),
+            cute.make_tensor(chunk_indices_ptr, cute.make_layout(1)),
             problem_size,
             total_nt,
             stream,
@@ -1104,6 +1076,7 @@ _recompute_wu_cache = {}
 _recompute_wu_ptr_cache = {}
 _qg_cache = {}
 _cuda_stream_cache = {}
+_runtime_ptr_cache = {}
 _dummy_cu_seqlens = None
 _dummy_chunk_indices = None
 _uniform_cu_cache = {}
@@ -1366,19 +1339,23 @@ def _compile_recompute_wu_ptrs(
         preprocessed_k=preprocessed_k,
         use_fast_math=USE_FAST_MATH,
     )
-    zero = Int64(0)
     compiled = cute.compile(
         kernel_obj.run_from_ptrs,
-        zero,
-        zero,
-        zero,
-        zero,
-        zero,
-        zero,
-        zero,
-        zero,
-        zero,
-        zero,
+        RuntimePointer(0, cutlass.BFloat16, cute.AddressSpace.gmem, 16),
+        RuntimePointer(0, cutlass.BFloat16, cute.AddressSpace.gmem, 16),
+        RuntimePointer(0, beta_dtype, cute.AddressSpace.gmem, 16),
+        RuntimePointer(0, cutlass.BFloat16, cute.AddressSpace.gmem, 16),
+        RuntimePointer(
+            0,
+            cutlass.BFloat16 if preprocessed_k else cutlass.Float32,
+            cute.AddressSpace.gmem,
+            16,
+        ),
+        RuntimePointer(0, cutlass.BFloat16, cute.AddressSpace.gmem, 16),
+        RuntimePointer(0, cutlass.BFloat16, cute.AddressSpace.gmem, 16),
+        RuntimePointer(0, cutlass.BFloat16, cute.AddressSpace.gmem, 16),
+        RuntimePointer(0, cutlass.Int32, cute.AddressSpace.gmem, 16),
+        RuntimePointer(0, cutlass.Int32, cute.AddressSpace.gmem, 16),
         (Int32(1), Int32(1), Int32(H_qk), Int32(H_v), Int32(K), Int32(V)),
         Int32(1),
         make_fake_stream(),
@@ -1396,18 +1373,31 @@ def _current_cuda_stream(device):
     return stream
 
 
+def _runtime_ptr(tensor, dtype):
+    key = (tensor.data_ptr(), dtype)
+    ptr = _runtime_ptr_cache.get(key)
+    if ptr is None:
+        if len(_runtime_ptr_cache) >= 4096:
+            _runtime_ptr_cache.clear()
+        ptr = RuntimePointer(key[0], dtype, cute.AddressSpace.gmem, 16)
+        _runtime_ptr_cache[key] = ptr
+    return ptr
+
+
 def _launch_recompute_wu_ptrs(compiled, k, v, beta, A, gk, w, u, kg, cu, ci, problem_size, total_nt):
+    beta_dtype = cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16
+    gk_dtype = cutlass.Float32 if gk.dtype == torch.float32 else cutlass.BFloat16
     compiled(
-        Int64(k.data_ptr()),
-        Int64(v.data_ptr()),
-        Int64(beta.data_ptr()),
-        Int64(A.data_ptr()),
-        Int64(gk.data_ptr()),
-        Int64(w.data_ptr()),
-        Int64(u.data_ptr()),
-        Int64(kg.data_ptr()),
-        Int64(cu.data_ptr()),
-        Int64(ci.data_ptr()),
+        _runtime_ptr(k, cutlass.BFloat16),
+        _runtime_ptr(v, cutlass.BFloat16),
+        _runtime_ptr(beta, beta_dtype),
+        _runtime_ptr(A, cutlass.BFloat16),
+        _runtime_ptr(gk, gk_dtype),
+        _runtime_ptr(w, cutlass.BFloat16),
+        _runtime_ptr(u, cutlass.BFloat16),
+        _runtime_ptr(kg, cutlass.BFloat16),
+        _runtime_ptr(cu, cutlass.Int32),
+        _runtime_ptr(ci, cutlass.Int32),
         problem_size,
         Int32(total_nt),
         _current_cuda_stream(k.device),
