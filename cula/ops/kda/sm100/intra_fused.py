@@ -2457,7 +2457,7 @@ def make_host_function(
 
         _grid_x = min(NUM_SMS, _total_cgs_val)
 
-        fused_kernel123(
+        kernel = fused_kernel123(
             tma_atom_Q,
             tma_tensor_Q,
             tma_atom_K,
@@ -2507,12 +2507,24 @@ def make_host_function(
             _TMA_WARP,
             _STORE_WARP_START,
             _TOTAL_WARPS,
-        ).launch(
-            grid=(_grid_x, 1, 1),
-            block=(_THREADS, 1, 1),
-            smem=smem_size,
-            stream=stream,
         )
+        # Standalone callers compile this host with the default stream and
+        # therefore pass Python None.  A composed host passes a real DSL
+        # stream value.  Omitting the keyword in the former case is required:
+        # MLIR launch operands cannot contain None.
+        if stream is None:
+            kernel.launch(
+                grid=(_grid_x, 1, 1),
+                block=(_THREADS, 1, 1),
+                smem=smem_size,
+            )
+        else:
+            kernel.launch(
+                grid=(_grid_x, 1, 1),
+                block=(_THREADS, 1, 1),
+                smem=smem_size,
+                stream=stream,
+            )
 
     return host_fn
 

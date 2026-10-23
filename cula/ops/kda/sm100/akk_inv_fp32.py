@@ -252,7 +252,7 @@ def akk_inv_fp32_physical_host(
     stmp_layout = cute.make_layout((TMP_SLOTS, SB, SB), stride=(SB * TMP_STRIDE, TMP_STRIDE, 1))
     smem_bytes = BS * AKK_STRIDE * 4 + TMP_SLOTS * SB * TMP_STRIDE * 4 + 256
 
-    akk_inv_fp32_physical_kernel(
+    kernel = akk_inv_fp32_physical_kernel(
         gA_phys,
         gA_out,
         smat_layout,
@@ -262,9 +262,17 @@ def akk_inv_fp32_physical_host(
         mCuSeqlens,
         mChunkIndices,
         IS_VARLEN,
-    ).launch(
-        grid=(H, NT, B),
-        block=(THREADS, 1, 1),
-        smem=smem_bytes,
-        stream=stream,
     )
+    if stream is None:
+        kernel.launch(
+            grid=(H, NT, B),
+            block=(THREADS, 1, 1),
+            smem=smem_bytes,
+        )
+    else:
+        kernel.launch(
+            grid=(H, NT, B),
+            block=(THREADS, 1, 1),
+            smem=smem_bytes,
+            stream=stream,
+        )
