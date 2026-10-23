@@ -227,6 +227,8 @@ def chunk_kda_fwd_full_sm100_from_gk(q, k, v, gk, beta, scale):
     h_v = v.shape[2]
     if dim != K_DIM or v.shape[-1] != K_DIM:
         raise NotImplementedError("the SM100 full port requires K=V=128")
+    if h_qk != h_v:
+        raise NotImplementedError("the single-dispatch SM100 full port currently requires matching QK and V heads")
     if length % (4 * BT):
         raise NotImplementedError("the full-port fast path requires T to be divisible by 256")
 

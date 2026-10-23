@@ -6,6 +6,7 @@ import gc
 import pytest
 import torch
 
+from cula.kda.chunk_intra import chunk_kda_fwd_intra
 from cula.ops.kda.sm100.full_port import chunk_kda_fwd_full_sm100_from_gk
 from cula.ops.kda.sm100.intra_fused import chunk_kda_fwd_intra_sm100_from_gk
 from cula.ops.kda.sm100.recompute_wu import recompute_w_u_fwd
@@ -18,7 +19,7 @@ def _requires_sm100():
         pytest.skip("SM100 CUDA device required")
 
 
-def _inputs(seed, h_qk=4, h_v=8):
+def _inputs(seed, h_qk=4, h_v=4):
     torch.manual_seed(seed)
     batch, length, dim = 2, 512, 128
     q = torch.randn(batch, length, h_qk, dim, dtype=torch.bfloat16, device="cuda") * 0.1
@@ -95,3 +96,12 @@ def test_full_port_does_not_retain_per_call_outputs():
     gc.collect()
     allocated_after = torch.cuda.memory_allocated()
     assert allocated_after <= allocated_before + 1024 * 1024
+
+
+def test_public_gva_dispatch_uses_stable_modular_path():
+    _requires_sm100()
+    inputs = _inputs(29, h_qk=2, h_v=4)
+    q, k, v, gk, beta = inputs
+    actual = chunk_kda_fwd_intra(q, k, v, gk, beta, safe_gate=True)
+    expected = _separate(inputs)
+    _assert_bitwise(expected, actual)
