@@ -96,7 +96,11 @@ def _make_cutedsl_launcher(k, v, beta, A, gk):
     def run():
         compiled(k, v, beta, A, gk, w, u, kg, cu, ci, problem_size, Int32(total_nt))
 
-    return run, (w, u, None, kg)
+    def run_pooled():
+        run()
+        return w.view_as(w), u.view_as(u), None, kg.view_as(kg)
+
+    return run, run_pooled, (w, u, None, kg)
 
 
 _WRAPPER_CACHE = {}
@@ -229,7 +233,8 @@ def main():
 
     print(
         f"{'T':>8} {'C++ core':>10} {'DSL core':>10} {'core x':>8} "
-        f"{'native':>10} {'native e2e':>10} {'C++ e2e':>10} {'DSL e2e':>10} {'e2e x':>8} {'rel_rmse':>12}"
+        f"{'pooled':>10} {'native':>10} {'native e2e':>10} {'C++ e2e':>10} {'DSL e2e':>10} {'e2e x':>8} "
+        f"{'rel_rmse':>12}"
     )
     for T in args.lengths:
         cu_seqlens = torch.tensor([0, T, 2 * T], dtype=torch.int32, device=device)
@@ -243,17 +248,19 @@ def main():
             raise AssertionError(f"non-finite error at T={T}: ws={ws_err}")
 
         cpp_core, _ = _make_cpp_launcher(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices)
-        dsl_core, _ = _make_cutedsl_launcher(k, v, beta, A, cu_gk)
+        dsl_core, dsl_pooled, _ = _make_cutedsl_launcher(k, v, beta, A, cu_gk)
         native_core, native_e2e = _make_native_cutedsl_launchers(k, v, beta, A, cu_gk)
         cpp_core_ms = triton_bench_fn(cpp_core)
         dsl_core_ms = triton_bench_fn(dsl_core)
+        dsl_pooled_ms = triton_bench_fn(dsl_pooled)
         native_core_ms = triton_bench_fn(native_core)
         native_e2e_ms = triton_bench_fn(native_e2e)
         cpp_e2e_ms = triton_bench_fn(lambda: _run_cpp(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices))
         dsl_e2e_ms = triton_bench_fn(lambda: recompute_w_u_fwd(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices))
         print(
             f"{T:8d} {cpp_core_ms:10.4f} {dsl_core_ms:10.4f} {cpp_core_ms / dsl_core_ms:8.3f} "
-            f"{native_core_ms:10.4f} {native_e2e_ms:10.4f} {cpp_e2e_ms:10.4f} {dsl_e2e_ms:10.4f} "
+            f"{dsl_pooled_ms:10.4f} {native_core_ms:10.4f} {native_e2e_ms:10.4f} "
+            f"{cpp_e2e_ms:10.4f} {dsl_e2e_ms:10.4f} "
             f"{cpp_e2e_ms / dsl_e2e_ms:8.3f} {ws_err:12.6g}"
         )
 
