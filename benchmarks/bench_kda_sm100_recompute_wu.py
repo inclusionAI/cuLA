@@ -99,9 +99,17 @@ def _make_cutedsl_launcher(k, v, beta, A, gk):
     return run, (w, u, None, kg)
 
 
+_WRAPPER_CACHE = {}
+
+
 def _wrap_tensor(tensor, dtype):
+    key = (tensor.device.index, tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype, dtype)
+    wrapped = _WRAPPER_CACHE.get(key)
+    if wrapped is not None:
+        return wrapped
     wrapped = from_dlpack(tensor, assumed_align=16).mark_layout_dynamic()
     wrapped.element_type = dtype
+    _WRAPPER_CACHE[key] = wrapped
     return wrapped
 
 
