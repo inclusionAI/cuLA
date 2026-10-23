@@ -18,7 +18,6 @@ from cula.ops.kda.sm100.intra_fused import (
     _get_csrc_port_dummy_alog,
     _get_csrc_port_dummy_bias,
     _get_csrc_port_dummy_outputs,
-    _get_eqlen_dummies,
     make_host_function,
 )
 from cula.ops.kda.sm100.recompute_wu import (
@@ -29,6 +28,19 @@ from cula.ops.kda.sm100.recompute_wu import (
 from cula.utils import USE_FAST_MATH
 
 _FULL_PORT_CACHE = {}
+_FULL_METADATA_CACHE = {}
+
+
+def _get_full_metadata(device):
+    key = device.index if device.index is not None else 0
+    tensors = _FULL_METADATA_CACHE.get(key)
+    if tensors is None:
+        tensors = (
+            torch.tensor([0, 1], dtype=torch.int32, device=device),
+            torch.tensor([[0, 0]], dtype=torch.int32, device=device),
+        )
+        _FULL_METADATA_CACHE[key] = tensors
+    return tensors
 
 
 def _make_full_host(batch, length, h_qk, h_v, beta_dtype, scale):
@@ -167,7 +179,13 @@ def _compile_full_port(device, batch, length, h_qk, h_v, beta_dtype, scale):
     alog_fake = make_fake_compact_tensor(cutlass.Float32, (h_v,), assumed_align=128)
     dummy_bf16_fake = make_fake_compact_tensor(cutlass.BFloat16, (1,), assumed_align=16)
     dummy_fp32_fake = make_fake_compact_tensor(cutlass.Float32, (1,), assumed_align=16)
-    metadata_fake = make_fake_compact_tensor(cutlass.Int32, (2,), assumed_align=16)
+    cu_fake = make_fake_compact_tensor(cutlass.Int32, (2,), assumed_align=16)
+    ci_fake = make_fake_compact_tensor(
+        cutlass.Int32,
+        (1, 2),
+        stride_order=(1, 0),
+        assumed_align=16,
+    )
     bias_fake = make_fake_compact_tensor(
         cutlass.Float32,
         (h_v, K_DIM),
@@ -191,8 +209,8 @@ def _compile_full_port(device, batch, length, h_qk, h_v, beta_dtype, scale):
         alog_fake,
         dummy_bf16_fake,
         dummy_fp32_fake,
-        metadata_fake,
-        metadata_fake,
+        cu_fake,
+        ci_fake,
         bias_fake,
         make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
@@ -221,7 +239,7 @@ def chunk_kda_fwd_full_sm100_from_gk(q, k, v, gk, beta, scale):
     )
     dummy_alog = _get_csrc_port_dummy_alog(q.device, h_v)
     dummy_bf16, dummy_fp32 = _get_csrc_port_dummy_outputs(q.device)
-    cu_seqlens, chunk_indices = _get_eqlen_dummies(q.device)
+    cu_seqlens, chunk_indices = _get_full_metadata(q.device)
     dummy_bias = _get_csrc_port_dummy_bias(q.device, h_v)
     compiled = _compile_full_port(q.device, batch, length, h_qk, h_v, beta.dtype, scale)
     try:
