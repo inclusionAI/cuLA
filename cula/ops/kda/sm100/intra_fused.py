@@ -2537,8 +2537,8 @@ from fla.ops.utils import prepare_chunk_indices
 
 _K123_CACHE = {}
 _VARLEN_PAD_CACHE = {}
-_CSRC_PORT_OUTPUT_POOLS = {}
-_MAX_CSRC_PORT_POOLED_BYTES = 128 * 1024 * 1024
+_EXACT_PORT_OUTPUT_POOLS = {}
+_MAX_EXACT_PORT_POOLED_BYTES = 128 * 1024 * 1024
 
 
 def _tensor_version(t: torch.Tensor) -> int:
@@ -2682,9 +2682,9 @@ def _get_eqlen_dummies(device):
     return entry[2], entry[3]
 
 
-def _get_csrc_port_dummy_alog(device, heads):
+def _get_exact_port_dummy_alog(device, heads):
     """Return an unused A_log argument for the FP32-gk specialization."""
-    key = ("csrc_port_dummy_alog", device.index if device.index is not None else 0, heads)
+    key = ("exact_port_dummy_alog", device.index if device.index is not None else 0, heads)
     entry = _K123_CACHE.get(key)
     if entry is None:
         entry = torch.zeros(heads, dtype=torch.float32, device=device)
@@ -2692,9 +2692,9 @@ def _get_csrc_port_dummy_alog(device, heads):
     return entry
 
 
-def _get_csrc_port_dummy_bias(device, heads):
+def _get_exact_port_dummy_bias(device, heads):
     """Return an unused dt-bias argument for the FP32-gk specialization."""
-    key = ("csrc_port_dummy_bias", device.index if device.index is not None else 0, heads)
+    key = ("exact_port_dummy_bias", device.index if device.index is not None else 0, heads)
     entry = _K123_CACHE.get(key)
     if entry is None:
         entry = torch.zeros((heads, K_DIM), dtype=torch.float32, device=device)
@@ -2702,9 +2702,9 @@ def _get_csrc_port_dummy_bias(device, heads):
     return entry
 
 
-def _get_csrc_port_dummy_outputs(device):
+def _get_exact_port_dummy_outputs(device):
     """Return untouched ABI placeholders for the FP32-gk specialization."""
-    key = ("csrc_port_dummy_outputs", device.index if device.index is not None else 0)
+    key = ("exact_port_dummy_outputs", device.index if device.index is not None else 0)
     entry = _K123_CACHE.get(key)
     if entry is None:
         bf16 = torch.empty(1, dtype=torch.bfloat16, device=device)
@@ -2714,7 +2714,7 @@ def _get_csrc_port_dummy_outputs(device):
     return entry
 
 
-class _CsrcPortOutputEntry:
+class _ExactPortOutputEntry:
     def __init__(self, specs, device):
         self.specs = specs
         self.buffers = tuple(torch.empty(shape, dtype=dtype, device=device) for shape, dtype in specs)
@@ -2739,25 +2739,25 @@ class _CsrcPortOutputEntry:
         self.busy = False
 
 
-def _acquire_csrc_port_outputs(device, B, T, H):
+def _acquire_exact_port_outputs(device, B, T, H):
     shape = (B, T, H, BT)
     specs = ((shape, torch.bfloat16), (shape, torch.bfloat16), (shape, torch.float32))
     nbytes = sum(dtype.itemsize * torch.Size(tensor_shape).numel() for tensor_shape, dtype in specs)
-    if nbytes > _MAX_CSRC_PORT_POOLED_BYTES:
+    if nbytes > _MAX_EXACT_PORT_POOLED_BYTES:
         return None, tuple(torch.empty(tensor_shape, dtype=dtype, device=device) for tensor_shape, dtype in specs)
 
     stream_ptr = int(torch.cuda.current_stream(device).cuda_stream)
-    pool = _CSRC_PORT_OUTPUT_POOLS.setdefault((device.index, stream_ptr), [])
+    pool = _EXACT_PORT_OUTPUT_POOLS.setdefault((device.index, stream_ptr), [])
     for entry in pool:
         if entry.is_free() and entry.specs == specs:
             return entry, entry.acquire()
     pool[:] = [entry for entry in pool if not entry.is_free()]
-    entry = _CsrcPortOutputEntry(specs, device)
+    entry = _ExactPortOutputEntry(specs, device)
     pool.append(entry)
     return entry, entry.acquire()
 
 
-def _export_csrc_port_outputs(entry, A_qk, A_kk):
+def _export_exact_port_outputs(entry, A_qk, A_kk):
     if entry is None:
         return A_qk, A_kk
     outputs = (A_qk.view_as(A_qk), A_kk.view_as(A_kk))
@@ -2950,12 +2950,12 @@ def chunk_kda_fwd_intra_sm100_from_gk(
     use_tf32_inverse: bool = True,
     fp32_akk_inv: bool = True,
 ):
-    """CuTeDSL port of the csrc intra API.
+    """CuTeDSL implementation of the exact SM100 intra contract.
 
     Unlike :func:`chunk_kda_fwd_intra_sm100_equal`, this entry point consumes
     the already activated and chunk-cumsummed FP32 ``gk`` tensor, exactly like
-    ``chunk_kda_fwd_intra_cuda``. It deliberately preserves the csrc kernel
-    boundary; gate fusion is not part of this correctness baseline.
+    the former SM100 native API. It deliberately preserves that kernel
+    boundary; gate fusion is not part of this exactness baseline.
 
     ``fp32_akk_inv=True`` keeps the pre-inverse Akk workspace in FP32 and runs
     the standalone TF32 inverse. ``fp32_akk_inv=False`` enables the matching
@@ -3016,19 +3016,19 @@ def chunk_kda_fwd_intra_sm100_from_gk(
 
         NT = chunk_indices.shape[0]
         dev = q.device.index if q.device.index is not None else 0
-        cache_key = ("csrc_port_varlen", dev, T_padded, NT, H_qk, H_v, beta.dtype, fp32_akk_inv)
-        output_entry, (A_qk, A_kk, A_kk_workspace) = _acquire_csrc_port_outputs(q.device, 1, T_padded, H_v)
+        cache_key = ("exact_port_varlen", dev, T_padded, NT, H_qk, H_v, beta.dtype, fp32_akk_inv)
+        output_entry, (A_qk, A_kk, A_kk_workspace) = _acquire_exact_port_outputs(q.device, 1, T_padded, H_v)
         wrap_output = _ct_cached if output_entry is not None else _ct_uncached
 
         q_ct = _ct_uncached(q_pad, cutlass.BFloat16)
         k_ct = _ct_uncached(k_pad, cutlass.BFloat16)
         gk_in_ct = _ct_uncached(gk_pad, cutlass.Float32)
-        alog_ct = _ct_cached(_get_csrc_port_dummy_alog(q.device, H_v), cutlass.Float32)
+        alog_ct = _ct_cached(_get_exact_port_dummy_alog(q.device, H_v), cutlass.Float32)
         beta_type = cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16
         beta_ct = _ct_uncached(beta_pad, beta_type)
         # The FP32-gk specialization does not materialize these K1 outputs,
         # but the shared kernel ABI still carries their tensors.
-        dummy_bf16, dummy_fp32 = _get_csrc_port_dummy_outputs(q.device)
+        dummy_bf16, dummy_fp32 = _get_exact_port_dummy_outputs(q.device)
         ks_ct = _ct_cached(dummy_bf16, cutlass.BFloat16)
         kg_ct = ks_ct
         qs_ct = ks_ct
@@ -3037,7 +3037,7 @@ def chunk_kda_fwd_intra_sm100_from_gk(
         akk_ct = wrap_output(A_kk_workspace, cutlass.Float32)
         cu_ct = _ct_uncached(cu_seqlens, cutlass.Int32)
         ci_ct = _ct_uncached(chunk_indices, cutlass.Int32)
-        bias_ct = _ct_cached(_get_csrc_port_dummy_bias(q.device, H_v), cutlass.Float32)
+        bias_ct = _ct_cached(_get_exact_port_dummy_bias(q.device, H_v), cutlass.Float32)
         ct_args = (
             q_ct,
             k_ct,
@@ -3091,7 +3091,7 @@ def chunk_kda_fwd_intra_sm100_from_gk(
             if output_entry is not None:
                 output_entry.release_after_error()
             raise
-        return _export_csrc_port_outputs(
+        return _export_exact_port_outputs(
             output_entry,
             A_qk[:, :T_flat].view(B, T_total, H_v, BT),
             A_kk[:, :T_flat].view(B, T_total, H_v, BT),
@@ -3099,17 +3099,17 @@ def chunk_kda_fwd_intra_sm100_from_gk(
 
     NT = T_total // BT
     dev = q.device.index if q.device.index is not None else 0
-    cache_key = ("csrc_port", dev, B, NT, H_qk, H_v, beta.dtype, fp32_akk_inv)
-    output_entry, (A_qk, A_kk, A_kk_workspace) = _acquire_csrc_port_outputs(q.device, B, T_total, H_v)
+    cache_key = ("exact_port", dev, B, NT, H_qk, H_v, beta.dtype, fp32_akk_inv)
+    output_entry, (A_qk, A_kk, A_kk_workspace) = _acquire_exact_port_outputs(q.device, B, T_total, H_v)
     wrap_output = _ct_cached if output_entry is not None else _ct_uncached
 
     q_ct = _ct_uncached(q, cutlass.BFloat16)
     k_ct = _ct_uncached(k, cutlass.BFloat16)
     gk_in_ct = _ct_uncached(gk, cutlass.Float32)
-    alog_ct = _ct_cached(_get_csrc_port_dummy_alog(q.device, H_v), cutlass.Float32)
+    alog_ct = _ct_cached(_get_exact_port_dummy_alog(q.device, H_v), cutlass.Float32)
     beta_type = cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16
     beta_ct = _ct_uncached(beta, beta_type)
-    dummy_bf16, dummy_fp32 = _get_csrc_port_dummy_outputs(q.device)
+    dummy_bf16, dummy_fp32 = _get_exact_port_dummy_outputs(q.device)
     ks_ct = _ct_cached(dummy_bf16, cutlass.BFloat16)
     kg_ct = ks_ct
     qs_ct = ks_ct
@@ -3118,7 +3118,7 @@ def chunk_kda_fwd_intra_sm100_from_gk(
     akk_storage = A_kk_workspace if fp32_akk_inv else A_kk
     akk_ct = wrap_output(akk_storage, cutlass.Float32 if fp32_akk_inv else cutlass.BFloat16)
     cu_ct, ci_ct = _get_eqlen_dummies(q.device)
-    bias_ct = _ct_cached(_get_csrc_port_dummy_bias(q.device, H_v), cutlass.Float32)
+    bias_ct = _ct_cached(_get_exact_port_dummy_bias(q.device, H_v), cutlass.Float32)
 
     ct_args = (
         q_ct,
@@ -3173,7 +3173,7 @@ def chunk_kda_fwd_intra_sm100_from_gk(
         if output_entry is not None:
             output_entry.release_after_error()
         raise
-    return _export_csrc_port_outputs(output_entry, A_qk, A_kk)
+    return _export_exact_port_outputs(output_entry, A_qk, A_kk)
 
 
 def chunk_kda_fwd_intra_sm100_varlen(

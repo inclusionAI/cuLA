@@ -69,13 +69,11 @@ def get_features_args():
 USE_FAST_MATH = os.getenv("CULA_USE_FAST_MATH", "1") == "1"
 
 if os.getenv("CULA_BUILD_ALL_ARCHS", "0") == "1":
-    print("CULA_BUILD_ALL_ARCHS=1: enabling all SM targets (sm90a, sm100a, sm103a)")
+    print("CULA_BUILD_ALL_ARCHS=1: enabling the SM90 native extension; SM100/SM103 use CuTeDSL JIT")
 else:
     print("Detecting GPU architectures...")
 
 _has_sm100, _has_sm103, _has_sm90 = detect_gpu_archs()
-DISABLE_SM100 = resolve_disable_flag("CULA_DISABLE_SM100", _has_sm100)
-DISABLE_SM103 = resolve_disable_flag("CULA_DISABLE_SM103", _has_sm103)
 DISABLE_SM90 = resolve_disable_flag("CULA_DISABLE_SM90", _has_sm90)
 
 
@@ -92,37 +90,10 @@ def get_nvcc_version() -> tuple[int, int]:
     return major, minor
 
 
-def nvcc_supports_blackwell() -> bool:
-    """Return ``True`` if the current NVCC version is >= 12.9, which is
-    required for compiling SM100/SM103 (Blackwell) kernels.
-
-    This is a **build-time** utility.  For runtime Blackwell device checks,
-    see :func:`cula.utils.is_blackwell` and :func:`cula.utils.assert_blackwell`.
-    """
-    major, minor = get_nvcc_version()
-    return major > 12 or (major == 12 and minor >= 9)
-
-
-def assert_blackwell_build_env() -> None:
-    """Assert that the build environment can compile Blackwell (SM100/SM103) kernels.
-
-    Raises ``AssertionError`` when NVCC < 12.9 and Blackwell targets have not
-    been explicitly disabled via ``CULA_DISABLE_SM100`` / ``CULA_DISABLE_SM103``.
-    """
-    if not nvcc_supports_blackwell():
-        assert DISABLE_SM100 and DISABLE_SM103, (
-            "sm100/sm103 compilation requires NVCC 12.9 or higher. "
-            "Please set CULA_DISABLE_SM100=1 and CULA_DISABLE_SM103=1 to disable them, "
-            "or update your environment."
-        )
-
-
 def get_nvcc_thread_args():
     nvcc_threads = os.getenv("NVCC_THREADS") or "32"
     return ["--threads", nvcc_threads]
 
-
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -155,40 +126,12 @@ include_dirs = [
     Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
 ]
 
-major, minor = get_nvcc_version()
-print(f"Compiling using NVCC {major}.{minor}")
-assert_blackwell_build_env()
-
 ext_modules = []
 
-if not DISABLE_SM100 or not DISABLE_SM103:
-    sm100_arch_flags = []
-    if not DISABLE_SM100:
-        sm100_arch_flags.extend(["-gencode", "arch=compute_100a,code=sm_100a", "-DCULA_SM100_ENABLED"])
-    if not DISABLE_SM103:
-        sm100_arch_flags.extend(["-gencode", "arch=compute_103a,code=sm_103a", "-DCULA_SM103_ENABLED"])
-
-    ext_modules.append(
-        CUDAExtension(
-            name="cula._cudac_sm100",
-            sources=[
-                "csrc/api/kda_sm100.cu",
-                "csrc/api/pybind_sm100.cu",
-                "csrc/kda/sm100/kda_fwd_sm100.cu",
-            ],
-            extra_compile_args={
-                "cxx": cxx_args + get_features_args(),
-                "nvcc": nvcc_common_args
-                + get_features_args()
-                + sm100_arch_flags
-                + get_nvcc_thread_args()
-                + (["--use_fast_math"] if USE_FAST_MATH else []),
-            },
-            include_dirs=include_dirs,
-        )
-    )
-
 if not DISABLE_SM90:
+    subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
+    major, minor = get_nvcc_version()
+    print(f"Compiling the SM90 extension using NVCC {major}.{minor}")
     sm90_arch_flags = ["-gencode", "arch=compute_90a,code=sm_90a", "-DCULA_SM90A_ENABLED"]
 
     ext_modules.append(

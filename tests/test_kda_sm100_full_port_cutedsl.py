@@ -98,10 +98,19 @@ def test_full_port_does_not_retain_per_call_outputs():
     assert allocated_after <= allocated_before + 1024 * 1024
 
 
-def test_public_gva_dispatch_uses_stable_modular_path():
+def test_public_gva_dispatch_is_bitwise():
     _requires_sm100()
     inputs = _inputs(29, h_qk=2, h_v=4)
     q, k, v, gk, beta = inputs
+    actual = chunk_kda_fwd_intra(q, k, v, gk, beta, safe_gate=True)
+    expected = _separate(inputs)
+    _assert_bitwise(expected, actual)
+
+
+def test_public_batch_one_dispatch_uses_stable_modular_path():
+    _requires_sm100()
+    q, k, v, gk, beta = (tensor[:1] for tensor in _inputs(31))
+    inputs = (q, k, v, gk, beta)
     actual = chunk_kda_fwd_intra(q, k, v, gk, beta, safe_gate=True)
     expected = _separate(inputs)
     _assert_bitwise(expected, actual)

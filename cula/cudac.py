@@ -14,14 +14,12 @@
 
 """Unified interface to per-architecture CUDA extensions.
 
-Downstream code can continue to use ``import cula.cudac as cula_cuda``
-and call ``cula_cuda.kda_fwd_prefill(...)`` or
-``cula_cuda.chunk_kda_fwd_intra_cuda(...)`` without knowing which
-extension provides the function.
+This module exposes the remaining SM90 native extension. SM100/SM103 KDA
+forward uses the public CuTeDSL path and no longer ships a CUDA extension.
 
 Loading is **once per process**: the first attribute access checks the
-currently active CUDA device, imports the matching ``cula._cudac_sm*``
-extension, and caches the discovered callables on the module instance.
+currently active CUDA device, imports ``cula._cudac_sm90`` when applicable,
+and caches the discovered callables on the module instance.
 Changing the active CUDA device to a different architecture after a
 process has already loaded ``cula.cudac`` will therefore not be picked
 up -- callers that need a different extension must restart Python.
@@ -45,11 +43,14 @@ def _current_device_extension() -> tuple[str, str]:
     device = torch.cuda.current_device()
     prop = torch.cuda.get_device_properties(device)
     sm_label = f"sm_{prop.major}{prop.minor}"
-    if prop.major == 10 and prop.minor in (0, 3):
-        return "cula._cudac_sm100", sm_label
     if prop.major == 9 and prop.minor == 0:
         return "cula._cudac_sm90", sm_label
-    raise RuntimeError(f"Unsupported CUDA compute capability {sm_label}. Supported architectures: sm_100, sm_103, sm_90.")
+    if prop.major == 10 and prop.minor in (0, 3):
+        raise RuntimeError(
+            f"{sm_label} KDA kernels use CuTeDSL and do not provide a cula.cudac extension; "
+            "call the public cula.kda APIs instead."
+        )
+    raise RuntimeError(f"Unsupported CUDA compute capability {sm_label}. The native extension supports sm_90 only.")
 
 
 class _CudacProxy(ModuleType):

@@ -20,7 +20,7 @@ Linear attention mechanisms reformulate standard attention to use linear-time st
 
 cuLA supports both **Hopper (SM90)** and **Blackwell (SM10X)** GPUs.
 
-> **Requirements (Hopper & Blackwell):** Python 3.12+, CUDA Toolkit 12.9+ (SM10X support), NVCC 12.9+, PyTorch 2.9.1+
+> **Requirements (Hopper & Blackwell):** Python 3.12+, CUDA Toolkit 12.9+, PyTorch 2.9.1+. Building the optional SM90 native extension also requires NVCC.
 
 > **Note:** The PyTorch CUDA version must match your system CUDA Toolkit version. Check with `nvcc --version` and `python -c "import torch; print(torch.version.cuda)"`.
 
@@ -57,7 +57,7 @@ pip install -e third_party/flash-linear-attention
 pip install -e . --no-build-isolation
 ```
 
-**Build fat wheel (SM90 + SM100 + SM103):**
+**Build a wheel with the SM90 extension (SM100/SM103 use CuTeDSL JIT):**
 
 ```bash
 CULA_BUILD_ALL_ARCHS=1 python -m build --wheel --no-isolation

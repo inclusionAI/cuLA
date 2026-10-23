@@ -13,11 +13,11 @@ from cula.ops.kda.sm100.akk_inv_fp32 import akk_inv_fp32_physical_host
 from cula.ops.kda.sm100.intra_fused import (
     BT,
     K_DIM,
-    _acquire_csrc_port_outputs,
-    _export_csrc_port_outputs,
-    _get_csrc_port_dummy_alog,
-    _get_csrc_port_dummy_bias,
-    _get_csrc_port_dummy_outputs,
+    _acquire_exact_port_outputs,
+    _export_exact_port_outputs,
+    _get_exact_port_dummy_alog,
+    _get_exact_port_dummy_bias,
+    _get_exact_port_dummy_outputs,
     make_host_function,
 )
 from cula.ops.kda.sm100.recompute_wu import (
@@ -142,44 +142,39 @@ def _compile_full_port(device, batch, length, h_qk, h_v, beta_dtype, scale):
     if compiled is not None:
         return compiled
 
-    # Keep the FFI batch dimension symbolic even though the generated host
-    # captures the concrete launch geometry.  A static extent of one is
-    # folded out of compact fake tensors by the DSL type builder and can make
-    # the composed host's tensor ABI inconsistent with a real rank-4 tensor.
-    fake_batch = cute.sym_int()
     bf16_4d_qk = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (fake_batch, length, h_qk, K_DIM),
+        (batch, length, h_qk, K_DIM),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     bf16_4d_v = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (fake_batch, length, h_v, K_DIM),
+        (batch, length, h_v, K_DIM),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     fp32_gk = make_fake_compact_tensor(
         cutlass.Float32,
-        (fake_batch, length, h_v, K_DIM),
+        (batch, length, h_v, K_DIM),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     beta_fake = make_fake_compact_tensor(
         cutlass.Float32 if beta_dtype == torch.float32 else cutlass.BFloat16,
-        (fake_batch, length, h_v),
+        (batch, length, h_v),
         stride_order=(2, 1, 0),
         assumed_align=128,
     )
     bf16_A = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (fake_batch, length, h_v, BT),
+        (batch, length, h_v, BT),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     fp32_A = make_fake_compact_tensor(
         cutlass.Float32,
-        (fake_batch, length, h_v, BT),
+        (batch, length, h_v, BT),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
@@ -232,12 +227,12 @@ def chunk_kda_fwd_full_sm100_from_gk(q, k, v, gk, beta, scale):
     h_v = v.shape[2]
     if dim != K_DIM or v.shape[-1] != K_DIM:
         raise NotImplementedError("the SM100 full port requires K=V=128")
-    if h_qk != h_v:
-        raise NotImplementedError("the single-dispatch SM100 full port currently requires matching QK and V heads")
+    if batch < 2:
+        raise NotImplementedError("the single-dispatch SM100 full port currently requires batch size >= 2")
     if length % (4 * BT):
         raise NotImplementedError("the full-port fast path requires T to be divisible by 256")
 
-    intra_entry, (Aqk, Akk, Akk_workspace) = _acquire_csrc_port_outputs(q.device, batch, length, h_v)
+    intra_entry, (Aqk, Akk, Akk_workspace) = _acquire_exact_port_outputs(q.device, batch, length, h_v)
     wu_entry, (w, u, kg) = _acquire_output_buffers(
         q.device,
         (
@@ -246,10 +241,10 @@ def chunk_kda_fwd_full_sm100_from_gk(q, k, v, gk, beta, scale):
             ((batch, length, h_v, K_DIM), q.dtype),
         ),
     )
-    dummy_alog = _get_csrc_port_dummy_alog(q.device, h_v)
-    dummy_bf16, dummy_fp32 = _get_csrc_port_dummy_outputs(q.device)
+    dummy_alog = _get_exact_port_dummy_alog(q.device, h_v)
+    dummy_bf16, dummy_fp32 = _get_exact_port_dummy_outputs(q.device)
     cu_seqlens, chunk_indices = _get_full_metadata(q.device)
-    dummy_bias = _get_csrc_port_dummy_bias(q.device, h_v)
+    dummy_bias = _get_exact_port_dummy_bias(q.device, h_v)
     compiled = _compile_full_port(q.device, batch, length, h_qk, h_v, beta.dtype, scale)
     try:
         compiled(
@@ -278,6 +273,6 @@ def chunk_kda_fwd_full_sm100_from_gk(q, k, v, gk, beta, scale):
             wu_entry.release_after_error()
         raise
 
-    Aqk, Akk = _export_csrc_port_outputs(intra_entry, Aqk, Akk)
+    Aqk, Akk = _export_exact_port_outputs(intra_entry, Aqk, Akk)
     w, u, kg = _export_output_buffers(wu_entry, (w, u, kg))
     return w, u, None, kg, Aqk, Akk
