@@ -1047,7 +1047,10 @@ class _OutputPoolEntry:
         self.specs = specs
         self.buffers = tuple(torch.empty(shape, dtype=dtype, device=device) for shape, dtype in specs)
         self.busy = False
-        self.remaining = 0
+        self.output_refs = ()
+
+    def is_free(self):
+        return not self.busy and all(ref() is None for ref in self.output_refs)
 
     def acquire(self):
         if self.busy:
@@ -1056,25 +1059,12 @@ class _OutputPoolEntry:
         return self.buffers
 
     def attach(self, outputs):
-        self.remaining = len(outputs)
-        for output in outputs:
-            weakref.finalize(output, self._release_one)
+        self.output_refs = tuple(weakref.ref(output) for output in outputs)
+        self.busy = False
 
     def release_after_error(self):
-        self.remaining = 0
         self.busy = False
-        self._prune_extra_free_entries()
-
-    def _release_one(self):
-        self.remaining -= 1
-        if self.remaining == 0:
-            self.busy = False
-            self._prune_extra_free_entries()
-
-    def _prune_extra_free_entries(self):
-        for entry in tuple(self.pool):
-            if entry is not self and not entry.busy:
-                self.pool.remove(entry)
+        self.output_refs = ()
 
 
 def _output_specs_nbytes(specs):
@@ -1090,10 +1080,10 @@ def _acquire_output_buffers(device, specs):
     stream_ptr = int(torch.cuda.current_stream(device).cuda_stream)
     pool = _output_pools.setdefault((device.index, stream_ptr), [])
     for entry in pool:
-        if not entry.busy and entry.specs == specs:
+        if entry.is_free() and entry.specs == specs:
             return entry, entry.acquire()
 
-    pool[:] = [entry for entry in pool if entry.busy]
+    pool[:] = [entry for entry in pool if not entry.is_free()]
     entry = _OutputPoolEntry(pool, specs, device)
     pool.append(entry)
     return entry, entry.acquire()
