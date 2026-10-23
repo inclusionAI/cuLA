@@ -33,6 +33,7 @@ Warp assignment:
 
 import weakref
 
+import cuda.bindings.driver as cuda_drv
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -213,6 +214,76 @@ class KDARecomputeWU:
             data_bidx = i_b
             remaining = Int32(BT)
         return i_b, i_t, i_h, tok_offset, data_bidx, remaining
+
+    @cute.jit
+    def run_from_ptrs(
+        self,
+        k_addr: Int64,
+        v_addr: Int64,
+        beta_addr: Int64,
+        A_addr: Int64,
+        gk_addr: Int64,
+        w_addr: Int64,
+        u_addr: Int64,
+        kg_addr: Int64,
+        cu_seqlens_addr: Int64,
+        chunk_indices_addr: Int64,
+        problem_size: tuple[Int32, Int32, Int32, Int32, Int32, Int32],
+        total_nt: Int32,
+        stream,
+    ):
+        """Pointer-only launch boundary avoiding per-call DLPack conversion.
+
+        The kernel constructs every logical layout from ``problem_size`` and
+        only consumes the input tensors' base pointers.  Passing those
+        pointers directly preserves the exact generated kernel while letting
+        call-owned output tensors follow normal PyTorch allocator lifetime.
+        """
+
+        self(
+            cute.make_tensor(
+                cute.make_ptr(self.io_dtype, k_addr, cute.AddressSpace.gmem, assumed_align=16), cute.make_layout(1)
+            ),
+            cute.make_tensor(
+                cute.make_ptr(self.io_dtype, v_addr, cute.AddressSpace.gmem, assumed_align=16), cute.make_layout(1)
+            ),
+            cute.make_tensor(
+                cute.make_ptr(self.beta_dtype, beta_addr, cute.AddressSpace.gmem, assumed_align=16),
+                cute.make_layout(1),
+            ),
+            cute.make_tensor(
+                cute.make_ptr(self.io_dtype, A_addr, cute.AddressSpace.gmem, assumed_align=16), cute.make_layout(1)
+            ),
+            cute.make_tensor(
+                cute.make_ptr(
+                    self.io_dtype if self.preprocessed_k else self.acc_dtype,
+                    gk_addr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
+                cute.make_layout(1),
+            ),
+            cute.make_tensor(
+                cute.make_ptr(self.io_dtype, w_addr, cute.AddressSpace.gmem, assumed_align=16), cute.make_layout(1)
+            ),
+            cute.make_tensor(
+                cute.make_ptr(self.io_dtype, u_addr, cute.AddressSpace.gmem, assumed_align=16), cute.make_layout(1)
+            ),
+            cute.make_tensor(
+                cute.make_ptr(self.io_dtype, kg_addr, cute.AddressSpace.gmem, assumed_align=16), cute.make_layout(1)
+            ),
+            cute.make_tensor(
+                cute.make_ptr(cutlass.Int32, cu_seqlens_addr, cute.AddressSpace.gmem, assumed_align=16),
+                cute.make_layout(1),
+            ),
+            cute.make_tensor(
+                cute.make_ptr(cutlass.Int32, chunk_indices_addr, cute.AddressSpace.gmem, assumed_align=16),
+                cute.make_layout(1),
+            ),
+            problem_size,
+            total_nt,
+            stream,
+        )
 
     @cute.jit
     def __call__(
@@ -1030,7 +1101,9 @@ class KDARecomputeWU:
 # ============================================================================
 
 _recompute_wu_cache = {}
+_recompute_wu_ptr_cache = {}
 _qg_cache = {}
+_cuda_stream_cache = {}
 _dummy_cu_seqlens = None
 _dummy_chunk_indices = None
 _uniform_cu_cache = {}
@@ -1250,6 +1323,97 @@ def _compile_recompute_wu(
     return compiled_fn
 
 
+def _compile_recompute_wu_ptrs(
+    H_qk,
+    H_v,
+    K,
+    V,
+    chunk_size=64,
+    block_k=None,
+    block_v=None,
+    persistent=True,
+    is_varlen=False,
+    beta_dtype=cutlass.Float32,
+    preprocessed_k=False,
+):
+    """Compile the same kernel behind a scalar-pointer launch boundary."""
+    key = (
+        H_qk,
+        H_v,
+        K,
+        V,
+        chunk_size,
+        block_k,
+        block_v,
+        persistent,
+        is_varlen,
+        beta_dtype,
+        preprocessed_k,
+        USE_FAST_MATH,
+    )
+    compiled = _recompute_wu_ptr_cache.get(key)
+    if compiled is not None:
+        return compiled
+
+    kernel_obj = KDARecomputeWU(
+        K=K,
+        V=V,
+        chunk_size=chunk_size,
+        block_k=block_k,
+        block_v=block_v,
+        beta_dtype=beta_dtype,
+        is_varlen=is_varlen,
+        preprocessed_k=preprocessed_k,
+        use_fast_math=USE_FAST_MATH,
+    )
+    zero = Int64(0)
+    compiled = cute.compile(
+        kernel_obj.run_from_ptrs,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        (Int32(1), Int32(1), Int32(H_qk), Int32(H_v), Int32(K), Int32(V)),
+        Int32(1),
+        make_fake_stream(),
+    )
+    _recompute_wu_ptr_cache[key] = compiled
+    return compiled
+
+
+def _current_cuda_stream(device):
+    stream_ptr = int(torch.cuda.current_stream(device).cuda_stream)
+    stream = _cuda_stream_cache.get(stream_ptr)
+    if stream is None:
+        stream = cuda_drv.CUstream(stream_ptr)
+        _cuda_stream_cache[stream_ptr] = stream
+    return stream
+
+
+def _launch_recompute_wu_ptrs(compiled, k, v, beta, A, gk, w, u, kg, cu, ci, problem_size, total_nt):
+    compiled(
+        Int64(k.data_ptr()),
+        Int64(v.data_ptr()),
+        Int64(beta.data_ptr()),
+        Int64(A.data_ptr()),
+        Int64(gk.data_ptr()),
+        Int64(w.data_ptr()),
+        Int64(u.data_ptr()),
+        Int64(kg.data_ptr()),
+        Int64(cu.data_ptr()),
+        Int64(ci.data_ptr()),
+        problem_size,
+        Int32(total_nt),
+        _current_cuda_stream(k.device),
+    )
+
+
 # ============================================================================
 # Public API
 # ============================================================================
@@ -1361,7 +1525,7 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
     u = torch.empty_like(v)
     kg = torch.empty_like(w)
 
-    compiled_fn = _compile_recompute_wu(
+    compiled_fn = _compile_recompute_wu_ptrs(
         H_qk,
         H_v,
         K,
@@ -1373,7 +1537,7 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
         beta_dtype=cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16,
     )
 
-    compiled_fn(k, v, beta, A, gk, w, u, kg, cu_s, ci_s, ps, Int32(total_nt))
+    _launch_recompute_wu_ptrs(compiled_fn, k, v, beta, A, gk, w, u, kg, cu_s, ci_s, ps, total_nt)
 
     if restore_flat_packed:
         w, u, kg = (x.flatten(0, 1).unsqueeze(0) for x in (w, u, kg))
@@ -1444,7 +1608,7 @@ def recompute_w_u_from_preprocessed(
 
     w = torch.empty_like(k_scaled)
     u = torch.empty_like(v)
-    compiled_fn = _compile_recompute_wu(
+    compiled_fn = _compile_recompute_wu_ptrs(
         H,
         H,
         K,
@@ -1459,7 +1623,21 @@ def recompute_w_u_from_preprocessed(
 
     # gk and kg are unused compile-signature placeholders for this
     # specialization. Reusing existing bf16 buffers avoids extra allocations.
-    compiled_fn(k_scaled, v, beta, A, k_scaled, w, u, w, cu_s, ci_s, ps, Int32(total_nt))
+    _launch_recompute_wu_ptrs(
+        compiled_fn,
+        k_scaled,
+        v,
+        beta,
+        A,
+        k_scaled,
+        w,
+        u,
+        w,
+        cu_s,
+        ci_s,
+        ps,
+        total_nt,
+    )
 
     if restore_packed:
         w, u = (x.flatten(0, 1).unsqueeze(0) for x in (w, u))
