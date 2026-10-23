@@ -13,12 +13,12 @@ from cula.kda.chunk_intra import chunk_kda_fwd_intra
 pytestmark = pytest.mark.cula_slow
 
 _CSRC_SHA256 = {
-    (torch.float32, "mha"): "b4fc1c3e4f98beb7c372c050465cfea30e6deec1c4f9a39e4e7c1295cd3b65a5",
-    (torch.float32, "gva_varlen"): "a0349594fa31fbc78c79f43d3c88883413197cc8acbc98a1c87597e70d3dc214",
-    (torch.float32, "tail"): "3241a28b76ea1e752de642e7872a739022973a08d9be25f9736ede3163004eff",
-    (torch.bfloat16, "mha"): "0668ccdd9eb7b6999ee69581a23877177fd4f01d39e172fd4d230fe11a743ddb",
-    (torch.bfloat16, "gva_varlen"): "1dadb1ed9712abd9c0fbaf067db37f110afdb58b9e3eca08ad951f5ccf11597c",
-    (torch.bfloat16, "tail"): "e750eb9df65f9fe15dd4ccf0ee87b8480d4eb4e75fe2c6b7f7ba45893996918f",
+    (torch.float32, "mha"): "106ea353dc56f883005d039481bb0bd4c1db6e5c6816c9a9524101271779d26d",
+    (torch.float32, "gva_varlen"): "22d07fdbbd4c7e2593a9a3e862dd6b73f898e384ace1d1af47c7cdc7769889c2",
+    (torch.float32, "tail"): "56a93b44f09ccc26611e370ec68de243e5ebcb34eeafd193dc04c3c01ab0a32f",
+    (torch.bfloat16, "mha"): "124605da8d60287ec41ed63f8e4afcdc468fdf3183da87426d7e43ce5d073790",
+    (torch.bfloat16, "gva_varlen"): "7aea0a7eedc5832b5d68f9a8b5d82323dce5ffdb97b0e3078bd9c0dc4b201f42",
+    (torch.bfloat16, "tail"): "e7df48c614161effdd7ab1829c5f77198ac3f79c275d3187961252cbd7ae9264",
 }
 
 _CASES = {
@@ -54,7 +54,10 @@ def test_pure_cutedsl_matches_frozen_csrc_bits(beta_dtype, case_name):
     k = torch.randn(batch, length, h_qk, dim, device="cuda", dtype=torch.bfloat16) * 0.1
     v = torch.randn(batch, length, h_v, dim, device="cuda", dtype=torch.bfloat16) * 0.1
     gk = torch.randn(batch, length, h_v, dim, device="cuda", dtype=torch.float32) * 0.02
-    beta = torch.rand(batch, length, h_v, device="cuda", dtype=beta_dtype)
+    # Generate in FP32 before casting so the frozen BF16 vectors do not
+    # contain exact zeros. IEEE +0/-0 are value-equivalent, but a raw SHA256
+    # intentionally treats their sign bits as different.
+    beta = torch.randn(batch, length, h_v, device="cuda").sigmoid().to(beta_dtype)
 
     cu_seqlens = None
     if case_name == "gva_varlen":
