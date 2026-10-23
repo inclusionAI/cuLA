@@ -116,7 +116,6 @@ def _invert_diag_forward16(sAkk: cute.Tensor, block_idx, tidx, *, loc=None, ip=N
     for src_row in range(SB - 1):
         row_scale = -row[src_row]
         target_lane = group_base + src_row
-        active = cutlass.Float32(tid_in_group > src_row)
         for i in range(src_row):
             src_row_value = cute.arch.shuffle_sync_op(
                 value=row[i],
@@ -124,8 +123,8 @@ def _invert_diag_forward16(sAkk: cute.Tensor, block_idx, tidx, *, loc=None, ip=N
                 mask=0xFFFFFFFF,
                 mask_and_clamp=31,
             )
-            row[i] = row[i] + active * row_scale * src_row_value
-        row[src_row] = active * row_scale + (cutlass.Float32(1.0) - active) * row[src_row]
+            row[i] = cutlass.select_(tid_in_group > src_row, row_scale * src_row_value + row[i], row[i])
+        row[src_row] = cutlass.select_(tid_in_group > src_row, row_scale, row[src_row])
 
     for i in range(SB):
         sAkk[base + tid_in_group, base + i] = row[i]
