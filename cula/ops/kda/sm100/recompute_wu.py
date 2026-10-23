@@ -1030,9 +1030,97 @@ class KDARecomputeWU:
 # ============================================================================
 
 _recompute_wu_cache = {}
+_qg_cache = {}
 _dummy_cu_seqlens = None
 _dummy_chunk_indices = None
 _uniform_cu_cache = {}
+
+_QG_THREADS = 256
+
+
+@cute.kernel
+def _qg_kernel(
+    q: cute.Tensor,
+    gk: cute.Tensor,
+    qg: cute.Tensor,
+    problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
+):
+    B, T, H_qk, H_v, K = problem_size
+    tidx, _, _ = cute.arch.thread_idx()
+    block_idx, _, _ = cute.arch.block_idx()
+    grid_dim = cute.arch.grid_dim()[0]
+    linear = block_idx * _QG_THREADS + tidx
+    total = B * T * H_v * K
+    stride = grid_dim * _QG_THREADS
+    heads_per_group = H_v // H_qk
+
+    for idx in cutlass.range(linear, total, stride, unroll=0):
+        d = idx % K
+        coord = idx // K
+        h_v = coord % H_v
+        coord = coord // H_v
+        t = coord % T
+        b = coord // T
+        h_qk = h_v // heads_per_group
+        value = cutlass.Float32(q[b, t, h_qk, d]) * cute.exp2(gk[b, t, h_v, d], fastmath=USE_FAST_MATH)
+        qg[b, t, h_v, d] = value.to(cutlass.BFloat16)
+
+
+@cute.jit
+def _qg_host(
+    q: cute.Tensor,
+    gk: cute.Tensor,
+    qg: cute.Tensor,
+    problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
+    stream,
+):
+    B, T, H_qk, H_v, K = problem_size
+    total = B * T * H_v * K
+    grid = (total + _QG_THREADS - 1) // _QG_THREADS
+    _qg_kernel(q, gk, qg, problem_size).launch(grid=(grid, 1, 1), block=(_QG_THREADS, 1, 1), stream=stream)
+
+
+def _compile_qg(H_qk: int, H_v: int, K: int):
+    key = (H_qk, H_v, K, USE_FAST_MATH)
+    compiled = _qg_cache.get(key)
+    if compiled is not None:
+        return compiled
+
+    sym_b = cute.sym_int()
+    sym_t = cute.sym_int()
+    q_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_b, sym_t, H_qk, K), stride_order=(3, 2, 1, 0), assumed_align=128)
+    gk_fake = make_fake_compact_tensor(cutlass.Float32, (sym_b, sym_t, H_v, K), stride_order=(3, 2, 1, 0), assumed_align=128)
+    qg_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_b, sym_t, H_v, K), stride_order=(3, 2, 1, 0), assumed_align=128)
+    compiled = cute.compile(
+        _qg_host,
+        q_fake,
+        gk_fake,
+        qg_fake,
+        (Int32(1), Int32(1), Int32(H_qk), Int32(H_v), Int32(K)),
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+    _qg_cache[key] = compiled
+    return compiled
+
+
+def _compute_qg(q: torch.Tensor, gk: torch.Tensor) -> torch.Tensor:
+    restore_3d = q.dim() == 3
+    if restore_3d:
+        q = q.unsqueeze(0)
+        gk = gk.unsqueeze(0)
+    if q.dim() != 4 or gk.dim() != 4:
+        raise ValueError("q and gk must both have rank 3 or rank 4")
+    B, T, H_qk, K = q.shape
+    H_v = gk.shape[2]
+    if gk.shape != (B, T, H_v, K):
+        raise ValueError(f"gk must have shape {(B, T, H_v, K)}, got {tuple(gk.shape)}")
+    if H_qk <= 0 or H_v <= 0 or H_v % H_qk != 0:
+        raise ValueError(f"H_v ({H_v}) must be a positive multiple of H_qk ({H_qk})")
+    qg = torch.empty((B, T, H_v, K), device=q.device, dtype=q.dtype)
+    compiled = _compile_qg(H_qk, H_v, K)
+    compiled(q, gk, qg, (Int32(B), Int32(T), Int32(H_qk), Int32(H_v), Int32(K)))
+    return qg.squeeze(0) if restore_3d else qg
 
 
 def _uniform_problem(cu_seqlens: torch.Tensor) -> tuple[int, int] | None:
@@ -1167,13 +1255,20 @@ def _compile_recompute_wu(
 # ============================================================================
 
 
-def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, block_k=None, block_v=None):
+def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, block_k=None, block_v=None, q=None):
     if k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
         raise TypeError("k and v must be bfloat16")
     if gk.dtype != torch.float32:
         raise TypeError("gk must be float32")
     if beta.dtype not in (torch.bfloat16, torch.float32):
         raise TypeError("beta must be bfloat16 or float32")
+    if q is not None:
+        if q.dtype != torch.bfloat16:
+            raise TypeError("q must be bfloat16")
+        if not q.is_contiguous() or not gk.is_contiguous():
+            raise ValueError("q and gk must be contiguous when qg is requested")
+    q_for_qg = q
+    gk_for_qg = gk
     is_varlen = cu_seqlens is not None
     packed_4d = is_varlen and k.dim() == 4
     restore_packed = False
@@ -1281,7 +1376,8 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
         w, u, kg = (x.flatten(0, 1).unsqueeze(0) for x in (w, u, kg))
     elif packed_4d:
         w, u, kg = (x.unsqueeze(0) for x in (w, u, kg))
-    return w, u, None, kg
+    qg = _compute_qg(q_for_qg, gk_for_qg) if q_for_qg is not None else None
+    return w, u, qg, kg
 
 
 def recompute_w_u_from_preprocessed(

@@ -36,6 +36,7 @@ def test_recompute_wu_matches_csrc(beta_dtype, qk_heads, value_heads, cu_offsets
     total_tokens, dim, chunk_size = cu_offsets[-1], 128, 64
 
     k = torch.randn(1, total_tokens, qk_heads, dim, device=device, dtype=torch.bfloat16) * 0.1
+    q = torch.randn_like(k) * 0.1
     v = torch.randn(1, total_tokens, value_heads, dim, device=device, dtype=torch.bfloat16) * 0.1
     beta = torch.rand(1, total_tokens, value_heads, device=device, dtype=beta_dtype)
     gk = torch.randn(1, total_tokens, value_heads, dim, device=device, dtype=torch.float32) * 0.02
@@ -46,6 +47,7 @@ def test_recompute_wu_matches_csrc(beta_dtype, qk_heads, value_heads, cu_offsets
     w_ref = torch.empty(1, total_tokens, value_heads, dim, device=device, dtype=k.dtype)
     u_ref = torch.empty_like(v)
     kg_ref = torch.empty_like(w_ref)
+    qg_ref = torch.empty_like(w_ref)
     cula_cuda.recompute_w_u_cuda(
         k,
         v,
@@ -58,14 +60,15 @@ def test_recompute_wu_matches_csrc(beta_dtype, qk_heads, value_heads, cu_offsets
         u_ref,
         kg_ref,
         chunk_size,
-        None,
-        None,
+        q,
+        qg_ref,
     )
-    w, u, _, kg = recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens, chunk_indices)
+    w, u, qg, kg = recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens, chunk_indices, q=q)
 
     assert torch.equal(w, w_ref), f"w differs bitwise: max_abs={(w.float() - w_ref.float()).abs().max().item()}"
     assert torch.equal(u, u_ref), f"u differs bitwise: max_abs={(u.float() - u_ref.float()).abs().max().item()}"
     assert torch.equal(kg, kg_ref), f"kg differs bitwise: max_abs={(kg.float() - kg_ref.float()).abs().max().item()}"
+    assert torch.equal(qg, qg_ref), f"qg differs bitwise: max_abs={(qg.float() - qg_ref.float()).abs().max().item()}"
 
 
 @pytest.mark.cula_fast
