@@ -1269,13 +1269,18 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
             raise ValueError("q and gk must be contiguous when qg is requested")
     q_for_qg = q
     gk_for_qg = gk
+    BT = A.shape[-1]
+    if cu_seqlens is None and k.dim() == 4 and k.shape[1] % BT != 0:
+        B_uniform, T_uniform = k.shape[:2]
+        cu_seqlens = torch.arange(B_uniform + 1, dtype=torch.int32, device=k.device) * T_uniform
     is_varlen = cu_seqlens is not None
     packed_4d = is_varlen and k.dim() == 4
-    restore_packed = False
+    restore_shape = None
+    restore_flat_packed = False
     if packed_4d:
-        if k.shape[0] != 1:
-            raise ValueError("varlen inputs must be packed with batch dimension 1")
-        k, v, beta, A, gk = (x.squeeze(0) for x in (k, v, beta, A, gk))
+        input_B, input_T = k.shape[:2]
+        restore_shape = (input_B, input_T)
+        k, v, beta, A, gk = (x.flatten(0, 1) for x in (k, v, beta, A, gk))
 
         uniform = _uniform_problem(cu_seqlens)
         if uniform is not None and uniform[1] % A.shape[-1] == 0:
@@ -1287,10 +1292,9 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
             gk = gk.view(batch, seq_len, *gk.shape[1:])
             is_varlen = False
             packed_4d = False
-            restore_packed = True
+            restore_flat_packed = input_B == 1 and input_T == batch * seq_len
 
     if is_varlen:
-        BT = A.shape[-1]
         T_total, H_qk, K = k.shape
         H_v = v.shape[1]
         V = v.shape[2]
@@ -1326,7 +1330,6 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
         B, T, H_qk, K = k.shape
         H_v = v.shape[2]
         V = v.shape[-1]
-        BT = A.shape[-1]
         NT = (T + BT - 1) // BT
         total_nt = B * NT
         ps = (Int32(B), Int32(T), Int32(H_qk), Int32(H_v), Int32(K), Int32(V))
@@ -1372,10 +1375,11 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
 
     compiled_fn(k, v, beta, A, gk, w, u, kg, cu_s, ci_s, ps, Int32(total_nt))
 
-    if restore_packed:
+    if restore_flat_packed:
         w, u, kg = (x.flatten(0, 1).unsqueeze(0) for x in (w, u, kg))
     elif packed_4d:
-        w, u, kg = (x.unsqueeze(0) for x in (w, u, kg))
+        input_B, input_T = restore_shape
+        w, u, kg = (x.view(input_B, input_T, *x.shape[1:]) for x in (w, u, kg))
     qg = _compute_qg(q_for_qg, gk_for_qg) if q_for_qg is not None else None
     return w, u, qg, kg
 

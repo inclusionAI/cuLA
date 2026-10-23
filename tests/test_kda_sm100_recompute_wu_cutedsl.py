@@ -71,6 +71,48 @@ def test_recompute_wu_matches_csrc(beta_dtype, qk_heads, value_heads, cu_offsets
     assert torch.equal(qg, qg_ref), f"qg differs bitwise: max_abs={(qg.float() - qg_ref.float()).abs().max().item()}"
 
 
+@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16])
+def test_recompute_wu_unaligned_uniform_4d_matches_csrc(beta_dtype):
+    _requires_sm100()
+    torch.manual_seed(5)
+    device = torch.device("cuda")
+    batch, seqlen, qk_heads, value_heads, dim, chunk_size = 2, 63, 2, 4, 128, 64
+    k = torch.randn(batch, seqlen, qk_heads, dim, device=device, dtype=torch.bfloat16) * 0.1
+    q = torch.randn_like(k) * 0.1
+    v = torch.randn(batch, seqlen, value_heads, dim, device=device, dtype=torch.bfloat16) * 0.1
+    beta = torch.rand(batch, seqlen, value_heads, device=device, dtype=beta_dtype)
+    gk = torch.randn(batch, seqlen, value_heads, dim, device=device, dtype=torch.float32) * 0.02
+    A = torch.randn(batch, seqlen, value_heads, chunk_size, device=device, dtype=torch.bfloat16) * 0.02
+    cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=device) * seqlen
+    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+
+    w_ref = torch.empty(batch, seqlen, value_heads, dim, device=device, dtype=k.dtype)
+    u_ref = torch.empty_like(v)
+    kg_ref = torch.empty_like(w_ref)
+    qg_ref = torch.empty_like(w_ref)
+    cula_cuda.recompute_w_u_cuda(
+        k,
+        v,
+        beta,
+        A,
+        gk,
+        cu_seqlens,
+        chunk_indices,
+        w_ref,
+        u_ref,
+        kg_ref,
+        chunk_size,
+        q,
+        qg_ref,
+    )
+    w, u, qg, kg = recompute_w_u_fwd(k, v, beta, A, gk, q=q)
+
+    assert torch.equal(w, w_ref)
+    assert torch.equal(u, u_ref)
+    assert torch.equal(kg, kg_ref)
+    assert torch.equal(qg, qg_ref)
+
+
 @pytest.mark.cula_fast
 def test_preprocessed_recompute_wu_matches_torch():
     _requires_sm100()
