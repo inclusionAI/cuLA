@@ -11,18 +11,19 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
+from fla.ops.utils import prepare_chunk_indices
+
 import cula.cudac as cula_cuda
 from benchmarks.utils import triton_bench_fn
 from cula.kda.chunk_intra import chunk_kda_fwd_intra
-from fla.ops.utils import prepare_chunk_indices
 
 
 def _make_inputs(batch, length, h_qk, h_v, dim, beta_bf16):
     generator = torch.Generator(device="cuda").manual_seed(42)
-    q = torch.randn(batch, length, h_qk, dim, dtype=torch.bfloat16, device="cuda", generator=generator)
-    k = torch.randn(batch, length, h_qk, dim, dtype=torch.bfloat16, device="cuda", generator=generator)
-    v = torch.randn(batch, length, h_v, dim, dtype=torch.bfloat16, device="cuda", generator=generator)
-    gk = -torch.rand(batch, length, h_v, dim, dtype=torch.float32, device="cuda", generator=generator) * 3
+    q = torch.randn(batch, length, h_qk, dim, dtype=torch.bfloat16, device="cuda", generator=generator) * 0.1
+    k = torch.randn(batch, length, h_qk, dim, dtype=torch.bfloat16, device="cuda", generator=generator) * 0.1
+    v = torch.randn(batch, length, h_v, dim, dtype=torch.bfloat16, device="cuda", generator=generator) * 0.1
+    gk = torch.randn(batch, length, h_v, dim, dtype=torch.float32, device="cuda", generator=generator) * 0.02
     beta = torch.rand(batch, length, h_v, dtype=torch.float32, device="cuda", generator=generator)
     if beta_bf16:
         beta = beta.bfloat16()
