@@ -75,6 +75,7 @@ def _run_csrc(q, k, v, gk, beta, cu_seqlens, chunk_indices, scale):
 
 
 def _run_cutedsl(q, k, v, gk, beta, cu_seqlens, chunk_indices, scale):
+    del cu_seqlens, chunk_indices
     return chunk_kda_fwd_intra(
         q=q,
         k=k,
@@ -82,8 +83,6 @@ def _run_cutedsl(q, k, v, gk, beta, cu_seqlens, chunk_indices, scale):
         gk=gk,
         beta=beta,
         scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
         chunk_size=64,
         safe_gate=True,
     )
