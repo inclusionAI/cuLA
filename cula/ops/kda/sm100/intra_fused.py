@@ -2640,6 +2640,26 @@ def _get_csrc_port_dummy_bias(device, heads):
     return entry
 
 
+def _get_csrc_port_dummy_outputs(device):
+    """Return untouched ABI placeholders for the FP32-gk specialization."""
+    key = ("csrc_port_dummy_outputs", device.index if device.index is not None else 0)
+    entry = _K123_CACHE.get(key)
+    if entry is None:
+        bf16 = torch.empty(1, dtype=torch.bfloat16, device=device)
+        fp32 = torch.empty(1, dtype=torch.float32, device=device)
+        entry = (bf16, fp32)
+        _K123_CACHE[key] = entry
+    return entry
+
+
+def _allocate_csrc_port_outputs(device, B, T, H):
+    """Allocate call-owned outputs and workspace for stream-safe launches."""
+    A_qk = torch.empty(B, T, H, BT, dtype=torch.bfloat16, device=device)
+    A_kk = torch.empty_like(A_qk)
+    A_kk_workspace = torch.empty(B, T, H, BT, dtype=torch.float32, device=device)
+    return A_qk, A_kk, A_kk_workspace
+
+
 def _run_akk_inv_fp32_physical(
     A_phys: torch.Tensor,
     A_out: torch.Tensor,
@@ -2893,8 +2913,7 @@ def chunk_kda_fwd_intra_sm100_from_gk(
         NT = chunk_indices.shape[0]
         dev = q.device.index if q.device.index is not None else 0
         cache_key = ("csrc_port_varlen", dev, T_padded, NT, H_qk, H_v, beta.dtype, fp32_akk_inv)
-        _, _, _, _, A_qk, A_kk = _get_out_buffers_varlen(q.device, T_padded, NT, H_v, torch.bfloat16)
-        A_kk_workspace = _get_akk_fp32_workspace_varlen(q.device, T_padded, NT, H_v) if fp32_akk_inv else A_kk
+        A_qk, A_kk, A_kk_workspace = _allocate_csrc_port_outputs(q.device, 1, T_padded, H_v)
 
         q_ct = _ct_cached(q_pad, cutlass.BFloat16)
         k_ct = _ct_cached(k_pad, cutlass.BFloat16)
@@ -2904,11 +2923,11 @@ def chunk_kda_fwd_intra_sm100_from_gk(
         beta_ct = _ct_cached(beta_pad, beta_type)
         # The FP32-gk specialization does not materialize these K1 outputs,
         # but the shared kernel ABI still carries their tensors.
-        k_scaled, kg, q_scaled, gk_last_exp, _, _ = _get_out_buffers_varlen(q.device, T_padded, NT, H_v, torch.bfloat16)
-        ks_ct = _ct_cached(k_scaled, cutlass.BFloat16)
-        kg_ct = _ct_cached(kg, cutlass.BFloat16)
-        qs_ct = _ct_cached(q_scaled, cutlass.BFloat16)
-        gk_last_ct = _ct_cached(gk_last_exp, cutlass.Float32)
+        dummy_bf16, dummy_fp32 = _get_csrc_port_dummy_outputs(q.device)
+        ks_ct = _ct_cached(dummy_bf16, cutlass.BFloat16)
+        kg_ct = ks_ct
+        qs_ct = ks_ct
+        gk_last_ct = _ct_cached(dummy_fp32, cutlass.Float32)
         aqk_ct = _ct_cached(A_qk, cutlass.BFloat16)
         akk_ct = _ct_cached(A_kk_workspace, cutlass.Float32)
         cu_ct = _ct_cached(cu_seqlens, cutlass.Int32)
@@ -2969,8 +2988,7 @@ def chunk_kda_fwd_intra_sm100_from_gk(
     NT = T_total // BT
     dev = q.device.index if q.device.index is not None else 0
     cache_key = ("csrc_port", dev, B, NT, H_qk, H_v, beta.dtype, fp32_akk_inv)
-    k_scaled, kg, q_scaled, gk_last_exp, A_qk, A_kk = _get_out_buffers_equal(q.device, B, T_total, H_v, torch.bfloat16)
-    A_kk_workspace = _get_akk_fp32_workspace_equal(q.device, B, T_total, H_v) if fp32_akk_inv else A_kk
+    A_qk, A_kk, A_kk_workspace = _allocate_csrc_port_outputs(q.device, B, T_total, H_v)
 
     q_ct = _ct_cached(q, cutlass.BFloat16)
     k_ct = _ct_cached(k, cutlass.BFloat16)
@@ -2978,10 +2996,11 @@ def chunk_kda_fwd_intra_sm100_from_gk(
     alog_ct = _ct_cached(_get_csrc_port_dummy_alog(q.device, H_v), cutlass.Float32)
     beta_type = cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16
     beta_ct = _ct_cached(beta, beta_type)
-    ks_ct = _ct_cached(k_scaled, cutlass.BFloat16)
-    kg_ct = _ct_cached(kg, cutlass.BFloat16)
-    qs_ct = _ct_cached(q_scaled, cutlass.BFloat16)
-    gk_last_ct = _ct_cached(gk_last_exp, cutlass.Float32)
+    dummy_bf16, dummy_fp32 = _get_csrc_port_dummy_outputs(q.device)
+    ks_ct = _ct_cached(dummy_bf16, cutlass.BFloat16)
+    kg_ct = ks_ct
+    qs_ct = ks_ct
+    gk_last_ct = _ct_cached(dummy_fp32, cutlass.Float32)
     aqk_ct = _ct_cached(A_qk, cutlass.BFloat16)
     akk_ct = _ct_cached(A_kk_workspace, cutlass.Float32 if fp32_akk_inv else cutlass.BFloat16)
     cu_ct, ci_ct = _get_eqlen_dummies(q.device)

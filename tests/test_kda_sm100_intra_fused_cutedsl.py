@@ -195,6 +195,8 @@ def test_csrc_boundary_port_intra_wu_larger_shape_bitwise(beta_dtype):
         scale=scale,
         fp32_akk_inv=True,
     )
+    assert Aqk_repeat.data_ptr() != Aqk.data_ptr()
+    assert Akk_repeat.data_ptr() != Akk.data_ptr()
     assert torch.equal(Aqk_repeat, Aqk_ref)
     assert torch.equal(Akk_repeat, Akk_ref)
 
@@ -309,6 +311,49 @@ def test_csrc_boundary_port_intra_wu_gva_partial_varlen_bitwise(beta_dtype):
         assert torch.equal(actual, expected), (
             f"{name} differs bitwise: max_abs={(actual.float() - expected.float()).abs().max().item()}"
         )
+
+
+def test_csrc_boundary_port_intra_multistream_isolation():
+    _requires_sm100()
+    device = torch.device("cuda")
+    batch, seqlen, heads, dim = 1, 256, 4, 128
+    inputs = []
+    refs = []
+    for seed in (31, 37):
+        torch.manual_seed(seed)
+        q = F.normalize(torch.randn(batch, seqlen, heads, dim, device=device).float(), dim=-1).bfloat16()
+        k = F.normalize(torch.randn(batch, seqlen, heads, dim, device=device).float(), dim=-1).bfloat16()
+        gk = torch.randn(batch, seqlen, heads, dim, device=device, dtype=torch.float32) * 0.02
+        beta = torch.rand(batch, seqlen, heads, device=device, dtype=torch.float32)
+        inputs.append((q, k, gk, beta))
+        refs.append(
+            csrc_chunk_kda_fwd_intra(
+                q=q,
+                k=k,
+                v=k,
+                gk=gk,
+                beta=beta,
+                scale=dim**-0.5,
+                safe_gate=True,
+            )[-2:]
+        )
+
+    # Compile before the concurrent launch so this test exercises only runtime
+    # stream isolation, not compiler initialization.
+    chunk_kda_fwd_intra_sm100_from_gk(*inputs[0], scale=dim**-0.5)
+    torch.cuda.synchronize()
+    streams = (torch.cuda.Stream(), torch.cuda.Stream())
+    outputs = []
+    for stream, args in zip(streams, inputs, strict=True):
+        with torch.cuda.stream(stream):
+            outputs.append(chunk_kda_fwd_intra_sm100_from_gk(*args, scale=dim**-0.5))
+    torch.cuda.synchronize()
+
+    assert outputs[0][0].data_ptr() != outputs[1][0].data_ptr()
+    assert outputs[0][1].data_ptr() != outputs[1][1].data_ptr()
+    for (Aqk, Akk), (Aqk_ref, Akk_ref) in zip(outputs, refs, strict=True):
+        assert torch.equal(Aqk, Aqk_ref)
+        assert torch.equal(Akk, Akk_ref)
 
 
 def test_uniform_varlen_uses_equal_fp16_path_bitwise():
