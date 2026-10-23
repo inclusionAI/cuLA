@@ -42,15 +42,15 @@ from fla.utils import (
 
 from cula.kda.chunk_intra import chunk_kda_bwd_intra
 from cula.ops.kda.sm100.bwd_wy_dqkg import chunk_kda_bwd_wy_dqkg_fused as chunk_kda_bwd_wy_dqkg_fused_cutedsl
-from cula.utils import get_device_sm_version, prepare_uniform_cu_seqlens
+from cula.utils import get_device_sm_version
 
 _delta_h_mod = importlib.import_module("cula.ops.kda.sm100.delta_h")
 chunk_gated_delta_rule_fwd_h = _delta_h_mod.chunk_gated_delta_rule_fwd_h
 
 
 @functools.cache
-def _get_cula_cuda():
-    return importlib.import_module("cula.cudac")
+def _get_sm100_cutedsl_recompute_wu():
+    return importlib.import_module("cula.ops.kda.sm100.recompute_wu").recompute_w_u_fwd
 
 
 def _sm90_triton_chunk_gated_delta_rule_fwd_h(
@@ -106,7 +106,7 @@ def _select_recompute_w_u_backend(device: torch.device):
     if major == 9 and minor == 0:
         return "triton"
     if major == 10 and minor in (0, 3):
-        return "cuda_extension"
+        return "cutedsl"
     raise RuntimeError(
         f"Unsupported CUDA compute capability sm_{major}{minor}. "
         "Only sm90a (Hopper) and Blackwell (SM100/SM103) are supported."
@@ -556,7 +556,6 @@ def chunk_kda_bwd(
     G = HV // H
 
     if disable_recompute is False:
-        B, T, _, K = k.shape
         if use_gate_in_kernel:
             g = kda_gate_chunk_cumsum(
                 g=g_org,
@@ -570,32 +569,17 @@ def chunk_kda_bwd(
             )
         if cu_seqlens is not None and chunk_indices is None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-        reset_cu_seqlens = False
         recompute_backend = _select_recompute_w_u_backend(q.device)
-        if recompute_backend == "cuda_extension":
-            if cu_seqlens is None:
-                reset_cu_seqlens = True
-                cu_seqlens = prepare_uniform_cu_seqlens(B, T, q.device, torch.int32)
-                chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-            # w, u, kg, qg all live in h_v head space.
-            w = torch.empty(B, T, HV, K, device=k.device, dtype=k.dtype)
-            u = torch.empty_like(v)
-            qg = torch.empty(B, T, HV, K, device=k.device, dtype=k.dtype) if q is not None else None
-            kg = torch.empty(B, T, HV, K, device=k.device, dtype=k.dtype)
-            _get_cula_cuda().recompute_w_u_cuda(
+        if recompute_backend == "cutedsl":
+            w, u, qg, kg = _get_sm100_cutedsl_recompute_wu()(
                 k,
                 v,
                 beta,
                 Akk,
                 g,
-                cu_seqlens,
-                chunk_indices,
-                w,
-                u,
-                kg,
-                chunk_size,
-                q,
-                qg,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                q=q,
             )
         else:
             w, u, qg, kg = recompute_w_u_fwd_triton(
@@ -612,9 +596,6 @@ def chunk_kda_bwd(
             # Restore the full initial_state tensor from the compressed version.
             # Only the first sequence's state is non-zero as it's the only one that could be cross-rank.
             initial_state = expand_h0(initial_state, context=cp_context)
-        if reset_cu_seqlens:
-            cu_seqlens = None
-            chunk_indices = None
         # TODO: update to support only varlen (1,T,H,D) format
         chunk_delta_h_fwd = _get_chunk_delta_h_fwd(q.device)
         h, v_new, _ = chunk_delta_h_fwd(

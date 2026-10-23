@@ -13,15 +13,81 @@ from fla.ops.utils.constant import RCP_LN2
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from cula.kda.chunk_intra import chunk_kda_fwd_intra as csrc_chunk_kda_fwd_intra
+import cula.cudac as cula_cuda
 from cula.ops.kda.sm100.intra_fused import (
     chunk_kda_fwd_intra_sm100_equal,
     chunk_kda_fwd_intra_sm100_from_gk,
     chunk_kda_fwd_intra_sm100_varlen,
 )
 from cula.ops.kda.sm100.recompute_wu import recompute_w_u_fwd
+from cula.utils import prepare_uniform_cu_seqlens
 
 pytestmark = pytest.mark.cula_slow
+
+
+def csrc_chunk_kda_fwd_intra(
+    q,
+    k,
+    v,
+    gk,
+    beta,
+    scale=None,
+    cu_seqlens=None,
+    chunk_size=64,
+    chunk_indices=None,
+    safe_gate=False,
+    disable_recompute=False,
+    use_tf32_inverse=True,
+    unified_gref=False,
+):
+    """Direct extension call retained only as the migration oracle."""
+    assert safe_gate
+    B, T, H_qk, K = q.shape
+    H_v = v.shape[2]
+    if scale is None:
+        scale = K**-0.5
+    if cu_seqlens is None:
+        cu_seqlens = prepare_uniform_cu_seqlens(B, T, q.device, torch.int32)
+    if chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    Aqk = torch.empty(B, T, H_v, chunk_size, device=q.device, dtype=q.dtype)
+    Akk = torch.empty_like(Aqk)
+    tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
+    cula_cuda.chunk_kda_fwd_intra_cuda(
+        q,
+        k,
+        gk,
+        beta,
+        cu_seqlens,
+        chunk_indices,
+        Aqk,
+        Akk,
+        tile_counter,
+        scale,
+        chunk_size,
+        use_tf32_inverse,
+        unified_gref,
+    )
+    w = torch.empty(B, T, H_v, K, device=q.device, dtype=q.dtype)
+    u = torch.empty_like(v)
+    kg = torch.empty_like(w)
+    qg = torch.empty_like(w) if disable_recompute else None
+    cula_cuda.recompute_w_u_cuda(
+        k,
+        v,
+        beta,
+        Akk,
+        gk,
+        cu_seqlens,
+        chunk_indices,
+        w,
+        u,
+        kg,
+        chunk_size,
+        q if disable_recompute else None,
+        qg,
+    )
+    return w, u, qg, kg, Aqk, Akk
 
 
 def _requires_sm100():
