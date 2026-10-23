@@ -1042,15 +1042,18 @@ _QG_THREADS = 256
 
 
 class _OutputPoolEntry:
-    def __init__(self, pool, specs, device):
-        self.pool = pool
+    def __init__(self, specs, device):
         self.specs = specs
         self.buffers = tuple(torch.empty(shape, dtype=dtype, device=device) for shape, dtype in specs)
         self.busy = False
-        self.output_refs = ()
 
     def is_free(self):
-        return not self.busy and all(ref() is None for ref in self.output_refs)
+        if self.busy:
+            return False
+        # StorageImpl counts cover aliases such as detach() that do not keep
+        # the exported Tensor wrapper alive. Two references are internal: the
+        # pooled tensor and this call's temporary UntypedStorage wrapper.
+        return all(torch._C._storage_Use_Count(buffer.untyped_storage()._cdata) == 2 for buffer in self.buffers)
 
     def acquire(self):
         if self.busy:
@@ -1058,13 +1061,11 @@ class _OutputPoolEntry:
         self.busy = True
         return self.buffers
 
-    def attach(self, outputs):
-        self.output_refs = tuple(weakref.ref(output) for output in outputs)
+    def attach(self):
         self.busy = False
 
     def release_after_error(self):
         self.busy = False
-        self.output_refs = ()
 
 
 def _output_specs_nbytes(specs):
@@ -1084,7 +1085,7 @@ def _acquire_output_buffers(device, specs):
             return entry, entry.acquire()
 
     pool[:] = [entry for entry in pool if not entry.is_free()]
-    entry = _OutputPoolEntry(pool, specs, device)
+    entry = _OutputPoolEntry(specs, device)
     pool.append(entry)
     return entry, entry.acquire()
 
@@ -1093,7 +1094,7 @@ def _export_output_buffers(entry, outputs):
     if entry is None:
         return outputs
     exported = tuple(output.view_as(output) for output in outputs)
-    entry.attach(exported)
+    entry.attach()
     return exported
 
 
@@ -1415,12 +1416,6 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
     if tuple(gk.shape) != expected_gk:
         raise ValueError(f"gk must have shape {expected_gk}, got {tuple(gk.shape)}")
 
-    w_shape = (T_total, H_v, K) if is_varlen else (B, T, H_v, K)
-    output_entry, (w, u, kg) = _acquire_output_buffers(
-        k.device,
-        ((w_shape, k.dtype), (tuple(v.shape), v.dtype), (w_shape, k.dtype)),
-    )
-
     compiled_fn = _compile_recompute_wu(
         H_qk,
         H_v,
@@ -1431,6 +1426,11 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
         block_v=block_v,
         is_varlen=is_varlen,
         beta_dtype=cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16,
+    )
+    w_shape = (T_total, H_v, K) if is_varlen else (B, T, H_v, K)
+    output_entry, (w, u, kg) = _acquire_output_buffers(
+        k.device,
+        ((w_shape, k.dtype), (tuple(v.shape), v.dtype), (w_shape, k.dtype)),
     )
 
     try:
@@ -1508,10 +1508,6 @@ def recompute_w_u_from_preprocessed(
         cu_s = _dummy_cu_seqlens
         ci_s = _dummy_chunk_indices
 
-    output_entry, (w, u) = _acquire_output_buffers(
-        k_scaled.device,
-        ((tuple(k_scaled.shape), k_scaled.dtype), (tuple(v.shape), v.dtype)),
-    )
     compiled_fn = _compile_recompute_wu(
         H,
         H,
@@ -1523,6 +1519,10 @@ def recompute_w_u_from_preprocessed(
         is_varlen=is_varlen,
         beta_dtype=cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16,
         preprocessed_k=True,
+    )
+    output_entry, (w, u) = _acquire_output_buffers(
+        k_scaled.device,
+        ((tuple(k_scaled.shape), k_scaled.dtype), (tuple(v.shape), v.dtype)),
     )
 
     # gk and kg are unused compile-signature placeholders for this

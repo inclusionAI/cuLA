@@ -104,6 +104,37 @@ def test_exact_port_isolates_concurrent_streams():
         assert torch.equal(actual[1], expected[1])
 
 
+def test_exact_port_clamps_beta_for_boundary_aligned_packed_tail():
+    """A final packed tail at the allocation boundary must not read past beta."""
+    _requires_sm100()
+    torch.manual_seed(41)
+    lengths = (193, 63)
+    total = sum(lengths)
+    h_qk, h_v, dim = 2, 4, 128
+    q = torch.randn(1, total, h_qk, dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    gk = torch.randn(1, total, h_v, dim, device="cuda", dtype=torch.float32) * 0.02
+    beta = torch.rand(1, total, h_v, device="cuda", dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, lengths[0], total], dtype=torch.int32, device="cuda")
+
+    actual = chunk_kda_fwd_intra_sm100_from_gk(q, k, gk, beta, cu_seqlens=cu_seqlens)
+    expected_parts = []
+    offset = 0
+    for length in lengths:
+        expected_parts.append(
+            chunk_kda_fwd_intra_sm100_from_gk(
+                q[:, offset : offset + length],
+                k[:, offset : offset + length],
+                gk[:, offset : offset + length],
+                beta[:, offset : offset + length],
+            )
+        )
+        offset += length
+    expected = tuple(torch.cat(parts, dim=1) for parts in zip(*expected_parts, strict=True))
+    for observed, reference in zip(actual, expected, strict=True):
+        assert torch.equal(observed, reference)
+
+
 def test_uniform_varlen_uses_equal_fp16_path_bitwise():
     _requires_sm100()
     torch.manual_seed(7)

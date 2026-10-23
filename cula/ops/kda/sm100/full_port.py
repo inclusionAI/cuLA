@@ -232,21 +232,23 @@ def chunk_kda_fwd_full_sm100_from_gk(q, k, v, gk, beta, scale):
     if length % (4 * BT):
         raise NotImplementedError("the full-port fast path requires T to be divisible by 256")
 
-    intra_entry, (Aqk, Akk, Akk_workspace) = _acquire_exact_port_outputs(q.device, batch, length, h_v)
-    wu_entry, (w, u, kg) = _acquire_output_buffers(
-        q.device,
-        (
-            ((batch, length, h_v, K_DIM), q.dtype),
-            (tuple(v.shape), v.dtype),
-            ((batch, length, h_v, K_DIM), q.dtype),
-        ),
-    )
     dummy_alog = _get_exact_port_dummy_alog(q.device, h_v)
     dummy_bf16, dummy_fp32 = _get_exact_port_dummy_outputs(q.device)
     cu_seqlens, chunk_indices = _get_full_metadata(q.device)
     dummy_bias = _get_exact_port_dummy_bias(q.device, h_v)
     compiled = _compile_full_port(q.device, batch, length, h_qk, h_v, beta.dtype, scale)
+    intra_entry = None
+    wu_entry = None
     try:
+        intra_entry, (Aqk, Akk, Akk_workspace) = _acquire_exact_port_outputs(q.device, batch, length, h_v)
+        wu_entry, (w, u, kg) = _acquire_output_buffers(
+            q.device,
+            (
+                ((batch, length, h_v, K_DIM), q.dtype),
+                (tuple(v.shape), v.dtype),
+                ((batch, length, h_v, K_DIM), q.dtype),
+            ),
+        )
         compiled(
             q,
             k,

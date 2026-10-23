@@ -1376,10 +1376,12 @@ def fused_kernel123(
 
             # Prefetch chunk 0 -> stage 0 (stage_reuse[0] pre-arrived)
             pf_cs = cutlass.Int32(0)
+            pf_eos = cutlass.Int32(BT)
             if IS_VARLEN:
                 pf_seq_id_0 = cutlass.Int32(mChunkIndices[chunk_base, 0])
                 pf_local_0 = cutlass.Int32(mChunkIndices[chunk_base, 1])
                 pf_bos_0 = cutlass.Int32(mCuSeqlens[pf_seq_id_0])
+                pf_eos = cutlass.Int32(mCuSeqlens[pf_seq_id_0 + 1])
                 pf_cs = pf_bos_0 + pf_local_0 * BT
             else:
                 pf_cs = i_b * num_chunks * BT + chunk_base * BT
@@ -1416,7 +1418,11 @@ def fused_kernel123(
                     beta_cs = chunk_base * BT
                 for beta_iter in cutlass.range_constexpr(BT // 32):
                     beta_row = beta_iter * 32 + lane_id
-                    sBeta_pf[beta_row] = mBeta[i_b, beta_cs + beta_row, i_h]
+                    beta_load_row = beta_cs + beta_row
+                    if IS_VARLEN:
+                        if beta_load_row >= pf_eos:
+                            beta_load_row = pf_eos - 1
+                    sBeta_pf[beta_row] = mBeta[i_b, beta_load_row, i_h]
                 cute.arch.mbarrier_arrive(k1_done_mbars)
 
             # Issue TMAs for chunks 1..CHUNKS_PER_BLOCK-1
@@ -1424,11 +1430,14 @@ def fused_kernel123(
                 next_stage = next_i % NUM_STAGES
                 next_phase = next_i // NUM_STAGES % 2
                 next_cs = cutlass.Int32(0)
+                next_eos = cutlass.Int32(BT)
                 if IS_VARLEN:
+                    next_eos = cutlass.Int32(1)
                     next_chunk_idx = chunk_base + next_i
                     if next_chunk_idx < num_chunks:
                         _nsid = cutlass.Int32(mChunkIndices[next_chunk_idx, 0])
                         next_cs = cutlass.Int32(mCuSeqlens[_nsid]) + cutlass.Int32(mChunkIndices[next_chunk_idx, 1]) * BT
+                        next_eos = cutlass.Int32(mCuSeqlens[_nsid + 1])
                 else:
                     next_cs = i_b * num_chunks * BT + (chunk_base + next_i) * BT
                 cute.arch.mbarrier_wait(stage_reuse_mbars + next_stage, next_phase)
@@ -1464,7 +1473,11 @@ def fused_kernel123(
                         beta_cs = (chunk_base + next_i) * BT
                     for beta_iter in cutlass.range_constexpr(BT // 32):
                         beta_row = beta_iter * 32 + lane_id
-                        sBeta_ns[beta_row] = mBeta[i_b, beta_cs + beta_row, i_h]
+                        beta_load_row = beta_cs + beta_row
+                        if IS_VARLEN:
+                            if beta_load_row >= next_eos:
+                                beta_load_row = next_eos - 1
+                        sBeta_ns[beta_row] = mBeta[i_b, beta_load_row, i_h]
                     cute.arch.mbarrier_arrive(k1_done_mbars + next_stage)
 
         # =============================================================
@@ -2719,10 +2732,14 @@ class _ExactPortOutputEntry:
         self.specs = specs
         self.buffers = tuple(torch.empty(shape, dtype=dtype, device=device) for shape, dtype in specs)
         self.busy = False
-        self.output_refs = ()
 
     def is_free(self):
-        return not self.busy and all(ref() is None for ref in self.output_refs)
+        if self.busy:
+            return False
+        # The temporary UntypedStorage wrapper contributes one reference and
+        # the pooled tensor contributes the other. Any returned view, slice,
+        # or detached alias adds another StorageImpl reference.
+        return all(torch._C._storage_Use_Count(buffer.untyped_storage()._cdata) == 2 for buffer in self.buffers)
 
     def acquire(self):
         if self.busy:
@@ -2730,12 +2747,10 @@ class _ExactPortOutputEntry:
         self.busy = True
         return self.buffers
 
-    def attach(self, outputs):
-        self.output_refs = tuple(weakref.ref(output) for output in outputs)
+    def attach(self):
         self.busy = False
 
     def release_after_error(self):
-        self.output_refs = ()
         self.busy = False
 
 
@@ -2761,7 +2776,7 @@ def _export_exact_port_outputs(entry, A_qk, A_kk):
     if entry is None:
         return A_qk, A_kk
     outputs = (A_qk.view_as(A_qk), A_kk.view_as(A_kk))
-    entry.attach(outputs)
+    entry.attach()
     return outputs
 
 
@@ -3018,26 +3033,104 @@ def chunk_kda_fwd_intra_sm100_from_gk(
         dev = q.device.index if q.device.index is not None else 0
         cache_key = ("exact_port_varlen", dev, T_padded, NT, H_qk, H_v, beta.dtype, fp32_akk_inv)
         output_entry, (A_qk, A_kk, A_kk_workspace) = _acquire_exact_port_outputs(q.device, 1, T_padded, H_v)
-        wrap_output = _ct_cached if output_entry is not None else _ct_uncached
+        try:
+            q_ct = _ct_uncached(q_pad, cutlass.BFloat16)
+            k_ct = _ct_uncached(k_pad, cutlass.BFloat16)
+            gk_in_ct = _ct_uncached(gk_pad, cutlass.Float32)
+            alog_ct = _ct_cached(_get_exact_port_dummy_alog(q.device, H_v), cutlass.Float32)
+            beta_type = cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16
+            beta_ct = _ct_uncached(beta_pad, beta_type)
+            # The FP32-gk specialization does not materialize these K1 outputs,
+            # but the shared kernel ABI still carries their tensors.
+            dummy_bf16, dummy_fp32 = _get_exact_port_dummy_outputs(q.device)
+            ks_ct = _ct_cached(dummy_bf16, cutlass.BFloat16)
+            kg_ct = ks_ct
+            qs_ct = ks_ct
+            gk_last_ct = _ct_cached(dummy_fp32, cutlass.Float32)
+            aqk_ct = _ct_uncached(A_qk, cutlass.BFloat16)
+            akk_ct = _ct_uncached(A_kk_workspace, cutlass.Float32)
+            cu_ct = _ct_uncached(cu_seqlens, cutlass.Int32)
+            ci_ct = _ct_uncached(chunk_indices, cutlass.Int32)
+            bias_ct = _ct_cached(_get_exact_port_dummy_bias(q.device, H_v), cutlass.Float32)
+            ct_args = (
+                q_ct,
+                k_ct,
+                gk_in_ct,
+                alog_ct,
+                beta_ct,
+                float(scale),
+                ks_ct,
+                kg_ct,
+                qs_ct,
+                gk_last_ct,
+                aqk_ct,
+                akk_ct,
+                cu_ct,
+                ci_ct,
+                bias_ct,
+                0.0,
+            )
+            kernel = _K123_CACHE.get(("kernel", cache_key))
+            if kernel is None:
+                host_fn = make_host_function(
+                    1,
+                    NT,
+                    H_qk,
+                    H_v,
+                    is_varlen=True,
+                    T_padded=T_padded,
+                    varlen_pure=False,
+                    fp32_akk_workspace=True,
+                    input_gk_fp32=True,
+                    beta_fp32=beta.dtype == torch.float32,
+                )
+                kernel = cute.compile(host_fn, *ct_args)
+                _K123_CACHE[("kernel", cache_key)] = kernel
+            kernel(*ct_args)
+            _run_akk_inv_fp32_physical(
+                A_kk_workspace,
+                A_kk,
+                1,
+                NT,
+                H_v,
+                cu_ct,
+                ci_ct,
+                is_varlen=True,
+                T_val=T_padded,
+                cache_wrappers=False,
+            )
+        except Exception:
+            if output_entry is not None:
+                output_entry.release_after_error()
+            raise
+        return _export_exact_port_outputs(
+            output_entry,
+            A_qk[:, :T_flat].view(B, T_total, H_v, BT),
+            A_kk[:, :T_flat].view(B, T_total, H_v, BT),
+        )
 
-        q_ct = _ct_uncached(q_pad, cutlass.BFloat16)
-        k_ct = _ct_uncached(k_pad, cutlass.BFloat16)
-        gk_in_ct = _ct_uncached(gk_pad, cutlass.Float32)
+    NT = T_total // BT
+    dev = q.device.index if q.device.index is not None else 0
+    cache_key = ("exact_port", dev, B, NT, H_qk, H_v, beta.dtype, fp32_akk_inv)
+    output_entry, (A_qk, A_kk, A_kk_workspace) = _acquire_exact_port_outputs(q.device, B, T_total, H_v)
+    try:
+        q_ct = _ct_uncached(q, cutlass.BFloat16)
+        k_ct = _ct_uncached(k, cutlass.BFloat16)
+        gk_in_ct = _ct_uncached(gk, cutlass.Float32)
         alog_ct = _ct_cached(_get_exact_port_dummy_alog(q.device, H_v), cutlass.Float32)
         beta_type = cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16
-        beta_ct = _ct_uncached(beta_pad, beta_type)
-        # The FP32-gk specialization does not materialize these K1 outputs,
-        # but the shared kernel ABI still carries their tensors.
+        beta_ct = _ct_uncached(beta, beta_type)
         dummy_bf16, dummy_fp32 = _get_exact_port_dummy_outputs(q.device)
         ks_ct = _ct_cached(dummy_bf16, cutlass.BFloat16)
         kg_ct = ks_ct
         qs_ct = ks_ct
         gk_last_ct = _ct_cached(dummy_fp32, cutlass.Float32)
-        aqk_ct = wrap_output(A_qk, cutlass.BFloat16)
-        akk_ct = wrap_output(A_kk_workspace, cutlass.Float32)
-        cu_ct = _ct_uncached(cu_seqlens, cutlass.Int32)
-        ci_ct = _ct_uncached(chunk_indices, cutlass.Int32)
+        aqk_ct = _ct_uncached(A_qk, cutlass.BFloat16)
+        akk_storage = A_kk_workspace if fp32_akk_inv else A_kk
+        akk_ct = _ct_uncached(akk_storage, cutlass.Float32 if fp32_akk_inv else cutlass.BFloat16)
+        cu_ct, ci_ct = _get_eqlen_dummies(q.device)
         bias_ct = _ct_cached(_get_exact_port_dummy_bias(q.device, H_v), cutlass.Float32)
+
         ct_args = (
             q_ct,
             k_ct,
@@ -3059,102 +3152,18 @@ def chunk_kda_fwd_intra_sm100_from_gk(
         kernel = _K123_CACHE.get(("kernel", cache_key))
         if kernel is None:
             host_fn = make_host_function(
-                1,
+                B,
                 NT,
                 H_qk,
                 H_v,
-                is_varlen=True,
-                T_padded=T_padded,
-                varlen_pure=False,
-                fp32_akk_workspace=True,
+                is_varlen=False,
+                fuse_akk_inv=not fp32_akk_inv,
+                fp32_akk_workspace=fp32_akk_inv,
                 input_gk_fp32=True,
                 beta_fp32=beta.dtype == torch.float32,
             )
             kernel = cute.compile(host_fn, *ct_args)
             _K123_CACHE[("kernel", cache_key)] = kernel
-
-        try:
-            kernel(*ct_args)
-            _run_akk_inv_fp32_physical(
-                A_kk_workspace,
-                A_kk,
-                1,
-                NT,
-                H_v,
-                cu_ct,
-                ci_ct,
-                is_varlen=True,
-                T_val=T_padded,
-                cache_wrappers=output_entry is not None,
-            )
-        except Exception:
-            if output_entry is not None:
-                output_entry.release_after_error()
-            raise
-        return _export_exact_port_outputs(
-            output_entry,
-            A_qk[:, :T_flat].view(B, T_total, H_v, BT),
-            A_kk[:, :T_flat].view(B, T_total, H_v, BT),
-        )
-
-    NT = T_total // BT
-    dev = q.device.index if q.device.index is not None else 0
-    cache_key = ("exact_port", dev, B, NT, H_qk, H_v, beta.dtype, fp32_akk_inv)
-    output_entry, (A_qk, A_kk, A_kk_workspace) = _acquire_exact_port_outputs(q.device, B, T_total, H_v)
-    wrap_output = _ct_cached if output_entry is not None else _ct_uncached
-
-    q_ct = _ct_uncached(q, cutlass.BFloat16)
-    k_ct = _ct_uncached(k, cutlass.BFloat16)
-    gk_in_ct = _ct_uncached(gk, cutlass.Float32)
-    alog_ct = _ct_cached(_get_exact_port_dummy_alog(q.device, H_v), cutlass.Float32)
-    beta_type = cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16
-    beta_ct = _ct_uncached(beta, beta_type)
-    dummy_bf16, dummy_fp32 = _get_exact_port_dummy_outputs(q.device)
-    ks_ct = _ct_cached(dummy_bf16, cutlass.BFloat16)
-    kg_ct = ks_ct
-    qs_ct = ks_ct
-    gk_last_ct = _ct_cached(dummy_fp32, cutlass.Float32)
-    aqk_ct = wrap_output(A_qk, cutlass.BFloat16)
-    akk_storage = A_kk_workspace if fp32_akk_inv else A_kk
-    akk_ct = wrap_output(akk_storage, cutlass.Float32 if fp32_akk_inv else cutlass.BFloat16)
-    cu_ct, ci_ct = _get_eqlen_dummies(q.device)
-    bias_ct = _ct_cached(_get_exact_port_dummy_bias(q.device, H_v), cutlass.Float32)
-
-    ct_args = (
-        q_ct,
-        k_ct,
-        gk_in_ct,
-        alog_ct,
-        beta_ct,
-        float(scale),
-        ks_ct,
-        kg_ct,
-        qs_ct,
-        gk_last_ct,
-        aqk_ct,
-        akk_ct,
-        cu_ct,
-        ci_ct,
-        bias_ct,
-        0.0,
-    )
-    kernel = _K123_CACHE.get(("kernel", cache_key))
-    if kernel is None:
-        host_fn = make_host_function(
-            B,
-            NT,
-            H_qk,
-            H_v,
-            is_varlen=False,
-            fuse_akk_inv=not fp32_akk_inv,
-            fp32_akk_workspace=fp32_akk_inv,
-            input_gk_fp32=True,
-            beta_fp32=beta.dtype == torch.float32,
-        )
-        kernel = cute.compile(host_fn, *ct_args)
-        _K123_CACHE[("kernel", cache_key)] = kernel
-
-    try:
         kernel(*ct_args)
         if fp32_akk_inv:
             _run_akk_inv_fp32_physical(
@@ -3167,7 +3176,7 @@ def chunk_kda_fwd_intra_sm100_from_gk(
                 ci_ct,
                 is_varlen=False,
                 T_val=T_total,
-                cache_wrappers=output_entry is not None,
+                cache_wrappers=False,
             )
     except Exception:
         if output_entry is not None:

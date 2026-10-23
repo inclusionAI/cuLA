@@ -64,6 +64,24 @@ def test_full_port_keeps_live_outputs_disjoint():
     _assert_bitwise(first, second)
 
 
+def test_full_port_keeps_detached_aliases_disjoint():
+    """A detached result must keep its pooled storage from being reused."""
+    _requires_sm100()
+    first = chunk_kda_fwd_full_sm100_from_gk(*_inputs(181), 128**-0.5)
+    w_alias = first[0].detach()
+    aqk_alias = first[4].detach()
+    w_reference = w_alias.clone()
+    aqk_reference = aqk_alias.clone()
+    del first
+    gc.collect()
+
+    second = chunk_kda_fwd_full_sm100_from_gk(*_inputs(182), 128**-0.5)
+    assert w_alias.data_ptr() != second[0].data_ptr()
+    assert aqk_alias.data_ptr() != second[4].data_ptr()
+    assert torch.equal(w_alias, w_reference)
+    assert torch.equal(aqk_alias, aqk_reference)
+
+
 def test_full_port_isolates_concurrent_streams():
     _requires_sm100()
     inputs_a = _inputs(19)
