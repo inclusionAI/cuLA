@@ -33,7 +33,6 @@ Warp assignment:
 
 import weakref
 
-import cuda.bindings.driver as cuda_drv
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -41,10 +40,9 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import _Pointer as RuntimePointer
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.tensor import TensorSSA
-from cutlass.cute.typing import Int32, Int64, Pointer
+from cutlass.cute.typing import Int32, Int64
 from fla.ops.utils import prepare_chunk_indices
 
 from cula.ops.ptx import reinterpret_cast, store_256b, subvec
@@ -215,47 +213,6 @@ class KDARecomputeWU:
             data_bidx = i_b
             remaining = Int32(BT)
         return i_b, i_t, i_h, tok_offset, data_bidx, remaining
-
-    @cute.jit
-    def run_from_ptrs(
-        self,
-        k_ptr: Pointer,
-        v_ptr: Pointer,
-        beta_ptr: Pointer,
-        A_ptr: Pointer,
-        gk_ptr: Pointer,
-        w_ptr: Pointer,
-        u_ptr: Pointer,
-        kg_ptr: Pointer,
-        cu_seqlens_ptr: Pointer,
-        chunk_indices_ptr: Pointer,
-        problem_size: tuple[Int32, Int32, Int32, Int32, Int32, Int32],
-        total_nt: Int32,
-        stream,
-    ):
-        """Pointer-only launch boundary avoiding per-call DLPack conversion.
-
-        The kernel constructs every logical layout from ``problem_size`` and
-        only consumes the input tensors' base pointers.  Passing those
-        pointers directly preserves the exact generated kernel while letting
-        call-owned output tensors follow normal PyTorch allocator lifetime.
-        """
-
-        self(
-            cute.make_tensor(k_ptr, cute.make_layout(1)),
-            cute.make_tensor(v_ptr, cute.make_layout(1)),
-            cute.make_tensor(beta_ptr, cute.make_layout(1)),
-            cute.make_tensor(A_ptr, cute.make_layout(1)),
-            cute.make_tensor(gk_ptr, cute.make_layout(1)),
-            cute.make_tensor(w_ptr, cute.make_layout(1)),
-            cute.make_tensor(u_ptr, cute.make_layout(1)),
-            cute.make_tensor(kg_ptr, cute.make_layout(1)),
-            cute.make_tensor(cu_seqlens_ptr, cute.make_layout(1)),
-            cute.make_tensor(chunk_indices_ptr, cute.make_layout(1)),
-            problem_size,
-            total_nt,
-            stream,
-        )
 
     @cute.jit
     def __call__(
@@ -1073,15 +1030,81 @@ class KDARecomputeWU:
 # ============================================================================
 
 _recompute_wu_cache = {}
-_recompute_wu_ptr_cache = {}
 _qg_cache = {}
-_cuda_stream_cache = {}
-_runtime_ptr_cache = {}
 _dummy_cu_seqlens = None
 _dummy_chunk_indices = None
 _uniform_cu_cache = {}
+_output_pools = {}
+
+_MAX_POOLED_OUTPUT_BYTES = 128 * 1024 * 1024
 
 _QG_THREADS = 256
+
+
+class _OutputPoolEntry:
+    def __init__(self, pool, specs, device):
+        self.pool = pool
+        self.specs = specs
+        self.buffers = tuple(torch.empty(shape, dtype=dtype, device=device) for shape, dtype in specs)
+        self.busy = False
+        self.remaining = 0
+
+    def acquire(self):
+        if self.busy:
+            raise RuntimeError("attempted to acquire a busy KDA output buffer")
+        self.busy = True
+        return self.buffers
+
+    def attach(self, outputs):
+        self.remaining = len(outputs)
+        for output in outputs:
+            weakref.finalize(output, self._release_one)
+
+    def release_after_error(self):
+        self.remaining = 0
+        self.busy = False
+        self._prune_extra_free_entries()
+
+    def _release_one(self):
+        self.remaining -= 1
+        if self.remaining == 0:
+            self.busy = False
+            self._prune_extra_free_entries()
+
+    def _prune_extra_free_entries(self):
+        for entry in tuple(self.pool):
+            if entry is not self and not entry.busy:
+                self.pool.remove(entry)
+
+
+def _output_specs_nbytes(specs):
+    return sum(dtype.itemsize * torch.Size(shape).numel() for shape, dtype in specs)
+
+
+def _acquire_output_buffers(device, specs):
+    """Acquire call-owned outputs, pooling only fixed-overhead-sized cases."""
+    specs = tuple((tuple(shape), dtype) for shape, dtype in specs)
+    if _output_specs_nbytes(specs) > _MAX_POOLED_OUTPUT_BYTES:
+        return None, tuple(torch.empty(shape, dtype=dtype, device=device) for shape, dtype in specs)
+
+    stream_ptr = int(torch.cuda.current_stream(device).cuda_stream)
+    pool = _output_pools.setdefault((device.index, stream_ptr), [])
+    for entry in pool:
+        if not entry.busy and entry.specs == specs:
+            return entry, entry.acquire()
+
+    pool[:] = [entry for entry in pool if entry.busy]
+    entry = _OutputPoolEntry(pool, specs, device)
+    pool.append(entry)
+    return entry, entry.acquire()
+
+
+def _export_output_buffers(entry, outputs):
+    if entry is None:
+        return outputs
+    exported = tuple(output.view_as(output) for output in outputs)
+    entry.attach(exported)
+    return exported
 
 
 @cute.kernel
@@ -1296,114 +1319,6 @@ def _compile_recompute_wu(
     return compiled_fn
 
 
-def _compile_recompute_wu_ptrs(
-    H_qk,
-    H_v,
-    K,
-    V,
-    chunk_size=64,
-    block_k=None,
-    block_v=None,
-    persistent=True,
-    is_varlen=False,
-    beta_dtype=cutlass.Float32,
-    preprocessed_k=False,
-):
-    """Compile the same kernel behind a scalar-pointer launch boundary."""
-    key = (
-        H_qk,
-        H_v,
-        K,
-        V,
-        chunk_size,
-        block_k,
-        block_v,
-        persistent,
-        is_varlen,
-        beta_dtype,
-        preprocessed_k,
-        USE_FAST_MATH,
-    )
-    compiled = _recompute_wu_ptr_cache.get(key)
-    if compiled is not None:
-        return compiled
-
-    kernel_obj = KDARecomputeWU(
-        K=K,
-        V=V,
-        chunk_size=chunk_size,
-        block_k=block_k,
-        block_v=block_v,
-        beta_dtype=beta_dtype,
-        is_varlen=is_varlen,
-        preprocessed_k=preprocessed_k,
-        use_fast_math=USE_FAST_MATH,
-    )
-    compiled = cute.compile(
-        kernel_obj.run_from_ptrs,
-        RuntimePointer(0, cutlass.BFloat16, cute.AddressSpace.gmem, 16),
-        RuntimePointer(0, cutlass.BFloat16, cute.AddressSpace.gmem, 16),
-        RuntimePointer(0, beta_dtype, cute.AddressSpace.gmem, 16),
-        RuntimePointer(0, cutlass.BFloat16, cute.AddressSpace.gmem, 16),
-        RuntimePointer(
-            0,
-            cutlass.BFloat16 if preprocessed_k else cutlass.Float32,
-            cute.AddressSpace.gmem,
-            16,
-        ),
-        RuntimePointer(0, cutlass.BFloat16, cute.AddressSpace.gmem, 16),
-        RuntimePointer(0, cutlass.BFloat16, cute.AddressSpace.gmem, 16),
-        RuntimePointer(0, cutlass.BFloat16, cute.AddressSpace.gmem, 16),
-        RuntimePointer(0, cutlass.Int32, cute.AddressSpace.gmem, 16),
-        RuntimePointer(0, cutlass.Int32, cute.AddressSpace.gmem, 16),
-        (Int32(1), Int32(1), Int32(H_qk), Int32(H_v), Int32(K), Int32(V)),
-        Int32(1),
-        make_fake_stream(),
-    )
-    _recompute_wu_ptr_cache[key] = compiled
-    return compiled
-
-
-def _current_cuda_stream(device):
-    stream_ptr = int(torch.cuda.current_stream(device).cuda_stream)
-    stream = _cuda_stream_cache.get(stream_ptr)
-    if stream is None:
-        stream = cuda_drv.CUstream(stream_ptr)
-        _cuda_stream_cache[stream_ptr] = stream
-    return stream
-
-
-def _runtime_ptr(tensor, dtype):
-    key = (tensor.data_ptr(), dtype)
-    ptr = _runtime_ptr_cache.get(key)
-    if ptr is None:
-        if len(_runtime_ptr_cache) >= 4096:
-            _runtime_ptr_cache.clear()
-        ptr = RuntimePointer(key[0], dtype, cute.AddressSpace.gmem, 16)
-        _runtime_ptr_cache[key] = ptr
-    return ptr
-
-
-def _launch_recompute_wu_ptrs(compiled, k, v, beta, A, gk, w, u, kg, cu, ci, problem_size, total_nt):
-    beta_dtype = cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16
-    gk_dtype = cutlass.Float32 if gk.dtype == torch.float32 else cutlass.BFloat16
-    compiled(
-        _runtime_ptr(k, cutlass.BFloat16),
-        _runtime_ptr(v, cutlass.BFloat16),
-        _runtime_ptr(beta, beta_dtype),
-        _runtime_ptr(A, cutlass.BFloat16),
-        _runtime_ptr(gk, gk_dtype),
-        _runtime_ptr(w, cutlass.BFloat16),
-        _runtime_ptr(u, cutlass.BFloat16),
-        _runtime_ptr(kg, cutlass.BFloat16),
-        _runtime_ptr(cu, cutlass.Int32),
-        _runtime_ptr(ci, cutlass.Int32),
-        problem_size,
-        Int32(total_nt),
-        _current_cuda_stream(k.device),
-    )
-
-
 # ============================================================================
 # Public API
 # ============================================================================
@@ -1511,11 +1426,12 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
         raise ValueError(f"gk must have shape {expected_gk}, got {tuple(gk.shape)}")
 
     w_shape = (T_total, H_v, K) if is_varlen else (B, T, H_v, K)
-    w = torch.empty(w_shape, device=k.device, dtype=k.dtype)
-    u = torch.empty_like(v)
-    kg = torch.empty_like(w)
+    output_entry, (w, u, kg) = _acquire_output_buffers(
+        k.device,
+        ((w_shape, k.dtype), (tuple(v.shape), v.dtype), (w_shape, k.dtype)),
+    )
 
-    compiled_fn = _compile_recompute_wu_ptrs(
+    compiled_fn = _compile_recompute_wu(
         H_qk,
         H_v,
         K,
@@ -1527,13 +1443,19 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
         beta_dtype=cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16,
     )
 
-    _launch_recompute_wu_ptrs(compiled_fn, k, v, beta, A, gk, w, u, kg, cu_s, ci_s, ps, total_nt)
+    try:
+        compiled_fn(k, v, beta, A, gk, w, u, kg, cu_s, ci_s, ps, Int32(total_nt))
+    except Exception:
+        if output_entry is not None:
+            output_entry.release_after_error()
+        raise
 
     if restore_flat_packed:
         w, u, kg = (x.flatten(0, 1).unsqueeze(0) for x in (w, u, kg))
     elif packed_4d:
         input_B, input_T = restore_shape
         w, u, kg = (x.view(input_B, input_T, *x.shape[1:]) for x in (w, u, kg))
+    w, u, kg = _export_output_buffers(output_entry, (w, u, kg))
     qg = _compute_qg(q_for_qg, gk_for_qg) if q_for_qg is not None else None
     return w, u, qg, kg
 
@@ -1596,9 +1518,11 @@ def recompute_w_u_from_preprocessed(
         cu_s = _dummy_cu_seqlens
         ci_s = _dummy_chunk_indices
 
-    w = torch.empty_like(k_scaled)
-    u = torch.empty_like(v)
-    compiled_fn = _compile_recompute_wu_ptrs(
+    output_entry, (w, u) = _acquire_output_buffers(
+        k_scaled.device,
+        ((tuple(k_scaled.shape), k_scaled.dtype), (tuple(v.shape), v.dtype)),
+    )
+    compiled_fn = _compile_recompute_wu(
         H,
         H,
         K,
@@ -1613,24 +1537,16 @@ def recompute_w_u_from_preprocessed(
 
     # gk and kg are unused compile-signature placeholders for this
     # specialization. Reusing existing bf16 buffers avoids extra allocations.
-    _launch_recompute_wu_ptrs(
-        compiled_fn,
-        k_scaled,
-        v,
-        beta,
-        A,
-        k_scaled,
-        w,
-        u,
-        w,
-        cu_s,
-        ci_s,
-        ps,
-        total_nt,
-    )
+    try:
+        compiled_fn(k_scaled, v, beta, A, k_scaled, w, u, w, cu_s, ci_s, ps, Int32(total_nt))
+    except Exception:
+        if output_entry is not None:
+            output_entry.release_after_error()
+        raise
 
     if restore_packed:
         w, u = (x.flatten(0, 1).unsqueeze(0) for x in (w, u))
     elif packed_4d:
         w, u = (x.unsqueeze(0) for x in (w, u))
+    w, u = _export_output_buffers(output_entry, (w, u))
     return w, u
