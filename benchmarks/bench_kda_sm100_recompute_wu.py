@@ -7,11 +7,8 @@ import argparse
 import pathlib
 import sys
 
-import cuda.bindings.driver as cuda_drv
 import cutlass
-import cutlass.cute as cute
 import torch
-from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cutlass.cute.typing import Int32
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
@@ -103,77 +100,6 @@ def _make_cutedsl_launcher(k, v, beta, A, gk):
     return run, run_pooled, (w, u, None, kg)
 
 
-_WRAPPER_CACHE = {}
-
-
-def _wrap_tensor(tensor, dtype):
-    key = (tensor.device.index, tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype, dtype)
-    wrapped = _WRAPPER_CACHE.get(key)
-    if wrapped is not None:
-        return wrapped
-    wrapped = from_dlpack(tensor, assumed_align=16).mark_layout_dynamic()
-    wrapped.element_type = dtype
-    _WRAPPER_CACHE[key] = wrapped
-    return wrapped
-
-
-def _make_native_cutedsl_launchers(k, v, beta, A, gk):
-    """Build raw CuTe launchers without the TVM FFI tensor conversion path."""
-    B, T, H_qk, K = k.shape
-    H_v = v.shape[2]
-    V = v.shape[3]
-    BT = A.shape[-1]
-    total_nt = B * ((T + BT - 1) // BT)
-    w = torch.empty((B, T, H_v, K), dtype=k.dtype, device=k.device)
-    u = torch.empty_like(v)
-    kg = torch.empty_like(w)
-    cu = torch.zeros(2, dtype=torch.int32, device=k.device)
-    ci = torch.zeros(2, dtype=torch.int32, device=k.device)
-    beta_dtype = cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16
-    problem_size = (Int32(B), Int32(T), Int32(H_qk), Int32(H_v), Int32(K), Int32(V))
-
-    static_args = (
-        _wrap_tensor(k, cutlass.BFloat16),
-        _wrap_tensor(v, cutlass.BFloat16),
-        _wrap_tensor(beta, beta_dtype),
-        _wrap_tensor(A, cutlass.BFloat16),
-        _wrap_tensor(gk, cutlass.Float32),
-        _wrap_tensor(w, cutlass.BFloat16),
-        _wrap_tensor(u, cutlass.BFloat16),
-        _wrap_tensor(kg, cutlass.BFloat16),
-        _wrap_tensor(cu, cutlass.Int32),
-        _wrap_tensor(ci, cutlass.Int32),
-    )
-    kernel = recompute_wu_module.KDARecomputeWU(
-        K=K,
-        V=V,
-        chunk_size=BT,
-        beta_dtype=beta_dtype,
-    )
-    compiled = cute.compile(kernel, *static_args, problem_size, Int32(total_nt), make_fake_stream())
-    stream = cuda_drv.CUstream(torch.cuda.current_stream(k.device).cuda_stream)
-
-    def run_core():
-        compiled(*static_args, problem_size, Int32(total_nt), stream)
-
-    input_args = static_args[:5]
-    metadata_args = static_args[8:]
-
-    def run_e2e():
-        w_new = torch.empty_like(w)
-        u_new = torch.empty_like(u)
-        kg_new = torch.empty_like(kg)
-        output_args = (
-            _wrap_tensor(w_new, cutlass.BFloat16),
-            _wrap_tensor(u_new, cutlass.BFloat16),
-            _wrap_tensor(kg_new, cutlass.BFloat16),
-        )
-        compiled(*input_args, *output_args, *metadata_args, problem_size, Int32(total_nt), stream)
-        return w_new, u_new, None, kg_new
-
-    return run_core, run_e2e
-
-
 def _max_error(ref, out):
     stats = [relative_rms_error_rel_max_mean_abs_rhs(a, b) for a, b in zip(ref, out) if a is not None]
     return tuple(max(values) for values in zip(*stats))
@@ -233,8 +159,7 @@ def main():
 
     print(
         f"{'T':>8} {'C++ core':>10} {'DSL core':>10} {'core x':>8} "
-        f"{'pooled':>10} {'native':>10} {'native e2e':>10} {'C++ e2e':>10} {'DSL e2e':>10} {'e2e x':>8} "
-        f"{'rel_rmse':>12}"
+        f"{'pooled':>10} {'C++ e2e':>10} {'DSL e2e':>10} {'e2e x':>8} {'rel_rmse':>12}"
     )
     for T in args.lengths:
         cu_seqlens = torch.tensor([0, T, 2 * T], dtype=torch.int32, device=device)
@@ -249,18 +174,14 @@ def main():
 
         cpp_core, _ = _make_cpp_launcher(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices)
         dsl_core, dsl_pooled, _ = _make_cutedsl_launcher(k, v, beta, A, cu_gk)
-        native_core, native_e2e = _make_native_cutedsl_launchers(k, v, beta, A, cu_gk)
         cpp_core_ms = triton_bench_fn(cpp_core)
         dsl_core_ms = triton_bench_fn(dsl_core)
         dsl_pooled_ms = triton_bench_fn(dsl_pooled)
-        native_core_ms = triton_bench_fn(native_core)
-        native_e2e_ms = triton_bench_fn(native_e2e)
         cpp_e2e_ms = triton_bench_fn(lambda: _run_cpp(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices))
         dsl_e2e_ms = triton_bench_fn(lambda: recompute_w_u_fwd(k, v, beta, A, cu_gk, cu_seqlens, chunk_indices))
         print(
             f"{T:8d} {cpp_core_ms:10.4f} {dsl_core_ms:10.4f} {cpp_core_ms / dsl_core_ms:8.3f} "
-            f"{dsl_pooled_ms:10.4f} {native_core_ms:10.4f} {native_e2e_ms:10.4f} "
-            f"{cpp_e2e_ms:10.4f} {dsl_e2e_ms:10.4f} "
+            f"{dsl_pooled_ms:10.4f} {cpp_e2e_ms:10.4f} {dsl_e2e_ms:10.4f} "
             f"{cpp_e2e_ms / dsl_e2e_ms:8.3f} {ws_err:12.6g}"
         )
 
