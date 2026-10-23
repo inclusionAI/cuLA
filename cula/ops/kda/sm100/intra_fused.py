@@ -1411,9 +1411,12 @@ def fused_kernel123(
                 cute.arch.mbarrier_arrive(tma_mbars)
             if cutlass.const_expr(INPUT_GK_FP32 != 0):
                 sBeta_pf = sBeta[(None, 0)]
+                beta_cs = pf_cs
+                if not IS_VARLEN:
+                    beta_cs = chunk_base * BT
                 for beta_iter in cutlass.range_constexpr(BT // 32):
                     beta_row = beta_iter * 32 + lane_id
-                    sBeta_pf[beta_row] = mBeta[i_b, pf_cs + beta_row, i_h]
+                    sBeta_pf[beta_row] = mBeta[i_b, beta_cs + beta_row, i_h]
                 cute.arch.mbarrier_arrive(k1_done_mbars)
 
             # Issue TMAs for chunks 1..CHUNKS_PER_BLOCK-1
@@ -1456,9 +1459,12 @@ def fused_kernel123(
                     cute.arch.mbarrier_arrive(tma_mbars + next_stage)
                 if cutlass.const_expr(INPUT_GK_FP32 != 0):
                     sBeta_ns = sBeta[(None, next_stage)]
+                    beta_cs = next_cs
+                    if not IS_VARLEN:
+                        beta_cs = (chunk_base + next_i) * BT
                     for beta_iter in cutlass.range_constexpr(BT // 32):
                         beta_row = beta_iter * 32 + lane_id
-                        sBeta_ns[beta_row] = mBeta[i_b, next_cs + beta_row, i_h]
+                        sBeta_ns[beta_row] = mBeta[i_b, beta_cs + beta_row, i_h]
                     cute.arch.mbarrier_arrive(k1_done_mbars + next_stage)
 
         # =============================================================
