@@ -1501,12 +1501,27 @@ def fused_kernel123(
                 phase = chunk_iter // NUM_STAGES % 2
                 chunk_idx = chunk_base + chunk_iter
                 chunk_start = cutlass.Int32(0)
+                valid_rows = cutlass.Int32(BT)
                 if IS_VARLEN:
+                    valid_rows = cutlass.Int32(1)
                     if chunk_idx < num_chunks:
                         _sid = cutlass.Int32(mChunkIndices[chunk_idx, 0])
                         chunk_start = cutlass.Int32(mCuSeqlens[_sid]) + cutlass.Int32(mChunkIndices[chunk_idx, 1]) * BT
+                        _mma_eos = cutlass.Int32(mCuSeqlens[_sid + 1])
+                        valid_rows = _mma_eos - chunk_start
+                        if valid_rows > BT:
+                            valid_rows = cutlass.Int32(BT)
                 else:
                     chunk_start = chunk_idx * BT
+
+                # csrc clamps each 16-row gate reference to the final valid
+                # row of a partial chunk. Reading the nominal row (8/16/32/48)
+                # changes the gated K operands at a tail and can move FP32-beta
+                # Akk by one BF16 ULP after inversion.
+                norm_row_cur = norm_row
+                if IS_VARLEN and not VARLEN_PURE:
+                    if norm_row_cur >= valid_rows:
+                        norm_row_cur = valid_rows - 1
 
                 cute.arch.mbarrier_wait(k1_done_mbars + s, phase)
                 cute.arch.mbarrier_wait(store_done_mbars + s, phase)
@@ -1550,14 +1565,14 @@ def fused_kernel123(
                         cute.copy(tiled_copy_mma_B, thr_copy_B.partition_S(sK_tile_n1), thr_copy_B.retile(tCrK_n1))
 
                         # ---- Gate norm (2x k=8 covers k=16) ----
-                        sGn_a = cute.local_tile(csGcum, tiler=(1, 8), coord=(norm_row, k_block * 2))
+                        sGn_a = cute.local_tile(csGcum, tiler=(1, 8), coord=(norm_row_cur, k_block * 2))
                         tCsGn_a = thr_copy_Gn.partition_S(sGn_a)
                         tCrGn_a = cute.make_fragment_like(tCsGn_a, cutlass.Float32)
                         cute.copy(tiled_copy_Gcum_norm, tCsGn_a, thr_copy_Gn.retile(tCrGn_a))
                         gn_a0 = tCrGn_a[0]
                         gn_a1 = tCrGn_a[1]
 
-                        sGn_b = cute.local_tile(csGcum, tiler=(1, 8), coord=(norm_row, k_block * 2 + 1))
+                        sGn_b = cute.local_tile(csGcum, tiler=(1, 8), coord=(norm_row_cur, k_block * 2 + 1))
                         tCsGn_b = thr_copy_Gn.partition_S(sGn_b)
                         tCrGn_b = cute.make_fragment_like(tCsGn_b, cutlass.Float32)
                         cute.copy(tiled_copy_Gcum_norm, tCsGn_b, thr_copy_Gn.retile(tCrGn_b))
