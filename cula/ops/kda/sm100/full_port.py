@@ -103,6 +103,7 @@ def _make_full_host(batch, length, h_qk, h_v, beta_dtype, scale):
             chunk_indices,
             dummy_bias,
             cutlass.Float32(0.0),
+            stream,
         )
         akk_inv_fp32_physical_host(
             Akk_workspace,
@@ -114,6 +115,7 @@ def _make_full_host(batch, length, h_qk, h_v, beta_dtype, scale):
             chunk_indices,
             0,
             length,
+            stream,
         )
         wu(
             k,

@@ -2341,6 +2341,7 @@ def make_host_function(
         mChunkIndices,
         mDtBias,
         lower_bound_val,
+        stream=None,
     ):
         # 3D TMA view: (B*T, K_DIM, H). domain_offset in kernel shifts to
         # arbitrary chunk_start — no BT alignment required for varlen.
@@ -2510,6 +2511,7 @@ def make_host_function(
             grid=(_grid_x, 1, 1),
             block=(_THREADS, 1, 1),
             smem=smem_size,
+            stream=stream,
         )
 
     return host_fn

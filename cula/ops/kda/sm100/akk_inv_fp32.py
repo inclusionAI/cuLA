@@ -241,6 +241,7 @@ def akk_inv_fp32_physical_host(
     mChunkIndices: cute.Tensor,
     IS_VARLEN: cutlass.Constexpr[int],
     T_VAL: cutlass.Constexpr[int],
+    stream=None,
 ):
     in_layout = cute.make_layout((B, T_VAL, H, BS), stride=(T_VAL * H * BS, H * BS, BS, 1))
     out_layout = cute.make_layout((B, T_VAL, H, BS), stride=(T_VAL * H * BS, H * BS, BS, 1))
@@ -265,4 +266,5 @@ def akk_inv_fp32_physical_host(
         grid=(H, NT, B),
         block=(THREADS, 1, 1),
         smem=smem_bytes,
+        stream=stream,
     )
