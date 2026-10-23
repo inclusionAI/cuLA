@@ -83,7 +83,7 @@ def _run_csrc_intra(q, k, v, gk, beta, cu_seqlens, chunk_indices, scale):
 
 
 def _run_cutedsl_intra(q, k, _v, gk, beta, _cu_seqlens, _chunk_indices, scale):
-    return chunk_kda_fwd_intra_sm100_from_gk(q, k, gk, beta, scale)
+    return chunk_kda_fwd_intra_sm100_from_gk(q, k, gk, beta, scale, fp32_akk_inv=False)
 
 
 def _run_cutedsl(q, k, v, gk, beta, cu_seqlens, chunk_indices, scale):
@@ -140,6 +140,12 @@ def main():
         csrc = _run_csrc(*inputs, scale)
         cutedsl = _run_cutedsl(*inputs, scale)
         _assert_bitwise(csrc, cutedsl)
+        csrc_intra = _run_csrc_intra(*inputs, scale)
+        cutedsl_intra = _run_cutedsl_intra(*inputs, scale)
+        for name, expected, observed in zip(("Aqk", "Akk"), csrc_intra, cutedsl_intra):
+            if not torch.equal(expected, observed):
+                mismatches = torch.count_nonzero(expected != observed).item()
+                raise AssertionError(f"fused {name}: {mismatches} bitwise mismatches")
 
         csrc_intra_ms = triton_bench_fn(lambda: _run_csrc_intra(*inputs, scale))
         cutedsl_intra_ms = triton_bench_fn(lambda: _run_cutedsl_intra(*inputs, scale))

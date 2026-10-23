@@ -2906,10 +2906,9 @@ def chunk_kda_fwd_intra_sm100_from_gk(
     ``chunk_kda_fwd_intra_cuda``. It deliberately preserves the csrc kernel
     boundary; gate fusion is not part of this correctness baseline.
 
-    ``fp32_akk_inv=True`` keeps the pre-inverse Akk workspace in FP32 and uses
-    the same single-accumulator K=32 TF32 Schur reduction order as csrc.  The
-    experimental in-CTA inverse is intentionally excluded from this bitwise
-    correctness boundary.
+    ``fp32_akk_inv=True`` keeps the pre-inverse Akk workspace in FP32 and runs
+    the standalone TF32 inverse. ``fp32_akk_inv=False`` enables the matching
+    in-CTA TF32 inverse for aligned equal-length inputs.
     """
     if chunk_size != BT:
         raise NotImplementedError(f"chunk_size must be {BT}, got {chunk_size}.")
@@ -2935,10 +2934,8 @@ def chunk_kda_fwd_intra_sm100_from_gk(
         raise ValueError(f"beta shape must be {(B, T_total, H_v)}, got {tuple(beta.shape)}.")
     if not use_tf32_inverse:
         raise NotImplementedError("The one-to-one baseline currently ports the default csrc TF32 inverse only.")
-    if not fp32_akk_inv:
-        raise NotImplementedError(
-            "The csrc-boundary port requires fp32_akk_inv=True; the experimental in-CTA inverse is not bitwise aligned."
-        )
+    if not fp32_akk_inv and (cu_seqlens is not None or T_total % (CHUNKS_PER_BLOCK * BT) != 0):
+        raise NotImplementedError("The in-CTA inverse currently requires the aligned equal-length scheduler.")
     if scale is None:
         scale = K_DIM**-0.5
 
@@ -3067,7 +3064,8 @@ def chunk_kda_fwd_intra_sm100_from_gk(
     qs_ct = ks_ct
     gk_last_ct = _ct_cached(dummy_fp32, cutlass.Float32)
     aqk_ct = wrap_output(A_qk, cutlass.BFloat16)
-    akk_ct = wrap_output(A_kk_workspace, cutlass.Float32 if fp32_akk_inv else cutlass.BFloat16)
+    akk_storage = A_kk_workspace if fp32_akk_inv else A_kk
+    akk_ct = wrap_output(akk_storage, cutlass.Float32 if fp32_akk_inv else cutlass.BFloat16)
     cu_ct, ci_ct = _get_eqlen_dummies(q.device)
     bias_ct = _ct_cached(_get_csrc_port_dummy_bias(q.device, H_v), cutlass.Float32)
 
