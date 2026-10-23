@@ -142,39 +142,44 @@ def _compile_full_port(device, batch, length, h_qk, h_v, beta_dtype, scale):
     if compiled is not None:
         return compiled
 
+    # Keep the FFI batch dimension symbolic even though the generated host
+    # captures the concrete launch geometry.  A static extent of one is
+    # folded out of compact fake tensors by the DSL type builder and can make
+    # the composed host's tensor ABI inconsistent with a real rank-4 tensor.
+    fake_batch = cute.sym_int()
     bf16_4d_qk = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (batch, length, h_qk, K_DIM),
+        (fake_batch, length, h_qk, K_DIM),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     bf16_4d_v = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (batch, length, h_v, K_DIM),
+        (fake_batch, length, h_v, K_DIM),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     fp32_gk = make_fake_compact_tensor(
         cutlass.Float32,
-        (batch, length, h_v, K_DIM),
+        (fake_batch, length, h_v, K_DIM),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     beta_fake = make_fake_compact_tensor(
         cutlass.Float32 if beta_dtype == torch.float32 else cutlass.BFloat16,
-        (batch, length, h_v),
+        (fake_batch, length, h_v),
         stride_order=(2, 1, 0),
         assumed_align=128,
     )
     bf16_A = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (batch, length, h_v, BT),
+        (fake_batch, length, h_v, BT),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
     fp32_A = make_fake_compact_tensor(
         cutlass.Float32,
-        (batch, length, h_v, BT),
+        (fake_batch, length, h_v, BT),
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
