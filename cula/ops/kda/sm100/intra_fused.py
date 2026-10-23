@@ -2041,6 +2041,18 @@ def fused_kernel123(
                             csAkk[norm_row, norm_col] = norm_val
                     store_internal_barrier()
 
+                    # The off-diagonal source tiles occupy the physical
+                    # upper triangle.  They must be cleared after every
+                    # logical-lower copy has consumed them; otherwise the
+                    # TF32 inverse observes stale K123 accumulator values.
+                    for clear_i in cutlass.range_constexpr((BT * BT) // (NUM_STORE_WARPS * 32)):
+                        linear = store_tid + clear_i * (NUM_STORE_WARPS * 32)
+                        clear_row = linear // BT
+                        clear_col = linear % BT
+                        if clear_row < clear_col:
+                            csAkk[clear_row, clear_col] = cutlass.Float32(0.0)
+                    store_internal_barrier()
+
                     if store_tid < 64:
                         _tf32_invert_diag_forward16(csAkk, store_tid // 16, store_tid)
                     store_internal_barrier()
