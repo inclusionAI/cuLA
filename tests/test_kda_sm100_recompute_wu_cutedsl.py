@@ -22,23 +22,30 @@ def _requires_sm100():
 
 
 @pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16])
-def test_recompute_wu_matches_csrc(beta_dtype):
+@pytest.mark.parametrize(
+    ("qk_heads", "value_heads", "cu_offsets"),
+    [
+        pytest.param(16, 16, [0, 256, 512], id="mha-uniform"),
+        pytest.param(4, 8, [0, 63, 193], id="gva-partial-varlen"),
+    ],
+)
+def test_recompute_wu_matches_csrc(beta_dtype, qk_heads, value_heads, cu_offsets):
     _requires_sm100()
     torch.manual_seed(0)
     device = torch.device("cuda")
-    batch, seqlen, heads, dim, chunk_size = 2, 256, 16, 128, 64
+    total_tokens, dim, chunk_size = cu_offsets[-1], 128, 64
 
-    k = torch.randn(1, batch * seqlen, heads, dim, device=device, dtype=torch.bfloat16) * 0.1
-    v = torch.randn_like(k) * 0.1
-    beta = torch.rand(1, batch * seqlen, heads, device=device, dtype=beta_dtype)
-    gk = torch.randn(1, batch * seqlen, heads, dim, device=device, dtype=torch.float32) * 0.02
-    A = torch.randn(1, batch * seqlen, heads, chunk_size, device=device, dtype=torch.bfloat16) * 0.02
-    cu_seqlens = torch.tensor([0, seqlen, 2 * seqlen], dtype=torch.int32, device=device)
+    k = torch.randn(1, total_tokens, qk_heads, dim, device=device, dtype=torch.bfloat16) * 0.1
+    v = torch.randn(1, total_tokens, value_heads, dim, device=device, dtype=torch.bfloat16) * 0.1
+    beta = torch.rand(1, total_tokens, value_heads, device=device, dtype=beta_dtype)
+    gk = torch.randn(1, total_tokens, value_heads, dim, device=device, dtype=torch.float32) * 0.02
+    A = torch.randn(1, total_tokens, value_heads, chunk_size, device=device, dtype=torch.bfloat16) * 0.02
+    cu_seqlens = torch.tensor(cu_offsets, dtype=torch.int32, device=device)
     chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
 
-    w_ref = torch.empty_like(k)
+    w_ref = torch.empty(1, total_tokens, value_heads, dim, device=device, dtype=k.dtype)
     u_ref = torch.empty_like(v)
-    kg_ref = torch.empty_like(k)
+    kg_ref = torch.empty_like(w_ref)
     cula_cuda.recompute_w_u_cuda(
         k,
         v,
