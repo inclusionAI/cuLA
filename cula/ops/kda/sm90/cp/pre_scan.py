@@ -30,7 +30,7 @@ from cutlass.cute.nvgpu import warp
 from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind, make_smem_layout_atom
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
-from cula.ops.kda.sm90._common import copy_async_bulk, movm_t_b16
+from cula.ops.kda.sm90._common import movm_t_b16
 from cula.ops.kda.sm90.k2 import (
     CHUNK,
     D,
@@ -48,6 +48,10 @@ LOAD_WARP_IDX = 4
 def pre_scan_kernel(
     tma_atom_v: cute.CopyAtom,
     tma_tensor_v: cute.Tensor,
+    tma_atom_kd: cute.CopyAtom,
+    tma_tensor_kd: cute.Tensor,
+    tma_atom_kr: cute.CopyAtom,
+    tma_tensor_kr: cute.Tensor,
     tma_atom_inv: cute.CopyAtom,
     tma_tensor_inv: cute.Tensor,
     tma_atom_gt: cute.CopyAtom,
@@ -119,6 +123,25 @@ def pre_scan_kernel(
         cute.group_modes(sV, 0, 2),
         cute.group_modes(gSrc_v, 0, 2),
     )
+    # K1 stores the physical K_INTER byte image directly. Plain-layout TMA
+    # restores those bytes while participating in the input transaction
+    # barrier; raw cp.async.bulk copies can otherwise leave the wait pending.
+    raw_qk_stage_layout = cute.make_layout((CHUNK, D, STAGES), stride=(D, 1, CHUNK * D))
+    sKD_raw = cute.make_tensor(sKd.iterator, raw_qk_stage_layout)
+    sKR_raw = cute.make_tensor(sKr.iterator, raw_qk_stage_layout)
+
+    def partition_raw_workspace(atom, tensor, smem_tensor):
+        g_tile = cute.local_tile(tensor, (CHUNK, D), (None, None, None))
+        return cpasync.tma_partition(
+            atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(smem_tensor, 0, 2),
+            cute.group_modes(g_tile, 0, 2),
+        )
+
+    tKDs, tKDg = partition_raw_workspace(tma_atom_kd, tma_tensor_kd, sKD_raw)
+    tKRs, tKRg = partition_raw_workspace(tma_atom_kr, tma_tensor_kr, sKR_raw)
     gSrc_inv = cute.local_tile(tma_tensor_inv, (CHUNK, CHUNK), (None, None, None))
     tIs, tIg = cpasync.tma_partition(
         tma_atom_inv,
@@ -143,20 +166,6 @@ def pre_scan_kernel(
         cute.group_modes(sBeta, 0, 2),
         cute.group_modes(gSrc_beta, 0, 2),
     )
-    raw_copy_atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), cutlass.BFloat16)
-    raw_stage_layout = cute.make_layout(
-        (CHUNK * D, STAGES),
-        stride=(1, CHUNK * D),
-    )
-    raw_gmem_layout = cute.make_layout(
-        (CHUNK * D, total_tiles * H),
-        stride=(1, CHUNK * D),
-    )
-    sKD_raw = cute.make_tensor(sKd.iterator, raw_stage_layout)
-    sKR_raw = cute.make_tensor(sKr.iterator, raw_stage_layout)
-    gKD_raw = cute.make_tensor(ws_kd.iterator, raw_gmem_layout)
-    gKR_raw = cute.make_tensor(ws_kr.iterator, raw_gmem_layout)
-
     # sState=0.  The distributed FP32 M accumulator initializes sM below.
     if tidx < D:
         for e in cutlass.range_constexpr(D):
@@ -285,8 +294,8 @@ def pre_scan_kernel(
                 cute.copy(tma_atom_v, tVg_seq[(None, t, 0, head_idx)], tVs_seq[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             else:
                 cute.copy(tma_atom_v, tVg[(None, tg_l, 0, head_idx)], tVs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
-            copy_async_bulk(raw_copy_atom, gKD_raw[(None, wt_l)], sKD_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
-            copy_async_bulk(raw_copy_atom, gKR_raw[(None, wt_l)], sKR_raw[(None, s_dyn_l)], mbar_ptr=bar_l)
+            cute.copy(tma_atom_kd, tKDg[(None, 0, 0, wt_l)], tKDs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
+            cute.copy(tma_atom_kr, tKRg[(None, 0, 0, wt_l)], tKRs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             cute.copy(tma_atom_inv, tIg[(None, 0, 0, wt_l)], tIs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             cute.copy(tma_atom_gt, tGTg[(None, 0, 0, wt_l)], tGTs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
             cute.copy(tma_atom_beta, tBg[(None, 0, 0, wt_l)], tBs[(None, s_dyn_l)], tma_bar_ptr=bar_l)
@@ -486,6 +495,7 @@ def run_pre_scan(
 ):
     cc_smem = cute.make_layout((CHUNK, CHUNK), stride=(CHUNK, 1))
     kinter_smem = _make_out_kinter_one_stage()
+    raw_qk_smem = cute.make_layout((CHUNK, D), stride=(D, 1))
 
     def make_thd_atom(t, op):
         view = cute.make_tensor(
@@ -501,7 +511,16 @@ def run_pre_scan(
         )
         return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), view, cc_smem, (CHUNK, CHUNK))
 
+    def make_raw_ws_qk_atom(t):
+        view = cute.make_tensor(
+            t.iterator,
+            cute.make_layout((CHUNK, D, total_tiles * H), stride=(D, 1, CHUNK * D)),
+        )
+        return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), view, raw_qk_smem, (CHUNK, D))
+
     tma_atom_v, tma_tensor_v = make_thd_atom(v, cpasync.CopyBulkTensorTileG2SOp())
+    tma_atom_kd, tma_tensor_kd = make_raw_ws_qk_atom(ws_kd)
+    tma_atom_kr, tma_tensor_kr = make_raw_ws_qk_atom(ws_kr)
     tma_atom_inv, tma_tensor_inv = make_ws_cc_atom(ws_inv)
 
     gt_smem = cute.make_layout((D, 1), stride=(1, D))
@@ -549,6 +568,10 @@ def run_pre_scan(
     pre_scan_kernel(
         tma_atom_v,
         tma_tensor_v,
+        tma_atom_kd,
+        tma_tensor_kd,
+        tma_atom_kr,
+        tma_tensor_kr,
         tma_atom_inv,
         tma_tensor_inv,
         tma_atom_gt,

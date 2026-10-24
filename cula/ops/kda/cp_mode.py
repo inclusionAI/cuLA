@@ -1,7 +1,7 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Intracard context-parallel dispatch vocabulary shared by the KDA backends."""
+"""Intracard context-parallel dispatch vocabulary shared by KDA paths."""
 
 from __future__ import annotations
 

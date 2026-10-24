@@ -1,15 +1,14 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Public FlashKDA prefill entry point."""
+
 from __future__ import annotations
 
 from numbers import Real
 
 import torch
 
-from cula.backends import BackendRegistry
-from cula.kda.backends.flashkda import FlashKDABackend
-from cula.kda.backends.fully_fused import FullyFusedBackend
 from cula.ops.kda.cp_mode import CPMode
 
 _EXTRA_KWARGS = {
@@ -21,10 +20,6 @@ _EXTRA_KWARGS = {
     "out",
     "final_state",
 }
-
-kda_prefill_registry = BackendRegistry("kda_prefill")
-kda_prefill_registry.register(FlashKDABackend())
-kda_prefill_registry.register(FullyFusedBackend())
 
 
 @torch.compiler.disable
@@ -45,11 +40,12 @@ def kda_prefill(
     chunk_indices: torch.IntTensor | None = None,
     **kwargs,
 ):
-    """Select the first SM90 prefill backend that accepts the call.
+    """Run the CuTeDSL FlashKDA forward prefill implementation.
 
-    This forward-only API does not implement backward. FlashKDA has priority
-    over the fully-fused CUDA path; disabling either backend with its
-    ``CULA_BACKEND_*`` variable makes dispatch try the remaining implementation.
+    This forward-only API supports SM90 and SM100. It has no native-extension
+    fallback: unsupported inputs are rejected by FlashKDA with a concrete
+    validation error. In particular, grouped-value attention is not currently
+    supported and the Q/K/V head counts must match.
     """
     tensors = (q, k, v, g, beta)
     if any(not isinstance(t, torch.Tensor) for t in tensors):
@@ -75,8 +71,9 @@ def kda_prefill(
     if "use_intracard_cp" in kwargs:
         kwargs["use_intracard_cp"] = CPMode.parse(kwargs["use_intracard_cp"])
 
-    return kda_prefill_registry.dispatch(
-        "kda_prefill",
+    from cula.kda.flashkda import cula_kda_prefill
+
+    return cula_kda_prefill(
         q,
         k,
         v,
@@ -95,4 +92,4 @@ def kda_prefill(
     )
 
 
-__all__ = ["kda_prefill", "kda_prefill_registry"]
+__all__ = ["kda_prefill"]

@@ -5,7 +5,7 @@ builds cuLA, runs the compat + SM90/SM100 kernel JIT tests, returns a JSON
 summary. The GPU and the CuTeDSL version are chosen via environment
 variables so a reviewer can reproduce a specific environment, e.g.::
 
-    CULA_VALIDATE_GPU=B200 CULA_VALIDATE_CUTLASS='nvidia-cutlass-dsl==4.5.2' \\
+    CULA_VALIDATE_GPU=B200 CULA_VALIDATE_CUTLASS='nvidia-cutlass-dsl==4.8.1' \\
         modal run scripts/modal_validate.py
 
 SM100-only tests (``test_ptx_umma_ws.py``) self-deselect on non-Blackwell
@@ -24,9 +24,9 @@ import modal
 FORK = "https://github.com/bikrammajhi/cuLA.git"
 BRANCH = "mlir-compat-gateway"
 CUDA_TAG = "cu129"
-TORCH_VERSION = "2.9.1"
+TORCH_VERSION = "2.8.0"
 GPU = os.environ.get("CULA_VALIDATE_GPU", "H100")
-CUTLASS_SPEC = os.environ.get("CULA_VALIDATE_CUTLASS", "nvidia-cutlass-dsl>=4.4.2,<4.7,!=4.5.0")
+CUTLASS_SPEC = os.environ.get("CULA_VALIDATE_CUTLASS", "nvidia-cutlass-dsl>=4.6.2,<4.9")
 TESTS = [
     "tests/test_cutedsl_compat.py",
     "tests/test_lightning_attn_prefill_sm90.py",

@@ -3,8 +3,8 @@
 
 """FlashKDA CuTeDSL intracard CP (SM90): CP vs serial, CP vs FLA, determinism.
 
-Distinct from tests/test_intracard_cp_sm90.py, which covers the CUDA C++
-fully-fused path (kda_prefill_hopper_opt / auto_cp via cp_context).
+This is the production SM90 prefill path; the former CUDA C++ implementation
+and its separate CP scheduler have been removed.
 """
 
 import pytest

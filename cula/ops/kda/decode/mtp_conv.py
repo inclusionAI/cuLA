@@ -35,9 +35,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32
-from cutlass.cutlass_dsl import T as _T
 
-from cula.ops._mlir_compat import llvm as _llvm
 from cula.ops.kda.decode.cute import (
     TILE_K,
     _get_cached_stream,
@@ -56,30 +54,13 @@ WCONV = 4  # conv width (KDA short_conv_kernel_size)
 NWARP2 = 2
 
 
-@cutlass.dsl_user_op
-def _atomic_add_global_i32(ptr_i64, addend_i32, *, loc=None, ip=None):
-    """Atomically add to a global int32 counter and return its old value."""
-    result = _llvm.inline_asm(
-        _T.i32(),
-        [ptr_i64, addend_i32],
-        "atom.global.add.s32 $0, [$1], $2;",
-        "=r,l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return Int32(result)
-
-
 @cute.jit
 def _announce_qk_read_complete(qk_arrival_counters, counter_idx, expected_arrivals, lane):
     """Return a warp-uniform flag identifying the last CTA in a q/k group."""
     arrival = Int32(0)
     if lane == 0:
         counter_ptr = qk_arrival_counters.iterator + counter_idx
-        arrival = _atomic_add_global_i32(counter_ptr.toint().ir_value(), Int32(1).ir_value())
+        arrival = cute.arch.atomic_add(counter_ptr, Int32(1), sem="relaxed", scope="gpu")
     arrival = cute.arch.shuffle_sync(arrival, 0, mask=-1, mask_and_clamp=31)
     return arrival == expected_arrivals - 1
 

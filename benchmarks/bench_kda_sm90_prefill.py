@@ -14,10 +14,11 @@
 # limitations under the License.
 
 """
-bench_kda_sm90_prefill.py — Benchmark: SM90 CuTeDSL KDA prefill vs FLA Triton baseline
+bench_kda_sm90_prefill.py — Benchmark: SM90/SM100 CuTeDSL KDA prefill vs FLA Triton baseline
 
-Hopper-only. Calls cula.kda.flashkda (cula_kda_prefill, the K1+K2
-two-kernel prefill) directly.
+Calls cula.kda.flashkda (cula_kda_prefill, the K1+K2 two-kernel prefill)
+directly on supported SM90 and SM100 devices. The filename is retained because
+the implementation originated as the SM90 FlashKDA pipeline.
 
 Compares:
   - Accuracy: relative_rms_error, rel_max, mean_diff of the output o vs FLA Triton
@@ -58,9 +59,9 @@ from benchmarks.utils import (
     set_seed,
 )
 from cula.kda import flashkda_prefill as cula_kda_prefill
-from cula.utils import assert_hopper
+from cula.kda._flashkda_arch import assert_flashkda_supported
 
-_SM_TAG = "sm90"
+_SM_TAG = "sm90/sm100"
 
 H, D = 64, 128
 WARMUP = 25
@@ -159,7 +160,7 @@ def _make_common(B, T, cu_seqlens, device):
 
 def bench_fixed(configs):
     print("\n" + "=" * 100)
-    print(f" Fixed-Length Benchmark: SM90 cula_kda_prefill ({_SM_TAG}) vs FLA Triton")
+    print(f" Fixed-Length Benchmark: cula_kda_prefill ({_SM_TAG}) vs FLA Triton")
     print("=" * 100)
     results = []
     for B, T in configs:
@@ -187,7 +188,7 @@ def bench_fixed(configs):
 
 def bench_varlen(configs):
     print("\n" + "=" * 100)
-    print(f" Varlen Benchmark: SM90 cula_kda_prefill ({_SM_TAG}) vs FLA Triton")
+    print(f" Varlen Benchmark: cula_kda_prefill ({_SM_TAG}) vs FLA Triton")
     print("=" * 100)
     results = []
     for seq_lens, total_len, dist in configs:
@@ -219,7 +220,7 @@ def bench_varlen(configs):
 def print_report(fixed_results, varlen_results):
     sep = "=" * 110
     print(f"\n\n{sep}")
-    print("                  BENCHMARK REPORT: SM90 cula_kda_prefill (K1+K2 two-kernel)")
+    print("                  BENCHMARK REPORT: cula_kda_prefill (K1+K2 two-kernel)")
     print(f"                  cuLA {_SM_TAG} vs FLA Triton")
     print(f"                  H={H}  D={D}  dtype=bf16  safe_gate=True  has_init_state={HAS_INIT_STATE}")
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
@@ -264,7 +265,7 @@ def print_report(fixed_results, varlen_results):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="bench_kda_sm90_prefill: SM90 cula_kda_prefill vs FLA Triton")
+    parser = argparse.ArgumentParser(description="bench_kda_sm90_prefill: SM90/SM100 cula_kda_prefill vs FLA Triton")
     parser.add_argument(
         "--mode",
         type=str,
@@ -279,7 +280,8 @@ def main():
     parser.add_argument("--heads", type=int, default=H, help=f"Number of heads (H == HV, MHA). Default: {H}")
     args = parser.parse_args()
 
-    assert_hopper(torch.device("cuda"))
+    device = torch.device("cuda")
+    assert_flashkda_supported(device)
 
     global NCU_MODE, SANITIZER_MODE, HAS_INIT_STATE
     H = args.heads
@@ -293,7 +295,11 @@ def main():
         HAS_INIT_STATE = True
         print("[init_state] using non-zero initial state")
 
-    print(f"[Device] {torch.cuda.get_device_name(0)}  compute capability {_SM_TAG}  →  cula_kda_prefill (SM90 K1+K2)")
+    major, minor = torch.cuda.get_device_capability(device)
+    print(
+        f"[Device] {torch.cuda.get_device_name(device)}  compute capability sm{major}{minor}  "
+        "→  cula_kda_prefill (SM90-derived K1+K2)"
+    )
 
     fixed_configs = [
         (1, 512),

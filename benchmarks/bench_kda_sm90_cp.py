@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-bench_kda_sm90_cp.py — Benchmark: SM90 FlashKDA CP-auto vs CP-off
+bench_kda_sm90_cp.py — Benchmark: SM90/SM100 FlashKDA CP-auto vs CP-off
 
 Compares flashkda_prefill(use_intracard_cp="auto") against
 flashkda_prefill(use_intracard_cp=False) on varlen configs. Reports whether
@@ -33,8 +33,9 @@ from benchmarks.utils import (
     set_seed,
 )
 from cula.kda import flashkda_prefill as cula_kda_prefill
+from cula.kda._flashkda_arch import assert_flashkda_supported
 from cula.ops.kda.sm90.cp.plan import CHUNK, plan_auto
-from cula.utils import assert_hopper, get_device_sm_count
+from cula.utils import get_device_sm_count
 
 D = 128
 H_VALUES = [4, 8]
@@ -99,11 +100,11 @@ def _auto_engages(seq_lens, H, sm_count) -> bool:
 
 def bench_cp(h_values, configs):
     print("\n" + "=" * 100)
-    print(" SM90 FlashKDA Benchmark: CP-auto vs CP-off")
+    print(" SM90/SM100 FlashKDA Benchmark: CP-auto vs CP-off")
     print("=" * 100)
 
     device = torch.device("cuda")
-    assert_hopper(device)
+    assert_flashkda_supported(device)
     num_sms = get_device_sm_count(device)
     print(f" [Device] {torch.cuda.get_device_name(0)}  SMs={num_sms}")
     results = []
@@ -160,7 +161,7 @@ def bench_cp(h_values, configs):
 def print_report(results, h_values):
     sep = "=" * 105
     print(f"\n\n{sep}")
-    print("               BENCHMARK REPORT: SM90 FlashKDA")
+    print("               BENCHMARK REPORT: SM90/SM100 FlashKDA")
     print('               CP-auto (use_intracard_cp="auto") vs CP-off (False)')
     print(f"               D={D}  dtype=bf16  safe_gate=True")
     wu, ni = resolve_benchmark_repeats(WARMUP, N_ITERS, ncu_mode=NCU_MODE, sanitizer_mode=SANITIZER_MODE)

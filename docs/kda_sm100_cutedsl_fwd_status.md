@@ -2,8 +2,8 @@
 
 The SM100/SM103 modular KDA forward no longer builds or loads a C++/CUDA
 extension. Intra-chunk Aqk/Akk, the csrc-ordered TF32 inverse, recompute W/U,
-KG, and optional QG are implemented in CuTeDSL. The remaining native cuLA
-extension is SM90-only.
+KG, and optional QG are implemented in CuTeDSL. cuLA no longer builds any
+native extension; SM90 prefill uses FlashKDA's CuTeDSL K1+K2 pipeline.
 
 ## Compatibility and dispatch
 
@@ -22,12 +22,17 @@ partial, and packed-varlen inputs use the same exact CuTeDSL kernels through
 the modular host path. Batch one deliberately avoids a composed-host compiler
 failure observed in CUTLASS DSL 4.6.2 and 4.6.3; it does not fall back to C++.
 
-The package currently declares `nvidia-cutlass-dsl>=4.4.2,<4.7,!=4.5.0`
-and this migration was validated with 4.6.2. An isolated 4.6.3 check reproduced
-the batch-one composed-host compiler failure, so a patch-version upgrade does
-not remove the modular fallback. Version 4.8.1 is outside the supported range
-and did not provide a clean drop-in validation in the current environment;
-the production path therefore does not depend on an unverified upgrade.
+The package declares `nvidia-cutlass-dsl>=4.6.2,<4.9` and a CUDA 13 extra.
+The low-level TMEM and NVVM wrappers use the 4.6 API directly and normalize the
+MMA keyword renames introduced by 4.8. The batch-one modular fallback remains:
+it is a stable dispatch choice and does not depend on the composed-host
+compiler behavior of a particular patch release.
+
+FlashKDA K2 and intracard-CP pre-scan restore K1's physical K_INTER workspace
+images through plain-layout TMA loads. This keeps the byte layout unchanged and
+accounts every load in the transaction barrier. Raw G2S bulk copies are not
+mixed into that barrier: on SM100 they could leave K2 waiting indefinitely,
+which appears on the host as a busy `cudaDeviceSynchronize()` call.
 
 `unified_gref=True` and `use_tf32_inverse=False` are rejected explicitly
 because neither option belongs to the bitwise-compatible production path.
@@ -116,5 +121,5 @@ Final pure-path results:
 - default-stream and concurrent-stream isolation;
 - output lifetime, pool reuse, and bounded retained memory;
 - fixed, GVA, QG, packed-varlen, and tail routing;
-- installation without an SM100 native extension;
-- SM90 extension build retained independently.
+- installation from the platform-independent wheel;
+- SM90 FlashKDA prefill without a native fallback.
