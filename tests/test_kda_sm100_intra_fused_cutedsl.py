@@ -5,11 +5,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from cula.ops.kda.sm100.intra_fused import (
-    chunk_kda_fwd_intra_sm100_equal,
-    chunk_kda_fwd_intra_sm100_from_gk,
-    chunk_kda_fwd_intra_sm100_varlen,
-)
+from cula.ops.kda.sm100.intra_fused import chunk_kda_fwd_intra_sm100_from_gk
 from cula.ops.kda.sm100.recompute_wu import recompute_w_u_fwd
 
 pytestmark = pytest.mark.cula_slow
@@ -151,34 +147,3 @@ def test_exact_port_normalizes_strided_inputs():
     actual = chunk_kda_fwd_intra_sm100_from_gk(q, k, gk, beta)
     for observed, reference in zip(actual, expected, strict=True):
         assert torch.equal(observed, reference)
-
-
-def test_uniform_varlen_uses_equal_fp16_path_bitwise():
-    _requires_sm100()
-    torch.manual_seed(7)
-    batch, seqlen, heads, dim = 2, 256, 4, 128
-    q = F.normalize(torch.randn(batch, seqlen, heads, dim, device="cuda").float(), dim=-1).bfloat16()
-    k = F.normalize(torch.randn(batch, seqlen, heads, dim, device="cuda").float(), dim=-1).bfloat16()
-    g = torch.randn(batch, seqlen, heads, dim, device="cuda", dtype=torch.bfloat16)
-    beta = torch.rand(batch, seqlen, heads, device="cuda", dtype=torch.bfloat16)
-    kwargs = dict(
-        A_log=torch.full((heads,), -4.0, device="cuda"),
-        dt_bias=torch.zeros(heads * dim, device="cuda"),
-        safe_gate=True,
-        lower_bound=-5.0,
-        fp32_akk_inv=True,
-        kscaled_fp16=True,
-    )
-    equal = chunk_kda_fwd_intra_sm100_equal(q=q, k=k, g=g, beta=beta, **kwargs)
-    packed = chunk_kda_fwd_intra_sm100_varlen(
-        q=q.flatten(0, 1).unsqueeze(0),
-        k=k.flatten(0, 1).unsqueeze(0),
-        g=g.flatten(0, 1).unsqueeze(0),
-        beta=beta.flatten(0, 1).unsqueeze(0),
-        cu_seqlens=torch.tensor([0, seqlen, 2 * seqlen], dtype=torch.int32, device="cuda"),
-        seq_lens=[seqlen, seqlen],
-        **kwargs,
-    )
-    for equal_tensor, packed_tensor in zip(equal, packed, strict=True):
-        expected = equal_tensor.flatten(0, 1).unsqueeze(0)
-        torch.testing.assert_close(packed_tensor, expected, rtol=0, atol=0, equal_nan=True)

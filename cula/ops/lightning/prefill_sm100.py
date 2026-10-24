@@ -727,6 +727,9 @@ class LinearAttentionChunkwiseDecay:
             sWorkIdx: cute.struct.MemRange[Int32, 2]
             # Double-buffered scheduling mbarriers (count=1 each, Load warp elect_one arrives)
             sched_mbar: cute.struct.MemRange[Int64, 2]
+            # End-of-work-unit rendezvous. Every CTA thread arrives before the
+            # Load warp publishes the next work index.
+            sched_done_mbar: cute.struct.MemRange[Int64, 1]
             # State transpose buffer for coalesced BHVK state load/store.
             # Sized for 64 V-rows × (D+4) K-values in f32 (~33KB for D=128).
             # Padding of 4 elements per row eliminates SMEM bank conflicts
@@ -1046,10 +1049,16 @@ class LinearAttentionChunkwiseDecay:
         # ===================== Scheduling mbarrier init (persistent varlen) =====================
         if cutlass.const_expr(self.is_varlen and self.persistent):
             sched_mbar_base = storage.sched_mbar.data_ptr()
-            # Init 2 mbarriers with count=1: only Load warp elect_one arrives
+            sched_done_mbar = storage.sched_done_mbar.data_ptr()
+            # Scheduling barriers have one elected Load-warp arrival; the
+            # completion barrier receives one arrival from every CTA thread.
             if warp_idx == 0:
-                cute.arch.mbarrier_init(sched_mbar_base, 1)
-                cute.arch.mbarrier_init(sched_mbar_base + 1, 1)
+                # mbarrier.init must execute exactly once per barrier, not
+                # once per lane in the selected warp.
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_init(sched_mbar_base, 1)
+                    cute.arch.mbarrier_init(sched_mbar_base + 1, 1)
+                    cute.arch.mbarrier_init(sched_done_mbar, self.threads_per_cta)
             cute.arch.mbarrier_init_fence()
             cute.arch.barrier(barrier_id=0, number_of_threads=self.threads_per_cta)
 
@@ -1253,6 +1262,7 @@ class LinearAttentionChunkwiseDecay:
                 cute.arch.sync_warp()
                 work_idx = sWorkIdx[(0,)]
                 sched_buf = Int32(1)  # next buffer to write
+                sched_done_phase = Int32(0)
                 should_continue = work_idx < total_work_units
             elif cutlass.const_expr(self.is_varlen):
                 work_idx = Int32(0)
@@ -1357,8 +1367,14 @@ class LinearAttentionChunkwiseDecay:
 
                 # --- End-of-WU: Load warp fetches next work_idx and signals ---
                 if cutlass.const_expr(self.is_varlen and self.persistent):
-                    # CTA barrier: sync all warps before WU transition
-                    cute.arch.barrier(barrier_id=1, number_of_threads=self.threads_per_cta)
+                    # Each thread arrives from its role-specific control-flow
+                    # path. A named CTA barrier here would be divergent because
+                    # those paths have different PCs. The shared mbarrier is the
+                    # common rendezvous; only the Load warp needs to wait before
+                    # publishing the next work index.
+                    cute.arch.mbarrier_arrive(sched_done_mbar)
+                    cute.arch.mbarrier_wait(sched_done_mbar, sched_done_phase)
+                    sched_done_phase = Int32(1) - sched_done_phase
                     with cute.arch.elect_one():
                         next_idx = _atomic_add_global_i32(workspace_iter.toint().ir_value(), Int32(1).ir_value())
                         sWorkIdx[(sched_buf,)] = next_idx
@@ -1486,8 +1502,7 @@ class LinearAttentionChunkwiseDecay:
 
                 # --- End-of-WU: wait for Load warp's scheduling signal ---
                 if cutlass.const_expr(self.is_varlen and self.persistent):
-                    # CTA barrier: sync all warps before WU transition
-                    cute.arch.barrier(barrier_id=1, number_of_threads=self.threads_per_cta)
+                    cute.arch.mbarrier_arrive(sched_done_mbar)
                     if sched_buf == 0:
                         cute.arch.mbarrier_wait(sched_mbar_base, sched_phase0)
                         sched_phase0 = Int32(1) - sched_phase0
@@ -1986,8 +2001,7 @@ class LinearAttentionChunkwiseDecay:
 
                 # --- End-of-WU: wait for Load warp's scheduling signal ---
                 if cutlass.const_expr(self.is_varlen and self.persistent):
-                    # CTA barrier: sync all warps before WU transition
-                    cute.arch.barrier(barrier_id=1, number_of_threads=self.threads_per_cta)
+                    cute.arch.mbarrier_arrive(sched_done_mbar)
                     if sched_buf == 0:
                         cute.arch.mbarrier_wait(sched_mbar_base, sched_phase0)
                         sched_phase0 = Int32(1) - sched_phase0
@@ -2129,8 +2143,7 @@ class LinearAttentionChunkwiseDecay:
 
                 # --- End-of-WU: wait for Load warp's scheduling signal ---
                 if cutlass.const_expr(self.is_varlen and self.persistent):
-                    # CTA barrier: sync all warps before WU transition
-                    cute.arch.barrier(barrier_id=1, number_of_threads=self.threads_per_cta)
+                    cute.arch.mbarrier_arrive(sched_done_mbar)
                     if sched_buf == 0:
                         cute.arch.mbarrier_wait(sched_mbar_base, sched_phase0)
                         sched_phase0 = Int32(1) - sched_phase0
@@ -2155,8 +2168,7 @@ class LinearAttentionChunkwiseDecay:
                 sched_phase1 = Int32(0)
                 should_continue_else = work_idx < total_work_units
                 while should_continue_else:
-                    # CTA barrier: sync all warps before WU transition
-                    cute.arch.barrier(barrier_id=1, number_of_threads=self.threads_per_cta)
+                    cute.arch.mbarrier_arrive(sched_done_mbar)
                     if sched_buf == 0:
                         cute.arch.mbarrier_wait(sched_mbar_base, sched_phase0)
                         sched_phase0 = Int32(1) - sched_phase0

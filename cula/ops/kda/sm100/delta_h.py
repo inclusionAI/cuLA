@@ -753,12 +753,15 @@ class ChunkDeltaRuleFwdH:
             sched_consumed_mbar_base = storage.sched_consumed_mbar.data_ptr()
             # Init 2 scheduling mbarriers with count=32: all 32 Load warp threads arrive.
             # Init 2 consumed mbarriers with count=32*7: all 32 threads × 7 consumer warps arrive.
-            # (MMA=1, CC=4, Store=1, Empty=1; all full-thread arrives, no elect_one)
+            # (MMA=1, CC=4, Store=1, Empty=1; all full-thread arrives)
             if warp_idx == 0:
-                cute.arch.mbarrier_init(sched_mbar_base, 32)
-                cute.arch.mbarrier_init(sched_mbar_base + 1, 32)
-                cute.arch.mbarrier_init(sched_consumed_mbar_base, 32 * 7)
-                cute.arch.mbarrier_init(sched_consumed_mbar_base + 1, 32 * 7)
+                # mbarrier.init must execute exactly once per barrier, not
+                # once per lane in the selected warp.
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_init(sched_mbar_base, 32)
+                    cute.arch.mbarrier_init(sched_mbar_base + 1, 32)
+                    cute.arch.mbarrier_init(sched_consumed_mbar_base, 32 * 7)
+                    cute.arch.mbarrier_init(sched_consumed_mbar_base + 1, 32 * 7)
             cute.arch.mbarrier_init_fence()
             cute.arch.barrier(barrier_id=0, number_of_threads=self.threads_per_cta)
 
