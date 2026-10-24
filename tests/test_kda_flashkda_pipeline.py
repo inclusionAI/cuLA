@@ -12,13 +12,23 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize(
-    ("relative_path", "run_function", "workspace_names"),
+    ("relative_path", "run_function", "workspace_names", "expected_tma_bytes"),
     [
-        ("cula/ops/kda/sm90/k2.py", "run_k2", ("ws_kd", "ws_qd", "ws_kr")),
-        ("cula/ops/kda/sm90/cp/pre_scan.py", "run_pre_scan", ("ws_kd", "ws_kr")),
+        (
+            "cula/ops/kda/sm90/k2.py",
+            "run_k2",
+            ("ws_kd", "ws_qd", "ws_kr"),
+            "4 * CHUNK * D * 2 + 2 * CHUNK * CHUNK * 2 + D * 4 + CHUNK * 2",
+        ),
+        (
+            "cula/ops/kda/sm90/cp/pre_scan.py",
+            "run_pre_scan",
+            ("ws_kd", "ws_kr"),
+            "3 * CHUNK * D * 2 + CHUNK * CHUNK * 2 + D * 4 + CHUNK * 2",
+        ),
     ],
 )
-def test_workspace_loads_use_barrier_accounted_plain_tma(relative_path, run_function, workspace_names):
+def test_workspace_loads_use_barrier_accounted_plain_tma(relative_path, run_function, workspace_names, expected_tma_bytes):
     source = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
     tree = ast.parse(source)
     run = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == run_function)
@@ -29,12 +39,27 @@ def test_workspace_loads_use_barrier_accounted_plain_tma(relative_path, run_func
     for name in workspace_names:
         assert f"make_raw_ws_qk_atom({name})" in run_text
 
-    kernel_text = ast.unparse(
-        next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name.endswith("kernel"))
-    )
+    kernel = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name.endswith("kernel"))
+    kernel_text = ast.unparse(kernel)
     assert "raw_qk_stage_layout = cute.make_layout((CHUNK, D, STAGES), stride=(D, 1, CHUNK * D))" in kernel_text
-    for atom in ("tma_atom_kd", "tma_atom_kr"):
-        assert f"cute.copy({atom}" in kernel_text
-    if "ws_qd" in workspace_names:
-        assert "cute.copy(tma_atom_qd" in kernel_text
-    assert kernel_text.count("tma_bar_ptr=bar_l") >= len(workspace_names)
+
+    tma_bytes = next(
+        node
+        for node in ast.walk(kernel)
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "TMA_BYTES"
+    )
+    expected_bytes = ast.parse(expected_tma_bytes, mode="eval").body
+    assert ast.dump(tma_bytes.value, include_attributes=False) == ast.dump(expected_bytes, include_attributes=False)
+
+    copy_calls = [
+        node
+        for node in ast.walk(kernel)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and ast.unparse(node.func) == "cute.copy"
+    ]
+    for workspace_name in workspace_names:
+        atom = f"tma_atom_{workspace_name.removeprefix('ws_')}"
+        workspace_copies = [call for call in copy_calls if call.args and ast.unparse(call.args[0]) == atom]
+        assert len(workspace_copies) == 1
+        assert any(
+            keyword.arg == "tma_bar_ptr" and ast.unparse(keyword.value) == "bar_l" for keyword in workspace_copies[0].keywords
+        )
