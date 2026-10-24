@@ -20,7 +20,7 @@ Linear attention mechanisms reformulate standard attention to use linear-time st
 
 cuLA supports both **Hopper (SM90)** and **Blackwell (SM10X)** GPUs.
 
-> **Requirements (Hopper & Blackwell):** Python 3.12+, CUDA Toolkit 12.9+, PyTorch 2.9.1+, and a matching `nvidia-cutlass-dsl` installation. cuLA does not build a C++/CUDA extension.
+> **Requirements (Hopper & Blackwell):** Python 3.12+, CUDA Toolkit 12.9+, PyTorch 2.8.0+, and a matching `nvidia-cutlass-dsl` installation. cuLA does not build a C++/CUDA extension.
 
 > **Note:** The PyTorch CUDA version must match your system CUDA Toolkit version. Check with `nvcc --version` and `python -c "import torch; print(torch.version.cuda)"`.
 
@@ -32,6 +32,10 @@ Platform-independent wheels containing the CuTeDSL sources are available on [Git
 
 Replace `<TAG>` with the release tag (e.g., `v0.2.0`) and `<VERSION>` with the version (e.g., `0.2.0`). Or download the `.whl` file directly from the [Releases page](https://github.com/inclusionAI/cuLA/releases) and install it with `pip install <filename>.whl`.
 
+The cuLA wheel does not install FLA. Install `flash-linear-attention` before importing `chunk_kda`:
+
+    pip install flash-linear-attention
+
 ### Build from Source
 
 **Clone cuLA & dependencies:**
@@ -41,15 +45,19 @@ git clone https://github.com/inclusionAI/cuLA.git
 git submodule update --init --recursive
 ```
 
-**Install PyTorch:**
+**Install PyTorch and CuTeDSL:**
+
+For CUDA 12.9:
 
 ```bash
-pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu129
+pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu129
+pip install 'nvidia-cutlass-dsl>=4.6.2,<4.9'
 ```
 
-For CUDA 13, install the CuTeDSL CUDA 13 extra before installing cuLA:
+For CUDA 13:
 
 ```bash
+pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu130
 pip install 'nvidia-cutlass-dsl[cu13]>=4.6.2,<4.9'
 ```
 

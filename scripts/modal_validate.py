@@ -24,7 +24,7 @@ import modal
 FORK = "https://github.com/bikrammajhi/cuLA.git"
 BRANCH = "mlir-compat-gateway"
 CUDA_TAG = "cu129"
-TORCH_VERSION = "2.9.1"
+TORCH_VERSION = "2.8.0"
 GPU = os.environ.get("CULA_VALIDATE_GPU", "H100")
 CUTLASS_SPEC = os.environ.get("CULA_VALIDATE_CUTLASS", "nvidia-cutlass-dsl>=4.6.2,<4.9")
 TESTS = [
