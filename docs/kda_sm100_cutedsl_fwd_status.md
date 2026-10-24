@@ -2,8 +2,8 @@
 
 The SM100/SM103 modular KDA forward no longer builds or loads a C++/CUDA
 extension. Intra-chunk Aqk/Akk, the csrc-ordered TF32 inverse, recompute W/U,
-KG, and optional QG are implemented in CuTeDSL. The remaining native cuLA
-extension is SM90-only.
+KG, and optional QG are implemented in CuTeDSL. cuLA no longer builds any
+native extension; SM90 prefill uses FlashKDA's CuTeDSL K1+K2 pipeline.
 
 ## Compatibility and dispatch
 
@@ -116,5 +116,5 @@ Final pure-path results:
 - default-stream and concurrent-stream isolation;
 - output lifetime, pool reuse, and bounded retained memory;
 - fixed, GVA, QG, packed-varlen, and tail routing;
-- installation without an SM100 native extension;
-- SM90 extension build retained independently.
+- installation from the platform-independent wheel;
+- SM90 FlashKDA prefill without a native fallback.

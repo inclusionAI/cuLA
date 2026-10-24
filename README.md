@@ -4,7 +4,7 @@
 
 # cuLA — CUDA Linear Attention
 
-**High-performance CUDA kernels for linear attention variants, written in [CuTe DSL](https://github.com/NVIDIA/cutlass/tree/main/python/CuTeDSL) and CUTLASS C++.**
+**High-performance CUDA kernels for linear attention variants, written entirely in [CuTe DSL](https://github.com/NVIDIA/cutlass/tree/main/python/CuTeDSL).**
 
 </div>
 
@@ -20,17 +20,17 @@ Linear attention mechanisms reformulate standard attention to use linear-time st
 
 cuLA supports both **Hopper (SM90)** and **Blackwell (SM10X)** GPUs.
 
-> **Requirements (Hopper & Blackwell):** Python 3.12+, CUDA Toolkit 12.9+, PyTorch 2.9.1+. Building the optional SM90 native extension also requires NVCC.
+> **Requirements (Hopper & Blackwell):** Python 3.12+, CUDA Toolkit 12.9+, PyTorch 2.9.1+, and a matching `nvidia-cutlass-dsl` installation. cuLA does not build a C++/CUDA extension.
 
 > **Note:** The PyTorch CUDA version must match your system CUDA Toolkit version. Check with `nvcc --version` and `python -c "import torch; print(torch.version.cuda)"`.
 
 ### Pre-built Wheels
 
-Pre-built wheels with the SM90 native extension and CuTeDSL JIT kernels for SM100/SM103 are available on [GitHub Releases](https://github.com/inclusionAI/cuLA/releases). Linux wheels target `manylinux_2_28` and require glibc 2.28 or newer:
+Platform-independent wheels containing the CuTeDSL sources are available on [GitHub Releases](https://github.com/inclusionAI/cuLA/releases):
 
-    pip install "cuda-linear-attention==<VERSION>+<CUDA_TAG>" -f https://github.com/inclusionAI/cuLA/releases/expanded_assets/<TAG>
+    pip install "cuda-linear-attention==<VERSION>" -f https://github.com/inclusionAI/cuLA/releases/expanded_assets/<TAG>
 
-Replace `<TAG>` with the release tag (e.g., `v0.2.0`), `<VERSION>` with the base version (e.g., `0.2.0`), and `<CUDA_TAG>` with your PyTorch CUDA build tag (e.g., `cu129` or `cu130`). Or download the `.whl` file directly from the [Releases page](https://github.com/inclusionAI/cuLA/releases) and install it with `pip install <filename>.whl`.
+Replace `<TAG>` with the release tag (e.g., `v0.2.0`) and `<VERSION>` with the version (e.g., `0.2.0`). Or download the `.whl` file directly from the [Releases page](https://github.com/inclusionAI/cuLA/releases) and install it with `pip install <filename>.whl`.
 
 ### Build from Source
 
@@ -47,6 +47,12 @@ git submodule update --init --recursive
 pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu129
 ```
 
+For CUDA 13, install the CuTeDSL CUDA 13 extra before installing cuLA:
+
+```bash
+pip install 'nvidia-cutlass-dsl[cu13]>=4.4.2,<4.7,!=4.5.0'
+```
+
 **Install cuLA & dependencies:**
 
 ```bash
@@ -57,10 +63,10 @@ pip install -e third_party/flash-linear-attention
 pip install -e . --no-build-isolation
 ```
 
-**Build a wheel with the SM90 extension (SM100/SM103 use CuTeDSL JIT):**
+**Build the platform-independent wheel:**
 
 ```bash
-CULA_BUILD_ALL_ARCHS=1 python -m build --wheel --no-isolation
+python -m build --wheel
 ```
 
 ## Quick Start

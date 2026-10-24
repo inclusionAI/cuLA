@@ -1,12 +1,12 @@
 
 [build-system]
-requires = ["setuptools>=61", "wheel", "setuptools_scm>=6.0", "torch"]
+requires = ["setuptools>=61", "wheel", "setuptools_scm>=6.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "cuda-linear-attention"
 dynamic = ["version"]
-description = "cuLA CUDA extension"
+description = "High-performance CuTeDSL linear-attention kernels"
 readme = "README.md"
 authors = [ { name = "cula contributors" } ]
 requires-python = ">=3.10"
@@ -15,7 +15,7 @@ dependencies = [
     "apache-tvm-ffi>=0.1.9",
     "packaging>=23.2",
 ]
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 
 [project.optional-dependencies]
 dev = [
@@ -33,10 +33,7 @@ include = ["cula", "cula.*"]
 [tool.ruff]
 target-version = "py312"
 line-length = 127
-exclude = [
-    "csrc/",
-    "third_party/",
-]
+exclude = ["third_party/"]
 
 [tool.ruff.lint]
 select = [

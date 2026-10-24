@@ -1,199 +1,65 @@
 # Coding Style Guide
 
-This document outlines the coding style and conventions used in this project, which is primarily written in CUDA C++ with heavy use of CUTLASS and CUTE libraries.
+cuLA is a Python package whose GPU kernels are written in CuTeDSL, with a
+small number of Triton support kernels. The package does not build a native
+C++/CUDA extension.
 
-## Table of Contents
-1. [General Principles](#general-principles)
-2. [File Organization](#file-organization)
-3. [Naming Conventions](#naming-conventions)
-4. [Formatting](#formatting)
-5. [CUDA-Specific Conventions](#cuda-specific-conventions)
-6. [Comments](#comments)
-7. [Templates and Generics](#templates-and-generics)
-8. [Error Handling](#error-handling)
+## General principles
 
-## General Principles
+- Prefer clear Python host code and explicit CuTeDSL data movement.
+- Keep architecture-specific code under `cula/ops/<operator>/sm90/` or
+  `cula/ops/<operator>/sm100/`.
+- Preserve the public FLA-compatible tensor layout, dtype, and state-layout
+  contracts at wrapper boundaries.
+- Validate unsupported architectures, shapes, dtypes, layouts, and modes
+  before launching a kernel.
+- Document intentional precision changes and reduction-order differences.
 
-- Follow modern C++ standards (C++14/17) combined with CUDA extensions
-- Prioritize performance and readability
-- Use CUTLASS and CUTE libraries for tensor operations
-- Maintain consistency with NVIDIA's CUTLASS codebase style
+## Python
 
-## File Organization
+- Use four spaces, type annotations for public APIs, and `snake_case` names.
+- Keep imports sorted with Ruff and avoid eager imports of large kernel modules
+  from package `__init__.py` files.
+- Use `PascalCase` for classes and `SCREAMING_SNAKE_CASE` for module constants.
+- Raise `TypeError` for dtype/type mismatches, `ValueError` for invalid values
+  or shapes, and `NotImplementedError` for valid but unsupported modes.
+- Keep compile caches bounded and key them by every property that affects the
+  generated kernel.
 
-- Use hierarchical directory structure: `csrc/sm{xx,90,100}/decode|prefill/dense|sparse/`
-- Group related files in subdirectories (e.g., `instantiations/`, `common/`)
-- Separate header files (`.h`, `.cuh`) from implementation files (`.cu`, `.cpp`)
-- Use `#include` guards or `#pragma once` in headers
+## CuTeDSL kernels
 
-## Naming Conventions
+- Make grid shape, warp roles, pipeline stages, and shared-memory ownership
+  explicit near the kernel entry point.
+- Keep barrier arrival counts and phase changes next to the producer/consumer
+  protocol they protect.
+- Do not reuse shared memory until every prior consumer has completed and the
+  required async-proxy fence has been issued.
+- Prefer vectorized, aligned global-memory accesses and state the required
+  alignment in host validation.
+- Use descriptive memory-space prefixes for tensors (`g`, `s`, `r`) when that
+  matches the surrounding CuTe/CUTLASS conventions.
+- Keep numerical conversion points visible. Avoid implicit precision loss in
+  accumulators, recurrence state, or transition products.
 
-### Variables
-- Use `snake_case` for local variables and function parameters
-- Use descriptive names that indicate purpose
-- Examples:
-  ```cpp
-  int batch_idx = blockIdx.x;
-  int warp_idx = threadIdx.x / 32;
-  float max_lse = -INFINITY;
-  ```
+## Tests and benchmarks
 
-### Tensor Variables (CUTE Library)
-- For CUTE `Tensor` objects, use abbreviated mixed case following CUTLASS/CUTE conventions
-- Format: lowercase prefix + PascalCase suffix
-- Prefix indicates memory space: `g` for global, `s` for shared, `r` for register
-- Suffix indicates data type or purpose (single letter or abbreviation)
-- Examples:
-  ```cpp
-  Tensor gA = make_tensor(...);          // Global tensor A
-  Tensor gLse = make_tensor(...);        // Global LSE tensor
-  Tensor sB = make_tensor(...);          // Shared tensor B
-  Tensor rC = make_tensor(...);          // Register tensor C
-  ```
-- This style prioritizes brevity in mathematical code while maintaining readability
+- Add a focused test for every public behavior change and each corrected race
+  or boundary condition.
+- Compare against an independent reference where possible, and distinguish
+  bitwise requirements from tolerance-based numerical contracts.
+- Include tail, varlen, initial-state, output-state, and non-default-stream
+  coverage when the changed path supports them.
+- Mark architecture-specific and long-running cases with the repository's
+  pytest markers so the default suite stays bounded.
+- Benchmark the complete public boundary, warm up JIT compilation first, and
+  report the device, shapes, dtype, and aggregation method.
 
-### Functions
-- Use `snake_case` for function names
-- Kernel functions: `fwd_combine_kernel`
-- Host functions: `run_fwd_combine_kernel`
-- Template instantiations: `run_fwd_combine_kernel<ElementT>`
+## Tooling
 
-### Types and Classes
-- Use `PascalCase` for type names
-- Template parameters: `ElementT`, `HEAD_DIM_V`
-- Structs: `CombineParams`, `DenseAttnDecodeParams`
+Before committing, run:
 
-### Namespaces
-- Use nested namespaces: `namespace smxx::decode { ... }`
-- Avoid `using namespace` in header files
-- Use `using namespace cute;` in implementation files when appropriate
+```bash
+pre-commit run --all-files
+```
 
-### Constants and Macros
-- Use `SCREAMING_SNAKE_CASE` for constants
-- CUDA-specific: `FLASH_DEVICE_ASSERT`, `CUTLASS_PRAGMA_UNROLL`
-- Mathematical constants: `M_LOG2E`, `CUDART_L2E_F`
-
-## Formatting
-
-### Indentation
-- Use 4 spaces for indentation (no tabs)
-- Align continuation lines with the opening parenthesis or bracket
-
-### Braces
-- Use K&R style (opening brace on same line)
-- Always use braces for control structures, even for single statements
-- Examples:
-  ```cpp
-  if (condition) {
-      return;
-  }
-
-  for (int i = 0; i < n; ++i) {
-      // statements
-  }
-  ```
-
-### Line Length
-- Limit lines to 120 characters
-- Break long lines at logical points (operators, commas)
-
-### Spacing
-- One space around binary operators: `a + b`
-- No space after unary operators: `-x`
-- Space after keywords: `if (`, `for (`
-- No space before semicolons
-- No space after C-style casts: `(int)value` not `(int) value`
-
-### Template Declarations
-- Always break template declarations onto new lines
-- Example:
-  ```cpp
-  template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M>
-  __global__ void kernel_function(...)
-  ```
-
-## CUDA-Specific Conventions
-
-### Kernel Launch
-- Use `__launch_bounds__(NUM_THREADS)` for kernel declarations
-- Use `__grid_constant__` for constant parameters
-- Example:
-  ```cpp
-  template<typename ElementT, ...>
-  __global__ void __launch_bounds__(NUM_THREADS)
-  fwd_combine_kernel(__grid_constant__ const CombineParams params)
-  ```
-
-### Thread Management
-- Use `threadIdx`, `blockIdx`, `blockDim` for indexing
-- Calculate `warp_idx = threadIdx.x / 32`, `lane_idx = threadIdx.x % 32`
-- Use `__syncwarp()` for warp synchronization
-
-### Memory Access
-- Use `__ldg()` for read-only global memory access (when compatible)
-- Use `float4` for vectorized loads/stores
-- Prefer shared memory for intra-block communication
-
-### Pragmas
-- Use `CUTLASS_PRAGMA_UNROLL` for loop unrolling hints
-- Use `#pragma unroll` sparingly, prefer compiler hints
-
-## Comments
-
-### Style
-- Use `//` for single-line comments
-- Use `/* */` for multi-line comments only when necessary
-- Place comments above the code they describe
-
-### Content
-- Explain complex algorithms and optimizations
-- Document kernel grid/block dimensions: `// grid_shape: [batch_size, s_q, h_q/BLOCK_SIZE_M]`
-- Note performance-critical sections
-- Warn about limitations: `// NOTE: We don't use __ldg here since it is incompatible with PDL`
-
-## Templates and Generics
-
-### Template Parameters
-- Use descriptive names: `typename ElementT`, `int HEAD_DIM_V`
-- Order: types first, then integers, then booleans
-- Example:
-  ```cpp
-  template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS>
-  ```
-
-### Template Instantiations
-- Explicitly instantiate in `.cu` files
-- Group instantiations at end of file
-- Example:
-  ```cpp
-  template void run_fwd_combine_kernel<cutlass::bfloat16_t>(CombineParams &params);
-  template void run_fwd_combine_kernel<cutlass::half_t>(CombineParams &params);
-  ```
-
-## Error Handling
-
-- Use `FLASH_DEVICE_ASSERT` for device-side assertions
-- Use `CUTLASS_CHECK` for CUTLASS operations
-- Handle edge cases gracefully (e.g., `my_num_splits == 1` early return)
-- Validate inputs at kernel launch time
-
-## Tools
-
-### Code Formatting
-- Use `clang-format` with the provided `.clang-format` configuration
-- Run before committing: `clang-format -i <file>`
-
-### Static Analysis
-- Use `clang-tidy` with the provided `.clang-tidy` configuration
-- Run on modified files: `clang-tidy <file> -- -I<include_paths>`
-- Configure IDE integration for real-time checking
-- Checks enforce naming conventions, code quality, and modernization rules
-- Some CUDA-specific patterns are intentionally excluded to avoid false positives
-
-### Recommended Workflow
-1. Write or modify code
-2. Run `clang-format -i` to fix formatting
-3. Run `clang-tidy` to check for issues
-4. Fix warnings before committing
-
-This style guide should be followed for all new code contributions. For existing code that doesn't conform, consider refactoring during related changes.
+Run CPU-only checks locally and CUDA tests in the designated remote container.

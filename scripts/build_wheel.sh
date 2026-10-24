@@ -24,9 +24,9 @@ for arg in "$@"; do
             ISOLATION_FLAG=""
             echo "[build_wheel] Using isolated build environment"
             ;;
-        --fat)
-            export CULA_BUILD_ALL_ARCHS=1
-            echo "[build_wheel] Fat binary: building for all SM architectures"
+        *)
+            echo "[build_wheel] Unknown argument: $arg" >&2
+            exit 2
             ;;
     esac
 done
@@ -40,9 +40,7 @@ rm -rf dist build *.egg-info
 
 # Show environment info
 echo "[build_wheel] Python: $(python -V 2>&1)"
-echo "[build_wheel] torch:  $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'not installed')"
-echo "[build_wheel] CUDA:   $(nvcc --version 2>/dev/null | grep 'release' | sed 's/.*release //' | sed 's/,.*//' || echo 'not found')"
-echo "[build_wheel] Fat binary: ${CULA_BUILD_ALL_ARCHS:-0}"
+echo "[build_wheel] Packaging: pure Python (CuTeDSL kernels compile at runtime)"
 
 # Build wheel
 echo "[build_wheel] Building wheel..."

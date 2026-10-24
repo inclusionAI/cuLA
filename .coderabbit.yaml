@@ -16,16 +16,9 @@ reviews:
       mode: "off"
 
   path_filters:
-    - "!csrc/cutlass/**"
     - "!third_party/**"
 
   path_instructions:
-    - path: "csrc/**"
-      instructions: |
-        Review CUDA changes for synchronization and memory-ordering correctness,
-        shared-memory and barrier lifetimes, out-of-bounds access, divergence,
-        architecture guards, numerical precision, and concrete performance regressions.
-
     - path: "cula/**"
       instructions: |
         Review CuTe DSL kernels and Python APIs for architecture dispatch,

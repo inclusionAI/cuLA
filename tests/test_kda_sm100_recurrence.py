@@ -17,7 +17,7 @@ import torch
 # ─── FLA reference ───
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as fla_fwd_h
 
-# ─── CuTe DSL kernel (via importlib to avoid cula __init__ requiring cudac) ───
+# ─── CuTe DSL kernel (loaded directly for this standalone test) ───
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import importlib.util
 
