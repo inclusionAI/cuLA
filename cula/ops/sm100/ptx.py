@@ -60,18 +60,15 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.typing import Int32
 from cutlass.cutlass_dsl import dsl_user_op
 
-from cula.ops._cutedsl_compat import detect_tcgen05_ldst_api
 from cula.ops._mlir_compat import arith as _arith
 from cula.ops._mlir_compat import ir, llvm
 from cula.ops._mlir_compat import nvvm as _nvvm
+from cula.ops._nvvm_compat import bind_mma_ops
 
 CollectorBBuffer = _nvvm.Tcgen05MMACollectorBBuffer
 CollectorOp = _nvvm.Tcgen05MMACollectorOp
 
-_tcgen05_ldst_api = detect_tcgen05_ldst_api(_nvvm.tcgen05_ld, _nvvm.tcgen05_st)
-_TCGEN05_LD_HAS_NUM = _tcgen05_ldst_api.ld_has_num
-_TCGEN05_ST_HAS_NUM = _tcgen05_ldst_api.st_has_num
-_TCGEN05_ST_USES_R = _tcgen05_ldst_api.st_value_keyword == "r"
+_tcgen05_mma, _tcgen05_mma_ws = bind_mma_ops(_nvvm)
 
 
 def _to_ir(val, loc=None, ip=None):
@@ -174,24 +171,13 @@ def tcgen05_ld_32x32b(num: int, taddr: int):
         ptr6_ty = llvm.PointerType.get(address_space=6)
         tmem_ptr = llvm.inttoptr(ptr6_ty, _to_ir(addr_val, loc, ip), loc=loc, ip=ip)
         vec_i32_ty = ir.VectorType.get([num], i32_ty)
-        if cutlass.const_expr(_TCGEN05_LD_HAS_NUM):
-            result = _nvvm.tcgen05_ld(
-                res=vec_i32_ty,
-                shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
-                num=num,
-                tmem_addr=tmem_ptr,
-                loc=loc,
-                ip=ip,
-            )
-        else:
-            result = _nvvm.tcgen05_ld(
-                res=vec_i32_ty,
-                shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
-                tmem_addr=tmem_ptr,
-                loc=loc,
-                ip=ip,
-            )
-        return result
+        return _nvvm.tcgen05_ld(
+            res=vec_i32_ty,
+            shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
+            tmem_addr=tmem_ptr,
+            loc=loc,
+            ip=ip,
+        )
 
     return _do(Int32(taddr))
 
@@ -204,42 +190,13 @@ def tcgen05_st_32x32b(num: int, taddr: int, vec):
     def _do(addr_val, vec_val, *, loc=None, ip=None):
         ptr6_ty = llvm.PointerType.get(address_space=6)
         tmem_ptr = llvm.inttoptr(ptr6_ty, _to_ir(addr_val, loc, ip), loc=loc, ip=ip)
-        if cutlass.const_expr(_TCGEN05_ST_HAS_NUM):
-            if cutlass.const_expr(_TCGEN05_ST_USES_R):
-                _nvvm.tcgen05_st(
-                    shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
-                    num=num,
-                    tmem_addr=tmem_ptr,
-                    r=_to_ir(vec_val, loc, ip),
-                    loc=loc,
-                    ip=ip,
-                )
-            else:
-                _nvvm.tcgen05_st(
-                    shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
-                    num=num,
-                    tmem_addr=tmem_ptr,
-                    val=_to_ir(vec_val, loc, ip),
-                    loc=loc,
-                    ip=ip,
-                )
-        else:
-            if cutlass.const_expr(_TCGEN05_ST_USES_R):
-                _nvvm.tcgen05_st(
-                    shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
-                    tmem_addr=tmem_ptr,
-                    r=_to_ir(vec_val, loc, ip),
-                    loc=loc,
-                    ip=ip,
-                )
-            else:
-                _nvvm.tcgen05_st(
-                    shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
-                    tmem_addr=tmem_ptr,
-                    val=_to_ir(vec_val, loc, ip),
-                    loc=loc,
-                    ip=ip,
-                )
+        _nvvm.tcgen05_st(
+            shape=_nvvm.Tcgen05LdStShape.SHAPE_32X32B,
+            tmem_addr=tmem_ptr,
+            val=_to_ir(vec_val, loc, ip),
+            loc=loc,
+            ip=ip,
+        )
 
     _do(Int32(taddr), vec)
 
@@ -256,7 +213,7 @@ def tcgen05_cp_128x256b(taddr: int, smem_desc: Tcgen05SmemDescriptor):
             shape=_nvvm.Tcgen05CpShape.SHAPE_128x256b,
             taddr=tmem_ptr,
             smem_desc=_to_ir(desc_val, loc, ip),
-            cta_group=_nvvm.Tcgen05GroupKind.CTA_1,
+            group=_nvvm.CTAGroupKind.CTA_1,
             loc=loc,
             ip=ip,
         )
@@ -276,7 +233,7 @@ def tcgen05_cp_128x128b(taddr: int, smem_desc: Tcgen05SmemDescriptor):
             shape=_nvvm.Tcgen05CpShape.SHAPE_128x128b,
             taddr=tmem_ptr,
             smem_desc=_to_ir(desc_val, loc, ip),
-            cta_group=_nvvm.Tcgen05GroupKind.CTA_1,
+            group=_nvvm.CTAGroupKind.CTA_1,
             loc=loc,
             ip=ip,
         )
@@ -382,9 +339,9 @@ def tcgen05mma_ss(
         v = llvm.InsertElementOp(v, m2_ir, idx2, loc=loc, ip=ip)
         mask = llvm.InsertElementOp(v, m3_ir, idx3, loc=loc, ip=ip)
 
-        _nvvm.tcgen05_mma(
+        _tcgen05_mma(
             mma_kind=_nvvm.Tcgen05MMAKind.TF32,
-            cta_group=_nvvm.Tcgen05GroupKind.CTA_1,
+            cta_group=_nvvm.CTAGroupKind.CTA_1,
             d=d_ptr,
             a=da_ir,
             b=db_ir,
@@ -453,9 +410,9 @@ def tcgen05mma_ts(
         v = llvm.InsertElementOp(v, m2_ir, idx2, loc=loc, ip=ip)
         mask = llvm.InsertElementOp(v, m3_ir, idx3, loc=loc, ip=ip)
 
-        _nvvm.tcgen05_mma(
+        _tcgen05_mma(
             mma_kind=_nvvm.Tcgen05MMAKind.TF32,
-            cta_group=_nvvm.Tcgen05GroupKind.CTA_1,
+            cta_group=_nvvm.CTAGroupKind.CTA_1,
             d=d_ptr,
             a=a_ptr,
             b=b_ir,
@@ -509,7 +466,7 @@ def tcgen05mma_ws_ss_tf32(
         sc_ir = _to_ir(sc_val, loc, ip)
         enable_d = _arith.trunci(i1_ty, sc_ir, loc=loc, ip=ip)
 
-        _nvvm.tcgen05_mma_ws(
+        _tcgen05_mma_ws(
             mma_kind=_nvvm.Tcgen05MMAKind.TF32,
             d=d_ptr,
             a=da_ir,
@@ -556,7 +513,7 @@ def tcgen05mma_ws_ss_f16(
         sc_ir = _to_ir(sc_val, loc, ip)
         enable_d = _arith.trunci(i1_ty, sc_ir, loc=loc, ip=ip)
 
-        _nvvm.tcgen05_mma_ws(
+        _tcgen05_mma_ws(
             mma_kind=_nvvm.Tcgen05MMAKind.F16,
             d=d_ptr,
             a=da_ir,
@@ -604,7 +561,7 @@ def tcgen05mma_ws_ts_tf32(
         sc_ir = _to_ir(sc_val, loc, ip)
         enable_d = _arith.trunci(i1_ty, sc_ir, loc=loc, ip=ip)
 
-        _nvvm.tcgen05_mma_ws(
+        _tcgen05_mma_ws(
             mma_kind=_nvvm.Tcgen05MMAKind.TF32,
             d=d_ptr,
             a=a_ptr,
@@ -652,7 +609,7 @@ def tcgen05mma_ws_ts_f16(
         sc_ir = _to_ir(sc_val, loc, ip)
         enable_d = _arith.trunci(i1_ty, sc_ir, loc=loc, ip=ip)
 
-        _nvvm.tcgen05_mma_ws(
+        _tcgen05_mma_ws(
             mma_kind=_nvvm.Tcgen05MMAKind.F16,
             d=d_ptr,
             a=a_ptr,

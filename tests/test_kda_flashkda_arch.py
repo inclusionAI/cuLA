@@ -1,6 +1,8 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -33,3 +35,11 @@ def test_flashkda_rejects_cpu():
     assert not is_flashkda_supported(device)
     with pytest.raises(RuntimeError, match="requires a CUDA device"):
         assert_flashkda_supported(device)
+
+
+@pytest.mark.parametrize("benchmark", ["bench_kda_sm90_prefill.py", "bench_kda_sm90_cp.py"])
+def test_flashkda_benchmark_uses_shared_architecture_guard(benchmark):
+    source = (Path(__file__).parents[1] / "benchmarks" / benchmark).read_text()
+
+    assert "assert_flashkda_supported" in source
+    assert "assert_hopper" not in source

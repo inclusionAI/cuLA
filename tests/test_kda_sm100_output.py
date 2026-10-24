@@ -32,7 +32,7 @@ import sys
 import pytest
 import torch
 
-# Import directly from the module file to avoid cula package __init__ (requires cudac)
+# Import directly from the module file so this standalone test controls loading.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import importlib.util
 

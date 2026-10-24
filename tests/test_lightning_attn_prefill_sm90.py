@@ -82,10 +82,10 @@ def test_kernel_exposes_only_production_entrypoints() -> None:
 
     assert [_qualified_name(base) for base in backend.bases] == ["LightningSm90PrefillSchedule"]
     specifier = values["SUPPORTED_CUTLASS_DSL_SPECIFIER"]
-    assert specifier == ">=4.4.2,<4.7,!=4.5.0"
+    assert specifier == ">=4.6.2,<4.9"
     accepted = SpecifierSet(specifier)
-    assert all(version in accepted for version in ("4.4.2", "4.5.1", "4.5.2", "4.5.3", "4.6.0", "4.6.1"))
-    assert all(version not in accepted for version in ("4.4.1", "4.5.0", "4.7.0"))
+    assert all(version in accepted for version in ("4.6.2", "4.6.3", "4.7.0", "4.8.0", "4.8.1"))
+    assert all(version not in accepted for version in ("4.6.1", "4.9.0"))
     assert values["DECAY_LUT_ENTRIES"] == 65
     assert SCHEDULE_PATH.exists()
     assert not any(isinstance(node, ast.FunctionDef) and node.name.startswith("launch_") for node in tree.body)

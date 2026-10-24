@@ -3,6 +3,4 @@ include LICENSE
 include pyproject.toml
 include setup.py
 
-recursive-include csrc *.h *.hpp *.cuh *.cu *.cpp *.cc
-recursive-include csrc/cutlass *
 recursive-include cula *.py
