@@ -11,6 +11,10 @@ reviews:
     drafts: false
     auto_incremental_review: true
 
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+
   path_filters:
     - "!csrc/cutlass/**"
     - "!third_party/**"
