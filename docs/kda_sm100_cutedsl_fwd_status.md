@@ -28,6 +28,12 @@ MMA keyword renames introduced by 4.8. The batch-one modular fallback remains:
 it is a stable dispatch choice and does not depend on the composed-host
 compiler behavior of a particular patch release.
 
+FlashKDA K2 and intracard-CP pre-scan restore K1's physical K_INTER workspace
+images through plain-layout TMA loads. This keeps the byte layout unchanged and
+accounts every load in the transaction barrier. Raw G2S bulk copies are not
+mixed into that barrier: on SM100 they could leave K2 waiting indefinitely,
+which appears on the host as a busy `cudaDeviceSynchronize()` call.
+
 `unified_gref=True` and `use_tf32_inverse=False` are rejected explicitly
 because neither option belongs to the bitwise-compatible production path.
 
