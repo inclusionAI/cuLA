@@ -279,7 +279,7 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
         )
         return (gk, *fla)
 
-    def run_csrc_with_gk():
+    def run_cutedsl_with_gk():
         gk = kda_gate_chunk_cumsum(
             g=g,
             A_log=a_log,
@@ -288,7 +288,7 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
             chunk_size=BT,
             lower_bound=args.lower_bound,
         )
-        csrc = cula_chunk_kda_fwd_intra(
+        cutedsl = cula_chunk_kda_fwd_intra(
             q=q,
             k=k,
             v=k,
@@ -298,7 +298,7 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
             chunk_size=BT,
             safe_gate=True,
         )
-        return (gk, *csrc)
+        return (gk, *cutedsl)
 
     valid_mask = _valid_lower_mask(args.B, args.T, args.H, q.device)
 
@@ -336,7 +336,7 @@ def make_equal_case(args: argparse.Namespace) -> BenchCase:
 
     nt = args.B * (args.T // BT)
     detail = f"B={args.B} T={args.T} H={args.H} K={args.K} NT={nt} bias={not args.no_bias} variant={args.cutedsl_variant}"
-    run_ref = run_csrc_with_gk if args.baseline == "csrc" else run_fla_with_gk
+    run_ref = run_cutedsl_with_gk if args.baseline == "cutedsl" else run_fla_with_gk
     return BenchCase("equal", detail, run, run_ref, compare)
 
 
@@ -534,7 +534,7 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
         )
         return (gk, *fla)
 
-    def run_csrc_with_gk():
+    def run_cutedsl_with_gk():
         gk = kda_gate_chunk_cumsum(
             g=g,
             A_log=a_log,
@@ -545,7 +545,7 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
             chunk_indices=chunk_indices,
             lower_bound=args.lower_bound,
         )
-        csrc = cula_chunk_kda_fwd_intra(
+        cutedsl = cula_chunk_kda_fwd_intra(
             q=q,
             k=k,
             v=k,
@@ -557,7 +557,7 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
             chunk_size=BT,
             safe_gate=True,
         )
-        return (gk, *csrc)
+        return (gk, *cutedsl)
 
     valid_mask = _valid_lower_mask_varlen(seq_lens, args.H, q.device)
 
@@ -601,7 +601,7 @@ def make_varlen_case(args: argparse.Namespace) -> BenchCase:
         f"seqs={len(seq_lens)} total={total_t} H={args.H} K={args.K} NT={nt} "
         f"T_launch={t_launch} pure={pure} dist={args.dist} bias={not args.no_bias} seq_lens=[{seq_preview}]"
     )
-    run_ref = run_csrc_with_gk if args.baseline == "csrc" else run_fla_with_gk
+    run_ref = run_cutedsl_with_gk if args.baseline == "cutedsl" else run_fla_with_gk
     return BenchCase("varlen", detail, run, run_ref, compare)
 
 
@@ -713,7 +713,7 @@ def main() -> None:
     parser.add_argument(
         "--no-fla", action="store_true", help="Only time CuTeDSL; skip baseline timing and accuracy comparison."
     )
-    parser.add_argument("--baseline", choices=("csrc", "fla"), default="csrc")
+    parser.add_argument("--baseline", choices=("cutedsl", "fla"), default="cutedsl")
     parser.add_argument(
         "--with-recompute-wu",
         action="store_true",

@@ -241,6 +241,7 @@ def akk_inv_fp32_physical_host(
     mChunkIndices: cute.Tensor,
     IS_VARLEN: cutlass.Constexpr[int],
     T_VAL: cutlass.Constexpr[int],
+    stream=None,
 ):
     in_layout = cute.make_layout((B, T_VAL, H, BS), stride=(T_VAL * H * BS, H * BS, BS, 1))
     out_layout = cute.make_layout((B, T_VAL, H, BS), stride=(T_VAL * H * BS, H * BS, BS, 1))
@@ -251,7 +252,7 @@ def akk_inv_fp32_physical_host(
     stmp_layout = cute.make_layout((TMP_SLOTS, SB, SB), stride=(SB * TMP_STRIDE, TMP_STRIDE, 1))
     smem_bytes = BS * AKK_STRIDE * 4 + TMP_SLOTS * SB * TMP_STRIDE * 4 + 256
 
-    akk_inv_fp32_physical_kernel(
+    kernel = akk_inv_fp32_physical_kernel(
         gA_phys,
         gA_out,
         smat_layout,
@@ -261,8 +262,17 @@ def akk_inv_fp32_physical_host(
         mCuSeqlens,
         mChunkIndices,
         IS_VARLEN,
-    ).launch(
-        grid=(H, NT, B),
-        block=(THREADS, 1, 1),
-        smem=smem_bytes,
     )
+    if cutlass.const_expr(stream is None):
+        kernel.launch(
+            grid=(H, NT, B),
+            block=(THREADS, 1, 1),
+            smem=smem_bytes,
+        )
+    else:
+        kernel.launch(
+            grid=(H, NT, B),
+            block=(THREADS, 1, 1),
+            smem=smem_bytes,
+            stream=stream,
+        )

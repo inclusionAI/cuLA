@@ -34,7 +34,6 @@ os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1")) 
 
 from fla.ops.kda.wy_fast import recompute_w_u_fwd as fla_recompute_w_u_fwd
 
-import cula.cudac as cula_cuda
 from benchmarks.utils import (
     SEED,
     exclusive_cumsum,
@@ -45,6 +44,7 @@ from benchmarks.utils import (
     triton_bench_fn,
 )
 from cula.kda.chunk_intra import chunk_kda_fwd_intra as cula_chunk_kda_fwd_intra
+from cula.ops.kda.sm100.recompute_wu import recompute_w_u_fwd as cula_recompute_w_u_fwd
 
 # Constant params
 B, H, D = 2, 64, 128
@@ -106,17 +106,19 @@ def run_fla_recompute_wu(k, v, beta, Akk, q, gk, cu_seqlens, chunk_indices, disa
 
 
 def run_cula_recompute_wu(k, v, beta, Akk, q, gk, cu_seqlens, chunk_indices, chunk_size, disable_recompute):
-    """cuLA recompute_w_u (handles both MHA and GVA; w/u/qg/kg allocated in HV head space)."""
-    B_flat, T, HV_out, Dv = v.shape
-    w = torch.empty_like(v)
-    u = torch.empty_like(v)
-    qg = torch.empty(B_flat, T, HV_out, Dv, device=q.device, dtype=q.dtype) if disable_recompute else None
-    kg = torch.empty_like(v) if gk is not None else None
-
-    cula_cuda.recompute_w_u_cuda(
-        k, v, beta, Akk, gk, cu_seqlens, chunk_indices, w, u, kg, chunk_size, q if disable_recompute else None, qg
+    """Run the pure CuTeDSL recompute-WU implementation."""
+    if chunk_size != BT:
+        raise ValueError(f"CuTeDSL benchmark expects chunk_size={BT}, got {chunk_size}")
+    return cula_recompute_w_u_fwd(
+        k,
+        v,
+        beta,
+        Akk,
+        gk,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        q=q if disable_recompute else None,
     )
-    return w, u, qg, kg
 
 
 # ==============================================================================

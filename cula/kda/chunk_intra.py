@@ -28,12 +28,15 @@ from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2, gather
 from fla.utils import IS_GATHER_SUPPORTED, autotune_cache_kwargs
 
-from cula.utils import get_device_sm_version, prepare_uniform_cu_seqlens
+from cula.utils import get_device_sm_version
 
 
 @functools.cache
-def _get_cula_cuda():
-    return importlib.import_module("cula.cudac")
+def _get_sm100_cutedsl_fwd():
+    intra = importlib.import_module("cula.ops.kda.sm100.intra_fused")
+    recompute = importlib.import_module("cula.ops.kda.sm100.recompute_wu")
+    full = importlib.import_module("cula.ops.kda.sm100.full_port")
+    return intra.chunk_kda_fwd_intra_sm100_from_gk, recompute.recompute_w_u_fwd, full.chunk_kda_fwd_full_sm100_from_gk
 
 
 @triton.heuristics(
@@ -356,35 +359,40 @@ def chunk_kda_fwd_intra(
     assert H > 0 and HV > 0 and HV % H == 0, f"HV ({HV}) must be a positive multiple of HQK ({H})"
     BT = chunk_size
 
-    if cu_seqlens is None:
-        cu_seqlens = prepare_uniform_cu_seqlens(B, T, q.device, torch.int32)
-
+    if gk is None or beta is None:
+        raise ValueError("gk and beta are required for the SM100/SM103 CuTeDSL path")
+    if unified_gref:
+        raise NotImplementedError("unified_gref=True is not part of the bitwise-aligned CuTeDSL path")
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
 
-    # NOTE: inside kernel we use int32 for cu_seqlens
-    assert cu_seqlens.dtype == torch.int32 and chunk_indices.dtype == torch.int32, (
-        "cu_seqlens and chunk_indices must be int32 for cuda impl"
+    if cu_seqlens is not None and (cu_seqlens.dtype != torch.int32 or chunk_indices.dtype != torch.int32):
+        raise TypeError("cu_seqlens and chunk_indices must be int32")
+
+    cutedsl_intra, cutedsl_recompute_wu, cutedsl_full = _get_sm100_cutedsl_fwd()
+    if cu_seqlens is None and not disable_recompute and B >= 2 and T % (4 * BT) == 0 and K == 128 and v.shape[-1] == 128:
+        return cutedsl_full(q, k, v, gk, beta, K**-0.5 if scale is None else scale)
+
+    Aqk, Akk = cutedsl_intra(
+        q=q,
+        k=k,
+        gk=gk,
+        beta=beta,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
+        use_tf32_inverse=use_tf32_inverse,
     )
-
-    # Aqk and Akk are produced per v-head by the intra kernel.
-    Aqk = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
-    Akk = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
-
-    tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
-    cula_cuda = _get_cula_cuda()
-    cula_cuda.chunk_kda_fwd_intra_cuda(
-        q, k, gk, beta, cu_seqlens, chunk_indices, Aqk, Akk, tile_counter, scale, chunk_size, use_tf32_inverse, unified_gref
-    )
-
-    # w, u, kg, qg all live in h_v head space.
-    w = torch.empty_like(v)
-    u = torch.empty_like(v)
-    qg = torch.empty(B, T, HV, K, device=q.device, dtype=q.dtype) if disable_recompute else None
-    kg = torch.empty(B, T, HV, K, device=k.device, dtype=k.dtype) if gk is not None else None
-
-    cula_cuda.recompute_w_u_cuda(
-        k, v, beta, Akk, gk, cu_seqlens, chunk_indices, w, u, kg, chunk_size, q if disable_recompute else None, qg
+    w, u, qg, kg = cutedsl_recompute_wu(
+        k,
+        v,
+        beta,
+        Akk,
+        gk,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        q=q if disable_recompute else None,
     )
 
     return w, u, qg, kg, Aqk, Akk

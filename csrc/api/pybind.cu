@@ -17,39 +17,6 @@
 #include <torch/nn/functional.h>
 #include <torch/python.h>
 
-#if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
-void
-ChunkKDAFwdIntra(
-    at::Tensor q,
-    at::Tensor k,
-    at::Tensor g,
-    at::Tensor beta,
-    at::Tensor cu_seqlens,
-    at::Tensor chunk_indices,
-    at::Tensor Aqk_out,
-    at::Tensor Akk_out,
-    at::Tensor tile_counter,
-    float scale,
-    int chunk_size,
-    bool use_tf32_inverse,
-    bool unified_gref);
-void
-ChunkKDAFwdRecompWU(
-    at::Tensor k,
-    at::Tensor v,
-    at::Tensor beta,
-    at::Tensor A,
-    at::Tensor g,
-    at::Tensor cu_seqlens,
-    at::Tensor chunk_indices,
-    at::Tensor w_out,
-    at::Tensor u_out,
-    at::Tensor kg_out,
-    int chunk_size,
-    std::optional<at::Tensor> q,
-    std::optional<at::Tensor> qg_out);
-#endif
-
 #if defined(CULA_SM90A_ENABLED)
 std::tuple<torch::Tensor, std::optional<torch::Tensor>>
 kda_fwd_prefill(
@@ -72,10 +39,6 @@ kda_fwd_prefill(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "cuLA";
-#if defined(CULA_SM100_ENABLED) || defined(CULA_SM103_ENABLED)
-    m.def("chunk_kda_fwd_intra_cuda", &ChunkKDAFwdIntra);
-    m.def("recompute_w_u_cuda", &ChunkKDAFwdRecompWU);
-#endif
 #if defined(CULA_SM90A_ENABLED)
     m.def(
         "kda_fwd_prefill",

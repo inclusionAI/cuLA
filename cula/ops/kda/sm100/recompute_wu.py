@@ -227,7 +227,7 @@ class KDARecomputeWU:
         kg_in: cute.Tensor,
         cu_seqlens_in: cute.Tensor,
         chunk_indices_in: cute.Tensor,
-        problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
+        problem_size: tuple[Int32, Int32, Int32, Int32, Int32, Int32],
         total_nt: Int32,
         stream,
     ):
@@ -242,7 +242,7 @@ class KDARecomputeWU:
         cu_seqlens_ptr = cu_seqlens_in.iterator
         chunk_indices_ptr = chunk_indices_in.iterator
 
-        B, T, H, K, V = problem_size
+        B, T, H_qk, H_v, K, V = problem_size
         BT = self.BT
 
         # For varlen: data_B=1, T=T_total
@@ -319,26 +319,26 @@ class KDARecomputeWU:
         # varlen: T=T_total, data_B=1
         # non-varlen: T=seq_len, data_B=B
         A_layout = cute.make_layout(
-            (T, BT, (H, data_B)),
-            stride=(H * BT, 1, (BT, T * H * BT)),
+            (T, BT, (H_v, data_B)),
+            stride=(H_v * BT, 1, (BT, T * H_v * BT)),
         )
         A_gmem = cute.make_tensor(A_ptr, A_layout)
 
         k_layout = cute.make_layout(
-            (T, K, (H, data_B)),
-            stride=(H * K, 1, (K, T * H * K)),
+            (T, K, (H_qk, data_B)),
+            stride=(H_qk * K, 1, (K, T * H_qk * K)),
         )
         k_gmem = cute.make_tensor(k_ptr, k_layout)
 
         v_layout = cute.make_layout(
-            (T, V, (H, data_B)),
-            stride=(H * V, 1, (V, T * H * V)),
+            (T, V, (H_v, data_B)),
+            stride=(H_v * V, 1, (V, T * H_v * V)),
         )
         v_gmem = cute.make_tensor(v_ptr, v_layout)
 
         gk_layout = cute.make_layout(
-            (T, K, (H, data_B)),
-            stride=(H * K, 1, (K, T * H * K)),
+            (T, K, (H_v, data_B)),
+            stride=(H_v * K, 1, (K, T * H_v * K)),
         )
         gk_gmem = cute.make_tensor(gk_ptr, gk_layout)
 
@@ -507,17 +507,17 @@ class KDARecomputeWU:
         kg_ptr: cute.Pointer,
         cu_seqlens: cute.Tensor,
         chunk_indices: cute.Tensor,
-        problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
+        problem_size: tuple[Int32, Int32, Int32, Int32, Int32, Int32],
         total_nt: Int32,
     ):
-        B, T, H, K, V = problem_size
+        B, T, H_qk, H_v, K, V = problem_size
         BT = self.BT
 
         # Match csrc StaticPersistentTileScheduler: one CTA per SM,
         # tile_id = blockIdx.x + iteration * gridDim.x.
         block_idx_x = cute.arch.block_idx()[0]
         grid_dim_x = cute.arch.grid_dim()[0]
-        total_work_units = total_nt * H
+        total_work_units = total_nt * H_v
         num_iters = (total_work_units - block_idx_x + grid_dim_x - 1) // grid_dim_x
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -640,8 +640,9 @@ class KDARecomputeWU:
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 work_idx = block_idx_x + wu_iter * grid_dim_x
                 i_b, i_t, i_h, tok_offset, data_bidx, remaining = self._decode_persistent_work(
-                    work_idx, total_nt, H, T, BT, cu_seqlens, chunk_indices
+                    work_idx, total_nt, H_v, T, BT, cu_seqlens, chunk_indices
                 )
+                i_h_qk = i_h // (H_v // H_qk)
                 # --- Domain offset (varlen) or alias (non-varlen) ---
                 if cutlass.const_expr(self.is_varlen):
                     tma_k_v = cute.domain_offset((tok_offset, 0, (0, 0)), tma_tensor_k)
@@ -658,7 +659,7 @@ class KDARecomputeWU:
                 if cutlass.const_expr(self.is_varlen):
                     bSG_sK, bSG_gK = self._epilog_partition_varlen(
                         tma_atom_k,
-                        tma_k_v[None, None, (i_h, data_bidx)],
+                        tma_k_v[None, None, (i_h_qk, data_bidx)],
                         (self.BT, self.BK),
                         sK,
                     )
@@ -690,7 +691,7 @@ class KDARecomputeWU:
                         tma_k_v,
                         (self.BT, self.BK),
                         sK,
-                        i_h,
+                        i_h_qk,
                         data_bidx,
                     )
                     bSG_sV, bSG_gV = self._data_tma_partition(
@@ -762,10 +763,10 @@ class KDARecomputeWU:
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 work_idx = block_idx_x + wu_iter * grid_dim_x
                 i_b, i_t, i_h, tok_offset, data_bidx, remaining = self._decode_persistent_work(
-                    work_idx, total_nt, H, T, BT, cu_seqlens, chunk_indices
+                    work_idx, total_nt, H_v, T, BT, cu_seqlens, chunk_indices
                 )
                 beta_h = beta_P.acquire_and_advance()
-                beta_base = (tok_offset + i_t * BT) * H + i_h
+                beta_base = (tok_offset + i_t * BT) * H_v + i_h
                 beta_gmem = cute.make_tensor(
                     cute.make_ptr(
                         self.beta_dtype,
@@ -773,7 +774,7 @@ class KDARecomputeWU:
                         cute.AddressSpace.gmem,
                         assumed_align=2,
                     ),
-                    cute.make_layout((self.BT,), stride=(H,)),
+                    cute.make_layout((self.BT,), stride=(H_v,)),
                 )
                 sBeta[(aux_tidx, beta_h.index)] = cutlass.select_(
                     aux_tidx < remaining,
@@ -794,7 +795,7 @@ class KDARecomputeWU:
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 work_idx = block_idx_x + wu_iter * grid_dim_x
                 i_b, i_t, i_h, tok_offset, data_bidx, remaining = self._decode_persistent_work(
-                    work_idx, total_nt, H, T, BT, cu_seqlens, chunk_indices
+                    work_idx, total_nt, H_v, T, BT, cu_seqlens, chunk_indices
                 )
                 # Wait for A_mat — hold handle until all GEMMs finish reading sA
                 a_h = load_A_C.wait_and_advance()
@@ -872,16 +873,16 @@ class KDARecomputeWU:
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 work_idx = block_idx_x + wu_iter * grid_dim_x
                 i_b, i_t, i_h, tok_offset, data_bidx, remaining = self._decode_persistent_work(
-                    work_idx, total_nt, H, T, BT, cu_seqlens, chunk_indices
+                    work_idx, total_nt, H_v, T, BT, cu_seqlens, chunk_indices
                 )
                 beta_h = beta_C.wait_and_advance()
                 token_base = tok_offset + i_t * BT
-                kg_base = token_base * H * K + i_h * K
+                kg_base = token_base * H_v * K + i_h * K
                 gKg = cute.make_tensor(
                     cute.make_ptr(self.io_dtype, (kg_ptr + kg_base).toint(), cute.AddressSpace.gmem, assumed_align=16),
                     cute.make_layout(
                         (self.BT, self.BK),
-                        stride=(cute.assume(H * K, divby=async_copy_elems), 1),
+                        stride=(cute.assume(H_v * K, divby=async_copy_elems), 1),
                     ),
                 )
                 tOgKg = r2g_thr_copy.partition_D(gKg)
@@ -968,7 +969,7 @@ class KDARecomputeWU:
             for wu_iter in cutlass.range(0, num_iters, unroll=0):
                 work_idx = block_idx_x + wu_iter * grid_dim_x
                 i_b, i_t, i_h, tok_offset, data_bidx, remaining = self._decode_persistent_work(
-                    work_idx, total_nt, H, T, BT, cu_seqlens, chunk_indices
+                    work_idx, total_nt, H_v, T, BT, cu_seqlens, chunk_indices
                 )
                 beta_h = beta_C.wait_and_advance()
                 for i_kv in cutlass.range(0, self.NK):
@@ -993,9 +994,9 @@ class KDARecomputeWU:
                     token_base = tok_offset + i_t * BT
                     output_addr = Int64(0)
                     if acc_idx == 0:
-                        output_addr = (w_ptr + (token_base + output_row) * H * K + i_h * K + i_kv * self.BK).toint()
+                        output_addr = (w_ptr + (token_base + output_row) * H_v * K + i_h * K + i_kv * self.BK).toint()
                     else:
-                        output_addr = (u_ptr + (token_base + output_row) * H * V + i_h * V + i_kv * self.BV).toint()
+                        output_addr = (u_ptr + (token_base + output_row) * H_v * V + i_h * V + i_kv * self.BV).toint()
 
                     tcgen05_fence_after()
                     for quar in cutlass.range_constexpr(4):
@@ -1029,9 +1030,157 @@ class KDARecomputeWU:
 # ============================================================================
 
 _recompute_wu_cache = {}
+_qg_cache = {}
 _dummy_cu_seqlens = None
 _dummy_chunk_indices = None
 _uniform_cu_cache = {}
+_output_pools = {}
+
+_MAX_POOLED_OUTPUT_BYTES = 128 * 1024 * 1024
+
+_QG_THREADS = 256
+
+
+class _OutputPoolEntry:
+    def __init__(self, specs, device):
+        self.specs = specs
+        self.buffers = tuple(torch.empty(shape, dtype=dtype, device=device) for shape, dtype in specs)
+        self.busy = False
+
+    def is_free(self):
+        if self.busy:
+            return False
+        # StorageImpl counts cover aliases such as detach() that do not keep
+        # the exported Tensor wrapper alive. Two references are internal: the
+        # pooled tensor and this call's temporary UntypedStorage wrapper.
+        return all(torch._C._storage_Use_Count(buffer.untyped_storage()._cdata) == 2 for buffer in self.buffers)
+
+    def acquire(self):
+        if self.busy:
+            raise RuntimeError("attempted to acquire a busy KDA output buffer")
+        self.busy = True
+        return self.buffers
+
+    def attach(self):
+        self.busy = False
+
+    def release_after_error(self):
+        self.busy = False
+
+
+def _output_specs_nbytes(specs):
+    return sum(dtype.itemsize * torch.Size(shape).numel() for shape, dtype in specs)
+
+
+def _acquire_output_buffers(device, specs):
+    """Acquire call-owned outputs, pooling only fixed-overhead-sized cases."""
+    specs = tuple((tuple(shape), dtype) for shape, dtype in specs)
+    if _output_specs_nbytes(specs) > _MAX_POOLED_OUTPUT_BYTES:
+        return None, tuple(torch.empty(shape, dtype=dtype, device=device) for shape, dtype in specs)
+
+    stream_ptr = int(torch.cuda.current_stream(device).cuda_stream)
+    pool = _output_pools.setdefault((device.index, stream_ptr), [])
+    for entry in pool:
+        if entry.is_free() and entry.specs == specs:
+            return entry, entry.acquire()
+
+    pool[:] = [entry for entry in pool if not entry.is_free()]
+    entry = _OutputPoolEntry(specs, device)
+    pool.append(entry)
+    return entry, entry.acquire()
+
+
+def _export_output_buffers(entry, outputs):
+    if entry is None:
+        return outputs
+    exported = tuple(output.view_as(output) for output in outputs)
+    entry.attach()
+    return exported
+
+
+@cute.kernel
+def _qg_kernel(
+    q: cute.Tensor,
+    gk: cute.Tensor,
+    qg: cute.Tensor,
+    problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
+):
+    B, T, H_qk, H_v, K = problem_size
+    tidx, _, _ = cute.arch.thread_idx()
+    block_idx, _, _ = cute.arch.block_idx()
+    grid_dim = cute.arch.grid_dim()[0]
+    linear = block_idx * _QG_THREADS + tidx
+    total = B * T * H_v * K
+    stride = grid_dim * _QG_THREADS
+    heads_per_group = H_v // H_qk
+
+    for idx in cutlass.range(linear, total, stride, unroll=0):
+        d = idx % K
+        coord = idx // K
+        h_v = coord % H_v
+        coord = coord // H_v
+        t = coord % T
+        b = coord // T
+        h_qk = h_v // heads_per_group
+        value = cutlass.Float32(q[b, t, h_qk, d]) * cute.exp2(gk[b, t, h_v, d], fastmath=USE_FAST_MATH)
+        qg[b, t, h_v, d] = value.to(cutlass.BFloat16)
+
+
+@cute.jit
+def _qg_host(
+    q: cute.Tensor,
+    gk: cute.Tensor,
+    qg: cute.Tensor,
+    problem_size: tuple[Int32, Int32, Int32, Int32, Int32],
+    stream,
+):
+    B, T, H_qk, H_v, K = problem_size
+    total = B * T * H_v * K
+    grid = (total + _QG_THREADS - 1) // _QG_THREADS
+    _qg_kernel(q, gk, qg, problem_size).launch(grid=(grid, 1, 1), block=(_QG_THREADS, 1, 1), stream=stream)
+
+
+def _compile_qg(H_qk: int, H_v: int, K: int):
+    key = (H_qk, H_v, K, USE_FAST_MATH)
+    compiled = _qg_cache.get(key)
+    if compiled is not None:
+        return compiled
+
+    sym_b = cute.sym_int()
+    sym_t = cute.sym_int()
+    q_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_b, sym_t, H_qk, K), stride_order=(3, 2, 1, 0), assumed_align=128)
+    gk_fake = make_fake_compact_tensor(cutlass.Float32, (sym_b, sym_t, H_v, K), stride_order=(3, 2, 1, 0), assumed_align=128)
+    qg_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_b, sym_t, H_v, K), stride_order=(3, 2, 1, 0), assumed_align=128)
+    compiled = cute.compile(
+        _qg_host,
+        q_fake,
+        gk_fake,
+        qg_fake,
+        (Int32(1), Int32(1), Int32(H_qk), Int32(H_v), Int32(K)),
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+    _qg_cache[key] = compiled
+    return compiled
+
+
+def _compute_qg(q: torch.Tensor, gk: torch.Tensor) -> torch.Tensor:
+    restore_3d = q.dim() == 3
+    if restore_3d:
+        q = q.unsqueeze(0)
+        gk = gk.unsqueeze(0)
+    if q.dim() != 4 or gk.dim() != 4:
+        raise ValueError("q and gk must both have rank 3 or rank 4")
+    B, T, H_qk, K = q.shape
+    H_v = gk.shape[2]
+    if gk.shape != (B, T, H_v, K):
+        raise ValueError(f"gk must have shape {(B, T, H_v, K)}, got {tuple(gk.shape)}")
+    if H_qk <= 0 or H_v <= 0 or H_v % H_qk != 0:
+        raise ValueError(f"H_v ({H_v}) must be a positive multiple of H_qk ({H_qk})")
+    qg = torch.empty((B, T, H_v, K), device=q.device, dtype=q.dtype)
+    compiled = _compile_qg(H_qk, H_v, K)
+    compiled(q, gk, qg, (Int32(B), Int32(T), Int32(H_qk), Int32(H_v), Int32(K)))
+    return qg.squeeze(0) if restore_3d else qg
 
 
 def _uniform_problem(cu_seqlens: torch.Tensor) -> tuple[int, int] | None:
@@ -1048,7 +1197,8 @@ def _uniform_problem(cu_seqlens: torch.Tensor) -> tuple[int, int] | None:
 
 
 def _compile_recompute_wu(
-    H,
+    H_qk,
+    H_v,
     K,
     V,
     chunk_size=64,
@@ -1060,7 +1210,8 @@ def _compile_recompute_wu(
     preprocessed_k=False,
 ):
     key = (
-        H,
+        H_qk,
+        H_v,
         K,
         V,
         chunk_size,
@@ -1094,36 +1245,44 @@ def _compile_recompute_wu(
     BT = chunk_size
 
     if is_varlen:
-        k_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, K), stride_order=(2, 1, 0), assumed_align=128)
-        v_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, V), stride_order=(2, 1, 0), assumed_align=128)
-        beta_fake = make_fake_compact_tensor(beta_dtype, (sym_a, H), stride_order=(1, 0), assumed_align=128)
-        A_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, BT), stride_order=(2, 1, 0), assumed_align=128)
+        k_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H_qk, K), stride_order=(2, 1, 0), assumed_align=128)
+        v_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H_v, V), stride_order=(2, 1, 0), assumed_align=128)
+        beta_fake = make_fake_compact_tensor(beta_dtype, (sym_a, H_v), stride_order=(1, 0), assumed_align=128)
+        A_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H_v, BT), stride_order=(2, 1, 0), assumed_align=128)
         gk_fake = make_fake_compact_tensor(
             cutlass.BFloat16 if preprocessed_k else cutlass.Float32,
-            (sym_a, H, K),
+            (sym_a, H_v, K),
             stride_order=(2, 1, 0),
             assumed_align=128,
         )
-        w_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, K), stride_order=(2, 1, 0), assumed_align=128)
-        u_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, V), stride_order=(2, 1, 0), assumed_align=128)
-        kg_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H, K), stride_order=(2, 1, 0), assumed_align=128)
+        w_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H_v, K), stride_order=(2, 1, 0), assumed_align=128)
+        u_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H_v, V), stride_order=(2, 1, 0), assumed_align=128)
+        kg_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, H_v, K), stride_order=(2, 1, 0), assumed_align=128)
     else:
-        k_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
-        v_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, V), stride_order=(3, 2, 1, 0), assumed_align=128)
-        beta_fake = make_fake_compact_tensor(beta_dtype, (sym_a, sym_b, H), stride_order=(2, 1, 0), assumed_align=128)
+        k_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_b, H_qk, K), stride_order=(3, 2, 1, 0), assumed_align=128
+        )
+        v_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_b, H_v, V), stride_order=(3, 2, 1, 0), assumed_align=128
+        )
+        beta_fake = make_fake_compact_tensor(beta_dtype, (sym_a, sym_b, H_v), stride_order=(2, 1, 0), assumed_align=128)
         A_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (sym_a, sym_b, H, BT), stride_order=(3, 2, 1, 0), assumed_align=128
+            cutlass.BFloat16, (sym_a, sym_b, H_v, BT), stride_order=(3, 2, 1, 0), assumed_align=128
         )
         gk_fake = make_fake_compact_tensor(
             cutlass.BFloat16 if preprocessed_k else cutlass.Float32,
-            (sym_a, sym_b, H, K),
+            (sym_a, sym_b, H_v, K),
             stride_order=(3, 2, 1, 0),
             assumed_align=128,
         )
-        w_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128)
-        u_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_a, sym_b, H, V), stride_order=(3, 2, 1, 0), assumed_align=128)
+        w_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_b, H_v, K), stride_order=(3, 2, 1, 0), assumed_align=128
+        )
+        u_fake = make_fake_compact_tensor(
+            cutlass.BFloat16, (sym_a, sym_b, H_v, V), stride_order=(3, 2, 1, 0), assumed_align=128
+        )
         kg_fake = make_fake_compact_tensor(
-            cutlass.BFloat16, (sym_a, sym_b, H, K), stride_order=(3, 2, 1, 0), assumed_align=128
+            cutlass.BFloat16, (sym_a, sym_b, H_v, K), stride_order=(3, 2, 1, 0), assumed_align=128
         )
 
     cu_fake = make_fake_compact_tensor(cutlass.Int32, (sym_cu,), assumed_align=128)
@@ -1142,7 +1301,7 @@ def _compile_recompute_wu(
         kg_fake,
         cu_fake,
         ci_fake,
-        (Int32(1), Int32(1), Int32(H), Int32(K), Int32(V)),
+        (Int32(1), Int32(1), Int32(H_qk), Int32(H_v), Int32(K), Int32(V)),
         Int32(1),
         stream_fake,
         options="--enable-tvm-ffi",
@@ -1156,14 +1315,32 @@ def _compile_recompute_wu(
 # ============================================================================
 
 
-def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, block_k=None, block_v=None):
+def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, block_k=None, block_v=None, q=None):
+    if k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
+        raise TypeError("k and v must be bfloat16")
+    if gk.dtype != torch.float32:
+        raise TypeError("gk must be float32")
+    if beta.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError("beta must be bfloat16 or float32")
+    if q is not None:
+        if q.dtype != torch.bfloat16:
+            raise TypeError("q must be bfloat16")
+        if not q.is_contiguous() or not gk.is_contiguous():
+            raise ValueError("q and gk must be contiguous when qg is requested")
+    q_for_qg = q
+    gk_for_qg = gk
+    BT = A.shape[-1]
+    if cu_seqlens is None and k.dim() == 4 and k.shape[1] % BT != 0:
+        B_uniform, T_uniform = k.shape[:2]
+        cu_seqlens = torch.arange(B_uniform + 1, dtype=torch.int32, device=k.device) * T_uniform
     is_varlen = cu_seqlens is not None
     packed_4d = is_varlen and k.dim() == 4
-    restore_packed = False
+    restore_shape = None
+    restore_flat_packed = False
     if packed_4d:
-        if k.shape[0] != 1:
-            raise ValueError("varlen inputs must be packed with batch dimension 1")
-        k, v, beta, A, gk = (x.squeeze(0) for x in (k, v, beta, A, gk))
+        input_B, input_T = k.shape[:2]
+        restore_shape = (input_B, input_T)
+        k, v, beta, A, gk = (x.flatten(0, 1) for x in (k, v, beta, A, gk))
 
         uniform = _uniform_problem(cu_seqlens)
         if uniform is not None and uniform[1] % A.shape[-1] == 0:
@@ -1175,11 +1352,11 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
             gk = gk.view(batch, seq_len, *gk.shape[1:])
             is_varlen = False
             packed_4d = False
-            restore_packed = True
+            restore_flat_packed = input_B == 1 and input_T == batch * seq_len
 
     if is_varlen:
-        BT = A.shape[-1]
-        T_total, H, K = k.shape
+        T_total, H_qk, K = k.shape
+        H_v = v.shape[1]
         V = v.shape[2]
         num_seqs = cu_seqlens.shape[0] - 1
 
@@ -1207,15 +1384,15 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
             ci_s = prepare_chunk_indices(cu_seqlens, BT).reshape(-1)
 
         total_nt = ci_s.shape[0] // 2
-        ps = (Int32(num_seqs), Int32(T_total), Int32(H), Int32(K), Int32(V))
+        ps = (Int32(num_seqs), Int32(T_total), Int32(H_qk), Int32(H_v), Int32(K), Int32(V))
         cu_s = cu_seqlens
     else:
-        B, T, H, K = k.shape
+        B, T, H_qk, K = k.shape
+        H_v = v.shape[2]
         V = v.shape[-1]
-        BT = A.shape[-1]
         NT = (T + BT - 1) // BT
         total_nt = B * NT
-        ps = (Int32(B), Int32(T), Int32(H), Int32(K), Int32(V))
+        ps = (Int32(B), Int32(T), Int32(H_qk), Int32(H_v), Int32(K), Int32(V))
         global _dummy_cu_seqlens, _dummy_chunk_indices
         if _dummy_cu_seqlens is None or _dummy_cu_seqlens.device != k.device:
             _dummy_cu_seqlens = torch.zeros(2, dtype=torch.int32, device=k.device)
@@ -1224,12 +1401,24 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
         cu_s = _dummy_cu_seqlens
         ci_s = _dummy_chunk_indices
 
-    w = torch.empty_like(k)
-    u = torch.empty_like(v)
-    kg = torch.empty_like(k)
+    if H_qk <= 0 or H_v <= 0 or H_v % H_qk != 0:
+        raise ValueError(f"H_v ({H_v}) must be a positive multiple of H_qk ({H_qk})")
+    expected_v = (*k.shape[:2], H_v, V) if not is_varlen else (T_total, H_v, V)
+    expected_beta = expected_v[:-1]
+    expected_A = (*expected_v[:-1], BT)
+    expected_gk = (*expected_v[:-1], K)
+    if tuple(v.shape) != expected_v:
+        raise ValueError(f"v must have shape {expected_v}, got {tuple(v.shape)}")
+    if tuple(beta.shape) != expected_beta:
+        raise ValueError(f"beta must have shape {expected_beta}, got {tuple(beta.shape)}")
+    if tuple(A.shape) != expected_A:
+        raise ValueError(f"A must have shape {expected_A}, got {tuple(A.shape)}")
+    if tuple(gk.shape) != expected_gk:
+        raise ValueError(f"gk must have shape {expected_gk}, got {tuple(gk.shape)}")
 
     compiled_fn = _compile_recompute_wu(
-        H,
+        H_qk,
+        H_v,
         K,
         V,
         chunk_size=BT,
@@ -1238,14 +1427,27 @@ def recompute_w_u_fwd(k, v, beta, A, gk, cu_seqlens=None, chunk_indices=None, bl
         is_varlen=is_varlen,
         beta_dtype=cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16,
     )
+    w_shape = (T_total, H_v, K) if is_varlen else (B, T, H_v, K)
+    output_entry, (w, u, kg) = _acquire_output_buffers(
+        k.device,
+        ((w_shape, k.dtype), (tuple(v.shape), v.dtype), (w_shape, k.dtype)),
+    )
 
-    compiled_fn(k, v, beta, A, gk, w, u, kg, cu_s, ci_s, ps, Int32(total_nt))
+    try:
+        compiled_fn(k, v, beta, A, gk, w, u, kg, cu_s, ci_s, ps, Int32(total_nt))
+    except Exception:
+        if output_entry is not None:
+            output_entry.release_after_error()
+        raise
 
-    if restore_packed:
+    if restore_flat_packed:
         w, u, kg = (x.flatten(0, 1).unsqueeze(0) for x in (w, u, kg))
     elif packed_4d:
-        w, u, kg = (x.unsqueeze(0) for x in (w, u, kg))
-    return w, u, None, kg
+        input_B, input_T = restore_shape
+        w, u, kg = (x.view(input_B, input_T, *x.shape[1:]) for x in (w, u, kg))
+    w, u, kg = _export_output_buffers(output_entry, (w, u, kg))
+    qg = _compute_qg(q_for_qg, gk_for_qg) if q_for_qg is not None else None
+    return w, u, qg, kg
 
 
 def recompute_w_u_from_preprocessed(
@@ -1290,14 +1492,14 @@ def recompute_w_u_from_preprocessed(
         num_seqs = cu_seqlens.shape[0] - 1
         ci_s = chunk_indices.reshape(-1) if chunk_indices is not None else prepare_chunk_indices(cu_seqlens, BT).reshape(-1)
         total_nt = ci_s.shape[0] // 2
-        ps = (Int32(num_seqs), Int32(T_total), Int32(H), Int32(K), Int32(V))
+        ps = (Int32(num_seqs), Int32(T_total), Int32(H), Int32(H), Int32(K), Int32(V))
         cu_s = cu_seqlens
     else:
         B, T, H, K = k_scaled.shape
         V = v.shape[-1]
         BT = A.shape[-1]
         total_nt = B * ((T + BT - 1) // BT)
-        ps = (Int32(B), Int32(T), Int32(H), Int32(K), Int32(V))
+        ps = (Int32(B), Int32(T), Int32(H), Int32(H), Int32(K), Int32(V))
         global _dummy_cu_seqlens, _dummy_chunk_indices
         if _dummy_cu_seqlens is None or _dummy_cu_seqlens.device != k_scaled.device:
             _dummy_cu_seqlens = torch.zeros(2, dtype=torch.int32, device=k_scaled.device)
@@ -1306,9 +1508,8 @@ def recompute_w_u_from_preprocessed(
         cu_s = _dummy_cu_seqlens
         ci_s = _dummy_chunk_indices
 
-    w = torch.empty_like(k_scaled)
-    u = torch.empty_like(v)
     compiled_fn = _compile_recompute_wu(
+        H,
         H,
         K,
         V,
@@ -1319,13 +1520,23 @@ def recompute_w_u_from_preprocessed(
         beta_dtype=cutlass.Float32 if beta.dtype == torch.float32 else cutlass.BFloat16,
         preprocessed_k=True,
     )
+    output_entry, (w, u) = _acquire_output_buffers(
+        k_scaled.device,
+        ((tuple(k_scaled.shape), k_scaled.dtype), (tuple(v.shape), v.dtype)),
+    )
 
     # gk and kg are unused compile-signature placeholders for this
     # specialization. Reusing existing bf16 buffers avoids extra allocations.
-    compiled_fn(k_scaled, v, beta, A, k_scaled, w, u, w, cu_s, ci_s, ps, Int32(total_nt))
+    try:
+        compiled_fn(k_scaled, v, beta, A, k_scaled, w, u, w, cu_s, ci_s, ps, Int32(total_nt))
+    except Exception:
+        if output_entry is not None:
+            output_entry.release_after_error()
+        raise
 
     if restore_packed:
         w, u = (x.flatten(0, 1).unsqueeze(0) for x in (w, u))
     elif packed_4d:
         w, u = (x.unsqueeze(0) for x in (w, u))
+    w, u = _export_output_buffers(output_entry, (w, u))
     return w, u
