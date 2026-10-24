@@ -9,7 +9,7 @@ dynamic = ["version"]
 description = "High-performance CuTeDSL linear-attention kernels"
 readme = "README.md"
 authors = [ { name = "cula contributors" } ]
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "nvidia-cutlass-dsl>=4.6.2,<4.9",
     "apache-tvm-ffi>=0.1.11",
