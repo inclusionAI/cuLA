@@ -29,7 +29,9 @@ def test_workspace_loads_use_barrier_accounted_plain_tma(relative_path, run_func
     for name in workspace_names:
         assert f"make_raw_ws_qk_atom({name})" in run_text
 
-    kernel_text = ast.unparse(next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name.endswith("kernel")))
+    kernel_text = ast.unparse(
+        next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name.endswith("kernel"))
+    )
     assert "raw_qk_stage_layout = cute.make_layout((CHUNK, D, STAGES), stride=(D, 1, CHUNK * D))" in kernel_text
     for atom in ("tma_atom_kd", "tma_atom_kr"):
         assert f"cute.copy({atom}" in kernel_text
