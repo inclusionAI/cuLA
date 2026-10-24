@@ -61,28 +61,8 @@ import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Float32, Int32, Int64
-from cutlass.cutlass_dsl import T as _T
 
-from cula.ops._mlir_compat import llvm as _llvm
 from cula.utils import USE_FAST_MATH, assert_blackwell
-
-
-@cutlass.dsl_user_op
-def _atomic_add_global_i32(ptr_i64, addend_i32, *, loc=None, ip=None):
-    """Atomic add on global memory int32. Returns old value."""
-    result = _llvm.inline_asm(
-        _T.i32(),
-        [ptr_i64, addend_i32],
-        "atom.global.add.s32 $0, [$1], $2;",
-        "=r,l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=_llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return Int32(result)
-
 
 PRINT_DEBUG = False
 
@@ -1242,7 +1222,7 @@ class LinearAttentionChunkwiseDecay:
             sWorkIdx = storage.sWorkIdx.get_tensor(cute.make_layout((2,)))
             if warp_idx == self.load_warp_id:
                 with cute.arch.elect_one():
-                    first_work_idx = _atomic_add_global_i32(workspace_iter.toint().ir_value(), Int32(1).ir_value())
+                    first_work_idx = cute.arch.atomic_add(workspace_iter, Int32(1), sem="relaxed", scope="gpu")
                     sWorkIdx[(0,)] = first_work_idx
                     cute.arch.fence_acq_rel_cta()
                     cute.arch.mbarrier_arrive(sched_mbar_base)
@@ -1376,7 +1356,7 @@ class LinearAttentionChunkwiseDecay:
                     cute.arch.mbarrier_wait(sched_done_mbar, sched_done_phase)
                     sched_done_phase = Int32(1) - sched_done_phase
                     with cute.arch.elect_one():
-                        next_idx = _atomic_add_global_i32(workspace_iter.toint().ir_value(), Int32(1).ir_value())
+                        next_idx = cute.arch.atomic_add(workspace_iter, Int32(1), sem="relaxed", scope="gpu")
                         sWorkIdx[(sched_buf,)] = next_idx
                         cute.arch.fence_acq_rel_cta()
                         cute.arch.mbarrier_arrive(sched_mbar_base + sched_buf)

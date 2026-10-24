@@ -171,7 +171,7 @@ units before pipeline storage and TensorMap views are reused.
 ## Supported specialization
 
 - Target: `sm_90a` on compute capability 9.0.
-- CuTe DSL: `nvidia-cutlass-dsl>=4.4.2,<4.7,!=4.5.0`.
+- CuTe DSL: `nvidia-cutlass-dsl>=4.6.2,<4.9`.
 - Q, K, V, and O: BF16.
 - Decay and recurrent state: FP32.
 - Key and value dimensions: 128.

@@ -18,56 +18,72 @@ import types
 import pytest
 
 from cula.ops import _mlir_compat
-from cula.ops._cutedsl_compat import Tcgen05LdStApi, detect_tcgen05_ldst_api
 from cula.ops._mlir_compat import _parse_version
+from cula.ops._nvvm_compat import adapt_keywords, bind_mma_ops
 
 
-def _legacy_ld(res, shape, num, tmem_addr, *, pack=None, half_split_offset=None):
-    pass
+def test_adapt_keywords_preserves_46_binding():
+    def mma(mma_kind, d, a, b, *, write_disable_mask=None):
+        return mma_kind, d, a, b, write_disable_mask
+
+    adapted = adapt_keywords(mma, {"mma_kind": "kind", "d": "matrix_d", "write_disable_mask": "disable_output_lane"})
+    assert adapted is mma
+    assert adapted(mma_kind="tf32", d=1, a=2, b=3, write_disable_mask=4) == ("tf32", 1, 2, 3, 4)
 
 
-def _legacy_st(shape, num, tmem_addr, r, *, unpack=None, half_split_offset=None):
-    pass
+def test_adapt_keywords_translates_48_binding():
+    def mma(kind, matrix_d, matrix_a, matrix_b, *, disable_output_lane=None):
+        return kind, matrix_d, matrix_a, matrix_b, disable_output_lane
 
-
-def _inferred_ld(res, shape, tmem_addr, *, pack=None, offset=None):
-    pass
-
-
-def _inferred_st(shape, tmem_addr, val, *, unpack=None, offset=None):
-    pass
-
-
-def test_detect_tcgen05_ldst_legacy_api():
-    assert detect_tcgen05_ldst_api(_legacy_ld, _legacy_st) == Tcgen05LdStApi(
-        ld_has_num=True,
-        st_has_num=True,
-        st_value_keyword="r",
+    adapted = adapt_keywords(
+        mma,
+        {
+            "mma_kind": "kind",
+            "d": "matrix_d",
+            "a": "matrix_a",
+            "b": "matrix_b",
+            "write_disable_mask": "disable_output_lane",
+        },
     )
+    assert adapted(mma_kind="tf32", d=1, a=2, b=3, write_disable_mask=4) == ("tf32", 1, 2, 3, 4)
 
 
-def test_detect_tcgen05_ldst_inferred_api():
-    assert detect_tcgen05_ldst_api(_inferred_ld, _inferred_st) == Tcgen05LdStApi(
-        ld_has_num=False,
-        st_has_num=False,
-        st_value_keyword="val",
-    )
+def test_adapt_keywords_rejects_duplicate_old_and_new_names():
+    def mma(kind):
+        return kind
+
+    adapted = adapt_keywords(mma, {"mma_kind": "kind"})
+    with pytest.raises(TypeError, match="Both 'mma_kind' and 'kind'"):
+        adapted(mma_kind="tf32", kind="f16")
 
 
-def test_detect_tcgen05_ldst_mixed_api():
-    assert detect_tcgen05_ldst_api(_legacy_ld, _inferred_st) == Tcgen05LdStApi(
-        ld_has_num=True,
-        st_has_num=False,
-        st_value_keyword="val",
-    )
+def test_bind_mma_ops_adapts_regular_and_weight_stationary_calls():
+    def mma(kind, cta_group, matrix_d, matrix_a, matrix_b, idesc, enable_input_d, *, disable_output_lane=None):
+        return kind, matrix_d, matrix_a, matrix_b, disable_output_lane
 
+    def mma_ws(kind, matrix_d, matrix_a, matrix_b, idesc, enable_input_d, *, zero_col_mask=None):
+        return kind, matrix_d, matrix_a, matrix_b, zero_col_mask
 
-def test_detect_tcgen05_ldst_rejects_unknown_store_value_keyword():
-    def unsupported_st(shape, tmem_addr, value):
-        pass
-
-    with pytest.raises(RuntimeError, match="expected exactly one value keyword"):
-        detect_tcgen05_ldst_api(_inferred_ld, unsupported_st)
+    regular, weight_stationary = bind_mma_ops(types.SimpleNamespace(tcgen05_mma=mma, tcgen05_mma_ws=mma_ws))
+    assert regular(
+        mma_kind="tf32",
+        cta_group="one",
+        d=1,
+        a=2,
+        b=3,
+        idesc=4,
+        enable_input_d=True,
+        write_disable_mask=5,
+    ) == ("tf32", 1, 2, 3, 5)
+    assert weight_stationary(
+        mma_kind="f16",
+        d=1,
+        a=2,
+        b=3,
+        idesc=4,
+        enable_input_d=True,
+        col_b_zero_mask=5,
+    ) == ("f16", 1, 2, 3, 5)
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +202,8 @@ def test_version_contract_rejects_out_of_range():
 
 
 def test_version_contract_rejects_two_component_upper_bound():
-    # "4.7" must normalize to (4, 7, 0) and not slip under the < 4.7.0 cap.
-    restore = _install_fake_cutlass("4.7")
+    # "4.9" must normalize to (4, 9, 0) and not slip under the < 4.9 cap.
+    restore = _install_fake_cutlass("4.9")
     try:
         with pytest.raises(RuntimeError, match="outside the range validated by cuLA"):
             _touch_gateway("llvm")
@@ -195,18 +211,17 @@ def test_version_contract_rejects_two_component_upper_bound():
         restore()
 
 
-def test_version_contract_rejects_two_component_excluded():
-    # "4.5" must normalize to (4, 5, 0) and hit the explicit 4.5.0 exclusion.
-    restore = _install_fake_cutlass("4.5")
+def test_version_contract_rejects_below_minimum():
+    restore = _install_fake_cutlass("4.6.1")
     try:
-        with pytest.raises(RuntimeError, match="explicitly excluded by cuLA"):
+        with pytest.raises(RuntimeError, match="outside the range validated by cuLA"):
             _touch_gateway("llvm")
     finally:
         restore()
 
 
 def test_missing_cutlass_reports_install_hint():
-    restore = _install_fake_cutlass("4.5.3", with_mlir=False)
+    restore = _install_fake_cutlass("4.6.2", with_mlir=False)
     sys.modules["cutlass"] = None  # simulate the package being absent
     try:
         with pytest.raises(RuntimeError, match="nvidia-cutlass-dsl"):
@@ -216,7 +231,7 @@ def test_missing_cutlass_reports_install_hint():
 
 
 def test_missing_dialect_raises_with_dialect_name():
-    restore = _install_fake_cutlass("4.5.3", missing_dialect="llvm")
+    restore = _install_fake_cutlass("4.8.1", missing_dialect="llvm")
     try:
         with pytest.raises(RuntimeError, match="no longer exposes 'llvm'"):
             _touch_gateway("llvm")
@@ -225,7 +240,7 @@ def test_missing_dialect_raises_with_dialect_name():
 
 
 def test_missing_canary_raises_naming_the_entry_point():
-    restore = _install_fake_cutlass("4.5.3", broken_canary="llvm")
+    restore = _install_fake_cutlass("4.8.1", broken_canary="llvm")
     try:
         with pytest.raises(RuntimeError, match="missing the canary entry point inline_asm"):
             _touch_gateway("llvm")
@@ -234,7 +249,7 @@ def test_missing_canary_raises_naming_the_entry_point():
 
 
 def test_vector_dispatch_uses_extractelement_when_extract_absent():
-    restore = _install_fake_cutlass("4.5.3")
+    restore = _install_fake_cutlass("4.6.2")
     try:
         seen = {}
         vector_dialect = _mlir_compat._load("vector")
@@ -254,7 +269,7 @@ def test_vector_dispatch_uses_extractelement_when_extract_absent():
 
 
 def test_vector_dispatch_uses_extract_when_available():
-    restore = _install_fake_cutlass("4.6.0")
+    restore = _install_fake_cutlass("4.8.1")
     try:
         vector_dialect = _mlir_compat._load("vector")
         # simulate the 4.6 rename: drop extractelement, add extract
@@ -281,7 +296,7 @@ def test_unknown_attribute_raises_attribute_error():
 
 
 def test_dialect_bindings_are_cached():
-    restore = _install_fake_cutlass("4.5.3")
+    restore = _install_fake_cutlass("4.8.1")
     try:
         assert _mlir_compat.llvm is _mlir_compat.llvm
     finally:

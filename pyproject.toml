@@ -11,8 +11,8 @@ readme = "README.md"
 authors = [ { name = "cula contributors" } ]
 requires-python = ">=3.10"
 dependencies = [
-    "nvidia-cutlass-dsl>=4.4.2,<4.7,!=4.5.0",
-    "apache-tvm-ffi>=0.1.9",
+    "nvidia-cutlass-dsl>=4.6.2,<4.9",
+    "apache-tvm-ffi>=0.1.11",
     "packaging>=23.2",
 ]
 license = "Apache-2.0"
@@ -25,6 +25,7 @@ dev = [
     "build",
     "twine",
 ]
+cu13 = ["nvidia-cutlass-dsl[cu13]>=4.6.2,<4.9"]
 
 [tool.setuptools.packages.find]
 where = ["."]

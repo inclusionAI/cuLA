@@ -40,9 +40,9 @@ Design goals:
 - Zero dependencies: version parsing is done with a small regex so this module
   stays usable in any environment cuLA can be installed into.
 
-The version contract mirrors ``pyproject.toml`` (including its ``!=4.5.0``
-exclusion) and the canary probes make a broken binding fail fast with an
-actionable message instead of surfacing mid-JIT.
+The version contract mirrors ``pyproject.toml`` and the canary probes make a
+broken binding fail fast with an actionable message instead of surfacing
+mid-JIT.
 """
 
 from __future__ import annotations
@@ -55,9 +55,8 @@ from typing import Any, Final
 # ``pyproject.toml``; when CuTeDSL is bumped, extend ``_SUPPORTED_MIN`` /
 # ``_SUPPORTED_MAX`` only after the new release has been validated against the
 # canaries below (and ideally against the SM90/SM100 kernel test suites).
-_SUPPORTED_MIN: Final[tuple[int, ...]] = (4, 4, 2)
-_SUPPORTED_MAX: Final[tuple[int, ...]] = (4, 7, 0)
-_EXCLUDED_VERSIONS: Final[frozenset[tuple[int, ...]]] = frozenset({(4, 5, 0)})
+_SUPPORTED_MIN: Final[tuple[int, ...]] = (4, 6, 2)
+_SUPPORTED_MAX: Final[tuple[int, ...]] = (4, 9, 0)
 
 # dialect name -> (package, attribute) inside ``cutlass``.
 _PRIVATE_TABLE: Final[dict[str, tuple[str, str]]] = {
@@ -123,7 +122,7 @@ def _installed_version() -> tuple[int, int, int]:
         import cutlass  # noqa: PLC0415
     except ImportError:
         raise RuntimeError(
-            "cuLA requires the nvidia-cutlass-dsl package; install it with `pip install 'nvidia-cutlass-dsl>=4.4.2,<4.7'`."
+            "cuLA requires the nvidia-cutlass-dsl package; install it with `pip install 'nvidia-cutlass-dsl>=4.6.2,<4.9'`."
         ) from None
     version = getattr(cutlass, "__version__", None)
     if not isinstance(version, str):
@@ -135,11 +134,6 @@ def _installed_version() -> tuple[int, int, int]:
 
 
 def _check_contract(version: tuple[int, ...]) -> None:
-    if version in _EXCLUDED_VERSIONS:
-        raise RuntimeError(
-            f"Installed CuTeDSL version {'.'.join(map(str, version))} is explicitly "
-            f"excluded by cuLA (see pyproject.toml). {_INCIDENT_NOTE}"
-        )
     if not (_SUPPORTED_MIN <= version < _SUPPORTED_MAX):
         raise RuntimeError(
             f"Installed CuTeDSL version {'.'.join(map(str, version))} is outside the "
@@ -231,8 +225,8 @@ def vector_extract_element(vec, position, *, loc=None, ip=None):
       plus a static-position array, so a constant position is ``extract(vec,
       [], [position], ...)``.
 
-    Preferring ``extractelement`` when both exist keeps the pre-4.6 code path
-    byte-identical to what cuLA shipped before the gateway.
+    The fallback remains for early 4.6 development wheels; supported releases
+    use ``extract``.
     """
     vector_dialect = _load("vector")
     if _has_attribute_path(vector_dialect, ("extractelement",)):

@@ -50,7 +50,7 @@ pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu129
 For CUDA 13, install the CuTeDSL CUDA 13 extra before installing cuLA:
 
 ```bash
-pip install 'nvidia-cutlass-dsl[cu13]>=4.4.2,<4.7,!=4.5.0'
+pip install 'nvidia-cutlass-dsl[cu13]>=4.6.2,<4.9'
 ```
 
 **Install cuLA & dependencies:**

@@ -22,12 +22,11 @@ partial, and packed-varlen inputs use the same exact CuTeDSL kernels through
 the modular host path. Batch one deliberately avoids a composed-host compiler
 failure observed in CUTLASS DSL 4.6.2 and 4.6.3; it does not fall back to C++.
 
-The package currently declares `nvidia-cutlass-dsl>=4.4.2,<4.7,!=4.5.0`
-and this migration was validated with 4.6.2. An isolated 4.6.3 check reproduced
-the batch-one composed-host compiler failure, so a patch-version upgrade does
-not remove the modular fallback. Version 4.8.1 is outside the supported range
-and did not provide a clean drop-in validation in the current environment;
-the production path therefore does not depend on an unverified upgrade.
+The package declares `nvidia-cutlass-dsl>=4.6.2,<4.9` and a CUDA 13 extra.
+The low-level TMEM and NVVM wrappers use the 4.6 API directly and normalize the
+MMA keyword renames introduced by 4.8. The batch-one modular fallback remains:
+it is a stable dispatch choice and does not depend on the composed-host
+compiler behavior of a particular patch release.
 
 `unified_gref=True` and `use_tf32_inverse=False` are rejected explicitly
 because neither option belongs to the bitwise-compatible production path.
