@@ -40,6 +40,11 @@ It also preserves the four K=8 TF32 MMA steps in one inverse accumulator, beta
 rounding, BF16 conversion points, causal masking, GVA head mapping, and partial
 chunk behavior.
 
+The earlier experimental raw-gate `equal`/`varlen` entry points have been
+removed. They were not part of the public dispatch, duplicated gate/cumsum
+work already owned by the pipeline, and carried a separate shared-memory
+lifetime protocol that the production path did not need.
+
 Before the C++ sources were removed, 21 direct migration tests passed on
 SM100. Complete tensors were compared with `torch.equal`, including causal
 upper triangles, for FP32/BF16 beta, MHA, GVA, packed partial-varlen, unaligned
@@ -94,23 +99,14 @@ python benchmarks/stress_kda_sm100_cutedsl_determinism.py \
   --report-json /tmp/kda_sm100_cutedsl_10m.json
 ```
 
-The packed partial-varlen raw-gate candidate has a separate harness:
-
-```bash
-python benchmarks/stress_kda_sm100_varlen_determinism.py \
-  --iterations 10000000 --checkpoint 1000000 \
-  --report-json /tmp/kda_sm100_varlen_10m.json
-```
-
-Both harnesses retain a first-run golden output, reject NaN/Inf, compare every
-output bit on every replay, and report checkpoint progress plus a JSON result.
+The harness retains a first-run golden output, rejects NaN/Inf, compares every
+output bit on every replay, and reports checkpoint progress plus a JSON result.
 
 Final pure-path results:
 
 | Path | Shape | Outputs checked | Replays | Mismatches | Time | Replays/s |
 |---|---|---|---:|---:|---:|---:|
 | Public fixed-length | B=1, T=256, H=4 | W, U, KG, Aqk, Akk | 10,000,000 | 0 | 266.210 s | 37,564.4 |
-| Packed partial-varlen | lengths 65/127/193/255, H=8 | K-scaled, KG, Q-scaled, gate tail, Aqk, Akk, W, U | 10,000,000 | 0 | 610.337 s | 16,384.4 |
 
 ## Validation gates
 

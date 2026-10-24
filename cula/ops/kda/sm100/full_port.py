@@ -15,9 +15,6 @@ from cula.ops.kda.sm100.intra_fused import (
     K_DIM,
     _acquire_exact_port_outputs,
     _export_exact_port_outputs,
-    _get_exact_port_dummy_alog,
-    _get_exact_port_dummy_bias,
-    _get_exact_port_dummy_outputs,
     make_host_function,
 )
 from cula.ops.kda.sm100.recompute_wu import (
@@ -52,7 +49,6 @@ def _make_full_host(batch, length, h_qk, h_v, beta_dtype, scale):
         h_v,
         is_varlen=False,
         fp32_akk_workspace=True,
-        input_gk_fp32=True,
         beta_fp32=beta_dtype == torch.float32,
     )
     wu = KDARecomputeWU(
@@ -78,31 +74,20 @@ def _make_full_host(batch, length, h_qk, h_v, beta_dtype, scale):
         w,
         u,
         kg,
-        dummy_alog,
-        dummy_bf16,
-        dummy_fp32,
         cu_seqlens,
         chunk_indices,
-        dummy_bias,
         stream,
     ):
         intra_host(
             q,
             k,
             gk,
-            dummy_alog,
             beta,
             cutlass.Float32(scale),
-            dummy_bf16,
-            dummy_bf16,
-            dummy_bf16,
-            dummy_fp32,
             Aqk,
             Akk_workspace,
             cu_seqlens,
             chunk_indices,
-            dummy_bias,
-            cutlass.Float32(0.0),
             stream,
         )
         akk_inv_fp32_physical_host(
@@ -178,21 +163,12 @@ def _compile_full_port(device, batch, length, h_qk, h_v, beta_dtype, scale):
         stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
-    alog_fake = make_fake_compact_tensor(cutlass.Float32, (h_v,), assumed_align=128)
-    dummy_bf16_fake = make_fake_compact_tensor(cutlass.BFloat16, (1,), assumed_align=16)
-    dummy_fp32_fake = make_fake_compact_tensor(cutlass.Float32, (1,), assumed_align=16)
     cu_fake = make_fake_compact_tensor(cutlass.Int32, (2,), assumed_align=16)
     ci_fake = make_fake_compact_tensor(
         cutlass.Int32,
         (1, 2),
         stride_order=(1, 0),
         assumed_align=16,
-    )
-    bias_fake = make_fake_compact_tensor(
-        cutlass.Float32,
-        (h_v, K_DIM),
-        stride_order=(1, 0),
-        assumed_align=128,
     )
     full_host = _make_full_host(batch, length, h_qk, h_v, beta_dtype, scale)
     compiled = cute.compile(
@@ -208,12 +184,8 @@ def _compile_full_port(device, batch, length, h_qk, h_v, beta_dtype, scale):
         bf16_4d_v,
         bf16_4d_v,
         bf16_4d_v,
-        alog_fake,
-        dummy_bf16_fake,
-        dummy_fp32_fake,
         cu_fake,
         ci_fake,
-        bias_fake,
         make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -232,10 +204,7 @@ def chunk_kda_fwd_full_sm100_from_gk(q, k, v, gk, beta, scale):
     if length % (4 * BT):
         raise NotImplementedError("the full-port fast path requires T to be divisible by 256")
 
-    dummy_alog = _get_exact_port_dummy_alog(q.device, h_v)
-    dummy_bf16, dummy_fp32 = _get_exact_port_dummy_outputs(q.device)
     cu_seqlens, chunk_indices = _get_full_metadata(q.device)
-    dummy_bias = _get_exact_port_dummy_bias(q.device, h_v)
     compiled = _compile_full_port(q.device, batch, length, h_qk, h_v, beta.dtype, scale)
     intra_entry = None
     wu_entry = None
@@ -261,12 +230,8 @@ def chunk_kda_fwd_full_sm100_from_gk(q, k, v, gk, beta, scale):
             w,
             u,
             kg,
-            dummy_alog,
-            dummy_bf16,
-            dummy_fp32,
             cu_seqlens,
             chunk_indices,
-            dummy_bias,
         )
     except Exception:
         if intra_entry is not None:
