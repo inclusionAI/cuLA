@@ -15,7 +15,7 @@ dependencies = [
     "apache-tvm-ffi>=0.1.11",
     "packaging>=23.2",
 ]
-license = "Apache-2.0"
+license = { text = "Apache-2.0" }
 
 [project.optional-dependencies]
 dev = [
