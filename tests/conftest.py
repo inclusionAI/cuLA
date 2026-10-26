@@ -1,7 +1,25 @@
+import importlib.util
 import re
 
 import pytest
 import torch
+
+_FLA_REFERENCE_TESTS = {
+    "test_chunk_wy_dqkg_sm90.py",
+    "test_kda_flashkda_sm100.py",
+    "test_kda_sm100_intracard_cp.py",
+    "test_kda_sm100_output.py",
+    "test_kda_sm100_recurrence.py",
+    "test_kda_sm90_intracard_cp.py",
+    "test_kda_sm90_prefill_vs_fla.py",
+}
+
+
+def pytest_ignore_collect(collection_path, config):
+    """Keep external-reference tests optional in a standalone installation."""
+
+    del config
+    return collection_path.name in _FLA_REFERENCE_TESTS and importlib.util.find_spec("fla") is None
 
 
 def _is_sm100() -> bool:

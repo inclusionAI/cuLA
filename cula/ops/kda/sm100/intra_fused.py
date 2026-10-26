@@ -74,8 +74,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
-from fla.ops.utils import prepare_chunk_indices
-
+from cula.ops.kda.index import prepare_chunk_indices
 from cula.ops.kda.sm100.akk_inv_fp32 import akk_inv_fp32_physical_host as _akk_inv_fp32_physical_host
 from cula.ops.kda.sm100.akk_inv_tf32 import _add_store_C16_smem as _tf32_add_store_C16_smem
 from cula.ops.kda.sm100.akk_inv_tf32 import _invert_diag_forward16 as _tf32_invert_diag_forward16
@@ -2035,8 +2034,6 @@ def make_host_function(
 # ============================================================================
 # High-level Python wrappers for training usage
 # ============================================================================
-
-from fla.ops.utils import prepare_chunk_indices
 
 _INTRA_CACHE = {}
 _VARLEN_PAD_CACHE = {}

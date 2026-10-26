@@ -77,8 +77,8 @@ import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Float32, Int32, Int64
-from fla.ops.utils import prepare_chunk_indices
 
+from cula.ops.kda.index import prepare_chunk_indices
 from cula.utils import USE_FAST_MATH, assert_blackwell
 
 PRINT_DEBUG = False
@@ -2091,26 +2091,6 @@ def main():
             torch.cuda.synchronize()
             ms = start.elapsed_time(end) / N_iters
             print(f"  CuTe DSL T={bench_T}: {ms:.3f} ms")
-
-            try:
-                from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
-
-                for _ in range(10):
-                    chunk_gla_fwd_o_gk(
-                        q=q_b, v=v_b, g=g_b, A=A_b, h=h_b.flatten(0, 1), scale=scale, chunk_size=BT, use_exp2=True
-                    )
-                torch.cuda.synchronize()
-                start.record()
-                for _ in range(N_iters):
-                    chunk_gla_fwd_o_gk(
-                        q=q_b, v=v_b, g=g_b, A=A_b, h=h_b.flatten(0, 1), scale=scale, chunk_size=BT, use_exp2=True
-                    )
-                end.record()
-                torch.cuda.synchronize()
-                ms_fla = start.elapsed_time(end) / N_iters
-                print(f"  Triton T={bench_T}: {ms_fla:.3f} ms  speedup={ms_fla / ms:.2f}x")
-            except Exception as e:
-                print(f"  Triton benchmark failed: {e}")
 
 
 if __name__ == "__main__":

@@ -6,15 +6,17 @@ Public entry points for KDA. For full examples (varlen, intracard CP, per-backen
 
 | Symbol | Description | Arch | Direction |
 |--------|-------------|------|-----------|
-| `chunk_kda` | Chunked KDA prefill | SM100 (Blackwell) | Forward + backward |
+| `chunk_kda_fwd_intra` | Atomic intra + W/U composition from cumulative gates | SM100 (Blackwell) | Forward primitives |
 | `flashkda_prefill` | KDA prefill (CuTeDSL K1+K2, intracard-CP capable) | SM90 (Hopper) | Forward only |
 | `kda_prefill` | Public FlashKDA prefill entry point | SM90/SM100 | Forward only |
 | `kda_decode` | Single-token decode | SM100 | Forward |
 | `fused_sigmoid_gating_delta_rule_update` | Decode state update | SM100 | Forward |
 
-`chunk_kda` and `flashkda_prefill` each call a fixed implementation.
+`chunk_kda_fwd_intra` and `flashkda_prefill` each call owned CuTeDSL implementations.
 `kda_prefill` calls FlashKDA directly; there is no C++/CUDA extension fallback.
 FlashKDA currently requires matching Q/K/V head counts (MHA rather than GVA).
+The standalone package does not provide the former FLA-backed `chunk_kda`
+autograd composition.
 
 ## Minimal example
 

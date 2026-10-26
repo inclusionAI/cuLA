@@ -12,7 +12,7 @@
 
 Linear attention mechanisms reformulate standard attention to use linear-time state updates instead of quadratic pairwise interactions, making them well suited for long-context LLM workloads. Recent variants such as [GLA](https://arxiv.org/abs/2312.06635), [KDA](http://arxiv.org/abs/2510.26692), [GDN](https://arxiv.org/abs/2412.06464), and [Lightning Attention](https://arxiv.org/abs/2405.17381) further improve expressiveness with gating, delta-style updates, and chunkwise decomposition.
 
-**cuLA** provides hand-tuned CUDA implementations of these linear attention variants, targeting NVIDIA Blackwell (SM10X) and Hopper (SM90) GPUs. It is designed as a submodule of [flash-linear-attention (FLA)](https://github.com/fla-org/flash-linear-attention), sharing the same interface — adopting cuLA requires only a one-line import change. For ease of maintenance, cuLA is currently developed as a standalone library; the end goal is for users to seamlessly access these kernels through FLA. Since FLA already has a kernel dispatch mechanism in place, integration will be ready soon.
+**cuLA** provides hand-tuned CuTeDSL implementations of these linear attention variants, targeting NVIDIA Blackwell (SM10X) and Hopper (SM90) GPUs. The runtime is a standalone kernel library: it does not import or vendor FLA, Triton, or a C++/CUDA extension. Complete operators and deliberately exposed atomic kernels are available through `cula.kernels`.
 
 > **⚠️ Early Stage:** cuLA is in its early development phase. Many kernels still have significant room for optimization, and the API may evolve. We warmly welcome contributions from the community — whether it's performance tuning, new algorithm support, bug fixes, or architectural improvements. Every contribution helps push the boundaries of linear attention on modern GPUs!
 
@@ -32,17 +32,12 @@ Platform-independent wheels containing the CuTeDSL sources are available on [Git
 
 Replace `<TAG>` with the release tag (e.g., `v0.2.0`) and `<VERSION>` with the version (e.g., `0.2.0`). Or download the `.whl` file directly from the [Releases page](https://github.com/inclusionAI/cuLA/releases) and install it with `pip install <filename>.whl`.
 
-The cuLA wheel does not install FLA. Install `flash-linear-attention` before importing `chunk_kda`:
-
-    pip install flash-linear-attention
-
 ### Build from Source
 
 **Clone cuLA & dependencies:**
 
 ```bash
 git clone https://github.com/inclusionAI/cuLA.git
-git submodule update --init --recursive
 ```
 
 **Install PyTorch and CuTeDSL:**
@@ -64,9 +59,6 @@ pip install 'nvidia-cutlass-dsl[cu13]>=4.6.2,<4.9'
 **Install cuLA & dependencies:**
 
 ```bash
-# Install flash-linear-attention for benchmark repro
-pip install -e third_party/flash-linear-attention
-
 # Install cuLA
 pip install -e . --no-build-isolation
 ```
@@ -108,28 +100,26 @@ See [the SM90 Lightning prefill pipeline](docs/lightning_attn_sm90.md) for the
 warp-group roles, WGMMA dataflow, pipeline stages, recurrent-state placement,
 and fixed/packed scheduling modes.
 
-### KDA (Kimi Delta Attention) — Blackwell (SM10X)
-
-Just change the import:
+### KDA (Kimi Delta Attention) prefill
 
 ```python
 import torch
-from cula.kda import chunk_kda  # <-- one-line change from fla.ops.kda
+from cula.kernels.kda import kda_prefill
 
 B, T, H, K, V = 2, 2048, 32, 128, 128
 device = 'cuda'
 
-q = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16, requires_grad=True)
-k = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16, requires_grad=True)
-v = torch.randn(B, T, H, V, device=device, dtype=torch.bfloat16, requires_grad=True)
+q = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16)
+k = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16)
+v = torch.randn(B, T, H, V, device=device, dtype=torch.bfloat16)
 g = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1   # gate (log space)
 beta = torch.randn(B, T, H, device=device, dtype=torch.bfloat16).sigmoid()
 A_log = torch.randn(H, device=device, dtype=torch.float32) * 0.01
 dt_bias = torch.zeros(H * K, device=device, dtype=torch.float32)
 init_state = torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
 
-# Forward
-o, final_state = chunk_kda(
+# Forward-only standalone operator
+o, final_state = kda_prefill(
     q=q, k=k, v=v, g=g, beta=beta,
     A_log=A_log,
     dt_bias=dt_bias,
@@ -141,28 +131,27 @@ o, final_state = chunk_kda(
     lower_bound=-5.0,
 )
 
-# Backward
-do = torch.randn_like(o)
-o.backward(do)
-
 print(f'Output shape: {o.shape}')             # [2, 2048, 32, 128]
 print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 ```
 
 **Notes:**
-- `safe_gate=True` is required to leverage TensorCore acceleration.
+- `kda_prefill` is forward-only. The modular SM100 training primitives are exposed separately rather than hidden behind an FLA autograd wrapper.
+- `safe_gate=True` is required by this path.
 - `beta` supports both `float32` and `bfloat16`; `initial_state` must be `float32`.
 - `cu_seqlens` (for variable-length sequences) must be `int32`.
 
 ## Usage
 
 See [USAGE.md](USAGE.md) for detailed usage examples and notes.
+See [the standalone kernel inventory](docs/KERNEL_VALUE.md) for the public
+kernel boundary and the overlap assessment against FlashInfer and cuDNN.
 
 ## Benchmarks
 
 Benchmarks run on a single **NVIDIA GB200/H200** GPU with **PyTorch 2.9.1**, **Triton 3.5.1**.
 
-FLA baseline: [flash-linear-attention v0.5.0](https://github.com/fla-org/flash-linear-attention/releases/tag/v0.5.0).
+Historical result files use FLA as an external baseline. FLA is not a runtime or source-tree dependency.
 
 **Blackwell (SM10X)**
 
@@ -183,7 +172,8 @@ To reproduce the benchmark suites directly:
 
 ```bash
 # Blackwell (SM10X)
-python benchmarks/bench_kda.py --mode both
+python benchmarks/bench_kda_sm90_prefill.py --mode both
+python benchmarks/bench_kda_chunk_intra.py --mode both
 python benchmarks/bench_lightning_attn_prefill.py --modes no_state varlen
 python benchmarks/bench_la_decode_vs_fla.py --heads 64 --head-dim 128
 
@@ -205,11 +195,8 @@ python -m pytest -m cula_slow -q
 # Default tests plus every extended CUDA case
 python -m pytest -m cula_full -q
 
-# Tests for modular KDA forward against FLA Triton implementation
-python -m pytest tests/test_kda_sm100_chunk_vs_fla.py -v
-# Tests for modular KDA forward against naive KDA reference
-python -m pytest tests/test_kda_sm100_chunk_vs_naive.py -v
-# Tests for the SM90 CuTeDSL two-kernel prefill + intracard CP (vs FLA)
+# Optional reference tests (require a separately installed FLA)
+# SM90 CuTeDSL two-kernel prefill + intracard CP
 python -m pytest tests/test_kda_sm90_prefill_vs_fla.py tests/test_kda_sm90_intracard_cp.py -v
 # Tests for Lightning Attention prefill on SM100
 python tests/test_lightning_sm100_prefill.py
@@ -218,13 +205,6 @@ python -m pytest tests/test_lightning_attn_prefill_dispatch.py tests/test_lightn
 # Tests for Lightning Attention decode
 python -m pytest tests/test_lightning_decode.py -v
 
-# The two chunk-vs-reference files also retain their narrower KDA fast/slow split.
-# Fast (default) — representative correctness paths for default CI and local iteration
-python -m pytest tests/test_kda_sm100_chunk_vs_naive.py tests/test_kda_sm100_chunk_vs_fla.py -v
-# Slow — broader stress coverage for nightly or manual runs
-python -m pytest -m kda_slow tests/test_kda_sm100_chunk_vs_naive.py tests/test_kda_sm100_chunk_vs_fla.py -v
-# Full sweep (fast + slow) — run before submitting a PR
-python -m pytest -m kda_full tests/test_kda_sm100_chunk_vs_naive.py tests/test_kda_sm100_chunk_vs_fla.py -v
 ```
 
 <details>
@@ -252,7 +232,7 @@ See [REPO_LAYOUT.md](REPO_LAYOUT.md) for the full directory structure and a summ
 
 ## Roadmap
 
-* [ ] Integrate into [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) via FLA's kernel dispatch mechanism
+* [ ] Stabilize the standalone atomic-kernel contracts and publish per-kernel benchmarks.
 * [ ] Polynomial approximation to mitigate the exponential bottleneck, as in [Flash-Attentiton-4](https://arxiv.org/abs/2603.05451).
 * [ ] Larger chunk size and 2-CTA on SM10X for improved throughput.
 * [ ] Continuous optimization via agentic methods such as [AVO](https://arxiv.org/abs/2603.24517).
@@ -262,7 +242,7 @@ See [REPO_LAYOUT.md](REPO_LAYOUT.md) for the full directory structure and a summ
 
 **Train**
 
-* [x] Modular KDA Forward (SM10X, compatible with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/README.md))
+* [x] Modular KDA Forward (SM10X)
   * [x] kda chunk intra
   * [x] chunk gated delta h
   * [x] recompute wu
@@ -284,7 +264,7 @@ See [REPO_LAYOUT.md](REPO_LAYOUT.md) for the full directory structure and a summ
 
 * [ ] Fused KDA prefill kernel (SM10X)
 
-* [ ] MTP support
+* [x] KDA and Lightning Attention MTP decode/verify support
 
 * [ ] More aggressive fusion of small neighboring kernels like cumsum for inference scenarios.
 

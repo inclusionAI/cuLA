@@ -57,7 +57,7 @@ Summary (18 configs): **avg=1.35x**, min=1.33x, max=1.37x.
 To reproduce:
 
 ```bash
-python benchmarks/bench_kda.py --mode both
+python benchmarks/bench_kda_chunk_intra.py --mode both
 ```
 
 ## Lightning Attention

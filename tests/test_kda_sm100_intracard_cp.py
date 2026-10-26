@@ -48,11 +48,10 @@ DEVICE = "cuda"
 #   * Same-kernel (CP scheduling only): torch.testing.assert_close(atol=1e-2, rtol=1e-2)
 #                                       — matches tests/test_kda_sm100_recurrence.py CP block
 #   * Cross-impl / vs ref:              fla.utils.assert_close(ratio=...)
-#                                       — matches tests/test_kda_sm100_chunk_vs_fla.py
 ATOL_SAME_KERNEL = 1e-2
 RTOL_SAME_KERNEL = 1e-2
 RATIO_VS_REF = 0.005  # RMSE / RMS(ref) — matches FLA test_gated_delta.py fwd
-RATIO_VS_FLA = 0.015  # cross-impl gap measured ~1.27% (TF32 MMA vs Triton fp32)
+RATIO_VS_FLA = 0.015  # cross-implementation gap measured ~1.27% (TF32 MMA vs Triton fp32)
 RATIO_STRESS = 1e-6  # deterministic re-run: drift would indicate race
 
 

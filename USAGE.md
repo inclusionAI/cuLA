@@ -10,11 +10,11 @@ cuLA exposes several KDA entry points targeting different GPU architectures:
 
 | Kernel | GPU | Import |
 |---|---|---|
-| Modular Forward | Blackwell (SM100) | `from cula.kda import chunk_kda` |
+| Modular Intra/WU | Blackwell (SM100) | `from cula.kernels.kda import chunk_kda_fwd_intra` |
 | Two-Kernel Prefill | Hopper (SM90) | `from cula.kda import flashkda_prefill` |
 | Public Prefill | Hopper (SM90) / Blackwell (SM100) | `from cula.kda import kda_prefill` |
 
-`chunk_kda` and `flashkda_prefill` each call a fixed implementation.
+`chunk_kda_fwd_intra` and `flashkda_prefill` each call owned CuTeDSL implementations.
 `kda_prefill` is the public FlashKDA wrapper and has no native-extension fallback.
 The removed `kda_prefill_hopper`, `kda_prefill_hopper_opt`, and
 `kda_prefill_hopper_auto` names should be migrated to one of these FlashKDA
@@ -61,50 +61,39 @@ with torch.inference_mode():
     )
 ```
 
-### Modular Forward (SM100 — Blackwell)
+### Modular Intra/WU primitives (SM100 — Blackwell)
 
-The modular forward kernel replaces sub-kernels of KDA in FLA (chunk_intra, chunk_delta_h, fwd_o, etc.) for easy integration with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/README.md).
+This boundary accepts an already activated, chunk-cumulative FP32 gate and
+returns the intra-chunk matrices plus W/U preparation tensors. Gate activation,
+cumsum, recurrent-state propagation, and output projection remain explicit
+caller-owned stages.
 
 #### Example
 
 ```python
 import torch
-from cula.kda import chunk_kda
+from cula.kernels.kda import chunk_kda_fwd_intra
 
 B, T, H, K, V = 2, 2048, 32, 128, 128
 device = 'cuda'
 
-q = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16, requires_grad=True)
-k = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16, requires_grad=True)
-v = torch.randn(B, T, H, V, device=device, dtype=torch.bfloat16, requires_grad=True)
-g = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1
+q = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16)
+k = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16)
+v = torch.randn(B, T, H, V, device=device, dtype=torch.bfloat16)
+gk = torch.randn(B, T, H, K, device=device, dtype=torch.float32) * 0.1
 beta = torch.randn(B, T, H, device=device, dtype=torch.bfloat16).sigmoid()
-A_log = torch.randn(H, device=device, dtype=torch.float32) * 0.01
-dt_bias = torch.zeros(H * K, device=device, dtype=torch.float32)
-init_state = torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
 
-o, final_state = chunk_kda(
-    q=q, k=k, v=v, g=g, beta=beta,
-    A_log=A_log, dt_bias=dt_bias,
-    initial_state=init_state,
-    output_final_state=True,
-    use_qk_l2norm_in_kernel=True,
-    use_gate_in_kernel=True,
+w, u, qg, kg, Aqk, Akk = chunk_kda_fwd_intra(
+    q=q, k=k, v=v, gk=gk, beta=beta,
     safe_gate=True,
-    lower_bound=-5.0,
 )
-
-# Backward is supported
-o.backward(torch.randn_like(o))
-
-print(f'Output shape: {o.shape}')             # [2, 2048, 32, 128]
-print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
+print(w.shape, u.shape, Aqk.shape, Akk.shape)
 ```
 
 **Notes**
 
-- The backward pass is currently supported via FLA's implementation; further optimizations are on the roadmap.
-- Compatible with [Kimi CP](https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/cp/README.md) via the `cp_context` parameter, same as in FLA.
+- This is not a full KDA operator and has no autograd wrapper.
+- Import individual primitives from `cula.kernels.kda` when integrating a custom pipeline.
 
 ---
 

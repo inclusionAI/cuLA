@@ -8,15 +8,16 @@ cuLA/
 │   ├── __init__.py
 │   ├── utils.py                       # Architecture, stream-buffer, and cu_seqlens helpers
 │   │
-│   ├── kda/                           # KDA public API, wrappers, autograd, and support kernels
-│   │   ├── __init__.py                # Lazy exports for chunk, prefill, and decode APIs
+│   ├── kernels/                       # Stable standalone lazy exports + static registry
+│   │   ├── kda.py                     # KDA operators and atomic primitives
+│   │   ├── lightning.py               # Lightning operators
+│   │   └── registry.py                # Architecture/level/status metadata
+│   │
+│   ├── kda/                           # KDA public wrappers
+│   │   ├── __init__.py                # Lazy exports for prefill and decode APIs
 │   │   ├── prefill.py                 # Public FlashKDA prefill validation and routing
 │   │   ├── flashkda.py                # SM90 CuTeDSL K1+K2 wrapper, autograd shell, and CP selection
-│   │   ├── chunk.py                   # SM100 modular chunk API + autograd
-│   │   ├── chunk_fwd.py               # SM100 forward orchestration
-│   │   ├── chunk_intra.py             # CuTeDSL forward intra + Triton backward intra
-│   │   ├── chunk_bwd.py               # Triton + FLA + CuTeDSL backward orchestration
-│   │   └── wy_intra.py / wy_recompute.py # Triton WY preparation kernels
+│   │   └── chunk_intra.py             # Pure-CuTeDSL SM100 intra/WU composition
 │   │
 │   ├── lightning/                     # [non-KDA] Lightning Attention public wrappers
 │   │
@@ -47,7 +48,6 @@ cuLA/
 ├── tests/                              # CPU registry tests and architecture-marked GPU tests
 ├── docs/                               # Pipeline and backend-dispatch design notes
 ├── scripts/build_wheel.sh
-├── third_party/flash-linear-attention/ # FLA baseline and reused operations
 ├── README.md  USAGE.md  REPO_LAYOUT.md  RECOMMENDED_CODING_STYLE.md
 └── setup.py  pyproject.toml  LICENSE
 ```
@@ -56,7 +56,8 @@ cuLA/
 
 | Directory | Language | Description |
 |-----------|----------|-------------|
-| `cula/kda/` | Python / Triton | Public KDA APIs, wrappers, autograd, routing, and supporting Triton kernels. `kda_prefill` calls FlashKDA directly without a native fallback. See [`cula/kda/README.md`](cula/kda/README.md). |
+| `cula/kernels/` | Python | Framework-independent public surface and static kernel inventory. Imports are lazy and do not compile kernels. |
+| `cula/kda/` | Python / CuTeDSL | KDA prefill/decode wrappers and the pure-CuTeDSL SM100 modular composition. `kda_prefill` calls FlashKDA directly without a native fallback. See [`cula/kda/README.md`](cula/kda/README.md). |
 | `cula/ops/kda/` | Python (CuTeDSL) | CuTeDSL KDA kernels organized into SM100 modular kernels, SM90 FlashKDA K1+K2 and intracard CP, decode, and experimental code. |
 | `cula/ops/lightning/` · `cula/ops/experimental/` | Python (CuTeDSL) | `[non-KDA]` Lightning/linear-attention kernels and prototypes. Lightning prefill dispatches to the SM90 or SM100 backend from Q's device capability. |
 | `cula/ops/{inv,ptx}.py` · `cula/ops/sm100/ptx.py` | Python | Shared low-level helpers used across operators. |

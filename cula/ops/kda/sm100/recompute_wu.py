@@ -43,8 +43,8 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import Int32, Int64
-from fla.ops.utils import prepare_chunk_indices
 
+from cula.ops.kda.index import prepare_chunk_indices
 from cula.ops.ptx import reinterpret_cast, store_256b, subvec
 from cula.ops.sm100.ptx import tcgen05_fence_after, tcgen05_fence_before, tcgen05_ld_32x32b
 from cula.utils import USE_FAST_MATH, assert_blackwell

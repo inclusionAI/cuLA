@@ -3543,8 +3543,7 @@ def chunk_kda_bwd_wy_dqkg_fused(
     Returns:
         (dq, dk, dv, db, dg, dA), matching FLA's output order.
     """
-    from fla.ops.utils.index import prepare_chunk_indices
-
+    from cula.ops.kda.index import prepare_chunk_indices
     from cula.utils import prepare_uniform_cu_seqlens
 
     B, T, H, K = q.shape

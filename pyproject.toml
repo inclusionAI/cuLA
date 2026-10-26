@@ -34,7 +34,6 @@ include = ["cula", "cula.*"]
 [tool.ruff]
 target-version = "py312"
 line-length = 127
-exclude = ["third_party/"]
 
 [tool.ruff.lint]
 select = [

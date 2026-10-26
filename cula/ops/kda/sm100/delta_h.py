@@ -26,13 +26,11 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 import torch.nn.functional as F
-import triton
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.typing import Float32, Int32, Int64
-from fla.ops.utils import prepare_chunk_indices, prepare_lens
-from fla.utils import tensor_cache
 
+from cula.ops.kda.index import prepare_chunk_indices, prepare_lens, single_entry_tensor_cache
 from cula.ops.kda.sm100.policy import sm100_intracard_cp_decision
 from cula.utils import USE_FAST_MATH, assert_blackwell, get_device_sm_count
 
@@ -40,12 +38,13 @@ COMPILE_OPTIONS = "--enable-tvm-ffi --generate-line-info --ptxas-options '--verb
 
 
 # in FLA, cumsum returns int64 tensor by default
-@tensor_cache
+@single_entry_tensor_cache
 def prepare_chunk_offsets_i32(
     cu_seqlens: torch.Tensor,
     chunk_size: int,
 ) -> torch.Tensor:
-    return F.pad(triton.cdiv(prepare_lens(cu_seqlens), chunk_size), (1, 0), value=0).cumsum(-1).int()
+    chunk_counts = torch.div(prepare_lens(cu_seqlens) + chunk_size - 1, chunk_size, rounding_mode="floor")
+    return F.pad(chunk_counts, (1, 0), value=0).cumsum(-1).int()
 
 
 PRINT_DEBUG = False
@@ -2490,45 +2489,6 @@ def main():
     torch.cuda.synchronize()
     elapsed_ms = start_event.elapsed_time(end_event) / n_iter
     print(f"  V2 kernel: {elapsed_ms:.3f} ms")
-
-    # FLA h-kernel reference (apples-to-apples: h-state recurrence only)
-    try:
-        from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as fla_fwd_h
-
-        # Warmup
-        for _ in range(3):
-            fla_fwd_h(
-                k=kb,
-                w=wb,
-                u=ub,
-                g=None,
-                gk=None,
-                initial_state=None,
-                output_final_state=False,
-                chunk_size=BT,
-                save_new_value=True,
-            )
-        torch.cuda.synchronize()
-        start_event.record()
-        for _ in range(n_iter):
-            fla_fwd_h(
-                k=kb,
-                w=wb,
-                u=ub,
-                g=None,
-                gk=None,
-                initial_state=None,
-                output_final_state=False,
-                chunk_size=BT,
-                save_new_value=True,
-            )
-        end_event.record()
-        torch.cuda.synchronize()
-        fla_ms = start_event.elapsed_time(end_event) / n_iter
-        print(f"  FLA h-kernel: {fla_ms:.3f} ms")
-        print(f"  Speedup vs FLA h-kernel: {fla_ms / elapsed_ms:.2f}x")
-    except Exception as e:
-        print(f"  FLA not available: {e}")
 
 
 if __name__ == "__main__":

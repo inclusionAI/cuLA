@@ -1279,57 +1279,6 @@ def main():
         elapsed_ms = start_event.elapsed_time(end_event) / n_iter
         print(f"  cuLA pre_scan: {elapsed_ms:.3f} ms")
 
-        # FLA Triton kernel reference (call raw kernel directly)
-        try:
-            import triton
-            from fla.ops.cp.chunk_delta_h import pre_process_fwd_kernel_merged as fla_kernel
-
-            BLOCK_SIZE_FLA = 32 if K <= 64 else 64
-            BK1_FLA = triton.next_power_of_2(K)
-            fla_grid = (triton.cdiv(V, BLOCK_SIZE_FLA) + triton.cdiv(K, BLOCK_SIZE_FLA), S_split * H)
-
-            # FLA expects [T, H, K/V] layout (no batch dim), HV=H for this case
-            k_fla = k_b[0]  # [T, H, K]
-            w_fla = w_b[0]  # [T, H, K]
-            u_fla = u_b[0]  # [T, H, V]
-            gk_fla = gk_b[0]  # [T, H, K]
-            hm_fla = torch.empty(S_split, H, K, V + K, device=device, dtype=torch.float32)
-
-            def run_fla():
-                fla_kernel[fla_grid](
-                    k=k_fla,
-                    v=u_fla,
-                    w=w_fla,
-                    g=None,
-                    gk=gk_fla,
-                    hm=hm_fla,
-                    cu_seqlens=cu_seqlens,
-                    T=T,
-                    H=H,
-                    HV=H,
-                    K=K,
-                    V=V,
-                    BT=BT,
-                    BK1=BK1_FLA,
-                    BLOCK_SIZE=BLOCK_SIZE_FLA,
-                    USE_EXP2=True,
-                    MULTI_SEQS=True,
-                )
-
-            for _ in range(3):
-                run_fla()
-            torch.cuda.synchronize()
-            start_event.record()
-            for _ in range(n_iter):
-                run_fla()
-            end_event.record()
-            torch.cuda.synchronize()
-            fla_ms = start_event.elapsed_time(end_event) / n_iter
-            print(f"  FLA pre_scan:  {fla_ms:.3f} ms")
-            print(f"  Speedup vs FLA: {fla_ms / elapsed_ms:.2f}x")
-        except Exception as e:
-            print(f"  FLA not available: {e}")
-
 
 if __name__ == "__main__":
     main()
