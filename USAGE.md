@@ -4,6 +4,48 @@ This document provides usage notes and examples for cuLA kernels.
 
 ---
 
+## cuDNN Frontend KDA context parallelism (THD)
+
+The optional distributed wrapper partitions the global packed token stream
+into contiguous, rank-ordered shards. A sequence may end locally, remain
+entirely local, or cross one or more rank boundaries.
+
+```python
+from cula.distributed import cudnn_kda_cp_thd
+
+# Local tensors: q/k/v/g [local_tokens, H, D], beta [local_tokens, H].
+# local_cu_seqlens contains the clipped sequences present on this rank.
+o_local = cudnn_kda_cp_thd(
+    q_local,
+    k_local,
+    v_local,
+    g_local,
+    beta_local,
+    local_cu_seqlens,
+    group=cp_group,
+    # Adjacent ranks sharing this rank's first/last local sequence.
+    pre_num_ranks=cp_context.pre_num_ranks,
+    post_num_ranks=cp_context.post_num_ranks,
+)
+```
+
+Forward and backward each pack the one cross-rank H/M boundary into a single
+FP32 `all_gather_into_tensor`. cuDNN Frontend's FP32-only `kimi_cp_merge`
+composes the matching boundary ranks; local forward and backward remain native
+cuDNN KDA. Interior packed-sequence slots never enter the cross-rank chain.
+
+The Python dependency requires cuDNN Frontend 1.32 or newer. Until
+`KimiCPMerge` is included in a release, use a build containing
+NVIDIA/cudnn-frontend#1997. Run the two-rank forward/backward integration and
+FLA comparison with:
+
+```bash
+torchrun --standalone --nproc-per-node=2 \
+  -m pytest -q tests/test_cudnn_kda_cp_distributed.py
+```
+
+---
+
 ## KDA
 
 cuLA exposes several KDA entry points targeting different GPU architectures:

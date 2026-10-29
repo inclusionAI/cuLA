@@ -27,6 +27,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "sm90_only: only run on SM90 devices")
     config.addinivalue_line("markers", "benchmark: long-running benchmark-shaped coverage")
     config.addinivalue_line("markers", "sanitizer: tests intended to run under compute-sanitizer")
+    config.addinivalue_line("markers", "distributed: tests launched under torchrun with multiple CUDA processes")
     config.addinivalue_line(
         "markers",
         "cula_fast: representative case kept in the default, time-bounded test suite",

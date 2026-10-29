@@ -158,6 +158,22 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 
 See [USAGE.md](USAGE.md) for detailed usage examples and notes.
 
+### Optional cuDNN Frontend THD context parallelism
+
+Install cuDNN Frontend 1.32+, its CUDA 13 CuTeDSL runtime, and FLA with:
+
+```bash
+pip install 'cuda-linear-attention[cudnn-cp]'
+```
+
+`cula.distributed.cudnn_kda_cp_thd` accepts one contiguous shard of a global
+packed THD token stream. Boundary metadata identifies how many adjacent ranks
+share the first and last local sequence. Forward and backward communicate one
+compressed FP32 H/M boundary each, compose it with cuDNN's FP32-only
+`kimi_cp_merge`, and execute the local KDA kernels through cuDNN Frontend.
+Packed interior sequences remain independent. The wrapper supports autograd;
+cuDNN Frontend builds must include `KimiCPMerge` (NVIDIA/cudnn-frontend#1997).
+
 ## Benchmarks
 
 Benchmarks run on a single **NVIDIA GB200/H200** GPU with **PyTorch 2.9.1**, **Triton 3.5.1**.

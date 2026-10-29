@@ -18,6 +18,11 @@ dependencies = [
 license = "Apache-2.0"
 
 [project.optional-dependencies]
+cudnn-cp = [
+    "nvidia-cutlass-dsl[cu13]>=4.8.0",
+    "nvidia-cudnn-frontend>=1.32.0",
+    "flash-linear-attention==0.5.2",
+]
 dev = [
     "pytest",
     "matplotlib",

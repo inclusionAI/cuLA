@@ -28,12 +28,18 @@ __all__ = [
     "fused_sigmoid_gating_delta_rule_update",
     "flashkda_prefill",
     "kda_prefill",
+    "cudnn_kda_thd",
+    "cudnn_kda_summary_thd",
+    "cudnn_kda_cp_thd",
 ]
 
 _LAZY = {
     "chunk_kda": ("cula.kda.chunk", "chunk_kda"),
     "flashkda_prefill": ("cula.kda.flashkda", "cula_kda_prefill"),
     "kda_prefill": ("cula.kda.prefill", "kda_prefill"),
+    "cudnn_kda_thd": ("cula.kda.backends.cudnn", "cudnn_kda_thd"),
+    "cudnn_kda_summary_thd": ("cula.kda.backends.cudnn", "cudnn_kda_summary_thd"),
+    "cudnn_kda_cp_thd": ("cula.distributed.kda", "cudnn_kda_cp_thd"),
     "kda_decode": ("cula.ops.kda.decode.cute", "kda_decode"),
     "kda_decode_mtp": ("cula.ops.kda.decode.mtp", "kda_decode_mtp"),
     "kda_decode_mtp_recurrent": ("cula.ops.kda.decode.mtp", "kda_decode_mtp_recurrent"),
