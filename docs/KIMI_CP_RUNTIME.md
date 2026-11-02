@@ -7,15 +7,17 @@ owns local KDA forward/backward, span summaries, and the IEEE FP32 affine state
 merge.  Frameworks own model-specific tensor layouts, gate parameterization,
 and construction of the global packed sequence metadata.
 
-The public surface intentionally has two concepts:
+The public surface intentionally has three KDA-specific layers:
 
 - `KimiCPPlan`: immutable CPU metadata for one contiguous packed-THD shard.
+- `KimiCPBoundaryTransport`: the narrow ordered-state propagation contract,
+  with `AllGatherKimiCPTransport` as the exact prepared implementation.
 - `cudnn_kda_cp`: the differentiable distributed KDA call.
 
 There is no generic backend hierarchy.  The runtime is KDA-specific and uses
-the cuDNN contracts directly.  Transport and workspace may become replaceable
-implementation details when a second implementation is justified by measured
-CP32/CP64 results.
+the cuDNN contracts directly. A future hierarchical or scan implementation can
+replace only boundary-state propagation without changing planning, local KDA,
+autograd, or the framework adapter.
 
 ## Ownership boundary
 
@@ -25,8 +27,7 @@ framework adapter
           |
           v
 cuLA Kimi CP runtime
-  shard plan, boundary-only summaries, collective, ordered state chain,
-  distributed autograd
+  shard plan, boundary-only summaries, boundary transport, distributed autograd
           |
           v
 cuDNN Frontend
@@ -97,10 +98,61 @@ FP32 matrix products and therefore changes the numerical contract.  It should
 not replace the current path without an explicit accuracy study and real
 multi-node CP64 evidence.
 
-CUDA Graph is an execution mode, not a CP algorithm.  Graph-ready follow-up
-work should add explicit reusable collective/state buffers without changing
-the public operator.  A future cuDNN correction API can likewise replace the
-current summary-plus-full-local-pass implementation behind the same call.
+## Prepared large-CP transport
+
+The convenience path allocates its packed local and gathered summary tensors
+on each forward and backward call. At large CP this creates avoidable allocator
+traffic: for `H=32`, `K=V=128`, and CP64, the gathered tensor is 256 MiB and the
+local payload is 4 MiB.
+
+`AllGatherKimiCPTransport.prepare` allocates those FP32 buffers once. The same
+transport can be reused by every KDA layer that executes sequentially on one
+CUDA stream because the buffers are not retained by the local autograd graph.
+Use one prepared transport per concurrently executing stream. Shape, device,
+world-size, dtype, and contiguity are validated before every collective.
+`required_workspace_bytes` reports the exact allocation before materializing
+it; the standard CP64 shape above requires 260 MiB.
+
+```python
+from cula.distributed import (
+    AllGatherKimiCPTransport,
+    build_kimi_cp_plan,
+    cudnn_kda_cp,
+)
+
+plan = build_kimi_cp_plan(global_cu_seqlens_cpu, group=cp_group)
+transport = AllGatherKimiCPTransport.prepare(
+    plan,
+    heads=32,
+    key_dim=128,
+    value_dim=128,
+    device=q.device,
+)
+
+# Reuse `plan` and `transport` across compatible KDA layers.
+output = cudnn_kda_cp(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    local_cu_seqlens,
+    plan=plan,
+    group=cp_group,
+    boundary_transport=transport,
+)
+```
+
+The transport contract returns only the FP32 state entering the first local
+sequence (forward) or leaving the last local sequence (backward). It does not
+expose framework layouts or local KDA details. This is the intended extension
+point for future topology-aware CP64 implementations.
+
+CUDA Graph is an execution mode, not a CP algorithm. The prepared transport
+provides stable collective addresses; full graph capture also depends on the
+process group and cuDNN merge implementation supporting capture. A future
+cuDNN correction API can likewise replace the current summary-plus-full-local
+pass implementation behind the same call.
 
 ## Validation ladder
 

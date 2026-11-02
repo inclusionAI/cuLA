@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import torch
 
 from cula.distributed import kda as cp
+from cula.distributed.plan import KimiCPPlan
 
 
 def test_cudnn_loader_accepts_current_linear_attention_exports(monkeypatch):
@@ -154,3 +155,168 @@ def test_merge_uses_cudnn_fixed_ieee_api_without_precision_option(monkeypatch):
 
     assert result.item() == 1.0
     assert observed["reverse"] is True
+
+
+def _transport_plan(*, rank=2, pre=2, post=1):
+    return KimiCPPlan(
+        rank=rank,
+        world_size=4,
+        token_start=8,
+        token_end=12,
+        first_sequence=0,
+        last_sequence=0,
+        local_cu_seqlens=(0, 4),
+        first_boundary_end=4,
+        last_boundary_start=0,
+        pre_num_ranks=pre,
+        post_num_ranks=post,
+    )
+
+
+def test_collective_workspace_has_stable_fp32_storage():
+    workspace = cp._KimiCPCollectiveWorkspace.allocate(
+        world_size=4,
+        heads=2,
+        key_dim=4,
+        value_dim=3,
+        device="cpu",
+    )
+
+    assert workspace.local_payload.shape == (2, 7, 4)
+    assert workspace.gathered_payload.shape == (8, 7, 4)
+    assert workspace.local_payload.dtype == workspace.gathered_payload.dtype == torch.float32
+    assert workspace.nbytes == (2 * 7 * 4 + 8 * 7 * 4) * 4
+    cp64_plan = KimiCPPlan(
+        rank=0,
+        world_size=64,
+        token_start=0,
+        token_end=1,
+        first_sequence=0,
+        last_sequence=0,
+        local_cu_seqlens=(0, 1),
+        first_boundary_end=1,
+        last_boundary_start=0,
+        pre_num_ranks=0,
+        post_num_ranks=63,
+    )
+    required = cp.AllGatherKimiCPTransport.required_workspace_bytes(
+        cp64_plan,
+        heads=32,
+        key_dim=128,
+        value_dim=128,
+    )
+    assert required == 260 << 20
+
+    try:
+        cp.AllGatherKimiCPTransport(workspace=object())
+    except TypeError as error:
+        assert "prepare" in str(error)
+    else:
+        raise AssertionError("transport must reject an unrelated workspace object")
+
+
+def test_prepared_all_gather_transport_reuses_workspace(monkeypatch):
+    plan = _transport_plan()
+    transport = cp.AllGatherKimiCPTransport.prepare(
+        plan,
+        heads=1,
+        key_dim=1,
+        value_dim=1,
+        device="cpu",
+    )
+    workspace = transport.workspace
+    assert workspace is not None
+    local_pointer = workspace.local_payload.data_ptr()
+    gathered_pointer = workspace.gathered_payload.data_ptr()
+
+    def fake_all_gather(output, tensor, *, group):
+        assert group == "cp"
+        gathered = output.view(4, *tensor.shape)
+        for rank in range(4):
+            gathered[rank].copy_(tensor)
+            gathered[rank, :, 0, :].fill_(rank + 1)
+
+    calls = []
+
+    def fake_merge(h, transition, *, reverse):
+        calls.append((h.flatten().tolist(), transition.flatten().tolist(), reverse))
+        return h.sum(dim=0)
+
+    monkeypatch.setattr(cp.dist, "all_gather_into_tensor", fake_all_gather)
+    monkeypatch.setattr(cp, "_merge_rank_summaries", fake_merge)
+    h = torch.ones(1, 1, 1, dtype=torch.float32)
+    transition = torch.zeros(1, 1, 1, dtype=torch.float32)
+
+    incoming = transport.boundary_state(h, transition, plan=plan, group="cp", reverse=False)
+    outgoing = transport.boundary_state(
+        h,
+        transition,
+        plan=_transport_plan(rank=1, pre=1, post=2),
+        group="cp",
+        reverse=True,
+    )
+
+    assert incoming.item() == 3
+    assert outgoing.item() == 7
+    assert calls == [([1.0, 2.0], [0.0, 0.0], False), ([3.0, 4.0], [0.0, 0.0], True)]
+    assert workspace.local_payload.data_ptr() == local_pointer
+    assert workspace.gathered_payload.data_ptr() == gathered_pointer
+
+
+def test_collective_workspace_rejects_shape_or_world_mismatch():
+    workspace = cp._KimiCPCollectiveWorkspace.allocate(
+        world_size=4,
+        heads=2,
+        key_dim=4,
+        value_dim=3,
+        device="cpu",
+    )
+    h = torch.zeros(2, 3, 4, dtype=torch.float32)
+    transition = torch.zeros(2, 4, 4, dtype=torch.float32)
+
+    workspace.validate(h, transition, world_size=4)
+    for bad_h, world_size, message in (
+        (h[:1], 4, "shape mismatch"),
+        (h, 8, "world_size"),
+    ):
+        try:
+            workspace.validate(bad_h, transition, world_size=world_size)
+        except ValueError as error:
+            assert message in str(error)
+        else:
+            raise AssertionError("workspace mismatch must be rejected")
+
+    try:
+        workspace.validate(h.to(torch.bfloat16), transition, world_size=4)
+    except TypeError as error:
+        assert "FP32" in str(error)
+    else:
+        raise AssertionError("workspace must not silently cast BF16 summaries")
+
+
+def test_boundary_transport_protocol_is_structural():
+    class CustomTransport:
+        def boundary_state(self, h, transition, *, plan, group, reverse):
+            return h
+
+    assert isinstance(CustomTransport(), cp.KimiCPBoundaryTransport)
+    assert not isinstance(object(), cp.KimiCPBoundaryTransport)
+
+
+def test_boundary_transport_state_contract_rejects_precision_or_shape_changes():
+    reference = torch.zeros(2, 3, 4, dtype=torch.float32)
+    noncontiguous = torch.zeros(3, 2, 4, dtype=torch.float32).transpose(0, 1)
+    assert cp._validate_boundary_state(reference, reference) is reference
+
+    for state, error_type, message in (
+        (None, TypeError, "torch.Tensor"),
+        (reference.to(torch.bfloat16), TypeError, "FP32"),
+        (reference[:1], ValueError, "mismatch"),
+        (noncontiguous, ValueError, "contiguous"),
+    ):
+        try:
+            cp._validate_boundary_state(state, reference)
+        except error_type as error:
+            assert message in str(error)
+        else:
+            raise AssertionError("invalid transport state must be rejected")

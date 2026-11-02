@@ -28,7 +28,7 @@ def test_cudnn_kda_cp_matches_monolithic_forward_backward():
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl")
     try:
-        from cula.distributed import build_kimi_cp_plan, cudnn_kda_cp
+        from cula.distributed import AllGatherKimiCPTransport, build_kimi_cp_plan, cudnn_kda_cp
 
         device = torch.device("cuda", local_rank)
         generator = torch.Generator(device=device).manual_seed(20261102)
@@ -38,6 +38,13 @@ def test_cudnn_kda_cp_matches_monolithic_forward_backward():
         global_cu_cpu = torch.tensor([0, lengths[0], total], dtype=torch.int32)
         global_cu = global_cu_cpu.to(device)
         plan = build_kimi_cp_plan(global_cu_cpu, group=dist.group.WORLD)
+        boundary_transport = AllGatherKimiCPTransport.prepare(
+            plan,
+            heads=heads,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            device=device,
+        )
         local_cu = torch.tensor(plan.local_cu_seqlens, dtype=torch.int32, device=device)
         start, end = plan.token_start, plan.token_end
 
@@ -67,6 +74,7 @@ def test_cudnn_kda_cp_matches_monolithic_forward_backward():
             local_cu,
             plan=plan,
             group=dist.group.WORLD,
+            boundary_transport=boundary_transport,
         )
         local_output.backward(grad_output[start:end])
 

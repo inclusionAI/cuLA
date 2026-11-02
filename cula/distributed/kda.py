@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from functools import cache
 from importlib import import_module
 from inspect import signature
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 import torch.distributed as dist
@@ -145,6 +145,205 @@ def _merge_boundary_chain(
     return _merge_rank_summaries(h_all[start:stop], transition_all[start:stop], reverse=reverse)
 
 
+@dataclass(slots=True)
+class _KimiCPCollectiveWorkspace:
+    """Reusable FP32 payload storage for one Kimi CP collective stream.
+
+    The workspace is temporary transport storage and is not retained by the
+    local KDA autograd graph. One instance can therefore be reused across KDA
+    layers executed sequentially on the same CUDA stream. Concurrent streams
+    require separate instances.
+    """
+
+    world_size: int
+    heads: int
+    key_dim: int
+    value_dim: int
+    local_payload: torch.Tensor
+    gathered_payload: torch.Tensor
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        world_size: int,
+        heads: int,
+        key_dim: int,
+        value_dim: int,
+        device: torch.device | str | int,
+    ) -> _KimiCPCollectiveWorkspace:
+        dimensions = {
+            "world_size": world_size,
+            "heads": heads,
+            "key_dim": key_dim,
+            "value_dim": value_dim,
+        }
+        for name, value in dimensions.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        resolved = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
+        payload_shape = (heads, value_dim + key_dim, key_dim)
+        local = torch.empty(payload_shape, dtype=torch.float32, device=resolved)
+        gathered = torch.empty((world_size * heads, value_dim + key_dim, key_dim), dtype=torch.float32, device=resolved)
+        return cls(world_size, heads, key_dim, value_dim, local, gathered)
+
+    @property
+    def nbytes(self) -> int:
+        return sum(tensor.numel() * tensor.element_size() for tensor in (self.local_payload, self.gathered_payload))
+
+    def validate(self, h: torch.Tensor, transition: torch.Tensor, *, world_size: int) -> None:
+        expected_h = (self.heads, self.value_dim, self.key_dim)
+        expected_transition = (self.heads, self.key_dim, self.key_dim)
+        expected_local = (self.heads, self.value_dim + self.key_dim, self.key_dim)
+        expected_gathered = (self.world_size * self.heads, self.value_dim + self.key_dim, self.key_dim)
+        if world_size != self.world_size:
+            raise ValueError(f"workspace world_size={self.world_size} does not match KimiCPPlan world_size={world_size}")
+        if h.dtype != torch.float32 or transition.dtype != torch.float32:
+            raise TypeError("Kimi CP boundary summaries must remain FP32")
+        if transition.device != h.device:
+            raise ValueError("Kimi CP H and transition summaries must be on the same device")
+        if tuple(h.shape) != expected_h or tuple(transition.shape) != expected_transition:
+            raise ValueError(
+                "workspace H/M shape mismatch: "
+                f"expected {expected_h} and {expected_transition}, got {tuple(h.shape)} and {tuple(transition.shape)}"
+            )
+        for name, tensor, shape in (
+            ("local_payload", self.local_payload, expected_local),
+            ("gathered_payload", self.gathered_payload, expected_gathered),
+        ):
+            if tensor.dtype != torch.float32 or tensor.device != h.device or tuple(tensor.shape) != shape:
+                raise ValueError(f"workspace {name} must be FP32 on {h.device} with shape {shape}")
+            if not tensor.is_contiguous():
+                raise ValueError(f"workspace {name} must be contiguous")
+
+
+@runtime_checkable
+class KimiCPBoundaryTransport(Protocol):
+    """KDA-specific contract for ordered cross-rank boundary propagation."""
+
+    def boundary_state(
+        self,
+        h: torch.Tensor,
+        transition: torch.Tensor,
+        *,
+        plan: KimiCPPlan,
+        group: dist.ProcessGroup | None,
+        reverse: bool,
+    ) -> torch.Tensor: ...
+
+
+@dataclass(slots=True)
+class AllGatherKimiCPTransport:
+    """Exact ordered Kimi CP transport backed by one all-gather.
+
+    With no workspace, storage is allocated lazily on each call. Use
+    :meth:`prepare` for stable large-CP memory and CUDA Graph integration.
+    """
+
+    workspace: _KimiCPCollectiveWorkspace | None = None
+
+    def __post_init__(self) -> None:
+        if self.workspace is not None and not isinstance(self.workspace, _KimiCPCollectiveWorkspace):
+            raise TypeError("workspace must be created by AllGatherKimiCPTransport.prepare")
+
+    @staticmethod
+    def required_workspace_bytes(
+        plan: KimiCPPlan,
+        *,
+        heads: int,
+        key_dim: int,
+        value_dim: int,
+    ) -> int:
+        """Return local plus gathered FP32 payload bytes without allocating."""
+        if not isinstance(plan, KimiCPPlan):
+            raise TypeError("plan must be a KimiCPPlan")
+        for name, value in {"heads": heads, "key_dim": key_dim, "value_dim": value_dim}.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        return (plan.world_size + 1) * heads * (value_dim + key_dim) * key_dim * torch.float32.itemsize
+
+    @classmethod
+    def prepare(
+        cls,
+        plan: KimiCPPlan,
+        *,
+        heads: int,
+        key_dim: int,
+        value_dim: int,
+        device: torch.device | str | int,
+    ) -> AllGatherKimiCPTransport:
+        if not isinstance(plan, KimiCPPlan):
+            raise TypeError("plan must be a KimiCPPlan")
+        return cls(
+            _KimiCPCollectiveWorkspace.allocate(
+                world_size=plan.world_size,
+                heads=heads,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                device=device,
+            )
+        )
+
+    @property
+    def workspace_bytes(self) -> int:
+        return 0 if self.workspace is None else self.workspace.nbytes
+
+    def boundary_state(
+        self,
+        h: torch.Tensor,
+        transition: torch.Tensor,
+        *,
+        plan: KimiCPPlan,
+        group: dist.ProcessGroup | None,
+        reverse: bool,
+    ) -> torch.Tensor:
+        if self.workspace is None:
+            packed = _pack_boundary_summary(h, transition)
+            packed_all = _all_gather(packed, group, plan.world_size)
+        else:
+            workspace = self.workspace
+            workspace.validate(h, transition, world_size=plan.world_size)
+            with torch.no_grad():
+                workspace.local_payload[..., : workspace.value_dim, :].copy_(h)
+                workspace.local_payload[..., workspace.value_dim :, :].copy_(transition)
+            if plan.world_size == 1:
+                packed_all = workspace.local_payload.unsqueeze(0)
+            else:
+                dist.all_gather_into_tensor(
+                    workspace.gathered_payload,
+                    workspace.local_payload,
+                    group=group,
+                )
+                packed_all = workspace.gathered_payload.view(plan.world_size, *workspace.local_payload.shape)
+        h_all, transition_all = _unpack_boundary_summaries(packed_all, h.shape[-2])
+        return _merge_boundary_chain(
+            h_all,
+            transition_all,
+            rank=plan.rank,
+            num_remote_ranks=plan.post_num_ranks if reverse else plan.pre_num_ranks,
+            reverse=reverse,
+        )
+
+
+_DEFAULT_BOUNDARY_TRANSPORT = AllGatherKimiCPTransport()
+
+
+def _validate_boundary_state(state: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    if not isinstance(state, torch.Tensor):
+        raise TypeError("KimiCPBoundaryTransport must return a torch.Tensor")
+    if state.dtype != torch.float32:
+        raise TypeError("KimiCPBoundaryTransport must return an FP32 state")
+    if state.device != reference.device or state.shape != reference.shape:
+        raise ValueError(
+            "KimiCPBoundaryTransport state mismatch: "
+            f"expected shape/device {tuple(reference.shape)} on {reference.device}, "
+            f"got {tuple(state.shape)} on {state.device}"
+        )
+    if not state.is_contiguous():
+        raise ValueError("KimiCPBoundaryTransport must return a contiguous state")
+    return state
+
+
 class _CudnnKdaCP(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -160,6 +359,7 @@ class _CudnnKdaCP(torch.autograd.Function):
         plan: KimiCPPlan,
         group: dist.ProcessGroup | None,
         options: _KdaOptions,
+        boundary_transport: KimiCPBoundaryTransport,
     ) -> torch.Tensor:
         _, kimi_delta_attention, kimi_delta_attention_summary, _ = _load_cudnn_cp_ops()
         kwargs = options.kwargs(a_log, dt_bias)
@@ -177,16 +377,15 @@ class _CudnnKdaCP(torch.autograd.Function):
             plan_name=options.summary_plan_name,
             **kwargs,
         )
-        dim_v = h_local.shape[-2]
-        packed = _pack_boundary_summary(h_local[0], transition_local[0])
-        packed_all = _all_gather(packed, group, plan.world_size)
-        h_all, transition_all = _unpack_boundary_summaries(packed_all, dim_v)
-        incoming_boundary = _merge_boundary_chain(
-            h_all,
-            transition_all,
-            rank=plan.rank,
-            num_remote_ranks=plan.pre_num_ranks,
-            reverse=False,
+        incoming_boundary = _validate_boundary_state(
+            boundary_transport.boundary_state(
+                h_local[0],
+                transition_local[0],
+                plan=plan,
+                group=group,
+                reverse=False,
+            ),
+            h_local[0],
         )
         incoming = h_local.new_zeros(
             plan.num_local_sequences,
@@ -220,6 +419,7 @@ class _CudnnKdaCP(torch.autograd.Function):
         ctx.plan = plan
         ctx.group = group
         ctx.options = options
+        ctx.boundary_transport = boundary_transport
         ctx.a_log_present = a_log is not None
         ctx.dt_bias_present = dt_bias is not None
         ctx.inner_leaves = (*leaves, incoming_leaf, a_leaf, dt_leaf)
@@ -266,15 +466,15 @@ class _CudnnKdaCP(torch.autograd.Function):
             **options.kwargs(a_log, dt_bias),
         )
         transition_first = transition_backward[0].transpose(-2, -1)
-        packed = _pack_boundary_summary(g_local[0], transition_first)
-        packed_all = _all_gather(packed, ctx.group, plan.world_size)
-        g_all, transition_all = _unpack_boundary_summaries(packed_all, g_local.shape[-2])
-        outgoing_boundary = _merge_boundary_chain(
-            g_all,
-            transition_all,
-            rank=plan.rank,
-            num_remote_ranks=plan.post_num_ranks,
-            reverse=True,
+        outgoing_boundary = _validate_boundary_state(
+            ctx.boundary_transport.boundary_state(
+                g_local[0],
+                transition_first,
+                plan=plan,
+                group=ctx.group,
+                reverse=True,
+            ),
+            g_local[0],
         )
         grad_final_state = g_local.new_zeros(
             plan.num_local_sequences,
@@ -305,7 +505,7 @@ class _CudnnKdaCP(torch.autograd.Function):
         ddt_bias = next(optional_grads) if dt_leaf is not None else None
         ctx.inner_leaves = None
         ctx.inner_outputs = None
-        return dq, dk, dv, dg, dbeta, None, da_log, ddt_bias, None, None, None
+        return dq, dk, dv, dg, dbeta, None, da_log, ddt_bias, None, None, None, None
 
 
 def _validate_inputs(
@@ -369,6 +569,7 @@ def cudnn_kda_cp(
     batch_invariant: bool = True,
     plan_name: str | None = "kda_frost",
     summary_plan_name: str | None = "kda_summary_frost",
+    boundary_transport: KimiCPBoundaryTransport | None = None,
 ) -> torch.Tensor:
     """Run differentiable cuDNN KDA over one contiguous packed-THD CP shard.
 
@@ -381,10 +582,18 @@ def cudnn_kda_cp(
     ``plan`` should be built once per packed microbatch and reused by all KDA
     layers.  Inputs use cuDNN's canonical THD contract; framework-specific
     layout and gate conversions belong in the framework adapter.
+
+    ``boundary_transport`` defaults to exact ordered all-gather with lazy
+    storage. Large-CP callers should prepare one
+    :class:`AllGatherKimiCPTransport` per concurrent CUDA stream and reuse it
+    across layers to avoid repeated collective-buffer allocations.
     """
 
     if not isinstance(plan, KimiCPPlan):
         raise TypeError("plan must be a KimiCPPlan")
+    resolved_transport = _DEFAULT_BOUNDARY_TRANSPORT if boundary_transport is None else boundary_transport
+    if not isinstance(resolved_transport, KimiCPBoundaryTransport):
+        raise TypeError("boundary_transport must implement KimiCPBoundaryTransport")
     _validate_inputs(
         q,
         k,
@@ -438,7 +647,12 @@ def cudnn_kda_cp(
         plan,
         group,
         options,
+        resolved_transport,
     )
 
 
-__all__ = ["cudnn_kda_cp"]
+__all__ = [
+    "AllGatherKimiCPTransport",
+    "KimiCPBoundaryTransport",
+    "cudnn_kda_cp",
+]
