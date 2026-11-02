@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cache
+from importlib import import_module
+from inspect import signature
 from typing import Any
 
 import torch
@@ -19,12 +21,36 @@ from cula.distributed.plan import KimiCPPlan
 @cache
 def _load_cudnn_cp_ops():
     try:
-        from cudnn.linear_attention import (
-            kimi_cp_merge,
-            kimi_delta_attention,
-            kimi_delta_attention_summary,
-            kimi_delta_attention_summary_bwd,
-        )
+        cudnn = import_module("cudnn")
+        linear_attention = import_module("cudnn.linear_attention")
+        ops = linear_attention
+        if not all(
+            hasattr(ops, name)
+            for name in (
+                "kimi_delta_attention",
+                "kimi_delta_attention_summary",
+                "kimi_delta_attention_summary_bwd",
+            )
+        ):
+            ops = import_module("cudnn.linear_attention.ops")
+        raw_kimi_cp_merge = getattr(linear_attention, "kimi_cp_merge", None)
+        if raw_kimi_cp_merge is None:
+            try:
+                raw_kimi_cp_merge = import_module("cudnn.linear_attention.merge").kimi_cp_merge
+            except ImportError:
+                raw_kimi_cp_merge = cudnn.kimi_cp_merge
+        if "precision" in signature(raw_kimi_cp_merge).parameters:
+            # Development builds predating the fixed-IEEE API exposed a
+            # precision switch.  Preserve the runtime's FP32 invariant while
+            # allowing those builds to validate the distributed layer.
+            def kimi_cp_merge(*args, **kwargs):
+                return raw_kimi_cp_merge(*args, precision="ieee", **kwargs)
+
+        else:
+            kimi_cp_merge = raw_kimi_cp_merge
+        kimi_delta_attention = ops.kimi_delta_attention
+        kimi_delta_attention_summary = ops.kimi_delta_attention_summary
+        kimi_delta_attention_summary_bwd = ops.kimi_delta_attention_summary_bwd
     except (ImportError, AttributeError) as error:
         raise ImportError(
             "cuDNN Kimi CP requires cuDNN Frontend with KDA summary APIs and KimiCPMerge; "

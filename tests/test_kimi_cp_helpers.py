@@ -1,9 +1,77 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import torch
 
 from cula.distributed import kda as cp
+
+
+def test_cudnn_loader_accepts_current_linear_attention_exports(monkeypatch):
+    def merge(h, m, *, reverse=False):
+        return h, m, reverse
+
+    sentinels = {name: object() for name in ("op", "summary", "summary_bwd")}
+    modules = {
+        "cudnn": SimpleNamespace(),
+        "cudnn.linear_attention": SimpleNamespace(
+            kimi_cp_merge=merge,
+            kimi_delta_attention=sentinels["op"],
+            kimi_delta_attention_summary=sentinels["summary"],
+            kimi_delta_attention_summary_bwd=sentinels["summary_bwd"],
+        ),
+    }
+
+    def import_fake(name):
+        try:
+            return modules[name]
+        except KeyError as error:
+            raise ModuleNotFoundError(name) from error
+
+    monkeypatch.setattr(cp, "import_module", import_fake)
+    cp._load_cudnn_cp_ops.cache_clear()
+    try:
+        loaded = cp._load_cudnn_cp_ops()
+        assert loaded[0] is merge
+        assert loaded[1:] == tuple(sentinels.values())
+    finally:
+        cp._load_cudnn_cp_ops.cache_clear()
+
+
+def test_cudnn_loader_accepts_legacy_top_level_merge_export(monkeypatch):
+    observed = {}
+
+    def merge(h, m, *, reverse=False, precision="bf16"):
+        observed["precision"] = precision
+        return h, m, reverse
+
+    sentinels = {name: object() for name in ("op", "summary", "summary_bwd")}
+    modules = {
+        "cudnn": SimpleNamespace(kimi_cp_merge=merge),
+        "cudnn.linear_attention": SimpleNamespace(),
+        "cudnn.linear_attention.ops": SimpleNamespace(
+            kimi_delta_attention=sentinels["op"],
+            kimi_delta_attention_summary=sentinels["summary"],
+            kimi_delta_attention_summary_bwd=sentinels["summary_bwd"],
+        ),
+    }
+
+    def import_fake(name):
+        try:
+            return modules[name]
+        except KeyError as error:
+            raise ModuleNotFoundError(name) from error
+
+    monkeypatch.setattr(cp, "import_module", import_fake)
+    cp._load_cudnn_cp_ops.cache_clear()
+    try:
+        loaded = cp._load_cudnn_cp_ops()
+        assert loaded[1:] == tuple(sentinels.values())
+        loaded[0](object(), object(), reverse=True)
+        assert observed["precision"] == "ieee"
+    finally:
+        cp._load_cudnn_cp_ops.cache_clear()
 
 
 def test_boundary_summary_pack_round_trip_preserves_fp32():
