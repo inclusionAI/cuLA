@@ -18,6 +18,9 @@ cuLA/
 │   │   ├── prefill.py                 # Public FlashKDA prefill validation and routing
 │   │   ├── flashkda.py                # SM90 CuTeDSL K1+K2 wrapper, autograd shell, and CP selection
 │   │   └── chunk_intra.py             # Pure-CuTeDSL SM100 intra/WU composition
+│   ├── distributed/                   # Optional cuDNN KDA Kimi CP runtime
+│   │   ├── plan.py                    # CPU-only packed-THD boundary planning
+│   │   └── kda.py                     # Collectives and distributed autograd
 │   │
 │   ├── lightning/                     # [non-KDA] Lightning Attention public wrappers
 │   │

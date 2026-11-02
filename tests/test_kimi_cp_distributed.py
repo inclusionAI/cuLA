@@ -1,0 +1,81 @@
+# Copyright 2025-2026 Ant Group Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Run with: torchrun --standalone --nproc-per-node=2 -m pytest -q tests/test_kimi_cp_distributed.py"""
+
+import os
+
+import pytest
+import torch
+import torch.distributed as dist
+
+
+def _relative_rms(actual, expected):
+    delta = actual.float() - expected.float()
+    return delta.norm() / expected.float().norm().clamp_min(1e-8)
+
+
+@pytest.mark.distributed
+@pytest.mark.sm100_only
+def test_cudnn_kda_cp_matches_monolithic_forward_backward():
+    if int(os.environ.get("WORLD_SIZE", "1")) != 2:
+        pytest.skip("launch this deterministic fixture with exactly two processes")
+    cudnn_la = pytest.importorskip("cudnn.linear_attention")
+    if not hasattr(cudnn_la, "kimi_cp_merge"):
+        pytest.skip("cuDNN Frontend build does not include KimiCPMerge")
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group("nccl")
+    try:
+        from cula.distributed import build_kimi_cp_plan, cudnn_kda_cp
+
+        device = torch.device("cuda", local_rank)
+        generator = torch.Generator(device=device).manual_seed(20261102)
+        heads, key_dim, value_dim = 8, 128, 128
+        lengths = (48, 112)
+        total = sum(lengths)
+        global_cu_cpu = torch.tensor([0, lengths[0], total], dtype=torch.int32)
+        global_cu = global_cu_cpu.to(device)
+        plan = build_kimi_cp_plan(global_cu_cpu, group=dist.group.WORLD)
+        local_cu = torch.tensor(plan.local_cu_seqlens, dtype=torch.int32, device=device)
+        start, end = plan.token_start, plan.token_end
+
+        def randn(*shape, dtype=torch.bfloat16):
+            return torch.randn(*shape, dtype=dtype, device=device, generator=generator)
+
+        q = torch.nn.functional.normalize(randn(total, heads, key_dim).float(), dim=-1).to(torch.bfloat16)
+        k = torch.nn.functional.normalize(randn(total, heads, key_dim).float(), dim=-1).to(torch.bfloat16)
+        v = randn(total, heads, value_dim)
+        g = -(0.01 + 0.04 * torch.rand(total, heads, key_dim, dtype=torch.float32, device=device, generator=generator))
+        beta = torch.sigmoid(randn(total, heads, dtype=torch.float32))
+        grad_output = randn(total, heads, value_dim)
+
+        full_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in (q, k, v, g, beta)]
+        local_inputs = [tensor[start:end].detach().clone().requires_grad_(True) for tensor in (q, k, v, g, beta)]
+
+        full_output, _ = cudnn_la.kimi_delta_attention(
+            *full_inputs,
+            global_cu,
+            output_final_state=True,
+            batch_invariant=True,
+            plan_name="kda_frost",
+        )
+        full_output.backward(grad_output)
+        local_output = cudnn_kda_cp(
+            *local_inputs,
+            local_cu,
+            plan=plan,
+            group=dist.group.WORLD,
+        )
+        local_output.backward(grad_output[start:end])
+
+        torch.testing.assert_close(local_output, full_output[start:end], rtol=2e-2, atol=1e-2)
+        for actual, expected in zip(local_inputs, full_inputs):
+            assert torch.isfinite(actual.grad).all()
+            delta = (actual.grad.float() - expected.grad[start:end].float()).abs()
+            assert delta.max().item() <= 1.25e-1
+            assert _relative_rms(actual.grad, expected.grad[start:end]).item() < 5e-2
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()

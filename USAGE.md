@@ -4,6 +4,49 @@ This document provides usage notes and examples for cuLA kernels.
 
 ---
 
+## cuDNN KDA Kimi context parallelism
+
+The optional distributed runtime executes cuDNN KDA over contiguous packed-THD
+shards.  Build one CPU plan per packed microbatch and reuse it across layers:
+
+```python
+from cula.distributed import build_kimi_cp_plan, cudnn_kda_cp
+
+cp_plan = build_kimi_cp_plan(
+    global_cu_seqlens_cpu,
+    group=cp_group,
+)
+local_cu_seqlens = torch.tensor(
+    cp_plan.local_cu_seqlens,
+    dtype=torch.int32,
+    device=q.device,
+)
+
+output = cudnn_kda_cp(
+    q, k, v, g, beta,
+    local_cu_seqlens,
+    plan=cp_plan,
+    group=cp_group,
+    safe_gate=True,
+    a_log=a_log,                 # [heads]
+    dt_bias=dt_bias,             # canonical [heads, key_dim]
+)
+```
+
+Inputs use cuDNN's canonical THD layout.  Framework adapters must reshape
+model-specific parameter layouts before the call.  The runtime summarizes only
+the two local boundary spans and uses cuDNN's fixed IEEE FP32 Kimi state merge.
+See [`docs/KIMI_CP_RUNTIME.md`](docs/KIMI_CP_RUNTIME.md) for the ownership and
+validation contracts.
+
+Install the optional CUDA 13 dependencies with:
+
+```bash
+pip install 'cuda-linear-attention[cudnn-cp]'
+```
+
+---
+
 ## KDA
 
 cuLA exposes several KDA entry points targeting different GPU architectures:
