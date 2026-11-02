@@ -1,0 +1,16 @@
+cula/distributed/kda.py
+  h_4fcb07cc3ccaae 10-11,24-53
+tests/test_kimi_cp_helpers.py
+  h_4fcb07cc3ccaae 4-5,11-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8d7e20a102d366a76d3c861d978e5b2e28148f5d",
+  "prompts": {},
+  "humans": {
+    "h_4fcb07cc3ccaae": {
+      "author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
