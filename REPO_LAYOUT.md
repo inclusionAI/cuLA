@@ -21,6 +21,10 @@ cuLA/
 │   ├── distributed/                   # Optional cuDNN KDA Kimi CP runtime
 │   │   ├── plan.py                    # CPU-only packed-THD boundary planning
 │   │   └── kda.py                     # Collectives and distributed autograd
+│   ├── hybrid/                        # Layout-aware cuDNN hybrid-attention runtime
+│   │   ├── index_pool.py              # Differentiable CSA index pooling
+│   │   ├── dsa.py                     # Bounded packed-THD DSA block selection
+│   │   └── plan.py                    # CP block ownership and seam-halo plans
 │   │
 │   ├── lightning/                     # [non-KDA] Lightning Attention public wrappers
 │   │
@@ -61,6 +65,7 @@ cuLA/
 |-----------|----------|-------------|
 | `cula/kernels/` | Python | Framework-independent public surface and static kernel inventory. Imports are lazy and do not compile kernels. |
 | `cula/kda/` | Python / CuTeDSL | KDA prefill/decode wrappers and the pure-CuTeDSL SM100 modular composition. `kda_prefill` calls FlashKDA directly without a native fallback. See [`cula/kda/README.md`](cula/kda/README.md). |
+| `cula/hybrid/` | Python | Optional cuDNN-backed composition layer for packed index pooling, bounded DSA selection, and CP layout planning. See [`docs/HYBRID_CUDNN_RUNTIME.md`](docs/HYBRID_CUDNN_RUNTIME.md). |
 | `cula/ops/kda/` | Python (CuTeDSL) | CuTeDSL KDA kernels organized into SM100 modular kernels, SM90 FlashKDA K1+K2 and intracard CP, decode, and experimental code. |
 | `cula/ops/lightning/` · `cula/ops/experimental/` | Python (CuTeDSL) | `[non-KDA]` Lightning/linear-attention kernels and prototypes. Lightning prefill dispatches to the SM90 or SM100 backend from Q's device capability. |
 | `cula/ops/{inv,ptx}.py` · `cula/ops/sm100/ptx.py` | Python | Shared low-level helpers used across operators. |
