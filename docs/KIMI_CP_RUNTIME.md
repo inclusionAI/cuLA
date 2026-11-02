@@ -83,7 +83,7 @@ release is published, use the tested source revision
 `9e056425989e75f406a5ce3ad58cb563e4dff8b5` as shown in `USAGE.md`; the runtime
 also checks the required call signatures and fails early on older builds.
 
-## Current transport and intended evolution
+## Current transport and rejected chain experiment
 
 The first implementation uses two typed `all_gather_into_tensor` calls per
 direction. Keeping H and M separate preserves the dense layout required by

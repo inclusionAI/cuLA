@@ -16,8 +16,16 @@ import torch
 
 from cula._metadata import as_boundaries
 
-DEFAULT_CANDIDATE_BUDGET_BYTES = 512 << 20
-"""Default peak FP32 compact-logit workspace, matching cuDNN's QSA budget."""
+MEMORY_EFFICIENT_CANDIDATE_BUDGET_BYTES = 512 << 20
+"""Lower-memory policy matching cuDNN QSA's serving-side selection budget."""
+
+DEFAULT_CANDIDATE_BUDGET_BYTES = MEMORY_EFFICIENT_CANDIDATE_BUDGET_BYTES
+"""Base FP32 compact-logit workspace used by the adaptive default policy."""
+
+MAX_BALANCED_CANDIDATE_BUDGET_BYTES = 4 << 30
+"""Maximum FP32 compact-logit workspace selected by the adaptive policy."""
+
+_CANDIDATE_BUDGET_POSITION_QUANTUM = 128 << 10
 
 
 def _as_nonnegative(
@@ -79,6 +87,14 @@ def _candidate_prefix(position: int, block_size: int) -> int:
 
 def _candidate_floats(position: int, rows: int, block_size: int) -> int:
     return _candidate_prefix(position + rows, block_size) - _candidate_prefix(position, block_size)
+
+
+def _balanced_candidate_budget(cu_q: tuple[int, ...], offsets: tuple[int, ...]) -> int:
+    max_causal_end = max(
+        offset + right - left for left, right, offset in zip(cu_q[:-1], cu_q[1:], offsets, strict=True)
+    )
+    steps = max(1, (max_causal_end + _CANDIDATE_BUDGET_POSITION_QUANTUM - 1) // _CANDIDATE_BUDGET_POSITION_QUANTUM)
+    return min(MAX_BALANCED_CANDIDATE_BUDGET_BYTES, steps * DEFAULT_CANDIDATE_BUDGET_BYTES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,9 +171,14 @@ class DsaSelectionPlan:
         top_k: int,
         block_size: int = 4,
         q_causal_offsets: torch.Tensor | Sequence[int] | None = None,
-        candidate_budget_bytes: int = DEFAULT_CANDIDATE_BUDGET_BYTES,
+        candidate_budget_bytes: int | None = None,
     ) -> DsaSelectionPlan:
-        """Create a plan entirely from host-visible packed metadata."""
+        """Create a plan entirely from host-visible packed metadata.
+
+        A ``None`` budget selects the balanced 512 MiB-per-128K causal-reach
+        policy, capped at 4 GiB. Pass an explicit byte count to enforce a fixed
+        memory policy across ranks and microbatches.
+        """
 
         cu_q = as_boundaries(cu_seqlens_q, name="cu_seqlens_q")
         cu_k = _as_block_prefix(cu_seqlens_k)
@@ -167,7 +188,7 @@ class DsaSelectionPlan:
             raise ValueError("block_size must be a positive integer")
         if not isinstance(top_k, int) or isinstance(top_k, bool) or not 1 <= top_k <= 2048:
             raise ValueError("top_k must be an integer in [1, 2048]")
-        if (
+        if candidate_budget_bytes is not None and (
             not isinstance(candidate_budget_bytes, int)
             or isinstance(candidate_budget_bytes, bool)
             or candidate_budget_bytes < torch.float32.itemsize
@@ -182,6 +203,8 @@ class DsaSelectionPlan:
             if q_causal_offsets is None
             else _as_nonnegative(q_causal_offsets, entries=batch, name="q_causal_offsets")
         )
+        if candidate_budget_bytes is None:
+            candidate_budget_bytes = _balanced_candidate_budget(cu_q, offsets)
         budget_floats = candidate_budget_bytes // torch.float32.itemsize
         atoms: list[tuple[int, int, int, int, int, int, int]] = []
         for sequence in range(batch):
@@ -476,6 +499,8 @@ def cudnn_dsa_select(
 
 __all__ = [
     "DEFAULT_CANDIDATE_BUDGET_BYTES",
+    "MAX_BALANCED_CANDIDATE_BUDGET_BYTES",
+    "MEMORY_EFFICIENT_CANDIDATE_BUDGET_BYTES",
     "DsaSelectionPlan",
     "DsaSelectionResult",
     "DsaSelectionWindow",
