@@ -5,6 +5,8 @@
 
 from cula.hybrid.dsa import (
     DEFAULT_CANDIDATE_BUDGET_BYTES,
+    MAX_BALANCED_CANDIDATE_BUDGET_BYTES,
+    MEMORY_EFFICIENT_CANDIDATE_BUDGET_BYTES,
     DsaSelectionPlan,
     DsaSelectionResult,
     DsaSelectionWindow,
@@ -16,6 +18,8 @@ from cula.hybrid.plan import IndexPoolPlan, IndexPoolShardPlan
 
 __all__ = [
     "DEFAULT_CANDIDATE_BUDGET_BYTES",
+    "MAX_BALANCED_CANDIDATE_BUDGET_BYTES",
+    "MEMORY_EFFICIENT_CANDIDATE_BUDGET_BYTES",
     "DsaSelectionPlan",
     "DsaSelectionResult",
     "DsaSelectionWindow",

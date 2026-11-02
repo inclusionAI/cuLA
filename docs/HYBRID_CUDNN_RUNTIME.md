@@ -51,9 +51,15 @@ that is still quadratic scratch even though no dense score tensor is exposed.
 FP32 candidate buffer. It coalesces adjacent short packed sequences when they
 fit the same budget.
 
-The default budget is 512 MiB, matching cuDNN QSA's serving-side selection
-budget. It is a memory/scheduling choice, not a numerical choice. Callers can
-set another explicit budget when constructing the plan.
+When `candidate_budget_bytes=None`, the balanced policy starts at 512 MiB and
+adds 512 MiB for each 128K of absolute causal reach, capped at 4 GiB. Thus the
+128K packed workload retains its 512 MiB workspace while the worst 1M/CP64
+rank reaches the measured 4 GiB performance knee. The exported
+`MEMORY_EFFICIENT_CANDIDATE_BUDGET_BYTES` forces a fixed 512 MiB policy, and
+`MAX_BALANCED_CANDIDATE_BUDGET_BYTES` exposes the cap. This is a
+memory/scheduling choice, not a numerical choice. Allocate one workspace per
+concurrent execution stream and reuse it across compatible layers; do not
+allocate one multi-GiB workspace per layer.
 
 ### 128K heterogeneous THD result
 
@@ -63,9 +69,9 @@ compression ratio 4, Top-K 512.
 | Selection form | Windows | Candidate scratch | Median time |
 |---|---:|---:|---:|
 | One packed launch | 1 | 2.8573 GiB | 5.3818 ms |
-| cuLA bounded plan | 7 | 512 MiB | 5.3246 ms |
+| 512 MiB memory policy | 7 | 512 MiB | 5.3246 ms |
 
-The bounded plan reduced candidate scratch by 5.715x. The measured time was
+The memory policy reduced candidate scratch by 5.715x. The measured time was
 effectively unchanged; the small apparent speedup is within benchmark noise.
 
 The same batch partitioned as four contiguous 32K-token CP shards shows the
@@ -81,6 +87,27 @@ rank imbalance that a global-only measurement hides:
 The worst rank saves about 704 MiB of candidate scratch for a 4.72% local
 selection-stage cost. This table excludes model tensors, outputs, and
 collectives; it isolates the DSA compact-logit stage.
+
+### 1M context, simulated CP64 worst rank
+
+The simulation uses one CP64 rank's real shape: 16,384 query tokens at logical
+rank 63, 262,144 globally visible compressed blocks, ratio 4 and Top-K 512.
+Every entry executes the real cuDNN scorer/Top-K kernels; only the 64-rank
+network is virtualized.
+
+| Candidate budget | Windows | Median selection time | Versus full |
+|---:|---:|---:|---:|
+| 256 MiB | 64 | 78.895 ms | 2.81x |
+| 512 MiB | 32 | 72.247 ms | 2.58x |
+| 1 GiB | 16 | 48.121 ms | 1.72x |
+| 2 GiB | 8 | 37.752 ms | 1.35x |
+| **4 GiB (adaptive cap)** | **4** | **33.519 ms** | **1.20x** |
+| 8 GiB | 2 | 29.464 ms | 1.05x |
+| 15.875 GiB full | 1 | 28.039 ms | 1.00x |
+
+Four GiB is the measured knee: it saves 11.875 GiB on the worst logical rank
+while retaining about 84% of the full-scratch throughput. The 512 MiB policy
+remains available when activation pressure matters more than selection latency.
 
 ## Integration example
 

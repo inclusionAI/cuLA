@@ -77,12 +77,25 @@ Backward performs the symmetric reverse chain:
 The state payload and transition remain FP32.  cuLA exposes no merge-precision
 switch; the cuDNN API uses its fixed IEEE FP32 state chain.
 
-## Current transport and intended evolution
+## Current transport and rejected chain experiment
 
-The first implementation uses `all_gather_into_tensor`.  It is simple, has one
-collective per direction, and matches the validated Megatron path.  It also
-materializes every rank's summary on every rank, so CP32/CP64 profiling should
-decide whether to add an ordered tree or hierarchical scan.
+The runtime uses `all_gather_into_tensor`.  It has one collective per direction
+and lets cuDNN merge all preceding or following summaries in one batch.  For
+`H=32`, `K=V=128`, and CP64, the gathered `(H,M)` storage is 256 MiB per rank.
+
+An order-preserving P2P chain was prototyped as a bounded-memory alternative.
+It reduced communication storage to one 2 MiB `H` state and was numerically
+exact: one P63 IEEE merge and 63 same-order P1 IEEE merges produced bitwise
+identical final and per-piece initial states in both directions.  It was not
+retained because 63 real NCCL hops plus P1 merges took 7.346 ms on the four-GPU
+emulation, versus 3.024 ms for the 4 MiB ring path plus 0.305 ms for one P63
+merge (3.329 ms estimated total).  Unbatched dependent P2P also creates lazy
+rank-pair communicators and is a poor fit for CUDA Graph capture.
+
+A tree or recursive-doubling scan can reduce the hop count, but reassociates
+FP32 matrix products and therefore changes the numerical contract.  It should
+not replace the current path without an explicit accuracy study and real
+multi-node CP64 evidence.
 
 CUDA Graph is an execution mode, not a CP algorithm.  Graph-ready follow-up
 work should add explicit reusable collective/state buffers without changing

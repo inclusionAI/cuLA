@@ -4,7 +4,11 @@
 import pytest
 import torch
 
-from cula.hybrid import DsaSelectionPlan
+from cula.hybrid import (
+    MAX_BALANCED_CANDIDATE_BUDGET_BYTES,
+    MEMORY_EFFICIENT_CANDIDATE_BUDGET_BYTES,
+    DsaSelectionPlan,
+)
 
 
 def test_selection_plan_coalesces_short_packed_sequences():
@@ -100,6 +104,32 @@ def test_selection_plan_covers_heterogeneous_128k_without_exceeding_budget():
     assert plan.candidate_workspace_floats * 4 <= budget
     assert plan.windows[0].cu_seqlens_q == tuple(i * 1024 for i in range(21))
     assert plan.windows[0].candidate_floats * 4 < 10 << 20
+
+
+def test_adaptive_budget_keeps_128k_workload_memory_efficient():
+    plan = DsaSelectionPlan.from_cu_seqlens(
+        [0, 1 << 17],
+        [0, 1 << 15],
+        top_k=512,
+    )
+
+    assert plan.candidate_budget_bytes == MEMORY_EFFICIENT_CANDIDATE_BUDGET_BYTES
+    assert plan.candidate_workspace_floats * 4 <= MEMORY_EFFICIENT_CANDIDATE_BUDGET_BYTES
+
+
+def test_adaptive_budget_reaches_measured_cap_at_1m_cp64_tail():
+    local_tokens = (1 << 20) // 64
+    query_offset = (1 << 20) - local_tokens
+    plan = DsaSelectionPlan.from_cu_seqlens(
+        [0, local_tokens],
+        [0, (1 << 20) // 4],
+        top_k=512,
+        q_causal_offsets=[query_offset],
+    )
+
+    assert plan.candidate_budget_bytes == MAX_BALANCED_CANDIDATE_BUDGET_BYTES
+    assert len(plan.windows) == 4
+    assert plan.candidate_workspace_floats * 4 <= MAX_BALANCED_CANDIDATE_BUDGET_BYTES
 
 
 @pytest.mark.parametrize(
