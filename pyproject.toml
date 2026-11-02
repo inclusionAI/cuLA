@@ -18,6 +18,10 @@ dependencies = [
 license = "Apache-2.0"
 
 [project.optional-dependencies]
+cudnn-hybrid = [
+    "nvidia-cutlass-dsl[cu13]>=4.8.0,<4.9",
+    "nvidia-cudnn-frontend>=1.33.0",
+]
 cudnn-cp = [
     "nvidia-cutlass-dsl[cu13]>=4.8.0,<4.9",
     "nvidia-cudnn-frontend>=1.33.0",

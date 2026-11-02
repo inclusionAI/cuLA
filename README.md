@@ -146,6 +146,9 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 See [USAGE.md](USAGE.md) for detailed usage examples and notes.
 See [the standalone kernel inventory](docs/KERNEL_VALUE.md) for the public
 kernel boundary and the overlap assessment against FlashInfer and cuDNN.
+The optional [cuDNN hybrid-attention runtime](docs/HYBRID_CUDNN_RUNTIME.md)
+documents packed index pooling, memory-bounded DSA selection, and CP layout
+ownership without precision downgrades.
 
 ## Benchmarks
 
