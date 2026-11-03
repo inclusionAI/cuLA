@@ -64,6 +64,9 @@ def test_aligned_cp_shards_pool_locally_and_gather_only_blocks():
     assert plans[1].local_plan is not None
     assert plans[1].local_plan.cu_seqlens == (0, 3, 11, 14)
     assert plans[1].local_plan.cu_seqlens_comp == (0, 0, 2, 2)
+    assert plans[0].global_blocks == 5
+    assert plans[0].block_counts == (3, 2)
+    assert not plans[0].equal_block_counts
 
 
 def test_misaligned_cp_shard_derives_bounded_pooling_halo():

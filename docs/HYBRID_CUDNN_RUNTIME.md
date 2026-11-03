@@ -158,11 +158,39 @@ selection tensors alias the workspace and are overwritten on its next use.
 ## Context-parallel ownership
 
 `IndexPoolShardPlan` assigns each complete ratio-4 block to the rank owning its
-first token. Aligned shards pool locally and exchange only compressed rows.
-Misaligned shards report a bounded neighbor halo (at most three raw tokens for
-ratio 4), avoiding a raw-token all-gather. The current implementation exposes
-and tests this ownership/halo plan; the distributed halo executor is not yet
-part of the public path.
+first token. `cudnn_index_pool_cp` executes the aligned fast path: each rank
+pools its native THD rows first and all-gathers only compressed blocks. Unequal
+block counts use uneven compressed-axis collective splits; raw token tensors
+are never padded or gathered.
+
+Backward deliberately does not reduce BF16 block gradients before cuDNN. It
+all-to-alls each loss rank's compressed slice to its input owner, invokes the
+local cuDNN backward once per loss rank, accumulates KV/score gradients in
+FP32, and reduce-scatters FP32 APE gradients. This has the same total token work
+as the global reference and avoids an early BF16 CP merge. At 128K/CP4 the
+forward, dKV, and dScore matched bitwise; dAPE differed only by FP32 reduction
+order and was closer to the FP32 eager oracle than the reference.
+
+Measured on the four-GPU validation host with ratio 4, head dimension 128, and
+the 20x1K + 2-long THD mix:
+
+| Global tokens | Raw / pooled forward payload | Forward | Forward + backward |
+|---:|---:|---:|---:|
+| 128K | 16 MiB / 2 MiB | 0.214 / 0.150 ms (1.43x) | 0.713 / 0.799 ms (0.89x) |
+| 1M | 128 MiB / 16 MiB | 1.037 / 0.230 ms (4.51x) | 3.670 / 2.026 ms (1.81x) |
+
+The 1M forward+backward incremental peak allocation fell from 1,280 MiB to
+640 MiB (2.0x). At 128K the precision-preserving four-launch backward costs
+about 11% end-to-end for this operator; at 1M, reduced communication and
+working set make the complete path 1.81x faster. Timings are medians of
+interleaved, order-reversed pairs using each iteration's slowest rank. These
+are isolated index-pooling measurements, not whole-model throughput claims.
+
+Misaligned shards still report a bounded neighbor halo (at most three raw
+tokens for ratio 4), avoiding the need for a raw-token all-gather in the next
+executor. The public function currently rejects those seams rather than
+silently changing block membership. `coff=2` and ranks owning zero complete
+blocks are also explicit unsupported boundaries.
 
 For large CP, the next execution layer should keep tokens stationary and move
 only compressed blocks or QSA partial statistics. It must preserve FP32 merge
@@ -174,6 +202,7 @@ this runtime's contract.
 Implemented and tested:
 
 - differentiable cuDNN index pooling;
+- aligned CP pool-before-gather with precision-preserving backward;
 - packed THD DSA selection with exact bounded workspace;
 - deterministic local block ids and FP32 logits;
 - CP block ownership and seam-halo planning.
