@@ -209,7 +209,10 @@ class _DsaIndexerBranch:
 
     def _communicate(self, local_kbar: torch.Tensor) -> None:
         if self.mode == "real":
-            dist.all_gather_into_tensor(self.global_kbar, local_kbar.contiguous())
+            if hasattr(dist, "all_gather_single"):
+                dist.all_gather_single(self.global_kbar, local_kbar.contiguous())
+            else:  # pragma: no cover - compatibility with older PyTorch releases
+                dist.all_gather_into_tensor(self.global_kbar, local_kbar.contiguous())
             return
 
         emulate_ring_hops(
@@ -372,6 +375,7 @@ def _run(args: argparse.Namespace) -> None:
             with torch.cuda.nvtx.range("hybrid.hotpath.begin_marker"):
                 profile_marker.add_(1)
             torch.cuda.synchronize(device)
+        hotpath_wall_start = time.perf_counter()
         torch.cuda.nvtx.range_push(f"hybrid.hotpath.{schedule}")
         start.record()
 
@@ -402,11 +406,13 @@ def _run(args: argparse.Namespace) -> None:
             with torch.cuda.nvtx.range("hybrid.hotpath.end_marker"):
                 profile_marker.add_(1)
         end.synchronize()
+        hotpath_wall_ms = (time.perf_counter() - hotpath_wall_start) * 1000
 
         result = dsa.last_result
         assert result is not None
         sample: dict[str, object] = {
             "cuda_total_ms": start.elapsed_time(end) if measure else None,
+            "wall_ms": hotpath_wall_ms if measure else None,
             "kda_ms": kda_start.elapsed_time(kda_end) if measure else None,
             "dsa_ms": dsa_events.timings() if measure else None,
             "proxy_loss": (output.float() * grad_output.float()).sum().item(),
@@ -445,10 +451,8 @@ def _run(args: argparse.Namespace) -> None:
         samples = []
         for _ in range(args.repeats):
             dist.barrier(device_ids=[local_rank])
-            wall_start = time.perf_counter()
             with torch.cuda.nvtx.range(f"hybrid.{schedule}"):
                 sample = execute(schedule, True)
-            sample["wall_ms"] = (time.perf_counter() - wall_start) * 1000
             samples.append(sample)
         if args.cuda_profiler_capture:
             torch.cuda.cudart().cudaProfilerStop()
@@ -486,6 +490,23 @@ def _run(args: argparse.Namespace) -> None:
                 "critical_cuda_median_ms": statistics.median(critical_cuda),
                 "critical_wall_samples_ms": critical_wall,
                 "critical_wall_median_ms": statistics.median(critical_wall),
+                "rank_stage_medians_ms": [
+                    {
+                        "physical_rank": r,
+                        "logical_rank": records[r]["logical_rank"],
+                        "kda": statistics.median(
+                            sample["kda_ms"] for sample in records[r]["samples"][schedule]
+                        ),
+                        **{
+                            f"dsa_{stage}": statistics.median(
+                                sample["dsa_ms"][stage]
+                                for sample in records[r]["samples"][schedule]
+                            )
+                            for stage in ("pool_ms", "comm_ms", "select_ms", "total_ms")
+                        },
+                    }
+                    for r in range(world_size)
+                ],
             }
         if set(schedules) == {"serial", "overlap"}:
             serial = summary["serial"]["critical_cuda_median_ms"]
@@ -503,7 +524,65 @@ def _run(args: argparse.Namespace) -> None:
                     "local_tokens": local_tokens,
                     "sequence_lengths": workload.sequence_lengths,
                     "schedules": summary,
-                    "records": records,
+                    "rank_resources": [
+                        {
+                            "physical_rank": r,
+                            "logical_rank": records[r]["logical_rank"],
+                            "dsa_windows": records[r]["dsa_windows"],
+                            "dsa_candidate_workspace_gib": records[r][
+                                "dsa_candidate_workspace_gib"
+                            ],
+                            "dsa_workspace_gib": records[r]["dsa_workspace_gib"],
+                            "kda_transport_workspace_gib": records[r][
+                                "kda_transport_workspace_gib"
+                            ],
+                            "memory_by_schedule": records[r]["memory_by_schedule"],
+                        }
+                        for r in range(world_size)
+                    ],
+                    "rank_checks": [
+                        {
+                            "physical_rank": r,
+                            "logical_rank": records[r]["logical_rank"],
+                            "kda_finite": all(
+                                sample["kda_finite"]
+                                for schedule in schedules
+                                for sample in records[r]["samples"][schedule]
+                            ),
+                            "dsa_has_nan": any(
+                                sample["dsa_has_nan"]
+                                for schedule in schedules
+                                for sample in records[r]["samples"][schedule]
+                            ),
+                            "repeat_stable": all(
+                                all(
+                                    sample[key]
+                                    == records[r]["samples"][schedules[0]][0][key]
+                                    for key in (
+                                        "proxy_loss",
+                                        "output_norm",
+                                        "grad_norms",
+                                        "dsa_id_sum",
+                                        "dsa_finite_score_sum",
+                                    )
+                                )
+                                for schedule in schedules
+                                for sample in records[r]["samples"][schedule]
+                            ),
+                            **{
+                                key: records[r]["samples"][schedules[0]][0][key]
+                                for key in (
+                                    "proxy_loss",
+                                    "output_norm",
+                                    "grad_norms",
+                                    "dsa_id_sum",
+                                    "dsa_finite_score_sum",
+                                )
+                            },
+                        }
+                        for r in range(world_size)
+                    ],
+                    "records": None if args.summary_only else records,
                 }
             ),
             flush=True,
@@ -552,6 +631,11 @@ def _parse_args() -> argparse.Namespace:
         subparser.add_argument("--short-tokens", type=_positive_int, default=1024)
         subparser.add_argument("--long-sequences", type=_positive_int, default=2)
         subparser.add_argument("--cuda-profiler-capture", action="store_true")
+        subparser.add_argument(
+            "--summary-only",
+            action="store_true",
+            help="omit per-iteration records from the JSON output",
+        )
     return parser.parse_args()
 
 

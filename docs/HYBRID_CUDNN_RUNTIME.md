@@ -52,9 +52,12 @@ FP32 candidate buffer. It coalesces adjacent short packed sequences when they
 fit the same budget.
 
 When `candidate_budget_bytes=None`, the balanced policy starts at 512 MiB and
-adds 512 MiB for each 128K of absolute causal reach, capped at 4 GiB. Thus the
-128K packed workload retains its 512 MiB workspace while the worst 1M/CP64
-rank reaches the measured 4 GiB performance knee. The exported
+adds 512 MiB for each 128K of absolute causal reach. Beyond the first 128K of
+causal reach, each 64K of rank-local query rows adds up to a capped 4x
+throughput multiplier; the global cap is 8 GiB. Thus the 128K packed workload
+retains its 512 MiB workspace, the worst 1M/CP64 rank stays at its measured
+4 GiB performance knee, and critical long-sequence ranks at 1M/CP4 select the
+measured 8 GiB knee. The exported
 `MEMORY_EFFICIENT_CANDIDATE_BUDGET_BYTES` forces a fixed 512 MiB policy, and
 `MAX_BALANCED_CANDIDATE_BUDGET_BYTES` exposes the cap. This is a
 memory/scheduling choice, not a numerical choice. Allocate one workspace per
@@ -101,13 +104,52 @@ network is virtualized.
 | 512 MiB | 32 | 72.247 ms | 2.58x |
 | 1 GiB | 16 | 48.121 ms | 1.72x |
 | 2 GiB | 8 | 37.752 ms | 1.35x |
-| **4 GiB (adaptive cap)** | **4** | **33.519 ms** | **1.20x** |
+| **4 GiB (adaptive CP64 choice)** | **4** | **33.519 ms** | **1.20x** |
 | 8 GiB | 2 | 29.464 ms | 1.05x |
 | 15.875 GiB full | 1 | 28.039 ms | 1.00x |
 
 Four GiB is the measured knee: it saves 11.875 GiB on the worst logical rank
 while retaining about 84% of the full-scratch throughput. The 512 MiB policy
 remains available when activation pressure matters more than selection latency.
+
+### 1M THD, real CP4 KDA + DSA indexer E2E
+
+Input: 20 sequences of 1,024 tokens plus two sequences of 514,048 tokens,
+four physical CP ranks, KDA forward/backward, ratio-4 CSA pooling, compressed
+block all-gather, and deterministic Top-K 512 selection. KDA and the independent
+indexer branch run on separate CUDA streams.
+
+| Candidate policy | Critical GPU median | Versus old default |
+|---|---:|---:|
+| Old reach-only adaptive policy | 228.220 ms | 1.00x |
+| Fixed 4 GiB | 218.031 ms | 1.05x |
+| **Row-aware adaptive, up to 8 GiB** | **209.504 ms** | **1.09x** |
+| Fixed 16 GiB | 210.363 ms | 1.08x |
+
+Eight GiB is the E2E knee. On the critical rank it uses 12 selection windows
+and raises peak allocated memory from about 43.9 GiB to 49.7 GiB. Sixteen GiB
+doubles candidate scratch without improving the critical path. The output and
+all five KDA gradients remained finite; proxy loss, norms, selected-id sum,
+and finite-logit sum were stable across seven repeats and matched the smaller
+workspace policies.
+
+Nsight Systems measured only 1.318 ms of kernel-idle time in the 212.454 ms
+critical-rank hot path (0.62%). CSA pooling itself took 0.046 ms and compressed
+block communication about 0.2--0.3 ms. The remaining critical work is dominated
+by 12 cuDNN score kernels (88.5 ms total) and 12 deterministic Top-K kernels
+(90.1 ms total), overlapped with KDA and NCCL. High-priority streams and
+20--100 ms staggered launches produced no stable gain, so cuLA does not retain
+those scheduling knobs.
+
+An isolated NCU sample identifies the next optimization boundary inside the
+cuDNN kernels. The score kernel used 112 registers per thread and 75.8 KiB of
+dynamic shared memory per block; theoretical occupancy was 25% and achieved
+occupancy 10.9%, with 45.2% compute and 35.3% maximum-memory throughput. The
+Top-K kernel used 39 registers and 25.0 KiB of dynamic shared memory, reached
+71.6% occupancy, but only 32.7% compute and 27.1% memory throughput. Further
+material gains therefore require reducing score-kernel register/shared-memory
+pressure and improving Top-K reduction/radix synchronization in cuDNN, rather
+than adding more cuLA stream or caching policy.
 
 ## Integration example
 

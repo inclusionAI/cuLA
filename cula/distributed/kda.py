@@ -86,6 +86,18 @@ class _KdaOptions:
         }
 
 
+def _all_gather_into(
+    output: torch.Tensor,
+    tensor: torch.Tensor,
+    *,
+    group: dist.ProcessGroup | None,
+) -> None:
+    if hasattr(dist, "all_gather_single"):
+        dist.all_gather_single(output, tensor, group=group)
+    else:  # pragma: no cover - compatibility with older PyTorch releases
+        dist.all_gather_into_tensor(output, tensor, group=group)
+
+
 def _all_gather(tensor: torch.Tensor, group: dist.ProcessGroup | None, world_size: int) -> torch.Tensor:
     """Gather one equal-shaped boundary payload per rank."""
     if world_size == 1:
@@ -95,7 +107,7 @@ def _all_gather(tensor: torch.Tensor, group: dist.ProcessGroup | None, world_siz
         dtype=tensor.dtype,
         device=tensor.device,
     )
-    dist.all_gather_into_tensor(gathered, tensor.contiguous(), group=group)
+    _all_gather_into(gathered, tensor.contiguous(), group=group)
     return gathered.view(world_size, *tensor.shape)
 
 
@@ -309,7 +321,7 @@ class AllGatherKimiCPTransport:
             if plan.world_size == 1:
                 packed_all = workspace.local_payload.unsqueeze(0)
             else:
-                dist.all_gather_into_tensor(
+                _all_gather_into(
                     workspace.gathered_payload,
                     workspace.local_payload,
                     group=group,

@@ -242,7 +242,7 @@ def test_prepared_all_gather_transport_reuses_workspace(monkeypatch):
         calls.append((h.flatten().tolist(), transition.flatten().tolist(), reverse))
         return h.sum(dim=0)
 
-    monkeypatch.setattr(cp.dist, "all_gather_into_tensor", fake_all_gather)
+    monkeypatch.setattr(cp, "_all_gather_into", fake_all_gather)
     monkeypatch.setattr(cp, "_merge_rank_summaries", fake_merge)
     h = torch.ones(1, 1, 1, dtype=torch.float32)
     transition = torch.zeros(1, 1, 1, dtype=torch.float32)
