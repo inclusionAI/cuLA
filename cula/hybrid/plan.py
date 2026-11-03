@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from operator import index
 
 import torch
+import torch.distributed as dist
 
 from cula._metadata import as_boundaries, balanced_shards, validate_shards
 
@@ -187,6 +188,40 @@ class IndexPoolShardPlan:
     @property
     def local_blocks(self) -> int:
         return self.block_offsets[self.rank + 1] - self.block_offsets[self.rank]
+
+    @property
+    def global_blocks(self) -> int:
+        return self.block_offsets[-1]
+
+    @property
+    def block_counts(self) -> tuple[int, ...]:
+        return tuple(
+            right - left for left, right in zip(self.block_offsets, self.block_offsets[1:])
+        )
+
+    @property
+    def equal_block_counts(self) -> bool:
+        counts = self.block_counts
+        return all(count == counts[0] for count in counts[1:])
+
+    def validate_group(self, group: dist.ProcessGroup | None) -> None:
+        """Check that the runtime process group matches this rank-local plan."""
+
+        if not dist.is_available() or not dist.is_initialized():
+            if group is not None or self.world_size != 1 or self.rank != 0:
+                raise RuntimeError(
+                    "the index-pooling shard plan requires an initialized "
+                    "torch.distributed process group"
+                )
+            return
+        world_size = dist.get_world_size(group)
+        rank = dist.get_rank(group)
+        if (world_size, rank) != (self.world_size, self.rank):
+            raise ValueError(
+                "IndexPoolShardPlan process-group mismatch: "
+                f"plan has rank/world_size={self.rank}/{self.world_size}, "
+                f"runtime has {rank}/{world_size}"
+            )
 
     @classmethod
     def from_global_cu_seqlens(

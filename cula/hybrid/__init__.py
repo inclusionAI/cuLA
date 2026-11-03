@@ -3,6 +3,7 @@
 
 """cuDNN-backed hybrid-attention integration primitives."""
 
+from cula.hybrid.distributed_pool import cudnn_index_pool_cp
 from cula.hybrid.dsa import (
     DEFAULT_CANDIDATE_BUDGET_BYTES,
     MAX_BALANCED_CANDIDATE_BUDGET_BYTES,
@@ -28,4 +29,5 @@ __all__ = [
     "IndexPoolShardPlan",
     "cudnn_dsa_select",
     "cudnn_index_pool",
+    "cudnn_index_pool_cp",
 ]
