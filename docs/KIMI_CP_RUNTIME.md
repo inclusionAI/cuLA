@@ -131,7 +131,9 @@ Communication accounts for roughly 6.22 ms of the stage envelope and is the
 largest optimization target. These numbers model the serial CP64 dependency
 length on the local four-GPU fabric; they do not model 64-GPU topology,
 cross-node contention, or aggregate bisection bandwidth. The reproducible
-harness is `benchmarks/bench_kimi_cp_e2e.py`.
+harness is `benchmarks/large_cp_emulation/bench_kda.py`. The logical topology
+and benchmark-only transport live beside it rather than in the production CP
+runtime.
 
 ## Prepared large-CP transport
 
