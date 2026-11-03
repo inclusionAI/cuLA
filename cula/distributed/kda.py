@@ -107,6 +107,18 @@ def _all_gather_into(
         dist.all_gather_into_tensor(output, tensor, group=group)
 
 
+def _all_gather_into(
+    output: torch.Tensor,
+    tensor: torch.Tensor,
+    *,
+    group: dist.ProcessGroup | None,
+) -> None:
+    if hasattr(dist, "all_gather_single"):
+        dist.all_gather_single(output, tensor, group=group)
+    else:  # pragma: no cover - compatibility with older PyTorch releases
+        dist.all_gather_into_tensor(output, tensor, group=group)
+
+
 def _all_gather(tensor: torch.Tensor, group: dist.ProcessGroup | None, world_size: int) -> torch.Tensor:
     """Gather one equal-shaped boundary payload per rank."""
     if world_size == 1:

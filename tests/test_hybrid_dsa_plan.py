@@ -117,7 +117,7 @@ def test_adaptive_budget_keeps_128k_workload_memory_efficient():
     assert plan.candidate_workspace_floats * 4 <= MEMORY_EFFICIENT_CANDIDATE_BUDGET_BYTES
 
 
-def test_adaptive_budget_reaches_measured_cap_at_1m_cp64_tail():
+def test_adaptive_budget_keeps_measured_4g_choice_at_1m_cp64_tail():
     local_tokens = (1 << 20) // 64
     query_offset = (1 << 20) - local_tokens
     plan = DsaSelectionPlan.from_cu_seqlens(
@@ -127,9 +127,34 @@ def test_adaptive_budget_reaches_measured_cap_at_1m_cp64_tail():
         q_causal_offsets=[query_offset],
     )
 
-    assert plan.candidate_budget_bytes == MAX_BALANCED_CANDIDATE_BUDGET_BYTES
+    assert plan.candidate_budget_bytes == 4 << 30
     assert len(plan.windows) == 4
+    assert plan.candidate_workspace_floats * 4 <= 4 << 30
+
+
+def test_adaptive_budget_uses_throughput_multiplier_for_1m_cp4_tail():
+    local_tokens = (1 << 20) // 4
+    query_offset = (1 << 20) - local_tokens
+    plan = DsaSelectionPlan.from_cu_seqlens(
+        [0, local_tokens],
+        [0, (1 << 20) // 4],
+        top_k=512,
+        q_causal_offsets=[query_offset],
+    )
+
+    assert plan.candidate_budget_bytes == MAX_BALANCED_CANDIDATE_BUDGET_BYTES
     assert plan.candidate_workspace_floats * 4 <= MAX_BALANCED_CANDIDATE_BUDGET_BYTES
+
+
+def test_adaptive_budget_uses_8g_for_1m_thd_cp4_tail():
+    plan = DsaSelectionPlan.from_cu_seqlens(
+        [0, 1 << 18],
+        [0, 514048 // 4],
+        top_k=512,
+        q_causal_offsets=[514048 - (1 << 18)],
+    )
+
+    assert plan.candidate_budget_bytes == MAX_BALANCED_CANDIDATE_BUDGET_BYTES
 
 
 @pytest.mark.parametrize(

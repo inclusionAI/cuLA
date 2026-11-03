@@ -22,10 +22,12 @@ MEMORY_EFFICIENT_CANDIDATE_BUDGET_BYTES = 512 << 20
 DEFAULT_CANDIDATE_BUDGET_BYTES = MEMORY_EFFICIENT_CANDIDATE_BUDGET_BYTES
 """Base FP32 compact-logit workspace used by the adaptive default policy."""
 
-MAX_BALANCED_CANDIDATE_BUDGET_BYTES = 4 << 30
+MAX_BALANCED_CANDIDATE_BUDGET_BYTES = 8 << 30
 """Maximum FP32 compact-logit workspace selected by the adaptive policy."""
 
 _CANDIDATE_BUDGET_POSITION_QUANTUM = 128 << 10
+_CANDIDATE_BUDGET_LOCAL_ROWS_QUANTUM = 64 << 10
+_MAX_LOCAL_ROWS_MULTIPLIER = 4
 
 
 def _as_nonnegative(
@@ -93,8 +95,30 @@ def _balanced_candidate_budget(cu_q: tuple[int, ...], offsets: tuple[int, ...]) 
     max_causal_end = max(
         offset + right - left for left, right, offset in zip(cu_q[:-1], cu_q[1:], offsets, strict=True)
     )
-    steps = max(1, (max_causal_end + _CANDIDATE_BUDGET_POSITION_QUANTUM - 1) // _CANDIDATE_BUDGET_POSITION_QUANTUM)
-    return min(MAX_BALANCED_CANDIDATE_BUDGET_BYTES, steps * DEFAULT_CANDIDATE_BUDGET_BYTES)
+    position_steps = max(
+        1,
+        (max_causal_end + _CANDIDATE_BUDGET_POSITION_QUANTUM - 1)
+        // _CANDIDATE_BUDGET_POSITION_QUANTUM,
+    )
+    # Causal reach controls scratch per query row; total local rows control how
+    # many scorer/Top-K windows must launch. Preserve the 128K policy, then
+    # spend more workspace only where both dimensions make launch partitioning
+    # an observed throughput bottleneck.
+    total_local_rows = cu_q[-1]
+    local_rows_multiplier = 1
+    if position_steps > 1:
+        local_rows_multiplier = min(
+            _MAX_LOCAL_ROWS_MULTIPLIER,
+            max(
+                1,
+                (total_local_rows + _CANDIDATE_BUDGET_LOCAL_ROWS_QUANTUM - 1)
+                // _CANDIDATE_BUDGET_LOCAL_ROWS_QUANTUM,
+            ),
+        )
+    return min(
+        MAX_BALANCED_CANDIDATE_BUDGET_BYTES,
+        position_steps * DEFAULT_CANDIDATE_BUDGET_BYTES * local_rows_multiplier,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,8 +200,9 @@ class DsaSelectionPlan:
         """Create a plan entirely from host-visible packed metadata.
 
         A ``None`` budget selects the balanced 512 MiB-per-128K causal-reach
-        policy, capped at 4 GiB. Pass an explicit byte count to enforce a fixed
-        memory policy across ranks and microbatches.
+        policy. Beyond the first 128K of causal reach, local query rows add up
+        to a 4x throughput multiplier, capped at 8 GiB. Pass an explicit byte
+        count to enforce a fixed memory policy across ranks and microbatches.
         """
 
         cu_q = as_boundaries(cu_seqlens_q, name="cu_seqlens_q")
