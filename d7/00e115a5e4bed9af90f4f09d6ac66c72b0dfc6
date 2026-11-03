@@ -1,0 +1,50 @@
+cula/hybrid/distributed_pool.py
+  s_d4826b35da75c5::t_2603883fec6b8f 24-26
+  s_d4826b35da75c5::t_d654bb3d2050fc 12,32-206,265,272-281
+  s_d4826b35da75c5::t_71daa270731ce6 240-241
+  s_d4826b35da75c5::t_1bb70909dd3258 227-235,252-256
+  s_d4826b35da75c5::t_6207c2c496cd67 1-11,13-23,27-31,207-226,236-239,242-251,257-264,266-271,282-285
+docs/HYBRID_CUDNN_RUNTIME.md
+  s_d4826b35da75c5::t_9d58354b159582 179-180,183-187
+  s_d4826b35da75c5::t_1bb70909dd3258 161-178,181-182,188-193,205
+tests/test_hybrid_index_pool_plan.py
+  s_d4826b35da75c5::t_27d33c541ede20 67-69
+cula/hybrid/plan.py
+  s_d4826b35da75c5::t_6207c2c496cd67 13,192-224
+  s_d4826b35da75c5::t_519e05758e54e2 225
+tests/test_hybrid_distributed_pool.py
+  s_d4826b35da75c5::t_27d33c541ede20 1-26,29-31,48-58,61-85,89,96-110,112-115
+  s_d4826b35da75c5::t_2603883fec6b8f 27-28
+  s_d4826b35da75c5::t_8fea078b920191 32-47
+  s_d4826b35da75c5::t_20ca00666960b2 59-60,86-88,90-95,111
+  s_d4826b35da75c5::t_e8e09a0a09c0a7 116-177
+benchmarks/bench_index_pool_cp.py
+  s_d4826b35da75c5::t_666c5ef47c6a0a 116-138,140-149,232-244,248,264-273
+  s_d4826b35da75c5::t_88af5b9544a588 139
+  s_d4826b35da75c5::t_2603883fec6b8f 252,254-256
+  s_d4826b35da75c5::t_31ff848915bdad 29-60,198-199
+  s_d4826b35da75c5::t_e3c8d46367a9a1 75-86,88-89,91-102,280-284,301-305
+  s_d4826b35da75c5::t_d067f37a67cb44 1-8,10-11,13,15-17,20-28,61-74,87,90,150-197,200-231,245-247,249-251,253,257-263,274-279,285,319,321-323,328,330-331,336-337,340-356,363-371
+  s_d4826b35da75c5::t_1202c156e06621 9,103-115,299-300,308-315,320,329,334-335,360-362
+  s_d4826b35da75c5::t_5b3cf2bd699879 12,14,18-19
+  s_d4826b35da75c5::t_6a846bdc02be88 286-298,306-307,316-318,324-327,332-333,338-339,357-359
+cula/hybrid/__init__.py
+  s_d4826b35da75c5::t_6207c2c496cd67 32
+  s_d4826b35da75c5::t_339df7885707d2 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d700e115a5e4bed9af90f4f09d6ac66c72b0dfc6",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
