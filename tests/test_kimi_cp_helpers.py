@@ -9,6 +9,46 @@ from cula.distributed import kda as cp
 from cula.distributed.plan import KimiCPPlan
 
 
+def test_checkpoint_cadence_validation():
+    assert cp._validate_checkpoint_every_n_tokens(0) == 0
+    assert cp._validate_checkpoint_every_n_tokens(16) == 16
+
+    for invalid in (-16, 1, 24, 32, 64, 128, 256):
+        try:
+            cp._validate_checkpoint_every_n_tokens(invalid)
+        except ValueError as error:
+            assert "native chunk cadence 16" in str(error)
+        else:
+            raise AssertionError(f"invalid checkpoint cadence {invalid} was accepted")
+
+    for invalid in (True, 16.0, "16"):
+        try:
+            cp._validate_checkpoint_every_n_tokens(invalid)
+        except TypeError as error:
+            assert "integer" in str(error)
+        else:
+            raise AssertionError(f"non-integer checkpoint cadence {invalid!r} was accepted")
+
+
+def test_attention_kwargs_keep_checkpoints_out_of_summary_calls():
+    options = cp._KdaOptions(
+        scale=None,
+        use_qk_l2norm_in_kernel=False,
+        use_beta_sigmoid_in_kernel=False,
+        allow_neg_eigval=False,
+        safe_gate=False,
+        lower_bound=None,
+        gate_domain="log",
+        batch_invariant=True,
+        checkpoint_every_n_tokens=16,
+        plan_name="kda_frost",
+        summary_plan_name="kda_summary_frost",
+    )
+
+    assert "checkpoint_every_n_tokens" not in options.kwargs(None, None)
+    assert options.attention_kwargs(None, None)["checkpoint_every_n_tokens"] == 16
+
+
 def test_cudnn_loader_accepts_current_linear_attention_exports(monkeypatch):
     def merge(h, m, *, reverse=False):
         return h, m, reverse

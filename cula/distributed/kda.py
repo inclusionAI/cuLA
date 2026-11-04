@@ -69,6 +69,7 @@ class _KdaOptions:
     lower_bound: float | None
     gate_domain: str
     batch_invariant: bool
+    checkpoint_every_n_tokens: int
     plan_name: str | None
     summary_plan_name: str | None
 
@@ -84,6 +85,19 @@ class _KdaOptions:
             "dt_bias": dt_bias,
             "batch_invariant": self.batch_invariant,
         }
+
+    def attention_kwargs(self, a_log: torch.Tensor | None, dt_bias: torch.Tensor | None) -> dict[str, Any]:
+        kwargs = self.kwargs(a_log, dt_bias)
+        kwargs["checkpoint_every_n_tokens"] = self.checkpoint_every_n_tokens
+        return kwargs
+
+
+def _validate_checkpoint_every_n_tokens(value: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError("checkpoint_every_n_tokens must be an integer")
+    if value not in (0, 16):
+        raise ValueError("checkpoint_every_n_tokens must be 0 or the exact native chunk cadence 16")
+    return value
 
 
 def _all_gather_into(
@@ -418,15 +432,16 @@ class _CudnnKdaCP(torch.autograd.Function):
             a_leaf = a_log.detach().requires_grad_(True) if a_log is not None else None
             dt_leaf = dt_bias.detach().requires_grad_(True) if dt_bias is not None else None
             incoming_leaf = incoming.detach().requires_grad_(True)
-            output, final_state = kimi_delta_attention(
+            attention_outputs = kimi_delta_attention(
                 *leaves,
                 cu_seqlens,
                 scale=options.scale,
                 initial_state=incoming_leaf,
                 output_final_state=True,
                 plan_name=options.plan_name,
-                **options.kwargs(a_leaf, dt_leaf),
+                **options.attention_kwargs(a_leaf, dt_leaf),
             )
+            output, final_state = attention_outputs[:2]
 
         ctx.plan = plan
         ctx.group = group
@@ -579,6 +594,7 @@ def cudnn_kda_cp(
     a_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
     batch_invariant: bool = True,
+    checkpoint_every_n_tokens: int = 0,
     plan_name: str | None = "kda_frost",
     summary_plan_name: str | None = "kda_summary_frost",
     boundary_transport: KimiCPBoundaryTransport | None = None,
@@ -599,6 +615,14 @@ def cudnn_kda_cp(
     storage. Large-CP callers should prepare one
     :class:`AllGatherKimiCPTransport` per concurrent CUDA stream and reuse it
     across layers to avoid repeated collective-buffer allocations.
+
+    ``checkpoint_every_n_tokens=0`` lets cuDNN regenerate the chunk-state
+    series during backward. Passing 16 retains every native chunk state for
+    exact backward reuse. Coarser upstream cadences still recompute seeded
+    spans, were slower in the 1M study, and are intentionally not exposed.
+    Because exact checkpoints are large and live across the forward/backward
+    interval, cuLA never enables them implicitly; callers should select 16
+    only from measured whole-model memory/latency tradeoffs.
     """
 
     if not isinstance(plan, KimiCPPlan):
@@ -606,6 +630,7 @@ def cudnn_kda_cp(
     resolved_transport = _DEFAULT_BOUNDARY_TRANSPORT if boundary_transport is None else boundary_transport
     if not isinstance(resolved_transport, KimiCPBoundaryTransport):
         raise TypeError("boundary_transport must implement KimiCPBoundaryTransport")
+    checkpoint_every_n_tokens = _validate_checkpoint_every_n_tokens(checkpoint_every_n_tokens)
     _validate_inputs(
         q,
         k,
@@ -628,12 +653,13 @@ def cudnn_kda_cp(
         lower_bound=lower_bound,
         gate_domain=gate_domain,
         batch_invariant=batch_invariant,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         plan_name=plan_name,
         summary_plan_name=summary_plan_name,
     )
     if plan.world_size == 1:
         _, kimi_delta_attention, _, _ = _load_cudnn_cp_ops()
-        output, _ = kimi_delta_attention(
+        attention_outputs = kimi_delta_attention(
             q,
             k,
             v,
@@ -644,9 +670,9 @@ def cudnn_kda_cp(
             initial_state=None,
             output_final_state=False,
             plan_name=plan_name,
-            **options.kwargs(a_log, dt_bias),
+            **options.attention_kwargs(a_log, dt_bias),
         )
-        return output
+        return attention_outputs[0]
     return _CudnnKdaCP.apply(
         q.contiguous(),
         k.contiguous(),
