@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from cula._metadata import as_boundaries, balanced_shards
+from cula.distributed.thd_planner import THDPlannerConfig, plan_thd_layout
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,9 +179,37 @@ def build_alternating_sequence_query_layout(
     return QueryLayout(rank, world_size, block_size, spans)
 
 
+def build_planned_query_layout(
+    global_cu_seqlens: tuple[int, ...] | list[int],
+    *,
+    rank: int,
+    world_size: int,
+    block_size: int = 4,
+) -> QueryLayout:
+    """Adapt the production THD planner output to the DSA benchmark layout."""
+
+    plan = plan_thd_layout(
+        global_cu_seqlens,
+        world_size=world_size,
+        config=THDPlannerConfig(block_size=block_size),
+    )
+    spans = tuple(
+        QuerySpan(
+            span.sequence,
+            span.token_start,
+            span.token_end,
+            span.sequence_start,
+            span.sequence_end,
+        )
+        for span in plan.for_rank(rank).spans
+    )
+    return QueryLayout(rank, world_size, block_size, spans)
+
+
 __all__ = [
     "QueryLayout",
     "QuerySpan",
     "build_alternating_sequence_query_layout",
     "build_contiguous_query_layout",
+    "build_planned_query_layout",
 ]

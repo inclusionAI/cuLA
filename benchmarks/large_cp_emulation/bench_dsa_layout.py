@@ -21,6 +21,7 @@ from benchmarks.large_cp_emulation.query_layout import (  # noqa: E402
     QueryLayout,
     build_alternating_sequence_query_layout,
     build_contiguous_query_layout,
+    build_planned_query_layout,
 )
 from benchmarks.large_cp_emulation.workload import PackedTHDWorkload  # noqa: E402
 from cula.hybrid import (  # noqa: E402
@@ -39,6 +40,16 @@ def _positive_int(value: str) -> int:
     return result
 
 
+def _sequence_lengths(value: str) -> tuple[int, ...]:
+    try:
+        result = tuple(int(item) for item in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("sequence lengths must be comma-separated integers") from error
+    if not result or any(length < 1 for length in result):
+        raise argparse.ArgumentTypeError("sequence lengths must be positive")
+    return result
+
+
 def _global_block_prefix(boundaries: tuple[int, ...], block_size: int) -> tuple[int, ...]:
     result = [0]
     for left, right in zip(boundaries, boundaries[1:]):
@@ -54,11 +65,11 @@ def _layout_for_rank(
     world_size: int,
     block_size: int,
 ) -> QueryLayout:
-    builder = (
-        build_contiguous_query_layout
-        if name == "contiguous"
-        else build_alternating_sequence_query_layout
-    )
+    builder = {
+        "contiguous": build_contiguous_query_layout,
+        "alternating": build_alternating_sequence_query_layout,
+        "planned": build_planned_query_layout,
+    }[name]
     return builder(
         boundaries,
         rank=rank,
@@ -94,12 +105,18 @@ def _run(args: argparse.Namespace) -> None:
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    workload = PackedTHDWorkload.short_long_mix(
-        args.global_tokens,
-        short_sequences=args.short_sequences,
-        short_tokens=args.short_tokens,
-        long_sequences=args.long_sequences,
-    )
+    if args.sequence_lengths is None:
+        workload = PackedTHDWorkload.short_long_mix(
+            args.global_tokens,
+            short_sequences=args.short_sequences,
+            short_tokens=args.short_tokens,
+            long_sequences=args.long_sequences,
+        )
+    else:
+        boundaries = [0]
+        for length in args.sequence_lengths:
+            boundaries.append(boundaries[-1] + length)
+        workload = PackedTHDWorkload(tuple(boundaries))
     boundaries = workload.global_cu_seqlens
     layouts = tuple(
         _layout_for_rank(
@@ -243,7 +260,7 @@ def _run(args: argparse.Namespace) -> None:
             json.dumps(
                 {
                     "layout": args.layout,
-                    "global_tokens": args.global_tokens,
+                    "global_tokens": workload.global_tokens,
                     "physical_gpus": world_size,
                     "sequence_lengths": workload.sequence_lengths,
                     "critical_samples_ms": critical,
@@ -288,8 +305,13 @@ def _run(args: argparse.Namespace) -> None:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--layout", choices=("contiguous", "alternating"), required=True)
+    parser.add_argument("--layout", choices=("contiguous", "alternating", "planned"), required=True)
     parser.add_argument("--global-tokens", type=_positive_int, default=1 << 20)
+    parser.add_argument(
+        "--sequence-lengths",
+        type=_sequence_lengths,
+        help="explicit comma-separated THD lengths; overrides the generated short/long mix",
+    )
     parser.add_argument("--short-sequences", type=_positive_int, default=20)
     parser.add_argument("--short-tokens", type=_positive_int, default=1024)
     parser.add_argument("--long-sequences", type=_positive_int, default=2)

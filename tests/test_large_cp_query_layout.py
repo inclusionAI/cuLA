@@ -4,6 +4,7 @@
 from benchmarks.large_cp_emulation.query_layout import (
     build_alternating_sequence_query_layout,
     build_contiguous_query_layout,
+    build_planned_query_layout,
 )
 
 
@@ -54,3 +55,16 @@ def test_alternating_sequence_layout_balances_causal_candidates_better_than_cont
     alternating_costs = [layout.candidate_floats for layout in alternating]
     assert max(contiguous_costs) / min(contiguous_costs) > 2.5
     assert max(alternating_costs) / min(alternating_costs) < 1.01
+
+
+def test_planned_layout_balances_reference_workload_without_special_case():
+    boundaries = _workload_boundaries()
+    layouts = [
+        build_planned_query_layout(boundaries, rank=rank, world_size=4)
+        for rank in range(4)
+    ]
+
+    assert {layout.local_tokens for layout in layouts} == {1 << 18}
+    assert max(layout.candidate_floats for layout in layouts) == min(
+        layout.candidate_floats for layout in layouts
+    )
