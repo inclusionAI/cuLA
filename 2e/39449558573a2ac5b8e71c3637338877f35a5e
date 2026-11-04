@@ -1,0 +1,36 @@
+benchmarks/large_cp_emulation/transport.py
+  s_d4826b35da75c5::t_54919197f7fd12 13,16-19
+cula/distributed/kda.py
+  s_d4826b35da75c5::t_bbb3547ae05a16 72,89-97,100-101,435,442,444,597,618-619,633,656,662,673,675
+  s_d4826b35da75c5::t_c1ff1cda30a6e7 98-99,620-625
+benchmarks/large_cp_emulation/bench_hybrid.py
+  s_d4826b35da75c5::t_958c4a6fb648fc 507-508,717-722
+  s_d4826b35da75c5::t_c1ff1cda30a6e7 706,708
+  s_d4826b35da75c5::t_cd5f373dadead0 419,680-683
+  s_d4826b35da75c5::t_36247fa14b95ce 679
+  s_d4826b35da75c5::t_79b99708142ec5 90-140,382-383,496-497,567-577
+  s_d4826b35da75c5::t_9b28ddf95ab898 423,453,455,474-475,562-566,578,605,703-705,707,709
+  s_d4826b35da75c5::t_489974c42e6bac 601,694
+  s_d4826b35da75c5::t_dca46d1f969bcb 8
+  s_d4826b35da75c5::t_8dff2d9018b420 89
+tests/test_kimi_cp_helpers.py
+  s_d4826b35da75c5::t_d0bc2a2435f40a 12-15,17-19,21-42,44-48,50-51
+  s_d4826b35da75c5::t_c1ff1cda30a6e7 16,20
+  s_d4826b35da75c5::t_66ffa612ad9e71 43,49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2e39449558573a2ac5b8e71c3637338877f35a5e",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
