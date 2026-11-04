@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from math import ceil
+from math import ceil, isfinite
 from operator import index
 
 import torch
@@ -140,8 +140,6 @@ def _validate_inputs(
     boundaries = as_boundaries(global_cu_seqlens, name="global_cu_seqlens")
     if not isinstance(world_size, int) or isinstance(world_size, bool) or world_size < 1:
         raise ValueError("world_size must be a positive integer")
-    if boundaries[-1] < world_size:
-        raise ValueError("packed context parallelism requires at least one token per rank")
     for name in ("block_size", "min_split_tokens", "max_chunks_per_rank"):
         raw_value = getattr(config, name)
         if isinstance(raw_value, bool):
@@ -153,10 +151,12 @@ def _validate_inputs(
         raise ValueError("min_split_tokens must be block aligned")
     if any((right - left) % config.block_size for left, right in zip(boundaries, boundaries[1:])):
         raise ValueError("every sequence length must be block aligned")
+    if boundaries[-1] // config.block_size < world_size:
+        raise ValueError("packed context parallelism requires at least one block per rank")
     for name in ("token_weight", "causal_weight", "boundary_weight"):
         value = getattr(config, name)
-        if not isinstance(value, int | float) or value < 0:
-            raise ValueError(f"{name} must be non-negative")
+        if isinstance(value, bool) or not isinstance(value, int | float) or not isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and non-negative")
     if config.token_weight == 0 and config.causal_weight == 0:
         raise ValueError("at least one compute weight must be positive")
     return boundaries

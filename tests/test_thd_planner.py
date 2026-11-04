@@ -95,7 +95,7 @@ def test_cp64_long_sequence_uses_scaled_zigzag_chunks():
     ("boundaries", "message"),
     [
         ([0, 3, 8], "block aligned"),
-        ([0, 4], "at least one token per rank"),
+        ([0, 8], "at least one block per rank"),
     ],
 )
 def test_planner_rejects_invalid_partitions(boundaries, message):
