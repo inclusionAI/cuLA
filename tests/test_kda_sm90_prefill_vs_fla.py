@@ -27,7 +27,7 @@ transposed back to KV layout before comparison.
 import pytest
 import torch
 from fla.ops.kda.chunk import chunk_kda as fla_chunk_kda
-from fla.utils import assert_close, device
+from fla.utils import assert_close, device, get_err_ratio
 
 from cula.kda import flashkda_prefill as cula_kda_prefill
 
@@ -195,3 +195,56 @@ def test_prefill_workspace_reuse_across_shapes():
                 lower_bound=-5.0,
             )
         assert_close("o", ref_o, tri_o, 0.005)
+
+
+@pytest.mark.kda_fast
+def test_prefill_repeated_tokens_inverse_precision():
+    """Near-collinear keys stress the old fp16 Neumann inverse."""
+    B, T, H = 1, 16, 1
+    torch.manual_seed(321)
+    token = torch.linspace(-1.0, 1.0, D, dtype=torch.float32, device=device)
+    token = torch.nn.functional.normalize(token, dim=0).to(torch.bfloat16)
+    q = token.view(1, 1, 1, D).expand(B, T, H, D).contiguous()
+    k = q.clone()
+    v = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    # sigmoid(-80) makes the intra-chunk decay nearly one, so consecutive
+    # normalized keys produce a strictly-lower L with values close to one.
+    g = torch.full_like(q, -80.0)
+    beta = torch.full((B, T, H), 0.999, dtype=torch.bfloat16, device=device)
+    A_log = torch.zeros(H, dtype=torch.float32, device=device)
+    dt_bias = torch.zeros(H, D, dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        ref_o, ref_ht = fla_chunk_kda(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            safe_gate=True,
+            lower_bound=-5.0,
+        )
+        tri_o, tri_ht_vk = cula_kda_prefill(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            output_final_state=True,
+            safe_gate=True,
+            lower_bound=-5.0,
+            use_intracard_cp=False,
+        )
+    tri_ht = tri_ht_vk.transpose(-2, -1)
+
+    o_err_ratio = get_err_ratio(ref_o, tri_o)
+    ht_err_ratio = get_err_ratio(ref_ht, tri_ht)
+    assert o_err_ratio < 0.005, f"repeated-token output precision regressed: {o_err_ratio=:g}"
+    assert ht_err_ratio < 0.01, f"repeated-token final-state precision regressed: {ht_err_ratio=:g}"
