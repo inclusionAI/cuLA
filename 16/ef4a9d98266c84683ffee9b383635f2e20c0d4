@@ -1,0 +1,34 @@
+tests/test_standalone_kernel_surface.py
+  s_d4826b35da75c5::t_350c290f3b524a 38,42-44,64-66
+README.md
+  s_d4826b35da75c5::t_350c290f3b524a 175
+BENCHMARK_GB200.md
+  s_d4826b35da75c5::t_350c290f3b524a 13-16,61,64
+BENCHMARK_GB300.md
+  s_d4826b35da75c5::t_350c290f3b524a 13-16,61,64
+BENCHMARK_GB200_CUDA_130.md
+  s_d4826b35da75c5::t_350c290f3b524a 13-16,61,64
+cula/ops/kda/index.py
+  s_d4826b35da75c5::t_6887dcbffb2773 93
+  s_d4826b35da75c5::t_350c290f3b524a 29,33-41,44,46-48,76,84-91
+cula/kda/chunk_intra.py
+  s_d4826b35da75c5::t_350c290f3b524a 62-63
+cula/kernels/registry.py
+  s_d4826b35da75c5::t_b9e7e5a81dec10 29,31-54,63-78,95-102,111-118,143-150,167-174,191-206
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "16ef4a9d98266c84683ffee9b383635f2e20c0d4",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
