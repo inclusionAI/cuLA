@@ -1,0 +1,74 @@
+benchmarks/large_cp_emulation/query_layout.py
+  s_d4826b35da75c5::t_6805880ab19375 65,105,148,159,165
+benchmarks/large_cp_emulation/bench_kda.py
+  s_d4826b35da75c5::t_6805880ab19375 65-66,113,139-141
+  s_d4826b35da75c5::t_d5a5bae77385c5 7,104,106
+cula/hybrid/distributed_pool.py
+  s_d4826b35da75c5::t_6805880ab19375 62,150,162,238,248,253
+benchmarks/bench_index_pool_cp.py
+  s_d4826b35da75c5::t_6805880ab19375 121,123,128,187,191,244,246,329,331
+tests/test_large_cp_query_layout.py
+  s_d4826b35da75c5::t_6805880ab19375 21,28,38-39,49,52
+docs/KIMI_CP_RUNTIME.md
+  s_d4826b35da75c5::t_918764ab0001af 6-7,13,19,34,67-69,73-74,76-77,80,85,88-89
+  s_d4826b35da75c5::t_7af40d80d50c94 109-110,185-188,192
+benchmarks/large_cp_emulation/README.md
+  s_d4826b35da75c5::t_81607eed1282eb 23-24
+benchmarks/large_cp_emulation/workload.py
+  s_d4826b35da75c5::t_6805880ab19375 27
+tests/test_kimi_cp_plan.py
+  s_d4826b35da75c5::t_6805880ab19375 19
+cula/hybrid/index_pool.py
+  s_d4826b35da75c5::t_6805880ab19375 26,61,65
+cula/hybrid/plan.py
+  s_d4826b35da75c5::t_6805880ab19375 105,196,208
+cula/hybrid/dsa.py
+  s_d4826b35da75c5::t_6805880ab19375 33,93,96,109,412
+USAGE.md
+  s_d4826b35da75c5::t_42bab42172534a 53-54
+benchmarks/large_cp_emulation/bench_dsa_layout.py
+  s_d4826b35da75c5::t_6805880ab19375 83,92,148,250,275,280,282
+benchmarks/large_cp_emulation/transport.py
+  s_d4826b35da75c5::t_6805880ab19375 74
+  s_d4826b35da75c5::t_d5a5bae77385c5 102,110,119,125-127,130-132
+cula/distributed/kda.py
+  s_d4826b35da75c5::t_6805880ab19375 529
+  s_d4826b35da75c5::t_81607eed1282eb 475-476
+  s_d4826b35da75c5::t_e3d40c7b85610a 532-533,660
+  s_d4826b35da75c5::t_42bab42172534a 603-606,613
+  s_d4826b35da75c5::t_db96f1f7b091e1 38-43,46,49-54,140,147-148,153,230,232,240,245,299,307,327,339-370
+  s_d4826b35da75c5::t_a1b5aae6bb6f55 390,406-407,415-416,418-433,435,446,450-451,454,459,463,467-468,478,487-488,492-493,495,501-502,505-528,530-531
+cula/distributed/thd_planner.py
+  s_d4826b35da75c5::t_6805880ab19375 193,221,286,337,550
+benchmarks/large_cp_emulation/bench_hybrid.py
+  s_d4826b35da75c5::t_d5a5bae77385c5 107,115,119
+  s_d4826b35da75c5::t_6805880ab19375 212,353-354,483,539,550,560,569,600,602,612,615,619
+  s_d4826b35da75c5::t_42bab42172534a 485-486
+tests/test_kimi_cp_distributed.py
+  s_d4826b35da75c5::t_7ad3c2838f08db 25-26,28-32
+  s_d4826b35da75c5::t_6805880ab19375 27
+  s_d4826b35da75c5::t_0fdd7010222e07 6
+tests/test_kimi_cp_helpers.py
+  s_d4826b35da75c5::t_34ee12c2b70595 53-54,56-62,65-67,78,82,87-89,92-95,108-113,131,135,142,149,157-160,258-259,267-269,307-308,314-317,328-333,336-341,345
+  s_d4826b35da75c5::t_46829c7f332bd1 472
+  s_d4826b35da75c5::t_4066930a93f8a7 450-471
+  s_d4826b35da75c5::t_6805880ab19375 318-326
+  s_d4826b35da75c5::t_d61ec83de503df 385
+  s_d4826b35da75c5::t_b3690d0442f252 346-384,386-449
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bc85cc95c070c98710b1679ae8e3753420f95c96",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
