@@ -1,0 +1,21 @@
+benchmarks/bench_kimi_cp_e2e.py
+  s_d4826b35da75c5::t_e38cb5379317e8 1-257
+docs/KIMI_CP_RUNTIME.md
+  s_d4826b35da75c5::t_2084f99b532a19 88-122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "90d02f14505e06b1d45b26e2e94bef2268cd9e4e",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}

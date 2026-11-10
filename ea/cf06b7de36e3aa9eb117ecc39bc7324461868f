@@ -1,0 +1,36 @@
+REPO_LAYOUT.md
+  h_4fcb07cc3ccaae 21-23
+USAGE.md
+  h_4fcb07cc3ccaae 7-49
+cula/distributed/__init__.py
+  h_4fcb07cc3ccaae 1-9
+cula/distributed/kda.py
+  h_4fcb07cc3ccaae 1-418
+cula/distributed/plan.py
+  h_4fcb07cc3ccaae 1-218
+cula/kda/__init__.py
+  h_4fcb07cc3ccaae 31-33,40-42
+docs/KIMI_CP_RUNTIME.md
+  h_4fcb07cc3ccaae 1-99
+pyproject.toml
+  h_4fcb07cc3ccaae 21-24
+tests/conftest.py
+  h_4fcb07cc3ccaae 44
+tests/test_kimi_cp_distributed.py
+  h_4fcb07cc3ccaae 1-81
+tests/test_kimi_cp_helpers.py
+  h_4fcb07cc3ccaae 1-88
+tests/test_kimi_cp_plan.py
+  h_4fcb07cc3ccaae 1-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "eacf06b7de36e3aa9eb117ecc39bc7324461868f",
+  "prompts": {},
+  "humans": {
+    "h_4fcb07cc3ccaae": {
+      "author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
