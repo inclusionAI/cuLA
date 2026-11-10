@@ -1,0 +1,21 @@
+docs/HYBRID_CUDNN_RUNTIME.md
+  s_6257da69414ed9::t_1bb41ff6823cf1 1-53,63-71,73,75-90,112-190
+tests/test_hybrid_dsa_cudnn.py
+  s_6257da69414ed9::t_265dabeb86b7c2 1-52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "457217b9ccc19c01d47046dcc03990bc47858dc6",
+  "prompts": {},
+  "sessions": {
+    "s_6257da69414ed9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19b7a-bc9e-7233-bf21-32f8737c2d61",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
