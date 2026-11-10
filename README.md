@@ -172,8 +172,7 @@ To reproduce the benchmark suites directly:
 
 ```bash
 # Blackwell (SM10X)
-python benchmarks/bench_kda_sm90_prefill.py --mode both
-python benchmarks/bench_kda_chunk_intra.py --mode both
+python benchmarks/bench_kda_chunk_intra.py
 python benchmarks/bench_lightning_attn_prefill.py --modes no_state varlen
 python benchmarks/bench_la_decode_vs_fla.py --heads 64 --head-dim 128
 

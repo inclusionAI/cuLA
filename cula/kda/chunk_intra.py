@@ -59,6 +59,8 @@ def chunk_kda_fwd_intra(
     if cu_seqlens is not None and (cu_seqlens.dtype != torch.int32 or chunk_indices.dtype != torch.int32):
         raise TypeError("cu_seqlens and chunk_indices must be int32")
 
+    if not use_tf32_inverse:
+        raise NotImplementedError("use_tf32_inverse=False is not supported by the exact CuTeDSL path")
     resolved_scale = key_dim**-0.5 if scale is None else scale
     if (
         cu_seqlens is None

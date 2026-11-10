@@ -26,25 +26,26 @@ def single_entry_tensor_cache(fn: Callable[..., Any]) -> Callable[..., Any]:
     CUDA tensor merely to build a key.
     """
 
-    last_args: tuple[Any, ...] | None = None
-    last_kwargs: dict[str, Any] | None = None
-    last_result: Any = None
+    entry: tuple[tuple[Any, ...], dict[str, Any], Any] | None = None
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        nonlocal last_args, last_kwargs, last_result
-        if last_args is not None and last_kwargs is not None:
-            same_args = len(args) == len(last_args) and all(a is b for a, b in zip(args, last_args, strict=True))
-            same_kwargs = len(kwargs) == len(last_kwargs) and all(
-                key in last_kwargs and value is last_kwargs[key] for key, value in kwargs.items()
+        nonlocal entry
+        cached = entry
+        if cached is not None:
+            cached_args, cached_kwargs, cached_result = cached
+            same_args = len(args) == len(cached_args) and all(
+                arg is cached_arg for arg, cached_arg in zip(args, cached_args, strict=True)
+            )
+            same_kwargs = len(kwargs) == len(cached_kwargs) and all(
+                key in cached_kwargs and value is cached_kwargs[key] for key, value in kwargs.items()
             )
             if same_args and same_kwargs:
-                return last_result
+                return cached_result
 
-        last_result = fn(*args, **kwargs)
-        last_args = args
-        last_kwargs = kwargs
-        return last_result
+        result = fn(*args, **kwargs)
+        entry = (args, kwargs, result)
+        return result
 
     return wrapper
 
@@ -72,7 +73,7 @@ def prepare_chunk_indices(
     how many chunks belong to each sequence.
     """
 
-    if chunk_size <= 0:
+    if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}")
     source = cu_seqlens if cu_seqlens_cpu is None else cu_seqlens_cpu
     if source.ndim != 1:
@@ -80,21 +81,16 @@ def prepare_chunk_indices(
     if source.numel() == 0:
         raise ValueError("cu_seqlens must contain at least one element")
 
-    counts = torch.div(prepare_lens(source) + chunk_size - 1, chunk_size, rounding_mode="floor").tolist()
-    sequence_ids: list[int] = []
-    local_chunk_ids: list[int] = []
-    for sequence_id, count in enumerate(counts):
-        count = int(count)
-        sequence_ids.extend([sequence_id] * count)
-        local_chunk_ids.extend(range(count))
-
-    if not sequence_ids:
-        return torch.empty((0, 2), dtype=cu_seqlens.dtype, device=cu_seqlens.device)
-    return torch.tensor(
-        list(zip(sequence_ids, local_chunk_ids, strict=True)),
-        dtype=cu_seqlens.dtype,
-        device=cu_seqlens.device,
+    counts = torch.div(prepare_lens(source) + chunk_size - 1, chunk_size, rounding_mode="floor")
+    repeat_counts = counts.to(torch.int64)
+    sequence_ids = torch.repeat_interleave(
+        torch.arange(counts.numel(), dtype=source.dtype, device=source.device), repeat_counts
     )
+    sequence_starts = torch.cumsum(counts, dim=0) - counts
+    local_chunk_ids = torch.arange(sequence_ids.numel(), dtype=source.dtype, device=source.device) - (
+        torch.repeat_interleave(sequence_starts, repeat_counts)
+    )
+    return torch.stack((sequence_ids, local_chunk_ids), dim=-1).to(dtype=cu_seqlens.dtype, device=cu_seqlens.device)
 
 
 __all__ = ["prepare_chunk_indices", "prepare_lens", "single_entry_tensor_cache"]

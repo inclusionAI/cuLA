@@ -35,9 +35,13 @@ def test_runtime_package_has_no_fla_or_triton_imports():
 
 def test_registry_names_are_exported():
     namespaces = {"kda": kda, "lightning": lightning}
+    registered_by_family = {family: set() for family in namespaces}
     for spec in list_kernels():
         assert spec.name in namespaces[spec.family].__all__
         assert get_kernel(spec.name) is spec
+        registered_by_family[spec.family].add(spec.name)
+    for family, namespace in namespaces.items():
+        assert registered_by_family[family] == set(namespace.__all__)
 
 
 def test_registry_filters_are_stable():
@@ -57,7 +61,8 @@ def test_prepare_chunk_indices_cpu_contract():
 
 
 def test_prepare_chunk_indices_rejects_invalid_metadata():
-    with pytest.raises(ValueError, match="positive"):
-        prepare_chunk_indices(torch.tensor([0, 4], dtype=torch.int32), 0)
+    for chunk_size in (None, -1, 0, True, 64.0):
+        with pytest.raises(ValueError, match="positive"):
+            prepare_chunk_indices(torch.tensor([0, 4], dtype=torch.int32), chunk_size)
     with pytest.raises(ValueError, match="one-dimensional"):
         prepare_chunk_indices(torch.zeros((2, 2), dtype=torch.int32), 64)
