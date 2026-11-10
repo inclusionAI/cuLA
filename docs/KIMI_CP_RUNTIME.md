@@ -99,36 +99,22 @@ The four-GPU L20C environment cannot measure real 64-GPU scaling. The E2E
 emulator therefore maps representative logical ranks `0/21/42/63` onto four
 physical processes, uses 16,384 local tokens per logical rank, and executes 63
 real NCCL ring hops with the 4 MiB FP32 `(H,M)` payload in each direction. The
-local summary, IEEE merge, KDA forward, backward summary, reverse merge, and
-local autograd are real cuDNN operations. No DSA stage is included.
+local summaries, cuDNN concatenated-summary KDA apply, backward summaries, and
+local backward are real cuDNN operations. No DSA stage is included.
 
-Shape: 1,048,576 global tokens, logical CP64, `H=32`, `K=V=128`. One complete
-warmup was excluded, followed by three steady-state samples.
+The default shape is 1,048,576 global tokens, logical CP64, `H=32`, and
+`K=V=128`. The harness reports total CUDA/wall time, transport and preparation
+time, peak memory, proxy loss, output norm, gradient norms, and finiteness after
+one warmup. These measurements model the serial CP64 dependency length on the
+local four-GPU fabric; they do not model 64-GPU topology, cross-node contention,
+or aggregate bisection bandwidth. The reproducible harness is
+`benchmarks/large_cp_emulation/bench_kda.py`; its logical topology and
+benchmark-only transport remain outside the production CP runtime.
 
-| E2E stage | Critical-stage median |
-|---|---:|
-| Forward summary | 0.903 ms |
-| Forward 63-hop communication | 3.008 ms |
-| Forward FP32 merge | 0.293 ms |
-| Local KDA forward | 1.054 ms |
-| Backward summary | 1.083 ms |
-| Backward 63-hop communication | 3.216 ms |
-| Backward FP32 merge | 0.403 ms |
-| Local KDA backward | 3.261 ms |
+Results from the retired stand-alone merge API are intentionally not presented
+as current numbers. Re-run the harness with the cuDNN Frontend version under
+evaluation before using it for a performance decision.
 
-The measured critical-path median was **12.953 ms GPU time** and **16.102 ms
-wall time**. Peak allocated memory was 3.049 GiB per physical process; peak
-reserved memory was 3.15–3.27 GiB. Outputs and all five local input gradients
-were finite on every representative rank. Proxy loss, output norm, and gradient
-norms were identical across all three repeats on each rank.
-
-Communication accounts for roughly 6.22 ms of the stage envelope and is the
-largest optimization target. These numbers model the serial CP64 dependency
-length on the local four-GPU fabric; they do not model 64-GPU topology,
-cross-node contention, or aggregate bisection bandwidth. The reproducible
-harness is `benchmarks/large_cp_emulation/bench_kda.py`. The logical topology
-and benchmark-only transport live beside it rather than in the production CP
-runtime.
 ## Prepared large-CP transport
 
 The convenience path allocates its gathered H and M tensors on each forward and
