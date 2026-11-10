@@ -5,7 +5,7 @@
 
 Two modes deliberately answer different questions:
 
-* ``real`` runs a real CP group.  KDA uses cuLA's prepared all-gather
+* ``real`` runs a real CP group. KDA uses cuLA's prepared all-gather
   transport, while the DSA branch pools local index keys and all-gathers the
   compressed rows before deterministic selection.
 * ``logical`` maps representative ranks from a larger logical CP group onto
@@ -83,6 +83,58 @@ class _DsaEvents:
             "comm_ms": self.after_pool.elapsed_time(self.after_comm),
             "select_ms": self.after_comm.elapsed_time(self.end),
             "total_ms": self.start.elapsed_time(self.end),
+        }
+
+
+@dataclass(slots=True)
+class _TimedKimiCPTransport:
+    """Benchmark-only CUDA timing wrapper for KDA boundary propagation."""
+
+    transport: object
+    events: list[tuple[bool, torch.cuda.Event, torch.cuda.Event]]
+
+    @classmethod
+    def wrap(cls, transport: object) -> _TimedKimiCPTransport:
+        return cls(transport=transport, events=[])
+
+    @property
+    def workspace_bytes(self) -> int:
+        return self.transport.workspace_bytes
+
+    def clear_events(self) -> None:
+        self.events.clear()
+
+    def boundary_state(
+        self,
+        h: torch.Tensor,
+        transition: torch.Tensor,
+        *,
+        plan: KimiCPPlan,
+        group: dist.ProcessGroup | None,
+        reverse: bool,
+    ) -> torch.Tensor:
+        begin = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        begin.record()
+        result = self.transport.boundary_state(
+            h,
+            transition,
+            plan=plan,
+            group=group,
+            reverse=reverse,
+        )
+        end.record()
+        self.events.append((reverse, begin, end))
+        return result
+
+    def timings(self) -> dict[str, float]:
+        totals = {False: 0.0, True: 0.0}
+        for reverse, begin, end in self.events:
+            totals[reverse] += begin.elapsed_time(end)
+        return {
+            "forward_ms": totals[False],
+            "reverse_ms": totals[True],
+            "total_ms": totals[False] + totals[True],
         }
 
 
@@ -327,6 +379,8 @@ def _run(args: argparse.Namespace) -> None:
             value_dim=args.value_dim,
             device=device,
         )
+        if args.profile_kda_transport:
+            kda_transport = _TimedKimiCPTransport.wrap(kda_transport)
     else:
         kda_transport = LogicalCPRingTransport(
             logical_cp,
@@ -362,10 +416,11 @@ def _run(args: argparse.Namespace) -> None:
 
     def execute(schedule: str, measure: bool) -> dict[str, object]:
         leaves = [tensor.detach().requires_grad_(True) for tensor in (q, k, v, g, beta)]
-        if isinstance(kda_transport, LogicalCPRingTransport):
+        if isinstance(kda_transport, LogicalCPRingTransport | _TimedKimiCPTransport):
             kda_transport.clear_events()
         start = torch.cuda.Event(enable_timing=True)
         kda_start = torch.cuda.Event(enable_timing=True)
+        kda_forward_end = torch.cuda.Event(enable_timing=True)
         kda_end = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         if args.cuda_profiler_capture:
@@ -395,7 +450,9 @@ def _run(args: argparse.Namespace) -> None:
                 plan=kda_plan,
                 group=dist.group.WORLD,
                 boundary_transport=kda_transport,
+                checkpoint_every_n_tokens=args.kda_checkpoint_tokens,
             )
+            kda_forward_end.record()
             output.backward(grad_output)
         kda_end.record()
         if schedule == "overlap":
@@ -414,6 +471,8 @@ def _run(args: argparse.Namespace) -> None:
             "cuda_total_ms": start.elapsed_time(end) if measure else None,
             "wall_ms": hotpath_wall_ms if measure else None,
             "kda_ms": kda_start.elapsed_time(kda_end) if measure else None,
+            "kda_forward_ms": kda_start.elapsed_time(kda_forward_end) if measure else None,
+            "kda_backward_ms": kda_forward_end.elapsed_time(kda_end) if measure else None,
             "dsa_ms": dsa_events.timings() if measure else None,
             "proxy_loss": (output.float() * grad_output.float()).sum().item(),
             "output_norm": output.float().norm().item(),
@@ -434,6 +493,8 @@ def _run(args: argparse.Namespace) -> None:
                 for direction, begin, after_comm, after_merge in kda_transport.events
                 for stage in ("comm", "merge")
             }
+        if measure and isinstance(kda_transport, _TimedKimiCPTransport):
+            sample["kda_boundary_ms"] = kda_transport.timings()
         return sample
 
     schedules = ("serial", "overlap") if args.schedule == "both" else (args.schedule,)
@@ -443,7 +504,8 @@ def _run(args: argparse.Namespace) -> None:
     memory_by_schedule = {}
     for schedule in schedules:
         dist.barrier(device_ids=[local_rank])
-        execute(schedule, False)
+        for _ in range(args.warmups):
+            execute(schedule, False)
         dist.barrier(device_ids=[local_rank])
         torch.cuda.reset_peak_memory_stats(device)
         if args.cuda_profiler_capture:
@@ -497,6 +559,23 @@ def _run(args: argparse.Namespace) -> None:
                         "kda": statistics.median(
                             sample["kda_ms"] for sample in records[r]["samples"][schedule]
                         ),
+                        "kda_forward": statistics.median(
+                            sample["kda_forward_ms"] for sample in records[r]["samples"][schedule]
+                        ),
+                        "kda_backward": statistics.median(
+                            sample["kda_backward_ms"] for sample in records[r]["samples"][schedule]
+                        ),
+                        **(
+                            {
+                                f"kda_boundary_{stage}": statistics.median(
+                                    sample["kda_boundary_ms"][stage]
+                                    for sample in records[r]["samples"][schedule]
+                                )
+                                for stage in ("forward_ms", "reverse_ms", "total_ms")
+                            }
+                            if args.profile_kda_transport
+                            else {}
+                        ),
                         **{
                             f"dsa_{stage}": statistics.median(
                                 sample["dsa_ms"][stage]
@@ -519,9 +598,11 @@ def _run(args: argparse.Namespace) -> None:
                     "global_tokens": args.global_tokens,
                     "logical_cp": logical_cp,
                     "logical_transport": args.logical_transport if args.mode == "logical" else "physical",
+                    "kda_transport": "allgather" if args.mode == "real" else "logical-ring",
                     "transport_hops": transport_hops,
                     "physical_gpus": world_size,
                     "local_tokens": local_tokens,
+                    "kda_checkpoint_tokens": args.kda_checkpoint_tokens,
                     "sequence_lengths": workload.sequence_lengths,
                     "schedules": summary,
                     "rank_resources": [
@@ -595,6 +676,11 @@ def _parse_args() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="mode", required=True)
     real = subparsers.add_parser("real", help="run the physical processes as the real CP group")
     real.add_argument("--global-tokens", type=_positive_int, default=1 << 17)
+    real.add_argument(
+        "--profile-kda-transport",
+        action="store_true",
+        help="record CUDA time around real KDA boundary transport calls",
+    )
     logical = subparsers.add_parser("logical", help="emulate a larger logical CP group")
     logical.add_argument("--global-tokens", type=_positive_int, default=1 << 20)
     logical.add_argument("--logical-cp", type=_positive_int, default=64)
@@ -605,6 +691,7 @@ def _parse_args() -> argparse.Namespace:
         help="emulate all CP edges or only the longest packed sample's CP chain",
     )
     real.set_defaults(logical_transport="physical")
+    logical.set_defaults(profile_kda_transport=False)
     for subparser in (real, logical):
         subparser.add_argument("--heads", type=_positive_int, default=32)
         subparser.add_argument("--key-dim", type=_positive_int, default=128)
@@ -614,12 +701,25 @@ def _parse_args() -> argparse.Namespace:
         subparser.add_argument("--top-k", type=_positive_int, default=512)
         subparser.add_argument("--block-size", type=_positive_int, default=4)
         subparser.add_argument(
+            "--kda-checkpoint-tokens",
+            type=int,
+            choices=(0, 16),
+            default=0,
+            help="16 retains every native KDA chunk state; 0 recomputes them in backward",
+        )
+        subparser.add_argument(
             "--dsa-budget-mib",
             type=int,
             default=0,
             help="0 selects cuLA's adaptive exact-workspace policy",
         )
         subparser.add_argument("--schedule", choices=("serial", "overlap", "both"), default="both")
+        subparser.add_argument(
+            "--warmups",
+            type=_positive_int,
+            default=3,
+            help="untimed iterations used to amortize cuDNN JIT and communicator setup",
+        )
         subparser.add_argument("--repeats", type=_positive_int, default=5)
         subparser.add_argument("--seed", type=int, default=20261102)
         subparser.add_argument(

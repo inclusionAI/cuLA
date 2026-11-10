@@ -5,23 +5,18 @@
 
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
 
+from cula.distributed.kda import _load_cudnn_cp_ops
+
 
 def _load_merge():
-    from cudnn.linear_attention import kimi_cp_merge
-
-    if "precision" not in inspect.signature(kimi_cp_merge).parameters:
-        return kimi_cp_merge
-
-    def ieee_merge(*args, **kwargs):
-        return kimi_cp_merge(*args, precision="ieee", **kwargs)
-
-    return ieee_merge
+    # Keep the benchmark emulator on exactly the same export compatibility
+    # and fixed-IEEE path as the production CP runtime.
+    return _load_cudnn_cp_ops()[0]
 
 
 def emulate_ring_hops(
