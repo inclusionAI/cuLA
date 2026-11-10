@@ -77,9 +77,11 @@ Backward performs the symmetric reverse chain:
 5. Let cuDNN compose the reverse chain and compute local tensor and gate gradients.
 
 The state payload and transition remain FP32. cuLA exposes no merge-precision
-switch; the cuDNN apply API owns the fixed high-precision state chain. This
-runtime requires cuDNN Frontend 1.33 or a newer develop build containing the
-concatenated-summary KDA API.
+switch; the cuDNN apply API owns the fixed high-precision state chain. The
+public cuDNN Frontend 1.32.2 wheel does not contain this API. Until a compatible
+release is published, use the tested source revision
+`9e056425989e75f406a5ce3ad58cb563e4dff8b5` as shown in `USAGE.md`; the runtime
+also checks the required call signatures and fails early on older builds.
 
 ## Current transport and intended evolution
 

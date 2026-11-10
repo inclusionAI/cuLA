@@ -40,10 +40,14 @@ context-parallel KDA apply.
 See [`docs/KIMI_CP_RUNTIME.md`](docs/KIMI_CP_RUNTIME.md) for the ownership and
 validation contracts.
 
-Install the optional CUDA 13 dependencies with:
+The public cuDNN Frontend 1.32.2 wheel predates the concatenated-summary API.
+Until a compatible release is published, install the CUDA 13 dependencies and
+the tested cuDNN Frontend source revision explicitly:
 
 ```bash
-pip install 'cuda-linear-attention[cudnn-cp]'
+python -m pip install '.[cudnn-cp]'
+python -m pip install -v \
+  'git+https://github.com/NVIDIA/cudnn-frontend.git@9e056425989e75f406a5ce3ad58cb563e4dff8b5'
 ```
 
 ---
