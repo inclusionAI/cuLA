@@ -1,0 +1,40 @@
+docs/HYBRID_CUDNN_RUNTIME.md
+  s_6257da69414ed9::t_1bb41ff6823cf1 1-53,63-71,73,75-90,112-190
+  s_d4826b35da75c5::t_4b6382b7f3efe9 54-62,72,74,91-110
+tests/test_hybrid_dsa_cudnn.py
+  s_6257da69414ed9::t_265dabeb86b7c2 1-52
+tests/test_hybrid_dsa_plan.py
+  s_d4826b35da75c5::t_4b6382b7f3efe9 7-11,109-132
+benchmarks/bench_hybrid_cp_emulation.py
+  s_d4826b35da75c5::t_4b6382b7f3efe9 1-225
+cula/hybrid/__init__.py
+  s_d4826b35da75c5::t_4b6382b7f3efe9 8-9,21-22
+cula/hybrid/dsa.py
+  s_d4826b35da75c5::t_4b6382b7f3efe9 19-28,92-99,174,176-181,191,206-207,502-503
+docs/KIMI_CP_RUNTIME.md
+  s_d4826b35da75c5::t_4b6382b7f3efe9 86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b5c56a2f7077c810da07bd024b3b476c16df4e7b",
+  "prompts": {},
+  "sessions": {
+    "s_6257da69414ed9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19b7a-bc9e-7233-bf21-32f8737c2d61",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    },
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}

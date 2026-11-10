@@ -1,0 +1,27 @@
+tests/test_large_cp_query_layout.py
+  s_d4826b35da75c5::t_50172d4c610e64 1-56
+benchmarks/large_cp_emulation/query_layout.py
+  s_d4826b35da75c5::t_50172d4c610e64 1-186
+docs/KDA_CSA_1M_OPTIMIZATION.md
+  s_d4826b35da75c5::t_6a72861fb86854 1-78
+  s_d4826b35da75c5::t_95c788006f8cd9 79
+benchmarks/large_cp_emulation/bench_dsa_layout.py
+  s_d4826b35da75c5::t_2024f1b9a76152 1-270,272-273,277,279-308
+  s_d4826b35da75c5::t_34a4b49505d6bd 271,274-276,278
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "804ef1b405bd5615315b491250c9887f15532198",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
