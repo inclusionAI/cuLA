@@ -62,9 +62,7 @@ def _candidate_prefix(position: int, block_size: int) -> int:
 
 def _candidate_floats(span: QuerySpan, block_size: int) -> int:
     start = span.causal_offset
-    return _candidate_prefix(start + span.tokens, block_size) - _candidate_prefix(
-        start, block_size
-    )
+    return _candidate_prefix(start + span.tokens, block_size) - _candidate_prefix(start, block_size)
 
 
 def _validate_layout_inputs(
@@ -104,9 +102,7 @@ def build_contiguous_query_layout(
     if shard_start % block_size or shard_end % block_size:
         raise ValueError("contiguous CP shard boundaries must be block aligned")
     spans = []
-    for sequence, (sequence_start, sequence_end) in enumerate(
-        zip(boundaries, boundaries[1:])
-    ):
+    for sequence, (sequence_start, sequence_end) in enumerate(zip(boundaries, boundaries[1:])):
         start = max(shard_start, sequence_start)
         end = min(shard_end, sequence_end)
         if start < end:
@@ -149,9 +145,7 @@ def build_alternating_sequence_query_layout(
     assigned_tokens = [0] * world_size
     long_index = 0
     short_sequences = []
-    for sequence, (sequence_start, sequence_end) in enumerate(
-        zip(boundaries, boundaries[1:])
-    ):
+    for sequence, (sequence_start, sequence_end) in enumerate(zip(boundaries, boundaries[1:])):
         length = sequence_end - sequence_start
         if length // world_size < min_shard_tokens:
             short_sequences.append((sequence, sequence_start, sequence_end))
@@ -162,17 +156,13 @@ def build_alternating_sequence_query_layout(
             shard = world_size - 1 - owner if reverse else owner
             start = sequence_start + block_offsets[shard] * block_size
             end = sequence_start + block_offsets[shard + 1] * block_size
-            assignments[owner].append(
-                QuerySpan(sequence, start, end, sequence_start, sequence_end)
-            )
+            assignments[owner].append(QuerySpan(sequence, start, end, sequence_start, sequence_end))
             assigned_tokens[owner] += end - start
         long_index += 1
 
     for sequence, sequence_start, sequence_end in short_sequences:
         owner = min(range(world_size), key=lambda candidate: (assigned_tokens[candidate], candidate))
-        assignments[owner].append(
-            QuerySpan(sequence, sequence_start, sequence_end, sequence_start, sequence_end)
-        )
+        assignments[owner].append(QuerySpan(sequence, sequence_start, sequence_end, sequence_start, sequence_end))
         assigned_tokens[owner] += sequence_end - sequence_start
 
     spans = tuple(sorted(assignments[rank], key=lambda span: (span.sequence, span.token_start)))

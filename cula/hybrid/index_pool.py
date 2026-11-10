@@ -23,8 +23,7 @@ def _load_cudnn_index_pool_ops():
         backward = namespace.csa_compressor_backward_wrapper
     except (ImportError, AttributeError) as error:
         raise ImportError(
-            "cuDNN index pooling requires cuDNN Frontend with the CSA compressor APIs; "
-            "install cuda-linear-attention[cudnn-cp]"
+            "cuDNN index pooling requires cuDNN Frontend with the CSA compressor APIs; install cuda-linear-attention[cudnn-cp]"
         ) from error
     return forward, backward
 
@@ -59,15 +58,11 @@ def _validate_inputs(
     if score.device != kv.device or ape.device != kv.device:
         raise ValueError("kv, score and ape must be on the same device")
     if kv.shape != (plan.total_tokens, plan.input_width):
-        raise ValueError(
-            f"kv must have shape [{plan.total_tokens}, {plan.input_width}], got {tuple(kv.shape)}"
-        )
+        raise ValueError(f"kv must have shape [{plan.total_tokens}, {plan.input_width}], got {tuple(kv.shape)}")
     if score.shape != kv.shape:
         raise ValueError(f"score shape {tuple(score.shape)} must match kv shape {tuple(kv.shape)}")
     if ape.shape != (plan.ratio, plan.input_width):
-        raise ValueError(
-            f"ape must have shape [{plan.ratio}, {plan.input_width}], got {tuple(ape.shape)}"
-        )
+        raise ValueError(f"ape must have shape [{plan.ratio}, {plan.input_width}], got {tuple(ape.shape)}")
     if kv.dtype != torch.bfloat16 or score.dtype != torch.bfloat16:
         raise TypeError("kv and score must have bfloat16 dtype")
     if ape.dtype != torch.float32:

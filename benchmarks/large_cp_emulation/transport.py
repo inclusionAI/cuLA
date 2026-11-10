@@ -10,14 +10,6 @@ from dataclasses import dataclass, field
 import torch
 import torch.distributed as dist
 
-from cula.distributed.kda import _load_cudnn_cp_ops
-
-
-def _load_merge():
-    # Keep the benchmark emulator on exactly the same export compatibility
-    # and fixed-IEEE path as the production CP runtime.
-    return _load_cudnn_cp_ops()[0]
-
 
 def emulate_ring_hops(
     source: torch.Tensor,
@@ -57,7 +49,6 @@ class LogicalCPRingTransport:
     physical_rank: int
     physical_world_size: int
     ring_hops: int | None = field(default=None, kw_only=True)
-    merge: object = field(default_factory=_load_merge)
     events: list[tuple[str, torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]] = field(default_factory=list)
     local_payload: torch.Tensor | None = None
     receive_payload: torch.Tensor | None = None
@@ -80,9 +71,7 @@ class LogicalCPRingTransport:
         self.local_payload = torch.empty(payload_shape, dtype=torch.float32, device=h.device)
         self.receive_payload = torch.empty_like(self.local_payload)
         self.h_summaries = torch.empty((self.logical_cp - 1, *h.shape), dtype=torch.float32, device=h.device)
-        self.transition_summaries = torch.empty(
-            (self.logical_cp - 1, *transition.shape), dtype=torch.float32, device=h.device
-        )
+        self.transition_summaries = torch.empty((self.logical_cp - 1, *transition.shape), dtype=torch.float32, device=h.device)
 
     @property
     def workspace_bytes(self) -> int:
@@ -110,7 +99,7 @@ class LogicalCPRingTransport:
             hops=hops,
         )
 
-    def boundary_state(
+    def boundary_summaries(
         self,
         h: torch.Tensor,
         transition: torch.Tensor,
@@ -118,7 +107,7 @@ class LogicalCPRingTransport:
         plan,
         group,
         reverse: bool,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         del group
         self._prepare(h, transition)
         assert self.local_payload is not None
@@ -127,20 +116,17 @@ class LogicalCPRingTransport:
         self.local_payload[..., h.shape[-2] :, :].copy_(transition)
         start = torch.cuda.Event(enable_timing=True)
         after_comm = torch.cuda.Event(enable_timing=True)
-        after_merge = torch.cuda.Event(enable_timing=True)
+        after_prepare = torch.cuda.Event(enable_timing=True)
         start.record()
         self._ring()
         after_comm.record()
 
         pieces = plan.post_num_ranks if reverse else plan.pre_num_ranks
-        if pieces == 0:
-            state = torch.zeros_like(h)
-        else:
-            h_all = self.h_summaries[:pieces]
-            transition_all = self.transition_summaries[:pieces]
+        h_all = self.h_summaries[:pieces]
+        transition_all = self.transition_summaries[:pieces]
+        if pieces:
             h_all.copy_(h.unsqueeze(0))
             transition_all.copy_(transition.unsqueeze(0))
-            state = self.merge(h_all, transition_all, reverse=reverse)["final_state"][0]
-        after_merge.record()
-        self.events.append(("backward" if reverse else "forward", start, after_comm, after_merge))
-        return state
+        after_prepare.record()
+        self.events.append(("backward" if reverse else "forward", start, after_comm, after_prepare))
+        return h_all, transition_all

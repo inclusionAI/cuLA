@@ -24,9 +24,7 @@ class PackedTHDWorkload:
 
     @property
     def sequence_lengths(self) -> tuple[int, ...]:
-        return tuple(
-            right - left for left, right in zip(self.global_cu_seqlens, self.global_cu_seqlens[1:])
-        )
+        return tuple(right - left for left, right in zip(self.global_cu_seqlens, self.global_cu_seqlens[1:]))
 
     @classmethod
     def single_sequence(cls, global_tokens: int) -> PackedTHDWorkload:

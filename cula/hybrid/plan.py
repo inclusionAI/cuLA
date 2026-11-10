@@ -102,9 +102,7 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
 
-def _local_boundaries(
-    global_cu_seqlens: tuple[int, ...], token_start: int, token_end: int
-) -> tuple[int, ...]:
+def _local_boundaries(global_cu_seqlens: tuple[int, ...], token_start: int, token_end: int) -> tuple[int, ...]:
     return (
         (0,)
         + tuple(value - token_start for value in global_cu_seqlens[1:-1] if token_start < value < token_end)
@@ -195,9 +193,7 @@ class IndexPoolShardPlan:
 
     @property
     def block_counts(self) -> tuple[int, ...]:
-        return tuple(
-            right - left for left, right in zip(self.block_offsets, self.block_offsets[1:])
-        )
+        return tuple(right - left for left, right in zip(self.block_offsets, self.block_offsets[1:]))
 
     @property
     def equal_block_counts(self) -> bool:
@@ -209,10 +205,7 @@ class IndexPoolShardPlan:
 
         if not dist.is_available() or not dist.is_initialized():
             if group is not None or self.world_size != 1 or self.rank != 0:
-                raise RuntimeError(
-                    "the index-pooling shard plan requires an initialized "
-                    "torch.distributed process group"
-                )
+                raise RuntimeError("the index-pooling shard plan requires an initialized torch.distributed process group")
             return
         world_size = dist.get_world_size(group)
         rank = dist.get_rank(group)

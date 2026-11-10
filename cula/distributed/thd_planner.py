@@ -190,9 +190,7 @@ def _contiguous_items(boundaries: tuple[int, ...], world_size: int, block_size: 
             start = max(shard_start, sequence_start)
             end = min(shard_end, sequence_end)
             if start < end:
-                result.append(
-                    (_make_item(sequence, start, end, sequence_start, sequence_end, block_size), rank)
-                )
+                result.append((_make_item(sequence, start, end, sequence_start, sequence_end, block_size), rank))
     return result
 
 
@@ -220,9 +218,7 @@ def _adaptive_items(
         for left, right in zip(offsets, offsets[1:]):
             start = sequence_start + left * block_size
             end = sequence_start + right * block_size
-            result.append(
-                _make_item(sequence, start, end, sequence_start, sequence_end, block_size)
-            )
+            result.append(_make_item(sequence, start, end, sequence_start, sequence_end, block_size))
 
     # Keep all ranks non-empty even for small batches containing fewer than W
     # sequences.  The minimum span is a performance preference, not a semantic
@@ -287,8 +283,7 @@ def _greedy_assign(items: list[_PlanningItem], world_size: int) -> list[tuple[_P
                     (token_loads[rank] + item.tokens) / ideal_tokens,
                     (causal_loads[rank] + item.causal_work) / ideal_causal,
                 ),
-                (token_loads[rank] + item.tokens) / ideal_tokens
-                + (causal_loads[rank] + item.causal_work) / ideal_causal,
+                (token_loads[rank] + item.tokens) / ideal_tokens + (causal_loads[rank] + item.causal_work) / ideal_causal,
                 item_counts[rank],
                 rank,
             ),
@@ -339,10 +334,7 @@ def _rebalance_tokens(
 
     total_blocks = sum(item.tokens for item, _ in assignments) // block_size
     capacity_offsets = balanced_shards(total_blocks, world_size)
-    capacities = [
-        (right - left) * block_size
-        for left, right in zip(capacity_offsets, capacity_offsets[1:])
-    ]
+    capacities = [(right - left) * block_size for left, right in zip(capacity_offsets, capacity_offsets[1:])]
     loads = [0] * world_size
     causal_loads = [0] * world_size
     for item, owner in assignments:
@@ -555,10 +547,7 @@ def plan_thd_layout(
         )
         if adaptive is None:
             continue
-        signature = tuple(
-            (span.sequence, span.token_start, span.token_end, span.owner)
-            for span in adaptive[1]
-        )
+        signature = tuple((span.sequence, span.token_start, span.token_end, span.owner) for span in adaptive[1])
         if signature not in seen_assignments:
             adaptive_candidates.append(adaptive)
             seen_assignments.add(signature)

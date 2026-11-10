@@ -104,7 +104,7 @@ class _TimedKimiCPTransport:
     def clear_events(self) -> None:
         self.events.clear()
 
-    def boundary_state(
+    def boundary_summaries(
         self,
         h: torch.Tensor,
         transition: torch.Tensor,
@@ -112,11 +112,11 @@ class _TimedKimiCPTransport:
         plan: KimiCPPlan,
         group: dist.ProcessGroup | None,
         reverse: bool,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         begin = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         begin.record()
-        result = self.transport.boundary_state(
+        result = self.transport.boundary_summaries(
             h,
             transition,
             plan=plan,
@@ -209,9 +209,7 @@ class _DsaIndexerBranch:
         select_cu_k = [0]
         select_offsets = []
         for sequence in range(first_sequence, last_sequence + 1):
-            select_cu_k.append(
-                select_cu_k[-1] + global_block_prefix[sequence + 1] - global_block_prefix[sequence]
-            )
+            select_cu_k.append(select_cu_k[-1] + global_block_prefix[sequence + 1] - global_block_prefix[sequence])
             local_sequence_start = max(shard_plan.token_start, global_cu_seqlens[sequence])
             select_offsets.append(local_sequence_start - global_cu_seqlens[sequence])
         select_plan = DsaSelectionPlan.from_cu_seqlens(
@@ -352,12 +350,8 @@ def _run(args: argparse.Namespace) -> None:
     def randn(*shape, dtype=torch.bfloat16):
         return torch.randn(*shape, dtype=dtype, device=device)
 
-    q = torch.nn.functional.normalize(randn(local_tokens, args.heads, args.key_dim).float(), dim=-1).to(
-        torch.bfloat16
-    )
-    k = torch.nn.functional.normalize(randn(local_tokens, args.heads, args.key_dim).float(), dim=-1).to(
-        torch.bfloat16
-    )
+    q = torch.nn.functional.normalize(randn(local_tokens, args.heads, args.key_dim).float(), dim=-1).to(torch.bfloat16)
+    k = torch.nn.functional.normalize(randn(local_tokens, args.heads, args.key_dim).float(), dim=-1).to(torch.bfloat16)
     v = randn(local_tokens, args.heads, args.value_dim)
     g = -(0.01 + 0.04 * torch.rand(local_tokens, args.heads, args.key_dim, dtype=torch.float32, device=device))
     beta = torch.sigmoid(randn(local_tokens, args.heads, dtype=torch.float32))
@@ -486,12 +480,10 @@ def _run(args: argparse.Namespace) -> None:
         if measure and isinstance(kda_transport, LogicalCPRingTransport):
             sample["kda_transport_ms"] = {
                 f"{direction}_{stage}_ms": (
-                    begin.elapsed_time(after_comm)
-                    if stage == "comm"
-                    else after_comm.elapsed_time(after_merge)
+                    begin.elapsed_time(after_comm) if stage == "comm" else after_comm.elapsed_time(after_prepare)
                 )
-                for direction, begin, after_comm, after_merge in kda_transport.events
-                for stage in ("comm", "merge")
+                for direction, begin, after_comm, after_prepare in kda_transport.events
+                for stage in ("comm", "prepare")
             }
         if measure and isinstance(kda_transport, _TimedKimiCPTransport):
             sample["kda_boundary_ms"] = kda_transport.timings()
@@ -544,8 +536,7 @@ def _run(args: argparse.Namespace) -> None:
                 for i in range(args.repeats)
             ]
             critical_wall = [
-                max(records[r]["samples"][schedule][i]["wall_ms"] for r in range(world_size))
-                for i in range(args.repeats)
+                max(records[r]["samples"][schedule][i]["wall_ms"] for r in range(world_size)) for i in range(args.repeats)
             ]
             summary[schedule] = {
                 "critical_cuda_samples_ms": critical_cuda,
@@ -556,9 +547,7 @@ def _run(args: argparse.Namespace) -> None:
                     {
                         "physical_rank": r,
                         "logical_rank": records[r]["logical_rank"],
-                        "kda": statistics.median(
-                            sample["kda_ms"] for sample in records[r]["samples"][schedule]
-                        ),
+                        "kda": statistics.median(sample["kda_ms"] for sample in records[r]["samples"][schedule]),
                         "kda_forward": statistics.median(
                             sample["kda_forward_ms"] for sample in records[r]["samples"][schedule]
                         ),
@@ -568,8 +557,7 @@ def _run(args: argparse.Namespace) -> None:
                         **(
                             {
                                 f"kda_boundary_{stage}": statistics.median(
-                                    sample["kda_boundary_ms"][stage]
-                                    for sample in records[r]["samples"][schedule]
+                                    sample["kda_boundary_ms"][stage] for sample in records[r]["samples"][schedule]
                                 )
                                 for stage in ("forward_ms", "reverse_ms", "total_ms")
                             }
@@ -578,8 +566,7 @@ def _run(args: argparse.Namespace) -> None:
                         ),
                         **{
                             f"dsa_{stage}": statistics.median(
-                                sample["dsa_ms"][stage]
-                                for sample in records[r]["samples"][schedule]
+                                sample["dsa_ms"][stage] for sample in records[r]["samples"][schedule]
                             )
                             for stage in ("pool_ms", "comm_ms", "select_ms", "total_ms")
                         },
@@ -610,13 +597,9 @@ def _run(args: argparse.Namespace) -> None:
                             "physical_rank": r,
                             "logical_rank": records[r]["logical_rank"],
                             "dsa_windows": records[r]["dsa_windows"],
-                            "dsa_candidate_workspace_gib": records[r][
-                                "dsa_candidate_workspace_gib"
-                            ],
+                            "dsa_candidate_workspace_gib": records[r]["dsa_candidate_workspace_gib"],
                             "dsa_workspace_gib": records[r]["dsa_workspace_gib"],
-                            "kda_transport_workspace_gib": records[r][
-                                "kda_transport_workspace_gib"
-                            ],
+                            "kda_transport_workspace_gib": records[r]["kda_transport_workspace_gib"],
                             "memory_by_schedule": records[r]["memory_by_schedule"],
                         }
                         for r in range(world_size)
@@ -626,19 +609,14 @@ def _run(args: argparse.Namespace) -> None:
                             "physical_rank": r,
                             "logical_rank": records[r]["logical_rank"],
                             "kda_finite": all(
-                                sample["kda_finite"]
-                                for schedule in schedules
-                                for sample in records[r]["samples"][schedule]
+                                sample["kda_finite"] for schedule in schedules for sample in records[r]["samples"][schedule]
                             ),
                             "dsa_has_nan": any(
-                                sample["dsa_has_nan"]
-                                for schedule in schedules
-                                for sample in records[r]["samples"][schedule]
+                                sample["dsa_has_nan"] for schedule in schedules for sample in records[r]["samples"][schedule]
                             ),
                             "repeat_stable": all(
                                 all(
-                                    sample[key]
-                                    == records[r]["samples"][schedules[0]][0][key]
+                                    sample[key] == records[r]["samples"][schedules[0]][0][key]
                                     for key in (
                                         "proxy_loss",
                                         "output_norm",

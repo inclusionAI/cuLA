@@ -80,9 +80,7 @@ def _layout_for_rank(
 
 def _block_ids(layout: QueryLayout, block_size: int) -> tuple[int, ...]:
     return tuple(
-        block
-        for span in layout.spans
-        for block in range(span.token_start // block_size, span.token_end // block_size)
+        block for span in layout.spans for block in range(span.token_start // block_size, span.token_end // block_size)
     )
 
 
@@ -91,9 +89,7 @@ def _selection_key_ids(
     block_prefix: tuple[int, ...],
 ) -> tuple[int, ...]:
     return tuple(
-        block
-        for span in layout.spans
-        for block in range(block_prefix[span.sequence], block_prefix[span.sequence + 1])
+        block for span in layout.spans for block in range(block_prefix[span.sequence], block_prefix[span.sequence + 1])
     )
 
 
@@ -149,9 +145,7 @@ def _run(args: argparse.Namespace) -> None:
     )
     select_cu_k = [0]
     for span in layout.spans:
-        select_cu_k.append(
-            select_cu_k[-1] + block_prefix[span.sequence + 1] - block_prefix[span.sequence]
-        )
+        select_cu_k.append(select_cu_k[-1] + block_prefix[span.sequence + 1] - block_prefix[span.sequence])
 
     pool_plan = IndexPoolPlan.from_cu_seqlens(
         layout.local_cu_seqlens,
@@ -253,8 +247,7 @@ def _run(args: argparse.Namespace) -> None:
     dist.all_gather_object(records, record)
     if rank == 0:
         critical = [
-            max(records[owner]["samples"][sample]["total_ms"] for owner in range(world_size))
-            for sample in range(args.repeats)
+            max(records[owner]["samples"][sample]["total_ms"] for owner in range(world_size)) for sample in range(args.repeats)
         ]
         print(
             json.dumps(
@@ -279,19 +272,14 @@ def _run(args: argparse.Namespace) -> None:
                             )
                         }
                         | {
-                            f"{stage}_median_ms": statistics.median(
-                                sample[stage] for sample in record["samples"]
-                            )
+                            f"{stage}_median_ms": statistics.median(sample[stage] for sample in record["samples"])
                             for stage in ("pool_ms", "remap_comm_ms", "select_ms", "total_ms")
                         }
                         | {
                             "id_sum_stable": all(
-                                sample["id_sum"] == record["samples"][0]["id_sum"]
-                                for sample in record["samples"]
+                                sample["id_sum"] == record["samples"][0]["id_sum"] for sample in record["samples"]
                             ),
-                            "score_sum_span": max(
-                                sample["score_sum"] for sample in record["samples"]
-                            )
+                            "score_sum_span": max(sample["score_sum"] for sample in record["samples"])
                             - min(sample["score_sum"] for sample in record["samples"]),
                         }
                         for record in records

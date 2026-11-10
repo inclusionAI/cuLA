@@ -59,9 +59,7 @@ def _all_gather_block_rows(
 
     output = local.new_empty((sum(counts), *local.shape[1:]))
     for owner, count in enumerate(counts):
-        output[block_offsets[owner] : block_offsets[owner + 1]].copy_(
-            gathered[owner, :count]
-        )
+        output[block_offsets[owner] : block_offsets[owner + 1]].copy_(gathered[owner, :count])
     return output
 
 
@@ -149,9 +147,7 @@ class _CudnnIndexPoolCP(torch.autograd.Function):
         # would round the CP sum before the nonlinear compressor backward.
         counts = plan.block_counts
         local_count = counts[plan.rank]
-        received = grad_output.new_empty(
-            (plan.world_size * local_count, *grad_output.shape[1:])
-        )
+        received = grad_output.new_empty((plan.world_size * local_count, *grad_output.shape[1:]))
         dist.all_to_all_single(
             received,
             grad_output.contiguous(),
@@ -163,9 +159,7 @@ class _CudnnIndexPoolCP(torch.autograd.Function):
 
         grad_kv = torch.zeros_like(kv, dtype=torch.float32)
         grad_score = torch.zeros_like(score, dtype=torch.float32)
-        grad_ape_by_loss = torch.empty(
-            (plan.world_size, *ape.shape), dtype=torch.float32, device=ape.device
-        )
+        grad_ape_by_loss = torch.empty((plan.world_size, *ape.shape), dtype=torch.float32, device=ape.device)
         for loss_rank in range(plan.world_size):
             result = backward(
                 kv,
@@ -241,8 +235,7 @@ def cudnn_index_pool_cp(
         raise TypeError("deterministic must be a bool")
     if plan.coff != 1 and plan.world_size > 1:
         raise NotImplementedError(
-            "distributed pool-before-gather currently supports coff=1; "
-            "coff=2 requires an overlapping-window halo"
+            "distributed pool-before-gather currently supports coff=1; coff=2 requires an overlapping-window halo"
         )
     plan.validate_group(group)
     if not plan.all_shards_direct or not plan.direct_local_pool:
@@ -252,15 +245,12 @@ def cudnn_index_pool_cp(
         )
     if any(count == 0 for count in plan.block_counts):
         raise NotImplementedError(
-            "distributed pool-before-gather requires every rank to own at least "
-            "one complete pooling block"
+            "distributed pool-before-gather requires every rank to own at least one complete pooling block"
         )
     if plan.local_plan is None:
         raise RuntimeError("the direct local pooling plan is unavailable")
     if kv.shape[0] != plan.local_tokens:
-        raise ValueError(
-            f"kv must contain this rank's {plan.local_tokens} token rows, got {kv.shape[0]}"
-        )
+        raise ValueError(f"kv must contain this rank's {plan.local_tokens} token rows, got {kv.shape[0]}")
 
     _validate_inputs(
         kv,

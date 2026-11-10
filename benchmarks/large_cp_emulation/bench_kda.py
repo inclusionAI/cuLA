@@ -4,7 +4,7 @@
 """Emulate a large logical Kimi CP group on fewer physical GPUs.
 
 The benchmark executes the complete cuLA KDA path: local summary, boundary
-transport and IEEE merge, local forward, and distributed backward. It maps one
+transport and cuDNN-composed apply, local forward, and distributed backward. It maps one
 representative logical rank to each physical process and runs ``CP - 1`` real
 NCCL ring hops per direction. This is a critical-path emulator, not a claim
 about real CP64 topology or contention.
@@ -62,12 +62,8 @@ def _run(args) -> None:
     def randn(*shape, dtype=torch.bfloat16):
         return torch.randn(*shape, dtype=dtype, device=device)
 
-    q = torch.nn.functional.normalize(randn(local_tokens, args.heads, args.key_dim).float(), dim=-1).to(
-        torch.bfloat16
-    )
-    k = torch.nn.functional.normalize(randn(local_tokens, args.heads, args.key_dim).float(), dim=-1).to(
-        torch.bfloat16
-    )
+    q = torch.nn.functional.normalize(randn(local_tokens, args.heads, args.key_dim).float(), dim=-1).to(torch.bfloat16)
+    k = torch.nn.functional.normalize(randn(local_tokens, args.heads, args.key_dim).float(), dim=-1).to(torch.bfloat16)
     v = randn(local_tokens, args.heads, args.value_dim)
     g = -(0.01 + 0.04 * torch.rand(local_tokens, args.heads, args.key_dim, dtype=torch.float32, device=device))
     beta = torch.sigmoid(randn(local_tokens, args.heads, dtype=torch.float32))
@@ -105,17 +101,16 @@ def _run(args) -> None:
             torch.cuda.synchronize(device)
         transport_times = {}
         if measure:
-            for direction, begin, after_comm, after_merge in transport.events:
+            for direction, begin, after_comm, after_prepare in transport.events:
                 transport_times[f"comm_{direction}_ms"] = begin.elapsed_time(after_comm)
-                transport_times[f"merge_{direction}_ms"] = after_comm.elapsed_time(after_merge)
+                transport_times[f"prepare_{direction}_ms"] = after_comm.elapsed_time(after_prepare)
         return {
             "cuda_total_ms": start.elapsed_time(end) if measure else None,
             "transport_ms": transport_times,
             "proxy_loss": (output.float() * grad_output.float()).sum().item(),
             "output_norm": output.float().norm().item(),
             "grad_norms": [tensor.grad.float().norm().item() for tensor in inputs],
-            "finite": bool(torch.isfinite(output).all())
-            and all(bool(torch.isfinite(tensor.grad).all()) for tensor in inputs),
+            "finite": bool(torch.isfinite(output).all()) and all(bool(torch.isfinite(tensor.grad).all()) for tensor in inputs),
         }
 
     dist.barrier(device_ids=[local_rank])
@@ -141,7 +136,9 @@ def _run(args) -> None:
     records = [None] * world_size
     dist.all_gather_object(records, record)
     if rank == 0:
-        critical_cuda = [max(records[r]["samples"][i]["cuda_total_ms"] for r in range(world_size)) for i in range(args.repeats)]
+        critical_cuda = [
+            max(records[r]["samples"][i]["cuda_total_ms"] for r in range(world_size)) for i in range(args.repeats)
+        ]
         critical_wall = [max(records[r]["samples"][i]["wall_ms"] for r in range(world_size)) for i in range(args.repeats)]
         print(
             json.dumps(

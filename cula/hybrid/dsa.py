@@ -30,9 +30,7 @@ _CANDIDATE_BUDGET_LOCAL_ROWS_QUANTUM = 64 << 10
 _MAX_LOCAL_ROWS_MULTIPLIER = 4
 
 
-def _as_nonnegative(
-    values: torch.Tensor | Sequence[int], *, entries: int, name: str
-) -> tuple[int, ...]:
+def _as_nonnegative(values: torch.Tensor | Sequence[int], *, entries: int, name: str) -> tuple[int, ...]:
     if isinstance(values, torch.Tensor):
         if values.device.type != "cpu":
             raise ValueError(f"{name} must be a CPU tensor; copying CUDA metadata would synchronize the device")
@@ -92,13 +90,10 @@ def _candidate_floats(position: int, rows: int, block_size: int) -> int:
 
 
 def _balanced_candidate_budget(cu_q: tuple[int, ...], offsets: tuple[int, ...]) -> int:
-    max_causal_end = max(
-        offset + right - left for left, right, offset in zip(cu_q[:-1], cu_q[1:], offsets, strict=True)
-    )
+    max_causal_end = max(offset + right - left for left, right, offset in zip(cu_q[:-1], cu_q[1:], offsets, strict=True))
     position_steps = max(
         1,
-        (max_causal_end + _CANDIDATE_BUDGET_POSITION_QUANTUM - 1)
-        // _CANDIDATE_BUDGET_POSITION_QUANTUM,
+        (max_causal_end + _CANDIDATE_BUDGET_POSITION_QUANTUM - 1) // _CANDIDATE_BUDGET_POSITION_QUANTUM,
     )
     # Causal reach controls scratch per query row; total local rows control how
     # many scorer/Top-K windows must launch. Preserve the 128K policy, then
@@ -111,8 +106,7 @@ def _balanced_candidate_budget(cu_q: tuple[int, ...], offsets: tuple[int, ...]) 
             _MAX_LOCAL_ROWS_MULTIPLIER,
             max(
                 1,
-                (total_local_rows + _CANDIDATE_BUDGET_LOCAL_ROWS_QUANTUM - 1)
-                // _CANDIDATE_BUDGET_LOCAL_ROWS_QUANTUM,
+                (total_local_rows + _CANDIDATE_BUDGET_LOCAL_ROWS_QUANTUM - 1) // _CANDIDATE_BUDGET_LOCAL_ROWS_QUANTUM,
             ),
         )
     return min(
@@ -415,9 +409,7 @@ def _validate_selection_inputs(
     if qi.ndim != 3 or qi.shape[0] != plan.total_queries:
         raise ValueError(f"qi must have shape [{plan.total_queries}, H, D]")
     if kbar.shape != (plan.total_blocks, 1, qi.shape[2]):
-        raise ValueError(
-            f"kbar must have shape [{plan.total_blocks}, 1, {qi.shape[2]}], got {tuple(kbar.shape)}"
-        )
+        raise ValueError(f"kbar must have shape [{plan.total_blocks}, 1, {qi.shape[2]}], got {tuple(kbar.shape)}")
     if weights.shape != qi.shape[:2]:
         raise ValueError(f"weights must have shape {tuple(qi.shape[:2])}, got {tuple(weights.shape)}")
     if qi.dtype != torch.bfloat16 or kbar.dtype != torch.bfloat16:

@@ -20,8 +20,8 @@ cross-node congestion, or aggregate bandwidth.
 - `bench_hybrid.py`: native KDA plus DSA-indexer serial/overlap benchmark.
 
 `full-ring` emulates `logical_cp - 1` hops. `sample-chain` uses the longest
-packed sample's actual CP span. Neither mode changes KDA merge precision or
-DSA arithmetic.
+packed sample's actual CP span. Neither mode changes cuDNN's KDA summary
+composition arithmetic or DSA arithmetic.
 
 Run from the repository root, for example:
 

@@ -118,20 +118,14 @@ def _local_backward_oracle(kv, score, ape, grad_blocks, plan):
     for start, end in zip(plan.cu_seqlens, plan.cu_seqlens[1:]):
         complete_end = start + (end - start) // plan.ratio * plan.ratio
         if complete_end > start:
-            members.append(
-                torch.arange(start, complete_end, device=kv.device).view(-1, plan.ratio)
-            )
+            members.append(torch.arange(start, complete_end, device=kv.device).view(-1, plan.ratio))
     members = torch.cat(members)
-    grouped_kv = kv.index_select(0, members.flatten()).view(
-        -1, plan.ratio, plan.head_dim
-    ).float()
+    grouped_kv = kv.index_select(0, members.flatten()).view(-1, plan.ratio, plan.head_dim).float()
     grouped_score = score.index_select(0, members.flatten()).view_as(grouped_kv).float()
     weights = torch.softmax(grouped_score + ape.float().unsqueeze(0), dim=1)
     dy = grad_blocks.float().unsqueeze(1)
     dweight = grouped_kv * dy
-    dscore_grouped = weights * (
-        dweight - (dweight * weights).sum(dim=1, keepdim=True)
-    )
+    dscore_grouped = weights * (dweight - (dweight * weights).sum(dim=1, keepdim=True))
     dkv = torch.zeros_like(kv, dtype=torch.float32)
     dscore = torch.zeros_like(score, dtype=torch.float32)
     dkv.index_copy_(0, members.flatten(), (weights * dy).flatten(0, 1))
@@ -190,15 +184,11 @@ def main() -> None:
         ratio=args.ratio,
     )
     global_cu, global_cb = global_plan.materialize(device)
-    token_offsets = tuple(
-        shard * args.global_tokens // world_size for shard in range(world_size + 1)
-    )
+    token_offsets = tuple(shard * args.global_tokens // world_size for shard in range(world_size + 1))
 
     def reference(kv_, score_, ape_):
         global_kv = _GatherReferenceRows.apply(kv_, dist.group.WORLD, token_offsets, rank)
-        global_score = _GatherReferenceRows.apply(
-            score_, dist.group.WORLD, token_offsets, rank
-        )
+        global_score = _GatherReferenceRows.apply(score_, dist.group.WORLD, token_offsets, rank)
         return cudnn_index_pool(
             global_kv,
             global_score,
@@ -251,16 +241,9 @@ def main() -> None:
         "dk_bitwise": bool(torch.equal(ref_grads[0], opt_grads[0])),
         "dk_max_abs": float((ref_grads[0].float() - opt_grads[0].float()).abs().max()),
         "dscore_bitwise": bool(torch.equal(ref_grads[1], opt_grads[1])),
-        "dscore_max_abs": float(
-            (ref_grads[1].float() - opt_grads[1].float()).abs().max()
-        ),
+        "dscore_max_abs": float((ref_grads[1].float() - opt_grads[1].float()).abs().max()),
         "dape_max_abs": float((ref_grads[2] - opt_grads[2]).abs().max()),
-        "dape_max_rel": float(
-            (
-                (ref_grads[2] - opt_grads[2]).abs()
-                / ref_grads[2].abs().clamp_min(1e-12)
-            ).max()
-        ),
+        "dape_max_rel": float(((ref_grads[2] - opt_grads[2]).abs() / ref_grads[2].abs().clamp_min(1e-12)).max()),
         "reference_vs_fp32_oracle": {
             "dk": _errors(ref_grads[0], oracle_grads[0]),
             "dscore": _errors(ref_grads[1], oracle_grads[1]),
@@ -343,13 +326,9 @@ def main() -> None:
                     "global_tokens": args.global_tokens,
                     "world_size": world_size,
                     "ratio": args.ratio,
-                    "sequence_lengths": [
-                        right - left for left, right in zip(boundaries, boundaries[1:])
-                    ],
+                    "sequence_lengths": [right - left for left, right in zip(boundaries, boundaries[1:])],
                     "raw_collective_bytes_per_rank": 2 * kv.numel() * kv.element_size(),
-                    "pooled_collective_bytes_per_rank": (
-                        shard_plan.local_blocks * args.head_dim * kv.element_size()
-                    ),
+                    "pooled_collective_bytes_per_rank": (shard_plan.local_blocks * args.head_dim * kv.element_size()),
                     "correctness": correctness,
                     "gather_then_pool_median_ms": ref_median,
                     "pool_then_gather_median_ms": opt_median,
