@@ -1,0 +1,20 @@
+docs/KIMI_CP_RUNTIME.md
+  s_d4826b35da75c5::t_6e23ebd9690dfa 100-114
+  s_d4826b35da75c5::t_b892fc2ed63744 115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c4380fb739e676f180751c565f0bedbe8ac9dc6b",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}

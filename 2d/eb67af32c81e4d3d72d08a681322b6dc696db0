@@ -1,0 +1,66 @@
+benchmarks/large_cp_emulation/bench_hybrid.py
+  s_d4826b35da75c5::t_848f6474330261 38,43,45-48,50,218-224,267-275,277-297,318-320,331,365,427,525
+  s_d4826b35da75c5::t_b95877400403a2 356-357
+  s_d4826b35da75c5::t_de0eac35486da8 642,644-647
+  s_d4826b35da75c5::t_f16d6dc3b11127 1-37,39-42,44,49,51-211,216-217,225-266,276,298-317,321-330,332-355,358-364,366-377,379-408,410-414,416-426,428-453,454-455,456-492,510-524,526,586-633,639-641,643
+  s_d4826b35da75c5::t_49b01e5015c0da 212-215,378,409,415,493-509,527-585,634-638
+benchmarks/bench_hybrid_cp_emulation.py
+  s_d4826b35da75c5::t_efe4415652b310 3,14
+  s_d4826b35da75c5::t_de0eac35486da8 5
+docs/KIMI_CP_RUNTIME.md
+  s_d4826b35da75c5::t_0c6b7b03516c3a 127-129
+benchmarks/large_cp_emulation/bench_components.py
+  s_d4826b35da75c5::t_f16d6dc3b11127 1-24,26,29-148,156-220
+  s_d4826b35da75c5::t_b95877400403a2 25,27-28,149-155
+benchmarks/large_cp_emulation/workload.py
+  s_d4826b35da75c5::t_7c24a1fb31dd55 1-14,21-62
+  s_d4826b35da75c5::t_51c6a9900b1580 15-20
+benchmarks/bench_hybrid_kda_dsa_e2e.py
+  s_d4826b35da75c5::t_de0eac35486da8 5,18
+  s_d4826b35da75c5::t_efe4415652b310 3,14
+benchmarks/large_cp_emulation/__init__.py
+  s_d4826b35da75c5::t_7c24a1fb31dd55 1-17
+REPO_LAYOUT.md
+  s_d4826b35da75c5::t_0c6b7b03516c3a 55-61,76
+benchmarks/bench_kimi_cp_e2e.py
+  s_d4826b35da75c5::t_de0eac35486da8 5,18
+  s_d4826b35da75c5::t_efe4415652b310 3,14
+benchmarks/large_cp_emulation/README.md
+  s_d4826b35da75c5::t_7c24a1fb31dd55 1-33
+tests/test_large_cp_emulation.py
+  s_d4826b35da75c5::t_bf89195c386c70 4-8,12,14-15,19-37
+benchmarks/large_cp_emulation/bench_kda.py
+  s_d4826b35da75c5::t_f16d6dc3b11127 1-12,14-28,30,34-51,60-75,77,84-182,184
+  s_d4826b35da75c5::t_de0eac35486da8 183,185-188
+  s_d4826b35da75c5::t_e3d1ec057faeec 13,29,31-33,52-59,76,78-83
+benchmarks/large_cp_emulation/topology.py
+  s_d4826b35da75c5::t_7c24a1fb31dd55 1-72,79-109
+  s_d4826b35da75c5::t_51c6a9900b1580 73-78
+benchmarks/large_cp_emulation/transport.py
+  s_d4826b35da75c5::t_7c24a1fb31dd55 1-75,80-151
+  s_d4826b35da75c5::t_51c6a9900b1580 76-79
+cula/hybrid/dsa.py
+  s_d4826b35da75c5::t_49b01e5015c0da 25,29-30,98-121,203-205
+docs/HYBRID_CUDNN_RUNTIME.md
+  s_d4826b35da75c5::t_49b01e5015c0da 55-60,107,115-152
+cula/distributed/kda.py
+  s_d4826b35da75c5::t_49b01e5015c0da 110-121
+tests/test_hybrid_dsa_plan.py
+  s_d4826b35da75c5::t_49b01e5015c0da 120,130,132-145,147-157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2deb67af32c81e4d3d72d08a681322b6dc696db0",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
