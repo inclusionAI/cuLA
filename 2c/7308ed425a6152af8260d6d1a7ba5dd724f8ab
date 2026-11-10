@@ -1,5 +1,32 @@
 benchmarks/bench_hybrid_kda_dsa_e2e.py
   s_d4826b35da75c5::t_bc9e053a234a57 1-2,4,6-8,9,10,11-13,15-17
+  s_d4826b35da75c5::t_84cbda10685dd2 3,5,14,18
+docs/KIMI_CP_RUNTIME.md
+  s_d4826b35da75c5::t_84cbda10685dd2 94-129
+benchmarks/large_cp_emulation/topology.py
+  s_d4826b35da75c5::t_84cbda10685dd2 1-109
+REPO_LAYOUT.md
+  s_d4826b35da75c5::t_84cbda10685dd2 55-61,76
+benchmarks/large_cp_emulation/bench_components.py
+  s_d4826b35da75c5::t_84cbda10685dd2 1-220
+benchmarks/bench_hybrid_cp_emulation.py
+  s_d4826b35da75c5::t_84cbda10685dd2 3,5,14
+benchmarks/large_cp_emulation/workload.py
+  s_d4826b35da75c5::t_84cbda10685dd2 1-62
+benchmarks/large_cp_emulation/__init__.py
+  s_d4826b35da75c5::t_84cbda10685dd2 1-17
+benchmarks/large_cp_emulation/bench_hybrid.py
+  s_d4826b35da75c5::t_84cbda10685dd2 1-563
+tests/test_large_cp_emulation.py
+  s_d4826b35da75c5::t_84cbda10685dd2 1-37
+benchmarks/large_cp_emulation/transport.py
+  s_d4826b35da75c5::t_84cbda10685dd2 1-151
+benchmarks/large_cp_emulation/README.md
+  s_d4826b35da75c5::t_84cbda10685dd2 1-33
+benchmarks/bench_kimi_cp_e2e.py
+  s_d4826b35da75c5::t_84cbda10685dd2 3,5,14,18
+benchmarks/large_cp_emulation/bench_kda.py
+  s_d4826b35da75c5::t_84cbda10685dd2 1-188
 ---
 {
   "schema_version": "authorship/3.0.0",
