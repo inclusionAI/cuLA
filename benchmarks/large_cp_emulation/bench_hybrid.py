@@ -265,6 +265,9 @@ class _DsaIndexerBranch:
                 dist.all_gather_into_tensor(self.global_kbar, local_kbar.contiguous())
             return
 
+        local_slice = self.global_kbar[self.global_block_start : self.global_block_start + self.local_blocks]
+        local_slice.copy_(local_kbar)
+        # The ring alternates buffers; local_kbar is scratch from here on.
         emulate_ring_hops(
             local_kbar,
             self.ring_receive,
@@ -272,7 +275,6 @@ class _DsaIndexerBranch:
             physical_world_size=self.physical_world_size,
             hops=self.transport_hops,
         )
-        self.global_kbar[self.global_block_start : self.global_block_start + self.local_blocks].copy_(local_kbar)
 
     def execute(self) -> _DsaEvents:
         events = _DsaEvents(*(torch.cuda.Event(enable_timing=True) for _ in range(4)))

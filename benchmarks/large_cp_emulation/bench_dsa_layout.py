@@ -93,6 +93,11 @@ def _selection_key_ids(
     )
 
 
+def _validate_block_aligned_workload(workload: PackedTHDWorkload, block_size: int) -> None:
+    if any(length % block_size for length in workload.sequence_lengths):
+        raise ValueError("every packed sequence length must be divisible by the DSA block size")
+
+
 def _run(args: argparse.Namespace) -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -114,6 +119,7 @@ def _run(args: argparse.Namespace) -> None:
             boundaries.append(boundaries[-1] + length)
         workload = PackedTHDWorkload(tuple(boundaries))
     boundaries = workload.global_cu_seqlens
+    _validate_block_aligned_workload(workload, args.block_size)
     layouts = tuple(
         _layout_for_rank(
             args.layout,

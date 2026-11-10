@@ -97,10 +97,8 @@ def build_contiguous_query_layout(
         world_size=world_size,
         block_size=block_size,
     )
-    shard_offsets = balanced_shards(boundaries[-1], world_size)
-    shard_start, shard_end = shard_offsets[rank : rank + 2]
-    if shard_start % block_size or shard_end % block_size:
-        raise ValueError("contiguous CP shard boundaries must be block aligned")
+    block_offsets = balanced_shards(boundaries[-1] // block_size, world_size)
+    shard_start, shard_end = (offset * block_size for offset in block_offsets[rank : rank + 2])
     spans = []
     for sequence, (sequence_start, sequence_end) in enumerate(zip(boundaries, boundaries[1:])):
         start = max(shard_start, sequence_start)

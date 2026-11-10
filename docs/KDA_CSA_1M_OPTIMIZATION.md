@@ -75,5 +75,6 @@ integration needs a multi-span Kimi CP plan: cuDNN must receive one initial
 state per local span, and forward/backward summaries must be routed by
 `(sequence, segment-order)` rather than by physical rank order. The layout must
 be produced before the model stack so layers do not pay token-layout conversion.
-The benchmark and CPU planner live in `benchmarks/large_cp_emulation` to keep
-this not-yet-production policy separate from the contiguous runtime.
+The CPU THD planner lives in `cula/distributed/thd_planner.py`; the layout
+benchmark and its query-layout adapter live in `benchmarks/large_cp_emulation`,
+separate from the contiguous KDA runtime.

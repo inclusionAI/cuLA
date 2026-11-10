@@ -40,6 +40,8 @@ def test_windowed_dsa_selection_is_cuda_graph_set_deterministic():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
+    workspace.block_ids.fill_(-2)
+    workspace.scores.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
 

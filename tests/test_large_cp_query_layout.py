@@ -50,3 +50,17 @@ def test_planned_layout_balances_reference_workload_without_special_case():
 
     assert {layout.local_tokens for layout in layouts} == {1 << 18}
     assert max(layout.candidate_floats for layout in layouts) == min(layout.candidate_floats for layout in layouts)
+
+
+def test_contiguous_layout_uses_block_aligned_shards_for_non_power_of_two_cp():
+    boundaries = [0, 1024, 4096]
+    layouts = [build_contiguous_query_layout(boundaries, rank=rank, world_size=3) for rank in range(3)]
+
+    assert sum(layout.local_tokens for layout in layouts) == boundaries[-1]
+    assert all(span.token_start % 4 == 0 and span.token_end % 4 == 0 for layout in layouts for span in layout.spans)
+    covered = sorted((span.sequence, span.token_start, span.token_end) for layout in layouts for span in layout.spans)
+    for sequence, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+        sequence_spans = [span for span in covered if span[0] == sequence]
+        assert sequence_spans[0][1] == start
+        assert sequence_spans[-1][2] == end
+        assert all(left[2] == right[1] for left, right in zip(sequence_spans, sequence_spans[1:]))
