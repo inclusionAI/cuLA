@@ -1,0 +1,45 @@
+benchmarks/large_cp_emulation/bench_dsa_layout.py
+  s_d4826b35da75c5::t_dd4d7cb2e1096d 83,92,148,250,275,280,282
+benchmarks/large_cp_emulation/README.md
+  s_d4826b35da75c5::t_dd4d7cb2e1096d 23-24
+benchmarks/large_cp_emulation/workload.py
+  s_d4826b35da75c5::t_dd4d7cb2e1096d 27
+cula/hybrid/index_pool.py
+  s_d4826b35da75c5::t_dd4d7cb2e1096d 26,61,65
+tests/test_large_cp_query_layout.py
+  s_d4826b35da75c5::t_dd4d7cb2e1096d 21,28,38-39,49,52
+benchmarks/large_cp_emulation/query_layout.py
+  s_d4826b35da75c5::t_dd4d7cb2e1096d 65,105,148,159,165
+benchmarks/large_cp_emulation/transport.py
+  s_d4826b35da75c5::t_dd4d7cb2e1096d 74,102,110,119,125-127,130-132
+cula/hybrid/plan.py
+  s_d4826b35da75c5::t_dd4d7cb2e1096d 105,196,208
+cula/hybrid/distributed_pool.py
+  s_d4826b35da75c5::t_dd4d7cb2e1096d 62,150,162,238,248,253
+cula/distributed/thd_planner.py
+  s_d4826b35da75c5::t_dd4d7cb2e1096d 193,221,286,337,550
+benchmarks/large_cp_emulation/bench_hybrid.py
+  s_d4826b35da75c5::t_dd4d7cb2e1096d 107,115,119,212,353-354,483,485-486,539,550,560,569,600,602,612,615,619
+cula/hybrid/dsa.py
+  s_d4826b35da75c5::t_dd4d7cb2e1096d 33,93,96,109,412
+benchmarks/bench_index_pool_cp.py
+  s_d4826b35da75c5::t_dd4d7cb2e1096d 121,123,128,187,191,244,246,329,331
+benchmarks/large_cp_emulation/bench_kda.py
+  s_d4826b35da75c5::t_dd4d7cb2e1096d 7,65-66,104,106,113,139-141
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "648c4b3d53abd697c8aefbbb85e657367b27e8c6",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
