@@ -170,6 +170,9 @@ See [BENCHMARK_H200.md](BENCHMARK_H200.md) for CuTe DSL FlashKDA results on an H
 
 To reproduce the benchmark suites directly:
 
+The comparison commands below require FLA to be installed separately; FLA is
+not imported by the cuLA runtime package.
+
 ```bash
 # Blackwell (SM10X)
 python benchmarks/bench_kda_chunk_intra.py
