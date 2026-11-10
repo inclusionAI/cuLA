@@ -51,6 +51,8 @@ def _inv_fwd_subst_16(sL_fp32: cute.Tensor, sM_bf16: cute.Tensor, sINV_bf16: cut
     group = lane // 8
     inv = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), cutlass.Float32)
 
+    # Groups 0/2 invert A and groups 1/3 invert B. The redundant copies keep
+    # every lane named by the full-warp shuffle mask converged.
     for p in cutlass.range_constexpr(8):
         is_lower = cutlass.Float32(p < row)
         is_diag = cutlass.Float32(p == row)
@@ -69,6 +71,7 @@ def _inv_fwd_subst_16(sL_fp32: cute.Tensor, sM_bf16: cute.Tensor, sINV_bf16: cut
             inv[p] = cutlass.select_(row > src_row, row_scale * pivot + inv[p], inv[p])
         inv[src_row] = cutlass.select_(row > src_row, row_scale, inv[src_row])
 
+    # P = diag(A^-1, B^-1), M = [[0, 0], [C, 0]].
     zero = cutlass.BFloat16(0.0)
     if group == 0:
         for col in cutlass.range_constexpr(16):
@@ -117,6 +120,7 @@ def _inv_fwd_subst_16(sL_fp32: cute.Tensor, sM_bf16: cute.Tensor, sINV_bf16: cut
     for ii in cutlass.range_constexpr(cute.size(tCrM_A_u32)):
         tCrM_B_u32[ii] = movm_t_b16(cutlass.Int32(tCrM_A_u32[ii]))
 
+    # dc = P @ M with bf16 operands and fp32 accumulation.
     tCrDC = thr_mma.make_fragment_C(tiled_mma.partition_shape_C((16, 16)))
     tCrDC.fill(0.0)
     cute.gemm(tiled_mma, tCrDC, tCrP_A, tCrM_B, tCrDC)
@@ -139,6 +143,7 @@ def _inv_fwd_subst_16(sL_fp32: cute.Tensor, sM_bf16: cute.Tensor, sINV_bf16: cut
     for ii in cutlass.range_constexpr(cute.size(tCrP_A_u32)):
         tCrP_B_u32[ii] = movm_t_b16(cutlass.Int32(tCrP_A_u32[ii]))
 
+    # O = bf16(-dc) @ P; only its lower-left block is nonzero.
     tCrO = thr_mma.make_fragment_C(tiled_mma.partition_shape_C((16, 16)))
     tCrO.fill(0.0)
     cute.gemm(tiled_mma, tCrO, tCrNegDC_A, tCrP_B, tCrO)
@@ -152,6 +157,7 @@ def _inv_fwd_subst_16(sL_fp32: cute.Tensor, sM_bf16: cute.Tensor, sINV_bf16: cut
     )
     cute.arch.sync_warp()
 
+    # P and O have disjoint nonzero blocks, so this assembles (I + L)^-1.
     coord = cute.make_identity_tensor((16, 16))
     tCcC = thr_mma.partition_C(coord)
     for ii in cutlass.range_constexpr(cute.size(tCcC)):
@@ -212,9 +218,10 @@ def k1_kernel(
     s_k_restored = cute.make_tensor(sG_raw.iterator, kinter_qk_layout)
     sMqk_bf16 = smem.allocate_tensor(cutlass.BFloat16, cc_layout, 128)
     sBetaSig = smem.allocate_tensor(cutlass.Float32, cute.make_layout((CHUNK,)), 128)
-    # Inverse buffers alias sG_cumsum after decay_apply. L remains fp32;
-    # INV and the block-merge matrix use bf16 Tensor Core operands.
-    sL_fp32 = cute.make_tensor(sG_cumsum.iterator, cc_layout)
+    # L is written by warp 0 while warp 1 still reads s_k_inv, so it cannot
+    # alias sG_cumsum. The block-merge buffers are written only after both
+    # warps finish and may safely reuse that dead storage.
+    sL_fp32 = smem.allocate_tensor(cutlass.Float32, cc_layout, 128)
     sG_cumsum_bf16_ptr = cute.recast_ptr(sG_cumsum.iterator, dtype=cutlass.BFloat16)
     sINV_bf16 = cute.make_tensor(sG_cumsum_bf16_ptr + (2 * CHUNK * CHUNK), cc_layout)
     sM_bf16 = cute.make_tensor(sG_cumsum_bf16_ptr + (3 * CHUNK * CHUNK), cc_layout)
