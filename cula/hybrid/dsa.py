@@ -151,9 +151,8 @@ class DsaSelectionPlan:
 
     Long sequences are split into exact causal row windows whose compact-logit
     scratch fits ``candidate_budget_bytes``.  Windowing changes neither input
-    precision nor the selected set; deterministic tie-breaking remains enabled
-    by default at execution.  Whole adjacent sequences are coalesced into one
-    launch when they fit the same budget.
+    precision nor the selected set. Whole adjacent sequences are coalesced into
+    one launch when they fit the same budget.
     """
 
     block_size: int
@@ -462,15 +461,16 @@ def cudnn_dsa_select(
     plan: DsaSelectionPlan,
     workspace: DsaSelectionWorkspace,
     sm_scale: float = 1.0,
-    deterministic: bool = True,
+    deterministic: bool = False,
 ) -> DsaSelectionResult:
     """Select local compressed-block ids with bounded scratch and FP32 logits.
 
     The function consumes packed pooling output directly; it never pads blocks
     to ``[B, max_blocks, D]``.  Every long-sequence window reuses the same
     caller-owned compact-logit buffer.  Returned tensors alias ``workspace``
-    and are overwritten by its next invocation.  ``deterministic=True`` makes
-    the selected set reproducible; cuDNN's radix output slot order remains
+    and are overwritten by its next invocation. Non-deterministic selection is
+    the throughput-oriented default. Pass ``deterministic=True`` when exact-tie
+    reproducibility is required; cuDNN's radix output slot order remains
     unspecified, so downstream code that requires bitwise accumulation order
     must canonicalize the pairs explicitly.
     """

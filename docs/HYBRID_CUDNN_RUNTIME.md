@@ -30,11 +30,12 @@ The hybrid layer does not expose a precision downgrade knob:
 - index-pool KV/score inputs are BF16 and APE is FP32, matching cuDNN;
 - DSA indexer Q/K are BF16, weights may be BF16 or FP32, and selected logits
   are FP32;
-- deterministic Top-K is the default, so exact ties at the K-th boundary keep
-  the smaller block id;
-- deterministic selection guarantees the `(block_id, logit)` set, not radix
-  slot order. CUDA Graph capture/replay preserved the sorted pairs bitwise in
-  validation, while the raw slot order changed;
+- non-deterministic Top-K is the throughput-oriented default; callers can opt
+  into deterministic tie-breaking when exact ties at the K-th boundary must
+  keep the smaller block id;
+- with deterministic selection, the `(block_id, logit)` set is reproducible,
+  not its radix slot order. CUDA Graph capture/replay preserved the sorted
+  pairs bitwise in validation, while the raw slot order changed;
 - windowing replays the same causal rows and visible block range. It only
   changes scratch lifetime and launch partitioning.
 

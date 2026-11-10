@@ -29,7 +29,7 @@ def test_windowed_dsa_selection_is_cuda_graph_set_deterministic():
     weights = torch.randn(tokens, 4, dtype=torch.float32, device=device)
 
     def run():
-        return cudnn_dsa_select(qi, kbar, weights, plan=plan, workspace=workspace)
+        return cudnn_dsa_select(qi, kbar, weights, plan=plan, workspace=workspace, deterministic=True)
 
     run()
     torch.cuda.synchronize()
