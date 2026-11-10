@@ -1,0 +1,21 @@
+tests/test_kimi_cp_helpers.py
+  s_d4826b35da75c5::t_76114df3669354 12-51
+cula/distributed/kda.py
+  s_d4826b35da75c5::t_76114df3669354 72,89-101,423,430,432,585,606-613,621,644,650,661,663
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8585aefd26d0d0cbaa9c33e97e97bf8f186f828a",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}

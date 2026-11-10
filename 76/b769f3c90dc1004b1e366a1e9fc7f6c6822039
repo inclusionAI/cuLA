@@ -1,0 +1,24 @@
+cula/distributed/kda.py
+  s_d4826b35da75c5::t_ae3d24967757c6 38-43,46,49-54,140,147-148,153,230,232,240,245,299,307,327,339-370,390,406-407,415-416,418-433,435,446,450-451,454,459,463,467-468,475-476,478,487-488,492-493,495,501-502,505-533,603-606,613,660
+  s_d4826b35da75c5::t_4306a52368fe84 98-109,119,320
+tests/test_kimi_cp_distributed.py
+  s_d4826b35da75c5::t_ae3d24967757c6 6,25-32
+tests/test_kimi_cp_helpers.py
+  s_d4826b35da75c5::t_ae3d24967757c6 53-54,56-62,65-67,78,82,87-89,92-95,108-113,131,135,142,149,157-160,254,258-259,267-269,307-308,314-326,328-333,336-341,345-472
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "76b769f3c90dc1004b1e366a1e9fc7f6c6822039",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
