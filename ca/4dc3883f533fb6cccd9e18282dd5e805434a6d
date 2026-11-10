@@ -1,0 +1,25 @@
+tests/test_hybrid_dsa_cudnn.py
+  s_d4826b35da75c5::t_1866b37da6120c 32
+tests/test_hybrid_dsa_helpers.py
+  s_d4826b35da75c5::t_1866b37da6120c 6-7,20-72
+cula/hybrid/dsa.py
+  s_d4826b35da75c5::t_1866b37da6120c 154-155,464,471-473
+docs/HYBRID_CUDNN_RUNTIME.md
+  s_d4826b35da75c5::t_1866b37da6120c 33-38
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ca4dc3883f533fb6cccd9e18282dd5e805434a6d",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
