@@ -3,6 +3,7 @@ benchmarks/large_cp_emulation/bench_hybrid.py
   s_d4826b35da75c5::t_b95877400403a2 356-357
   s_d4826b35da75c5::t_de0eac35486da8 642,644-647
   s_d4826b35da75c5::t_f16d6dc3b11127 1-37,39-42,44,49,51-211,216-217,225-266,276,298-317,321-330,332-355,358-364,366-377,379-408,410-414,416-426,428-453,454-455,456-492,510-524,526,586-633,639-641,643
+  s_d4826b35da75c5::t_49b01e5015c0da 212-215,378,409,415,493-509,527-585,634-638
 benchmarks/bench_hybrid_cp_emulation.py
   s_d4826b35da75c5::t_efe4415652b310 3,14
   s_d4826b35da75c5::t_de0eac35486da8 5
@@ -38,6 +39,14 @@ benchmarks/large_cp_emulation/topology.py
 benchmarks/large_cp_emulation/transport.py
   s_d4826b35da75c5::t_7c24a1fb31dd55 1-75,80-151
   s_d4826b35da75c5::t_51c6a9900b1580 76-79
+cula/hybrid/dsa.py
+  s_d4826b35da75c5::t_49b01e5015c0da 25,29-30,98-121,203-205
+docs/HYBRID_CUDNN_RUNTIME.md
+  s_d4826b35da75c5::t_49b01e5015c0da 55-60,107,115-152
+cula/distributed/kda.py
+  s_d4826b35da75c5::t_49b01e5015c0da 110-121
+tests/test_hybrid_dsa_plan.py
+  s_d4826b35da75c5::t_49b01e5015c0da 120,130,132-145,147-157
 ---
 {
   "schema_version": "authorship/3.0.0",
