@@ -1,0 +1,21 @@
+cula/distributed/thd_planner.py
+  s_d4826b35da75c5::t_8e68919da5b375 17,154-155,158-159
+tests/test_thd_planner.py
+  s_d4826b35da75c5::t_8e68919da5b375 98
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7687afd21375c717c17ceeb3daa1ead1499f4cc9",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}

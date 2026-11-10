@@ -1,0 +1,21 @@
+benchmarks/large_cp_emulation/bench_hybrid.py
+  s_d4826b35da75c5::t_2a7cc24777033b 8,89-140,382-383,419,423,453,455,474-475,496-497,507-508,562-578,601,605,679-683,694,703-709,717-722
+benchmarks/large_cp_emulation/transport.py
+  s_d4826b35da75c5::t_b2b2c26eff90f5 13,16-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3421ad139fc29d8fa4c6ad0ecb08c2619a564f3d",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}

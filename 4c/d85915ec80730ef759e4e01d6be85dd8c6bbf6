@@ -1,0 +1,54 @@
+cula/hybrid/dsa.py
+  s_d4826b35da75c5::t_8657674c844c9d 21-28,92-93,95-99,174,191,206-207,502
+  s_d4826b35da75c5::t_e2d19eb22fd9fb 19-20,503
+  s_d4826b35da75c5::t_2a9e8cb89d85a0 94
+  s_d4826b35da75c5::t_3ae3dcc5a26920 176-181
+docs/HYBRID_CUDNN_RUNTIME.md
+  s_d4826b35da75c5::t_8657674c844c9d 54-62,104
+  s_d4826b35da75c5::t_e2d19eb22fd9fb 72,74,91-103,105-110
+  s_6257da69414ed9::t_1b1710266abe3a 111
+cula/hybrid/__init__.py
+  s_d4826b35da75c5::t_8657674c844c9d 8,21
+  s_d4826b35da75c5::t_e2d19eb22fd9fb 9,22
+docs/KIMI_CP_RUNTIME.md
+  s_d4826b35da75c5::t_2f33c176a9ae90 84-85
+benchmarks/bench_hybrid_cp_emulation.py
+  s_d4826b35da75c5::t_af50ab6d68919b 16,111,128,139
+  s_d4826b35da75c5::t_78be0ef84eb694 1-15,18,21-23,26-36,44-67,70-110,112-127,129-132,135-138,140-163,165-167,170-172,175-183,185-197,200-201,206,208-209,213-225
+  s_d4826b35da75c5::t_a6404dd538ffcc 20,37-43,68-69,164,169,173-174,184,198-199,202-205,207,210-212
+  s_d4826b35da75c5::t_3ae3dcc5a26920 133-134,168
+  s_d4826b35da75c5::t_b8f959b9f86038 17,19,24-25
+tests/test_hybrid_dsa_plan.py
+  s_d4826b35da75c5::t_fe0cadaa38865a 7-11,109-132
+  s_d4826b35da75c5::t_5313e6ed4a9c59 133-134
+benchmarks/bench_kimi_cp_e2e.py
+  s_d4826b35da75c5::t_4a78c639f2dacb 1-311
+tests/test_hybrid_cp_benchmark.py
+  s_d4826b35da75c5::t_4a78c639f2dacb 1-14
+benchmarks/bench_hybrid_kda_dsa_e2e.py
+  s_d4826b35da75c5::t_4a78c639f2dacb 1-585
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4cd85915ec80730ef759e4e01d6be85dd8c6bbf6",
+  "prompts": {},
+  "sessions": {
+    "s_6257da69414ed9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19b7a-bc9e-7233-bf21-32f8737c2d61",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    },
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
