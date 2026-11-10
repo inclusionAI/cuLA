@@ -21,6 +21,12 @@ benchmarks/bench_hybrid_cp_emulation.py
 tests/test_hybrid_dsa_plan.py
   s_d4826b35da75c5::t_fe0cadaa38865a 7-11,109-132
   s_d4826b35da75c5::t_5313e6ed4a9c59 133-134
+benchmarks/bench_kimi_cp_e2e.py
+  s_d4826b35da75c5::t_4a78c639f2dacb 1-311
+tests/test_hybrid_cp_benchmark.py
+  s_d4826b35da75c5::t_4a78c639f2dacb 1-14
+benchmarks/bench_hybrid_kda_dsa_e2e.py
+  s_d4826b35da75c5::t_4a78c639f2dacb 1-585
 ---
 {
   "schema_version": "authorship/3.0.0",
