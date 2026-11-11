@@ -31,6 +31,14 @@ def test_cudnn_kda_cp_matches_monolithic_forward_backward():
             supports_initial_state = False
         if not supports_initial_state:
             pytest.skip("cuDNN Frontend build does not include KDA state inputs")
+        capability_major = torch.cuda.get_device_capability(local_rank)[0]
+        if capability_major < 9:
+            pytest.skip("cuDNN Kimi CP requires SM90 or newer")
+        if (
+            capability_major >= 10
+            and "preceding_state_update" not in inspect.signature(cudnn_la.kimi_delta_attention).parameters
+        ):
+            pytest.skip("the Blackwell build does not include concatenated KDA summary apply")
 
         def stage(name):
             print(f"rank={local_rank} stage={name}", flush=True)

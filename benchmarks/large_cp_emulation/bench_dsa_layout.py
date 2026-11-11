@@ -260,6 +260,7 @@ def _run(args: argparse.Namespace) -> None:
                 {
                     "layout": args.layout,
                     "global_tokens": workload.global_tokens,
+                    "index_heads": args.index_heads,
                     "physical_gpus": world_size,
                     "sequence_lengths": workload.sequence_lengths,
                     "critical_samples_ms": critical,

@@ -91,6 +91,7 @@ def run_dsa(args) -> None:
                 "logical_cp": args.logical_cp,
                 "logical_rank": logical_rank,
                 "local_tokens": local_tokens,
+                "index_heads": args.index_heads,
                 "compressed_blocks": blocks,
                 "full_candidate_gib": full_floats * 4 / 2**30,
             }
@@ -117,6 +118,7 @@ def run_dsa(args) -> None:
         print(
             json.dumps(
                 {
+                    "index_heads": args.index_heads,
                     "budget_mib": budget_mib,
                     "windows": len(plan.windows),
                     "workspace_mib": plan.candidate_workspace_floats * 4 / 2**20,

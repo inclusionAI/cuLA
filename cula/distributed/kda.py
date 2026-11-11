@@ -31,8 +31,7 @@ def _load_cudnn_kda_ops():
         kimi_delta_attention_bwd = torch.ops.cudnn.kimi_delta_attention_bwd
     except (ImportError, AttributeError) as error:
         raise ImportError(
-            "cuDNN Kimi CP requires cuDNN Frontend KDA state APIs; "
-            "install cuda-linear-attention[cudnn-cp]"
+            "cuDNN Kimi CP requires cuDNN Frontend KDA state APIs; install cuda-linear-attention[cudnn-cp]"
         ) from error
     return kimi_delta_attention, kimi_delta_attention_bwd
 
@@ -396,8 +395,7 @@ def _compose_affine_summaries(
         raise ValueError("ordered KDA summaries must be on the same device")
     if state_updates.is_cuda and torch.backends.cuda.matmul.allow_tf32:
         raise RuntimeError(
-            "Kimi CP boundary composition requires IEEE FP32; "
-            "set torch.backends.cuda.matmul.allow_tf32 = False"
+            "Kimi CP boundary composition requires IEEE FP32; set torch.backends.cuda.matmul.allow_tf32 = False"
         )
     state = state_updates.new_zeros(state_updates.shape[1:])
     indices = range(state_updates.shape[0] - 1, -1, -1) if reverse else range(state_updates.shape[0])
@@ -406,7 +404,11 @@ def _compose_affine_summaries(
     return state.contiguous()
 
 
-def _validate_hopper_state_probe_options(options: _KdaOptions) -> None:
+def _validate_hopper_state_probe_options(
+    options: _KdaOptions,
+    a_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+) -> None:
     """Reject transformations unsupported by the Hopper backward engine."""
     unsupported = []
     if options.use_qk_l2norm_in_kernel:
@@ -415,6 +417,10 @@ def _validate_hopper_state_probe_options(options: _KdaOptions) -> None:
         unsupported.append("use_beta_sigmoid_in_kernel")
     if options.safe_gate:
         unsupported.append("safe_gate")
+    if a_log is not None:
+        unsupported.append("a_log")
+    if dt_bias is not None:
+        unsupported.append("dt_bias")
     if unsupported:
         names = ", ".join(unsupported)
         raise ValueError(
@@ -446,14 +452,13 @@ def _state_probe_summary(
     value_dim = v.shape[-1]
     if value_dim < key_dim:
         raise ValueError(
-            "SM90 Kimi CP state probing requires value_dim >= key_dim; "
-            f"got value_dim={value_dim}, key_dim={key_dim}"
+            f"SM90 Kimi CP state probing requires value_dim >= key_dim; got value_dim={value_dim}, key_dim={key_dim}"
         )
     state_shape = (1, heads, value_dim, key_dim)
     zero = torch.zeros(state_shape, dtype=torch.float32, device=q.device)
     probe = zero.clone()
     probe[:, :, :key_dim, :].copy_(torch.eye(key_dim, dtype=torch.float32, device=q.device))
-    kwargs = options.attention_kwargs(None, None)
+    kwargs = options.kwargs(None, None)
 
     def final_state(initial_state: torch.Tensor) -> torch.Tensor:
         outputs = kimi_delta_attention(
@@ -504,9 +509,7 @@ class _CudnnKdaCPHopper(torch.autograd.Function):
             q[last_start:], k[last_start:], v[last_start:], g[last_start:], beta[last_start:], last_cu, options=options
         )
         preceding_h, preceding_transition = _validate_boundary_summaries(
-            boundary_transport.boundary_summaries(
-                h_last, transition_last, plan=plan, group=group, reverse=False
-            ),
+            boundary_transport.boundary_summaries(h_last, transition_last, plan=plan, group=group, reverse=False),
             h_last,
             transition_last,
             rows=plan.pre_num_ranks,
@@ -542,9 +545,7 @@ class _CudnnKdaCPHopper(torch.autograd.Function):
         ctx.group = group
         ctx.options = options
         ctx.boundary_transport = boundary_transport
-        ctx.save_for_backward(
-            q, k, v, g, beta, cu_seqlens, initial_state, transition_first, state_checkpoints
-        )
+        ctx.save_for_backward(q, k, v, g, beta, cu_seqlens, initial_state, transition_first, state_checkpoints)
         return output
 
     @staticmethod
@@ -577,9 +578,7 @@ class _CudnnKdaCPHopper(torch.autograd.Function):
         g_local = first_grads[5][0].float().contiguous()
         transition_backward = transition_first.transpose(-1, -2).contiguous()
         following_h, following_transition = _validate_boundary_summaries(
-            ctx.boundary_transport.boundary_summaries(
-                g_local, transition_backward, plan=plan, group=ctx.group, reverse=True
-            ),
+            ctx.boundary_transport.boundary_summaries(g_local, transition_backward, plan=plan, group=ctx.group, reverse=True),
             g_local,
             transition_backward,
             rows=plan.post_num_ranks,
@@ -811,6 +810,19 @@ def _validate_inputs(
         raise ValueError("a_log and dt_bias are accepted only with safe_gate=True; canonicalize non-safe gates upstream")
 
 
+def _resolve_kimi_cp_backend(backend: str, device: torch.device) -> str:
+    if backend not in ("auto", "frost-summary", "hopper-state-probe"):
+        raise ValueError("backend must be 'auto', 'frost-summary', or 'hopper-state-probe'")
+    if backend != "auto":
+        return backend
+    major, _ = torch.cuda.get_device_capability(device)
+    if major == 9:
+        return "hopper-state-probe"
+    if major >= 10:
+        return "frost-summary"
+    raise RuntimeError(f"cuDNN Kimi CP does not support CUDA compute capability {major}.x")
+
+
 def cudnn_kda_cp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -913,18 +925,9 @@ def cudnn_kda_cp(
             **options.attention_kwargs(a_log, dt_bias),
         )
         return attention_outputs[0]
-    resolved_backend = backend
-    if resolved_backend == "auto":
-        major, _ = torch.cuda.get_device_capability(q.device)
-        if major == 9:
-            resolved_backend = "hopper-state-probe"
-        elif major >= 10:
-            resolved_backend = "frost-summary"
-        else:
-            raise RuntimeError(f"cuDNN Kimi CP does not support CUDA compute capability {major}.x")
+    resolved_backend = _resolve_kimi_cp_backend(backend, q.device)
     if resolved_backend == "hopper-state-probe":
-        if a_log is not None or dt_bias is not None:
-            raise ValueError("SM90 Kimi CP requires safe-gate preprocessing in the framework adapter")
+        _validate_hopper_state_probe_options(options, a_log, dt_bias)
         return _CudnnKdaCPHopper.apply(
             q.contiguous(),
             k.contiguous(),

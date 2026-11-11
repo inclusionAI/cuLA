@@ -79,6 +79,8 @@ The layout-native DSA benchmark executes real deterministic cuDNN index
 pooling and DSA selection, including pooled-key all-gather and global block-ID
 remap. Each number below is the median critical-path GPU time after two warmups
 and three measured iterations. All cases contain 1,048,576 global tokens.
+These published measurements used four index heads; current benchmark output
+records `index_heads` explicitly because the default model shape is now 64.
 
 | THD distribution | contiguous | planned | speedup | planned causal max/avg |
 |---|---:|---:|---:|---:|

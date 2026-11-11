@@ -591,6 +591,7 @@ def _run(args: argparse.Namespace) -> None:
                     "transport_hops": transport_hops,
                     "physical_gpus": world_size,
                     "local_tokens": local_tokens,
+                    "index_heads": args.index_heads,
                     "kda_checkpoint_tokens": args.kda_checkpoint_tokens,
                     "sequence_lengths": workload.sequence_lengths,
                     "schedules": summary,

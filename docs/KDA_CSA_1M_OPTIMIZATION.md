@@ -60,6 +60,7 @@ the total arithmetic is unchanged, but early and late causal regions cancel.
 
 A layout-native DSA benchmark includes deterministic index pooling, all-gather,
 global block reconstruction, discontiguous key remapping, and exact selection:
+the published measurements below used four index heads.
 
 | Query layout | Critical DSA time | Peak allocated |
 |---|---:|---:|

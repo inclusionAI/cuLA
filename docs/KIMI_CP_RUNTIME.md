@@ -113,6 +113,15 @@ PyTorch owns those outer chain-rule gradients. The SM90 backend rejects the
 corresponding in-kernel flags instead of silently producing incomplete gate
 gradients.
 
+The ordinary cuDNN Hopper backward state contract requires one FP32 state row
+per local sequence; its `state_indices` indirection is forward-only. The SM90
+compatibility backend therefore stores `initial_state`, `d_final_state`, and
+the returned state gradient with shape `[N, H, V, K]`. Each live state tensor
+costs `4 * N * H * V * K` bytes (2 MiB per sequence for `H=32`, `K=V=128`).
+Packed workloads with many local short samples must include this linear state
+storage in their memory plan. A future compact backward state port in cuDNN
+could remove it without changing cuLA's public distributed interface.
+
 ## Current transport and rejected chain experiment
 
 The first implementation uses two typed `all_gather_into_tensor` calls per
