@@ -3,10 +3,11 @@
 ## Scope
 
 cuLA owns the distributed execution layer around cuDNN Frontend KDA. cuDNN
-owns local KDA forward/backward, span summaries, and ordered FP32 affine-summary
-composition inside the KDA apply operations. Frameworks own model-specific
-tensor layouts, gate parameterization, and construction of the global packed
-sequence metadata.
+owns local KDA forward/backward and, on Blackwell, span summaries and ordered
+FP32 affine-summary composition inside the KDA apply operations. Hopper uses
+the same public layer through the ordinary cuDNN state ports described below.
+Frameworks own model-specific tensor layouts, gate parameterization, and
+construction of the global packed sequence metadata.
 
 The public surface intentionally has three KDA-specific layers:
 
@@ -15,10 +16,12 @@ The public surface intentionally has three KDA-specific layers:
   with `AllGatherKimiCPTransport` as the exact prepared implementation.
 - `cudnn_kda_cp`: the differentiable distributed KDA call.
 
-There is no generic backend hierarchy.  The runtime is KDA-specific and uses
-the cuDNN contracts directly. A future hierarchical or scan implementation can
-replace only boundary-summary propagation without changing planning, local KDA,
-autograd, or the framework adapter.
+There is no generic backend hierarchy. The runtime has one narrow
+architecture selector because cuDNN exposes different summary contracts on
+Hopper and Blackwell, but both implementations remain KDA-specific and use
+cuDNN state contracts directly. A future hierarchical or scan implementation
+can replace only boundary-summary propagation without changing planning,
+local KDA, autograd, or the framework adapter.
 
 ## Ownership boundary
 
@@ -32,7 +35,7 @@ cuLA Kimi CP runtime
           |
           v
 cuDNN Frontend
-  KDA summaries, concatenated-summary composition, local KDA fwd/bwd
+  Blackwell summaries/composition or Hopper state ports, local KDA fwd/bwd
 ```
 
 Framework-specific compatibility does not belong in the runtime.  In
@@ -82,6 +85,33 @@ public cuDNN Frontend 1.32.2 wheel does not contain this API. Until a compatible
 release is published, use the tested source revision
 `9e056425989e75f406a5ce3ad58cb563e4dff8b5` as shown in `USAGE.md`; the runtime
 also checks the required call signatures and fails early on older builds.
+
+### Hopper (SM90) compatibility backend
+
+cuDNN Hopper exposes ordinary FP32 `initial_state`, `final_state`,
+`d_final_state`, and `d_initial_state` ports, but not the FROST summary graph.
+`cudnn_kda_cp(backend="auto")` therefore selects a state-probe backend on
+SM90 and the native summary backend on SM100 and newer. KDA is affine in its
+initial state: a zero-state evaluation gives `H`, while an embedded-identity
+evaluation gives `H + M`. cuLA subtracts the two FP32 final states, composes
+the selected rank chain in FP32, and supplies the result through the ordinary
+state ports. Backward obtains the local `G` from `d_initial_state`, uses
+`M^T`, and composes following ranks in reverse causal order.
+The external composition rejects an enabled PyTorch TF32 matmul policy; callers
+must retain `torch.backends.cuda.matmul.allow_tf32 = False` so the advertised
+FP32 boundary contract cannot silently change with a process-global setting.
+
+This is a correctness-first compatibility backend and performs two additional
+boundary-state evaluations. It is not presented as the final SM90 performance
+path. A dedicated pre-scan may replace only the summary provider after it has
+equivalent compile-cache, CUDA Graph, accuracy, and fwd+bwd coverage.
+
+The Hopper backward engine requires canonical inputs: normalized q/k,
+post-sigmoid beta, and log-space g. Framework adapters must apply q/k
+normalization, beta sigmoid, and safe-gate conversion before calling cuLA so
+PyTorch owns those outer chain-rule gradients. The SM90 backend rejects the
+corresponding in-kernel flags instead of silently producing incomplete gate
+gradients.
 
 ## Current transport and rejected chain experiment
 

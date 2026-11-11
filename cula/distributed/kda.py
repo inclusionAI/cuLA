@@ -19,20 +19,32 @@ from cula.distributed.plan import KimiCPPlan
 
 
 @cache
-def _load_cudnn_cp_ops():
+def _load_cudnn_kda_ops():
     try:
         linear_attention = import_module("cudnn.linear_attention")
         ops = linear_attention
-        if not all(
-            hasattr(ops, name)
-            for name in (
-                "kimi_delta_attention",
-                "kimi_delta_attention_summary",
-                "kimi_delta_attention_summary_bwd",
-            )
-        ):
+        if not hasattr(ops, "kimi_delta_attention"):
             ops = import_module("cudnn.linear_attention.ops")
         kimi_delta_attention = ops.kimi_delta_attention
+        if "initial_state" not in signature(kimi_delta_attention).parameters:
+            raise AttributeError("KDA apply does not expose recurrent state inputs")
+        kimi_delta_attention_bwd = torch.ops.cudnn.kimi_delta_attention_bwd
+    except (ImportError, AttributeError) as error:
+        raise ImportError(
+            "cuDNN Kimi CP requires cuDNN Frontend KDA state APIs; "
+            "install cuda-linear-attention[cudnn-cp]"
+        ) from error
+    return kimi_delta_attention, kimi_delta_attention_bwd
+
+
+@cache
+def _load_cudnn_cp_ops():
+    try:
+        kimi_delta_attention, kimi_delta_attention_bwd = _load_cudnn_kda_ops()
+        linear_attention = import_module("cudnn.linear_attention")
+        ops = linear_attention
+        if not all(hasattr(ops, name) for name in ("kimi_delta_attention_summary", "kimi_delta_attention_summary_bwd")):
+            ops = import_module("cudnn.linear_attention.ops")
         kimi_delta_attention_summary = ops.kimi_delta_attention_summary
         kimi_delta_attention_summary_bwd = ops.kimi_delta_attention_summary_bwd
         if "preceding_state_update" not in signature(kimi_delta_attention).parameters:
@@ -40,7 +52,6 @@ def _load_cudnn_cp_ops():
         summary_bwd_parameters = signature(kimi_delta_attention_summary_bwd).parameters
         if "output_context" not in summary_bwd_parameters or "checkpoint_every_n_tokens" not in summary_bwd_parameters:
             raise AttributeError("KDA backward summary does not expose the CP apply context")
-        kimi_delta_attention_bwd = torch.ops.cudnn.kimi_delta_attention_bwd
     except (ImportError, AttributeError) as error:
         raise ImportError(
             "cuDNN Kimi CP requires cuDNN Frontend with concatenated KDA summary apply APIs; "
@@ -93,18 +104,6 @@ def _validate_checkpoint_every_n_tokens(value: int) -> int:
     if value not in (0, 16):
         raise ValueError("checkpoint_every_n_tokens must be 0 or the exact native chunk cadence 16")
     return value
-
-
-def _all_gather_into(
-    output: torch.Tensor,
-    tensor: torch.Tensor,
-    *,
-    group: dist.ProcessGroup | None,
-) -> None:
-    if hasattr(dist, "all_gather_single"):
-        dist.all_gather_single(output, tensor, group=group)
-    else:  # pragma: no cover - compatibility with older PyTorch releases
-        dist.all_gather_into_tensor(output, tensor, group=group)
 
 
 def _all_gather_into(
@@ -380,6 +379,235 @@ def _validate_boundary_summaries(
     return summaries
 
 
+def _compose_affine_summaries(
+    state_updates: torch.Tensor,
+    transitions: torch.Tensor,
+    *,
+    reverse: bool,
+) -> torch.Tensor:
+    """Compose ordered FP32 state maps without changing their precision."""
+    if state_updates.ndim != 4 or transitions.ndim != 4:
+        raise ValueError("ordered KDA summaries must have [ranks, heads, rows, cols] layout")
+    if state_updates.shape[0] != transitions.shape[0]:
+        raise ValueError("ordered KDA state updates and transitions must have the same rank count")
+    if state_updates.dtype != torch.float32 or transitions.dtype != torch.float32:
+        raise TypeError("ordered KDA summary composition requires FP32 inputs")
+    if state_updates.device != transitions.device:
+        raise ValueError("ordered KDA summaries must be on the same device")
+    if state_updates.is_cuda and torch.backends.cuda.matmul.allow_tf32:
+        raise RuntimeError(
+            "Kimi CP boundary composition requires IEEE FP32; "
+            "set torch.backends.cuda.matmul.allow_tf32 = False"
+        )
+    state = state_updates.new_zeros(state_updates.shape[1:])
+    indices = range(state_updates.shape[0] - 1, -1, -1) if reverse else range(state_updates.shape[0])
+    for index in indices:
+        state = torch.matmul(state, transitions[index]) + state_updates[index]
+    return state.contiguous()
+
+
+def _validate_hopper_state_probe_options(options: _KdaOptions) -> None:
+    """Reject transformations unsupported by the Hopper backward engine."""
+    unsupported = []
+    if options.use_qk_l2norm_in_kernel:
+        unsupported.append("use_qk_l2norm_in_kernel")
+    if options.use_beta_sigmoid_in_kernel:
+        unsupported.append("use_beta_sigmoid_in_kernel")
+    if options.safe_gate:
+        unsupported.append("safe_gate")
+    if unsupported:
+        names = ", ".join(unsupported)
+        raise ValueError(
+            "SM90 Kimi CP requires canonicalized q/k, beta, and log-space g because "
+            f"the cuDNN Hopper backward engine does not support in-kernel transforms: {names}"
+        )
+
+
+def _state_probe_summary(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    options: _KdaOptions,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Recover one local affine state map using the ordinary cuDNN KDA API.
+
+    Hopper does not expose the FROST summary graph. KDA is affine in its
+    initial state, so evaluating a zero state gives H and evaluating an
+    embedded identity gives H + M. State tensors are FP32, hence the boundary
+    contract remains high precision.
+    """
+    kimi_delta_attention, _ = _load_cudnn_kda_ops()
+    heads = max(q.shape[1], v.shape[1])
+    key_dim = k.shape[-1]
+    value_dim = v.shape[-1]
+    if value_dim < key_dim:
+        raise ValueError(
+            "SM90 Kimi CP state probing requires value_dim >= key_dim; "
+            f"got value_dim={value_dim}, key_dim={key_dim}"
+        )
+    state_shape = (1, heads, value_dim, key_dim)
+    zero = torch.zeros(state_shape, dtype=torch.float32, device=q.device)
+    probe = zero.clone()
+    probe[:, :, :key_dim, :].copy_(torch.eye(key_dim, dtype=torch.float32, device=q.device))
+    kwargs = options.attention_kwargs(None, None)
+
+    def final_state(initial_state: torch.Tensor) -> torch.Tensor:
+        outputs = kimi_delta_attention(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu_seqlens,
+            scale=options.scale,
+            initial_state=initial_state,
+            output_final_state=True,
+            plan_name=options.plan_name,
+            **kwargs,
+        )
+        return outputs[1].float()
+
+    state_update = final_state(zero)[0].contiguous()
+    probed = final_state(probe)[0]
+    transition = (probed[:, :key_dim, :] - state_update[:, :key_dim, :]).contiguous()
+    _validate_local_boundary_summaries(state_update, transition)
+    return state_update, transition
+
+
+class _CudnnKdaCPHopper(torch.autograd.Function):
+    """SM90 CP using ordinary Hopper state inputs instead of FROST summaries."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        plan: KimiCPPlan,
+        group: dist.ProcessGroup | None,
+        options: _KdaOptions,
+        boundary_transport: KimiCPBoundaryTransport,
+    ) -> torch.Tensor:
+        _validate_hopper_state_probe_options(options)
+        kimi_delta_attention, _ = _load_cudnn_kda_ops()
+
+        last_start = plan.last_boundary_start
+        last_cu = cu_seqlens[-2:] - last_start
+        h_last, transition_last = _state_probe_summary(
+            q[last_start:], k[last_start:], v[last_start:], g[last_start:], beta[last_start:], last_cu, options=options
+        )
+        preceding_h, preceding_transition = _validate_boundary_summaries(
+            boundary_transport.boundary_summaries(
+                h_last, transition_last, plan=plan, group=group, reverse=False
+            ),
+            h_last,
+            transition_last,
+            rows=plan.pre_num_ranks,
+        )
+        incoming_state = _compose_affine_summaries(preceding_h, preceding_transition, reverse=False)
+        initial_state = incoming_state.new_zeros((plan.num_local_sequences, *incoming_state.shape))
+        initial_state[0].copy_(incoming_state)
+
+        first_end = plan.first_boundary_end
+        if last_start == 0 and first_end == q.shape[0]:
+            transition_first = transition_last
+        else:
+            _, transition_first = _state_probe_summary(
+                q[:first_end], k[:first_end], v[:first_end], g[:first_end], beta[:first_end], cu_seqlens[:2], options=options
+            )
+
+        outputs = kimi_delta_attention(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu_seqlens,
+            scale=options.scale,
+            initial_state=initial_state,
+            output_final_state=False,
+            plan_name=options.plan_name,
+            **options.attention_kwargs(None, None),
+        )
+        output = outputs[0]
+        state_checkpoints = outputs[2] if len(outputs) > 2 else q.new_empty(0)
+        ctx.plan = plan
+        ctx.group = group
+        ctx.options = options
+        ctx.boundary_transport = boundary_transport
+        ctx.save_for_backward(
+            q, k, v, g, beta, cu_seqlens, initial_state, transition_first, state_checkpoints
+        )
+        return output
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output: torch.Tensor):
+        _, kimi_delta_attention_bwd = _load_cudnn_kda_ops()
+        q, k, v, g, beta, cu_seqlens, initial_state, transition_first, state_checkpoints = ctx.saved_tensors
+        plan = ctx.plan
+        options = ctx.options
+        grad_output = grad_output.contiguous()
+        scale = options.scale if options.scale is not None else q.shape[-1] ** -0.5
+
+        first_end = plan.first_boundary_end
+        zero_first = initial_state.new_zeros((1, *initial_state.shape[1:]))
+        first_grads = kimi_delta_attention_bwd(
+            grad_output[:first_end],
+            q[:first_end],
+            k[:first_end],
+            v[:first_end],
+            g[:first_end],
+            beta[:first_end],
+            cu_seqlens[:2],
+            float(scale),
+            initial_state=zero_first,
+            checkpoint_every_n_tokens=0,
+            batch_invariant=options.batch_invariant,
+            allow_neg_eigval=options.allow_neg_eigval,
+            plan_name=options.plan_name,
+        )
+        g_local = first_grads[5][0].float().contiguous()
+        transition_backward = transition_first.transpose(-1, -2).contiguous()
+        following_h, following_transition = _validate_boundary_summaries(
+            ctx.boundary_transport.boundary_summaries(
+                g_local, transition_backward, plan=plan, group=ctx.group, reverse=True
+            ),
+            g_local,
+            transition_backward,
+            rows=plan.post_num_ranks,
+        )
+        outgoing_grad = _compose_affine_summaries(following_h, following_transition, reverse=True)
+        d_final_state = initial_state.new_zeros(initial_state.shape)
+        d_final_state[-1].copy_(outgoing_grad)
+
+        dq, dk, dv, dg, dbeta, _, _, _ = kimi_delta_attention_bwd(
+            grad_output,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu_seqlens,
+            float(scale),
+            initial_state=initial_state,
+            d_final_state=d_final_state,
+            state_checkpoints=state_checkpoints if state_checkpoints.numel() else None,
+            checkpoint_every_n_tokens=options.checkpoint_every_n_tokens,
+            batch_invariant=options.batch_invariant,
+            allow_neg_eigval=options.allow_neg_eigval,
+            plan_name=options.plan_name,
+        )
+        return dq, dk, dv, dg, dbeta, None, None, None, None, None
+
+
 class _CudnnKdaCP(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -604,9 +832,10 @@ def cudnn_kda_cp(
     dt_bias: torch.Tensor | None = None,
     batch_invariant: bool = True,
     checkpoint_every_n_tokens: int = 0,
-    plan_name: str | None = "kda_frost",
-    summary_plan_name: str | None = "kda_summary_frost",
+    plan_name: str | None = None,
+    summary_plan_name: str | None = None,
     boundary_transport: KimiCPBoundaryTransport | None = None,
+    backend: str = "auto",
 ) -> torch.Tensor:
     """Run differentiable cuDNN KDA over one contiguous packed-THD CP shard.
 
@@ -636,6 +865,8 @@ def cudnn_kda_cp(
 
     if not isinstance(plan, KimiCPPlan):
         raise TypeError("plan must be a KimiCPPlan")
+    if backend not in ("auto", "frost-summary", "hopper-state-probe"):
+        raise ValueError("backend must be 'auto', 'frost-summary', or 'hopper-state-probe'")
     resolved_transport = _DEFAULT_BOUNDARY_TRANSPORT if boundary_transport is None else boundary_transport
     if not isinstance(resolved_transport, KimiCPBoundaryTransport):
         raise TypeError("boundary_transport must implement KimiCPBoundaryTransport")
@@ -667,7 +898,7 @@ def cudnn_kda_cp(
         summary_plan_name=summary_plan_name,
     )
     if plan.world_size == 1:
-        kimi_delta_attention, _, _, _ = _load_cudnn_cp_ops()
+        kimi_delta_attention, _ = _load_cudnn_kda_ops()
         attention_outputs = kimi_delta_attention(
             q,
             k,
@@ -682,6 +913,30 @@ def cudnn_kda_cp(
             **options.attention_kwargs(a_log, dt_bias),
         )
         return attention_outputs[0]
+    resolved_backend = backend
+    if resolved_backend == "auto":
+        major, _ = torch.cuda.get_device_capability(q.device)
+        if major == 9:
+            resolved_backend = "hopper-state-probe"
+        elif major >= 10:
+            resolved_backend = "frost-summary"
+        else:
+            raise RuntimeError(f"cuDNN Kimi CP does not support CUDA compute capability {major}.x")
+    if resolved_backend == "hopper-state-probe":
+        if a_log is not None or dt_bias is not None:
+            raise ValueError("SM90 Kimi CP requires safe-gate preprocessing in the framework adapter")
+        return _CudnnKdaCPHopper.apply(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            g.contiguous(),
+            beta.contiguous(),
+            cu_seqlens.contiguous(),
+            plan,
+            group,
+            options,
+            resolved_transport,
+        )
     return _CudnnKdaCP.apply(
         q.contiguous(),
         k.contiguous(),

@@ -676,7 +676,7 @@ def _parse_args() -> argparse.Namespace:
         subparser.add_argument("--heads", type=_positive_int, default=32)
         subparser.add_argument("--key-dim", type=_positive_int, default=128)
         subparser.add_argument("--value-dim", type=_positive_int, default=128)
-        subparser.add_argument("--index-heads", type=_positive_int, default=4)
+        subparser.add_argument("--index-heads", type=_positive_int, default=64)
         subparser.add_argument("--index-dim", type=_positive_int, default=128)
         subparser.add_argument("--top-k", type=_positive_int, default=512)
         subparser.add_argument("--block-size", type=_positive_int, default=4)

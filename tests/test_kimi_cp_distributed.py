@@ -17,7 +17,6 @@ def _relative_rms(actual, expected):
 
 
 @pytest.mark.distributed
-@pytest.mark.sm100_only
 def test_cudnn_kda_cp_matches_monolithic_forward_backward():
     if int(os.environ.get("WORLD_SIZE", "1")) < 2:
         pytest.skip("launch this deterministic fixture with at least two processes")
@@ -27,13 +26,11 @@ def test_cudnn_kda_cp_matches_monolithic_forward_backward():
     try:
         cudnn_la = pytest.importorskip("cudnn.linear_attention")
         try:
-            supports_concatenated_summaries = (
-                "preceding_state_update" in inspect.signature(cudnn_la.kimi_delta_attention).parameters
-            )
+            supports_initial_state = "initial_state" in inspect.signature(cudnn_la.kimi_delta_attention).parameters
         except (TypeError, ValueError):
-            supports_concatenated_summaries = False
-        if not supports_concatenated_summaries:
-            pytest.skip("cuDNN Frontend build does not include concatenated KDA summary apply")
+            supports_initial_state = False
+        if not supports_initial_state:
+            pytest.skip("cuDNN Frontend build does not include KDA state inputs")
 
         def stage(name):
             print(f"rank={local_rank} stage={name}", flush=True)
@@ -77,7 +74,7 @@ def test_cudnn_kda_cp_matches_monolithic_forward_backward():
             global_cu,
             output_final_state=True,
             batch_invariant=True,
-            plan_name="kda_frost",
+            plan_name=None,
         )
         stage("monolithic-forward-done")
         full_output.backward(grad_output)

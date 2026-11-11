@@ -311,7 +311,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--long-sequences", type=_positive_int, default=2)
     parser.add_argument("--block-size", type=_positive_int, default=4)
     parser.add_argument("--top-k", type=_positive_int, default=512)
-    parser.add_argument("--index-heads", type=_positive_int, default=4)
+    parser.add_argument("--index-heads", type=_positive_int, default=64)
     parser.add_argument("--index-dim", type=_positive_int, default=128)
     parser.add_argument("--dsa-budget-mib", type=int, default=8192)
     parser.add_argument("--warmups", type=_positive_int, default=2)

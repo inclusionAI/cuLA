@@ -196,7 +196,7 @@ def parse_args():
     dsa.add_argument("--budgets-mib", type=_csv_ints, default=(512, 1024, 2048, 4096))
     dsa.add_argument("--block-size", type=_positive_int, default=4)
     dsa.add_argument("--top-k", type=_positive_int, default=512)
-    dsa.add_argument("--index-heads", type=_positive_int, default=4)
+    dsa.add_argument("--index-heads", type=_positive_int, default=64)
     dsa.add_argument("--head-dim", type=_positive_int, default=128)
     dsa.add_argument("--device", type=int, default=0)
     dsa.add_argument("--repeats", type=_positive_int, default=5)
