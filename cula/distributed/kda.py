@@ -31,7 +31,8 @@ def _load_cudnn_kda_ops():
         kimi_delta_attention_bwd = torch.ops.cudnn.kimi_delta_attention_bwd
     except (ImportError, AttributeError) as error:
         raise ImportError(
-            "cuDNN Kimi CP requires cuDNN Frontend KDA state APIs; install cuda-linear-attention[cudnn-cp]"
+            "cuDNN Kimi CP requires cuDNN Frontend KDA state APIs; "
+            "install cuda-linear-attention[cudnn-cp] and follow the compatible source-build instructions in USAGE.md"
         ) from error
     return kimi_delta_attention, kimi_delta_attention_bwd
 
@@ -54,7 +55,7 @@ def _load_cudnn_cp_ops():
     except (ImportError, AttributeError) as error:
         raise ImportError(
             "cuDNN Kimi CP requires cuDNN Frontend with concatenated KDA summary apply APIs; "
-            "install cuda-linear-attention[cudnn-cp]"
+            "install cuda-linear-attention[cudnn-cp] and follow the compatible source-build instructions in USAGE.md"
         ) from error
     return (
         kimi_delta_attention,
@@ -393,10 +394,6 @@ def _compose_affine_summaries(
         raise TypeError("ordered KDA summary composition requires FP32 inputs")
     if state_updates.device != transitions.device:
         raise ValueError("ordered KDA summaries must be on the same device")
-    if state_updates.is_cuda and torch.backends.cuda.matmul.allow_tf32:
-        raise RuntimeError(
-            "Kimi CP boundary composition requires IEEE FP32; set torch.backends.cuda.matmul.allow_tf32 = False"
-        )
     state = state_updates.new_zeros(state_updates.shape[1:])
     indices = range(state_updates.shape[0] - 1, -1, -1) if reverse else range(state_updates.shape[0])
     for index in indices:
@@ -426,6 +423,13 @@ def _validate_hopper_state_probe_options(
         raise ValueError(
             "SM90 Kimi CP requires canonicalized q/k, beta, and log-space g because "
             f"the cuDNN Hopper backward engine does not support in-kernel transforms: {names}"
+        )
+
+
+def _validate_ieee_fp32_composition(device: torch.device) -> None:
+    if device.type == "cuda" and torch.backends.cuda.matmul.allow_tf32:
+        raise RuntimeError(
+            "Kimi CP boundary composition requires IEEE FP32; set torch.backends.cuda.matmul.allow_tf32 = False"
         )
 
 
@@ -545,16 +549,19 @@ class _CudnnKdaCPHopper(torch.autograd.Function):
         ctx.group = group
         ctx.options = options
         ctx.boundary_transport = boundary_transport
-        ctx.save_for_backward(q, k, v, g, beta, cu_seqlens, initial_state, transition_first, state_checkpoints)
+        ctx.save_for_backward(q, k, v, g, beta, cu_seqlens, incoming_state, transition_first, state_checkpoints)
         return output
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output: torch.Tensor):
         _, kimi_delta_attention_bwd = _load_cudnn_kda_ops()
-        q, k, v, g, beta, cu_seqlens, initial_state, transition_first, state_checkpoints = ctx.saved_tensors
+        q, k, v, g, beta, cu_seqlens, incoming_state, transition_first, state_checkpoints = ctx.saved_tensors
         plan = ctx.plan
         options = ctx.options
+        _validate_ieee_fp32_composition(q.device)
+        initial_state = incoming_state.new_zeros((plan.num_local_sequences, *incoming_state.shape))
+        initial_state[0].copy_(incoming_state)
         grad_output = grad_output.contiguous()
         scale = options.scale if options.scale is not None else q.shape[-1] ** -0.5
 
@@ -928,6 +935,7 @@ def cudnn_kda_cp(
     resolved_backend = _resolve_kimi_cp_backend(backend, q.device)
     if resolved_backend == "hopper-state-probe":
         _validate_hopper_state_probe_options(options, a_log, dt_bias)
+        _validate_ieee_fp32_composition(q.device)
         return _CudnnKdaCPHopper.apply(
             q.contiguous(),
             k.contiguous(),

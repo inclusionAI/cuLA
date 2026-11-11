@@ -195,6 +195,18 @@ def test_affine_summary_composition_uses_causal_order_in_both_directions():
     assert reverse.item() == 22.0  # (0 * 7 + 4) * 5 + 2
 
 
+def test_ieee_composition_validation_precedes_cuda_collectives(monkeypatch):
+    monkeypatch.setattr(cp.torch.backends.cuda.matmul, "allow_tf32", True)
+    try:
+        cp._validate_ieee_fp32_composition(torch.device("cuda", 0))
+    except RuntimeError as error:
+        assert "IEEE FP32" in str(error)
+    else:
+        raise AssertionError("TF32 boundary composition was accepted")
+
+    cp._validate_ieee_fp32_composition(torch.device("cpu"))
+
+
 def test_hopper_state_probe_recovers_fp32_affine_map(monkeypatch):
     heads, key_dim, value_dim = 2, 4, 6
     state_update = torch.arange(heads * value_dim * key_dim, dtype=torch.float32).reshape(1, heads, value_dim, key_dim) / 32

@@ -115,12 +115,15 @@ gradients.
 
 The ordinary cuDNN Hopper backward state contract requires one FP32 state row
 per local sequence; its `state_indices` indirection is forward-only. The SM90
-compatibility backend therefore stores `initial_state`, `d_final_state`, and
-the returned state gradient with shape `[N, H, V, K]`. Each live state tensor
-costs `4 * N * H * V * K` bytes (2 MiB per sequence for `H=32`, `K=V=128`).
-Packed workloads with many local short samples must include this linear state
-storage in their memory plan. A future compact backward state port in cuDNN
-could remove it without changing cuLA's public distributed interface.
+compatibility backend therefore materializes `initial_state`, `d_final_state`,
+and the returned state gradient with shape `[N, H, V, K]` during backward. Each
+live dense state tensor costs `4 * N * H * V * K` bytes (2 MiB per sequence for
+`H=32`, `K=V=128`). Only the single-row incoming state is retained across the
+forward/backward interval; the zero-padded initial state is rebuilt when
+backward begins. Packed workloads with many local short samples must still
+include the transient linear backward state storage in their memory plan. A
+future compact backward state port in cuDNN could remove it without changing
+cuLA's public distributed interface.
 
 ## Current transport and rejected chain experiment
 
