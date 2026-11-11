@@ -42,7 +42,7 @@ image = (
         f"torch=={TORCH_VERSION}",
         index_url=f"https://download.pytorch.org/whl/{CUDA_TAG}",
     )
-    .pip_install(CUTLASS_SPEC, "flash-linear-attention", "pytest")
+    .pip_install(CUTLASS_SPEC, "pytest")
 )
 
 app = modal.App("cula-validate-v5")

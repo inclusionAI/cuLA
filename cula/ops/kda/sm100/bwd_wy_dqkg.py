@@ -22,8 +22,8 @@ from cutlass.cute.nvgpu.tcgen05 import (
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
-from fla.ops.utils import prepare_chunk_indices
 
+from cula.ops.kda.index import prepare_chunk_indices
 from cula.ops.ptx import reinterpret_cast, store_256b, subvec
 from cula.ops.sm100.ptx import (
     Tcgen05SmemDescriptor,

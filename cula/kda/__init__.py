@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Public KDA API exports for chunk, prefill, and decode"""
+"""Public standalone KDA APIs."""
 
 __all__ = [
-    "chunk_kda",
+    "chunk_kda_fwd_intra",
     "kda_decode",
     "kda_decode_mtp",
     "kda_decode_mtp_recurrent",
@@ -31,7 +31,7 @@ __all__ = [
 ]
 
 _LAZY = {
-    "chunk_kda": ("cula.kda.chunk", "chunk_kda"),
+    "chunk_kda_fwd_intra": ("cula.kda.chunk_intra", "chunk_kda_fwd_intra"),
     "flashkda_prefill": ("cula.kda.flashkda", "cula_kda_prefill"),
     "kda_prefill": ("cula.kda.prefill", "kda_prefill"),
     "kda_decode": ("cula.ops.kda.decode.cute", "kda_decode"),

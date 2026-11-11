@@ -10,6 +10,10 @@
 
 ## KDA (Kimi Delta Attention)
 
+> The tables below are historical full-KDA measurements retained for reference.
+> The current standalone intra-kernel microbenchmark has a different scope and
+> configuration and does not reproduce these results.
+
 ### Fixed-Length (H=64, D=128, bf16)
 
 | B | T | FLA Triton (ms) | cuLA (ms) | Speedup |
@@ -54,10 +58,10 @@ Summary (10 configs): **avg=1.34x**, min=1.21x, max=1.44x.
 Summary (18 configs): **avg=1.39x**, min=1.37x, max=1.40x.
 
 
-To reproduce:
+Current intra-kernel microbenchmark (different scope):
 
 ```bash
-python benchmarks/bench_kda.py --mode both
+python benchmarks/bench_kda_chunk_intra.py
 ```
 
 ## Lightning Attention
