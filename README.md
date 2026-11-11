@@ -168,7 +168,10 @@ See [BENCHMARK_H200.md](BENCHMARK_H200.md) for CuTe DSL FlashKDA results on an H
 - **FlashKDA Prefill (Hopper):** **avg 2.72x** speedup over FLA across 28 fixed-length and variable-length configs, up to **7.56x**.
 - **FlashKDA Intracard CP (Hopper):** **4.29x geo-mean** speedup over serial FlashKDA on 28 CP-engaged long-sequence configs, up to **7.83x**.
 
-To reproduce the benchmark suites directly:
+The commands below run the currently maintained benchmark entry points. The
+Blackwell KDA command is an intra-kernel microbenchmark; it does not reproduce
+the historical full-KDA headline numbers above, which used different shapes
+and included the complete operator pipeline.
 
 The comparison commands below require FLA to be installed separately; FLA is
 not imported by the cuLA runtime package.

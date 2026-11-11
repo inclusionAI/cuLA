@@ -60,6 +60,18 @@ def test_prepare_chunk_indices_cpu_contract():
     assert torch.equal(prepare_lens(cu_seqlens), torch.tensor([1, 64, 128], dtype=torch.int32))
 
 
+def test_prepare_chunk_indices_invalidates_cache_after_in_place_update():
+    cu_seqlens = torch.tensor([0, 64, 128], dtype=torch.int32)
+    first = prepare_chunk_indices(cu_seqlens, 64)
+
+    cu_seqlens[1] = 128
+    cu_seqlens[2] = 192
+    second = prepare_chunk_indices(cu_seqlens, 64)
+
+    assert first.tolist() == [[0, 0], [1, 0]]
+    assert second.tolist() == [[0, 0], [0, 1], [1, 0]]
+
+
 def test_prepare_chunk_indices_rejects_invalid_metadata():
     for chunk_size in (None, -1, 0, True, 64.0):
         with pytest.raises(ValueError, match="positive"):

@@ -26,25 +26,45 @@ def single_entry_tensor_cache(fn: Callable[..., Any]) -> Callable[..., Any]:
     CUDA tensor merely to build a key.
     """
 
-    entry: tuple[tuple[Any, ...], dict[str, Any], Any] | None = None
+    entry: tuple[tuple[Any, ...], dict[str, Any], tuple[int | None, ...], Any] | None = None
+
+    def tensor_versions(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[int | None, ...]:
+        versions = []
+        for value in (*args, *kwargs.values()):
+            if not isinstance(value, torch.Tensor):
+                versions.append(None)
+                continue
+            try:
+                versions.append(value._version)
+            except RuntimeError:
+                # Inference tensors do not expose a version counter. Treat
+                # them as uncacheable rather than risking stale metadata.
+                versions.append(None)
+        return tuple(versions)
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         nonlocal entry
         cached = entry
         if cached is not None:
-            cached_args, cached_kwargs, cached_result = cached
+            cached_args, cached_kwargs, cached_versions, cached_result = cached
             same_args = len(args) == len(cached_args) and all(
                 arg is cached_arg for arg, cached_arg in zip(args, cached_args, strict=True)
             )
             same_kwargs = len(kwargs) == len(cached_kwargs) and all(
                 key in cached_kwargs and value is cached_kwargs[key] for key, value in kwargs.items()
             )
-            if same_args and same_kwargs:
+            versions = tensor_versions(args, kwargs)
+            versions_available = all(
+                version is not None
+                for value, version in zip((*args, *kwargs.values()), versions, strict=True)
+                if isinstance(value, torch.Tensor)
+            )
+            if same_args and same_kwargs and versions_available and versions == cached_versions:
                 return cached_result
 
         result = fn(*args, **kwargs)
-        entry = (args, kwargs, result)
+        entry = (args, kwargs, tensor_versions(args, kwargs), result)
         return result
 
     return wrapper
