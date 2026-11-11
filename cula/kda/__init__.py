@@ -28,12 +28,22 @@ __all__ = [
     "fused_sigmoid_gating_delta_rule_update",
     "flashkda_prefill",
     "kda_prefill",
+    "AllGatherKimiCPTransport",
+    "KimiCPBoundaryTransport",
+    "KimiCPPlan",
+    "build_kimi_cp_plan",
+    "cudnn_kda_cp",
 ]
 
 _LAZY = {
     "chunk_kda_fwd_intra": ("cula.kda.chunk_intra", "chunk_kda_fwd_intra"),
     "flashkda_prefill": ("cula.kda.flashkda", "cula_kda_prefill"),
     "kda_prefill": ("cula.kda.prefill", "kda_prefill"),
+    "AllGatherKimiCPTransport": ("cula.distributed", "AllGatherKimiCPTransport"),
+    "KimiCPBoundaryTransport": ("cula.distributed", "KimiCPBoundaryTransport"),
+    "KimiCPPlan": ("cula.distributed", "KimiCPPlan"),
+    "build_kimi_cp_plan": ("cula.distributed", "build_kimi_cp_plan"),
+    "cudnn_kda_cp": ("cula.distributed", "cudnn_kda_cp"),
     "kda_decode": ("cula.ops.kda.decode.cute", "kda_decode"),
     "kda_decode_mtp": ("cula.ops.kda.decode.mtp", "kda_decode_mtp"),
     "kda_decode_mtp_recurrent": ("cula.ops.kda.decode.mtp", "kda_decode_mtp_recurrent"),

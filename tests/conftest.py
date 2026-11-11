@@ -41,6 +41,7 @@ def _prepare_markexpr(markexpr: str) -> tuple[str, bool, bool]:
 
 
 def pytest_configure(config):
+    config.addinivalue_line("markers", "distributed: requires launch through torchrun")
     config.addinivalue_line("markers", "sm100_only: only run on SM100 devices")
     config.addinivalue_line("markers", "sm90_only: only run on SM90 devices")
     config.addinivalue_line("markers", "benchmark: long-running benchmark-shaped coverage")

@@ -4,6 +4,54 @@ This document provides usage notes and examples for cuLA kernels.
 
 ---
 
+## cuDNN KDA Kimi context parallelism
+
+The optional distributed runtime executes cuDNN KDA over contiguous packed-THD
+shards.  Build one CPU plan per packed microbatch and reuse it across layers:
+
+```python
+from cula.distributed import build_kimi_cp_plan, cudnn_kda_cp
+
+cp_plan = build_kimi_cp_plan(
+    global_cu_seqlens_cpu,
+    group=cp_group,
+)
+local_cu_seqlens = torch.tensor(
+    cp_plan.local_cu_seqlens,
+    dtype=torch.int32,
+    device=q.device,
+)
+
+output = cudnn_kda_cp(
+    q, k, v, g, beta,
+    local_cu_seqlens,
+    plan=cp_plan,
+    group=cp_group,
+    safe_gate=True,
+    a_log=a_log,                 # [heads]
+    dt_bias=dt_bias,             # canonical [heads, key_dim]
+)
+```
+
+Inputs use cuDNN's canonical THD layout.  Framework adapters must reshape
+model-specific parameter layouts before the call.  The runtime summarizes only
+the two local boundary spans and passes their ordered FP32 summaries to cuDNN's
+context-parallel KDA apply.
+See [`docs/KIMI_CP_RUNTIME.md`](docs/KIMI_CP_RUNTIME.md) for the ownership and
+validation contracts.
+
+The public cuDNN Frontend 1.32.2 wheel predates the concatenated-summary API.
+Until a compatible release is published, install the CUDA 13 dependencies and
+the tested cuDNN Frontend source revision explicitly:
+
+```bash
+python -m pip install '.[cudnn-cp]'
+python -m pip install -v \
+  'git+https://github.com/NVIDIA/cudnn-frontend.git@9e056425989e75f406a5ce3ad58cb563e4dff8b5'
+```
+
+---
+
 ## KDA
 
 cuLA exposes several KDA entry points targeting different GPU architectures:
