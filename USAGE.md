@@ -4,6 +4,21 @@ This document provides usage notes and examples for cuLA kernels.
 
 ---
 
+## cuDNN hybrid index pooling and DSA selection
+
+The optional hybrid runtime preserves packed THD layouts between cuDNN index
+pooling and DSA selection. It owns static metadata and bounded scratch, while
+cuDNN owns the fused kernels and precision contract. Install it with:
+
+```bash
+pip install 'cuda-linear-attention[cudnn-hybrid]'
+```
+
+See [`docs/HYBRID_CUDNN_RUNTIME.md`](docs/HYBRID_CUDNN_RUNTIME.md) for the API,
+128K heterogeneous/CP4 measurements, and current implementation boundary.
+
+---
+
 ## cuDNN KDA Kimi context parallelism
 
 The optional distributed runtime executes cuDNN KDA over contiguous packed-THD

@@ -50,7 +50,7 @@ def test_attention_kwargs_keep_checkpoints_out_of_summary_calls():
 
 
 def test_cudnn_loader_accepts_current_linear_attention_exports(monkeypatch):
-    def attention(*args, preceding_state_update=None, preceding_transition=None, **kwargs):
+    def attention(*args, initial_state=None, preceding_state_update=None, preceding_transition=None, **kwargs):
         return args, preceding_state_update, preceding_transition, kwargs
 
     def summary(*args, **kwargs):
@@ -76,16 +76,32 @@ def test_cudnn_loader_accepts_current_linear_attention_exports(monkeypatch):
 
     monkeypatch.setattr(cp, "import_module", import_fake)
     monkeypatch.setattr(cp.torch.ops.cudnn, "kimi_delta_attention_bwd", backward, raising=False)
+    cp._load_cudnn_kda_ops.cache_clear()
     cp._load_cudnn_cp_ops.cache_clear()
     try:
         loaded = cp._load_cudnn_cp_ops()
         assert loaded == (attention, summary, summary_bwd, backward)
     finally:
         cp._load_cudnn_cp_ops.cache_clear()
+        cp._load_cudnn_kda_ops.cache_clear()
+
+
+def test_cudnn_kda_loader_does_not_require_frost_summary_exports(monkeypatch):
+    def attention(*args, initial_state=None, **kwargs):
+        return args, initial_state, kwargs
+
+    backward = object()
+    monkeypatch.setattr(cp, "import_module", lambda name: SimpleNamespace(kimi_delta_attention=attention))
+    monkeypatch.setattr(cp.torch.ops.cudnn, "kimi_delta_attention_bwd", backward, raising=False)
+    cp._load_cudnn_kda_ops.cache_clear()
+    try:
+        assert cp._load_cudnn_kda_ops() == (attention, backward)
+    finally:
+        cp._load_cudnn_kda_ops.cache_clear()
 
 
 def test_cudnn_loader_rejects_pre_concatenated_summary_api(monkeypatch):
-    def old_attention(*args, **kwargs):
+    def old_attention(*args, initial_state=None, **kwargs):
         return args, kwargs
 
     modules = {
@@ -103,6 +119,7 @@ def test_cudnn_loader_rejects_pre_concatenated_summary_api(monkeypatch):
             raise ModuleNotFoundError(name) from error
 
     monkeypatch.setattr(cp, "import_module", import_fake)
+    cp._load_cudnn_kda_ops.cache_clear()
     cp._load_cudnn_cp_ops.cache_clear()
     try:
         try:
@@ -113,6 +130,7 @@ def test_cudnn_loader_rejects_pre_concatenated_summary_api(monkeypatch):
             raise AssertionError("the retired stand-alone merge API must not be accepted")
     finally:
         cp._load_cudnn_cp_ops.cache_clear()
+        cp._load_cudnn_kda_ops.cache_clear()
 
 
 def test_local_boundary_summary_contract_preserves_fp32():
@@ -164,6 +182,133 @@ def test_local_boundary_summary_contract_rejects_precision_downgrade():
         assert "FP32" in str(error)
     else:
         raise AssertionError("BF16 boundary state must be rejected")
+
+
+def test_affine_summary_composition_uses_causal_order_in_both_directions():
+    updates = torch.tensor([2.0, 4.0], dtype=torch.float32).reshape(2, 1, 1, 1)
+    transitions = torch.tensor([5.0, 7.0], dtype=torch.float32).reshape(2, 1, 1, 1)
+
+    forward = cp._compose_affine_summaries(updates, transitions, reverse=False)
+    reverse = cp._compose_affine_summaries(updates, transitions, reverse=True)
+
+    assert forward.item() == 18.0  # (0 * 5 + 2) * 7 + 4
+    assert reverse.item() == 22.0  # (0 * 7 + 4) * 5 + 2
+
+
+def test_ieee_composition_validation_precedes_cuda_collectives():
+    original = cp.torch.backends.cuda.matmul.allow_tf32
+    try:
+        cp.torch.backends.cuda.matmul.allow_tf32 = True
+        try:
+            cp._validate_ieee_fp32_composition(torch.device("cuda", 0))
+        except RuntimeError as error:
+            assert "IEEE FP32" in str(error)
+        else:
+            raise AssertionError("TF32 boundary composition was accepted")
+    finally:
+        cp.torch.backends.cuda.matmul.allow_tf32 = original
+
+    cp._validate_ieee_fp32_composition(torch.device("cpu"))
+
+
+def test_hopper_state_probe_recovers_fp32_affine_map(monkeypatch):
+    heads, key_dim, value_dim = 2, 4, 6
+    state_update = torch.arange(heads * value_dim * key_dim, dtype=torch.float32).reshape(1, heads, value_dim, key_dim) / 32
+    transition = torch.eye(key_dim, dtype=torch.float32).expand(heads, key_dim, key_dim).clone()
+    transition[:, 0, 1] = 0.25
+    observed_kwargs = {}
+
+    def attention(q, k, v, g, beta, cu, *, initial_state, **kwargs):
+        observed_kwargs.update(kwargs)
+        final = torch.matmul(initial_state, transition) + state_update
+        return torch.zeros_like(v), final, torch.empty(0), torch.empty(0)
+
+    monkeypatch.setattr(cp, "_load_cudnn_kda_ops", lambda: (attention, object()))
+    options = cp._KdaOptions(
+        scale=None,
+        use_qk_l2norm_in_kernel=False,
+        use_beta_sigmoid_in_kernel=False,
+        allow_neg_eigval=False,
+        safe_gate=False,
+        lower_bound=None,
+        gate_domain="log",
+        batch_invariant=True,
+        checkpoint_every_n_tokens=0,
+        plan_name=None,
+        summary_plan_name=None,
+    )
+    q = torch.zeros(8, heads, key_dim)
+    v = torch.zeros(8, heads, value_dim)
+    beta = torch.zeros(8, heads)
+    cu = torch.tensor([0, 8], dtype=torch.int32)
+
+    actual_h, actual_transition = cp._state_probe_summary(q, q, v, q, beta, cu, options=options)
+
+    assert actual_h.dtype == actual_transition.dtype == torch.float32
+    torch.testing.assert_close(actual_h, state_update[0])
+    torch.testing.assert_close(actual_transition, transition)
+    assert "checkpoint_every_n_tokens" not in observed_kwargs
+
+
+def test_hopper_state_probe_rejects_in_kernel_backward_transforms():
+    base = dict(
+        scale=None,
+        use_qk_l2norm_in_kernel=False,
+        use_beta_sigmoid_in_kernel=False,
+        allow_neg_eigval=False,
+        safe_gate=False,
+        lower_bound=None,
+        gate_domain="log",
+        batch_invariant=True,
+        checkpoint_every_n_tokens=0,
+        plan_name=None,
+        summary_plan_name=None,
+    )
+    for option in ("use_qk_l2norm_in_kernel", "use_beta_sigmoid_in_kernel", "safe_gate"):
+        values = dict(base)
+        values[option] = True
+        try:
+            cp._validate_hopper_state_probe_options(cp._KdaOptions(**values))
+        except ValueError as error:
+            assert option in str(error)
+        else:
+            raise AssertionError(f"SM90 accepted unsupported Hopper option {option}")
+
+    options = cp._KdaOptions(**base)
+    for name, kwargs in (
+        ("a_log", {"a_log": torch.zeros(1)}),
+        ("dt_bias", {"dt_bias": torch.zeros(1, 1)}),
+    ):
+        try:
+            cp._validate_hopper_state_probe_options(options, **kwargs)
+        except ValueError as error:
+            assert name in str(error)
+        else:
+            raise AssertionError(f"SM90 accepted unsupported Hopper input {name}")
+
+
+def test_kimi_cp_backend_resolution(monkeypatch):
+    device = torch.device("cuda", 0)
+    monkeypatch.setattr(cp.torch.cuda, "get_device_capability", lambda unused: (9, 0))
+    assert cp._resolve_kimi_cp_backend("auto", device) == "hopper-state-probe"
+    monkeypatch.setattr(cp.torch.cuda, "get_device_capability", lambda unused: (10, 0))
+    assert cp._resolve_kimi_cp_backend("auto", device) == "frost-summary"
+    monkeypatch.setattr(cp.torch.cuda, "get_device_capability", lambda unused: (8, 0))
+    try:
+        cp._resolve_kimi_cp_backend("auto", device)
+    except RuntimeError as error:
+        assert "8.x" in str(error)
+    else:
+        raise AssertionError("unsupported architectures must not select a Kimi CP backend")
+
+    for backend in ("frost-summary", "hopper-state-probe"):
+        assert cp._resolve_kimi_cp_backend(backend, device) == backend
+    try:
+        cp._resolve_kimi_cp_backend("unknown", device)
+    except ValueError as error:
+        assert "backend" in str(error)
+    else:
+        raise AssertionError("an unknown Kimi CP backend was accepted")
 
 
 def _transport_plan(*, rank=2, pre=2, post=1):
@@ -462,7 +607,7 @@ def test_single_rank_fast_path_calls_attention_export(monkeypatch):
         return torch.ones_like(v), torch.empty(0)
 
     monkeypatch.setattr(cp, "_validate_inputs", lambda *args, **kwargs: None)
-    monkeypatch.setattr(cp, "_load_cudnn_cp_ops", lambda: (attention, object(), object(), object()))
+    monkeypatch.setattr(cp, "_load_cudnn_kda_ops", lambda: (attention, object()))
 
     result = cp.cudnn_kda_cp(q, q, v, q, beta, cu, plan=plan)
 

@@ -21,6 +21,10 @@ cuLA/
 │   ├── distributed/                   # Optional cuDNN KDA Kimi CP runtime
 │   │   ├── plan.py                    # CPU-only packed-THD boundary planning
 │   │   └── kda.py                     # Collectives and distributed autograd
+│   ├── hybrid/                        # Layout-aware cuDNN hybrid-attention runtime
+│   │   ├── index_pool.py              # Differentiable CSA index pooling
+│   │   ├── dsa.py                     # Bounded packed-THD DSA block selection
+│   │   └── plan.py                    # CP block ownership and seam-halo plans
 │   │
 │   ├── lightning/                     # [non-KDA] Lightning Attention public wrappers
 │   │
@@ -48,6 +52,13 @@ cuLA/
 │       └── experimental/               # [non-KDA] unwired prototypes
 │
 ├── benchmarks/                         # Accuracy and performance runners
+│   └── large_cp_emulation/             # Logical CP-on-fewer-GPUs simulation layer
+│       ├── topology.py                 # Logical/physical rank separation
+│       ├── transport.py                # Native-CP protocol cost emulation
+│       ├── workload.py                 # Packed-THD workload descriptions
+│       ├── bench_components.py         # DSA and ring microbenchmarks
+│       ├── bench_kda.py                # KDA logical-CP E2E
+│       └── bench_hybrid.py             # KDA + DSA serial/overlap E2E
 ├── tests/                              # CPU registry tests and architecture-marked GPU tests
 ├── docs/                               # Pipeline and backend-dispatch design notes
 ├── scripts/build_wheel.sh
@@ -61,6 +72,8 @@ cuLA/
 |-----------|----------|-------------|
 | `cula/kernels/` | Python | Framework-independent public surface and static kernel inventory. Imports are lazy and do not compile kernels. |
 | `cula/kda/` | Python / CuTeDSL | KDA prefill/decode wrappers and the pure-CuTeDSL SM100 modular composition. `kda_prefill` calls FlashKDA directly without a native fallback. See [`cula/kda/README.md`](cula/kda/README.md). |
+| `cula/hybrid/` | Python | Optional cuDNN-backed composition layer for packed index pooling, bounded DSA selection, and CP layout planning. See [`docs/HYBRID_CUDNN_RUNTIME.md`](docs/HYBRID_CUDNN_RUNTIME.md). |
+| `benchmarks/large_cp_emulation/` | Python | Benchmark-only logical-CP layer built on the native `cula.distributed` and `cula.hybrid` APIs; it never participates in production imports. |
 | `cula/ops/kda/` | Python (CuTeDSL) | CuTeDSL KDA kernels organized into SM100 modular kernels, SM90 FlashKDA K1+K2 and intracard CP, decode, and experimental code. |
 | `cula/ops/lightning/` · `cula/ops/experimental/` | Python (CuTeDSL) | `[non-KDA]` Lightning/linear-attention kernels and prototypes. Lightning prefill dispatches to the SM90 or SM100 backend from Q's device capability. |
 | `cula/ops/{inv,ptx}.py` · `cula/ops/sm100/ptx.py` | Python | Shared low-level helpers used across operators. |
