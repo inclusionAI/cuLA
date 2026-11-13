@@ -776,11 +776,10 @@ class KDARecomputeWU:
                     ),
                     cute.make_layout((self.BT,), stride=(H_v,)),
                 )
-                sBeta[(aux_tidx, beta_h.index)] = cutlass.select_(
-                    aux_tidx < remaining,
-                    beta_gmem[aux_tidx].to(self.acc_dtype),
-                    self.acc_dtype(0.0),
-                )
+                value = self.acc_dtype(0.0)
+                if aux_tidx < remaining:
+                    value = beta_gmem[aux_tidx].to(self.acc_dtype)
+                sBeta[(aux_tidx, beta_h.index)] = value
                 cute.arch.fence_proxy("async.shared", space="cta")
                 beta_h.commit()
 

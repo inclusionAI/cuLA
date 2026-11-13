@@ -118,6 +118,7 @@ Final pure-path results:
 - frozen former-csrc bitwise vectors;
 - FP64 mathematical oracle bounds;
 - repeated-call and CUDA Graph determinism;
+- Compute Sanitizer coverage for guarded beta loads in final uneven sequence tails;
 - default-stream and concurrent-stream isolation;
 - output lifetime, pool reuse, and bounded retained memory;
 - fixed, GVA, QG, packed-varlen, and tail routing;

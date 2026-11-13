@@ -1,6 +1,8 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import pytest
 import torch
 
@@ -30,6 +32,31 @@ def test_recompute_wu_repeated_calls_are_bitwise_deterministic(beta_dtype):
     second = recompute_w_u_fwd(k, v, beta, A, gk, q=q)
     for expected, actual in zip(first, second, strict=True):
         assert torch.equal(expected, actual)
+
+
+@pytest.mark.sanitizer
+@pytest.mark.sm100_only
+@pytest.mark.skipif(
+    os.environ.get("CULA_RUN_SANITIZER_TESTS") != "1",
+    reason="set CULA_RUN_SANITIZER_TESTS=1 and run under compute-sanitizer",
+)
+@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16])
+def test_recompute_wu_uneven_tail_beta_load_is_in_bounds(beta_dtype):
+    _requires_sm100()
+    torch.manual_seed(7)
+    batch, seqlen, heads, dim, chunk_size = 1, 65, 1, 128, 64
+    k = torch.randn(batch, seqlen, heads, dim, device="cuda", dtype=torch.bfloat16) * 0.1
+    v = torch.randn_like(k) * 0.1
+    beta = torch.rand(batch, seqlen, heads, device="cuda", dtype=beta_dtype)
+    gk = torch.randn(batch, seqlen, heads, dim, device="cuda", dtype=torch.float32) * 0.02
+    A = torch.randn(batch, seqlen, heads, chunk_size, device="cuda", dtype=torch.bfloat16) * 0.02
+
+    w, u, qg, kg = recompute_w_u_fwd(k, v, beta, A, gk)
+    torch.cuda.synchronize()
+
+    assert qg is None
+    for output in (w, u, kg):
+        assert torch.isfinite(output).all()
 
 
 @pytest.mark.cula_fast
