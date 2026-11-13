@@ -1,0 +1,24 @@
+tests/test_kda_sm100_recompute_wu_cutedsl.py
+  s_33bff8766046bc::t_0cdbe7de4a75b1 4-5,37-59
+  s_33bff8766046bc::t_c0b33280ba45b3 60-61
+docs/kda_sm100_cutedsl_fwd_status.md
+  s_33bff8766046bc::t_0cdbe7de4a75b1 121
+cula/ops/kda/sm100/recompute_wu.py
+  s_33bff8766046bc::t_0cdbe7de4a75b1 779-782
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "133c5f68081876ef117a902a86e7774d406cf407",
+  "prompts": {},
+  "sessions": {
+    "s_33bff8766046bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1d3d3-0b03-7623-80cf-731c21cdefaf",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
