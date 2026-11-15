@@ -1,8 +1,10 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from cula.distributed import kda as cp
@@ -488,15 +490,18 @@ def test_boundary_transport_summary_contract_rejects_precision_or_shape_changes(
             raise AssertionError("invalid transport summaries must be rejected")
 
 
-def test_distributed_autograd_delegates_summary_composition_to_cudnn(monkeypatch):
+@pytest.mark.parametrize("multiple_documents", [False, True])
+def test_distributed_autograd_delegates_summary_composition_to_cudnn(monkeypatch, multiple_documents):
     plan = _transport_plan(rank=2, pre=2, post=1)
+    if multiple_documents:
+        plan = replace(plan, last_sequence=1, local_cu_seqlens=(0, 2, 4), first_boundary_end=2, last_boundary_start=2)
     heads, key_dim, value_dim = 2, 4, 3
     q = torch.zeros(4, heads, key_dim)
     k = torch.zeros_like(q)
     v = torch.zeros(4, heads, value_dim)
     g = torch.zeros_like(q)
     beta = torch.zeros(4, heads)
-    cu = torch.tensor([0, 4], dtype=torch.int32)
+    cu = torch.tensor(plan.local_cu_seqlens, dtype=torch.int32)
     options = cp._KdaOptions(
         scale=None,
         use_qk_l2norm_in_kernel=False,
@@ -538,19 +543,20 @@ def test_distributed_autograd_delegates_summary_composition_to_cudnn(monkeypatch
         )
 
     def summary_bwd(q, k, g, beta, d_o, cu, **kwargs):
-        assert kwargs["output_context"] is True
+        assert q.shape[0] == plan.first_boundary_end
+        assert kwargs["output_context"] is (not multiple_documents)
         assert kwargs["checkpoint_every_n_tokens"] == 16
-        return (
+        result = (
             torch.full((1, heads, value_dim, key_dim), 5.0),
             torch.full((1, heads, key_dim, key_dim), 6.0),
-            torch.tensor([7], dtype=torch.uint8),
         )
+        return result if multiple_documents else (*result, torch.tensor([7], dtype=torch.uint8))
 
     def backward(d_o, q, k, v, g, beta, cu, scale, **kwargs):
         observed["following_h"] = kwargs["following_state_grad"].clone()
         observed["following_transition"] = kwargs["following_transition"].clone()
         observed["composed"] = kwargs["composed_initial_state"].clone()
-        observed["context"] = kwargs["context"].clone()
+        observed["context"] = kwargs["context"]
         observed["checkpoints"] = kwargs["state_checkpoints"].clone()
         return (
             torch.ones_like(q),
@@ -587,14 +593,18 @@ def test_distributed_autograd_delegates_summary_composition_to_cudnn(monkeypatch
     assert observed["following_h"].shape[0] == 1
     assert torch.equal(observed["following_transition"], torch.full((1, heads, key_dim, key_dim), 6.0))
     assert torch.equal(observed["composed"], torch.full((1, heads, value_dim, key_dim), 4.0))
-    assert torch.equal(observed["context"], torch.tensor([7], dtype=torch.uint8))
+    if multiple_documents:
+        assert observed["context"] is None
+    else:
+        assert torch.equal(observed["context"], torch.tensor([7], dtype=torch.uint8))
     assert torch.equal(observed["checkpoints"], torch.full((1, heads, value_dim, key_dim), 3.0))
     assert len(gradients) == 12
     assert gradients[6:8] == (None, None)
 
 
-def test_single_rank_fast_path_calls_attention_export(monkeypatch):
-    plan = KimiCPPlan.from_global_cu_seqlens([0, 2], rank=0, world_size=1)
+@pytest.mark.parametrize("world", [1, 4])
+def test_independent_shards_call_native_attention_export(monkeypatch, world):
+    plan = KimiCPPlan.from_global_cu_seqlens(list(range(0, 2 * world + 1, 2)), rank=0, world_size=world)
     q = torch.zeros(2, 1, 4)
     v = torch.zeros(2, 1, 3)
     beta = torch.zeros(2, 1)
