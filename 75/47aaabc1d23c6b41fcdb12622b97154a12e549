@@ -1,0 +1,27 @@
+cula/distributed/kda.py
+  s_d4826b35da75c5::t_5ce3b3dc4f5451 722-727,736,741-742,878-882,931-935
+cula/distributed/plan.py
+  s_d4826b35da75c5::t_1756ab42586c2c 32-35,49-51,140-142,155
+docs/KIMI_CP_RUNTIME.md
+  s_d4826b35da75c5::t_4714f59a2a6b37 53-54,59-68,87,93-97
+tests/test_kimi_cp_helpers.py
+  s_d4826b35da75c5::t_7bbfdb08235ca3 4,7,493-494,496-497,504,546-547,549,553,559,596-599,605-607
+tests/test_kimi_cp_plan.py
+  s_d4826b35da75c5::t_ba5a9bff1f9e35 106-128
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7547aaabc1d23c6b41fcdb12622b97154a12e549",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
