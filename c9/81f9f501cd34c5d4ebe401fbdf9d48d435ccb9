@@ -1,0 +1,22 @@
+tests/test_hybrid_dsa_plan.py
+  s_d4826b35da75c5::t_ba06c1f15b8e3a 33-43,49-52
+  s_d4826b35da75c5::t_ed16b860c89810 44-48
+cula/hybrid/dsa.py
+  s_d4826b35da75c5::t_daf610c4aad102 268,277,281
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c981f9f501cd34c5d4ebe401fbdf9d48d435ccb9",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
