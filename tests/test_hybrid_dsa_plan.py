@@ -30,6 +30,26 @@ def test_selection_plan_coalesces_short_packed_sequences():
     assert window.candidate_offsets == (0, 28, 73)
 
 
+def test_thousands_of_short_sequences_keep_exact_window_budget_boundaries():
+    # Each four-token document contributes exactly one complete-block logit.
+    count, capacity = 4097, 1000
+    plan = DsaSelectionPlan.from_cu_seqlens(
+        tuple(4 * i for i in range(count + 1)),
+        tuple(range(count + 1)),
+        top_k=1,
+        candidate_budget_bytes=capacity * 4,
+    )
+    assert [w.candidate_floats for w in plan.windows] == [1000, 1000, 1000, 1000, 97]
+    assert [(w.query_start, w.query_end) for w in plan.windows] == [
+        (0, 4000),
+        (4000, 8000),
+        (8000, 12000),
+        (12000, 16000),
+        (16000, 16388),
+    ]
+    assert all(w.candidate_offsets == tuple(range(w.candidate_floats + 1)) for w in plan.windows)
+
+
 def test_selection_plan_splits_one_sequence_to_bound_peak_scratch():
     plan = DsaSelectionPlan.from_cu_seqlens(
         [0, 32],

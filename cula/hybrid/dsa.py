@@ -265,6 +265,7 @@ class DsaSelectionPlan:
             sequence, row_start, row_end, key_length, position, candidates, query_length = atoms[atom]
             whole = row_start == 0 and row_end == query_length
             group = [atoms[atom]]
+            group_candidates = candidates
             atom += 1
             while whole and atom < len(atoms):
                 next_atom = atoms[atom]
@@ -273,10 +274,11 @@ class DsaSelectionPlan:
                     next_sequence != group[-1][0] + 1
                     or next_start != 0
                     or next_end != next_length
-                    or sum(item[5] for item in group) + next_candidates > budget_floats
+                    or group_candidates + next_candidates > budget_floats
                 ):
                     break
                 group.append(next_atom)
+                group_candidates += next_candidates
                 atom += 1
 
             first_sequence = group[0][0]
