@@ -1,117 +1,197 @@
-# Cost-driven THD context-parallel layout planner
+# THD context-parallel planning
 
-## Why the alternating prototype is not the production policy
+cuLA separates **where selection runs** from **where recurrent state and
+attention activations live**. `plan_thd_selection` balances causal indexer work
+while KDA, pooling, attention forward/backward and indexer backward retain their
+original contiguous CP shards. Only indexer Q/weights move; document-local
+block IDs and FP32 scores return to the source query owners before attention.
+The [redistributor](THD_REDISTRIBUTION.md) implements both directions and their
+first-order autograd, without casting or reducing row values.
 
-Alternating the shard direction of adjacent long samples exactly balances the
-original `20 x 1K + 2 x 514048` experiment, but it encodes properties of that
-batch into the policy.  It is weak for a single dominant sequence, an odd
-number of long sequences, and power-law mixtures.
+This avoids applying full per-document zigzag to every short document or moving
+wide MLA attention activations just to balance selection. It is an eager
+integration; it does not promise CUDA Graph capture or whole-model E2E speedups.
+See the [31-distribution measurements](THD_SELECTION_RESULTS.md) for scope,
+preparation costs, precision, memory and measured limitations.
 
-`plan_thd_layout` instead consumes arbitrary CPU `global_cu_seqlens` and
-balances two independent resources:
+## Public interfaces
 
-- token-linear KDA and index-pooling work;
-- position-dependent causal candidate work in CSA/DSA.
+- `plan_thd_selection`: calibrated, capacity-bounded selection ownership; target
+  row counts can differ or be zero. Keep attention and KDA in source ownership.
+- `zigzag_thd_layout`: conventional per-document early/late pairing, shared by
+  the planner and benchmark baseline. Rank r receives pieces r and 2*CP-1-r
+  from each document, including short documents. Empty pieces are omitted;
+  adjacent pieces remain distinct execution spans.
+- `plan_thd_layout`: existing balanced-token policy, for consumers that need
+  exact balanced block capacities. Its default analytic objective is preserved.
+  This API alone does not make shuffled KDA spans executable by a contiguous
+  Kimi CP state chain.
 
-Short samples remain whole when exact token capacity permits it. Long samples
-are considered on several planning grids from `1 x CP` through `6 x CP`. Equal-token pieces are assigned by a
-deterministic multi-resource largest-processing-time scheduler, then adjacent
-pieces with the same owner are coalesced. This naturally produces an
-early/late zigzag for one long sequence and cross-sample compensation when
-several long sequences are available.
+All planning uses CPU sequence boundaries and explicit caller configuration.
+There is no device probing, online timing, hidden cache, process collective or
+case-name lookup. Peers must use identical global metadata, coefficients and
+configuration. Plan once at microbatch ingress and reuse where appropriate.
+Planning is deterministic; kernel `deterministic=False` remains the throughput
+option and is independent of the planner's stable tie-breaking.
 
-After compute scheduling, a capacity-repair pass moves whole spans where
-possible and otherwise splits the cheapest span boundary. Every rank receives
-its exact balanced block capacity (at most one block difference when the global
-block count is not divisible by CP), so the plan remains compatible with
-fixed-shape KDA and pooled all-gather collectives.
+```python
+from cula.distributed import plan_thd_selection, THDRedistributionPlan, THDRedistributor
 
-## Objective and fallback guarantee
-
-For rank `r`, let `T_r` be its tokens and `C_r` its exact analytic causal
-candidate count. The default robust objective is
-
-```text
-max(max(T_r) / mean(T_r), max(C_r) / mean(C_r))
-    + 0.02 * max(cross_rank_boundary_count_r)
+layout = plan_thd_selection(
+    global_cu_seqlens,
+    world_size=cp_world_size,
+    max_tokens_per_rank=query_capacity,
+    cost_model=calibrated_model,
+)
+route = THDRedistributionPlan.build(layout.ranks, source_offsets, cp_rank)
+exchange = THDRedistributor(route, local_index_q.device, group=cp_group)
+selection_q = exchange.distribute(local_index_q)
+selection_weights = exchange.distribute(local_weights)
+# Selection must use layout.for_rank(cp_rank)'s original document origins,
+# causal offsets and document-local block numbering, with the required keys.
+selected = select_for_spans(selection_q, selection_weights, layout.for_rank(cp_rank))
+local_ids = exchange.restore(selected.block_ids)
+local_scores = exchange.restore(selected.scores)
 ```
 
-The boundary term prevents fine planning grids from winning on an immaterial
-compute difference while introducing extra KDA state chains. The weights and
-maximum grid are explicit configuration rather than hidden thresholds.
+The model assumes balanced, block-aligned contiguous source shards. Pass those
+same offsets to the redistributor. `query_capacity` must be block aligned and
+fit the largest source shard. It bounds query-shaped buffers, **not** gathered
+keys or backend scratch. The full-CSA benchmark uses twice the source row count;
+callers must budget actual backend workspace separately. Documents must be
+block aligned for these planners; the current CSA harness uses ratio four.
 
-The planner always evaluates the ordinary contiguous CP partition with the
-same objective and returns the lowest-scoring candidate. Therefore its result
-is never worse than contiguous under the declared model. This is a model-level
-guarantee; GPU profiling is still needed to calibrate how candidate work,
-token work, and boundary communication overlap on a target system.
+## Candidate pool and fallback
 
-## Representative CP4 distributions
+Selection compares all feasible candidates under one cost model:
 
-The CPU benchmark is `benchmarks/large_cp_emulation/bench_thd_planner.py`.
-The following table uses 1M total tokens and the default cost model.
+1. Contiguous source ownership.
+2. Complete per-document zigzag, including documents below the split threshold.
+3. Early/late pairs within long documents, relabeled onto ranks with a
+   minimum-cost assignment to reduce aggregate traffic. Short source spans stay
+   local in this candidate family.
+4. Greedy long-span placement on grids from 1 through `max_chunks_per_rank`
+   pieces per rank. Descending modeled work is placed using current compute,
+   incoming/outgoing traffic and row capacity; a span splits only when no bin
+   can hold it. Adjacent same-owner spans coalesce.
 
-| THD distribution | selected grid | token max/avg | causal max/avg | selected score | contiguous score | remote boundaries |
-|---|---:|---:|---:|---:|---:|---:|
-| 1024 equal short samples | contiguous | 1.000 | 1.000 | 1.000 | 1.000 | 0 |
-| one 1M sequence | 2 x CP | 1.000 | 1.000 | 1.080 | 1.790 | 6 |
-| 20 x 1K + 2 x 514048 | 2 x CP | 1.000 | 1.000 | 1.040 | 1.560 | 4 |
-| 256 x 1K + 1 x 768K | 3 x CP | 1.000 | 1.037 | 1.157 | 2.261 | 10 |
-| 32 x 4K + 128K + 256K + 512K | 4 x CP | 1.000 | 1.046 | 1.166 | 2.302 | 10 |
-| power-law 1K through 511K | 4 x CP | 1.000 | 1.028 | 1.188 | 2.149 | 15 |
+Only candidates 3 and 4 pin documents shorter than twice `min_split_tokens`
+(default 16K). Full zigzag is independently considered and obeys the same row
+cap. A zigzag that concentrates tiny documents beyond that cap is infeasible.
+The minimum-cost assignment is a stable O(CP^3) primal-dual algorithm. It
+minimizes aggregate traffic, so the result is still scored by the full
+critical-path model rather than assumed to be best.
 
-The important result is not that one grid wins everywhere. Low-fragmentation
-`2 x CP` is selected for the original and single-long cases, while irregular
-mixtures spend additional boundaries only when they materially improve both
-token and causal balance.
+Migration requires both `min_gain_fraction` (default 5%) and `min_gain_ms`
+(default zero) over contiguous. `min_gain_ms` is an explicit minimum predicted
+saving per selection use. A caller can price one-time preparation divided by
+an expected reuse count; cuLA neither guesses that count nor hides preparation
+in steady-state timing. `evaluated_scores` contains only materialized/scored
+candidates. The selected modeled cost cannot exceed contiguous; this is **not**
+a guarantee of minimum measured GPU latency over arbitrary distributions.
 
-At logical CP64, the planning grid scales below the fixed 16K short-sample
-threshold for long sequences. A one-million-token sequence therefore still
-selects `2 x CP`, with exact token and causal balance. The original two-long
-mixture selects `5 x CP` and reduces modeled causal max/average from 2.007 to
-1.072; the power-law mixture also selects `5 x CP` and reduces it from 2.770
-to 1.034. The threshold is used only to preserve genuinely short samples, not
-to prevent a dominant long sequence from forming sub-rank zigzag pieces.
+## Compute and communication model
 
-## Four-GPU DSA validation
+For each rank, compute cost in nanoseconds is
 
-The layout-native DSA benchmark executes real deterministic cuDNN index
-pooling and DSA selection, including pooled-key all-gather and global block-ID
-remap. Each number below is the median critical-path GPU time after two warmups
-and three measured iterations. All cases contain 1,048,576 global tokens.
-These published measurements used four index heads; current benchmark output
-records `index_heads` explicitly because the default model shape is now 64.
+```text
+candidate_ns * exact_causal_candidates
+    + query_ns * query_rows + 1000 * span_us * execution_spans
+```
 
-| THD distribution | contiguous | planned | speedup | planned causal max/avg |
-|---|---:|---:|---:|---:|
-| one 1M sequence | 418.51 ms | 239.16 ms | 42.9% | 1.000 |
-| 20 x 1K + 2 x 514048 | 166.77 ms | 109.05 ms | 34.6% | 1.000 |
-| 256 x 1K + 1 x 768K | 291.80 ms | 134.35 ms | 54.0% | 1.037 |
+The candidate count is an integer prefix-sum formula for the complete causal
+blocks visible at each query. It includes original-document causal offsets,
+not just each fragment's local length. Critical compute is the maximum over
+ranks.
 
-For the original mixture, planned per-rank selection time is approximately
-108 ms and remap plus collective time is 0.55--0.96 ms. Under contiguous CP,
-the light ranks spend 107--120 ms waiting at the collective while the heavy
-ranks finish selection. For the single-long sequence, contiguous candidate
-work grows from 8.59 to 60.13 billion across ranks; the planned layout gives
-every rank exactly 34.36 billion candidates. This confirms that the speedup is
-removal of causal load bubbles rather than a precision or kernel change.
+Transport sums actual rows over source/destination edges. `bytes_per_query`
+includes the outgoing Q/weights and returning IDs/scores in their real dtypes.
+The critical transfer term takes the maximum of:
 
-## Plan contract and integration boundary
+- incoming and outgoing per-rank time at explicit intra/inter-node rates;
+- the busiest aggregated peer edge, if `peer_gbps` is supplied;
+- shared node injection/receive time, if `inter_node_aggregate_gbps` is supplied.
 
-`THDLayoutPlan` records the global spans, owner rank, local `cu_seqlens`,
-causal offsets, per-resource loads, and all candidate scores. Planning is
-CPU-only and deterministic. It must run once at microbatch ingress, before the
-model layer stack, rather than permuting tokens inside every KDA or CSA layer.
+Add the busiest rank's nonempty peer count times `peer_startup_us`, actual
+permutation-copy work times `packing_ns_per_query`, and `exchange_us`. Multiple
+fragments on one edge do not pay multiple peer startups. Naturally ordered
+source/receive ranges skip `index_select` and carry zero copy cost on that side.
+Global identity skips all transport terms.
 
-The current KDA runtime still assumes one contiguous global token shard. A
-separate lowering step is required before `THDLayoutPlan` becomes its default:
+Ordered forward exchange, compute and inverse exchange costs add. The optional
+`overlap_intra_inter` lets local and inter-node transfer resources overlap
+inside collectives; it does not assume compute/communication overlap. Enable
+it only after measuring mixed-link traffic. Coefficients are effective eager
+implementation costs, not physical link specifications. The payload model is
+shape-specific; different head counts, top-K, topology or software require
+calibration and held-out validation.
 
-1. derive every sequence's ordered `(sequence, span ordinal)` chain;
-2. merge forward and backward KDA state in sequence order, not physical-rank
-   order;
-3. produce CSA global block IDs and key-remap metadata from the same spans;
-4. apply the token permutation once and retain it across all model layers.
+## Admissible pruning and preparation complexity
 
-The benchmark adapter already lets DSA consume the planned layout. Keeping the
-planner independent from KDA transport is intentional: layout policy and the
-collective implementation can be validated and evolved separately.
+Two lower bounds avoid building candidates that cannot meet the margin:
+
+- Every partition has the same token/candidate sums and at least one span per
+  document. Their mean is a compute lower bound. To reduce source rank i's
+  compute below C, some work must leave it; no moved row can remove more work
+  than its largest causal position allows. Optimistic outgoing bandwidth prices
+  these minimum rows. Minimize `C + max(outgoing_bound_i(C))` at the endpoints
+  and intersections of affine functions. With concurrent intra/inter links,
+  their capacities add in this optimistic bound.
+- Full zigzag has a stronger bound: mean compute plus exact outgoing intra/inter
+  traffic. Consecutive pieces on the same node form interval runs. Intersecting
+  source spans with those runs and the owner's two pieces avoids constructing
+  O(documents * CP) objects. This bound omits incoming and peer bottlenecks and
+  permutation copies. Local candidates run first to tighten its incumbent.
+
+Bounds are tested against exhaustive small assignments and concrete zigzag
+layouts on contiguous, interleaved and irregular topologies. They cannot exclude
+a strictly better modeled zigzag; they make no statement about model error.
+
+Repeated planning grids are deduplicated. Pinned spans are coalesced once;
+owner groups are built in one pass, and diagnostics are computed only for the
+selected selection plan. Balanced-token scheduling uses a rank heap for
+identical-cost pieces and indexes capacity repair by donor and piece shape.
+Source intersections use binary search. DSA window construction maintains an
+integer candidate total instead of rescanning all preceding short documents;
+window boundaries, scratch requirements and numerical execution are unchanged.
+
+## Calibrating and measuring
+
+`benchmarks/calibrate_thd_selection.py` fits nonnegative candidate/query/span
+costs from unmodeled selection runs and retains source JSON digests. Pipeline
+exchange measurements use differences of maximum cumulative phase endpoints,
+so KDA/selection arrival waits are not counted again as network work.
+
+`benchmarks/bench_thd_transport.py` measures the actual Q/weight and inverse
+ID/score exchanges with exact marker checks. Sparse peer pairs, node-local,
+inter-node and dense exchanges exercise different message sizes. The 32768-row
+and striped fixtures are held out. `--validation-only` measures additional
+mixed-link fractions. `benchmarks/fit_thd_transport.py` fits nonnegative resource
+costs without using held-out rows in its objective. Ordered fixtures do not
+identify copy bandwidth: measure permutation copies separately and supply that
+coefficient in the input profile. Unidentifiable node limits must not be
+interpreted as measured physical bandwidth.
+
+The [example profiles](../benchmarks/profiles/README.md) are optional deployment
+inputs, not library defaults. The runner's `--suite validation` fixes the 31
+measured THD shapes. Use `summarize_csa_layout_matrix.py` to check complete
+output/gradient evidence, compatible configurations, all-rank samples and
+preparation accounting before producing a comparison. Preparation includes
+common metadata, layout/index/workspace construction and KDA transport buffers.
+Report it separately and added to one iteration; amortize only when reuse is real.
+
+## KDA integration
+
+The [Kimi CP runtime](KIMI_CP_RUNTIME.md) requires contiguous source ownership.
+When every internal shard boundary is a document boundary, all ranks agree that
+no recurrence crosses ranks. Native local KDA/autograd then skips summaries and
+boundary collectives, with unchanged operands, dtypes and batch-invariance.
+One isolated rank cannot bypass exchanges required by other ranks. Manually
+constructed plans conservatively default to requiring exchange.
+
+On the native summary path, backward context is reused only if the summarized
+first span covers the complete local shard. A prefix-only context does not
+contain the full THD shard's per-token intermediates; full apply prepares its
+own intermediates instead. The paired independent-shard benchmark checks the
+fast path against forced boundary execution, including weak decay and a
+crossing-document control.

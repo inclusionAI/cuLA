@@ -9,13 +9,17 @@ from cula.distributed.kda import (
     cudnn_kda_cp,
 )
 from cula.distributed.plan import KimiCPPlan, build_kimi_cp_plan
+from cula.distributed.redistribute import THDRedistributionPlan, THDRedistributor
 from cula.distributed.thd_planner import (
     THDLayoutMetrics,
     THDLayoutPlan,
     THDPlannerConfig,
     THDRankLayout,
+    THDSelectionCostModel,
     THDSpan,
     plan_thd_layout,
+    plan_thd_selection,
+    zigzag_thd_layout,
 )
 
 __all__ = [
@@ -26,8 +30,13 @@ __all__ = [
     "THDLayoutPlan",
     "THDPlannerConfig",
     "THDRankLayout",
+    "THDRedistributionPlan",
+    "THDRedistributor",
+    "THDSelectionCostModel",
     "THDSpan",
     "build_kimi_cp_plan",
     "cudnn_kda_cp",
     "plan_thd_layout",
+    "plan_thd_selection",
+    "zigzag_thd_layout",
 ]
