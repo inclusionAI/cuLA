@@ -1,0 +1,80 @@
+benchmarks/profiles/thd_selection_b300_cp8.json
+  s_d4826b35da75c5::t_8319800c5f2439 1-646
+benchmarks/profiles/README.md
+  s_d4826b35da75c5::t_8319800c5f2439 1-23
+benchmarks/bench_kda_independent_shards.py
+  s_d4826b35da75c5::t_8319800c5f2439 1-148
+tests/test_thd_redistribute.py
+  s_d4826b35da75c5::t_6ba21c8647e2a7 1-130
+docs/THD_REDISTRIBUTION.md
+  s_d4826b35da75c5::t_8319800c5f2439 1-36,43-99
+  s_d4826b35da75c5::t_8752b975d134ce 37-42
+tests/test_csa_matrix_report.py
+  s_d4826b35da75c5::t_6ba21c8647e2a7 1-62,79-107
+  s_d4826b35da75c5::t_171d7c1939a462 63-78
+docs/THD_LAYOUT_PLANNER.md
+  s_d4826b35da75c5::t_ed16b860c89810 1-55,57-95,98-99,102-197
+benchmarks/profiles/thd_selection_h20_cp16.json
+  s_d4826b35da75c5::t_8319800c5f2439 1-1168
+benchmarks/bench_csa_layout_matrix.py
+  s_d4826b35da75c5::t_171d7c1939a462 51-53
+  s_d4826b35da75c5::t_a7fdc06773ff96 1-50,54-155
+tests/test_thd_1m_cases.py
+  s_d4826b35da75c5::t_a7fdc06773ff96 1-79,82-91
+  s_d4826b35da75c5::t_171d7c1939a462 80-81
+docs/results/thd_selection_20261115.json
+  s_d4826b35da75c5::t_e261065076b34d 1-6530,6544
+  s_d4826b35da75c5::t_27751b4d1ae329 6531-6543
+benchmarks/summarize_csa_layout_matrix.py
+  s_d4826b35da75c5::t_6ba21c8647e2a7 1-38,40-76,87-132
+  s_d4826b35da75c5::t_171d7c1939a462 39,77-86
+benchmarks/bench_full_csa_cp.py
+  s_d4826b35da75c5::t_a7fdc06773ff96 583
+  s_d4826b35da75c5::t_1324ba7192c682 1-582,584-828
+docs/THD_1M_STATISTICS_CASES.md
+  s_d4826b35da75c5::t_8319800c5f2439 1-114
+docs/THD_SELECTION_RESULTS.md
+  s_d4826b35da75c5::t_e261065076b34d 1-140
+  s_d4826b35da75c5::t_d9982bbb02d1a8 141-163
+benchmarks/bench_thd_transport.py
+  s_d4826b35da75c5::t_0c071abb7e96c9 1-76,82,84,121-124,131-132,135,138-139,143-144,146-162,164-181,186,189-192,197-202,204
+  s_d4826b35da75c5::t_171d7c1939a462 77-81,83,85-120,125-130,133-134,136-137,140-142,145,163,182-185,187-188,193-196,203
+cula/distributed/redistribute.py
+  s_d4826b35da75c5::t_1324ba7192c682 1-186
+docs/results/thd_selection_review_20261115.json
+  s_d4826b35da75c5::t_d9982bbb02d1a8 1-1038
+benchmarks/calibrate_thd_selection.py
+  s_d4826b35da75c5::t_80f47ea18807c9 1-188
+benchmarks/cp_layouts.py
+  s_d4826b35da75c5::t_4d908e1e2ab177 1-37
+benchmarks/fit_thd_transport.py
+  s_d4826b35da75c5::t_dfce6112b5c5b7 1-108
+benchmarks/thd_1m_cases.py
+  s_d4826b35da75c5::t_d68934cf9a9b5a 1-259
+cula/distributed/__init__.py
+  s_d4826b35da75c5::t_f1c4bc2fa14970 12,18,21-22,33-35,40-41
+cula/distributed/thd_planner.py
+  s_d4826b35da75c5::t_2ad2746984da74 14,17-19,81,89,115-268,292-330,386-387,401,410-411,427,479-500,550-562,576-585,587-593,596-598,600-603,605-613,615-618,623-625,724-802,808,820-821,823-824,826,828,833-854,857,865-868,888-916,925-928,948-1328,1336,1340-1341
+tests/test_full_csa_cp_metadata.py
+  s_d4826b35da75c5::t_56c23c48306e6a 1-59
+tests/test_thd_cost_fit.py
+  s_d4826b35da75c5::t_84e25b4cf8fbb1 1-136
+tests/test_thd_planner.py
+  s_d4826b35da75c5::t_fb8eac224df7f8 6,10-21,129-548
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5bbe9475e91f22a6feefc521c9379769ee62a25e",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
