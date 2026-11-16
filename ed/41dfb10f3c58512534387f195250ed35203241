@@ -1,0 +1,26 @@
+cula/hybrid/csa_cp.py
+  s_d4826b35da75c5::t_083b9f7355e18f 37-38,177-182,233-235
+  s_d4826b35da75c5::t_aeead327bfe85c 236
+docs/CSA_CP_SELECTION.md
+  s_d4826b35da75c5::t_083b9f7355e18f 3-5,38-53,56-61,161-162
+  s_d4826b35da75c5::t_00d6acffc45707 6-8
+tests/test_csa_cp_selection.py
+  s_d4826b35da75c5::t_083b9f7355e18f 140-155,161,178,195-207
+  s_d4826b35da75c5::t_bc3fe46e368bfc 208
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ed41dfb10f3c58512534387f195250ed35203241",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
