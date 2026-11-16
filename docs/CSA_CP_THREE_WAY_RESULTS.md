@@ -169,6 +169,21 @@ the preparation change. Neither cohort establishes universally optimal one-use
 selection or a <3% preparation guarantee. Use a calibrated preparation budget
 and account for expected layout reuse.
 
+## Reuse across CSA layers
+
+These measurements charge fresh preparation to one CSA operator. A compatible
+multilayer stack can reuse one host plan and, for ordered invocations, its device
+metadata/workspace. Preparation then contributes `P / R` per CSA use; runtime
+communication and computation are still paid at every layer. Both fixed
+baselines receive the same reuse credit.
+
+Using this cohort for accounting, the worst gap to faster contiguous/zigzag
+becomes **2.634% at eight compatible uses** and **1.413% at sixteen**. These are
+projections from single-layer measurements, not measured multilayer training
+results. They assume the caller shares all preparation included in P, including
+common pooling/source metadata; sharing only the host plan amortizes only that
+portion. See [reuse conditions, formulas and limits](CSA_CP_PLAN_REUSE.md).
+
 ## Equivalent preparation optimization
 
 The update removes redundant metadata work and prunes candidates with a proved
@@ -271,8 +286,10 @@ dtype or native precision setting changed. These error envelopes include native
 nondeterminism; small differences from the previous run are not a new precision
 improvement or a bitwise-equivalence claim.
 
-The tested source is `489779ba35e2c5f51eccce7c7ff95ed4cdd640d0`. All 125 source
-files in the final timing manifest match the reviewed checkout.
+The tested source is `489779ba35e2c5f51eccce7c7ff95ed4cdd640d0`. The final timing
+manifest records all 125 source files for that cohort. Subsequent host-only
+rank-pruning timings and multilayer workspace-reuse checks are reported
+[separately](CSA_CP_PLAN_REUSE.md); they do not replace this GPU timing cohort.
 Every selected policy matches the previous run, and every measured full-zigzag
 baseline fits the planner's row cap. The new measurements supersede the primary
 tables in this document. The [previous 24-case evidence](results/csa_cp_three_way_20261116.json)

@@ -54,6 +54,31 @@ materialization uploads compact interval metadata and builds the large integer
 index/permutation arrays on the target device. This avoids constructing and
 copying token-sized CPU arrays. Device operations use explicit output sizes.
 
+## Reuse across layers
+
+Prepare once at microbatch ingress and pass the same immutable plan to every
+compatible CSA layer. The plan contains geometry, routing and scratch sizing,
+not layer activations or selected block IDs. Each invocation supplies its own
+Q, pooled keys and weights and computes fresh selection results.
+
+Reuse requires unchanged document boundaries, source ownership, CP group/rank
+mapping, block size, Top-K, row capacity and scratch policy. The calibrated costs
+must remain applicable to the indexer shape, dtypes and topology. A new batch
+with different boundaries needs a new plan even when its total token count
+matches. Layers with different selection geometry need separate plans.
+
+Sequential invocations on the same device/group/stream can also share one
+`CsaCPSelectionWorkspace`. Results own their storage and survive later calls;
+keep the per-layer results needed by backward. Concurrent invocations share
+only the host plan and need separate mutable workspaces or explicit ordering.
+This does not cache activations or sparse selections across layers.
+
+For R compatible uses, one-time host planning contributes `P_host / R` per use.
+If device metadata and scratch are also reused, their preparation is amortized
+too. Runtime routing, selection, attention and backward still execute per layer.
+The [reuse analysis](CSA_CP_PLAN_REUSE.md) separates this accounting from the
+single-CSA measurements and from measured multilayer model performance.
+
 ## Layout, lifetime and numerical contract
 
 - Documents are block-aligned, with pooling block size four by default. Source

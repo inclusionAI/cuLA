@@ -26,7 +26,10 @@ def canonical(result):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--weights-dtype", choices=("bf16", "fp32"), default="bf16")
+    parser.add_argument("--reuse-layers", type=int, default=3, help="Distinct sequential inputs sharing a plan/workspace")
     args = parser.parse_args()
+    if args.reuse_layers < 2:
+        parser.error("reuse-layers must be at least two")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device("cuda", torch.cuda.current_device())
     dist.init_process_group("nccl", timeout=datetime.timedelta(minutes=5))
@@ -58,15 +61,38 @@ def main():
             workspace = CsaCPSelectionWorkspace.from_plan(plan, device, group=group)
             result = cudnn_csa_select_cp(qi, keys, weights, workspace=workspace)
             ids, scores = canonical(result)
-            saved_ids, saved_scores = result.block_ids.clone(), result.scores.clone()
-            cudnn_csa_select_cp(qi * 2, keys, weights, workspace=workspace)
-            retained = torch.equal(saved_ids, result.block_ids) and torch.equal(saved_scores, result.scores)
+            saved = [(result, result.block_ids.clone(), result.scores.clone())]
+            reuse_ids_equal, reuse_error = True, 0.0
+            for layer in range(1, args.reuse_layers):
+                # Different layer inputs must not reuse the previous layer's
+                # sparse selection. Compare with a fresh workspace, retaining
+                # every earlier result as a training stack would for backward.
+                layer_q, layer_keys, layer_weights = qi.roll(layer, 0), keys.roll(-layer, 0), weights.roll(-layer, 0)
+                reused = cudnn_csa_select_cp(layer_q, layer_keys, layer_weights, workspace=workspace)
+                fresh_workspace = CsaCPSelectionWorkspace.from_plan(plan, device, group=group)
+                fresh = cudnn_csa_select_cp(layer_q, layer_keys, layer_weights, workspace=fresh_workspace)
+                reused_ids, reused_scores = canonical(reused)
+                fresh_ids, fresh_scores = canonical(fresh)
+                reuse_ids_equal &= torch.equal(reused_ids, fresh_ids)
+                error = ((reused_scores - fresh_scores).norm() / fresh_scores.norm().clamp_min(1e-12)).item()
+                reuse_error = max(reuse_error, error) if math.isfinite(error) else math.inf
+                saved.append((reused, reused.block_ids.clone(), reused.scores.clone()))
+            retained = all(
+                torch.equal(x.block_ids, ids_copy) and torch.equal(x.scores, scores_copy) for x, ids_copy, scores_copy in saved
+            )
             if baseline is None:
                 baseline = ids.clone(), scores.clone()
             ids_equal = torch.equal(ids, baseline[0])
             delta = (scores - baseline[1]).float()
             relative = (delta.norm() / baseline[1].norm().clamp_min(1e-12)).item()
-            okay = retained and ids_equal and bool(torch.isfinite(scores).all()) and relative < 1e-5
+            okay = (
+                retained
+                and ids_equal
+                and reuse_ids_equal
+                and reuse_error < 1e-5
+                and bool(torch.isfinite(scores).all())
+                and relative < 1e-5
+            )
             records.append(
                 dict(
                     lengths=lengths,
@@ -75,6 +101,9 @@ def main():
                     source_rows=n,
                     target_rows=plan.exchange.target_rows,
                     retained=retained,
+                    reuse_layers=args.reuse_layers,
+                    reuse_ids_equal=reuse_ids_equal,
+                    reuse_max_score_relative_rms=reuse_error if math.isfinite(reuse_error) else None,
                     ids_equal=ids_equal,
                     score_relative_rms=relative if math.isfinite(relative) else None,
                     okay=okay,
