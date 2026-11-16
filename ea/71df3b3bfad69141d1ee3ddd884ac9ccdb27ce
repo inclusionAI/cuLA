@@ -1,0 +1,31 @@
+docs/CSA_CP_THREE_WAY_RESULTS.md
+  s_d4826b35da75c5::t_e3db0a23883477 202-203
+  s_d4826b35da75c5::t_c45cf6acd7e18a 1-201,204-228
+benchmarks/bench_csa_cp_windows.py
+  s_d4826b35da75c5::t_82c6c74411629b 30,38-40,87
+docs/CSA_CP_SELECTION.md
+  s_d4826b35da75c5::t_2af9bce2d7fb9e 144-146
+tests/test_csa_cp_selection.py
+  s_d4826b35da75c5::t_82c6c74411629b 239-263
+docs/results/csa_cp_three_way_20261116.json
+  s_d4826b35da75c5::t_7e179ebc7f2016 1-3681
+docs/CSA_CP_WINDOW_RESULTS.md
+  s_d4826b35da75c5::t_2af9bce2d7fb9e 3-6
+  s_d4826b35da75c5::t_922a74c66e6236 134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ea71df3b3bfad69141d1ee3ddd884ac9ccdb27ce",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
