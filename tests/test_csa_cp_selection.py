@@ -236,3 +236,28 @@ def test_range_indices_preserve_duplicates_gaps_and_order(ranges):
     actual = _range_indices(ranges, torch.device("cpu"))
     expected = torch.tensor([i for a, z in ranges for i in range(a, z)], dtype=torch.int64)
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("tokens", [128 << 10, 256 << 10, 1 << 20])
+@pytest.mark.parametrize("case,documents", [("uniform-64", 64), ("near-uniform-64", 64), ("mixed-22", 22)])
+def test_dozens_of_document_cases_cover_each_context(tokens, case, documents):
+    from benchmarks.bench_csa_cp_windows import cases
+
+    lengths = cases(tokens)[case]
+    assert len(lengths) == documents and sum(lengths) == tokens
+    assert all(n > 0 and n % 4 == 0 for n in lengths)
+    cu = (0, *accumulate(lengths))
+    for policy in ("contiguous", "zigzag", "planner"):
+        plan = CsaCPSelectionPlan.from_cu_seqlens(
+            cu,
+            rank=0,
+            world_size=8,
+            top_k=8,
+            policy=policy,
+            cost_model=costs(8),
+            config=THDPlannerConfig(min_chunk_tokens=1024),
+        )
+        assert sum(r.local_tokens for r in plan.ranks) == tokens
+        intervals = sorted((s.token_start, s.token_end) for r in plan.ranks for s in r.spans)
+        assert intervals[0][0] == 0 and intervals[-1][1] == tokens
+        assert all(a[1] == b[0] for a, b in zip(intervals, intervals[1:]))

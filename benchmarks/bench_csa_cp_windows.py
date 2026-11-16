@@ -27,7 +27,7 @@ from cula.distributed import THDPlannerConfig, THDSelectionCostModel
 
 
 def cases(tokens):
-    """Five block-aligned layouts, including 512/1000-document packs."""
+    """Block-aligned layouts with one, dozens, and hundreds of documents."""
     short = 64
     mixed = [short] * 998 + [(tokens - 998 * short) // 2] * 2
     # The two long documents have different positions in a reproducible pack.
@@ -35,6 +35,9 @@ def cases(tokens):
     tail = [64] * 800 + [256] * 199 + [tokens - 800 * 64 - 199 * 256]
     return {
         "single": [tokens],
+        "uniform-64": [tokens // 64] * 64,
+        "near-uniform-64": [tokens // 64 - tokens // 1024, tokens // 64 + tokens // 1024] * 32,
+        "mixed-22": [1024] * 20 + [(tokens - 20 * 1024) // 2] * 2,
         "uniform-1024": [tokens // 1024] * 1024,
         "near-uniform-512": [tokens // 512 - 4, tokens // 512 + 4] * 256,
         "mixed-1000": mixed,
@@ -81,7 +84,7 @@ def main():
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--tokens", type=int, nargs="+", default=[128 << 10, 256 << 10])
-    parser.add_argument("--cases", nargs="+", help="Subset of the five named distributions")
+    parser.add_argument("--cases", nargs="+", help="Subset of the named distributions")
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--prepare-repeats", type=int, default=8)

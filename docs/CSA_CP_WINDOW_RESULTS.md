@@ -1,5 +1,9 @@
 # CSA CP selection at 128K and 256K
 
+The [expanded three-way comparison](CSA_CP_THREE_WAY_RESULTS.md) retains these
+ten measurements and adds 1M contexts and 22-/64-document packs, for 24 cases.
+The historical ten-case statistics below remain scoped to this original study.
+
 This tests the public `cudnn_csa_select_cp` API on eight B300 GPUs. The workload
 is **one complete CSA operator forward/backward**, including ratio-4 pooling,
 pooled-key and attention-KV gathers, selection routing/restoration, sparse
@@ -127,6 +131,7 @@ python -m torch.distributed.run --standalone --nproc-per-node=8 \
   -m benchmarks.bench_csa_cp_windows \
   --profile benchmarks/profiles/thd_selection_b300_cp8.json \
   --output-dir results/csa-windows --tokens 131072 262144 \
+  --cases single uniform-1024 near-uniform-512 mixed-1000 long-tail-1000 \
   --min-gain-ms 0 --min-chunk-tokens 1024 --max-chunks-per-rank 6 \
   --warmups 2 --repeats 7 --prepare-repeats 8
 

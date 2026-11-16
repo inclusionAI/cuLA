@@ -141,4 +141,6 @@ wall time includes workspace allocation, H2D metadata and a completion sync;
 there is no implicit cache or plan-reuse credit. Host-time outliers are retained.
 
 Measured B300 CP8 results and the preparation limitations are documented in
-[the 128K/256K study](CSA_CP_WINDOW_RESULTS.md).
+[the 128K/256K study](CSA_CP_WINDOW_RESULTS.md) and the expanded
+[128K/256K/1M three-way comparison](CSA_CP_THREE_WAY_RESULTS.md), including
+22- and 64-document packs.
