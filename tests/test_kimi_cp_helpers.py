@@ -603,7 +603,8 @@ def test_distributed_autograd_delegates_summary_composition_to_cudnn(monkeypatch
 
 
 @pytest.mark.parametrize("world", [1, 4])
-def test_independent_shards_call_native_attention_export(monkeypatch, world):
+@pytest.mark.parametrize("major", [9, 10])
+def test_independent_shards_call_native_attention_export(monkeypatch, world, major):
     plan = KimiCPPlan.from_global_cu_seqlens(list(range(0, 2 * world + 1, 2)), rank=0, world_size=world)
     q = torch.zeros(2, 1, 4)
     v = torch.zeros(2, 1, 3)
@@ -616,6 +617,7 @@ def test_independent_shards_call_native_attention_export(monkeypatch, world):
         observed["kwargs"] = kwargs
         return torch.ones_like(v), torch.empty(0)
 
+    monkeypatch.setattr(cp.torch.cuda, "get_device_capability", lambda device: (major, 0))
     monkeypatch.setattr(cp, "_validate_inputs", lambda *args, **kwargs: None)
     monkeypatch.setattr(cp, "_load_cudnn_kda_ops", lambda: (attention, object()))
 
@@ -623,3 +625,40 @@ def test_independent_shards_call_native_attention_export(monkeypatch, world):
 
     assert torch.equal(result, torch.ones_like(v))
     assert all(actual is expected for actual, expected in zip(observed["args"][:5], (q, q, v, q, beta), strict=True))
+
+
+@pytest.mark.parametrize("option", ["use_qk_l2norm_in_kernel", "use_beta_sigmoid_in_kernel", "safe_gate"])
+@pytest.mark.parametrize(
+    "world,major,backend,reject",
+    [
+        (4, 9, "auto", True),
+        (4, 10, "auto", False),
+        (1, 9, "auto", False),
+        (4, 10, "hopper-state-probe", True),
+        (4, 9, "frost-summary", False),
+    ],
+)
+def test_independent_shards_validate_only_multirank_hopper_options(monkeypatch, option, world, major, backend, reject):
+    plan = KimiCPPlan.from_global_cu_seqlens(list(range(0, 2 * world + 1, 2)), rank=0, world_size=world)
+    q = torch.zeros(2, 1, 4)
+    beta = torch.zeros(2, 1)
+    cu = torch.tensor([0, 2], dtype=torch.int32)
+    observed = {}
+
+    def attention(*args, **kwargs):
+        observed.update(kwargs)
+        return q, None
+
+    monkeypatch.setattr(cp, "_validate_inputs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cp.torch.cuda, "get_device_capability", lambda device: (major, 0))
+    monkeypatch.setattr(cp, "_load_cudnn_kda_ops", lambda: (attention, object()))
+    options = {option: True}
+    if option == "safe_gate":
+        options.update(a_log=torch.zeros(1), dt_bias=torch.zeros(1, 4))
+    if reject:
+        with pytest.raises(ValueError, match=option):
+            cp.cudnn_kda_cp(q, q, q, q, beta, cu, plan=plan, backend=backend, **options)
+        assert not observed
+    else:
+        assert cp.cudnn_kda_cp(q, q, q, q, beta, cu, plan=plan, backend=backend, **options) is q
+        assert observed[option] is True

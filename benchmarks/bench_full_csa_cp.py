@@ -40,6 +40,23 @@ from cula.hybrid import DsaSelectionPlan, DsaSelectionWorkspace, IndexPoolPlan, 
 from cula.hybrid.index_pool import _load_cudnn_index_pool_ops
 
 
+def validate_source_alignment(lengths, world):
+    """Make the same alignment decision on every balanced source rank."""
+    if sum(lengths) % (4 * world) or any(n % 4 for n in lengths):
+        raise ValueError("source CP shards and documents must be block aligned")
+
+
+def json_safe(value):
+    """Replace nonfinite measurements only in the serialized report copy."""
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def metrics(actual, expected):
     actual, expected = actual.float(), expected.float()
     delta = actual - expected
@@ -121,12 +138,11 @@ class FullCSA:
         torch.cuda.synchronize(device)
         common_prepare_start = time.perf_counter()
         self.rank, self.world = dist.get_rank(), dist.get_world_size()
+        validate_source_alignment(lengths, self.world)
         self.cu = (0, *accumulate(lengths))
         self.plan = build_kimi_cp_plan(self.cu, group=dist.group.WORLD)
         self.source_n, self.total = self.plan.local_tokens, self.cu[-1]
         self.scale, self.heads = 576**-0.5, heads
-        if self.source_n % 4 or any(n % 4 for n in lengths):
-            raise ValueError("source CP shards and documents must be block aligned")
         n = self.source_n
         pool_plan = IndexPoolPlan.from_cu_seqlens(self.plan.local_cu_seqlens, head_dim=128, ratio=4)
         pool_cu_tokens, pool_cu_blocks = pool_plan.materialize(device)
@@ -700,7 +716,7 @@ def main(*, keep_group=False, baseline=None, save_baseline=False, comparison_nam
         if iteration >= args.warmups:
             samples.append(sample)
         if rank == 0:
-            print("ITER", iteration, json.dumps(sample), flush=True)
+            print("ITER", iteration, json.dumps(json_safe(sample), allow_nan=False), flush=True)
         if args.check and check is None:
             check = check_reference(csa)
     finite = all(
@@ -797,8 +813,8 @@ def main(*, keep_group=False, baseline=None, save_baseline=False, comparison_nam
         report = dict(config=vars(args), world_size=world, critical_rank_median=critical, ranks=gathered)
         report["planner_cost_model"] = None if cost_model is None else asdict(cost_model)
         with open(args.output, "w") as f:
-            json.dump(report, f, indent=2)
-        print("RESULT", json.dumps(critical), flush=True)
+            json.dump(json_safe(report), f, indent=2, allow_nan=False)
+        print("RESULT", json.dumps(json_safe(critical), allow_nan=False), flush=True)
     okay = all(
         r["finite"]
         and r["input_match"]

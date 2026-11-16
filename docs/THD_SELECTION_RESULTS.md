@@ -117,13 +117,13 @@ and shared rendezvous; select `thd_selection_h20_cp16.json`. The runner first
 executes small FP32 checks, then all 31 cases, keeping contiguous first and
 alternating the other two policies. `--list-cases` lists shapes without CUDA.
 
-## Final source review
+## Original submission source review (2026-11-15)
 
 The full matrix above precedes the final CPU metadata cleanup. This cleanup
 rejects noninteger transport intervals, removes an obsolete benchmark import,
 fixes preparation accounting in the public summarizer and replaces a quadratic
 DSA window candidate sum with an integer running total. Planner decisions and
-numerical kernels are unchanged. The final branch has separate regression
+numerical kernels are unchanged. That submission has separate regression
 validation recorded below; the historical matrix is not relabeled as a new run.
 
 Local CPU preparation microbenchmark (10 measured samples after one warmup):
@@ -138,9 +138,9 @@ Local CPU preparation microbenchmark (10 measured samples after one warmup):
 These CPU-only measurements are not GPU or whole-chain speedups. The change
 removes repeated scans of already-grouped documents; it does not change scratch
 capacity, math precision or kernel launch boundaries.
-## Final-branch GPU regression
+## Original submission GPU regression
 
-On both H20 CP16 and B300 CP8, the final source passed four small FP32 fixtures
+On both H20 CP16 and B300 CP8, the original submission source passed four small FP32 fixtures
 and three representative 1M shapes (single long, 1000 documents with one long,
 and 1000-document tiny mixture), each under C/Z/P: **42 complete CSA rows**.
 The 1M rerun used three warmups and five measurements. A separate six-case KDA
@@ -148,7 +148,7 @@ A/B on each platform compared native document-local execution with the forced
 boundary route, including weak decay and isolated ranks with a crossing peer:
 **24 A/B rows**, with zero difference in output and all five gradients.
 
-All 181 tested source/config files match the submitted branch. The 62 original
+All 181 tested source/config files matched the original submission. The 62 original
 planner decisions still match every measured rank's policy, row count, span
 count and remote rows. All **2,232** DSA rank plans across the full 31 x 3 x
 (CP16 + CP8) matrix have field-for-field identical window metadata before and
@@ -161,3 +161,22 @@ coverage and ownership, collective participation, inverse autograd, storage
 lifetimes, context reuse, cost-model bounds and benchmark accounting. No
 handwritten GPU kernel, precision mode or math approximation is changed.
 This is not a claim of a complete race audit of every unchanged kernel in cuLA.
+
+
+## Post-review validation and timing protocol
+
+The subsequent review fixes add group-wide source-alignment rejection, finite
+calibration-input validation, strict JSON failure reports, and the SM90
+independent-shard option preflight. The independent-shard KDA benchmark now
+warms both routes and alternates baseline/candidate order for every measured
+pair. Each raw sample records its pair index, actual execution order and
+position; new reports identify this as `paired-alternating-v1`. Numerical
+output/gradient comparison runs separately after both routes' timed samples.
+
+The historical JSON result files and tables above are unchanged. In particular,
+the original KDA A/B timings ran all baseline samples before all candidate
+samples; they are not measurements under the new paired protocol. The recorded
+source hashes describe those historical runs, not the later review fixes.
+No fresh GPU, NCCL or performance rerun accompanies these fixes. Their
+validation consists of focused CPU regressions and repository-wide Ruff
+lint/format checks; a new paired GPU run is needed for updated timing claims.

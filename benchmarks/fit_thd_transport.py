@@ -40,8 +40,11 @@ def fit(raw, profile, *, overlap_links=False):
     ):
         raise ValueError("calibration topology requires CP >= 2 and complete nodes")
     rows = [r for r in raw["records"] if not r["heldout"]]
-    if len(rows) < 6 or any(not r["marker_exact"] or r["critical_median_ms"] <= 0 for r in raw["records"]):
-        raise ValueError("need complete, positive transport timings and exact row markers")
+    if len(rows) < 6 or any(
+        not r["marker_exact"] or not np.isfinite(r["critical_median_ms"]) or r["critical_median_ms"] <= 0
+        for r in raw["records"]
+    ):
+        raise ValueError("need complete, finite positive transport timings and exact row markers")
     y = np.array([r["critical_median_ms"] for r in rows])
 
     def residual(x):

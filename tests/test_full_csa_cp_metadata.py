@@ -3,10 +3,16 @@
 
 """CPU checks of the experimental full-CSA benchmark's addressing contract."""
 
+import json
+import math
+import sys
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from benchmarks.bench_full_csa_cp import expand_blocks, query_metadata
+from benchmarks import bench_full_csa_cp as bench
+from benchmarks.bench_full_csa_cp import expand_blocks, json_safe, metrics, query_metadata, validate_source_alignment
 from cula.distributed import THDRankLayout, THDSpan
 
 
@@ -57,3 +63,50 @@ def test_bulk_metadata_is_prepared_on_cpu_under_a_different_default_device():
     assert origin.tolist() == [0] * 4
     assert visible.tolist() == [5, 6, 7, 8]
     assert rows.tolist() == [4, 5, 6, 7]
+
+
+@pytest.mark.parametrize("lengths,world", [([32], 8), ([4, 28], 8), ([8, 8], 2), ([4], 1)])
+def test_source_alignment_accepts_group_wide_aligned_shards(lengths, world):
+    validate_source_alignment(lengths, world)
+
+
+@pytest.mark.parametrize("lengths,world", [([36], 8), ([12, 24], 8), ([6, 26], 8), ([6], 1)])
+def test_source_alignment_rejects_misaligned_shards_or_documents(lengths, world):
+    with pytest.raises(ValueError, match="source CP shards and documents must be block aligned"):
+        validate_source_alignment(lengths, world)
+
+
+@pytest.mark.parametrize("rank", range(8))
+def test_invalid_alignment_stops_every_rank_before_plan_or_collective(monkeypatch, rank):
+    monkeypatch.setitem(sys.modules, "cudnn", SimpleNamespace(DSA=object()))
+    monkeypatch.setattr(bench, "_load_cudnn_index_pool_ops", lambda: (None, None))
+    monkeypatch.setattr(bench.torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(bench.dist, "get_rank", lambda: rank)
+    monkeypatch.setattr(bench.dist, "get_world_size", lambda: 8)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid global alignment reached plan construction or a collective")
+
+    monkeypatch.setattr(bench, "build_kimi_cp_plan", unexpected)
+    monkeypatch.setattr(bench.dist, "broadcast", unexpected)
+    with pytest.raises(ValueError, match="block aligned"):
+        bench.FullCSA([36], heads=64, top_k=128, device="cpu", candidate_mib=0)
+
+
+def test_failure_report_is_strict_json_without_changing_failure_evidence():
+    errors = metrics(torch.tensor([float("nan")]), torch.ones(1))
+    raw = {
+        "finite": False,
+        "check": {"pass_": False, "errors": errors},
+        "samples": [{"time": float("inf")}],
+        "extra": (float("-inf"), 1.5, True, None),
+    }
+    encoded = json.dumps(json_safe(raw), allow_nan=False)
+    decoded = json.loads(encoded)
+    assert decoded["finite"] is False
+    assert decoded["check"]["pass_"] is False
+    assert decoded["check"]["errors"] == {"max_abs": None, "relative_rms": None, "finite": False}
+    assert decoded["samples"] == [{"time": None}]
+    assert decoded["extra"] == [None, 1.5, True, None]
+    assert math.isnan(raw["check"]["errors"]["max_abs"])
+    assert math.isinf(raw["samples"][0]["time"])

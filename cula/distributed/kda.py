@@ -933,6 +933,8 @@ def cudnn_kda_cp(
         # independent native recurrence as CP1, including native autograd;
         # no forward or backward state can cross ranks. The plan flag is
         # identical on all peers, so no rank skips a required collective.
+        if plan.world_size > 1 and _resolve_kimi_cp_backend(backend, q.device) == "hopper-state-probe":
+            _validate_hopper_state_probe_options(options, a_log, dt_bias)
         kimi_delta_attention, _ = _load_cudnn_kda_ops()
         attention_outputs = kimi_delta_attention(
             q,

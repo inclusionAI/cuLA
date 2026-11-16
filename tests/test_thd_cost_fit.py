@@ -179,3 +179,21 @@ def test_transport_fit_rejects_invalid_topology(transport_fit_inputs, world, per
     raw.update(world=world, ranks_per_node=per_node)
     with pytest.raises(ValueError, match="topology"):
         fit(raw, profile)
+
+
+@pytest.mark.parametrize("heldout", [False, True])
+@pytest.mark.parametrize("timing", [float("nan"), float("inf"), float("-inf"), 0, -1])
+def test_transport_fit_rejects_invalid_timings_before_optimization(transport_fit_inputs, monkeypatch, heldout, timing):
+    import scipy.optimize
+
+    from benchmarks.fit_thd_transport import fit
+
+    raw, profile = transport_fit_inputs
+    raw["records"].append(dict(raw["records"][0], heldout=heldout, critical_median_ms=timing))
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid timing reached the optimizer")
+
+    monkeypatch.setattr(scipy.optimize, "differential_evolution", unexpected)
+    with pytest.raises(ValueError, match="finite positive"):
+        fit(raw, profile)
