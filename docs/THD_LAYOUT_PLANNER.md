@@ -152,6 +152,14 @@ Bounds are tested against exhaustive small assignments and concrete zigzag
 layouts on contiguous, interleaved and irregular topologies. They cannot exclude
 a strictly better modeled zigzag; they make no statement about model error.
 
+Inside greedy placement, existing sender/receiver, peer and node bottlenecks
+also bound every prospective rank's cost. Compute the rank's prospective
+compute/copy price and reuse those existing transport bounds before building
+its communication deltas. If this floor strictly exceeds the best placement
+already examined, skip that rank. Nonnegative additions cannot improve it.
+Equality must still evaluate the complete tie-break key, including locality
+and row load. This changes neither the candidate family nor its assignments.
+
 Repeated planning grids are deduplicated. Pinned spans are coalesced once;
 their initial per-rank loads are computed once and copied for each grid. Adaptive
 grids visit only movable documents. Owner groups are built in one pass, and
@@ -169,8 +177,10 @@ for a split. It uses exact integer work, including unaligned causal offsets;
 long documents still receive the same maximal budget-fitting prefixes. An
 integer candidate total avoids rescanning all preceding short documents;
 window boundaries, scratch requirements and numerical execution are unchanged.
-All reuse is local to one preparation call; there is no retained layout cache
-or new device-to-host metadata read.
+Temporary solver state is local to one preparation call; there is no implicit
+retained layout cache or new device-to-host metadata read. Callers can explicitly
+reuse the resulting immutable plan across compatible CSA layers; see
+[plan/workspace reuse and amortized accounting](CSA_CP_PLAN_REUSE.md).
 
 ## Calibrating and measuring
 

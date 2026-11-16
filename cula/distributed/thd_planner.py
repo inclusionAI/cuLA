@@ -1013,9 +1013,27 @@ def _selection_assign(items, *, pinned_loads, pinned_compute, world, capacity, o
             max_copies = max(offsets[r + 1] - offsets[r] + n for r, n in enumerate(loads))
             if model.overlap_intra_inter:
                 max_incoming, max_outgoing = max(*intra_in, *inter_in), max(*intra_out, *inter_out)
+            transfer_floor = max(max_incoming, max_outgoing)
+            if model.peer_gbps is not None:
+                transfer_floor = max(transfer_floor, peer_peak * model.bytes_per_query / (model.peer_gbps * 1e6))
+            if model.inter_node_aggregate_gbps is not None:
+                transfer_floor = max(
+                    transfer_floor, node_peak * model.bytes_per_query / (model.inter_node_aggregate_gbps * 1e6)
+                )
+            transfer_floor += degree_peak * model.peer_startup_us / 1e3
             best = None
             for rank in range(world):
                 if loads[rank] + placed.tokens > capacity:
+                    continue
+                rank_compute = max(max_compute, compute[rank] + cost)
+                copies = max(max_copies, offsets[rank + 1] - offsets[rank] + loads[rank] + placed.tokens)
+                # New traffic cannot reduce an existing bottleneck. Evaluate
+                # the expensive peer/node deltas only if this rank can still
+                # beat the incumbent. Keep equality for the full tie break.
+                floor = rank_compute + transfer_floor
+                if peer_peak:
+                    floor += copies * model.packing_ns_per_query / 1e6 + model.exchange_us / 1e3
+                if best is not None and floor > best[0][0]:
                     continue
                 additions = []
                 moved = 0
@@ -1074,8 +1092,7 @@ def _selection_assign(items, *, pinned_loads, pinned_compute, world, capacity, o
                 transfer += candidate_degree * model.peer_startup_us / 1e3
                 # Partial placement uses an upper bound on copies. Final
                 # scoring checks the actual source/destination permutations.
-                copies = max(max_copies, offsets[rank + 1] - offsets[rank] + loads[rank] + placed.tokens)
-                critical = max(max_compute, compute[rank] + cost) + transfer
+                critical = rank_compute + transfer
                 if candidate_peer_peak:
                     critical += copies * model.packing_ns_per_query / 1e6 + model.exchange_us / 1e3
                 key = (critical, compute[rank] + cost + incoming[rank] + received, moved, loads[rank], rank)

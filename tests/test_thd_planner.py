@@ -516,6 +516,38 @@ def test_source_local_spans_still_price_local_reordering():
     assert model.estimate_ms(reordered, block_size=4) == pytest.approx(0.032 + 0.010)
 
 
+def test_equal_placement_bound_keeps_the_full_locality_tie_break():
+    from cula.distributed.thd_planner import _make_item, _selection_assign
+
+    model = _cost_model(
+        candidate_ns=0,
+        query_ns=1e6,
+        span_us=0,
+        bytes_per_query=1000,
+        intra_node_gbps=1,
+        inter_node_gbps=1,
+        rank_node_ids=(0,) * 4,
+        packing_ns_per_query=0,
+        exchange_us=0,
+    )
+    # Rank 0 already owns the compute bottleneck. Moving the first item to
+    # rank 1 establishes a network bottleneck too. For the second item, ranks
+    # 2 and 3 have equal critical cost, but rank 3 keeps the item source-local.
+    # Pruning on >= instead of > would incorrectly discard that tie winner.
+    items = [_make_item(0, 0, 8, 0, 8, 4), _make_item(1, 24, 28, 24, 28, 4)]
+    assigned = _selection_assign(
+        items,
+        pinned_loads=(0,) * 4,
+        pinned_compute=(100.0, 0.0, 0.0, 0.0),
+        world=4,
+        capacity=16,
+        offsets=(0, 8, 16, 24, 32),
+        model=model,
+        block_size=4,
+    )
+    assert [owner for _, owner in assigned] == [1, 3]
+
+
 @pytest.mark.parametrize("margin", [0, 0.05])
 def test_pinned_critical_path_avoids_useless_long_document_search(monkeypatch, margin):
     cu = _boundaries([64] * 998 + [33600] * 2)
