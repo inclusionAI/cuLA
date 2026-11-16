@@ -1,9 +1,11 @@
 # CSA context-parallel selection API
 
-`cudnn_csa_select_cp` packages THD planning, query/weight redistribution,
-cuDNN block selection, and the inverse exchange. It returns document-local
-block IDs and FP32 scores in the caller's original token order. Downstream
-attention implementations can use the planner without copying benchmark code.
+The API separates one-time THD planning and device preparation from per-layer
+execution. `cudnn_csa_select_cp` consumes a prepared workspace to redistribute
+queries/weights, run cuDNN block selection, and perform the inverse exchange.
+It returns document-local block IDs and FP32 scores in the caller's original
+token order. Downstream attention implementations can use the planner without
+copying benchmark code.
 
 The interface stops at selection. Projection weights, pooling transforms,
 sparse attention, and the indexer loss remain independently composable.
@@ -33,18 +35,29 @@ plan = CsaCPSelectionPlan.from_cu_seqlens(
     config=THDPlannerConfig(min_chunk_tokens=1024),
     candidate_budget_bytes=512 << 20,
 )
-workspace = CsaCPSelectionWorkspace.from_plan(plan, qi.device, group=cp_group)
+workspace = CsaCPSelectionWorkspace.from_plan(plan, device, group=cp_group)
 
-# Reuse for the same packed layout. Nondeterministic selection is the default.
-selected = cudnn_csa_select_cp(
-    qi,                    # BF16 [source_rows, index_heads, index_dim]
-    global_kbar[:, None],   # BF16 [global_blocks, 1, index_dim]
-    index_weights,         # BF16 or FP32 [source_rows, index_heads]
-    workspace=workspace,
-)
-# selected.block_ids: int32 [source_rows, 512], document-local, -1 padding
-# selected.scores: FP32 [source_rows, 512], paired raw scores
+# Each compatible layer supplies fresh activations but shares the prepared
+# workspace. Produce layer_inputs lazily as the model runs its layers.
+selected_by_layer = []
+for qi, global_kbar, index_weights in layer_inputs:
+    selected = cudnn_csa_select_cp(
+        qi,                    # BF16 [source_rows, index_heads, index_dim]
+        global_kbar[:, None],   # BF16 [global_blocks, 1, index_dim]
+        index_weights,         # BF16 or FP32 [source_rows, index_heads]
+        workspace=workspace,
+    )
+    # Retain the results needed by each layer's attention/backward.
+    selected_by_layer.append(selected)
+    # selected.block_ids: int32 [source_rows, 512], document-local, -1 padding
+    # selected.scores: FP32 [source_rows, 512], paired raw scores
 ```
+
+Both factories run outside the layer loop. The execution function requires
+`workspace`; it has no implicit planning or workspace-construction fallback.
+It reuses routing indices and native scratch, while per-layer payload transport,
+key packing and owned result storage can still allocate. Nondeterministic
+selection is the default.
 
 `plan.policy` and `plan.evaluated_scores` expose the chosen candidate and modeled
 costs. Fixed `contiguous` and complete per-document `zigzag` policies need no
@@ -145,7 +158,8 @@ than case-name or context-length-specific layout rules.
 ## Validation
 
 - `tests/test_csa_cp_selection.py`: host metadata parity, invalid inputs,
-  capacities, result lifetime and CP64 grain constraints.
+  capacities, execution without preparation, retained results across distinct
+  layer inputs, and CP64 grain constraints.
 - `benchmarks/check_csa_cp_selection.py`: native selection in two disjoint
   subgroups, unequal source sizes, empty destinations, exact source mapping,
   and workspace reuse.

@@ -34,6 +34,8 @@ class CsaCPSelectionPlan:
     ranks must use identical global boundaries, policy, capacity and costs.
     Documents must be block-aligned; selection destinations may be empty.
     No CUDA metadata is read, hardware probed, or process group accessed here.
+    Build once per packed layout and reuse across compatible CSA layers;
+    the plan contains no activations or selected block IDs.
     """
 
     global_cu_seqlens: tuple[int, ...]
@@ -172,6 +174,12 @@ class CsaCPSelectionWorkspace:
 
     @classmethod
     def from_plan(cls, plan: CsaCPSelectionPlan, device: torch.device | str, *, group=None) -> CsaCPSelectionWorkspace:
+        """Materialize a plan once for sequential reuse on this device/group.
+
+        The returned workspace retains the plan, device routing indices and
+        native scratch. Pass it directly to every compatible layer's execution;
+        do not call this factory inside the layer loop.
+        """
         if not isinstance(plan, CsaCPSelectionPlan):
             raise TypeError("plan must be a CsaCPSelectionPlan")
         device = torch.device(device)
@@ -221,6 +229,10 @@ def cudnn_csa_select_cp(
     in original packed-document order, already gathered by the caller. Pooling,
     attention, projections and their gradients stay independently composable.
     No precision casts, head padding, or device-to-host metadata copies occur.
+
+    ``workspace`` is required and already contains the plan. Execution never
+    replans, rebuilds routing indices or materializes native scratch. Each call
+    uses fresh layer inputs; transport buffers and retained results may allocate.
 
     All ranks must enter in the same order with matching tensor trailing
     dimensions/dtypes and scalar options, including empty destination ranks.

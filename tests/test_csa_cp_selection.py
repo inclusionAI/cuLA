@@ -137,12 +137,28 @@ def test_source_order_result_lifetime_and_validation(monkeypatch, identity):
     exchange = SimpleNamespace(device=torch.device("cpu"), group=None, distribute=route, restore=restore)
     native = SimpleNamespace(block_ids=torch.empty(16, 8, dtype=torch.int32), scores=torch.empty(16, 8))
     workspace = CsaCPSelectionWorkspace(plan, exchange, native, slice(0, 4), None)
+
+    def unexpected_preparation(*args, **kwargs):
+        pytest.fail("execution must reuse the prepared plan, routing indices and scratch")
+
+    # Preparation is explicit: none of its entry points may run during a layer.
+    for owner, name in (
+        (CsaCPSelectionPlan, "from_cu_seqlens"),
+        (CsaCPSelectionWorkspace, "from_plan"),
+        (csa_cp, "plan_thd_selection"),
+        (csa_cp.THDRedistributionPlan, "build"),
+        (csa_cp.THDRedistributor, "__init__"),
+        (csa_cp.DsaSelectionPlan, "from_cu_seqlens"),
+        (csa_cp.DsaSelectionWorkspace, "from_plan"),
+        (csa_cp, "_range_indices"),
+    ):
+        monkeypatch.setattr(owner, name, unexpected_preparation)
     monkeypatch.setattr(csa_cp.dist, "get_rank", lambda group: 0)
     monkeypatch.setattr(csa_cp.dist, "get_world_size", lambda group: 1)
     seen = []
 
     def select(q, k, w, **kwargs):
-        seen.append(kwargs)
+        seen.append((q.clone(), k.clone(), w.clone(), kwargs))
         native.block_ids.copy_(q[:, 0, 0, None].expand(-1, 8).int())
         native.scores.copy_(q[:, 0, 0, None].expand(-1, 8).float())
         return native
@@ -159,7 +175,7 @@ def test_source_order_result_lifetime_and_validation(monkeypatch, identity):
     assert torch.equal(result.scores[:, 0], torch.arange(16).float())
     assert not result.scores.requires_grad
     assert calls == ["route", "route", "restore", "restore"]
-    assert seen[0]["deterministic"] is False and seen[0]["sm_scale"] == 0.5
+    assert seen[0][3]["deterministic"] is False and seen[0][3]["sm_scale"] == 0.5
     for bad_q, bad_k, bad_w in [
         (qi.float(), keys, weights),
         (qi, keys.float(), weights),
@@ -175,6 +191,20 @@ def test_source_order_result_lifetime_and_validation(monkeypatch, identity):
     with pytest.raises(TypeError, match="bool"):
         cudnn_csa_select_cp(qi, keys, weights, workspace=workspace, deterministic=1)
     assert len(calls) == 4  # Invalid calls fail before any collective.
+
+    retained = [result]
+    for layer in (1, 2):
+        layer_q, layer_keys, layer_weights = qi + layer, keys + layer, weights + layer
+        retained.append(cudnn_csa_select_cp(layer_q, layer_keys, layer_weights, workspace=workspace))
+        q, k, w, options = seen[-1]
+        assert torch.equal(q, layer_q if identity else layer_q.flip(0))
+        assert torch.equal(k, layer_keys)
+        assert torch.equal(w, layer_weights if identity else layer_weights.flip(0))
+        assert options["plan"] is plan.selection and options["workspace"] is native
+    assert calls == ["route", "route", "restore", "restore"] * 3
+    for layer, selected in enumerate(retained):
+        assert torch.equal(selected.block_ids[:, 0], torch.arange(16) + layer)
+        assert torch.equal(selected.scores[:, 0], torch.arange(16).float() + layer)
 
 
 @pytest.mark.parametrize("world", [8, 16, 64])
