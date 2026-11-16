@@ -91,6 +91,9 @@ If device metadata and scratch are also reused, their preparation is amortized
 too. Runtime routing, selection, attention and backward still execute per layer.
 The [reuse analysis](CSA_CP_PLAN_REUSE.md) separates this accounting from the
 single-CSA measurements and from measured multilayer model performance.
+The [31-case 1M rerun](CSA_CP_1M_REUSE_RESULTS.md) directly measures four complete
+CSA instances sharing one plan/workspace, with all forwards preceding reverse
+backwards and full per-layer output/gradient comparisons.
 
 ## Layout, lifetime and numerical contract
 

@@ -1,5 +1,9 @@
 # CSA CP: three policies across 128K, 256K and 1M
 
+For all 31 historical 1M distributions with four actual CSA instances sharing
+one plan/workspace, see the [dedicated reuse rerun](CSA_CP_1M_REUSE_RESULTS.md).
+The 24 cases below remain eight distributions at each of three context lengths.
+
 This is the complete rerun after reducing host preparation work. On B300 CP8,
 adaptive selection routing stays within **0.339%** of the faster fixed
 contiguous/zigzag policy in steady execution across these 24 cases. All selected

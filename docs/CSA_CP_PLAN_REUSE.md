@@ -1,5 +1,10 @@
 # Reusing CSA plans across layers
 
+The [31-case B300 CP8 study](CSA_CP_1M_REUSE_RESULTS.md) now directly measures
+four complete CSA instances sharing one plan/workspace at 1M. The cross-window
+amortization table below remains a projection from its original single-CSA
+cohort; it is not relabeled as that new measurement.
+
 A single-CSA benchmark deliberately charges fresh preparation to one operator.
 A training stack can prepare once at microbatch ingress and reuse the same plan
 across compatible CSA layers. More KDA or MLP layers also enlarge the denominator
