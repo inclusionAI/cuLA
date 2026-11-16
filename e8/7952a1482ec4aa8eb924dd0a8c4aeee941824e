@@ -1,0 +1,23 @@
+tests/test_thd_planner.py
+  s_d4826b35da75c5::t_8a3da3b50251e8 519-550
+docs/THD_LAYOUT_PLANNER.md
+  s_d4826b35da75c5::t_2b9abd7de5c21d 155-162,180-183
+cula/distributed/thd_planner.py
+  s_d4826b35da75c5::t_45b2b2a32aebe6 1016-1023,1028-1037,1095
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e87952a1482ec4aa8eb924dd0a8c4aeee941824e",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
