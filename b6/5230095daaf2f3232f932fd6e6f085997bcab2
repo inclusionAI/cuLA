@@ -1,0 +1,21 @@
+benchmarks/bench_csa_cp_reuse.py
+  s_d4826b35da75c5::t_3572c00f989023 98-100,102,120-122,130
+tests/test_csa_cp_reuse.py
+  s_d4826b35da75c5::t_3572c00f989023 11,88-89,91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b65230095daaf2f3232f932fd6e6f085997bcab2",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
