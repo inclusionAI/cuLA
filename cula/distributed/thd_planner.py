@@ -1390,7 +1390,10 @@ def plan_thd_selection(
             + cost_model.query_ns * boundaries[-1] / 1e6
             + cost_model.span_us * (len(boundaries) - 1) / 1e3
         ) / world_size
-        lower_bound = _transfer_lower_bound(base, world_size, config.block_size, cost_model, lower_bound, baseline_ms)
+        # Transport is nonnegative. If average compute already cannot pay for
+        # migration, the more expensive traffic bound cannot change that.
+        if lower_bound < cost_model._migration_threshold_ms(baseline_ms):
+            lower_bound = _transfer_lower_bound(base, world_size, config.block_size, cost_model, lower_bound, baseline_ms)
     if movable and lower_bound < cost_model._migration_threshold_ms(baseline_ms):
         pinned_loads, pinned_compute = [0] * world_size, [0.0] * world_size
         for item, owner in pinned:
@@ -1404,7 +1407,9 @@ def plan_thd_selection(
         # Nonnegative work and transport cannot reduce their critical compute
         # time. This bound applies only to the pinned family, not full zigzag.
         if max(pinned_compute) < cost_model._migration_threshold_ms(baseline_ms):
-            pinned_spans = _coalesce(pinned)
+            # Contiguous source spans are already coalesced. Reuse their
+            # immutable objects instead of rebuilding every short document.
+            pinned_spans = tuple(s for rank in source_ranks for s in rank.spans if s.sequence not in movable)
             add(
                 _paired_selection_items(boundaries, movable, world_size, config.block_size, offsets, cost_model),
                 "selection-paired-local",

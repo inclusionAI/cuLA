@@ -167,7 +167,12 @@ already examined, skip that rank. Nonnegative additions cannot improve it.
 Equality must still evaluate the complete tie-break key, including locality
 and row load. This changes neither the candidate family nor its assignments.
 
-Repeated planning grids are deduplicated. Pinned spans are coalesced once;
+If mean compute alone already misses the migration margin, the nonnegative
+traffic bound need not be evaluated. Pinned spans reuse immutable, already
+coalesced contiguous source spans instead of reconstructing short-document
+objects. These shortcuts preserve the complete plan and evaluated scores.
+
+Repeated planning grids are deduplicated. Pinned spans are shared within a call;
 their initial per-rank loads are computed once and copied for each grid. Adaptive
 grids visit only movable documents. Owner groups are built in one pass, and
 diagnostics are computed only for the
