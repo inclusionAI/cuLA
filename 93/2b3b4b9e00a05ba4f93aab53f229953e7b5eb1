@@ -1,0 +1,45 @@
+benchmarks/profiles/thd_selection_b300_cp8.json
+  s_d4826b35da75c5::t_c4909a0fcfa033 2,8-9,20-21,25,27-28,502-509,516-518,524-526,532-558,564-566,572-574,580-582,588-614,620-622,628-630,636-638,644-670,676-734,740-742,748-750,756-782,788-790,795,797
+tests/test_thd_cost_fit.py
+  s_d4826b35da75c5::t_c4a3c1ce0b39a6 84,122
+  s_d4826b35da75c5::t_b69f18b62994d3 82-83,118,125-126,142
+  s_d4826b35da75c5::t_2aecf13ebeb3bd 176-177
+  s_d4826b35da75c5::t_93340ddbfc0cb9 164-175,178-182
+  s_d4826b35da75c5::t_0a1d1883ba590a 78-80
+docs/results/csa_cp_transport_local_20261117.json
+  s_d4826b35da75c5::t_c4909a0fcfa033 1-6341
+benchmarks/fit_thd_transport.py
+  s_d4826b35da75c5::t_0a1d1883ba590a 27-33
+  s_d4826b35da75c5::t_93340ddbfc0cb9 20-21,69-71
+  s_d4826b35da75c5::t_648931d958fc36 22-23,26,72-73,101,116,124
+benchmarks/bench_thd_transport.py
+  s_d4826b35da75c5::t_648931d958fc36 29-38,123,152-156,203
+docs/THD_LAYOUT_PLANNER.md
+  s_d4826b35da75c5::t_eb8d8cc4f73359 115-121,201-205,207-210
+tests/test_thd_planner.py
+  s_d4826b35da75c5::t_2184cf26d5350a 551-559
+  s_d4826b35da75c5::t_b69f18b62994d3 519-525,533-547
+  s_d4826b35da75c5::t_0a1d1883ba590a 526-532
+  s_d4826b35da75c5::t_c1058a6ead60a5 548-550,560-566
+cula/distributed/thd_planner.py
+  s_d4826b35da75c5::t_648931d958fc36 140-142,160,184,213,234,258-259,263-269
+benchmarks/profiles/README.md
+  s_d4826b35da75c5::t_6182ba4ea9d0fc 3,8-11,20-27
+  s_d4826b35da75c5::t_073f064f1fa07d 28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "932b3b4b9e00a05ba4f93aab53f229953e7b5eb1",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
