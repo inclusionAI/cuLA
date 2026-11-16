@@ -1,7 +1,8 @@
 # CSA CP selection at 128K and 256K
 
-The [expanded three-way comparison](CSA_CP_THREE_WAY_RESULTS.md) retains these
-ten measurements and adds 1M contexts and 22-/64-document packs, for 24 cases.
+The [expanded three-way comparison](CSA_CP_THREE_WAY_RESULTS.md) covers 1M
+contexts and 22-/64-document packs, for 24 cases, and has been rerun after the
+equivalent host-preparation optimization.
 The historical ten-case statistics below remain scoped to this original study.
 
 This tests the public `cudnn_csa_select_cp` API on eight B300 GPUs. The workload

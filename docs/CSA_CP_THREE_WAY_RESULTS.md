@@ -1,10 +1,11 @@
 # CSA CP: three policies across 128K, 256K and 1M
 
-On B300 CP8, adaptive selection routing stays within **0.576%** of the faster
-fixed contiguous/zigzag policy in steady execution across these 24 cases. The
-largest gains occur at 1M with unequal long documents. Uniform packs usually
-select contiguous; a single long document performs similarly to zigzag.
-This is measured coverage, not a guarantee over arbitrary THD inputs.
+This is the complete rerun after reducing host preparation work. On B300 CP8,
+adaptive selection routing stays within **0.339%** of the faster fixed
+contiguous/zigzag policy in steady execution across these 24 cases. All selected
+layouts match the previous revision. The largest gains occur with unequal long
+documents at 1M; uniform packs generally select contiguous. This is measured
+coverage, not a guarantee over arbitrary THD inputs.
 
 The workload is **one complete CSA operator forward/backward**: ratio-4 pooling,
 pooled-key and attention-KV gathers, routed selection and inverse exchange,
@@ -56,40 +57,40 @@ should be treated cautiously, rather than as strong evidence of a speedup.
 
 | Distribution | Contiguous | Zigzag | Planner | P time vs C | P time vs Z |
 |---|---:|---:|---:|---:|---:|
-| 1 long document | 47.60 | 46.23 | 45.82 | -3.74% | -0.88% |
-| 64 uniform | 20.11 | 20.66 | 20.04 | -0.37% | -3.02% |
-| 64 near-uniform | 20.08 | 20.79 | 20.06 | -0.13% | -3.53% |
-| 20 short + 2 long | 35.44 | 35.23 | 35.44 | -0.00% | +0.58% |
-| 1,024 uniform | 9.29 | 11.10 | 9.30 | +0.09% | -16.28% |
-| 512 near-uniform | 10.01 | 11.21 | 10.03 | +0.14% | -10.52% |
-| 998 short + 2 long | 33.07 | 38.75 | 33.07 | -0.00% | -14.64% |
-| 1,000 long-tail | 32.37 | 37.90 | 32.35 | -0.06% | -14.64% |
+| 1 long document | 47.69 | 46.27 | 45.83 | -3.91% | -0.97% |
+| 64 uniform | 20.00 | 20.67 | 19.99 | -0.04% | -3.29% |
+| 64 near-uniform | 20.03 | 20.76 | 20.02 | -0.03% | -3.53% |
+| 20 short + 2 long | 35.41 | 35.36 | 35.48 | +0.19% | +0.34% |
+| 1,024 uniform | 9.32 | 11.10 | 9.28 | -0.37% | -16.34% |
+| 512 near-uniform | 10.00 | 11.20 | 10.01 | +0.12% | -10.60% |
+| 998 short + 2 long | 33.10 | 38.75 | 33.09 | -0.05% | -14.63% |
+| 1,000 long-tail | 32.33 | 37.88 | 32.33 | +0.01% | -14.66% |
 
 ## 256K steady execution
 
 | Distribution | Contiguous | Zigzag | Planner | P time vs C | P time vs Z |
 |---|---:|---:|---:|---:|---:|
-| 1 long document | 115.29 | 105.58 | 104.15 | -9.67% | -1.36% |
-| 64 uniform | 50.34 | 51.73 | 50.33 | -0.00% | -2.70% |
-| 64 near-uniform | 50.34 | 51.77 | 50.35 | +0.01% | -2.75% |
-| 20 short + 2 long | 90.69 | 87.95 | 87.39 | -3.64% | -0.64% |
-| 1,024 uniform | 18.96 | 22.56 | 18.94 | -0.10% | -16.02% |
-| 512 near-uniform | 21.79 | 24.21 | 21.76 | -0.12% | -10.12% |
-| 998 short + 2 long | 83.64 | 96.05 | 82.15 | -1.78% | -14.47% |
-| 1,000 long-tail | 99.36 | 115.25 | 92.20 | -7.20% | -20.00% |
+| 1 long document | 115.74 | 105.47 | 104.23 | -9.94% | -1.17% |
+| 64 uniform | 50.32 | 51.76 | 50.36 | +0.08% | -2.70% |
+| 64 near-uniform | 50.35 | 51.71 | 50.30 | -0.09% | -2.72% |
+| 20 short + 2 long | 90.67 | 88.23 | 87.59 | -3.40% | -0.72% |
+| 1,024 uniform | 18.96 | 22.55 | 18.94 | -0.15% | -16.01% |
+| 512 near-uniform | 21.74 | 24.21 | 21.77 | +0.14% | -10.06% |
+| 998 short + 2 long | 83.71 | 95.86 | 82.07 | -1.96% | -14.39% |
+| 1,000 long-tail | 98.91 | 115.31 | 92.09 | -6.89% | -20.14% |
 
 ## 1M steady execution
 
 | Distribution | Contiguous | Zigzag | Planner | P time vs C | P time vs Z |
 |---|---:|---:|---:|---:|---:|
-| 1 long document | 853.46 | 638.50 | 637.55 | -25.30% | -0.15% |
-| 64 uniform | 239.31 | 244.20 | 239.05 | -0.11% | -2.11% |
-| 64 near-uniform | 239.06 | 244.37 | 239.25 | +0.08% | -2.10% |
-| 20 short + 2 long | 576.29 | 493.97 | 491.52 | -14.71% | -0.50% |
-| 1,024 uniform | 106.86 | 121.14 | 106.80 | -0.05% | -11.84% |
-| 512 near-uniform | 153.78 | 162.94 | 153.50 | -0.18% | -5.79% |
-| 998 short + 2 long | 566.17 | 549.72 | 493.44 | -12.85% | -10.24% |
-| 1,000 long-tail | 801.37 | 715.45 | 591.85 | -26.14% | -17.28% |
+| 1 long document | 852.26 | 637.36 | 637.78 | -25.17% | +0.07% |
+| 64 uniform | 239.24 | 244.40 | 239.44 | +0.09% | -2.03% |
+| 64 near-uniform | 239.18 | 244.56 | 239.23 | +0.02% | -2.18% |
+| 20 short + 2 long | 578.44 | 492.49 | 490.87 | -15.14% | -0.33% |
+| 1,024 uniform | 106.93 | 120.95 | 106.89 | -0.04% | -11.63% |
+| 512 near-uniform | 153.33 | 162.94 | 153.63 | +0.19% | -5.71% |
+| 998 short + 2 long | 567.96 | 550.56 | 494.71 | -12.90% | -10.14% |
+| 1,000 long-tail | 800.96 | 715.78 | 591.82 | -26.11% | -17.32% |
 
 ## Preparation plus one use
 
@@ -102,114 +103,186 @@ not replaced by a cache lookup. First compilation is still excluded.
 
 | Distribution | Contiguous | Zigzag | Planner |
 |---|---:|---:|---:|
-| 1 long document | 48.33 | 47.14 | 53.37 |
-| 64 uniform | 21.07 | 24.84 | 21.28 |
-| 64 near-uniform | 21.06 | 24.95 | 21.24 |
-| 20 short + 2 long | 36.25 | 37.16 | 43.04 |
-| 1,024 uniform | 16.07 | 58.33 | 18.27 |
-| 512 near-uniform | 13.76 | 35.29 | 14.98 |
-| 998 short + 2 long | 40.72 | 84.47 | 61.39 |
-| 1,000 long-tail | 39.95 | 83.74 | 44.48 |
+| 1 long document | 48.41 | 47.17 | 53.27 |
+| 64 uniform | 20.90 | 24.40 | 21.10 |
+| 64 near-uniform | 21.07 | 25.31 | 21.31 |
+| 20 short + 2 long | 36.17 | 37.22 | 43.18 |
+| 1,024 uniform | 15.78 | 54.64 | 17.80 |
+| 512 near-uniform | 13.56 | 33.89 | 14.72 |
+| 998 short + 2 long | 40.23 | 82.95 | 42.34 |
+| 1,000 long-tail | 39.66 | 83.09 | 41.45 |
 
 ### 256K
 
 | Distribution | Contiguous | Zigzag | Planner |
 |---|---:|---:|---:|
-| 1 long document | 116.41 | 106.72 | 111.94 |
-| 64 uniform | 51.40 | 55.87 | 51.61 |
-| 64 near-uniform | 51.40 | 56.02 | 51.62 |
-| 20 short + 2 long | 91.84 | 90.29 | 96.16 |
-| 1,024 uniform | 25.87 | 69.42 | 27.91 |
-| 512 near-uniform | 25.73 | 48.89 | 26.78 |
-| 998 short + 2 long | 93.22 | 188.33 | 114.82 |
-| 1,000 long-tail | 109.06 | 262.29 | 124.02 |
+| 1 long document | 116.81 | 106.57 | 111.94 |
+| 64 uniform | 51.31 | 55.48 | 51.57 |
+| 64 near-uniform | 51.34 | 55.48 | 51.51 |
+| 20 short + 2 long | 91.79 | 90.53 | 96.11 |
+| 1,024 uniform | 26.19 | 67.67 | 28.22 |
+| 512 near-uniform | 25.42 | 47.63 | 26.58 |
+| 998 short + 2 long | 92.58 | 191.44 | 106.15 |
+| 1,000 long-tail | 107.78 | 263.45 | 115.51 |
 
 ### 1M
 
 | Distribution | Contiguous | Zigzag | Planner |
 |---|---:|---:|---:|
-| 1 long document | 855.70 | 640.79 | 646.87 |
-| 64 uniform | 240.80 | 248.86 | 240.77 |
-| 64 near-uniform | 240.57 | 249.16 | 241.00 |
-| 20 short + 2 long | 578.53 | 497.20 | 501.32 |
-| 1,024 uniform | 114.35 | 169.54 | 116.43 |
-| 512 near-uniform | 158.33 | 188.80 | 159.24 |
-| 998 short + 2 long | 576.80 | 597.98 | 528.35 |
-| 1,000 long-tail | 815.55 | 867.25 | 630.53 |
+| 1 long document | 854.50 | 639.80 | 647.29 |
+| 64 uniform | 240.69 | 248.73 | 241.09 |
+| 64 near-uniform | 240.69 | 248.94 | 240.94 |
+| 20 short + 2 long | 580.61 | 495.68 | 500.99 |
+| 1,024 uniform | 114.18 | 168.40 | 116.17 |
+| 512 near-uniform | 158.24 | 187.40 | 159.63 |
+| 998 short + 2 long | 577.91 | 599.07 | 521.10 |
+| 1,000 long-tail | 813.63 | 817.01 | 620.98 |
 
 ## What the comparison shows
 
 The aggregate below sums one execution of each of the eight distributions at
-each context length. It assumes equal case frequency, not equal runtime weights
-or a measured production mix. Values are percentage time reductions relative
-to the specified fixed policy; a negative reduction means a slowdown.
+each context length. It assumes equal case frequency, not a production workload
+mix. Values are percentage time reductions relative to each fixed policy;
+negative reductions mean a slowdown.
 
 | Context | Steady vs contiguous | Steady vs zigzag | Prepare + one use vs contiguous | Prepare + one use vs zigzag |
 |---|---:|---:|---:|---:|
-| 128K | 0.90% | 7.11% | -17.22% | 29.77% |
-| 256K | 4.36% | 8.62% | -7.07% | 31.10% |
-| 1M | 16.50% | 6.85% | 14.41% | 11.42% |
+| 128K | 0.89% | 7.19% | -8.23% | 34.35% |
+| 256K | 4.35% | 8.60% | -4.33% | 33.10% |
+| 1M | 16.50% | 6.77% | 14.87% | 10.48% |
 
-At 1M, the two-long/998-short mixture improves steady time by **12.85% versus
-contiguous and 10.24% versus zigzag**. The 1,000-document long tail improves by
-**26.14% and 17.28%**, respectively. These two cases choose locality-preserving
-six-piece-per-rank candidates. Balancing causal selection work while avoiding
-unnecessary movement of short documents beats applying full zigzag everywhere.
+The same planner and coefficients handle all three lengths. Single long documents
+benefit from balancing causal work; many equal documents are already balanced
+under contiguous ownership. Mixed packs benefit from redistributing expensive
+long-document work while keeping cheap short documents local. At 1M, the
+998-short/two-long and 1,000-document long-tail cases reduce steady time by
+**10.14% and 17.32% versus full zigzag**, respectively. The 64-document cases
+choose contiguous; the 22-document 1M case performs close to zigzag.
 
-The dozens-of-documents cases add a useful distinction: 64 uniform/near-uniform
-documents choose contiguous at all three lengths, avoiding the full-zigzag cost
-for already-balanced work. The 20-short/two-long pack at 1M improves **14.71%**
-over contiguous and is close to zigzag. At 128K, however, the same document-count
-pattern is **0.576% slower than zigzag**. Layout choice is not perfectly predicted;
-the larger aggregate gain at 1M does not establish monotonic improvement per case.
+Preparation remains a limitation for one-use layouts. At 128K/256K, aggregate
+preparation-plus-one-step is still slower than contiguous. At 1M, the single
+long document and 22-document pack remain slightly slower than zigzag under
+one-use accounting. The largest one-use gap to the faster fixed policy is
+**19.40%** (128k-mixed-22), compared with 50.77% in the previous run.
+These are separately measured cohorts; the controlled host A/B below isolates
+the preparation change. Neither cohort establishes universally optimal one-use
+selection or a <3% preparation guarantee. Use a calibrated preparation budget
+and account for expected layout reuse.
 
-Fresh preparation still matters. At 1M, including it leaves planner slightly
-slower than zigzag for the single document and the 22-document pack, despite
-similar steady execution. At 128K/256K the aggregate one-use result remains
-slower than contiguous. The worst one-use gap to the faster fixed policy across
-all 24 cases is **50.77%** for the 128K two-long/998-short mixture. Thus this study
-does not establish universally optimal one-use selection or a <3% preparation
-budget. A reused layout and a layout used only once need different preparation
-budgets. Some preparation samples have large host-time spikes; the raw minimum,
-maximum and all critical samples are retained in the linked JSON.
+## Equivalent preparation optimization
+
+The update removes redundant metadata work and prunes candidates with a proved
+model-level bound; it introduces no retained cache:
+
+1. Compute pinned per-rank loads once per invocation and copy the small arrays
+   into each search grid. Visit only movable documents in adaptive grids.
+2. Skip long-document candidates when immutable pinned work alone exceeds the
+   migration threshold. Full zigzag remains independently eligible.
+3. Price a source-local span directly, preserving source/receive permutation
+   detection and floating-point accumulation order.
+4. Check full-zigzag grain feasibility before transport estimation, retaining
+   the original-source-fragment exception. No feasible candidate is discarded.
+5. Check exact whole-document/remainder work before the DSA binary split search.
+   Oversized intervals still use the same maximal budget-fitting prefix.
+
+Candidate definitions, coefficients, tie breaks, selected layouts, native window
+boundaries, scratch sizes and GPU execution are unchanged. The diagnostic list
+of evaluated scores can omit candidates rejected by the new lower bound.
+All extra state is local to preparation; no mutable global cache, collective,
+cast or D2H read is introduced.
+
+The following host-only A/B uses rank 7's complete `CsaCPSelectionPlan` constructor,
+20 samples per variant, alternating before/after order after two warmups. It
+excludes GPU workspace preparation. The baseline imports source from `ea71df3`;
+the otherwise unchanged caller binds that revision's planner and DSA builder.
+The raw report covers all 24 planner shapes plus fixed-policy controls.
+
+| Host-only case | Before (ms) | After (ms) | Time reduction |
+|---|---:|---:|---:|
+| 128k-single-planner | 6.177 | 6.052 | +2.0% |
+| 256k-single-planner | 6.190 | 6.082 | +1.8% |
+| 1024k-uniform-64-planner | 0.397 | 0.361 | +9.1% |
+| 256k-mixed-22-planner | 6.795 | 6.507 | +4.2% |
+| 128k-uniform-1024-planner | 4.494 | 4.157 | +7.5% |
+| 128k-uniform-1024-zigzag | 38.705 | 37.026 | +4.3% |
+| 128k-mixed-1000-planner | 21.876 | 3.862 | +82.3% |
+| 1024k-long-tail-1000-planner | 24.956 | 16.904 | +32.3% |
+
+Full fresh preparation, including GPU metadata/workspace work, is shown next.
+These before/after medians come from separate complete-CSA runs. Small values
+have visible run-to-run variation; the table does not imply every case improved.
+Host-time spikes remain in the raw samples. For example, the new 1M long-tail planner preparation ranges from 28.45 to 150.10 ms.
+
+| Context | Distribution | Before preparation | After preparation | Time reduction |
+|---|---|---:|---:|---:|
+| 128K | 1 long document | 7.55 | 7.45 | +1.4% |
+| 128K | 64 uniform | 1.24 | 1.11 | +10.8% |
+| 128K | 20 short + 2 long | 7.61 | 7.70 | -1.3% |
+| 128K | 1,024 uniform | 8.97 | 8.52 | +5.1% |
+| 128K | 998 short + 2 long | 28.31 | 9.26 | +67.3% |
+| 128K | 1,000 long-tail | 12.13 | 9.12 | +24.8% |
+| 256K | 1 long document | 7.79 | 7.71 | +1.0% |
+| 256K | 64 uniform | 1.28 | 1.21 | +5.0% |
+| 256K | 20 short + 2 long | 8.77 | 8.52 | +2.9% |
+| 256K | 1,024 uniform | 8.97 | 9.28 | -3.5% |
+| 256K | 998 short + 2 long | 32.67 | 24.09 | +26.3% |
+| 256K | 1,000 long-tail | 31.81 | 23.42 | +26.4% |
+| 1M | 1 long document | 9.32 | 9.51 | -2.0% |
+| 1M | 64 uniform | 1.72 | 1.65 | +4.3% |
+| 1M | 20 short + 2 long | 9.80 | 10.12 | -3.3% |
+| 1M | 1,024 uniform | 9.63 | 9.29 | +3.6% |
+| 1M | 998 short + 2 long | 34.91 | 26.39 | +24.4% |
+| 1M | 1,000 long-tail | 38.68 | 29.16 | +24.6% |
 
 ## Precision, review and provenance
 
-All **24 cases x four paths x eight ranks** pass row-identity/inverse checks and
-full-tensor output/seven-gradient comparisons against legacy contiguous. Maximum
-relative RMS across all public paths/ranks/cases is shown below; it is not a
-bitwise-equivalence claim for nondeterministic native kernels.
+- **518 focused CPU tests pass**, including exact budget-boundary checks with
+  unaligned causal offsets, local-reorder pricing and grain-check equivalence.
+- **660 planner comparisons** preserve the selected layout, metrics and score
+  exactly versus `ea71df3`. Every retained candidate score is identical; omitted
+  candidates are verified to miss the migration margin: 55 shapes
+  (31 historical + 24 window cases) x CP8/16/64 x zero/original headroom x
+  zero/1,024-token floors. CP64 is host metadata validation, not a GPU benchmark.
+- **300 randomized DSA plans and 69,281 windows** match the baseline exactly.
+- **128 native subgroup checks pass** for BF16/FP32 weights, unequal sources,
+  empty destinations and retained outputs; canonical IDs and scores match
+  unrouted selection exactly in these fixtures.
+- All **24 shapes x four paths x eight ranks** pass full-tensor output and
+  seven-gradient comparisons against legacy contiguous, plus exact row-marker
+  forward/inverse/autograd checks. Three small fixtures under all four paths
+  pass independent FP32 attention/teacher/KL/pooling checks. Those FP32 checks
+  use the selected key set and do not independently establish discrete ranking.
+
+Maximum relative RMS over all public paths/ranks/cases:
 
 | Tensor | Maximum relative RMS |
 |---|---:|
-| Output | 0.21361% |
-| dQ | 0.06709% |
-| dKV | 0.10311% |
-| Indexer dQ | 0.07967% |
-| Indexer dWeights | 0.06914% |
-| Pool dKV | 0.13756% |
-| Pool dScore | 0.13780% |
-| Pool dAPE | 0.00265% |
+| Output | 0.21341% |
+| dQ | 0.06697% |
+| dKV | 0.10307% |
+| Indexer dQ | 0.09174% |
+| Indexer dWeights | 0.06641% |
+| Pool dKV | 0.13371% |
+| Pool dScore | 0.13834% |
+| Pool dAPE | 0.00254% |
 
-Maximum auxiliary loss absolute difference is **8.15e-10**. No runtime math,
-dtype, kernel or precision option changed for this coverage extension.
-**444 focused CPU tests pass**, including nine new document-count/context
-coverage tests. The unchanged runtime had also passed 128 native subgroup
-selection checks and three small independent FP32 oracle fixtures under all
-four paths, as detailed in the [original study](CSA_CP_WINDOW_RESULTS.md).
+Maximum auxiliary loss absolute difference is **1.16e-09**. No math,
+dtype or native precision setting changed. These error envelopes include native
+nondeterminism; small differences from the previous run are not a new precision
+improvement or a bitwise-equivalence claim.
 
-The original ten 128K/256K records are reused from that study; fourteen additional
-records cover six dozens-of-documents cases at 128K/256K and all eight 1M
-distributions. Runtime source is `d2cf4fd`; only benchmark fixture
-construction/help changed between timing cohorts. All 125 source hashes match
-for the new cohorts. The only differing source hash in the original cohort is
-that benchmark file. No algorithm or profile was tuned between these cohorts.
+The tested source is `489779ba35e2c5f51eccce7c7ff95ed4cdd640d0`. All 125 source
+files in the final timing manifest match the reviewed checkout.
+Every selected policy matches the previous run, and every measured full-zigzag
+baseline fits the planner's row cap. The new measurements supersede the primary
+tables in this document. The [previous 24-case evidence](results/csa_cp_three_way_20261116.json)
+and [original 128K/256K study](CSA_CP_WINDOW_RESULTS.md) remain available.
 
-The report preserves per-case timing/error envelopes, selected policies, all
-critical timing/preparation samples, source-record hashes, and cohort source
-manifests in [machine-readable results](results/csa_cp_three_way_20261116.json).
-Diagnostic allocator peaks in the underlying harness include four coexisting
-fixtures; they must not be interpreted as isolated per-policy memory usage.
+[Current machine-readable results](results/csa_cp_preparation_20261116.json)
+retain critical timing/preparation samples, selected policies, precision envelopes,
+source-record hashes, cohort source hashes and the counterbalanced host A/B.
+The allocator diagnostics in the underlying harness include four coexisting
+fixtures; they are not isolated per-policy memory claims.
 
 ## Reproduction
 
