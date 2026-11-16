@@ -1,0 +1,27 @@
+docs/CSA_CP_1M_REUSE_RESULTS.md
+  s_d4826b35da75c5::t_68b6a312e977e2 1-197
+docs/results/csa_cp_1m_reuse_20261117.json
+  s_d4826b35da75c5::t_68b6a312e977e2 1-98775
+docs/CSA_CP_PLAN_REUSE.md
+  s_d4826b35da75c5::t_85fa0bf8811b49 3-7
+docs/CSA_CP_SELECTION.md
+  s_d4826b35da75c5::t_85fa0bf8811b49 94-96
+docs/CSA_CP_THREE_WAY_RESULTS.md
+  s_d4826b35da75c5::t_85fa0bf8811b49 3-6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7fbe3cf1100f35b1784ded6badcfa86e8158c3f6",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
