@@ -138,6 +138,7 @@ class FullCSA:
         planner_strategy="balanced",
         selection_api=False,
         planner_config=None,
+        prepared_from=None,
     ):
         import cudnn
 
@@ -146,6 +147,16 @@ class FullCSA:
         self.pool_backward_order = pool_backward_order
         self.redistribution_scope = redistribution_scope
         self.selection_api = selection_api
+        self._layout_options = dict(
+            device=device,
+            candidate_mib=candidate_mib,
+            layout=layout,
+            redistribution_scope=redistribution_scope,
+            planner_cost_model=planner_cost_model,
+            planner_strategy=planner_strategy,
+            selection_api=selection_api,
+            planner_config=planner_config,
+        )
         if selection_api and (
             redistribution_scope != "selection" or (layout == "planner" and planner_strategy != "selection")
         ):
@@ -156,12 +167,27 @@ class FullCSA:
         self.rank, self.world = dist.get_rank(), dist.get_world_size()
         validate_source_alignment(lengths, self.world)
         self.cu = (0, *accumulate(lengths))
-        self.plan = build_kimi_cp_plan(self.cu, group=dist.group.WORLD)
+        if prepared_from is not None and (
+            not selection_api
+            or not prepared_from.selection_api
+            or self.cu != prepared_from.cu
+            or (self.rank, self.world, top_k, heads)
+            != (prepared_from.rank, prepared_from.world, prepared_from.top_k, prepared_from.heads)
+            or torch.device(device) != prepared_from.source_q.device
+            or self._layout_options != prepared_from._layout_options
+        ):
+            raise ValueError("prepared CSA metadata must match geometry, device and group")
+        self.plan = build_kimi_cp_plan(self.cu, group=dist.group.WORLD) if prepared_from is None else prepared_from.plan
         self.source_n, self.total = self.plan.local_tokens, self.cu[-1]
         self.scale, self.heads = 576**-0.5, heads
         n = self.source_n
-        pool_plan = IndexPoolPlan.from_cu_seqlens(self.plan.local_cu_seqlens, head_dim=128, ratio=4)
-        pool_cu_tokens, pool_cu_blocks = pool_plan.materialize(device)
+        if prepared_from is None:
+            pool_plan = IndexPoolPlan.from_cu_seqlens(self.plan.local_cu_seqlens, head_dim=128, ratio=4)
+            pool_cu_tokens, pool_cu_blocks = pool_plan.materialize(device)
+        else:
+            prepared_pool = prepared_from.indexer
+            pool_plan = prepared_pool.pool_plan
+            pool_cu_tokens, pool_cu_blocks = prepared_pool.pool_cu_tokens, prepared_pool.pool_cu_blocks
         torch.cuda.synchronize(device)
         self.common_prepare_ms = (time.perf_counter() - common_prepare_start) * 1000
         # All random tensors are generated in SOURCE ownership, with identical
@@ -193,19 +219,51 @@ class FullCSA:
         self.global_kv = torch.empty(self.total, 576, device=device, dtype=torch.bfloat16)
         self.sink = torch.full((heads,), -torch.inf, device=device, dtype=torch.float32)
         self.unit_grad = torch.ones((), device=device, dtype=torch.float32)
-        self._layout_options = dict(
-            device=device,
-            candidate_mib=candidate_mib,
-            layout=layout,
-            redistribution_scope=redistribution_scope,
-            planner_cost_model=planner_cost_model,
-            planner_strategy=planner_strategy,
-            selection_api=selection_api,
-            planner_config=planner_config,
-        )
-        self._prepare_layout(**self._layout_options)
         self.events = []
         self.last = {}
+        if prepared_from is None:
+            self._prepare_layout(**self._layout_options)
+        else:
+            self.use_prepared_layout(prepared_from)
+            self.common_prepare_ms = self.layout_prepare_ms = 0.0
+
+    def use_prepared_layout(self, prepared):
+        """Bind prebuilt metadata to a benchmark layer without preparing again.
+
+        Only selection-only public API fixtures are supported. Activations,
+        gathers and results stay layer-owned; native selection scratch is shared
+        by sequential forwards. Finish backward before switching a layer's layout.
+        """
+        if self.last:
+            raise ValueError("release the layer's completed results before switching prepared layouts")
+        if (
+            not self.selection_api
+            or not prepared.selection_api
+            or self.redistribution_scope != "selection"
+            or prepared.redistribution_scope != "selection"
+            or (self.cu, self.rank, self.world, self.top_k, self.heads)
+            != (prepared.cu, prepared.rank, prepared.world, prepared.top_k, prepared.heads)
+            or self.source_q.device != prepared.source_q.device
+        ):
+            raise ValueError("prepared CSA metadata must match geometry, device and group")
+        for name in (
+            "cp_selection",
+            "selected_policy",
+            "selection_layout",
+            "selection_exchange",
+            "layout",
+            "exchange",
+            "n",
+            "doc_start",
+            "visible",
+            "query_global_rows",
+            "selection_key_slice",
+            "selection_key_ids",
+        ):
+            setattr(self, name, getattr(prepared, name))
+        self.indexer.select_plan = prepared.indexer.select_plan
+        self.indexer.select_workspace = prepared.indexer.select_workspace
+        self._layout_options = prepared._layout_options.copy()
 
     def prepare_metadata(self):
         """Rebuild fresh metadata after warmup, without regenerating inputs.
