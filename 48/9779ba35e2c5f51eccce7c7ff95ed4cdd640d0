@@ -1,0 +1,35 @@
+cula/hybrid/dsa.py
+  s_d4826b35da75c5::t_4a8e25cdbd4e02 249-252,254-264
+docs/THD_LAYOUT_PLANNER.md
+  s_d4826b35da75c5::t_44c03ae79f8de3 156,161-163,166-168,172-173
+  s_d4826b35da75c5::t_fb407837d71f5e 157-158,169-170
+  s_d4826b35da75c5::t_2c7128e6b434ec 131,145-149,164-165
+tests/test_hybrid_dsa_plan.py
+  s_d4826b35da75c5::t_a8ffab8e572bf4 69-98
+cula/distributed/thd_planner.py
+  s_d4826b35da75c5::t_01276d5997bc96 1230-1252,1406
+  s_d4826b35da75c5::t_9c0ea2414adab6 1371-1374,1377-1378,1380-1398
+  s_d4826b35da75c5::t_4a8e25cdbd4e02 217-218,220-221,224-233,432-433,976,984-985,1363-1370
+  s_d4826b35da75c5::t_d9ee80b195b418 1375
+tests/test_thd_planner.py
+  s_d4826b35da75c5::t_c0a588a7a0363e 519,521-536
+  s_d4826b35da75c5::t_d9ee80b195b418 520
+  s_d4826b35da75c5::t_ce7b089a4420f9 507-518
+  s_d4826b35da75c5::t_01276d5997bc96 537-553
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "489779ba35e2c5f51eccce7c7ff95ed4cdd640d0",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
