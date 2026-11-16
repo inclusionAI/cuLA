@@ -1,0 +1,32 @@
+docs/results/csa_cp_preparation_tail_20261117.json
+  s_d4826b35da75c5::t_5a7b1bed896d1d 1
+docs/results/csa_cp_planner_diagnostics_20261117.json
+  s_d4826b35da75c5::t_98c6eaa25a7ece 1-65,90-432
+  s_d4826b35da75c5::t_265f4a919d06be 66-89
+docs/results/csa_cp_1m_local_copy_20261117.json
+  s_d4826b35da75c5::t_a074c47196b094 1-370
+docs/CSA_CP_PLANNER_COST_RESULTS.md
+  s_d4826b35da75c5::t_a074c47196b094 1-9,20-307
+  s_d4826b35da75c5::t_19ebf593c5196a 10-19,308-393
+  s_d4826b35da75c5::t_5a7b1bed896d1d 394-398
+docs/CSA_CP_SELECTION.md
+  s_d4826b35da75c5::t_19ebf593c5196a 16-20
+docs/CSA_CP_PLAN_REUSE.md
+  s_d4826b35da75c5::t_19ebf593c5196a 13-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8ceeabdedbac76700c339a80e51b7ad9eb40cc3f",
+  "prompts": {},
+  "sessions": {
+    "s_d4826b35da75c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a187dd-d76f-7323-b91d-cb37785b22d1",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "shuyan.ycf <shuyan.ycf@antgroup.com>"
+    }
+  }
+}
