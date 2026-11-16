@@ -36,7 +36,16 @@ from cula.distributed import (
     build_kimi_cp_plan,
     cudnn_kda_cp,
 )
-from cula.hybrid import DsaSelectionPlan, DsaSelectionWorkspace, IndexPoolPlan, cudnn_dsa_select, cudnn_index_pool
+from cula.hybrid import (
+    CsaCPSelectionPlan,
+    CsaCPSelectionWorkspace,
+    DsaSelectionPlan,
+    DsaSelectionWorkspace,
+    IndexPoolPlan,
+    cudnn_csa_select_cp,
+    cudnn_dsa_select,
+    cudnn_index_pool,
+)
 from cula.hybrid.index_pool import _load_cudnn_index_pool_ops
 
 
@@ -50,7 +59,7 @@ def json_safe(value):
     """Replace nonfinite measurements only in the serialized report copy."""
     if isinstance(value, dict):
         return {key: json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [json_safe(item) for item in value]
     if isinstance(value, float) and not math.isfinite(value):
         return None
@@ -127,6 +136,8 @@ class FullCSA:
         redistribution_scope="selection",
         planner_cost_model=None,
         planner_strategy="balanced",
+        selection_api=False,
+        planner_config=None,
     ):
         import cudnn
 
@@ -134,6 +145,11 @@ class FullCSA:
         self.top_k = top_k
         self.pool_backward_order = pool_backward_order
         self.redistribution_scope = redistribution_scope
+        self.selection_api = selection_api
+        if selection_api and (
+            redistribution_scope != "selection" or (layout == "planner" and planner_strategy != "selection")
+        ):
+            raise ValueError("the public API requires selection-only routing and the selection planner")
         _, self.pool_backward = _load_cudnn_index_pool_ops()
         torch.cuda.synchronize(device)
         common_prepare_start = time.perf_counter()
@@ -177,23 +193,86 @@ class FullCSA:
         self.global_kv = torch.empty(self.total, 576, device=device, dtype=torch.bfloat16)
         self.sink = torch.full((heads,), -torch.inf, device=device, dtype=torch.float32)
         self.unit_grad = torch.ones((), device=device, dtype=torch.float32)
+        self._layout_options = dict(
+            device=device,
+            candidate_mib=candidate_mib,
+            layout=layout,
+            redistribution_scope=redistribution_scope,
+            planner_cost_model=planner_cost_model,
+            planner_strategy=planner_strategy,
+            selection_api=selection_api,
+            planner_config=planner_config,
+        )
+        self._prepare_layout(**self._layout_options)
+        self.events = []
+        self.last = {}
+
+    def prepare_metadata(self):
+        """Rebuild fresh metadata after warmup, without regenerating inputs.
+
+        Synchronization includes H2D metadata copies and workspace allocation;
+        compilation and RNG initialization are outside this preparation metric.
+        """
+        device = self.source_q.device
+        torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        self.plan = build_kimi_cp_plan(self.cu, group=dist.group.WORLD)
+        b = self.indexer
+        b.pool_plan = IndexPoolPlan.from_cu_seqlens(self.plan.local_cu_seqlens, head_dim=128, ratio=4)
+        b.pool_cu_tokens, b.pool_cu_blocks = b.pool_plan.materialize(device)
+        torch.cuda.synchronize(device)
+        self.common_prepare_ms = (time.perf_counter() - start) * 1000
+        self._prepare_layout(**self._layout_options)
+        return dict(common_ms=self.common_prepare_ms, layout_ms=self.layout_prepare_ms)
+
+    def _prepare_layout(
+        self,
+        *,
+        device,
+        candidate_mib,
+        layout,
+        redistribution_scope,
+        planner_cost_model,
+        planner_strategy,
+        selection_api,
+        planner_config,
+    ):
+        b, top_k = self.indexer, self.top_k
         torch.cuda.synchronize(device)
         prepare_start = time.perf_counter()
         if planner_cost_model is not None and redistribution_scope != "selection":
             raise ValueError("the selection cost model is valid only for selection-only redistribution")
         if planner_strategy == "selection" and redistribution_scope != "selection":
             raise ValueError("selection planning requires selection-only redistribution")
-        ranks, self.selected_policy = query_layouts(
-            self.cu, self.world, layout, cost_model=planner_cost_model, planner_strategy=planner_strategy
-        )
+        if selection_api:
+            cp_selection_plan = CsaCPSelectionPlan.from_cu_seqlens(
+                self.cu,
+                rank=self.rank,
+                world_size=self.world,
+                top_k=top_k,
+                policy=layout,
+                cost_model=planner_cost_model,
+                config=planner_config,
+                max_tokens_per_rank=self.total if layout == "zigzag" else None,
+                candidate_budget_bytes=None if candidate_mib == 0 else candidate_mib << 20,
+            )
+            self.cp_selection = CsaCPSelectionWorkspace.from_plan(cp_selection_plan, device, group=dist.group.WORLD)
+            ranks, self.selected_policy = cp_selection_plan.ranks, cp_selection_plan.policy
+        else:
+            ranks, self.selected_policy = query_layouts(
+                self.cu, self.world, layout, cost_model=planner_cost_model, planner_strategy=planner_strategy
+            )
         if redistribution_scope == "queries" and any(r.local_tokens == 0 for r in ranks):
             raise ValueError(
                 "query-wide redistribution requires nonempty attention ranks; use selection scope for empty ranks"
             )
         self.selection_layout = ranks[self.rank]
         source_offsets = balanced_shards(self.total, self.world)
-        exchange_plan = THDRedistributionPlan.build(ranks, source_offsets, self.rank)
-        self.selection_exchange = THDRedistributor(exchange_plan, device, group=dist.group.WORLD)
+        if selection_api:
+            self.selection_exchange = self.cp_selection.exchange
+        else:
+            exchange_plan = THDRedistributionPlan.build(ranks, source_offsets, self.rank)
+            self.selection_exchange = THDRedistributor(exchange_plan, device, group=dist.group.WORLD)
         if redistribution_scope == "selection":
             attention_ranks, _ = query_layouts(self.cu, self.world, "contiguous")
             self.layout = attention_ranks[self.rank]
@@ -211,7 +290,9 @@ class FullCSA:
             key_ranges.append((span.sequence_start // 4, span.sequence_end // 4))
         b.select_plan = None
         b.select_workspace = None
-        if self.selection_layout.local_tokens:
+        if selection_api:
+            b.select_plan, b.select_workspace = cp_selection_plan.selection, self.cp_selection.selection
+        elif self.selection_layout.local_tokens:
             b.select_plan = DsaSelectionPlan.from_cu_seqlens(
                 self.selection_layout.local_cu_seqlens,
                 key_prefix,
@@ -222,7 +303,9 @@ class FullCSA:
             )
             b.select_workspace = DsaSelectionWorkspace.from_plan(b.select_plan, device)
         self.selection_key_ids = None
-        if not key_ranges:
+        if selection_api:
+            self.selection_key_slice, self.selection_key_ids = self.cp_selection.key_slice, self.cp_selection.key_indices
+        elif not key_ranges:
             self.selection_key_slice = slice(0, 0)
         elif all(left[1] == right[0] for left, right in zip(key_ranges, key_ranges[1:])):
             self.selection_key_slice = slice(key_ranges[0][0], key_ranges[-1][1])
@@ -230,8 +313,6 @@ class FullCSA:
             self.selection_key_ids = torch.cat([torch.arange(a, z, device="cpu") for a, z in key_ranges]).to(device)
         torch.cuda.synchronize(device)
         self.layout_prepare_ms = (time.perf_counter() - prepare_start) * 1000
-        self.events = []
-        self.last = {}
 
     def mark(self, name):
         event = torch.cuda.Event(enable_timing=True)
@@ -249,8 +330,10 @@ class FullCSA:
         self.last = {}
         with torch.cuda.nvtx.range("csa.query_redistribute"):
             self.q = self.exchange.distribute(self.source_q)
-            selection_qi = self.selection_exchange.distribute(self.source_qi)
-            selection_weights = self.selection_exchange.distribute(self.source_weights)
+            selection_qi = self.source_qi if self.selection_api else self.selection_exchange.distribute(self.source_qi)
+            selection_weights = (
+                self.source_weights if self.selection_api else self.selection_exchange.distribute(self.source_weights)
+            )
             b.qi = self.source_qi if self.redistribution_scope == "selection" else selection_qi
             b.weights = self.source_weights if self.redistribution_scope == "selection" else selection_weights
         self.mark("query_redistribute")
@@ -266,13 +349,25 @@ class FullCSA:
         self.mark("pool_gather")
         with torch.cuda.nvtx.range("csa.selection_key_layout"):
             select_keys = (
-                b.global_kbar[self.selection_key_slice]
-                if self.selection_key_ids is None
-                else b.global_kbar.index_select(0, self.selection_key_ids)
+                None
+                if self.selection_api
+                else (
+                    b.global_kbar[self.selection_key_slice]
+                    if self.selection_key_ids is None
+                    else b.global_kbar.index_select(0, self.selection_key_ids)
+                )
             )
         self.mark("selection_key_layout")
         with torch.cuda.nvtx.range("csa.selection"):
-            if b.select_plan is None:
+            if self.selection_api:
+                selected = cudnn_csa_select_cp(
+                    self.source_qi,
+                    b.global_kbar[:, None],
+                    self.source_weights,
+                    workspace=self.cp_selection,
+                    deterministic=False,
+                )
+            elif b.select_plan is None:
                 selected = SimpleNamespace(
                     block_ids=torch.empty((0, self.top_k), device=selection_qi.device, dtype=torch.int32),
                     scores=torch.empty((0, self.top_k), device=selection_qi.device, dtype=torch.float32),
@@ -288,7 +383,7 @@ class FullCSA:
                 )
         self.mark("selection")
         with torch.cuda.nvtx.range("csa.selection_restore"):
-            if self.redistribution_scope == "selection":
+            if self.redistribution_scope == "selection" and not self.selection_api:
                 selected_ids = self.selection_exchange.restore(selected.block_ids)
                 selected_scores = self.selection_exchange.restore(selected.scores)
             else:
@@ -611,6 +706,7 @@ def main(*, keep_group=False, baseline=None, save_baseline=False, comparison_nam
     parser.add_argument("--redistribution-scope", choices=("selection", "queries"), default="selection")
     parser.add_argument("--planner-cost-model", help="JSON calibrated THDSelectionCostModel coefficients")
     parser.add_argument("--planner-strategy", choices=("balanced", "selection"), default="balanced")
+    parser.add_argument("--selection-api", action="store_true", help="Use the public CSA CP selection API")
     parser.add_argument("--memory-stages", action="store_true", help="Diagnostic allocator counters at each phase boundary")
     parser.add_argument("--pool-backward-order", choices=("per-loss", "sum-first"), default="per-loss")
     parser.add_argument("--output", required=True)
@@ -649,6 +745,7 @@ def main(*, keep_group=False, baseline=None, save_baseline=False, comparison_nam
         args.redistribution_scope,
         cost_model,
         args.planner_strategy,
+        args.selection_api,
     )
     csa.record_memory = args.memory_stages
     redistribution_ok = check_redistribution(csa)

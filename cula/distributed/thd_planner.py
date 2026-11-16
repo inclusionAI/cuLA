@@ -110,6 +110,12 @@ class THDPlannerConfig:
     token_weight: float = 1.0
     causal_weight: float = 1.0
     boundary_weight: float = 0.02
+    min_chunk_tokens: int = 0
+    """Minimum newly created selection span; zero preserves the legacy search.
+
+    Existing source fragments and complete short documents remain legal.
+    This does not change the explicitly requested full-zigzag baseline.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,6 +352,13 @@ def _validate_inputs(
             raise ValueError(f"{name} must be a positive integer")
     if config.min_split_tokens % config.block_size:
         raise ValueError("min_split_tokens must be block aligned")
+    if (
+        isinstance(config.min_chunk_tokens, bool)
+        or not isinstance(config.min_chunk_tokens, int)
+        or config.min_chunk_tokens < 0
+        or config.min_chunk_tokens % config.block_size
+    ):
+        raise ValueError("min_chunk_tokens must be nonnegative and block aligned")
     if any((right - left) % config.block_size for left, right in zip(boundaries, boundaries[1:])):
         raise ValueError("every sequence length must be block aligned")
     if boundaries[-1] // config.block_size < world_size:
@@ -415,6 +428,8 @@ def _adaptive_items(
         # prevents short THD samples from paying a max-CP fragmentation tax.
         if length_blocks < 2 * min_split_blocks:
             pieces = 1
+        if config.min_chunk_tokens:
+            pieces = min(pieces, max(1, length_blocks // (config.min_chunk_tokens // block_size)))
         offsets = balanced_shards(length_blocks, pieces)
         for left, right in zip(offsets, offsets[1:]):
             start = sequence_start + left * block_size
@@ -988,6 +1003,7 @@ def _selection_assign(items, pinned, *, world, capacity, offsets, model, block_s
             intersections = tuple(_source_intersections(placed, offsets))
             cost = work(placed)
             max_compute, max_incoming, max_outgoing = max(compute), max(incoming), max(outgoing)
+            max_copies = max(offsets[r + 1] - offsets[r] + n for r, n in enumerate(loads))
             if model.overlap_intra_inter:
                 max_incoming, max_outgoing = max(*intra_in, *inter_in), max(*intra_out, *inter_out)
             best = None
@@ -1036,23 +1052,22 @@ def _selection_assign(items, pinned, *, world, capacity, offsets, model, block_s
                     receive_peers[rank] + len(new_edges),
                     max((send_peers[s] + 1 for s in new_edges), default=0),
                 )
-                node_additions = defaultdict(int)
-                for s, n in intersections:
-                    if model.rank_node_ids[s] != model.rank_node_ids[rank]:
-                        node_additions[model.rank_node_ids[s]] += n
-                candidate_node = max(
-                    node_peak,
-                    node_in[model.rank_node_ids[rank]] + sum(node_additions.values()),
-                    max((node_out[n] + rows for n, rows in node_additions.items()), default=0),
-                )
+                candidate_node = node_peak
                 if model.inter_node_aggregate_gbps is not None:
+                    node_additions = defaultdict(int)
+                    for s, n in intersections:
+                        if model.rank_node_ids[s] != model.rank_node_ids[rank]:
+                            node_additions[model.rank_node_ids[s]] += n
+                    candidate_node = max(
+                        node_peak,
+                        node_in[model.rank_node_ids[rank]] + sum(node_additions.values()),
+                        max((node_out[n] + rows for n, rows in node_additions.items()), default=0),
+                    )
                     transfer = max(transfer, candidate_node * model.bytes_per_query / (model.inter_node_aggregate_gbps * 1e6))
                 transfer += candidate_degree * model.peer_startup_us / 1e3
                 # Partial placement uses an upper bound on copies. Final
                 # scoring checks the actual source/destination permutations.
-                copies = max(
-                    offsets[r + 1] - offsets[r] + n + (placed.tokens if r == rank else 0) for r, n in enumerate(loads)
-                )
+                copies = max(max_copies, offsets[rank + 1] - offsets[rank] + loads[rank] + placed.tokens)
                 critical = max(max_compute, compute[rank] + cost) + transfer
                 if candidate_peer_peak:
                     critical += copies * model.packing_ns_per_query / 1e6 + model.exchange_us / 1e3
@@ -1205,6 +1220,38 @@ def _zigzag_lower_bound(boundaries, source, world, block_size, model):
     return compute + transfer
 
 
+def _source_selection_candidate(source, world, model):
+    """Price known identity ownership without reconstructing its transport.
+
+    Source items already have exact causal work and global token order. Reuse
+    both for baseline metrics instead of recomputing candidate prefixes and
+    source intersections several times on the common no-migration path.
+    """
+    groups = [[] for _ in range(world)]
+    tokens, causal, boundaries, compute = ([0] * world for _ in range(4))
+    previous = None
+    for item, rank in source:
+        groups[rank].append(
+            THDSpan(item.sequence, item.token_start, item.token_end, item.sequence_start, item.sequence_end, rank)
+        )
+        tokens[rank] += item.tokens
+        causal[rank] += item.causal_work
+        compute[rank] += model.candidate_ns * item.causal_work / 1e6 + model.query_ns * item.tokens / 1e6 + model.span_us / 1e3
+        if previous is not None and previous[0].sequence == item.sequence and previous[1] != rank:
+            boundaries[previous[1]] += 1
+            boundaries[rank] += 1
+        previous = item, rank
+    metrics = THDLayoutMetrics(
+        tuple(tokens),
+        tuple(causal),
+        tuple(boundaries),
+        max(tokens) / (sum(tokens) / world),
+        max(causal) / (sum(causal) / world) if sum(causal) else 1.0,
+        max(compute),
+    )
+    return tuple(THDRankLayout(r, tuple(g)) for r, g in enumerate(groups)), metrics
+
+
 def plan_thd_selection(
     global_cu_seqlens: torch.Tensor | Sequence[int],
     *,
@@ -1241,18 +1288,27 @@ def plan_thd_selection(
     if max_tokens_per_rank % config.block_size or max_tokens_per_rank < max(b - a for a, b in zip(offsets, offsets[1:])):
         raise ValueError("max_tokens_per_rank must be block aligned and fit every source shard")
     base = _contiguous_items(boundaries, world_size, config.block_size)
+    source_fragments = (
+        {(item.sequence, item.token_start, item.token_end) for item, _ in base} if config.min_chunk_tokens else set()
+    )
     movable = {i for i, (a, z) in enumerate(zip(boundaries, boundaries[1:])) if z - a >= 2 * config.min_split_tokens}
     pinned = [(item, rank) for item, rank in base if item.sequence not in movable]
     pinned_spans = ()
-    candidates = []
+    source_ranks, source_metrics = _source_selection_candidate(base, world_size, cost_model)
+    candidates = [("contiguous", source_ranks, source_metrics.score)]
 
-    def add(assignments, policy, *, include_pinned=True):
-        spans = _coalesce(assignments)
-        if include_pinned:
-            # Pinned and movable documents are disjoint. Reusing their spans
-            # avoids rebuilding hundreds of identical short-document objects
-            # for every planning grid.
-            spans = sorted((*pinned_spans, *spans), key=lambda s: (s.sequence, s.token_start))
+    def add(assignments, policy):
+        # Pinned and movable documents are disjoint. Reusing pinned spans
+        # avoids rebuilding hundreds of short-document objects per grid.
+        spans = sorted((*pinned_spans, *_coalesce(assignments)), key=lambda s: (s.sequence, s.token_start))
+        # Capacity repair can split an otherwise useful item into tiny pieces.
+        # Reject the whole candidate instead of silently weakening the floor.
+        # Existing short source fragments are unavoidable and remain legal.
+        if policy != "contiguous" and any(
+            span.tokens < config.min_chunk_tokens and (span.sequence, span.token_start, span.token_end) not in source_fragments
+            for span in spans
+        ):
+            return
         grouped = [[] for _ in range(world_size)]
         for span in spans:
             grouped[span.owner].append(span)
@@ -1262,7 +1318,6 @@ def plan_thd_selection(
         score = cost_model.estimate_ms(ranks, block_size=config.block_size)
         candidates.append((policy, ranks, score))
 
-    add(base, "contiguous", include_pinned=False)
     baseline_ms = candidates[0][2]
     lower_bound = baseline_ms
     # This bound allows arbitrary row movement, including short documents.
@@ -1308,14 +1363,22 @@ def plan_thd_selection(
         and _zigzag_lower_bound(boundaries, base, world_size, config.block_size, cost_model) < threshold
     ):
         zigzag = zigzag_thd_layout(boundaries, world_size=world_size, block_size=config.block_size)
-        if all(rank.local_tokens <= max_tokens_per_rank for rank in zigzag):
+        if all(rank.local_tokens <= max_tokens_per_rank for rank in zigzag) and all(
+            span.tokens >= config.min_chunk_tokens or (span.sequence, span.token_start, span.token_end) in source_fragments
+            for rank in zigzag
+            for span in rank.spans
+        ):
             candidates.append(("zigzag", zigzag, cost_model.estimate_ms(zigzag, block_size=config.block_size)))
     selected = min(candidates, key=lambda c: (c[2], c[0] != "contiguous", c[0]))
     if selected[2] >= cost_model._migration_threshold_ms(baseline_ms):
         selected = candidates[0]
     policy, ranks, score = selected
-    metrics = _metrics(
-        [span for rank in ranks for span in rank.spans], world_size=world_size, block_size=config.block_size, config=config
+    metrics = (
+        source_metrics
+        if policy == "contiguous"
+        else _metrics(
+            [span for rank in ranks for span in rank.spans], world_size=world_size, block_size=config.block_size, config=config
+        )
     )
     metrics = replace(metrics, score=score)
     return THDLayoutPlan(

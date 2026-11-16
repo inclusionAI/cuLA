@@ -1,7 +1,7 @@
 # Copyright 2025-2026 Ant Group Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU-only packed-sequence and contiguous-shard metadata helpers."""
+"""Host sequence/shard planning and explicit device index materialization."""
 
 from __future__ import annotations
 
@@ -54,6 +54,26 @@ def validate_shards(shard_offsets: Sequence[int], *, total_tokens: int, world_si
     if any(left >= right for left, right in zip(offsets, offsets[1:])):
         raise ValueError("shard_offsets must be strictly increasing; empty CP shards are unsupported")
     return offsets
+
+
+def _range_indices(ranges: Sequence[tuple[int, int]], device: torch.device) -> torch.Tensor:
+    """Materialize validated half-open ranges without a large CPU index array.
+
+    CUDA receives only O(ranges) host metadata. The known output size avoids
+    repeat_interleave's device-to-host size synchronization. This helper does
+    not synchronize streams; callers retain normal PyTorch stream ordering.
+    """
+    sizes, shifts, total = [], [], 0
+    for start, end in ranges:
+        sizes.append(end - start)
+        shifts.append(start - total)
+        total += end - start
+    if not total:
+        return torch.empty(0, dtype=torch.int64, device=device)
+    metadata = torch.tensor((sizes, shifts), dtype=torch.int64, device=device)
+    result = torch.arange(total, dtype=torch.int64, device=device)
+    result += torch.repeat_interleave(metadata[1], metadata[0], output_size=total)
+    return result
 
 
 __all__ = ["as_boundaries", "balanced_shards", "validate_shards"]

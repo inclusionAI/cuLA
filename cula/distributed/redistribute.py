@@ -5,7 +5,7 @@
 
 Only row ownership/order changes. Floating point values are neither reduced
 nor cast. The backward is the exact inverse exchange. Preparation is CPU
-metadata work plus device index allocation; execution is eager PyTorch/NCCL
+metadata work plus device index construction; execution is eager PyTorch/NCCL
 and allocates outputs. No CUDA Graph contract is implied.
 """
 
@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 from torch.autograd.function import once_differentiable
 
+from cula._metadata import _range_indices
 from cula.distributed.thd_planner import THDRankLayout
 
 
@@ -117,16 +118,12 @@ def _permutations(ranges, rows, device):
         cursor = end
     if ordered and cursor == rows:
         return None, None
-    order = (
-        torch.cat([torch.arange(a, z, dtype=torch.int64, device="cpu") for a, z in ranges])
-        if rows
-        else torch.empty(0, dtype=torch.int64, device="cpu")
-    )
+    order = _range_indices(ranges, device)
     if order.numel() != rows:
         raise ValueError("incomplete permutation")
     inverse = torch.empty_like(order)
-    inverse[order] = torch.arange(rows, device="cpu")
-    return order.to(device), inverse.to(device)
+    inverse[order] = torch.arange(rows, device=device)
+    return order, inverse
 
 
 class THDRedistributor:

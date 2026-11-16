@@ -1,5 +1,8 @@
 # cuDNN hybrid-attention runtime
 
+For downstream context-parallel indexers, the [CSA CP selection API](CSA_CP_SELECTION.md)
+combines adaptive planning, distributed selection and exact source-order restoration.
+
 cuLA's hybrid layer is a layout-aware integration boundary for composing
 cuDNN Frontend attention kernels. It is intentionally not another graph API:
 cuDNN owns the kernels and their numerical contracts; cuLA owns static packed
