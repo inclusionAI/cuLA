@@ -13,6 +13,11 @@ sparse attention, and the indexer loss remain independently composable.
 pooled keys after its normalization/position transform. Attention and KDA
 keep source ownership.
 
+The [cost-model follow-up](CSA_CP_PLANNER_COST_RESULTS.md) reports the latest
+31-case four-layer qualification, independent transport calibration, smaller-
+window regressions and preparation GC tails. Steady and preparation-inclusive
+comparisons are reported separately.
+
 ## Integration
 
 ```python

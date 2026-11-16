@@ -10,6 +10,11 @@ A training stack can prepare once at microbatch ingress and reuse the same plan
 across compatible CSA layers. More KDA or MLP layers also enlarge the denominator
 of a model-step overhead ratio, but do not count as additional CSA plan uses.
 
+The [cost-model follow-up](CSA_CP_PLANNER_COST_RESULTS.md) reports the latest
+31-case four-layer qualification, independent transport calibration, smaller-
+window regressions and preparation GC tails. Steady and preparation-inclusive
+comparisons are reported separately.
+
 ## What is reusable
 
 `CsaCPSelectionPlan` is immutable host metadata: document geometry, source and
