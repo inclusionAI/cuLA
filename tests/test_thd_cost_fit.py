@@ -75,9 +75,13 @@ def test_transport_calibration_exercises_the_declared_links(kind, world, per_nod
 
 
 @pytest.mark.parametrize("world,per_node", [(4, 2), (8, 8), (16, 8)])
-@pytest.mark.parametrize("kind", ["intra_pair", "intra", "intra_dense", "striped"])
+@pytest.mark.parametrize(
+    "kind", ["intra_pair", "intra", "intra_dense", "striped", "local_quarter", "local_half", "local_three_quarters"]
+)
 @pytest.mark.parametrize("overlap", [False, True])
-def test_transport_fit_prediction_uses_the_same_cost_model_as_planning(world, per_node, kind, overlap):
+@pytest.mark.parametrize("local", [None, 2.5])
+def test_transport_fit_prediction_uses_the_same_cost_model_as_planning(world, per_node, kind, overlap, local):
+    from benchmarks.bench_thd_transport import features
     from benchmarks.fit_thd_transport import predict
     from cula.distributed import THDSelectionCostModel
 
@@ -111,12 +115,15 @@ def test_transport_fit_prediction_uses_the_same_cost_model_as_planning(world, pe
     f = dict(
         rank_intra_rows=intra_out + intra_in,
         rank_inter_rows=inter_out + inter_in,
+        rank_local_rows=[p.send_counts[r] for r, p in enumerate(plans)] * 2,
         peer_rows=max(edge),
         node_rows=max(node_out + node_in),
         peer_degree=max(degrees_out + degrees_in),
-        copies=0,
+        copies=features(layouts, rows, per_node)["copies"],
     )
     coeff = [1, 3, 4, 2, 0.5, 0.007, 0.01]
+    if local is not None:
+        coeff.append(local)
     factor = 65536 * 20608 / 1e6
     m = THDSelectionCostModel(
         candidate_ns=0,
@@ -132,6 +139,7 @@ def test_transport_fit_prediction_uses_the_same_cost_model_as_planning(world, pe
         peer_startup_us=coeff[5] * 1000,
         exchange_us=coeff[6] * 1000,
         overlap_intra_inter=overlap,
+        local_copy_gbps=None if local is None else factor / local,
     )
     assert predict(f, coeff, overlap) == pytest.approx(m.estimate_ms(layouts, block_size=4))
 
@@ -151,6 +159,25 @@ def transport_fit_inputs(monkeypatch):
     feature = dict(rank_intra_rows=[128] * 16, rank_inter_rows=[0] * 16, peer_rows=128, node_rows=0, copies=0, peer_degree=1)
     record = dict(heldout=False, marker_exact=True, critical_median_ms=1, features=feature, kind="intra", rows=128)
     return dict(world=8, ranks_per_node=8, records=[record.copy() for _ in range(6)]), profile
+
+
+def test_transport_fit_exports_diagonal_copy_rate(transport_fit_inputs, monkeypatch):
+    from types import SimpleNamespace
+
+    import numpy as np
+    import scipy.optimize
+
+    from benchmarks.fit_thd_transport import fit
+
+    raw, profile = transport_fit_inputs
+    for record in raw["records"]:
+        record["features"] = dict(record["features"], rank_local_rows=[64] * 16)
+    coefficients = np.array([1.0, 3.0, 4.0, 2.0, 0.5, 0.007, 0.01, 2.5])
+    monkeypatch.setattr(scipy.optimize, "differential_evolution", lambda *a, **kw: SimpleNamespace(x=coefficients.copy()))
+    monkeypatch.setattr(scipy.optimize, "least_squares", lambda *a, **kw: SimpleNamespace(x=coefficients.copy()))
+    result = fit(raw, profile)
+    assert result["schema_version"] == 6
+    assert result["model"]["local_copy_gbps"] == pytest.approx(65536 * 20608 / 1e6 / 2.5)
 
 
 @pytest.mark.parametrize("world,per_node", [(8, 4), (16, 8), (8, 8), (4, 1)])

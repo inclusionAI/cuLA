@@ -112,6 +112,13 @@ The critical transfer term takes the maximum of:
 - the busiest aggregated peer edge, if `peer_gbps` is supplied;
 - shared node injection/receive time, if `inter_node_aggregate_gbps` is supplied.
 
+When `local_copy_gbps` is supplied, rows retained on their source rank also
+consume the local per-rank transfer resource. A nonidentity eager all-to-all
+still copies its diagonal, including ranks whose ownership is unchanged.
+These bytes do not cross a network link and do not add remote peer startups.
+Omitting the coefficient preserves older profiles. A global identity layout
+still bypasses the collective entirely.
+
 Add the busiest rank's nonempty peer count times `peer_startup_us`, actual
 permutation-copy work times `packing_ns_per_query`, and `exchange_us`. Multiple
 fragments on one edge do not pay multiple peer startups. Naturally ordered
@@ -191,12 +198,16 @@ so KDA/selection arrival waits are not counted again as network work.
 
 `benchmarks/bench_thd_transport.py` measures the actual Q/weight and inverse
 ID/score exchanges with exact marker checks. Sparse peer pairs, node-local,
-inter-node and dense exchanges exercise different message sizes. The 32768-row
-and striped fixtures are held out. `--validation-only` measures additional
+inter-node and dense exchanges exercise different message sizes. Local-retention
+fixtures keep one quarter, one half or three quarters of each source shard and
+move the remainder to a neighboring rank. This separates diagonal copies from
+remote traffic. The 32768-row, striped and half-local fixtures are held out.
+`--validation-only` measures additional
 mixed-link fractions. `benchmarks/fit_thd_transport.py` fits nonnegative resource
-costs without using held-out rows in its objective. Ordered fixtures do not
-identify copy bandwidth: measure permutation copies separately and supply that
-coefficient in the input profile. Unidentifiable node limits must not be
+costs without using held-out rows in its objective. For older sweeps containing
+only ordered fixtures, permutation bandwidth comes from the input profile;
+new locality fixtures also exercise packing. Sweeps without diagonal features
+retain the older model. Unidentifiable node limits must not be
 interpreted as measured physical bandwidth.
 
 The [example profiles](../benchmarks/profiles/README.md) are optional deployment

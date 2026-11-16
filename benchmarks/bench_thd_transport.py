@@ -26,6 +26,16 @@ def transport_layout(world, rows, ranks_per_node, kind):
         raise ValueError("need complete nodes and row counts divisible by CP")
     assignments = [[] for _ in range(world)]
     for source in range(world):
+        if kind in ("local_quarter", "local_half", "local_three_quarters"):
+            if ranks_per_node < 2 or rows % 16:
+                raise ValueError("locality fixtures need multiple local ranks and 16-row alignment")
+            fraction = {"local_quarter": 1, "local_half": 2, "local_three_quarters": 3}[kind]
+            peer = source // ranks_per_node * ranks_per_node + (source + 1) % ranks_per_node
+            cursor = source * rows
+            for rank, count in ((source, rows // 4 * fraction), (peer, rows // 4 * (4 - fraction))):
+                assignments[rank].append(THDSpan(0, cursor, cursor + count, 0, world * rows, rank))
+                cursor += count
+            continue
         if kind in ("mixed_dense_quarter", "mixed_dense_three_quarters"):
             if ranks_per_node == world or rows % (4 * ranks_per_node):
                 raise ValueError("mixed validation needs multiple nodes and quarter-node aligned rows")
@@ -110,6 +120,7 @@ def features(layouts, rows, rpn):
     return dict(
         rank_intra_rows=intra_out + intra_in,
         rank_inter_rows=inter_out + inter_in,
+        rank_local_rows=[p.send_counts[r] for r, p in enumerate(plans)] * 2,
         peer_rows=max(edges.values(), default=0),
         node_rows=max(node_out + node_in),
         peer_degree=max(degree_out + degree_in),
@@ -138,7 +149,11 @@ def main():
     world, rank = dist.get_world_size(), dist.get_rank()
     if world < 2 or world % args.ranks_per_node:
         raise ValueError("require CP >= 2 and complete nodes")
-    kinds = ["intra_pair", "intra", "intra_dense"] if args.ranks_per_node > 1 else []
+    kinds = (
+        ["intra_pair", "intra", "intra_dense", "local_quarter", "local_half", "local_three_quarters"]
+        if args.ranks_per_node > 1
+        else []
+    )
     kinds += (["inter_pair", "inter", "inter_dense"] if world > args.ranks_per_node else []) + ["striped"]
     sizes = args.rows_per_rank
     if args.validation_only:
@@ -185,7 +200,7 @@ def main():
                 samples_ms=gathered,
                 critical_median_ms=statistics.median(max(s[i] for s in gathered) for i in range(args.repeats)),
                 marker_exact=True,
-                heldout=args.validation_only or rows == 32768 or kind == "striped",
+                heldout=args.validation_only or rows == 32768 or kind in ("striped", "local_half"),
             )
             results.append(record)
             if rank == 0:

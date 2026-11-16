@@ -137,6 +137,9 @@ class THDSelectionCostModel:
     peer count, summed over the ordered forward/return collectives. Calibrate
     these independently of kernel arrival waits; they are effective costs,
     not physical-link specifications. Unspecified limits preserve old profiles.
+    ``local_copy_gbps`` prices the diagonal of the eager all-to-all: a globally
+    nonidentity exchange still copies rows retained by the same rank. This
+    shares the local transfer resource; it is absent for an identity layout.
     """
 
     candidate_ns: float
@@ -154,6 +157,7 @@ class THDSelectionCostModel:
     peer_startup_us: float = 0.0
     inter_node_aggregate_gbps: float | None = None
     overlap_intra_inter: bool = False
+    local_copy_gbps: float | None = None
 
     def __post_init__(self):
         if not isinstance(self.overlap_intra_inter, bool):
@@ -177,7 +181,7 @@ class THDSelectionCostModel:
                 raise ValueError(f"{name} must be finite and positive")
         if self.min_gain_fraction >= 1:
             raise ValueError("min_gain_fraction must be below one")
-        for name in ("peer_gbps", "inter_node_aggregate_gbps"):
+        for name in ("peer_gbps", "inter_node_aggregate_gbps", "local_copy_gbps"):
             value = getattr(self, name)
             if value is not None and (
                 isinstance(value, bool) or not isinstance(value, int | float) or not isfinite(value) or value <= 0
@@ -206,6 +210,7 @@ class THDSelectionCostModel:
         offsets = tuple(x * block_size for x in balanced_shards(total // block_size, world))
         compute, incoming, outgoing = [0.0] * world, [0.0] * world, [0.0] * world
         intra_in, intra_out, inter_in, inter_out = ([0.0] * world for _ in range(4))
+        local_rows = [0] * world
         peer_rows = defaultdict(int)
         source_cursor = list(offsets[:-1])
         send_ordered, receive_ordered = [True] * world, [True] * world
@@ -226,6 +231,7 @@ class THDSelectionCostModel:
                 # Pinned source spans are common in mixed packs. Their exact
                 # one-source intersection needs neither a bisect nor a walk.
                 if offsets[rank] <= start and end <= offsets[rank + 1]:
+                    local_rows[rank] += tokens
                     send_ordered[rank] &= start == source_cursor[rank]
                     source_cursor[rank] += tokens
                     receive_ordered[rank] &= rank >= last_source
@@ -249,9 +255,18 @@ class THDSelectionCostModel:
                         (intra_out if local else inter_out)[source] += cost
                         (intra_in if local else inter_in)[rank] += cost
                         peer_rows[source, rank] += rows
+                    else:
+                        local_rows[rank] += rows
             identity &= cursor == offsets[rank + 1]
         if identity:
             return max(compute)
+        if self.local_copy_gbps is not None:
+            for rank, rows in enumerate(local_rows):
+                cost = rows * self.bytes_per_query / (self.local_copy_gbps * 1e6)
+                incoming[rank] += cost
+                outgoing[rank] += cost
+                intra_in[rank] += cost
+                intra_out[rank] += cost
         # Execution has ordered exchange/compute/return phases. Model their
         # critical durations separately rather than assuming unmeasured overlap.
         transfer = max(*incoming, *outgoing)

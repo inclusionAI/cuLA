@@ -516,6 +516,54 @@ def test_source_local_spans_still_price_local_reordering():
     assert model.estimate_ms(reordered, block_size=4) == pytest.approx(0.032 + 0.010)
 
 
+def test_diagonal_copy_is_charged_only_when_collective_executes():
+    from dataclasses import replace
+
+    from benchmarks.cp_layouts import query_layouts
+
+    layouts, _ = query_layouts(_boundaries([16] * 8), 4, "contiguous")
+    model = _cost_model(
+        candidate_ns=0,
+        query_ns=0,
+        span_us=0,
+        packing_ns_per_query=0,
+        exchange_us=0,
+        bytes_per_query=1000,
+        local_copy_gbps=1,
+    )
+    assert model.estimate_ms(layouts, block_size=4) == 0
+    # Only one rank changes local order. Every rank still enters all-to-all
+    # and copies its diagonal; none of these rows crosses a network link.
+    reordered = (THDRankLayout(0, layouts[0].spans[::-1]), *layouts[1:])
+    assert model.estimate_ms(reordered, block_size=4) == pytest.approx(0.032)
+    assert replace(model, local_copy_gbps=None).estimate_ms(reordered, block_size=4) == 0
+
+
+@pytest.mark.parametrize("value", [0, -1, True, float("nan"), float("inf")])
+def test_local_copy_bandwidth_must_be_positive(value):
+    with pytest.raises(ValueError, match="local_copy_gbps"):
+        _cost_model(local_copy_gbps=value)
+
+
+def test_diagonal_copy_intersects_a_span_crossing_source_shards():
+    ranks = (THDRankLayout(0, (THDSpan(0, 0, 128, 0, 128, 0),)), *(THDRankLayout(r, ()) for r in range(1, 4)))
+    model = _cost_model(
+        candidate_ns=0,
+        query_ns=0,
+        span_us=0,
+        packing_ns_per_query=0,
+        exchange_us=0,
+        bytes_per_query=1000,
+        intra_node_gbps=100,
+        inter_node_gbps=100,
+        local_copy_gbps=1,
+    )
+    # The receiver retains 32 rows and receives 96 remote rows. The span
+    # straddles all four source shards, so both diagonal and off-diagonal
+    # intersections must contribute exactly once.
+    assert model.estimate_ms(ranks, block_size=4) == pytest.approx(0.032 + 0.00096)
+
+
 def test_equal_placement_bound_keeps_the_full_locality_tie_break():
     from cula.distributed.thd_planner import _make_item, _selection_assign
 

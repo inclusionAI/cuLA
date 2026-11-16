@@ -1,12 +1,12 @@
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "model": {
     "candidate_ns": 0.01381271460590644,
     "query_ns": 0.0,
     "span_us": 9.547858289905301,
     "bytes_per_query": 20608,
-    "intra_node_gbps": 651.5586637992105,
-    "inter_node_gbps": 651.5586637992105,
+    "intra_node_gbps": 661.3111749180831,
+    "inter_node_gbps": 661.3111749180831,
     "rank_node_ids": [
       0,
       0,
@@ -17,14 +17,15 @@
       0,
       0
     ],
-    "packing_ns_per_query": 8.499999694322469,
-    "exchange_us": 181.36905458868262,
+    "packing_ns_per_query": 28.482437529561206,
+    "exchange_us": 185.84198535775175,
     "min_gain_fraction": 0.05,
     "min_gain_ms": 20,
     "overlap_intra_inter": false,
-    "peer_gbps": 408.72149682964135,
+    "peer_gbps": 407.8016423963969,
     "inter_node_aggregate_gbps": null,
-    "peer_startup_us": 7.460149512894069e-21
+    "peer_startup_us": 2.0219781415624504e-17,
+    "local_copy_gbps": 3594.331337476197
   },
   "calibration": {
     "sources": [
@@ -498,149 +499,302 @@
   "transport_calibration": {
     "method": "Nonnegative max-resource fit; independent eager transport timings",
     "coefficients_ms_per_65536_rows": [
-      2.0728231593528488,
-      5.25403206689115,
-      3.3043671509231323,
-      8.017647329379857,
-      0.5570559799671173,
-      7.460149512894069e-24,
-      0.1813690545886826
+      2.0422547496907115,
+      3.3698542514013305,
+      3.311820619611935,
+      6.112187418374655,
+      1.8666250259373232,
+      2.0219781415624504e-20,
+      0.18584198535775176,
+      0.37574885596059604
     ],
     "predictions": [
       {
         "kind": "intra_pair",
         "rows": 256,
         "heldout": false,
-        "actual_ms": 0.17163199931383133,
-        "predicted_ms": 0.1942767387719761,
-        "relative_error": 0.13193774790642965
+        "actual_ms": 0.17182400077581406,
+        "predicted_ms": 0.19877878465311088,
+        "relative_error": 0.15687438166723777
       },
       {
         "kind": "intra",
         "rows": 256,
         "heldout": false,
-        "actual_ms": 0.17878399789333344,
-        "predicted_ms": 0.1942767387719761,
-        "relative_error": 0.08665619440888661
+        "actual_ms": 0.16539199650287628,
+        "predicted_ms": 0.19877878465311088,
+        "relative_error": 0.2018645935485397
       },
       {
         "kind": "intra_dense",
         "rows": 256,
         "heldout": false,
-        "actual_ms": 0.1780639961361885,
-        "predicted_ms": 0.1884538993716269,
-        "relative_error": 0.05834926465141166
+        "actual_ms": 0.16688000410795212,
+        "predicted_ms": 0.1930058193928082,
+        "relative_error": 0.15655449809286726
+      },
+      {
+        "kind": "local_quarter",
+        "rows": 256,
+        "heldout": false,
+        "actual_ms": 0.1921439990401268,
+        "predicted_ms": 0.20283608883683876,
+        "relative_error": 0.055646233294431635
+      },
+      {
+        "kind": "local_half",
+        "rows": 256,
+        "heldout": true,
+        "actual_ms": 0.19073600322008133,
+        "predicted_ms": 0.199601889012999,
+        "relative_error": 0.04648249750042077
+      },
+      {
+        "kind": "local_three_quarters",
+        "rows": 256,
+        "heldout": false,
+        "actual_ms": 0.1905279979109764,
+        "predicted_ms": 0.1963676891891592,
+        "relative_error": 0.030650042734986283
       },
       {
         "kind": "striped",
         "rows": 256,
         "heldout": true,
-        "actual_ms": 0.18012800067663193,
-        "predicted_ms": 0.1884538993716269,
-        "relative_error": 0.04622212351061261
+        "actual_ms": 0.1684959977865219,
+        "predicted_ms": 0.1930058193928082,
+        "relative_error": 0.1454623369591206
       },
       {
         "kind": "intra_pair",
         "rows": 4096,
         "heldout": false,
-        "actual_ms": 0.6821600198745728,
-        "predicted_ms": 0.38789200152137837,
-        "relative_error": -0.431376817432515
+        "actual_ms": 0.6829280257225037,
+        "predicted_ms": 0.3928307740834977,
+        "relative_error": -0.4247845171269661
       },
       {
         "kind": "intra",
         "rows": 4096,
         "heldout": false,
-        "actual_ms": 1.0989919900894165,
-        "predicted_ms": 0.38789200152137837,
-        "relative_error": -0.6470474716655409
+        "actual_ms": 1.062880039215088,
+        "predicted_ms": 0.3928307740834977,
+        "relative_error": -0.6304091152435283
       },
       {
         "kind": "intra_dense",
         "rows": 4096,
         "heldout": false,
-        "actual_ms": 0.2651199996471405,
-        "predicted_ms": 0.29472657111579154,
-        "relative_error": 0.11167234274311899
+        "actual_ms": 0.26446399092674255,
+        "predicted_ms": 0.3004633299186547,
+        "relative_error": 0.13612189268475539
+      },
+      {
+        "kind": "local_quarter",
+        "rows": 4096,
+        "heldout": false,
+        "actual_ms": 0.8428319990634918,
+        "predicted_ms": 0.4577476410231439,
+        "relative_error": -0.4568933766969364
+      },
+      {
+        "kind": "local_half",
+        "rows": 4096,
+        "heldout": true,
+        "actual_ms": 0.6092159748077393,
+        "predicted_ms": 0.4060004438417074,
+        "relative_error": -0.3335689465959327
+      },
+      {
+        "kind": "local_three_quarters",
+        "rows": 4096,
+        "heldout": false,
+        "actual_ms": 0.4381759911775589,
+        "predicted_ms": 0.3542532466602709,
+        "relative_error": -0.19152748258012287
       },
       {
         "kind": "striped",
         "rows": 4096,
         "heldout": true,
-        "actual_ms": 0.26867200434207916,
-        "predicted_ms": 0.29472657111579154,
-        "relative_error": 0.09697536904715665
+        "actual_ms": 0.26395200192928314,
+        "predicted_ms": 0.3004633299186547,
+        "relative_error": 0.13832563391261377
       },
       {
         "kind": "intra_pair",
         "rows": 32768,
         "heldout": true,
-        "actual_ms": 2.0732479095458984,
-        "predicted_ms": 1.8335526300502487,
-        "relative_error": -0.11561341911501066
+        "actual_ms": 2.088207960128784,
+        "predicted_ms": 1.8417522951637193,
+        "relative_error": -0.11802256751758833
       },
       {
         "kind": "intra",
         "rows": 32768,
         "heldout": true,
-        "actual_ms": 2.6429920196533203,
-        "predicted_ms": 1.8335526300502487,
-        "relative_error": -0.3062587338834437
+        "actual_ms": 2.6548320055007935,
+        "predicted_ms": 1.8417522951637193,
+        "relative_error": -0.30626409077952155
       },
       {
         "kind": "intra_dense",
         "rows": 32768,
         "heldout": true,
-        "actual_ms": 1.1571199893951416,
-        "predicted_ms": 1.088229186805554,
-        "relative_error": -0.05953643807121389
+        "actual_ms": 1.1564000248908997,
+        "predicted_ms": 1.1028127418449754,
+        "relative_error": -0.046339745669739196
+      },
+      {
+        "kind": "local_quarter",
+        "rows": 32768,
+        "heldout": true,
+        "actual_ms": 2.7473599910736084,
+        "predicted_ms": 2.361087230680889,
+        "relative_error": -0.14059779630181357
+      },
+      {
+        "kind": "local_half",
+        "rows": 32768,
+        "heldout": true,
+        "actual_ms": 2.0850560665130615,
+        "predicted_ms": 1.947109653229397,
+        "relative_error": -0.06615957023849195
+      },
+      {
+        "kind": "local_three_quarters",
+        "rows": 32768,
+        "heldout": true,
+        "actual_ms": 2.3883520364761353,
+        "predicted_ms": 1.5331320757779052,
+        "relative_error": -0.35807952413918587
       },
       {
         "kind": "striped",
         "rows": 32768,
         "heldout": true,
-        "actual_ms": 1.1546720266342163,
-        "predicted_ms": 1.088229186805554,
-        "relative_error": -0.05754260802726663
+        "actual_ms": 1.1548159718513489,
+        "predicted_ms": 1.1028127418449754,
+        "relative_error": -0.04503161652934562
+      },
+      {
+        "kind": "intra_pair",
+        "rows": 65536,
+        "heldout": false,
+        "actual_ms": 3.172096014022827,
+        "predicted_ms": 3.497662604969687,
+        "relative_error": 0.10263453234316788
+      },
+      {
+        "kind": "intra",
+        "rows": 65536,
+        "heldout": false,
+        "actual_ms": 3.9223999977111816,
+        "predicted_ms": 3.497662604969687,
+        "relative_error": -0.10828507877558124
+      },
+      {
+        "kind": "intra_dense",
+        "rows": 65536,
+        "heldout": false,
+        "actual_ms": 2.0764319896698,
+        "predicted_ms": 2.019783498332199,
+        "relative_error": -0.027281650263252466
+      },
+      {
+        "kind": "local_quarter",
+        "rows": 65536,
+        "heldout": false,
+        "actual_ms": 4.722239971160889,
+        "predicted_ms": 4.536332476004026,
+        "relative_error": -0.03936849806282927
+      },
+      {
+        "kind": "local_half",
+        "rows": 65536,
+        "heldout": true,
+        "actual_ms": 3.8864001035690308,
+        "predicted_ms": 3.7083773211010422,
+        "relative_error": -0.045806601925649226
+      },
+      {
+        "kind": "local_three_quarters",
+        "rows": 65536,
+        "heldout": false,
+        "actual_ms": 3.120784044265747,
+        "predicted_ms": 2.8804221661980587,
+        "relative_error": -0.07701970872010155
+      },
+      {
+        "kind": "striped",
+        "rows": 65536,
+        "heldout": true,
+        "actual_ms": 2.0796959400177,
+        "predicted_ms": 2.019783498332199,
+        "relative_error": -0.028808269772835793
       },
       {
         "kind": "intra_pair",
         "rows": 131072,
         "heldout": false,
-        "actual_ms": 6.2092320919036865,
-        "predicted_ms": 6.790103356434948,
-        "relative_error": 0.09354961385461302
+        "actual_ms": 6.242736101150513,
+        "predicted_ms": 6.809483224581622,
+        "relative_error": 0.09078505229888867
       },
       {
         "kind": "intra",
         "rows": 131072,
         "heldout": false,
-        "actual_ms": 6.001280069351196,
-        "predicted_ms": 6.790103356434948,
-        "relative_error": 0.1314425052602206
+        "actual_ms": 6.007472038269043,
+        "predicted_ms": 6.809483224581622,
+        "relative_error": 0.13350227536700543
       },
       {
         "kind": "intra_dense",
         "rows": 131072,
         "heldout": false,
-        "actual_ms": 4.027600049972534,
-        "predicted_ms": 3.808809583456168,
-        "relative_error": -0.05432278870834217
+        "actual_ms": 4.020752191543579,
+        "predicted_ms": 3.853725011306646,
+        "relative_error": -0.041541276925303516
+      },
+      {
+        "kind": "local_quarter",
+        "rows": 131072,
+        "heldout": false,
+        "actual_ms": 7.957855939865112,
+        "predicted_ms": 8.8868229666503,
+        "relative_error": 0.11673584364998368
+      },
+      {
+        "kind": "local_half",
+        "rows": 131072,
+        "heldout": true,
+        "actual_ms": 6.951023817062378,
+        "predicted_ms": 7.230912656844333,
+        "relative_error": 0.04026584387395182
+      },
+      {
+        "kind": "local_three_quarters",
+        "rows": 131072,
+        "heldout": false,
+        "actual_ms": 4.83022403717041,
+        "predicted_ms": 5.575002347038366,
+        "relative_error": 0.15419125575472337
       },
       {
         "kind": "striped",
         "rows": 131072,
         "heldout": true,
-        "actual_ms": 4.0313920974731445,
-        "predicted_ms": 3.808809583456168,
-        "relative_error": -0.05521232086466865
+        "actual_ms": 4.031296014785767,
+        "predicted_ms": 3.853725011306646,
+        "relative_error": -0.044048118229927824
       }
     ],
     "ranks_per_node": 8,
     "world_size": 8,
-    "heldout_rule": "32768 rows or striped layout; never used in fitting",
+    "heldout_rule": "32768 rows, striped or local_half layout; never used in fitting",
     "note": "Effective coefficients include eager implementation costs; not physical bandwidth or universal optimality guarantees.",
-    "source_sha256": "a965b310b107366576791580b49e74f6b987ffd4307107518666fd444c061f11"
+    "source_sha256": "2affd7243a2ce7bfa7d4bfc7f56405283be68ab786ec710ce9c6581c5fb10d5a"
   },
   "cudnn_source": "855ccd77ba9efed22441fd454f7cc0206a068e94"
 }

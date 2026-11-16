@@ -17,10 +17,20 @@ import numpy as np
 
 def predict(features, coefficients, overlap_links=False):
     """Same ordered-phase resource model used by THDSelectionCostModel."""
-    intra, inter, peer, node, packing, startup, fixed = coefficients
+    if len(coefficients) not in (7, 8):
+        raise ValueError("transport prediction requires seven legacy or eight diagonal-aware coefficients")
+    intra, inter, peer, node, packing, startup, fixed = coefficients[:7]
+    local = coefficients[7] if len(coefficients) == 8 else 0.0
     unit = 65536
     combine = max if overlap_links else lambda a, b: a + b
-    rank = max(combine(a * intra, b * inter) for a, b in zip(features["rank_intra_rows"], features["rank_inter_rows"])) / unit
+    local_rows = features.get("rank_local_rows", [0] * len(features["rank_intra_rows"]))
+    rank = (
+        max(
+            combine(a * intra + c * local, b * inter)
+            for a, b, c in zip(features["rank_intra_rows"], features["rank_inter_rows"], local_rows)
+        )
+        / unit
+    )
     transfer = max(rank, features["peer_rows"] * peer / unit, features["node_rows"] * node / unit)
     return transfer + features["copies"] * packing / unit + features["peer_degree"] * startup + fixed
 
@@ -56,6 +66,11 @@ def fit(raw, profile, *, overlap_links=False):
     scale = max(y)
     startup_limit = min(r["critical_median_ms"] / max(r["features"]["peer_degree"], 1) for r in rows)
     bounds = [(0, 2 * scale)] * 5 + [(0, startup_limit), (0, min(y))]
+    fit_local = all("rank_local_rows" in r["features"] for r in rows) and any(
+        any(r["features"]["rank_local_rows"]) for r in rows
+    )
+    if fit_local:
+        bounds.append((0, 2 * scale))
     initialized = differential_evolution(
         lambda x: np.sum(residual(x) ** 2), bounds, seed=1, popsize=10, maxiter=300, tol=1e-8, polish=False
     )
@@ -83,6 +98,7 @@ def fit(raw, profile, *, overlap_links=False):
         packing_ns_per_query=x[4] * 1e6 / 65536,
         peer_startup_us=x[5] * 1000,
         exchange_us=x[6] * 1000,
+        local_copy_gbps=factor / max(x[7], 1e-10) if fit_local else None,
     )
     predictions = [
         dict(
@@ -97,7 +113,7 @@ def fit(raw, profile, *, overlap_links=False):
     ]
     return dict(
         profile,
-        schema_version=5,
+        schema_version=6 if fit_local else 5,
         model=model,
         transport_calibration=dict(
             method="Nonnegative max-resource fit; independent eager transport timings",
@@ -105,7 +121,7 @@ def fit(raw, profile, *, overlap_links=False):
             predictions=predictions,
             ranks_per_node=raw["ranks_per_node"],
             world_size=raw["world"],
-            heldout_rule="32768 rows or striped layout; never used in fitting",
+            heldout_rule="32768 rows, striped or local_half layout; never used in fitting",
             note="Effective coefficients include eager implementation costs; not physical bandwidth or universal optimality guarantees.",
         ),
     )
