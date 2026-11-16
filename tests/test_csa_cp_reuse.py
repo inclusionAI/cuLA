@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from benchmarks.bench_csa_cp_reuse import POLICIES, clone_holder, compare_cpu_actual, summarize
+from benchmarks.bench_csa_cp_reuse import POLICIES, clone_holder, compare_tensors, summarize
 from benchmarks.bench_full_csa_cp import FullCSA
 
 
@@ -85,7 +85,7 @@ def test_accounting_uses_critical_rank_and_charges_preparation_once():
         assert value["prepare_fraction"] == pytest.approx(1 / 3)
 
 
-def test_cpu_actual_error_uses_contiguous_reference_norm():
-    error = compare_cpu_actual(torch.tensor([2.0, 4.0]), torch.tensor([1.0, 2.0]))
+def test_tensor_error_uses_contiguous_reference_norm():
+    error = compare_tensors(torch.tensor([2.0, 4.0]), torch.tensor([1.0, 2.0]))
     assert error["relative_rms"] == 1.0 and error["max_abs"] == 2.0 and error["finite"]
-    assert not compare_cpu_actual(torch.tensor([float("nan")]), torch.ones(1))["finite"]
+    assert not compare_tensors(torch.tensor([float("nan")]), torch.ones(1))["finite"]

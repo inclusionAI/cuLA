@@ -95,11 +95,11 @@ def iteration(layers):
     )
 
 
-def compare_cpu_actual(actual, reference):
-    """Bounded GPU temporary storage; normalize by the contiguous reference."""
-    if actual.shape != reference.shape or actual.dtype != reference.dtype or actual.device.type != "cpu":
+def compare_tensors(actual, reference):
+    """Chunked full-tensor FP64 statistics, normalized by the contiguous reference."""
+    if actual.shape != reference.shape or actual.dtype != reference.dtype:
         raise ValueError("mismatched full-tensor numerical reference")
-    actual, reference = actual.reshape(-1), reference.detach().reshape(-1)
+    actual, reference = actual.detach().reshape(-1), reference.detach().reshape(-1)
     stats = torch.zeros(3, device=reference.device, dtype=torch.float64)
     finite = torch.ones((), device=reference.device, dtype=torch.bool)
     for start in range(0, reference.numel(), 1 << 22):
@@ -117,8 +117,9 @@ def qualify(layers, baseline, small):
     results = [None] * len(layers)
 
     def inspect(i, layer):
-        # One layer of CPU reference at a time bounds host memory for 1M packs.
-        actual = {k: v.detach().cpu() for k, v in tensors(layer).items()}
+        # Retain one layer on device while evaluating its independent reference.
+        # This avoids host staging without sampling or changing error precision.
+        actual = {k: v.detach() for k, v in tensors(layer).items()}
         actual_loss = layer.last["loss"].detach().clone()
         oracle = check_reference(layer) if small else None
         release(layer)
@@ -126,7 +127,7 @@ def qualify(layers, baseline, small):
         reference.use_prepared_layout(baseline)
         reference.forward()
         reference.backward()
-        errors = {k: compare_cpu_actual(actual[k], value) for k, value in tensors(reference).items()}
+        errors = {k: compare_tensors(actual[k], value) for k, value in tensors(reference).items()}
         loss_pair = torch.stack((actual_loss, reference.last["loss"].detach()))
         dist.all_reduce(loss_pair)
         loss, ref_loss = loss_pair.cpu().tolist()
