@@ -214,13 +214,23 @@ class THDSelectionCostModel:
             cursor = offsets[rank]
             last_source = -1
             for span in layout.spans:
+                start, end = span.token_start, span.token_end
+                tokens = end - start
                 compute[rank] += (
-                    self.candidate_ns * _candidate_work(span.causal_offset, span.tokens, block_size) / 1e6
-                    + self.query_ns * span.tokens / 1e6
+                    self.candidate_ns * _candidate_work(start - span.sequence_start, tokens, block_size) / 1e6
+                    + self.query_ns * tokens / 1e6
                     + self.span_us / 1e3
                 )
-                identity &= span.token_start == cursor
-                cursor += span.tokens
+                identity &= start == cursor
+                cursor += tokens
+                # Pinned source spans are common in mixed packs. Their exact
+                # one-source intersection needs neither a bisect nor a walk.
+                if offsets[rank] <= start and end <= offsets[rank + 1]:
+                    send_ordered[rank] &= start == source_cursor[rank]
+                    source_cursor[rank] += tokens
+                    receive_ordered[rank] &= rank >= last_source
+                    last_source = rank
+                    continue
                 for source, rows in _source_intersections(span, offsets):
                     send_ordered[source] &= max(offsets[source], span.token_start) == source_cursor[source]
                     source_cursor[source] += rows
@@ -419,9 +429,8 @@ def _adaptive_items(
     target_blocks = max(1, ceil(total_blocks / requested_grid))
     min_split_blocks = config.min_split_tokens // block_size
     result = []
-    for sequence, (sequence_start, sequence_end) in enumerate(zip(boundaries, boundaries[1:])):
-        if sequences is not None and sequence not in sequences:
-            continue
+    for sequence in range(len(boundaries) - 1) if sequences is None else sorted(sequences):
+        sequence_start, sequence_end = boundaries[sequence : sequence + 2]
         length_blocks = (sequence_end - sequence_start) // block_size
         pieces = min(requested_grid, max(1, ceil(length_blocks / target_blocks)))
         # A sequence shorter than two useful spans stays whole.  This is what
@@ -964,7 +973,7 @@ def plan_thd_layout(
     )
 
 
-def _selection_assign(items, pinned, *, world, capacity, offsets, model, block_size):
+def _selection_assign(items, *, pinned_loads, pinned_compute, world, capacity, offsets, model, block_size):
     """Keep cheap source spans local; place long-span work under a row cap.
 
     Unlike a shared KDA/CSA layout, selection ownership need not have equal
@@ -972,7 +981,8 @@ def _selection_assign(items, pinned, *, world, capacity, offsets, model, block_s
     scores ordered compute/transport phases using the same calibrated units
     as final candidate selection, with stable load/locality tie breaks.
     """
-    loads, compute = [0] * world, [0.0] * world
+    # Copy the small per-rank state; all grids share the same pinned spans.
+    loads, compute = list(pinned_loads), list(pinned_compute)
     incoming, outgoing = [0.0] * world, [0.0] * world
     intra_in, intra_out, inter_in, inter_out = ([0.0] * world for _ in range(4))
     peer_rows = [[0] * world for _ in range(world)]
@@ -986,9 +996,6 @@ def _selection_assign(items, pinned, *, world, capacity, offsets, model, block_s
     def work(item):
         return model.candidate_ns * item.causal_work / 1e6 + model.query_ns * item.tokens / 1e6 + model.span_us / 1e3
 
-    for item, owner in pinned:
-        loads[owner] += item.tokens
-        compute[owner] += work(item)
     for original in sorted(items, key=lambda item: (-work(item), -item.tokens, item.sequence, item.token_start)):
         item = original
         while item is not None:
@@ -1220,6 +1227,29 @@ def _zigzag_lower_bound(boundaries, source, world, block_size, model):
     return compute + transfer
 
 
+def _zigzag_meets_floor(boundaries, world, block_size, floor, source_fragments):
+    """Check grain feasibility before pricing or materializing full zigzag.
+
+    Whole documents with sufficiently large pieces need no piece walk. For
+    finer pieces, retain exactly the same original-source-fragment exception
+    used by the other candidates. This rejects no otherwise legal layout.
+    """
+    if not floor:
+        return True
+    for sequence, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+        blocks = (end - start) // block_size
+        base, remainder = divmod(blocks, 2 * world)
+        if max(1, base) * block_size >= floor:
+            continue
+        left = start
+        for piece in range(min(blocks, 2 * world)):
+            right = left + (base + (piece < remainder)) * block_size
+            if right - left < floor and (sequence, left, right) not in source_fragments:
+                return False
+            left = right
+    return True
+
+
 def _source_selection_candidate(source, world, model):
     """Price known identity ownership without reconstructing its transport.
 
@@ -1330,29 +1360,42 @@ def plan_thd_selection(
         ) / world_size
         lower_bound = _transfer_lower_bound(base, world_size, config.block_size, cost_model, lower_bound, baseline_ms)
     if movable and lower_bound < cost_model._migration_threshold_ms(baseline_ms):
-        pinned_spans = _coalesce(pinned)
-        add(
-            _paired_selection_items(boundaries, movable, world_size, config.block_size, offsets, cost_model),
-            "selection-paired-local",
-        )
-        seen = set()
-        for grid in range(1, config.max_chunks_per_rank + 1):
-            items = tuple(_adaptive_items(boundaries, world_size, config, chunks_per_rank=grid, sequences=movable))
-            if items in seen:
-                continue
-            seen.add(items)
-            add(
-                _selection_assign(
-                    items,
-                    pinned,
-                    world=world_size,
-                    capacity=max_tokens_per_rank,
-                    offsets=offsets,
-                    model=cost_model,
-                    block_size=config.block_size,
-                ),
-                f"selection-local-{grid}x",
+        pinned_loads, pinned_compute = [0] * world_size, [0.0] * world_size
+        for item, owner in pinned:
+            pinned_loads[owner] += item.tokens
+            pinned_compute[owner] += (
+                cost_model.candidate_ns * item.causal_work / 1e6
+                + cost_model.query_ns * item.tokens / 1e6
+                + cost_model.span_us / 1e3
             )
+        # These source-local spans remain in every long-document candidate.
+        # Nonnegative work and transport cannot reduce their critical compute
+        # time. This bound applies only to the pinned family, not full zigzag.
+        if max(pinned_compute) < cost_model._migration_threshold_ms(baseline_ms):
+            pinned_spans = _coalesce(pinned)
+            add(
+                _paired_selection_items(boundaries, movable, world_size, config.block_size, offsets, cost_model),
+                "selection-paired-local",
+            )
+            seen = set()
+            for grid in range(1, config.max_chunks_per_rank + 1):
+                items = tuple(_adaptive_items(boundaries, world_size, config, chunks_per_rank=grid, sequences=movable))
+                if items in seen:
+                    continue
+                seen.add(items)
+                add(
+                    _selection_assign(
+                        items,
+                        pinned_loads=pinned_loads,
+                        pinned_compute=pinned_compute,
+                        world=world_size,
+                        capacity=max_tokens_per_rank,
+                        offsets=offsets,
+                        model=cost_model,
+                        block_size=config.block_size,
+                    ),
+                    f"selection-local-{grid}x",
+                )
     # Score the cheap local candidates first. They tighten the incumbent,
     # allowing an admissible bound to reject a fragmented full zigzag without
     # allocating O(documents * CP) span objects. No candidate-specific heuristic
@@ -1360,6 +1403,7 @@ def plan_thd_selection(
     threshold = min(cost_model._migration_threshold_ms(baseline_ms), min(c[2] for c in candidates))
     if (
         lower_bound < threshold
+        and _zigzag_meets_floor(boundaries, world_size, config.block_size, config.min_chunk_tokens, source_fragments)
         and _zigzag_lower_bound(boundaries, base, world_size, config.block_size, cost_model) < threshold
     ):
         zigzag = zigzag_thd_layout(boundaries, world_size=world_size, block_size=config.block_size)

@@ -66,6 +66,36 @@ def test_selection_plan_splits_one_sequence_to_bound_peak_scratch():
     assert plan.windows[1].q_causal_offsets == (plan.windows[1].query_start,)
 
 
+@pytest.mark.parametrize("block", [1, 4, 16])
+@pytest.mark.parametrize("length", [1, 3, 16, 33])
+@pytest.mark.parametrize("offset", [0, 5, 64])
+def test_selection_windows_use_exact_maximal_prefix_at_budget_boundary(block, length, offset):
+    # Independent row enumeration covers unaligned offsets, zero-work rows,
+    # whole-document fits and the final short remainder of a split document.
+    rows = [(offset + i + 1) // block for i in range(length)]
+    whole = sum(rows)
+    for budget in {max(1, max(rows)), max(1, max(rows), whole - 1), max(1, whole), whole + 1}:
+        plan = DsaSelectionPlan.from_cu_seqlens(
+            [0, length],
+            [0, max(1, (offset + length) // block)],
+            top_k=1,
+            block_size=block,
+            q_causal_offsets=[offset],
+            candidate_budget_bytes=budget * 4,
+        )
+        cursor = 0
+        for window in plan.windows:
+            assert window.query_start == cursor
+            cursor = window.query_end
+            used = sum(rows[window.query_start : cursor])
+            assert window.candidate_offsets == (0, used)
+            assert window.q_causal_offsets == (offset + window.query_start,)
+            assert used <= budget
+            if cursor < length:
+                assert used + rows[cursor] > budget
+        assert cursor == length
+
+
 def test_selection_plan_keeps_chunked_prefill_position_offset():
     plan = DsaSelectionPlan.from_cu_seqlens(
         [0, 8],

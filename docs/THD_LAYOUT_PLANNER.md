@@ -128,7 +128,7 @@ calibration and held-out validation.
 
 ## Admissible pruning and preparation complexity
 
-Two lower bounds avoid building candidates that cannot meet the margin:
+Three lower bounds avoid building candidates that cannot meet the margin:
 
 - Every partition has the same token/candidate sums and at least one span per
   document. Their mean is a compute lower bound. To reduce source rank i's
@@ -142,18 +142,35 @@ Two lower bounds avoid building candidates that cannot meet the margin:
   source spans with those runs and the owner's two pieces avoids constructing
   O(documents * CP) objects. This bound omits incoming and peer bottlenecks and
   permutation copies. Local candidates run first to tighten its incumbent.
+- The long-document candidate family retains pinned source spans. Its critical
+  compute time cannot fall below the largest pinned per-rank compute load;
+  added nonnegative work and transport cannot lower it. If that bound already
+  misses the migration margin, skip the entire long-document search. Full
+  zigzag is checked independently because it can move the short documents too.
 
 Bounds are tested against exhaustive small assignments and concrete zigzag
 layouts on contiguous, interleaved and irregular topologies. They cannot exclude
 a strictly better modeled zigzag; they make no statement about model error.
 
 Repeated planning grids are deduplicated. Pinned spans are coalesced once;
-owner groups are built in one pass, and diagnostics are computed only for the
+their initial per-rank loads are computed once and copied for each grid. Adaptive
+grids visit only movable documents. Owner groups are built in one pass, and
+diagnostics are computed only for the
 selected selection plan. Balanced-token scheduling uses a rank heap for
 identical-cost pieces and indexes capacity repair by donor and piece shape.
-Source intersections use binary search. DSA window construction maintains an
-integer candidate total instead of rescanning all preceding short documents;
+Source-local spans have a direct intersection path; other source intersections
+use binary search. A geometry-only grain check rejects infeasible full zigzag
+before transport pricing, preserving the original-source-fragment exception.
+These changes preserve the scores of evaluated candidates, choices and stable
+tie breaks. Diagnostics can omit candidates proven unable to meet the margin.
+
+DSA window construction checks whether all remaining rows fit before searching
+for a split. It uses exact integer work, including unaligned causal offsets;
+long documents still receive the same maximal budget-fitting prefixes. An
+integer candidate total avoids rescanning all preceding short documents;
 window boundaries, scratch requirements and numerical execution are unchanged.
+All reuse is local to one preparation call; there is no retained layout cache
+or new device-to-host metadata read.
 
 ## Calibrating and measuring
 

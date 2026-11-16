@@ -246,16 +246,22 @@ class DsaSelectionPlan:
 
             row = 0
             while row < query_length:
-                low, high = row + 1, query_length
-                while low < high:
-                    middle = (low + high + 1) // 2
-                    needed = _candidate_floats(position + row, middle - row, block_size)
-                    if needed <= budget_floats:
-                        low = middle
-                    else:
-                        high = middle - 1
-                row_end = low
+                # Most short documents fit whole. Check the exact remaining
+                # work once before searching a split; retain the same maximal
+                # prefix when a long document exceeds the scratch budget.
+                row_end = query_length
                 candidates = _candidate_floats(position + row, row_end - row, block_size)
+                if candidates > budget_floats:
+                    low, high = row + 1, query_length - 1
+                    while low < high:
+                        middle = (low + high + 1) // 2
+                        needed = _candidate_floats(position + row, middle - row, block_size)
+                        if needed <= budget_floats:
+                            low = middle
+                        else:
+                            high = middle - 1
+                    row_end = low
+                    candidates = _candidate_floats(position + row, row_end - row, block_size)
                 atoms.append((sequence, row, row_end, key_length, position + row, candidates, query_length))
                 row = row_end
 

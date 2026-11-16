@@ -504,6 +504,53 @@ def test_transport_prices_only_executed_permutations():
     ) == pytest.approx(0.128)
 
 
+def test_source_local_spans_still_price_local_reordering():
+    from benchmarks.cp_layouts import query_layouts
+
+    layouts, _ = query_layouts(_boundaries([16] * 8), 4, "contiguous")
+    model = _cost_model(candidate_ns=0, query_ns=0, span_us=0, packing_ns_per_query=1000, exchange_us=10)
+    assert model.estimate_ms(layouts, block_size=4) == 0
+    reordered = tuple(THDRankLayout(r.rank, r.spans[::-1]) for r in layouts)
+    # No rows cross ranks, but source-side packing and its inverse still
+    # execute, as does the group-wide eager exchange for a nonidentity map.
+    assert model.estimate_ms(reordered, block_size=4) == pytest.approx(0.032 + 0.010)
+
+
+@pytest.mark.parametrize("margin", [0, 0.05])
+def test_pinned_critical_path_avoids_useless_long_document_search(monkeypatch, margin):
+    cu = _boundaries([64] * 998 + [33600] * 2)
+    model = _cost_model(candidate_ns=0.001, span_us=10, min_gain_fraction=margin)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("moving long documents cannot improve the pinned critical path")
+
+    monkeypatch.setattr("cula.distributed.thd_planner._selection_assign", forbidden)
+    monkeypatch.setattr("cula.distributed.thd_planner._paired_selection_items", forbidden)
+    plan = plan_thd_selection(
+        cu, world_size=4, max_tokens_per_rank=65536, cost_model=model, config=THDPlannerConfig(min_chunk_tokens=1024)
+    )
+    assert plan.policy == "contiguous"
+    assert plan.metrics.score == model.estimate_ms(plan.ranks, block_size=4)
+    _assert_exact_cover(plan, cu)
+
+
+@pytest.mark.parametrize("world", [1, 2, 8, 64])
+@pytest.mark.parametrize("floor", [0, 4, 16, 1024])
+def test_zigzag_grain_check_equals_materialized_candidate(world, floor):
+    from cula.distributed.thd_planner import _zigzag_meets_floor, zigzag_thd_layout
+
+    rng = random.Random(812 + world)
+    for lengths in ([4] * world, [4 * world], [4, 1024, 65536], [4 * rng.randint(1, 1024) for _ in range(17)]):
+        cu = _boundaries(lengths)
+        source = _contiguous_items(cu, world, 4)
+        fragments = {(s.sequence, s.token_start, s.token_end) for s, _ in source}
+        zigzag = zigzag_thd_layout(cu, world_size=world)
+        expected = all(
+            s.tokens >= floor or (s.sequence, s.token_start, s.token_end) in fragments for r in zigzag for s in r.spans
+        )
+        assert _zigzag_meets_floor(cu, world, 4, floor, fragments) == expected
+
+
 def test_independent_link_model_and_its_outgoing_bound():
     from dataclasses import replace
 
