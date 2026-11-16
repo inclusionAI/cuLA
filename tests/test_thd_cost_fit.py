@@ -134,3 +134,48 @@ def test_transport_fit_prediction_uses_the_same_cost_model_as_planning(world, pe
         overlap_intra_inter=overlap,
     )
     assert predict(f, coeff, overlap) == pytest.approx(m.estimate_ms(layouts, block_size=4))
+
+
+@pytest.fixture
+def transport_fit_inputs(monkeypatch):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    optimize = pytest.importorskip("scipy.optimize")
+    # Keep export/metadata regressions independent of optimizer convergence.
+    coefficients = np.array([1.0, 3.0, 4.0, 2.0, 0.5, 0.007, 0.01])
+    monkeypatch.setattr(optimize, "differential_evolution", lambda *a, **kw: SimpleNamespace(x=coefficients.copy()))
+    monkeypatch.setattr(optimize, "least_squares", lambda *a, **kw: SimpleNamespace(x=coefficients.copy()))
+    profile = dict(model=dict(bytes_per_query=20608, rank_node_ids=[0] * 8, packing_ns_per_query=8.5))
+    feature = dict(rank_intra_rows=[128] * 16, rank_inter_rows=[0] * 16, peer_rows=128, node_rows=0, copies=0, peer_degree=1)
+    record = dict(heldout=False, marker_exact=True, critical_median_ms=1, features=feature, kind="intra", rows=128)
+    return dict(world=8, ranks_per_node=8, records=[record.copy() for _ in range(6)]), profile
+
+
+@pytest.mark.parametrize("world,per_node", [(8, 4), (16, 8), (8, 8), (4, 1)])
+@pytest.mark.parametrize("old_per_node", [4, 8])
+def test_transport_fit_exports_calibration_topology(transport_fit_inputs, world, per_node, old_per_node):
+    from copy import deepcopy
+
+    from benchmarks.fit_thd_transport import fit
+
+    raw, profile = transport_fit_inputs
+    profile["model"]["rank_node_ids"] = [r // old_per_node for r in range(8)]
+    original = deepcopy(profile)
+    raw.update(world=world, ranks_per_node=per_node)
+    result = fit(raw, profile)
+    assert result["model"]["rank_node_ids"] == [r // per_node for r in range(world)]
+    assert result["transport_calibration"]["world_size"] == world
+    assert result["transport_calibration"]["ranks_per_node"] == per_node
+    assert profile == original
+
+
+@pytest.mark.parametrize("world,per_node", [(0, 4), (1, 1), (8, 0), (8, 3), (8, 16), (8.0, 4), (8, 4.0), (True, 1), (8, True)])
+def test_transport_fit_rejects_invalid_topology(transport_fit_inputs, world, per_node):
+    from benchmarks.fit_thd_transport import fit
+
+    raw, profile = transport_fit_inputs
+    raw.update(world=world, ranks_per_node=per_node)
+    with pytest.raises(ValueError, match="topology"):
+        fit(raw, profile)

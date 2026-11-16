@@ -19,7 +19,11 @@ def summarize(directory):
         ranks = raw["ranks"]
         if sorted(r["rank"] for r in ranks) != list(range(raw["world_size"])):
             raise ValueError(f"incomplete rank results: {path}")
-        if any(not all(r[k] for k in ("finite", "input_match", "redistribution_bitwise")) for r in ranks):
+        if any(
+            not all(r[k] for k in ("finite", "input_match", "redistribution_bitwise"))
+            or (r.get("check") is not None and not r["check"]["pass_"])
+            for r in ranks
+        ):
             raise ValueError(f"failed correctness check: {path}")
         repeats = raw["config"]["repeats"]
         if not repeats or any(len(r["samples"]) != repeats for r in ranks):

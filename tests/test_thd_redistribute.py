@@ -84,8 +84,8 @@ def test_exchange_and_its_transpose(monkeypatch, policy, boundaries):
 
 def test_reject_overlap():
     layouts, _ = query_layouts((0, 64), 4, "contiguous")
-    broken = (layouts[0], replace(layouts[1], spans=layouts[0].spans), *layouts[2:])
-    with pytest.raises(ValueError):
+    broken = (layouts[0], replace(layouts[1], spans=tuple(replace(span, owner=1) for span in layouts[0].spans)), *layouts[2:])
+    with pytest.raises(ValueError, match="without gaps or overlap"):
         THDRedistributionPlan.build(broken, (0, 16, 32, 48, 64), 0)
 
 

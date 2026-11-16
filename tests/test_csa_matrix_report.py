@@ -105,3 +105,26 @@ def test_report_rejects_incomplete_precision_evidence(tmp_path, broken):
     path.write_text(json.dumps(data))
     with pytest.raises(ValueError):
         summarize(tmp_path)
+
+
+@pytest.mark.parametrize("layout", ["contiguous", "zigzag", "planner"])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_report_rejects_failed_fp32_check(tmp_path, layout, rank):
+    _matrix(tmp_path)
+    path = tmp_path / f"layout-1m-fixture-{layout}.json"
+    data = json.loads(path.read_text())
+    data["ranks"][rank]["check"] = {"pass_": False}
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="failed correctness check"):
+        summarize(tmp_path)
+
+
+@pytest.mark.parametrize("check", [None, {"pass_": True}])
+def test_report_accepts_optional_or_successful_fp32_check(tmp_path, check):
+    _matrix(tmp_path)
+    for path in tmp_path.glob("*.json"):
+        data = json.loads(path.read_text())
+        for rank in data["ranks"]:
+            rank["check"] = check
+        path.write_text(json.dumps(data))
+    assert "1m-fixture" in summarize(tmp_path)

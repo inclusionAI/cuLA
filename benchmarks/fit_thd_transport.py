@@ -28,6 +28,17 @@ def predict(features, coefficients, overlap_links=False):
 def fit(raw, profile, *, overlap_links=False):
     from scipy.optimize import differential_evolution, least_squares
 
+    world, per_node = raw["world"], raw["ranks_per_node"]
+    if (
+        isinstance(world, bool)
+        or not isinstance(world, int)
+        or isinstance(per_node, bool)
+        or not isinstance(per_node, int)
+        or world < 2
+        or per_node < 1
+        or world % per_node
+    ):
+        raise ValueError("calibration topology requires CP >= 2 and complete nodes")
     rows = [r for r in raw["records"] if not r["heldout"]]
     if len(rows) < 6 or any(not r["marker_exact"] or r["critical_median_ms"] <= 0 for r in raw["records"]):
         raise ValueError("need complete, positive transport timings and exact row markers")
@@ -53,7 +64,13 @@ def fit(raw, profile, *, overlap_links=False):
         x[4] = profile["model"].get("packing_ns_per_query", 0) * 65536 / 1e6
     # A single-node calibration cannot identify inter-node bandwidth.
     # Use the same unused fallback rate, not an arbitrary optimizer parameter.
-    model = dict(profile["model"], overlap_intra_inter=overlap_links)
+    # The sweep assigns contiguous group ranks to nodes. Export that same
+    # topology rather than retaining the input profile's deployment mapping.
+    model = dict(
+        profile["model"],
+        overlap_intra_inter=overlap_links,
+        rank_node_ids=[rank // per_node for rank in range(world)],
+    )
     factor = 65536 * model["bytes_per_query"] / 1e6
     model.update(
         intra_node_gbps=factor / max(x[0], 1e-10),
