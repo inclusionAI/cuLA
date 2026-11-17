@@ -719,7 +719,12 @@ class _CudnnKdaCP(torch.autograd.Function):
         # The reverse carry is determined only by the first local span. cuDNN
         # backward apply consumes the summary transition in its stored M^T domain.
         first_end = plan.first_boundary_end
-        g_local, transition_backward, backward_context = kimi_delta_attention_summary_bwd(
+        # Native context contains per-token intermediates, not just the boundary
+        # summary. A prefix summary's context cannot serve the full THD shard.
+        # Keep the prefix-only scan for multi-document shards and let apply
+        # prepare its own intermediates; reuse only for identical token ranges.
+        reuse_context = first_end == q.shape[0]
+        summary_outputs = kimi_delta_attention_summary_bwd(
             q[:first_end],
             k[:first_end],
             g[:first_end],
@@ -728,11 +733,13 @@ class _CudnnKdaCP(torch.autograd.Function):
             cu_seqlens[:2],
             scale=options.scale,
             output_transition=True,
-            output_context=True,
+            output_context=reuse_context,
             checkpoint_every_n_tokens=options.checkpoint_every_n_tokens,
             plan_name=options.summary_plan_name,
             **options.kwargs(a_log, dt_bias),
         )
+        g_local, transition_backward = summary_outputs[:2]
+        backward_context = summary_outputs[2] if reuse_context else None
         following_h, following_transition = _validate_boundary_summaries(
             ctx.boundary_transport.boundary_summaries(
                 g_local[0],
@@ -868,6 +875,11 @@ def cudnn_kda_cp(
     layers.  Inputs use cuDNN's canonical THD contract; framework-specific
     layout and gate conversions belong in the framework adapter.
 
+    If every shard boundary is a document boundary, the plan marks the whole
+    group as independent. Execution then uses native local KDA/autograd and
+    skips boundary summaries and transport. An isolated rank alone cannot
+    enable this path while other ranks still require an exchange.
+
     ``boundary_transport`` defaults to exact ordered summary all-gather with lazy
     storage. Large-CP callers should prepare one
     :class:`AllGatherKimiCPTransport` per concurrent CUDA stream and reuse it
@@ -916,7 +928,13 @@ def cudnn_kda_cp(
         plan_name=plan_name,
         summary_plan_name=summary_plan_name,
     )
-    if plan.world_size == 1:
+    if plan.world_size == 1 or not plan.requires_boundary_exchange:
+        # Every shard boundary is a document boundary. This is the same
+        # independent native recurrence as CP1, including native autograd;
+        # no forward or backward state can cross ranks. The plan flag is
+        # identical on all peers, so no rank skips a required collective.
+        if plan.world_size > 1 and _resolve_kimi_cp_backend(backend, q.device) == "hopper-state-probe":
+            _validate_hopper_state_probe_options(options, a_log, dt_bias)
         kimi_delta_attention, _ = _load_cudnn_kda_ops()
         attention_outputs = kimi_delta_attention(
             q,

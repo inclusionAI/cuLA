@@ -30,6 +30,26 @@ def test_selection_plan_coalesces_short_packed_sequences():
     assert window.candidate_offsets == (0, 28, 73)
 
 
+def test_thousands_of_short_sequences_keep_exact_window_budget_boundaries():
+    # Each four-token document contributes exactly one complete-block logit.
+    count, capacity = 4097, 1000
+    plan = DsaSelectionPlan.from_cu_seqlens(
+        tuple(4 * i for i in range(count + 1)),
+        tuple(range(count + 1)),
+        top_k=1,
+        candidate_budget_bytes=capacity * 4,
+    )
+    assert [w.candidate_floats for w in plan.windows] == [1000, 1000, 1000, 1000, 97]
+    assert [(w.query_start, w.query_end) for w in plan.windows] == [
+        (0, 4000),
+        (4000, 8000),
+        (8000, 12000),
+        (12000, 16000),
+        (16000, 16388),
+    ]
+    assert all(w.candidate_offsets == tuple(range(w.candidate_floats + 1)) for w in plan.windows)
+
+
 def test_selection_plan_splits_one_sequence_to_bound_peak_scratch():
     plan = DsaSelectionPlan.from_cu_seqlens(
         [0, 32],
@@ -44,6 +64,36 @@ def test_selection_plan_splits_one_sequence_to_bound_peak_scratch():
     assert plan.windows[-1].query_end == 32
     assert all(window.key_start == 0 and window.key_end == 8 for window in plan.windows)
     assert plan.windows[1].q_causal_offsets == (plan.windows[1].query_start,)
+
+
+@pytest.mark.parametrize("block", [1, 4, 16])
+@pytest.mark.parametrize("length", [1, 3, 16, 33])
+@pytest.mark.parametrize("offset", [0, 5, 64])
+def test_selection_windows_use_exact_maximal_prefix_at_budget_boundary(block, length, offset):
+    # Independent row enumeration covers unaligned offsets, zero-work rows,
+    # whole-document fits and the final short remainder of a split document.
+    rows = [(offset + i + 1) // block for i in range(length)]
+    whole = sum(rows)
+    for budget in {max(1, max(rows)), max(1, max(rows), whole - 1), max(1, whole), whole + 1}:
+        plan = DsaSelectionPlan.from_cu_seqlens(
+            [0, length],
+            [0, max(1, (offset + length) // block)],
+            top_k=1,
+            block_size=block,
+            q_causal_offsets=[offset],
+            candidate_budget_bytes=budget * 4,
+        )
+        cursor = 0
+        for window in plan.windows:
+            assert window.query_start == cursor
+            cursor = window.query_end
+            used = sum(rows[window.query_start : cursor])
+            assert window.candidate_offsets == (0, used)
+            assert window.q_causal_offsets == (offset + window.query_start,)
+            assert used <= budget
+            if cursor < length:
+                assert used + rows[cursor] > budget
+        assert cursor == length
 
 
 def test_selection_plan_keeps_chunked_prefill_position_offset():

@@ -29,6 +29,10 @@ class KimiCPPlan:
     plan records their token spans and the ordered rank chains that contribute
     incoming forward state or outgoing backward state.  Tensor shapes and
     process-group identity are checked again at execution time.
+
+    ``requires_boundary_exchange`` is a group-wide property derived from all
+    shard boundaries, identical on every rank. Manual plans default to the
+    conservative exchanging path.
     """
 
     rank: int
@@ -42,6 +46,9 @@ class KimiCPPlan:
     last_boundary_start: int
     pre_num_ranks: int
     post_num_ranks: int
+    # Group-wide, not rank-local: one isolated rank must still participate if
+    # any other rank needs the boundary collective. Manual plans stay safe.
+    requires_boundary_exchange: bool = True
 
     @property
     def local_tokens(self) -> int:
@@ -130,6 +137,9 @@ class KimiCPPlan:
         if pre_num_ranks < 0 or post_num_ranks < 0:
             raise RuntimeError("internal error while deriving Kimi CP boundary rank ranges")
 
+        document_boundaries = set(boundaries)
+        requires_boundary_exchange = any(offset not in document_boundaries for offset in offsets[1:-1])
+
         return cls(
             rank=rank,
             world_size=world_size,
@@ -142,6 +152,7 @@ class KimiCPPlan:
             last_boundary_start=local_boundaries[-2],
             pre_num_ranks=pre_num_ranks,
             post_num_ranks=post_num_ranks,
+            requires_boundary_exchange=requires_boundary_exchange,
         )
 
 

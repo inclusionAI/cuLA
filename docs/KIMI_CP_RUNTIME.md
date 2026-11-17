@@ -50,10 +50,21 @@ balanced partition or explicit global shard offsets.  It derives:
 - clipped local `cu_seqlens`;
 - first and last local sequence IDs;
 - the first and last boundary token spans;
-- the number of preceding and following ranks in those sequence chains.
+- the number of preceding and following ranks in those sequence chains;
+- whether any document crosses a shard boundary anywhere in the group.
 
 Plan construction is CPU-only and must happen once per packed microbatch, not
 once per layer.  The same plan is reusable by every KDA layer.
+
+When every internal shard boundary is a document boundary,
+`requires_boundary_exchange` is false on **every rank**. The runtime then uses
+native local KDA/autograd without boundary summaries, state probes or transport.
+The operands, dtypes and batch-invariance option are unchanged. A locally
+isolated rank must still join the boundary exchanges if another document crosses
+ranks elsewhere in the group. Manually constructed plans default to the
+conservative exchanging path. The paired benchmark
+`benchmarks/bench_kda_independent_shards.py` checks all outputs and five gradients,
+including weak decay and an isolated-rank/crossing-peer control.
 
 Only the first and last local spans can cross rank boundaries under the
 contiguous-shard contract.  Forward therefore summarizes only the last local
@@ -73,11 +84,16 @@ Forward:
 
 Backward performs the symmetric reverse chain:
 
-1. Produce `(G, M^T)` and reusable backward context for the first local span.
+1. Produce `(G, M^T)` for the first local span.
 2. All-gather the transition in its stored-domain orientation.
 3. Select following ranks belonging to the last local sequence.
 4. Pass them as `following_state_grad` and `following_transition`.
 5. Let cuDNN compose the reverse chain and compute local tensor and gate gradients.
+
+Native backward context contains per-token intermediates. It is reused only
+when the summary covers the complete local shard. A multi-document shard's
+prefix-only summary cannot supply context for the full apply operation; apply
+prepares its own intermediates in that case.
 
 The state payload and transition remain FP32. cuLA exposes no merge-precision
 switch; the cuDNN apply API owns the fixed high-precision state chain. The

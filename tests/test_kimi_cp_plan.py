@@ -103,3 +103,26 @@ def test_cpu_local_boundaries_must_match_plan():
             torch.tensor([0, 3], dtype=torch.int32),
             device=torch.device("cpu"),
         )
+
+
+@pytest.mark.parametrize("world", [2, 4, 8, 16, 64])
+def test_document_local_shards_skip_boundary_exchange_globally(world):
+    cu = _global_cu([1024] * (world * 3))
+    plans = [KimiCPPlan.from_global_cu_seqlens(cu, rank=rank, world_size=world) for rank in range(world)]
+    assert all(not p.requires_boundary_exchange for p in plans)
+    assert all(p.pre_num_ranks == p.post_num_ranks == 0 for p in plans)
+
+
+def test_isolated_rank_cannot_skip_peers_boundary_collective():
+    # Rank zero is independent, but the second document crosses ranks 1/2.
+    plans = [KimiCPPlan.from_global_cu_seqlens([0, 4, 12], rank=rank, world_size=3) for rank in range(3)]
+    assert plans[0].pre_num_ranks == plans[0].post_num_ranks == 0
+    assert all(p.requires_boundary_exchange for p in plans)
+
+
+def test_independent_detection_uses_supplied_uneven_shards():
+    offsets = (0, 3, 11, 16)
+    plans = [
+        KimiCPPlan.from_global_cu_seqlens([0, 1, 3, 11, 13, 16], rank=r, world_size=3, shard_offsets=offsets) for r in range(3)
+    ]
+    assert all(not p.requires_boundary_exchange for p in plans)

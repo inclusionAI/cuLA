@@ -149,6 +149,8 @@ kernel boundary and the overlap assessment against FlashInfer and cuDNN.
 The optional [cuDNN hybrid-attention runtime](docs/HYBRID_CUDNN_RUNTIME.md)
 documents packed index pooling, memory-bounded DSA selection, and CP layout
 ownership without precision downgrades.
+The [CSA CP selection API](docs/CSA_CP_SELECTION.md) packages adaptive THD
+planning, query routing and result restoration for downstream frameworks.
 
 ## Benchmarks
 
