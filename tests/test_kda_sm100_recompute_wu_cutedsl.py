@@ -37,8 +37,8 @@ def test_recompute_wu_repeated_calls_are_bitwise_deterministic(beta_dtype):
 @pytest.mark.sanitizer
 @pytest.mark.sm100_only
 @pytest.mark.skipif(
-    os.environ.get("CULA_RUN_SANITIZER_TESTS") != "1",
-    reason="set CULA_RUN_SANITIZER_TESTS=1 and run under compute-sanitizer",
+    os.environ.get("CULA_RUN_SANITIZER_TESTS") != "1" or os.environ.get("PYTORCH_NO_CUDA_MEMORY_CACHING") != "1",
+    reason=("set CULA_RUN_SANITIZER_TESTS=1 and PYTORCH_NO_CUDA_MEMORY_CACHING=1 and run under compute-sanitizer"),
 )
 @pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16])
 def test_recompute_wu_uneven_tail_beta_load_is_in_bounds(beta_dtype):
