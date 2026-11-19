@@ -116,7 +116,7 @@ g = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16) * 0.1   # gate 
 beta = torch.randn(B, T, H, device=device, dtype=torch.bfloat16).sigmoid()
 A_log = torch.randn(H, device=device, dtype=torch.float32) * 0.01
 dt_bias = torch.zeros(H * K, device=device, dtype=torch.float32)
-init_state = torch.zeros(B, H, K, V, device=device, dtype=torch.float32)
+init_state = torch.zeros(B, H, V, K, device=device, dtype=torch.float32)
 
 # Forward-only standalone operator
 o, final_state = kda_prefill(
@@ -139,6 +139,7 @@ print(f'Final state shape: {final_state.shape}')  # [2, 32, 128, 128]
 - `kda_prefill` is forward-only. The modular SM100 training primitives are exposed separately rather than hidden behind an FLA autograd wrapper.
 - `safe_gate=True` is required by this path.
 - `beta` supports both `float32` and `bfloat16`; `initial_state` must be `float32`.
+- Grouped-value attention is supported when `V` heads (`HV`) are a positive multiple of Q/K heads (`H`); see the GVA shape contract in `cula/kda/README.md`.
 - `cu_seqlens` (for variable-length sequences) must be `int32`.
 
 ## Usage

@@ -190,7 +190,8 @@ def k1_kernel(
     ws_beta: cute.Tensor,
     tile_starts: cute.Tensor,
     tile_actual_lens: cute.Tensor,
-    H: cutlass.Constexpr[int],
+    Hq: cutlass.Constexpr[int],
+    HV: cutlass.Constexpr[int],
     total_tiles: cutlass.Int32,
     T_total: cutlass.Int32,
     scale: cutlass.Constexpr[float],
@@ -198,6 +199,7 @@ def k1_kernel(
     is_varlen: cutlass.Constexpr[bool],
 ):
     tile_idx, head_idx, _ = cute.arch.block_idx()
+    qk_head_idx = head_idx // (HV // Hq)
     tidx, _, _ = cute.arch.thread_idx()
 
     smem = cutlass.utils.SmemAllocator()
@@ -294,7 +296,7 @@ def k1_kernel(
     raw_copy_atom = cute.make_copy_atom(cpasync.CopyBulkS2GOp(), cutlass.BFloat16)
     raw_smem_layout = cute.make_layout((CHUNK * D,), stride=(1,))
     raw_gmem_layout = cute.make_layout(
-        (CHUNK * D, total_tiles * H),
+        (CHUNK * D, total_tiles * HV),
         stride=(1, CHUNK * D),
     )
     sQDws_raw = cute.make_tensor(s_q_decayed.iterator, raw_smem_layout)
@@ -307,8 +309,8 @@ def k1_kernel(
     if warp_idx == 0:
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(sMbar_ptr, cutlass.Int32(3 * CHUNK * D * 2))
-        cute.copy(tma_atom_q, tQg[(None, load_tile_idx, 0, head_idx)], tQs[(None,)], tma_bar_ptr=sMbar_ptr)
-        cute.copy(tma_atom_k, tKg[(None, load_tile_idx, 0, head_idx)], tKs[(None,)], tma_bar_ptr=sMbar_ptr)
+        cute.copy(tma_atom_q, tQg[(None, load_tile_idx, 0, qk_head_idx)], tQs[(None,)], tma_bar_ptr=sMbar_ptr)
+        cute.copy(tma_atom_k, tKg[(None, load_tile_idx, 0, qk_head_idx)], tKs[(None,)], tma_bar_ptr=sMbar_ptr)
         cute.copy(tma_atom_g, tGg[(None, load_tile_idx, 0, head_idx)], tGs[(None,)], tma_bar_ptr=sMbar_ptr)
 
     cute.arch.mbarrier_wait(sMbar_ptr, cutlass.Int32(0))
@@ -367,12 +369,12 @@ def k1_kernel(
         s_g_total[col_c] = cute.exp(s, fastmath=True)
     cute.arch.barrier()
 
-    # Pre-compute per-row sigmoid(beta). beta is the original packed [T, H]
+    # Pre-compute per-row sigmoid(beta). beta is the original packed [T, HV]
     # layout, so no host-side transpose is needed.
     if tidx < CHUNK:
         bv = cutlass.Float32(-80.0)
         if actual_len > tidx:
-            bv = cutlass.Float32(beta[(token_start + tidx) * H + head_idx])
+            bv = cutlass.Float32(beta[(token_start + tidx) * HV + head_idx])
         sBetaSig[tidx] = cutlass.Float32(0.5) * (cute.tanh(bv * cutlass.Float32(0.5), fastmath=True) + cutlass.Float32(1.0))
         # Emit raw beta into the compact wt_l workspace (tail rows = -80 -> sigmoid~0).
         ws_beta[(head_idx * total_tiles + tile_idx) * CHUNK + tidx] = cutlass.BFloat16(bv)
@@ -576,7 +578,8 @@ def run_k1(
     ws_beta: cute.Tensor,
     tile_starts: cute.Tensor,
     tile_actual_lens: cute.Tensor,
-    H: cutlass.Constexpr[int],
+    Hq: cutlass.Constexpr[int],
+    HV: cutlass.Constexpr[int],
     total_tiles: cutlass.Int32,
     T_total: cutlass.Int32,
     scale: cutlass.Constexpr[float],
@@ -586,10 +589,10 @@ def run_k1(
 ):
     smem_layout_qk = cute.make_layout((CHUNK, D), stride=(D, 1))
 
-    def make_atom(t):
+    def make_atom(t, heads):
         view = cute.make_tensor(
             t.iterator,
-            cute.make_layout((T_total, D, H), stride=(H * D, 1, D)),
+            cute.make_layout((T_total, D, heads), stride=(heads * D, 1, D)),
         )
         return cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
@@ -605,7 +608,7 @@ def run_k1(
         view = cute.make_tensor(
             t.iterator,
             cute.make_layout(
-                (CHUNK, CHUNK, total_tiles * H),
+                (CHUNK, CHUNK, total_tiles * HV),
                 stride=(CHUNK, 1, CHUNK * CHUNK),
             ),
         )
@@ -616,9 +619,9 @@ def run_k1(
             (CHUNK, CHUNK),
         )
 
-    tma_atom_q, tma_tensor_q = make_atom(q)
-    tma_atom_k, tma_tensor_k = make_atom(k)
-    tma_atom_g, tma_tensor_g = make_atom(g)
+    tma_atom_q, tma_tensor_q = make_atom(q, Hq)
+    tma_atom_k, tma_tensor_k = make_atom(k, Hq)
+    tma_atom_g, tma_tensor_g = make_atom(g, HV)
     tma_atom_ws_inv, tma_tensor_ws_inv = make_ws_cc_store_atom(ws_inv)
     tma_atom_ws_mqk, tma_tensor_ws_mqk = make_ws_cc_store_atom(ws_mqk)
 
@@ -647,14 +650,15 @@ def run_k1(
         ws_beta,
         tile_starts,
         tile_actual_lens,
-        H,
+        Hq,
+        HV,
         total_tiles,
         T_total,
         scale,
         gate_scale,
         is_varlen,
     ).launch(
-        grid=(total_tiles, H, 1),
+        grid=(total_tiles, HV, 1),
         block=[THREADS_PER_CTA, 1, 1],
         smem=smem_bytes,
         stream=stream,
@@ -672,22 +676,22 @@ _CU_STREAM_CACHE_MAXSIZE = 64
 _DUMMY_INT32_CACHE_MAXSIZE = 64
 
 
-def _compile_k1(H, scale, gate_scale, is_varlen):
+def _compile_k1(Hq, HV, scale, gate_scale, is_varlen):
     sym_t = cute.sym_int()  # T_total (q/k/g token extent)
     sym_al = cute.sym_int()  # a_log
-    sym_bt = cute.sym_int()  # beta, original packed [T_total, H] flattened (T_total*H)
-    sym_qk = cute.sym_int()  # ws_qd/kd/kr  (total_tiles*H*CHUNK*D)
-    sym_gt = cute.sym_int()  # ws_gt        (total_tiles*H*D)
-    sym_cc = cute.sym_int()  # ws_inv/mqk   (total_tiles*H*CHUNK*CHUNK)
-    sym_wb = cute.sym_int()  # ws_beta      (total_tiles*CHUNK*H)
+    sym_bt = cute.sym_int()  # beta, original packed [T_total, HV] flattened (T_total*HV)
+    sym_qk = cute.sym_int()  # ws_qd/kd/kr  (total_tiles*HV*CHUNK*D)
+    sym_gt = cute.sym_int()  # ws_gt        (total_tiles*HV*D)
+    sym_cc = cute.sym_int()  # ws_inv/mqk   (total_tiles*HV*CHUNK*CHUNK)
+    sym_wb = cute.sym_int()  # ws_beta      (total_tiles*CHUNK*HV)
     sym_ts = cute.sym_int()  # tile_starts
     sym_tal = cute.sym_int()  # tile_actual_lens
 
-    q_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_t, H, D), stride_order=(2, 1, 0), assumed_align=16)
-    k_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_t, H, D), stride_order=(2, 1, 0), assumed_align=16)
-    g_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_t, H, D), stride_order=(2, 1, 0), assumed_align=16)
+    q_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_t, Hq, D), stride_order=(2, 1, 0), assumed_align=16)
+    k_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_t, Hq, D), stride_order=(2, 1, 0), assumed_align=16)
+    g_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_t, HV, D), stride_order=(2, 1, 0), assumed_align=16)
     alog_fake = make_fake_compact_tensor(cutlass.Float32, (sym_al,), assumed_align=16)
-    dt_fake = make_fake_compact_tensor(cutlass.Float32, (H, D), stride_order=(1, 0), assumed_align=16)
+    dt_fake = make_fake_compact_tensor(cutlass.Float32, (HV, D), stride_order=(1, 0), assumed_align=16)
     beta_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_bt,), assumed_align=16)
     ws_qd_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_qk,), assumed_align=16)
     ws_kd_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_qk,), assumed_align=16)
@@ -717,7 +721,8 @@ def _compile_k1(H, scale, gate_scale, is_varlen):
         ws_beta_fake,
         ts_fake,
         tal_fake,
-        H,  # Constexpr -> baked
+        Hq,  # Constexpr -> baked
+        HV,  # Constexpr -> baked
         cutlass.Int32(1),  # total_tiles -> runtime (placeholder)
         cutlass.Int32(1),  # T_total -> runtime
         scale,  # Constexpr
@@ -728,13 +733,13 @@ def _compile_k1(H, scale, gate_scale, is_varlen):
     )
 
 
-def _get_compiled_k1(H, scale, gate_scale, is_varlen):
-    key = (H, scale, gate_scale, is_varlen)
+def _get_compiled_k1(Hq, HV, scale, gate_scale, is_varlen):
+    key = (Hq, HV, scale, gate_scale, is_varlen)
     cached = _k1_kernel_cache.get(key)
     if cached is None:
         if len(_k1_kernel_cache) >= _K1_KERNEL_CACHE_MAXSIZE:
             _k1_kernel_cache.pop(next(iter(_k1_kernel_cache)))
-        cached = _compile_k1(H, scale, gate_scale, is_varlen)
+        cached = _compile_k1(Hq, HV, scale, gate_scale, is_varlen)
         _k1_kernel_cache[key] = cached
     return cached
 
@@ -786,7 +791,8 @@ def launch_k1(
     is_varlen: bool = False,
 ) -> None:
     """Run K1 pipeline; produces all 6 K2-ready workspace tensors."""
-    B, T, H, _ = q.shape
+    B, T, Hq, _ = q.shape
+    HV = g.shape[2]
     T_total = B * T
     if not is_varlen:
         total_tiles = (B * T) // CHUNK
@@ -794,14 +800,14 @@ def launch_k1(
         tile_starts = dummy
         tile_actual_lens = dummy
 
-    compiled_fn = _get_compiled_k1(H, scale, gate_scale, is_varlen)
+    compiled_fn = _get_compiled_k1(Hq, HV, scale, gate_scale, is_varlen)
     stream = _get_current_custream()
     # TMA descriptors are (re)built inside run_k1 from the dynamic Int32 dims
     # every launch, so one compiled kernel serves all shapes.
     compiled_fn(
-        q.view(T_total, H, D),
-        k.view(T_total, H, D),
-        g.view(T_total, H, D),
+        q.view(T_total, Hq, D),
+        k.view(T_total, Hq, D),
+        g.view(T_total, HV, D),
         A_log,
         dt_bias,
         beta,
