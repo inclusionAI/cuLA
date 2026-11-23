@@ -83,14 +83,14 @@ def k2_kernel(
     tma_tensor_gt: cute.Tensor,
     tma_atom_beta: cute.CopyAtom,
     tma_tensor_beta: cute.Tensor,
-    H: cutlass.Constexpr[int],
+    HV: cutlass.Constexpr[int],
     total_tiles: cutlass.Int32,
     cu_seqlens_tiles: cute.Tensor,
     seq_order: cute.Tensor,  # int32 [N]: launch-slot -> sequence/segment index
     v_tile_starts: cute.Tensor,
     v_tile_actual_lens: cute.Tensor,
-    initial_state_g: cute.Tensor,  # flat fp32 [N*H*D*D] gmem (layout per state_transposed)
-    final_state_g: cute.Tensor,  # flat fp32 [N*H*D*D] gmem (layout per state_transposed)
+    initial_state_g: cute.Tensor,  # flat fp32 [N*HV*D*D] gmem (layout per state_transposed)
+    final_state_g: cute.Tensor,  # flat fp32 [N*HV*D*D] gmem (layout per state_transposed)
     has_initial_state: cutlass.Constexpr[bool],
     has_final_state: cutlass.Constexpr[bool],
     state_transposed: cutlass.Constexpr[bool],
@@ -222,7 +222,7 @@ def k2_kernel(
     )
     # Load initial_state -> sState[K_in, D_out]
     if has_initial_state:
-        state_base = cutlass.Int32(seq_idx) * cutlass.Int32(H * D * D) + cutlass.Int32(head_idx) * cutlass.Int32(D * D)
+        state_base = cutlass.Int32(seq_idx) * cutlass.Int32(HV * D * D) + cutlass.Int32(head_idx) * cutlass.Int32(D * D)
         if tidx < D:
             if state_transposed:
                 for k_in in cutlass.range_constexpr(D):
@@ -421,14 +421,14 @@ def k2_kernel(
                     tOrO = cute.make_fragment_like(tOsO, cutlass.BFloat16)
                     cute.autovec_copy(tOsO, tOrO)
 
-                    out_chunk_raw = out_gmem.iterator + out_start * H * D + head_idx * D
+                    out_chunk_raw = out_gmem.iterator + out_start * HV * D + head_idx * D
                     out_chunk_ptr = cute.make_ptr(
                         cutlass.BFloat16,
                         out_chunk_raw.toint(),
                         cute.AddressSpace.gmem,
                         assumed_align=16,
                     )
-                    out_stride_t: cutlass.Constexpr[int] = H * D
+                    out_stride_t: cutlass.Constexpr[int] = HV * D
                     gOut_chunk = cute.make_tensor(
                         out_chunk_ptr,
                         cute.make_layout((CHUNK, D), stride=(out_stride_t, 1)),
@@ -580,7 +580,7 @@ def k2_kernel(
                 phase_se = phase_se ^ cutlass.Int32(1)
     cute.arch.barrier()
     if has_final_state:
-        state_base_f = cutlass.Int32(seq_idx) * cutlass.Int32(H * D * D) + cutlass.Int32(head_idx) * cutlass.Int32(D * D)
+        state_base_f = cutlass.Int32(seq_idx) * cutlass.Int32(HV * D * D) + cutlass.Int32(head_idx) * cutlass.Int32(D * D)
         if tidx < D:
             if state_transposed:
                 for k_in in cutlass.range_constexpr(D):
@@ -607,11 +607,11 @@ def run_k2(
     out: cute.Tensor,
     cu_seqlens_tiles: cute.Tensor,
     seq_order: cute.Tensor,
-    initial_state_g: cute.Tensor,  # flat fp32 [N*H*D*D] or dummy [1]
-    final_state_g: cute.Tensor,  # flat fp32 [N*H*D*D] or dummy [1]
+    initial_state_g: cute.Tensor,  # flat fp32 [N*HV*D*D] or dummy [1]
+    final_state_g: cute.Tensor,  # flat fp32 [N*HV*D*D] or dummy [1]
     v_tile_starts: cute.Tensor,
     v_tile_actual_lens: cute.Tensor,
-    H: cutlass.Constexpr[int],
+    HV: cutlass.Constexpr[int],
     total_tiles: cutlass.Int32,
     O_T_total: cutlass.Int32,
     V_T_total: cutlass.Int32,
@@ -629,21 +629,21 @@ def run_k2(
     def make_thd_atom(t, op, t_total: cutlass.Int32):
         view = cute.make_tensor(
             t.iterator,
-            cute.make_layout((t_total, D, H), stride=(H * D, 1, D)),
+            cute.make_layout((t_total, D, HV), stride=(HV * D, 1, D)),
         )
         return cpasync.make_tiled_tma_atom(op, view, kinter_smem, (CHUNK, D))
 
     def make_ws_cc_atom(t):
         view = cute.make_tensor(
             t.iterator,
-            cute.make_layout((CHUNK, CHUNK, total_tiles * H), stride=(CHUNK, 1, CHUNK * CHUNK)),
+            cute.make_layout((CHUNK, CHUNK, total_tiles * HV), stride=(CHUNK, 1, CHUNK * CHUNK)),
         )
         return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), view, cc_smem, (CHUNK, CHUNK))
 
     def make_raw_ws_qk_atom(t):
         view = cute.make_tensor(
             t.iterator,
-            cute.make_layout((CHUNK, D, total_tiles * H), stride=(D, 1, CHUNK * D)),
+            cute.make_layout((CHUNK, D, total_tiles * HV), stride=(D, 1, CHUNK * D)),
         )
         return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), view, raw_qk_smem, (CHUNK, D))
 
@@ -661,7 +661,7 @@ def run_k2(
     def make_gt_atom(t):
         view = cute.make_tensor(
             t.iterator,
-            cute.make_layout((D, 1, total_tiles * H), stride=(1, D, D)),
+            cute.make_layout((D, 1, total_tiles * HV), stride=(1, D, D)),
         )
         return cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
@@ -673,7 +673,7 @@ def run_k2(
     def make_beta_atom(t):
         view = cute.make_tensor(
             t.iterator,
-            cute.make_layout((CHUNK, 1, total_tiles * H), stride=(1, CHUNK, CHUNK)),
+            cute.make_layout((CHUNK, 1, total_tiles * HV), stride=(1, CHUNK, CHUNK)),
         )
         return cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
@@ -721,7 +721,7 @@ def run_k2(
         tma_tensor_gt,
         tma_atom_beta,
         tma_tensor_beta,
-        H,
+        HV,
         total_tiles,
         cu_seqlens_tiles,
         seq_order,
@@ -734,7 +734,7 @@ def run_k2(
         state_transposed,
         v_is_varlen,
     ).launch(
-        grid=(N, H, 1),
+        grid=(N, HV, 1),
         block=[THREADS_PER_CTA, 1, 1],
         smem=smem_bytes,
         stream=stream,
@@ -756,24 +756,24 @@ _IDENTITY_ORDER_CACHE: dict[tuple, torch.Tensor] = {}
 _IDENTITY_ORDER_CACHE_MAXSIZE = 64
 
 
-def _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_varlen):
+def _compile_k2(HV, has_initial_state, has_final_state, state_transposed, v_is_varlen):
     # One sym_int per dynamic tensor extent; shape scalars are runtime Int32.
     sym_vt = cute.sym_int()  # V_T_total (v token extent)
     sym_ot = cute.sym_int()  # O_T_total (out token extent; differs from V in varlen)
-    sym_qk = cute.sym_int()  # ws_qd/kd/kr  (total_tiles*H*CHUNK*D)
-    sym_cc = cute.sym_int()  # ws_inv/mqk   (total_tiles*H*CHUNK*CHUNK)
-    sym_gt = cute.sym_int()  # ws_gt        (total_tiles*H*D)
-    sym_bt = cute.sym_int()  # beta/ws_beta (total_tiles*CHUNK*H)
+    sym_qk = cute.sym_int()  # ws_qd/kd/kr  (total_tiles*HV*CHUNK*D)
+    sym_cc = cute.sym_int()  # ws_inv/mqk   (total_tiles*HV*CHUNK*CHUNK)
+    sym_gt = cute.sym_int()  # ws_gt        (total_tiles*HV*D)
+    sym_bt = cute.sym_int()  # beta/ws_beta (total_tiles*CHUNK*HV)
     sym_cu = cute.sym_int()  # cu_seqlens_tiles (N+1)
     sym_so = cute.sym_int()  # seq_order (N) — own sym: length differs from cu_seqlens_tiles
     # init/final need separate syms: their runtime sizes differ when one is
     # the 1-element dummy, and tvm-ffi binds each sym to one value.
-    sym_sti = cute.sym_int()  # initial state flat (N*H*D*D or 1)
-    sym_stf = cute.sym_int()  # final state flat (N*H*D*D or 1)
+    sym_sti = cute.sym_int()  # initial state flat (N*HV*D*D or 1)
+    sym_stf = cute.sym_int()  # final state flat (N*HV*D*D or 1)
     sym_vs = cute.sym_int()  # v_tile_starts (total_tiles or 1)
     sym_va = cute.sym_int()  # v_tile_actual_lens (total_tiles or 1)
 
-    v_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_vt, H, D), stride_order=(2, 1, 0), assumed_align=16)
+    v_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_vt, HV, D), stride_order=(2, 1, 0), assumed_align=16)
     beta_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_bt,), assumed_align=16)
     ws_qd_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_qk,), assumed_align=16)
     ws_kd_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_qk,), assumed_align=16)
@@ -781,7 +781,7 @@ def _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_va
     ws_gt_fake = make_fake_compact_tensor(cutlass.Float32, (sym_gt,), assumed_align=16)
     ws_inv_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_cc,), assumed_align=16)
     ws_mqk_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_cc,), assumed_align=16)
-    out_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_ot, H, D), stride_order=(2, 1, 0), assumed_align=16)
+    out_fake = make_fake_compact_tensor(cutlass.BFloat16, (sym_ot, HV, D), stride_order=(2, 1, 0), assumed_align=16)
     cu_fake = make_fake_compact_tensor(cutlass.Int32, (sym_cu,), assumed_align=4)
     so_fake = make_fake_compact_tensor(cutlass.Int32, (sym_so,), assumed_align=4)
     init_fake = make_fake_compact_tensor(cutlass.Float32, (sym_sti,), assumed_align=16)
@@ -807,7 +807,7 @@ def _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_va
         final_fake,
         vts_fake,
         vtal_fake,
-        H,  # Constexpr -> baked
+        HV,  # Constexpr -> baked
         cutlass.Int32(1),  # total_tiles -> runtime (placeholder)
         cutlass.Int32(1),  # O_T_total
         cutlass.Int32(1),  # V_T_total
@@ -821,11 +821,11 @@ def _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_va
     )
 
 
-def _get_compiled_k2(H, has_initial_state, has_final_state, state_transposed, v_is_varlen):
-    key = (H, has_initial_state, has_final_state, state_transposed, v_is_varlen)
+def _get_compiled_k2(HV, has_initial_state, has_final_state, state_transposed, v_is_varlen):
+    key = (HV, has_initial_state, has_final_state, state_transposed, v_is_varlen)
     cached = _k2_kernel_cache.get(key)
     if cached is None:
-        cached = _compile_k2(H, has_initial_state, has_final_state, state_transposed, v_is_varlen)
+        cached = _compile_k2(HV, has_initial_state, has_final_state, state_transposed, v_is_varlen)
         _k2_kernel_cache[key] = cached
     return cached
 
@@ -909,8 +909,8 @@ def launch_k2(
     ws_mqk: torch.Tensor,
     out: torch.Tensor,
     cu_seqlens_tiles: torch.Tensor | None = None,
-    initial_state: torch.Tensor | None = None,  # [N, H, V, K] fp32 bhvk
-    final_state: torch.Tensor | None = None,  # [N, H, V, K] fp32 bhvk (written in-place)
+    initial_state: torch.Tensor | None = None,  # [N, HV, V, K] fp32 bhvk
+    final_state: torch.Tensor | None = None,  # [N, HV, V, K] fp32 bhvk (written in-place)
     state_transposed: bool = False,
     v_tile_starts: torch.Tensor | None = None,
     v_tile_actual_lens: torch.Tensor | None = None,
@@ -918,11 +918,11 @@ def launch_k2(
 ) -> None:
     """Run K2 recurrence. Supports fixed-len and varlen inputs.
 
-    state_transposed: False=[N,H,V,K] (default), True=[N,H,K,V].
+    state_transposed: False=[N,HV,V,K] (default), True=[N,HV,K,V].
     seq_order: optional int32 [N] launch-slot -> sequence index permutation
         (longest-first for ragged CP batches); None = identity.
     """
-    B, T, H, _ = v.shape
+    B, T, HV, _ = v.shape
     V_T_total = B * T
     O_T_total = out.shape[0] * out.shape[1]
     v_is_varlen = v_tile_starts is not None
@@ -958,7 +958,7 @@ def launch_k2(
         seq_order = _get_identity_order(N_seqs, v.device)
 
     compiled_fn = _get_compiled_k2(
-        H,
+        HV,
         has_initial_state_flag,
         has_final_state_flag,
         state_transposed,
@@ -970,7 +970,7 @@ def launch_k2(
     # run_k2 from the dynamic Int32 dims every launch, so one compiled kernel
     # serves all shapes.
     compiled_fn(
-        v.view(V_T_total, H, D),
+        v.view(V_T_total, HV, D),
         beta,
         ws_qd,
         ws_kd,
@@ -978,7 +978,7 @@ def launch_k2(
         ws_gt,
         ws_inv,
         ws_mqk,
-        out.view(O_T_total, H, D),
+        out.view(O_T_total, HV, D),
         cu_seqlens_tiles,
         seq_order,
         initial_state_fp32,

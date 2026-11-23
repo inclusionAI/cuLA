@@ -28,11 +28,8 @@ Modes:
   - Fixed-length: various (B, T) configs
   - Varlen: packed sequences with 2-3x length variation
 
-The SM90 prefill is MHA only (HV == H); grouped-value attention is not yet
-supported on this backend, so there is no --hv option.
-
 Usage:
-  python bench_kda_sm90_prefill.py [--mode fixed|varlen|both] [--heads H] [--init_state] [--ncu]
+  python bench_kda_sm90_prefill.py [--mode fixed|varlen|both] [--heads H] [--v-heads HV] [--init_state] [--ncu]
 
 With --ncu, warmup=1 and iters=1 for ncu profiling:
   ncu --set full -o report python bench_kda_sm90_prefill.py --mode varlen --ncu
@@ -64,6 +61,7 @@ from cula.kda._flashkda_arch import assert_flashkda_supported
 _SM_TAG = "sm90/sm100"
 
 H, D = 64, 128
+HV = H
 WARMUP = 25
 N_ITERS = 100
 NCU_MODE = False
@@ -142,7 +140,7 @@ def _bench_one(common):
 
 
 def _make_common(B, T, cu_seqlens, device):
-    inputs = prepare_safe_gate_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens, has_init_state=HAS_INIT_STATE, num_v_heads=H)
+    inputs = prepare_safe_gate_inputs(B, T, H, D, device, cu_seqlens=cu_seqlens, has_init_state=HAS_INIT_STATE, num_v_heads=HV)
     return dict(
         q=inputs["q"],
         k=inputs["k"],
@@ -222,7 +220,7 @@ def print_report(fixed_results, varlen_results):
     print(f"\n\n{sep}")
     print("                  BENCHMARK REPORT: cula_kda_prefill (K1+K2 two-kernel)")
     print(f"                  cuLA {_SM_TAG} vs FLA Triton")
-    print(f"                  H={H}  D={D}  dtype=bf16  safe_gate=True  has_init_state={HAS_INIT_STATE}")
+    print(f"                  H={H}  HV={HV}  D={D}  dtype=bf16  safe_gate=True  has_init_state={HAS_INIT_STATE}")
     wu = 1 if (NCU_MODE or SANITIZER_MODE) else WARMUP
     ni = 1 if (NCU_MODE or SANITIZER_MODE) else N_ITERS
     mode_tag = "  [NCU mode]" if NCU_MODE else ("  [Sanitizer mode]" if SANITIZER_MODE else "")
@@ -277,14 +275,18 @@ def main():
     parser.add_argument("--sanitizer", action="store_true", help="Sanitizer mode: warmup=1, iters=1")
     parser.add_argument("--init_state", action="store_true", help="Use non-zero initial state (default: False)")
     global H
-    parser.add_argument("--heads", type=int, default=H, help=f"Number of heads (H == HV, MHA). Default: {H}")
+    parser.add_argument("--heads", type=int, default=H, help=f"Number of Q/K heads. Default: {H}")
+    parser.add_argument("--v-heads", type=int, default=None, help="Number of V heads (defaults to --heads, MHA)")
     args = parser.parse_args()
 
     device = torch.device("cuda")
     assert_flashkda_supported(device)
 
-    global NCU_MODE, SANITIZER_MODE, HAS_INIT_STATE
+    global NCU_MODE, SANITIZER_MODE, HAS_INIT_STATE, HV
     H = args.heads
+    HV = H if args.v_heads is None else args.v_heads
+    if HV < H or HV % H:
+        parser.error("--v-heads must be a positive multiple of --heads")
     if args.ncu:
         NCU_MODE = True
         print("[NCU mode] warmup=1, iters=1")

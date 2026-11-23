@@ -44,8 +44,8 @@ def kda_prefill(
 
     This forward-only API supports SM90 and SM100. It has no native-extension
     fallback: unsupported inputs are rejected by FlashKDA with a concrete
-    validation error. In particular, grouped-value attention is not currently
-    supported and the Q/K/V head counts must match.
+    validation error. Grouped-value attention is supported when the value-head
+    count is a positive multiple of the Q/K-head count.
     """
     tensors = (q, k, v, g, beta)
     if any(not isinstance(t, torch.Tensor) for t in tensors):

@@ -89,7 +89,8 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         out,
         final_state,
     ):
-        batch_size, seq_len, num_heads, head_dim = q.shape
+        batch_size, seq_len, num_qk_heads, head_dim = q.shape
+        num_value_heads = v.shape[2]
 
         if out is None:
             out = torch.empty_like(v)
@@ -103,7 +104,7 @@ class HopperChunkKDAFunction(torch.autograd.Function):
         elif final_state is None:
             final_state = torch.empty(
                 n_seqs,
-                num_heads,
+                num_value_heads,
                 head_dim,
                 head_dim,
                 dtype=torch.float32,
@@ -116,10 +117,14 @@ class HopperChunkKDAFunction(torch.autograd.Function):
             beta = _beta_logits_bf16(beta)
 
         problem = _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens, cu_seqlens_cpu)
-        _validate_launch_options(q, out, lower_bound, True)
+        _validate_launch_options(v, out, lower_bound, True)
+        if num_value_heads != num_qk_heads:
+            if use_intracard_cp is CPMode.FORCE:
+                raise NotImplementedError("SM90 KDA GVA prefill does not support forced intracard context parallelism")
+            use_intracard_cp = CPMode.OFF
         plan = plan_prefill(
             _seq_tiles_from_problem(problem),
-            num_heads,
+            num_value_heads,
             q.device,
             use_intracard_cp,
         )
@@ -214,19 +219,20 @@ def cula_kda_prefill(
         k (torch.Tensor):
             keys of shape `[B, T, H, K]`.
         v (torch.Tensor):
-            values of shape `[B, T, H, V]`.
+            values of shape `[B, T, HV, V]`, where `HV` is a positive
+            multiple of the Q/K head count `H`.
         g (torch.Tensor):
-            (forget) gating tensor (in log space!) of shape `[B, T, H, K]`.
+            (forget) gating tensor (in log space!) of shape `[B, T, HV, K]`.
         beta (torch.Tensor):
-            betas of shape `[B, T, H]`.
+            betas of shape `[B, T, HV]`.
         scale (Optional[float]):
             Scale factor for the KDA attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[N, H, V, K]` for `N` input sequences.
+            Initial state of shape `[N, HV, V, K]` for `N` input sequences.
             Default: `None`.
         output_final_state (Optional[bool]):
-            Whether to output the final state of shape `[N, H, V, K]`. Default: `False`.
+            Whether to output the final state of shape `[N, HV, V, K]`. Default: `False`.
         use_qk_l2norm_in_kernel (bool):
             Accepted for API compatibility; CuTeDSL always applies L2-norm
             internally. Default: `False`.
@@ -254,21 +260,22 @@ def cula_kda_prefill(
         use_intracard_cp (Literal["auto"] | bool):
             Whether to use the FlashKDA intracard-CP path when profitable. ``True``
             requires CP support and raises on rejection, ``"auto"`` falls back
-            to the serial K1+K2 path, and ``False`` disables CP.
+            to the serial K1+K2 path, and ``False`` disables CP. GVA always
+            uses the serial path; forcing CP raises.
         out (Optional[torch.Tensor]):
             Preallocated output buffer, bf16, same shape as ``v``, written in
             place (also returned). ``None`` allocates per call. Default: `None`.
         final_state (Optional[torch.Tensor]):
-            Preallocated final-state buffer, fp32, shape `[N, H, V, K]`,
+            Preallocated final-state buffer, fp32, shape `[N, HV, V, K]`,
             written in place (also returned). Requires
             ``output_final_state=True``. ``None`` allocates per call.
             Default: `None`.
 
     Returns:
         o (torch.Tensor):
-            Outputs of shape `[B, T, H, V]`.
+            Outputs of shape `[B, T, HV, V]`.
         final_state (torch.Tensor):
-            Final state of shape `[N, H, V, K]` if `output_final_state=True` else `None`.
+            Final state of shape `[N, HV, V, K]` if `output_final_state=True` else `None`.
     """
     assert_flashkda_supported(q.device)
     if not use_gate_in_kernel:
@@ -278,7 +285,7 @@ def cula_kda_prefill(
         )
     if not safe_gate:
         raise NotImplementedError("FlashKDA CuTeDSL prefill only supports safe_gate=True.")
-    num_qk_heads, head_dim = q.shape[2], q.shape[3]
+    head_dim = q.shape[3]
     num_kv_heads = v.shape[2]
     A_log = kwargs.pop("A_log", None)
     dt_bias = kwargs.pop("dt_bias", None)
@@ -291,12 +298,6 @@ def cula_kda_prefill(
 
     if beta.dtype not in (torch.bfloat16, torch.float32):
         raise TypeError("beta must be in bfloat16 or float32.")
-    if num_kv_heads != num_qk_heads:
-        raise NotImplementedError(
-            "FlashKDA CuTeDSL prefill does not support grouped-value attention yet "
-            f"(num_kv_heads={num_kv_heads} != num_qk_heads={num_qk_heads}); native GVA is a follow-up change."
-        )
-
     if final_state is not None and not output_final_state:
         raise ValueError("final_state buffer requires output_final_state=True.")
 

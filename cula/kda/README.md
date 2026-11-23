@@ -14,7 +14,6 @@ Public entry points for KDA. For full examples (varlen, intracard CP, per-backen
 
 `chunk_kda_fwd_intra` and `flashkda_prefill` each call owned CuTeDSL implementations.
 `kda_prefill` calls FlashKDA directly; there is no C++/CUDA extension fallback.
-FlashKDA currently requires matching Q/K/V head counts (MHA rather than GVA).
 The standalone package does not provide the former FLA-backed `chunk_kda`
 autograd composition.
 

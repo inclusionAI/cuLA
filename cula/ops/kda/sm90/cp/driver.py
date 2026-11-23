@@ -78,6 +78,8 @@ def _run_cp(
     state_transposed=False,
 ) -> None:
     """Execute a non-trivial CPPlan verbatim -- no re-planning, no fallback."""
+    if _problem.H != _problem.HV:
+        raise NotImplementedError("SM90 KDA GVA prefill does not support intracard context parallelism")
     if not _problem.is_varlen and _problem.T % CHUNK != 0:
         _run_padded_dense(
             plan,
@@ -137,7 +139,9 @@ def intracard_prefill(
     allow_fallback=False means forced CP (structural split only, raise on a
     trivial plan); otherwise a trivial plan falls back to the serial kernel."""
     problem = _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens)
-    _validate_launch_options(q, out, lower_bound, True)
+    _validate_launch_options(v, out, lower_bound, True)
+    if problem.H != problem.HV:
+        raise NotImplementedError("SM90 KDA GVA prefill does not support intracard context parallelism")
     seq_tiles = _seq_tiles_from_problem(problem)
     H = q.shape[2]
     if s_split is not None:

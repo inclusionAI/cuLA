@@ -96,8 +96,8 @@ entry points.
 `kda_prefill` only runs forward (use it under `torch.inference_mode()` / `no_grad`).
 It calls the CuTeDSL FlashKDA implementation directly. Pass both `A_log` and
 `dt_bias`; unsupported calls fail explicitly rather than falling back to a
-native extension. Grouped-value attention (`V` heads != `Q/K` heads) is not
-yet supported by FlashKDA.
+native extension. Grouped-value attention is supported when the number of V
+heads is a positive multiple of the Q/K head count.
 
 ```python
 import torch
@@ -123,6 +123,10 @@ with torch.inference_mode():
         dt_bias=dt_bias,
     )
 ```
+
+For GVA, use `q/k: [B,T,H,D]` and `v/g: [B,T,HV,D]`, with
+`beta: [B,T,HV]`, `A_log: [HV]`, and `dt_bias: [HV,D]`. Pass
+`use_intracard_cp=False` or `"auto"`; `"auto"` falls back to the serial path.
 
 ### Modular Intra/WU primitives (SM100 — Blackwell)
 

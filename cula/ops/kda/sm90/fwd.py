@@ -58,6 +58,7 @@ class _PrefillProblem:
     B: int
     T: int
     H: int
+    HV: int
     total_tiles: int
     is_varlen: bool
     varlen_meta: _VarlenMetadata | None = None
@@ -74,6 +75,10 @@ def _validate_inputs(
 ) -> _PrefillProblem:
     if q.ndim != 4:
         raise ValueError(f"q must have shape [B, T, H, D], got {tuple(q.shape)}")
+    if v.ndim != 4 or g.ndim != 4:
+        raise ValueError(f"v/g must have shape [B, T, HV, D], got v={tuple(v.shape)}, g={tuple(g.shape)}")
+    if beta.ndim != 3:
+        raise ValueError(f"beta must have shape [B, T, HV], got {tuple(beta.shape)}")
     if not q.is_cuda or q.dtype != torch.bfloat16:
         raise TypeError(f"q must be a CUDA bfloat16 tensor, got dtype={q.dtype}, device={q.device}")
     for name, tensor in (("k", k), ("v", v), ("g", g), ("beta", beta)):
@@ -81,37 +86,40 @@ def _validate_inputs(
             raise TypeError(f"{name} must be a CUDA bfloat16 tensor, got dtype={tensor.dtype}, device={tensor.device}")
     if any(not tensor.is_contiguous() for tensor in (q, k, v, g, beta)):
         raise ValueError("q, k, v, g and beta must be contiguous")
-    if q.shape != k.shape or q.shape != g.shape:
-        raise ValueError(f"q/k/g shapes must match, got q={tuple(q.shape)}, k={tuple(k.shape)}, g={tuple(g.shape)}")
-    if v.shape != q.shape:
-        raise ValueError(f"v shape {tuple(v.shape)} must match q shape {tuple(q.shape)}")
+    if q.shape != k.shape:
+        raise ValueError(f"q/k shapes must match, got q={tuple(q.shape)}, k={tuple(k.shape)}")
 
     B, T, H, K = q.shape
+    HV = v.shape[2]
     if B <= 0 or T <= 0 or H <= 0:
         raise ValueError(f"B, T and H must be positive, got B={B}, T={T}, H={H}")
+    if v.shape[:2] != (B, T) or v.shape[-1] != K or g.shape != v.shape:
+        raise ValueError(f"v/g shapes must match with shape ({B}, {T}, HV, {K}), got v={tuple(v.shape)}, g={tuple(g.shape)}")
+    if HV < H or HV % H:
+        raise ValueError(f"value head count must be a positive multiple of Q/K head count, got H={H}, HV={HV}")
     if K != D:
         raise ValueError(f"only K=V={D} supported, got K={K} V={v.shape[-1]}")
-    if beta.shape != (B, T, H):
-        raise ValueError(f"beta shape mismatch: {tuple(beta.shape)} vs ({B},{T},{H})")
+    if beta.shape != (B, T, HV):
+        raise ValueError(f"beta shape mismatch: {tuple(beta.shape)} vs ({B},{T},{HV})")
     if (
         A_log is None
         or A_log.device != q.device
         or not A_log.is_contiguous()
-        or A_log.shape != (H,)
+        or A_log.shape != (HV,)
         or A_log.dtype != torch.float32
     ):
         raise ValueError(
-            f"A_log must be float32 with shape ({H},), got {None if A_log is None else (A_log.dtype, tuple(A_log.shape))}"
+            f"A_log must be float32 with shape ({HV},), got {None if A_log is None else (A_log.dtype, tuple(A_log.shape))}"
         )
     if (
         dt_bias is None
         or dt_bias.device != q.device
         or not dt_bias.is_contiguous()
-        or dt_bias.shape != (H, K)
+        or dt_bias.shape != (HV, K)
         or dt_bias.dtype != torch.float32
     ):
         raise ValueError(
-            f"dt_bias must be float32 with shape ({H}, {K}), "
+            f"dt_bias must be float32 with shape ({HV}, {K}), "
             f"got {None if dt_bias is None else (dt_bias.dtype, tuple(dt_bias.shape))}"
         )
 
@@ -152,13 +160,13 @@ def _validate_inputs(
         varlen_meta = None
 
     if initial_state is not None:
-        if initial_state.shape != (N, H, D, D):
-            raise ValueError(f"initial_state shape must be ({N}, {H}, {D}, {D}), got {tuple(initial_state.shape)}")
+        if initial_state.shape != (N, HV, D, D):
+            raise ValueError(f"initial_state shape must be ({N}, {HV}, {D}, {D}), got {tuple(initial_state.shape)}")
         if initial_state.device != q.device or initial_state.dtype != torch.float32 or not initial_state.is_contiguous():
             raise TypeError("initial_state must be a contiguous float32 tensor on the q device")
     if final_state is not None:
-        if final_state.shape != (N, H, D, D):
-            raise ValueError(f"final_state shape must be ({N}, {H}, {D}, {D}), got {tuple(final_state.shape)}")
+        if final_state.shape != (N, HV, D, D):
+            raise ValueError(f"final_state shape must be ({N}, {HV}, {D}, {D}), got {tuple(final_state.shape)}")
         if final_state.device != q.device or final_state.dtype != torch.float32 or not final_state.is_contiguous():
             raise TypeError("final_state must be a contiguous float32 tensor on the q device")
 
@@ -166,16 +174,17 @@ def _validate_inputs(
         B=B,
         T=T,
         H=H,
+        HV=HV,
         total_tiles=total_tiles,
         is_varlen=is_varlen,
         varlen_meta=varlen_meta,
     )
 
 
-def _validate_launch_options(q, out, lower_bound, use_gate_in_kernel) -> None:
-    if out.shape != q.shape or out.device != q.device or out.dtype != torch.bfloat16 or not out.is_contiguous():
+def _validate_launch_options(v, out, lower_bound, use_gate_in_kernel) -> None:
+    if out.shape != v.shape or out.device != v.device or out.dtype != torch.bfloat16 or not out.is_contiguous():
         raise ValueError(
-            f"out must be contiguous bfloat16 with shape {tuple(q.shape)} on {q.device}, "
+            f"out must be contiguous bfloat16 with shape {tuple(v.shape)} on {v.device}, "
             f"got dtype={out.dtype}, device={out.device}, shape={tuple(out.shape)}"
         )
     if not use_gate_in_kernel:
@@ -383,23 +392,24 @@ def flash_kda_fwd(
     """FlashKDA fwd. ``out`` and ``final_state`` are written in-place.
 
     Args:
-        q, k, v, g: [B, T, H, D] bf16.
-        beta: [B, T, H] bf16 (pre-sigmoid).
+        q, k: [B, T, H, D] bf16.
+        v, g: [B, T, HV, D] bf16.
+        beta: [B, T, HV] bf16 (pre-sigmoid).
         scale: attention scale.
-        out: [B, T, H, D] bf16 output (written in-place).
-        A_log: [H] fp32.
-        dt_bias: [H, D] fp32.
+        out: [B, T, HV, D] bf16 output (written in-place).
+        A_log: [HV] fp32.
+        dt_bias: [HV, D] fp32.
         lower_bound: gate floor (negative).
-        initial_state: [N, H, D, D] bf16/fp32 or None.
-        final_state: [N, H, D, D] bf16/fp32 or None (written in-place).
+        initial_state: [N, HV, D, D] bf16/fp32 or None.
+        final_state: [N, HV, D, D] bf16/fp32 or None (written in-place).
         cu_seqlens: [N+1] int32/int64 for variable-length, or None.
         cu_seqlens_cpu: optional CPU copy of cu_seqlens (same values) to skip the
             GPU->host sync when first building varlen metadata.
-        state_transposed: False -> [N,H,V,K] (default), True -> [N,H,K,V].
+        state_transposed: False -> [N,HV,V,K] (default), True -> [N,HV,K,V].
     """
     if _problem is None:
         problem = _validate_inputs(q, k, v, g, beta, A_log, dt_bias, initial_state, final_state, cu_seqlens, cu_seqlens_cpu)
-        _validate_launch_options(q, out, lower_bound, use_gate_in_kernel)
+        _validate_launch_options(v, out, lower_bound, use_gate_in_kernel)
     else:
         problem = _problem
 
@@ -447,7 +457,7 @@ def _dispatch_cute(
     need_t_pad = (not problem.is_varlen) and (T_orig % K1_CHUNK != 0)
     if need_t_pad:
         T_pad = ((T_orig + K1_CHUNK - 1) // K1_CHUNK) * K1_CHUNK
-        B, H = problem.B, problem.H
+        B, H, HV = problem.B, problem.H, problem.HV
         pad_len = T_pad - T_orig
         q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, pad_len))
         k = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, pad_len))
@@ -455,11 +465,12 @@ def _dispatch_cute(
         g = torch.nn.functional.pad(g, (0, 0, 0, 0, 0, pad_len), value=-1e6)
         beta = torch.nn.functional.pad(beta, (0, 0, 0, pad_len), value=-80.0)
         out_orig = out
-        out = torch.empty_like(q)
+        out = torch.empty_like(v)
         problem = _PrefillProblem(
             B=B,
             T=T_pad,
             H=H,
+            HV=HV,
             total_tiles=B * (T_pad // K1_CHUNK),
             is_varlen=False,
         )
@@ -500,6 +511,7 @@ def _dispatch_cute(
                 B=1,
                 T=total_aligned,
                 H=problem.H,
+                HV=problem.HV,
                 total_tiles=total_aligned // K1_CHUNK,
                 is_varlen=True,
             )
@@ -509,7 +521,7 @@ def _dispatch_cute(
 
     _launch_k2 = _get_k2_launcher()
 
-    B, T, H = problem.B, problem.T, problem.H
+    B, T, HV = problem.B, problem.T, problem.HV
 
     if problem.is_varlen:
         T_total = T
@@ -520,13 +532,13 @@ def _dispatch_cute(
 
     total_tiles = T_total // K1_CHUNK
 
-    n_qk = total_tiles * H * K1_CHUNK * K1_D
-    n_cc = total_tiles * H * K1_CHUNK * K1_CHUNK
+    n_qk = total_tiles * HV * K1_CHUNK * K1_D
+    n_cc = total_tiles * HV * K1_CHUNK * K1_CHUNK
     ws_qd, ws_kd, ws_kr, ws_gt, ws_inv, ws_mqk, ws_beta = _get_or_alloc_workspaces(
-        n_qk, n_cc, total_tiles * H * K1_D, T_total * H, q.device, beta.dtype
+        n_qk, n_cc, total_tiles * HV * K1_D, T_total * HV, q.device, beta.dtype
     )
 
-    # K1 reads beta from its original packed [T, H] layout and emits raw beta
+    # K1 reads beta from its original packed [T, HV] layout and emits raw beta
     # into ws_beta (tail rows = -80); K2 reads ws_beta directly, so no
     # host-side transpose/padding/gather of beta is needed.
     launch_k1(
